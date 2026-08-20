@@ -11,9 +11,20 @@ import {
   pathSeparatorNameError
 } from '../../web/js/lib/workflow-save.js'
 
-// A minimal ComfyUI workflow-service double that records what was called and
-// simulates the on-disk file set, so we can prove Save-As never consumes the
-// source file (issue #226).
+// A minimal ComfyUI workflow-STORE double (`app.extensionManager.workflow`) that
+// records what was called and simulates the on-disk file set, so we can prove
+// Save-As never consumes the source file (issue #226).
+//
+// STORE vs SERVICE (#1540). `saveInPlace` writes through `svc.saveWorkflow(wf)`,
+// and `svc` is the store, not `useWorkflowService`. Measured on frontend 1.49.6:
+// the store's saveWorkflow is `await e.save()` → `UserFile.save({force:true})`, a
+// write to `this.path`. It does NOT recompute a mode-derived path or rename.
+// Relocating saveWorkflow (`directory + appendWorkflowJsonExt(filename, isApp)`,
+// then `renameWorkflow`) belongs to the service, which the panel does not call.
+// Do not put that behavior back on this double; if a frontend ever exposes the
+// service at `extensionManager.workflow`, model it under an explicitly-named
+// helper rather than silently forking the store.
+//
 // Production-accurate extension derivation (mirrors ComfyUI formatUtil):
 // app-mode workflows persist as "<base>.app.json", everything else as
 // "<base>.json".
@@ -24,6 +35,14 @@ const stripExt = (name) => {
   if (lower.endsWith('.app.json')) return s.slice(0, -'.app.json'.length)
   if (lower.endsWith('.json')) return s.slice(0, -'.json'.length)
   return s
+}
+
+/** Store saveWorkflow: write `wf.path`. Shared by `makeService` and
+ *  `makeFaithfulService` so those two cannot disagree about the call the panel
+ *  makes. `makeStore147Service` writes the same path (through a content Map). */
+function storeSaveWorkflow(svc, wf) {
+  svc.calls.push(['saveWorkflow', wf.path])
+  svc.disk.add(wf.path) // overwrite / create in place — UserFile.save writes this.path
 }
 
 function makeService({ files = [], active } = {}) {
@@ -41,18 +60,8 @@ function makeService({ files = [], active } = {}) {
       if (disk.has(path)) return { path, isPersisted: true }
       return null
     },
-    // Mirrors ComfyUI's saveWorkflow: it recomputes the expected path from the
-    // workflow's mode-derived extension, and if that differs from the current
-    // path it RENAMES (moves) the file before saving. This is the exact upstream
-    // mechanism the panel must never trigger on a persisted source (#226).
     async saveWorkflow(wf) {
-      const dir = wf.directory || 'workflows'
-      const expected = `${dir}/${stripExt(wf.filename)}${extFor(wf)}`
-      if (wf.path !== expected) {
-        await svc.renameWorkflow(wf, expected)
-      }
-      calls.push(['saveWorkflow', wf.path])
-      disk.add(wf.path) // overwrite / create in place
+      storeSaveWorkflow(svc, wf)
     },
     async renameWorkflow(wf, newPath) {
       calls.push(['renameWorkflow', wf.path, newPath])
@@ -479,8 +488,9 @@ function makeFaithfulService({ files = [], active } = {}) {
       disk.add(newPath)
     },
     async saveWorkflow(wf) {
-      calls.push(['saveWorkflow', wf.path])
-      disk.add(wf.path)
+      // Same store write as makeService (#1540) — this double is "faithful" about
+      // saveWorkflowAs (moves a temporary), not about a different saveWorkflow.
+      storeSaveWorkflow(svc, wf)
     },
     async saveWorkflowAs(wf, { filename }) {
       // The DANGEROUS high-level API (MOVES a temporary). Kept so tests prove the
@@ -772,9 +782,11 @@ test('#1066/codex: the backstop reports DISAPPEARANCE, not causation — it name
 
 test('P0 round-5: no-name save of a persisted workflow with an EMPTY filename refuses — never moves Orig.json → .json (#226)', async () => {
   // Flow edge: an on-disk workflow whose in-memory filename is empty/unresolved,
-  // saved with NO name. effectiveName/finalTargetPath come out empty; the old
-  // code called saveInPlace unconditionally and the frontend's saveWorkflow
-  // recomputed the target from the empty name and MOVED "Orig.json" → ".json".
+  // saved with NO name. effectiveName/finalTargetPath come out empty. Refuse
+  // rather than write through saveInPlace with no destination (#226). (The
+  // workflow SERVICE's saveWorkflow would recompute a bare "…/.json" and rename
+  // onto it; the STORE this double models writes this.path. The panel calls the
+  // store, and still refuses an unresolved name.)
   const active = {
     path: 'workflows/Orig.json',
     filename: '',
@@ -1003,6 +1015,10 @@ test('P0-b: no-name save of an on-disk app-mode workflow COPIES to .app.json, so
 // states and only one of them is what a fresh file produces: `undefined` (the file has no
 // extra.linearMode at all — reproduced live) and `"graph"` (the file says
 // linearMode:false — what the issue reporter's file held on disk).
+//
+// #1540: these in-place cases run on `makeService` — the default store double, and
+// the one that used to relocate. A relocating saveWorkflow would move the .app.json
+// to the mode-derived .json and these assertions would fail.
 for (const [label, initialMode] of [
   ['mode never populated (no extra.linearMode in the file)', undefined],
   ['mode read as "graph" (the file says linearMode:false)', 'graph']
@@ -1018,7 +1034,7 @@ for (const [label, initialMode] of [
       isPersisted: true,
       isTemporary: false
     }
-    const svc = makeFaithfulService({ files: [active.path], active })
+    const svc = makeService({ files: [active.path], active })
 
     const saved = await saveActiveWorkflow(svc, undefined, {
       autoWorkflowName: () => 'Untitled',
@@ -1042,6 +1058,34 @@ for (const [label, initialMode] of [
   })
 }
 
+test('#1540: the default store double writes wf.path — a no-name .app.json save does not relocate', async () => {
+  // Exact state the two saveWorkflow models disagreed on (measured frontend 1.49.6):
+  // path is already .app.json, filename is the stem, initialMode unset. The SERVICE
+  // would rename onto the mode-derived .json; the STORE writes this.path. saveInPlace
+  // calls the store. Before this issue, makeService relocated and this case had to
+  // live on makeFaithfulService.
+  const active = {
+    path: 'workflows/X.app.json',
+    filename: 'X',
+    directory: 'workflows',
+    initialMode: undefined,
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  const saved = await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk: async (p) => svc.disk.has(p)
+  })
+
+  assert.equal(saved, 'X')
+  // Exact call list: a relocating saveWorkflow would have pushed renameWorkflow first
+  // and then saveWorkflow of the mode-derived .json.
+  assert.deepEqual(svc.calls, [['saveWorkflow', 'workflows/X.app.json']])
+  assert.deepEqual([...svc.disk], ['workflows/X.app.json'])
+})
+
 test('#1535: the in-place classification is the SAVE OUTCOME, so the reply cannot report a Save-As', async () => {
   // describeSaveOutcome reads the mode the save DECIDED. If the fork route were taken it
   // would record "save-as-copy" and the reply would carry `saved_as: true` — the field
@@ -1056,7 +1100,7 @@ test('#1535: the in-place classification is the SAVE OUTCOME, so the reply canno
     isPersisted: true,
     isTemporary: false
   }
-  const svc = makeFaithfulService({ files: [active.path], active })
+  const svc = makeService({ files: [active.path], active })
   const details = {}
 
   await saveActiveWorkflow(svc, undefined, {
@@ -1274,9 +1318,9 @@ function makeStore147Service({ files = [], active, graph = SAMPLE_GRAPH } = {}) 
       if (svc.activeWorkflow === wf) svc.activeWorkflow = openWorkflows[0] ?? null
     },
     async saveWorkflow(wf) {
+      // Store write to `wf.path` (#1540), plus the 1.47 content surface: save()
+      // serializes changeTracker?.activeState ?? null. An unopened copy writes "null".
       calls.push(['saveWorkflow', wf.path])
-      // save() serializes changeTracker?.activeState ?? null — the exact bug
-      // surface. An unopened copy writes "null".
       disk.set(wf.path, JSON.stringify(wf.changeTracker?.activeState ?? null))
       wf.isPersisted = true
       wf.isTemporary = false
