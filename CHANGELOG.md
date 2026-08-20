@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.24] - 2026-08-20
+
+### Fixed
+- the node-def refresh asks the raw /object_info route when the frontend client does not answer (#1502)
+- a graph read dates itself against the manual-change block it contradicts (#1503)
+- an instance-scoped promoted write discloses the inner callback it did not invoke (#1500)
+- the "you are inside a subgraph" remedy is now checked, not assumed (#1499)
+
+
 ## [0.15.23] - 2026-08-20
 
 ### Fixed
