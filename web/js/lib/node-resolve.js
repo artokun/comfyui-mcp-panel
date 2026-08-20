@@ -28,7 +28,7 @@ export const COMFY_CORE_SENTINEL_TYPES = [
   "SaveImage",
 ];
 
-import { importFailureNote } from "./pack-import-failures.js";
+import { importFailureNote, relevantPackImportFailures } from "./pack-import-failures.js";
 
 /** True when `type` is registered in the live LiteGraph registry object
  *  (LG.registered_node_types). */
@@ -557,7 +557,8 @@ export function assertAddNodeResolvable(registry, class_type) {
 export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
   // #775 — `readImportFailures` is injected and awaited ONLY on the refusal path,
   // so a healthy add pays nothing for it.
-  const { getFreshObjectInfo, refresh, wasTypeEverDefined, readImportFailures } = opts;
+  const { getFreshObjectInfo, refresh, wasTypeEverDefined, readImportFailures, readNodeMap } =
+    opts;
   const readRegistry = () =>
     typeof getRegistry === "function" ? getRegistry() : getRegistry;
 
@@ -692,13 +693,29 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // different type (VideoToImages) is missing.
       // #1523 — UUID types never reach here (handled above). Remaining failures
       // still do not prove ownership of the requested type.
+      // #1544 — naming a failed pack is a CAUSAL claim, and the panel was making it
+      // without evidence: `PreviewVideo` was refused with "coldinfire_fal_privacy
+      // FAILED TO IMPORT" attached. ComfyUI-Manager's node map is the ownership
+      // oracle (`readNodeMap`), and it is read ONLY once there is a surviving
+      // failure to adjudicate — it is a ~1.4 MB payload, and a refusal with no
+      // import failures must not pay for it.
       let failedNote = "";
       if (typeof readImportFailures === "function") {
         try {
-          failedNote = importFailureNote(await readImportFailures(), {
-            forType: class_type,
-            liveDefs: freshDefs,
-          });
+          const failed = await readImportFailures();
+          const noteOpts = { forType: class_type, liveDefs: freshDefs };
+          if (
+            typeof readNodeMap === "function" &&
+            relevantPackImportFailures(failed, noteOpts).length > 0
+          ) {
+            try {
+              noteOpts.nodeMap = await readNodeMap();
+            } catch {
+              // Manager unreachable/disabled: ownership stays unestablished, which
+              // the note reports as exactly that rather than guessing a cause.
+            }
+          }
+          failedNote = importFailureNote(failed, noteOpts);
         } catch {
           // A diagnostic that throws must not replace the refusal it explains.
         }

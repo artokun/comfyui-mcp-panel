@@ -27,6 +27,16 @@ import { readComfyLogText } from "./comfy-log.js";
  * types. Establishing that needs the pack's NODE_CLASS_MAPPINGS, which is not
  * readable from the browser — so the wording stays at "check these first".
  *
+ * #1544 CORRECTS THAT LAST PARAGRAPH. A pack's class list IS readable from the
+ * browser: ComfyUI-Manager's `/customnode/getmappings` is keyed pack →
+ * [[classNames…], meta], and the panel had been fetching that very payload for
+ * panel_search_nodes while throwing the class list away. Because ownership looked
+ * unknowable, every caller settled for a hedge — and a hedge in the last sentence
+ * did not stop `panel_add_node PreviewVideo` from reading as "coldinfire_fal_privacy
+ * is why". So ownership is now CHECKED (`packsProvidingType`): a pack the map ties
+ * to the requested type is named as the cause outright, and one it does not is
+ * presented as a separate problem, up front, in the first clause the reader sees.
+ *
  * #1447 — a pack that currently PROVIDES types cannot be the reason a different
  * type is missing. ReActorFaceSwap had just been added when `panel_add_node`
  * VideoToImages appended "comfyui-reactor-node FAILED TO IMPORT". That sentence
@@ -127,6 +137,86 @@ export function dropLivePackImportFailures(failed, liveDefs) {
   return failed.filter((name) => !live.has(packKey(name)));
 }
 
+/** A subgraph definition id, never a pack-provided class name (#1523). */
+const SUBGRAPH_UUID =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * The pack folder a ComfyUI-Manager node-map KEY corresponds to.
+ *
+ * Manager keys the map by whatever identifies the pack in its catalogue, and both
+ * shapes occur in one payload (observed on a live 5583-entry map): a repo URL
+ * (`https://github.com/0velia/ComfyUI-Dynamic-Dropdowns`) and a bare registry id
+ * (`llm-toolkit`). Manager clones into a folder named after that last segment, which
+ * is the SAME segment the `(IMPORT FAILED)` log line prints — so the final path
+ * component, `.git` stripped, is what the two sides have in common. Normalised
+ * through `packKey` so case and separators do not decide a match.
+ */
+function packKeyFromNodeMapKey(key) {
+  const s = String(key || "")
+    .trim()
+    .replace(/[?#].*$/, "")
+    .replace(/\/+$/, "");
+  if (!s) return "";
+  const seg = s.split(/[/\\]/).filter(Boolean).pop() || s;
+  return packKey(seg.replace(/\.git$/i, ""));
+}
+
+/**
+ * Pack keys that ComfyUI-Manager's node map says PROVIDE `forType`.
+ *
+ * The map (`/customnode/getmappings`) is keyed pack → [[classNames…], meta]; that
+ * class-name array is the ownership evidence this module previously recorded as
+ * unreadable from a browser. It is readable — the panel already fetches this exact
+ * payload for panel_search_nodes (`parseNodeMappings`), which consumed only the meta
+ * object and discarded the class list.
+ *
+ * POSITIVE EVIDENCE ONLY, deliberately. The converse — "the map knows this pack and
+ * its class list omits the type, therefore it is not the owner" — is NOT sound: on
+ * the machine this was measured on, 4 of the 59 installed packs the map recognises
+ * share no class at all with their own live /object_info entries, because the
+ * catalogue lags a pack's current release. Acting on that would silently discard
+ * real import failures — the #775 fault with its sign flipped. So a match PROMOTES a
+ * failure to "the cause"; a non-match only declines to promote it.
+ *
+ * @param {unknown} nodeMap raw `/customnode/getmappings` payload (or null)
+ * @param {string} forType requested class_type
+ * @returns {Set<string>} normalised pack keys
+ */
+export function packsProvidingType(nodeMap, forType) {
+  const type = String(forType || "").trim();
+  const out = new Set();
+  if (!type || !nodeMap || typeof nodeMap !== "object") return out;
+  // Both wire shapes, exactly as parseNodeMappings handles them: an ARRAY of pack
+  // objects, or the documented MAP of key → [[classNames…], meta].
+  const entries = Array.isArray(nodeMap)
+    ? nodeMap.map((p) => [p?.id ?? p?.reference ?? p?.title, p?.nodenames ?? p?.nodes])
+    : Object.entries(nodeMap).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v?.nodenames]);
+  for (const [key, classes] of entries) {
+    if (!Array.isArray(classes) || !classes.includes(type)) continue;
+    const pk = packKeyFromNodeMapKey(key);
+    if (pk) out.add(pk);
+  }
+  return out;
+}
+
+/**
+ * The failures a note would actually name: log failures minus the ones the live
+ * backend contradicts (#1447), and none at all for a subgraph UUID (#1523).
+ *
+ * Exported so a caller can decide whether fetching the node map is worth it BEFORE
+ * paying for it — that payload is ~1.4 MB, and there is nothing to adjudicate when
+ * this comes back empty.
+ */
+export function relevantPackImportFailures(failed, opts = {}) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const forType = typeof o.forType === "string" ? o.forType.trim() : "";
+  // #1523 — a UUID class_type is a subgraph definition, not a pack-provided node.
+  // The note would name an unrelated failed pack with no possible ownership link.
+  if (forType && SUBGRAPH_UUID.test(forType)) return [];
+  return dropLivePackImportFailures(failed, o.liveDefs);
+}
+
 /**
  * What to add to a missing-node message once the import failures are known.
  *
@@ -137,39 +227,85 @@ export function dropLivePackImportFailures(failed, liveDefs) {
  * `opts.forType` names the missing class so a leftover failure is labelled
  * unrelated rather than read as its cause. A subgraph UUID forType yields
  * no note at all (#1523) — ownership mapping cannot link a pack to it.
+ * `opts.nodeMap` is ComfyUI-Manager's node map; it is what PROMOTES a failure from
+ * an unrelated diagnostic to the stated cause (#1544).
+ *
+ * #1544 — the note used to open with "BEFORE INSTALLING ANYTHING: ComfyUI reported
+ * that this pack FAILED TO IMPORT" for ANY unknown type, and hedge only in its last
+ * sentence. A reporter asking for `PreviewVideo` was told `coldinfire_fal_privacy`
+ * had failed to import; the two have nothing to do with each other, and a leading
+ * sentence outweighs a trailing qualifier. So the causal framing is now earned
+ * rather than assumed: it appears only for a pack the node map ties to this exact
+ * class_type, and every other failure is presented as what it is — a real problem
+ * worth fixing that does not explain THIS missing type.
  */
 export function importFailureNote(failed, opts = {}) {
-  const forType = opts && typeof opts === "object" && typeof opts.forType === "string"
-    ? opts.forType.trim()
-    : "";
-  // #1523 — a UUID class_type is a subgraph definition, not a pack-provided
-  // node. The note would name an unrelated failed pack with no possible
-  // ownership link.
-  if (
-    forType &&
-    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(forType)
-  ) {
-    return "";
-  }
-  const relevant = dropLivePackImportFailures(
-    failed,
-    opts && typeof opts === "object" ? opts.liveDefs : undefined,
-  );
+  const o = opts && typeof opts === "object" ? opts : {};
+  const forType = typeof o.forType === "string" ? o.forType.trim() : "";
+  const relevant = relevantPackImportFailures(failed, o);
   if (relevant.length === 0) return "";
+
+  // Plurality follows the packs the sentence actually NAMES, not every failure in
+  // the log — a causal note names only the owner, so "those lines" would point the
+  // reader at log lines the message never mentioned.
+  const howToReadTheLog = (count) =>
+    `Check the server log (get_system_stats action:"logs") for the ImportError above ` +
+    `${count > 1 ? "those lines" : "that line"} — it is usually a version ` +
+    `mismatch between the pack and ComfyUI.`;
+
+  // EARNED CAUSE — the map ties one of these packs to this exact class_type. Only
+  // the owner is named: the other failures are real, but they are not what this add
+  // ran into, and listing them here would re-create the #1544 ambiguity inside the
+  // one message that finally has a definite answer. A workflow LOAD still reports
+  // every failure (the no-forType branch below).
+  const owners = packsProvidingType(o.nodeMap, forType);
+  const owning = owners.size ? relevant.filter((name) => owners.has(packKey(name))) : [];
+  if (owning.length) {
+    const many = owning.length > 1;
+    return (
+      ` BEFORE INSTALLING ANYTHING: "${forType}" is provided by ${owning.join(", ")}, and ` +
+      `ComfyUI reported that ${many ? "those packs" : "it"} FAILED TO IMPORT at startup. ` +
+      `A pack that fails to import registers NONE of its nodes, so its node types are missing ` +
+      `exactly as if it were not installed, and installing it again will not help. ` +
+      howToReadTheLog(owning.length) +
+      ` (Ownership is from ComfyUI-Manager's node map.)`
+    );
+  }
+
   const list = relevant.join(", ");
   const plural = relevant.length > 1;
-  const ownership = forType
-    ? ` This does not prove ${plural ? "they provide" : "it provides"} "${forType}" — ` +
-      `the failure may be unrelated.`
-    : ` This does not prove ${plural ? "they own" : "it owns"} the ` +
-      `missing types; it is the first thing to rule out.`;
+
+  // NO REQUESTED TYPE — the workflow-load path (#775), where the note explains a SET
+  // of missing types rather than one. There is nothing to establish ownership
+  // against, so this keeps its original wording.
+  if (!forType) {
+    return (
+      ` BEFORE INSTALLING ANYTHING: ComfyUI reported that ${plural ? "these packs" : "this pack"} ` +
+      `FAILED TO IMPORT at startup — ${list}. A pack that fails to import registers NONE of its ` +
+      `nodes, so its node types are missing exactly as if it were not installed, and installing it ` +
+      `again will not help. ` +
+      howToReadTheLog(relevant.length) +
+      ` This does not prove ${plural ? "they own" : "it owns"} the ` +
+      `missing types; it is the first thing to rule out.`
+    );
+  }
+
+  // UNEARNED — say so FIRST, so the pack name cannot be read as the answer. Which
+  // check came up short is stated exactly: a map that was read and did not link the
+  // pack is different evidence from a map that could not be read at all, and the
+  // reader's next step differs accordingly.
+  const why =
+    o.nodeMap && typeof o.nodeMap === "object"
+      ? `ComfyUI-Manager's node map does not link ${plural ? "them" : "it"} to that type`
+      : `ComfyUI-Manager's node map could not be read, so ownership was not checked`;
   return (
-    ` BEFORE INSTALLING ANYTHING: ComfyUI reported that ${plural ? "these packs" : "this pack"} ` +
-    `FAILED TO IMPORT at startup — ${list}. A pack that fails to import registers NONE of its ` +
-    `nodes, so its node types are missing exactly as if it were not installed, and installing it ` +
-    `again will not help. Check the server log (get_system_stats action:"logs") for the ` +
-    `ImportError above ${plural ? "those lines" : "that line"} — it is usually a version mismatch ` +
-    `between the pack and ComfyUI.` +
-    ownership
+    ` SEPARATE ISSUE, not the cause of this missing type: ComfyUI reported that ` +
+    `${plural ? "these packs" : "this pack"} FAILED TO IMPORT at startup — ${list}. ` +
+    `Nothing ties ${plural ? "them" : "it"} to "${forType}" — ${why} — so do not reinstall ` +
+    `${plural ? "them" : "it"} expecting "${forType}" to appear. ` +
+    `${plural ? "Those failures are" : "That failure is"} still worth fixing on ${
+      plural ? "their" : "its"
+    } own: a pack that fails to import registers NONE of its nodes. ` +
+    howToReadTheLog(relevant.length)
   );
 }
