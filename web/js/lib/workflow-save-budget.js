@@ -104,15 +104,15 @@ export function describeWorkflowSaveTimeout({
   // #1459 — but the two sides arrive normalized to DIFFERENT degrees, so one shared
   // helper cannot key both. `requested` is the caller's raw string and may still carry
   // a directory and a ".json"/".app.json" suffix — exactly what the save layer strips
-  // with baseName() before it builds the target path. `filename` has already had ONE
-  // trailing extension removed by the frontend (UserFile → getPathDetails →
-  // getFilenameDetails), so the directory is the only part of it still safe to drop.
-  // Running it through baseName() too strips it a SECOND time — the same double-strip
-  // workflow-save.js:650 documents as unsafe:
-  // a file on disk at "…/Foo.json.json" reports filename "Foo.json", which stripped
-  // again reads "Foo" and matches a requested "Foo". A genuinely different workflow
-  // then passes as the destination, the "not the save's destination" disclosure is
-  // suppressed, and the SOURCE's dirty/persisted flags are printed as the target's.
+  // with baseName() before it builds the target path. `filename` has already been
+  // stripped by the frontend (UserFile → getPathDetails → getFilenameDetails), so the
+  // directory is the only part of it still safe to drop. Running it through baseName()
+  // too strips it a SECOND time — the same double-strip workflow-save.js:650 documents
+  // as unsafe: a file on disk at "…/Foo.json.json" reports filename "Foo.json", which
+  // stripped again reads "Foo" and matches a requested "Foo". A genuinely different
+  // workflow then passes as the destination, the "not the save's destination"
+  // disclosure is suppressed, and the SOURCE's dirty/persisted flags are printed as
+  // the target's.
   const dropDir = (v) => {
     const raw = String(v ?? "").trim();
     if (!raw) return "";
@@ -121,13 +121,18 @@ export function describeWorkflowSaveTimeout({
   };
   /** Key a caller-supplied name: both the directory and the extension are presentation. */
   const requestedKey = (v) => baseName(dropDir(v));
-  // KNOWN AND UNCHANGED: getFilenameDetails removes one extension, not the compound
-  // ".app.json" — an app-mode workflow on disk at "Foo.app.json" reports filename
-  // "Foo.app", which no longer keys equal to a requested "Foo". That mismatch predates
-  // this change and is identical before and after it; activeKey deliberately does not
-  // paper over it, because ".app" is also a legal thing to call a workflow and guessing
-  // wrong here is the very failure mode above. Not normalizing it costs at most an extra
-  // "cannot say which file" disclosure, which is the safe direction to be wrong in.
+  // What getFilenameDetails actually does, read off the shipped frontend (1.49.6) rather
+  // than assumed: ONE special case for the compound ".app.json", then a cut at the LAST
+  // dot. So "Foo.app.json" → "Foo", "Foo.json" → "Foo", "Foo.json.json" → "Foo.json",
+  // and "My.Workflow.json" → "My.Workflow". Every one of those is already as bare as the
+  // frontend can make it, which is why activeKey must not cut again.
+  //
+  // KNOWN AND UNCHANGED: it leaves ONE residual mismatch, in the other (safe) direction.
+  // A workflow literally NAMED "Foo.app" persists at "Foo.app.json" and so reports
+  // filename "Foo", while requestedKey keeps the ".app" baseName does not recognise —
+  // the two do not key equal. That is identical before and after this change, and it
+  // errs toward an extra "cannot say which file" disclosure rather than toward a
+  // wrong-target claim, so it is left alone rather than papered over with another guess.
   /** Key a frontend-derived `filename`: drop the directory and NOTHING else. */
   const activeKey = (v) => dropDir(v);
   const dest = str(requested);
