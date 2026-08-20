@@ -9272,11 +9272,6 @@ function clearStaleRedFlag(node, { app, graph, rootGraph }) {
   return false;
 }
 
-/**
- * `convertToSubgraph()` rewires surviving root-graph neighbours to its new
- * wrapper but does not revalidate their sticky red flags. Re-adjudicate only
- * those direct neighbours; never the wrapper or the nodes moved inside it.
- */
 /** Run the frontend's conversion so that a THROW is as informative as a return.
  *
  *  #1463 — both tools called `graph.convertToSubgraph()` bare, so the caller got the
@@ -9404,6 +9399,11 @@ function subgraphConversionAdvisories({ disconnected, dangling, warning }) {
   };
 }
 
+/**
+ * `convertToSubgraph()` rewires surviving root-graph neighbours to its new
+ * wrapper but does not revalidate their sticky red flags. Re-adjudicate only
+ * those direct neighbours; never the wrapper or the nodes moved inside it.
+ */
 function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph }) {
   try {
     for (const id of collectLinkedNeighborNodeIds(res?.node, graph?.links)) {

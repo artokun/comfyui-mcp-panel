@@ -254,6 +254,14 @@ test("nothing moved → the report says so, and that there is nothing to undo", 
   assert.match(msg, /link table is unchanged at 3 entries/);
   assert.doesNotMatch(msg, /HAS CHANGED/);
   assert.ok(msg.includes(RAW));
+  // `wrapped` is an own-property test, so it cannot see a patch on LGraph.prototype.
+  // The sentence must therefore claim only what was measured — this graph OBJECT.
+  assert.match(msg, /nothing on this graph object overrides/);
+  assert.doesNotMatch(
+    msg,
+    /nothing has replaced convertToSubgraph/,
+    "a prototype-level patch would make that wider claim false",
+  );
 });
 
 test("a WRAPPED convertToSubgraph withdraws the confident verdict — the gate P1", () => {

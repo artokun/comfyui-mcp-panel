@@ -652,11 +652,17 @@ export function conversionThrowReport({ what, message, before, after }) {
     );
   }
 
+  // "nothing overrides it ON THIS GRAPH OBJECT" is exactly what `wrapped` measures, and
+  // is all this may say: a patch applied to `LGraph.prototype` is invisible to an
+  // own-property test, so the wider claim ("nothing has replaced convertToSubgraph")
+  // would be false there — and an unverified sentence in a tool result gets quoted back
+  // as a measurement. It costs nothing to say only the true one.
   return (
     `${what} failed and nothing the panel can read moved: all ${beforeIds.length} selected ` +
     `node(s) are still on the canvas, no subgraph definition was registered, the link table ` +
-    `is unchanged at ${after.links} entries, and nothing has replaced convertToSubgraph on ` +
-    `this graph. There is nothing to undo. ComfyUI's convertToSubgraph threw: "${raw}". A ` +
+    `is unchanged at ${after.links} entries, and nothing on this graph object overrides ` +
+    `ComfyUI's own convertToSubgraph. There is nothing to undo. ComfyUI's convertToSubgraph ` +
+    `threw: "${raw}". A ` +
     `straight retry will hit the same thing; the selection itself is intact, so this is about ` +
     `the state of the canvas, not the nodes you named. Reloading the ComfyUI page rebuilds ` +
     `the graph and clears the stale-canvas form of this (save first — panel_save_workflow). ` +
