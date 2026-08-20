@@ -1504,6 +1504,18 @@ test("#608: the client route is capped at a SHARE of the fetch phase, so the fal
     armed[0].ms > clientShare * 0.8,
     `…nor be starved to a floor (saw ${armed[0].ms}ms of ${clientShare}ms)`,
   );
+  // THE RESERVE ITSELF, in absolute milliseconds, because the two assertions above are
+  // written against the share READ FROM THE PANEL and therefore move with it: restoring
+  // NODE_DEFS_CLIENT_ROUTE_SHARE to 1 kept both of them green while leaving the fallback a
+  // one-millisecond budget — the floor `nodeDefsBudgetLeft` returns for an exhausted one,
+  // which in this harness a synchronous double still beats and a real 5MB GET never would.
+  // 1,000ms is twice the ~450ms this repo has measured the raw route at, and the oracle
+  // halves whatever it is given between the response and the body.
+  const reserveMs = wholeFetchPhase - armed[0].ms;
+  assert.ok(
+    reserveMs >= 1000,
+    `the second route must be left a usable reserve, saw ${reserveMs}ms of ${wholeFetchPhase}ms`,
+  );
   timers.fireAll();
   await orFail(running, "the run never finished");
 });
