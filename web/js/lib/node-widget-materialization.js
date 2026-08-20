@@ -325,23 +325,39 @@ export function unavailableRequiredWidgetMessage(report, classType, waitedMs, sc
         ? `no installed node outputs "${entry.type}" and no frontend widget is registered for it`
         : `no frontend widget is registered for "${entry.type}", and whether any installed node ` +
           `outputs it is UNKNOWN — the full /object_info read that would answer it did not ` +
-          `complete in time, so this is not evidence that nothing produces it`;
+          `complete, so this is not evidence that nothing produces it`;
     return `  - input ${inputs} (declared type "${entry.type}"): ${cause}.`;
   });
   const waited = Number.isFinite(waitedMs) ? `${(waitedMs / 1000).toFixed(1)}s` : "the wait window";
-  const remedy = schemaProofComplete
-    ? "Reload the ComfyUI browser tab so node packs can re-register their frontend widgets, then " +
-      "retry. If it fails again the pack's frontend extension is not loading and retrying alone " +
-      "will not fix it. This is NOT a link datatype being misread: an input the backend proves is " +
-      "a socket (MASK, IMAGE, LATENT, a comma-joined union of them) is added immediately, without " +
-      "any wait."
-    : // The schema read is the thing that ran out of time, so a retry is the remedy that can
-      // actually change the answer — unlike reloading the tab, which re-registers widgets and
-      // does nothing about an /object_info read that did not finish.
-      "RETRY this add: the full /object_info read is what ran out of time, and a retry can " +
-      "complete it. Reloading the tab does NOT help here — the missing thing is the schema " +
-      "answer, not a frontend widget. If it keeps timing out, this install's /object_info is " +
-      "large enough that the read needs a longer budget.";
+  // #1848 (gate) — the CAUSE is per entry, so the REMEDY has to be too. `linkProven` is
+  // decided from SAFE_SOCKET_TYPES / core 3D types / this class's own outputs, none of
+  // which a widen can change, so a report made only of link-proven entries is untouched
+  // by the schema question and must keep the remedy that can actually help it. Switching
+  // the whole message on a report-wide flag deleted that advice — the same
+  // remedy-that-cannot-work defect (#695/#700) this change exists to fix.
+  const schemaUnknown = !schemaProofComplete && report.some((e) => !e.linkProven);
+  const anyLinkProven = report.some((e) => e.linkProven);
+  const reloadRemedy =
+    "Reload the ComfyUI browser tab so node packs can re-register their frontend widgets, then " +
+    "retry. If it fails again the pack's frontend extension is not loading and retrying alone " +
+    "will not fix it. This is NOT a link datatype being misread: an input the backend proves is " +
+    "a socket (MASK, IMAGE, LATENT, a comma-joined union of them) is added immediately, without " +
+    "any wait.";
+  // The schema read is the thing that did not answer, so a retry is the remedy that can
+  // change it — unlike reloading the tab, which re-registers widgets and does nothing
+  // about an /object_info read that never came back.
+  const retryRemedy =
+    "RETRY this add: the full /object_info read that would answer the producer question did " +
+    "not complete, and a retry can complete it. Reloading the tab does NOT help THAT input — " +
+    "the missing thing is the schema answer, not a frontend widget. If it keeps failing, this " +
+    "install's /object_info may be large enough that the read needs a longer budget.";
+  // A MIXED report needs both: one input is waiting on a widget, another on an answer.
+  const remedy = schemaUnknown
+    ? anyLinkProven
+      ? `${retryRemedy}
+${reloadRemedy}`
+      : retryRemedy
+    : reloadRemedy;
   return (
     `Cannot add ${target}: ${report.length} required input type${report.length === 1 ? "" : "s"} ` +
     `had no widget after ${waited} waiting for node extensions to register.\n` +

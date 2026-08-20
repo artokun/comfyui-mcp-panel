@@ -1337,7 +1337,11 @@ test("#1848: a widen that could not answer is reported as UNKNOWN, not as absenc
     "never asserts absence from a state of not-knowing",
   );
   assert.match(unknown, /UNKNOWN/);
-  assert.match(unknown, /did not complete in time/);
+  // Deliberately not "in time": schemaProofComplete=false also covers a rejected
+  // getNodeDefs and an empty payload, so claiming a TIMEOUT would over-specify a
+  // cause the flag cannot distinguish.
+  assert.match(unknown, /did not complete/);
+  assert.doesNotMatch(unknown, /did not complete in time/);
   assert.match(unknown, /not evidence that nothing produces it/);
 
   // And the remedy has to change with the cause: reloading the tab re-registers widgets,
@@ -1370,7 +1374,30 @@ test("#1848: link-proven inputs are unaffected by the schema-proof state", () =>
   for (const m of [a, b]) {
     assert.match(m, /declares "ACME_VALUE" as a link datatype/);
     assert.doesNotMatch(m, /no installed node outputs/);
+    // The REMEDY, not just the cause. Checking only the cause line is how the first
+    // version of this fix shipped a report-wide remedy over a per-entry cause: a
+    // link-proven entry got "reloading does NOT help", deleting the only advice that
+    // works for it. linkProven comes from SAFE_SOCKET_TYPES / core 3D types / this
+    // class's own outputs, none of which a widen can change.
+    assert.match(m, /Reload the ComfyUI browser tab/, "keeps the remedy that fits its cause");
+    assert.doesNotMatch(m, /RETRY this add/);
   }
+});
+
+test("#1848: a MIXED report gives both remedies, because it has both causes", () => {
+  // One input waiting on a widget, another on an answer. Emitting only one remedy
+  // strands whichever input it does not address.
+  const message = unavailableRequiredWidgetMessage(
+    [
+      { type: "IMAGE,MASK", inputs: ["canvas"], linkProven: true },
+      { type: "SAM3_MODEL_CONFIG", inputs: ["cfg"], linkProven: false },
+    ],
+    "MixedNode",
+    5000,
+    false,
+  );
+  assert.match(message, /RETRY this add/, "for the input whose producer question went unanswered");
+  assert.match(message, /Reload the ComfyUI browser tab/, "for the input waiting on a widget");
 });
 
 test("#1848 WIRING: the widen's failure sets the flag the message reads", () => {
