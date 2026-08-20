@@ -640,6 +640,7 @@ import {
   describeGraphStateDifference,
   resolveOpenRebindVerdict,
   describeOpenRebindOutcome,
+  openContentDifferenceIsDefinitionsOnly,
   OPEN_REBIND_STATUS,
   OPEN_PROOF_FIELD,
   sealProvenRootBinding,
@@ -7944,6 +7945,22 @@ function assertGraphBoundToActiveWorkflow(
     graphLoading,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
+}
+
+/**
+ * #1477 — after a workflow tab switch, restamp a proven-stale root tag in the
+ * SAME tick as the session re-hello, so the live canvas identity and the active
+ * workflow fence cannot disagree. Uses the shipped fence (read bar): it already
+ * rebinds on content proof and fails closed on a foreign canvas. A throw here
+ * is swallowed — the next graph command runs the same fence.
+ */
+function tryHealStaleRootWorkflowIdentity() {
+  try {
+    const { graph, rootGraph } = getGraphCtx();
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar("graph_outline"));
+  } catch {
+    /* best-effort — a canvas that cannot prove ownership stays tagged as it is */
+  }
 }
 
 /**
@@ -16955,6 +16972,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // on an observation of the restore itself, so it names the fields rather than
     // vouching for them.
     let openContentNormalized = null;
+    // #1477 — a definitions-only mismatch on a proven binding. The open still
+    // publishes workflow_uuid (so the session is not left fenced to the prior
+    // workflow) and discloses rather than throwing.
+    let openDefinitionsUnverified = false;
     // #1260's disclosure, on the OPEN path: every node whose saved state could not be
     // applied even after the post-load retry. Non-empty is what makes the refusal
     // actionable — it is the difference between "widget values differ" and "this pack's
@@ -17430,37 +17451,54 @@ const GRAPH_TOOL_EXECUTORS = {
                 const contentDiff = contentMatches
                   ? { comparable: true, surfaces: [], accountedSurfaces: [], nodeDifference: null }
                   : describeGraphStateDifference({ rootGraph, state: repaintState });
-                rebindFailed = new Error(
-                  describeOpenRebindOutcome(verdict, {
-                    targetLabel: target.filename || target.path || "the requested workflow",
-                    activeLabel: activeNow ? activeNow.filename || activeNow.path || "another tab" : "no active tab",
-                    expectedMarker: openProofMarker,
-                    observedMarker: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[OPEN_PROOF_FIELD] ?? null,
-                    expectedUuid: targetUuid,
-                    observedUuid: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] ?? null,
-                    contentComparable: contentDiff.comparable,
-                    contentSurfaces: contentDiff.surfaces,
-                    // #1588 — which of those the panel has already fully characterised
-                    // (today: a `definitions` difference that is pure RENUMBERING — link ids,
-                    // and comfyui-mcp#1706 subgraph node ids — which a load of a workflow
-                    // containing subgraphs routinely produces).
-                    // Without this the disclosure counts an explained surface as a
-                    // second unexplained one and drops to the maximal-alarm wording.
-                    contentAccountedSurfaces: contentDiff.accountedSurfaces,
-                    // panel#1283 family — whether the restore ABORTED. `false` is the one
-                    // case where a content difference has a known cause other than the
-                    // frontend rewriting its own fields, and it is the case the reader
-                    // most needs named. `null` (the load could not be watched) is passed
-                    // through as null and says nothing, which is the pre-existing state
-                    // of knowledge.
-                    contentLoadRanToCompletion: loadRanToCompletion,
-                    contentRestoreFailures: openRestoreFailures,
-                    // #825 — within the `nodes` surface, whether anything was LOST
-                    // or the frontend merely re-measured the boxes. Same three
-                    // words otherwise, opposite meanings for the reader.
-                    contentNodeDifference: contentDiff.nodeDifference,
-                  }),
-                );
+                // #1477 — binding proven, and the only differing surface is
+                // `definitions`. That is not a previous-workflow graph (#1111/#1089
+                // disagree on nodes/links). Throwing here skipped the workflow_uuid
+                // publish and left the session fenced to the prior workflow, so
+                // panel_graph_outline then failed until panel_list_workflows
+                // republished the identity. Publish the fence; disclose; still fail
+                // closed when any other surface disagrees.
+                if (
+                  verdict.status === OPEN_REBIND_STATUS.CONTENT_UNVERIFIED &&
+                  openContentDifferenceIsDefinitionsOnly({
+                    comparable: contentDiff.comparable,
+                    surfaces: contentDiff.surfaces,
+                  })
+                ) {
+                  openDefinitionsUnverified = true;
+                } else {
+                  rebindFailed = new Error(
+                    describeOpenRebindOutcome(verdict, {
+                      targetLabel: target.filename || target.path || "the requested workflow",
+                      activeLabel: activeNow ? activeNow.filename || activeNow.path || "another tab" : "no active tab",
+                      expectedMarker: openProofMarker,
+                      observedMarker: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[OPEN_PROOF_FIELD] ?? null,
+                      expectedUuid: targetUuid,
+                      observedUuid: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] ?? null,
+                      contentComparable: contentDiff.comparable,
+                      contentSurfaces: contentDiff.surfaces,
+                      // #1588 — which of those the panel has already fully characterised
+                      // (today: a `definitions` difference that is pure RENUMBERING — link ids,
+                      // and comfyui-mcp#1706 subgraph node ids — which a load of a workflow
+                      // containing subgraphs routinely produces).
+                      // Without this the disclosure counts an explained surface as a
+                      // second unexplained one and drops to the maximal-alarm wording.
+                      contentAccountedSurfaces: contentDiff.accountedSurfaces,
+                      // panel#1283 family — whether the restore ABORTED. `false` is the one
+                      // case where a content difference has a known cause other than the
+                      // frontend rewriting its own fields, and it is the case the reader
+                      // most needs named. `null` (the load could not be watched) is passed
+                      // through as null and says nothing, which is the pre-existing state
+                      // of knowledge.
+                      contentLoadRanToCompletion: loadRanToCompletion,
+                      contentRestoreFailures: openRestoreFailures,
+                      // #825 — within the `nodes` surface, whether anything was LOST
+                      // or the frontend merely re-measured the boxes. Same three
+                      // words otherwise, opposite meanings for the reader.
+                      contentNodeDifference: contentDiff.nodeDifference,
+                    }),
+                  );
+                }
               }
             } finally {
               // Strip the marker so it does not ride the user's next save. In a FINALLY,
@@ -17886,6 +17924,18 @@ const GRAPH_TOOL_EXECUTORS = {
               `widgets are built asynchronously by their own pack. Nothing is missing because of ` +
               `it. That failure came from the node's own frontend code, not from the open; if it ` +
               `recurs, update or report the pack.`,
+          }
+        : {}),
+      ...(openDefinitionsUnverified
+        ? {
+            definitions_unverified: true,
+            definitions_unverified_note:
+              `workflow_open RAN and the canvas IS bound to this workflow — instance, marker and ` +
+              `identity all matched — but its subgraph definitions differ from the state that was ` +
+              `loaded. That is not a previous-workflow graph: a wrong canvas disagrees on nodes or ` +
+              `links, not on this surface alone. The session fence is published so a later graph ` +
+              `read is not refused as the prior workflow. Compare the graph with panel_graph_outline ` +
+              `if a subgraph value matters; a genuine wrong-graph still fails closed (#1477).`,
           }
         : {}),
       ...(openContentNormalized?.length
@@ -31443,6 +31493,11 @@ function buildPanel() {
         } catch {
           /* reconnect path retries the hello */
         }
+        // #1477 — the re-hello publishes the new session fence; this restamps the
+        // root tag when content proves the canvas is the new tab's. Together they
+        // are the atomic identity update a tab switch was leaving split. A rename
+        // is the same instance, so the tag already matches and this is a no-op.
+        if (!renaming) tryHealStaleRootWorkflowIdentity();
         const name = wf?.filename || wfkey || wfid;
         client?.armContext?.(
           renaming
