@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.23] - 2026-08-20
+
+### Fixed
+- adopt a loopback bridge URL the orchestrator advertises, not just a tunnel one (#1487)
+
+
 ## [0.15.22] - 2026-08-20
 
 ### Fixed
