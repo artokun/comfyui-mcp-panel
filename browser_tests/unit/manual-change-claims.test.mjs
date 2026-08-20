@@ -174,10 +174,13 @@ test("a REPEATED widget name is refused rather than guessed at", () => {
   // compare against is how a wrong-target claim gets made, so this says nothing.
   const res = reconcileWidgetClaims(
     [{ node_id: 8, widget: "RGTHREE_TOGGLE_AND_NAV", reported: true }],
+    // The FIRST row deliberately DISAGREES with the claim: a guard that merely took
+    // row[0] would report a supersession here, so this kills that mutation instead of
+    // passing by luck.
     () =>
       nodeWith([
-        { name: "RGTHREE_TOGGLE_AND_NAV", value: true },
         { name: "RGTHREE_TOGGLE_AND_NAV", value: false },
+        { name: "RGTHREE_TOGGLE_AND_NAV", value: true },
       ]),
   );
   assert.deepEqual(res.rows, []);
