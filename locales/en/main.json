@@ -342,6 +342,7 @@
       "at_menu_subgraph": "subgraph",
       "at_menu_workflow": "workflow — {title}",
       "attach_an_image_video_workflow_json_or": "Attach an image, video, workflow (.json), or text file",
+      "attachment_content_no_longer_loaded": "Sent without the content behind {tokens} — that attachment is no longer loaded, so the agent received the placeholder only. Re-paste or re-attach it to send the content.",
       "auto": "Auto",
       "auto_arranged_columns_one": " ({count} column)",
       "auto_arranged_columns_other": " ({count} columns)",

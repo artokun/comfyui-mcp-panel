@@ -485,6 +485,7 @@ import {
   registryTypePredicate,
   formatUnpasteableCopyWarning,
 } from "./lib/paste-report.js";
+import { planComposerPaste, orphanAttachmentTokens } from "./lib/composer-paste.js";
 import {
   withInMemoryClipboard,
   getInMemoryClipboard,
@@ -36050,7 +36051,10 @@ function buildPanel() {
   //   • workflow → the .json is read and inlined so the agent can load/analyze it
   //   • text     → the file's text is read and inlined (like a big paste)
   // A big text paste also collapses to a [Pasted text #N] chip.
-  const PASTE_TEXT_THRESHOLD = 800; // chars; longer pastes collapse to a chip
+  // The size at which a paste collapses to a chip is planComposerPaste's to know
+  // (web/js/lib/composer-paste.js) — it decides the file and text halves of one
+  // clipboard together, which is what stopped a file item from silently eating the
+  // text pasted with it (#1467).
   const MAX_INLINE_TEXT = 600_000; // chars; cap inlined file text (workflows/docs)
   // Text-ish files we read & inline rather than upload. (.json is handled as a
   // workflow first; if it doesn't parse as one it falls back to a text file.)
@@ -36586,31 +36590,30 @@ function buildPanel() {
     // Any pasted file (a screenshot, or a file copied from the OS) routes through
     // the same dispatcher as the attach button and drag-drop.
     const fileItem = Array.from(dt.items || []).find((it) => it.kind === "file");
-    if (fileItem) {
-      const file = fileItem.getAsFile();
-      if (file) {
-        ev.preventDefault();
-        // Once the composer has claimed a pasted file, stop the event here.
-        // Without stopPropagation it keeps bubbling to `document`, where
-        // ComfyUI core's own global paste-to-canvas listener also inspects the
-        // clipboard and drops a duplicate, unwanted LoadImage node onto the
-        // live graph for every screenshot/image attached to a chat message
-        // (#384).
-        ev.stopPropagation();
-        handleFile(file);
-        return;
-      }
-    }
+    const file = fileItem ? fileItem.getAsFile() : null;
     const text = dt.getData("text/plain");
-    if (text && (text.length > PASTE_TEXT_THRESHOLD || (text.match(/\n/g) || []).length >= 12)) {
-      ev.preventDefault();
-      // Same rationale as the file branch (#384): the composer has claimed this
-      // large paste as an attachment, so keep it from bubbling to ComfyUI's
-      // document-level paste handler (which would try to paste graph JSON /
-      // nodes onto the canvas).
-      ev.stopPropagation();
-      handlePastedText(text);
-    }
+    // #1467 — BOTH halves of the clipboard are decided in one place. The file
+    // branch used to call preventDefault() and RETURN, which threw away any
+    // text/plain that arrived with the file AND suppressed the browser's own
+    // insertion of it. Copying rich content on Windows (Word, Outlook, Excel,
+    // and many web pages) puts a synthesized bitmap on the clipboard next to the
+    // text, so pasting a prompt out of a document attached a picture of it and
+    // dropped every character, with no error and no placeholder.
+    const plan = planComposerPaste({ hasFile: !!file, text });
+    // The only answer that claims nothing: a small paste with no file, which the
+    // browser inserts for us exactly as it always did.
+    if (!plan.file && plan.text === "default") return;
+    ev.preventDefault();
+    // Once the composer has claimed this paste, stop the event here. Without
+    // stopPropagation it keeps bubbling to `document`, where ComfyUI core's own
+    // global paste-to-canvas listener also inspects the clipboard — dropping a
+    // duplicate, unwanted LoadImage node onto the live graph for every
+    // screenshot/image attached to a chat message, and trying to paste graph
+    // JSON / nodes onto the canvas for a large text paste (#384).
+    ev.stopPropagation();
+    if (plan.file) handleFile(file);
+    if (plan.text === "attach") handlePastedText(text);
+    else if (plan.text === "insert") insertAtCaret(text);
   });
 
   // ---- voice dictation (browser speech recognition; Chrome) ----
@@ -37190,7 +37193,24 @@ function buildPanel() {
     const refVideos = attachments.filter((a) => a.kind === "video" && referenced(a));
     const refFiles = attachments.filter((a) => (a.kind === "textfile" || a.kind === "workflow") && referenced(a));
     const refUploads = attachments.filter((a) => a.kind === "file" && referenced(a));
+    // #1467 — a token whose attachment is GONE. The registry is cleared after every
+    // send, but the raw composer text (tokens and all) is kept and handed back by ↑
+    // history recall, the ✎ edit control and the double-Esc rewind. Re-sending one of
+    // those shipped a bare `[Pasted text #1]` to the agent: the pasted content silently
+    // absent, no error, no placeholder — the message merely looked complete. Computed
+    // BEFORE resetAttachments() clears the registry it is measured against.
+    const orphanedTokens = orphanAttachmentTokens(text, attachments);
     resetAttachments();
+    if (orphanedTokens.length) {
+      appendSystem(
+        tr(
+          "panel.attachment_content_no_longer_loaded",
+          "Sent without the content behind {tokens} — that attachment is no longer loaded, " +
+            "so the agent received the placeholder only. Re-paste or re-attach it to send the content.",
+          { tokens: orphanedTokens.join(", ") },
+        ),
+      );
+    }
     const pending = [...refImgs, ...refVideos, ...refFiles, ...refUploads];
     if (pending.length) await Promise.all(pending.map((a) => a.ready));
     // Paint the message's media. For a queued send this runs later, inside
