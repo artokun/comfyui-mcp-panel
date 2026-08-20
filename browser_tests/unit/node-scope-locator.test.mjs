@@ -114,6 +114,71 @@ test("a root node while viewing a subgraph tells you to EXIT", () => {
   assert.match(msg, /panel_exit_subgraph/);
 });
 
+// ── #1495 the scope claim must be CHECKED, not assumed ────────────────────
+//
+// Reporter: panel_exit_subgraph returned scope=root / settled=true; a later
+// panel_enter_subgraph(5548) failed saying they were inside a subgraph; the
+// panel_exit_subgraph that error prescribed answered "already at root"; the
+// retry then succeeded. Nothing in the panel had two scope stores to
+// desynchronise — resolveScope is the single authority. What was wrong was the
+// MESSAGE: this branch asserted a subgraph scope it never looked at, because its
+// premise ("only reachable while viewing a subgraph") is not an invariant. The
+// root walk reads `_nodes`; the lookup that missed reads `getNodeById`. When
+// those two drift on the ROOT graph, the caller is at root and is sent to leave a
+// subgraph they are not in — the exact round-trip the reporter ran.
+
+test("#1495 a root node that missed while VIEWING root does not claim a subgraph", () => {
+  // The lookup searched the root graph itself (currentGraph === rootGraph) and the
+  // root walk found the id there. Claiming a subgraph scope here is unsupportable.
+  const root = sub([node(5548, { type: "SaveImage" }), node(12, { type: "KSampler" })]);
+  const msg = describeMissingNode(5548, root, true, root);
+  assert.match(msg, /^No node with id 5548/);
+  assert.ok(
+    !/you are currently inside a subgraph/.test(msg),
+    "must not assert a viewing scope it did not check",
+  );
+  assert.ok(
+    !/Call panel_exit_subgraph, then retry/.test(msg),
+    "prescribing the exit is the wasted round-trip the reporter ran",
+  );
+  assert.match(msg, /IS on the root graph/);
+  assert.match(msg, /NOT a subgraph scope problem/);
+  // and it still hands back something the caller can act on
+  assert.match(msg, /12 \(KSampler\)/);
+});
+
+test("#1495 the graph the lookup SEARCHED outranks a separately-read viewingRoot", () => {
+  // resolveNode reads `viewingRoot` from a SECOND getGraphCtx(), taken after the
+  // lookup. `currentGraph` is the graph the lookup actually ran on, so identity
+  // against the root decides — two readings must not be presented as one.
+  const root = sub([node(7, { type: "A" }), node(8, { type: "B" })]);
+  const msg = describeMissingNode(7, root, false, root);
+  assert.ok(!/you are currently inside a subgraph/.test(msg));
+  assert.match(msg, /IS on the root graph/);
+});
+
+test("#1495 a genuine subgraph view still gets the EXIT remedy", () => {
+  // The fix must not disarm the #697 message: when the lookup really did run on a
+  // subgraph, leaving it IS the remedy.
+  const inner = sub([node(10, { type: "InnerA" })]);
+  const root = sub([node(7, { type: "Root" }), node(9, { title: "S", subgraph: inner })]);
+  const msg = describeMissingNode(7, root, false, inner);
+  assert.match(msg, /on the ROOT graph/);
+  assert.match(msg, /you are currently inside a subgraph/);
+  assert.match(msg, /Call panel_exit_subgraph, then retry/);
+});
+
+test("#1495 a root graph holding only the missing node does not also say it is empty", () => {
+  // currentIdSuffix filters the missing id out, so a one-node root degrades to
+  // "has no nodes" — which would contradict "it IS on the root graph" in the same
+  // breath. The retarget list is offered only when it actually names ids.
+  const root = sub([node(7, { type: "SaveImage" })]);
+  const msg = describeMissingNode(7, root, true, root);
+  assert.match(msg, /IS on the root graph/);
+  assert.ok(!/currently has no nodes/.test(msg), "self-contradicting in one message");
+  assert.match(msg, /Re-read with panel_graph_outline/);
+});
+
 test("a genuine miss says how hard it looked, and does not invent a location", () => {
   const root = sub([node(1), node(9, { subgraph: sub([node(2)]) })]);
   const msg = describeMissingNode(999, root, true);

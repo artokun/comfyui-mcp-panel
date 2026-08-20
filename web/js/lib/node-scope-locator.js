@@ -56,6 +56,13 @@ const MAX_DEPTH = 12;
  */
 const MAX_CURRENT_IDS = 40;
 
+/**
+ * The opening of the retarget suffix, named once because #1495's message has to ask
+ * whether the suffix actually NAMES ids (it degrades to "…has no nodes" on an empty
+ * graph) before it may offer it as the remedy. A second literal here would drift.
+ */
+const CURRENT_IDS_PREFIX = "Current ids on the graph you are viewing: ";
+
 function nodesOf(graph) {
   const raw = graph?._nodes ?? graph?.nodes;
   return Array.isArray(raw) ? raw : [];
@@ -155,7 +162,7 @@ function currentIdSuffix(graph, nodeId) {
     const extra =
       parts.length > MAX_CURRENT_IDS ? `, …and ${parts.length - MAX_CURRENT_IDS} more` : "";
     return (
-      `Current ids on the graph you are viewing: ${shown.join(", ")}${extra}. ` +
+      `${CURRENT_IDS_PREFIX}${shown.join(", ")}${extra}. ` +
       `Retarget using a current id; re-read with panel_graph_outline if you need wiring.`
     );
   } catch {
@@ -195,7 +202,40 @@ export function describeMissingNode(nodeId, rootGraph, viewingRoot, currentGraph
   }
 
   if (found.scope === "root") {
-    // Only reachable while viewing a subgraph, so the remedy is to leave it.
+    // #1495 — this branch used to assert "you are currently inside a subgraph"
+    // unconditionally, on the premise the old comment here stated: that it was
+    // "only reachable while viewing a subgraph". Nothing enforces that premise.
+    // The branch fires whenever the ROOT walk finds the id, and the ROOT walk reads
+    // the graph's node LIST (`_nodes`) while the lookup that just missed reads the
+    // id INDEX (`getNodeById`) — the same two sources `currentIdSuffix` above
+    // already assumes can drift. When they drift on the root graph, the caller is
+    // AT root and is told to leave a subgraph they are not in. The reporter ran
+    // exactly that: panel_exit_subgraph answered "already at root", and the retry
+    // that followed succeeded. The wasted round-trip IS the defect, and its cause
+    // is a scope claim published without checking the scope.
+    //
+    // So decide it from evidence THIS call holds. `currentGraph` is the graph the
+    // failed lookup actually searched, so `currentGraph === rootGraph` is
+    // same-reading object identity. `viewingRoot` is a separately-timed reading of
+    // the viewing scope (resolveNode takes it AFTER the lookup, from a second
+    // getGraphCtx()), so it is only consulted when no `currentGraph` was passed.
+    const searchedRoot = currentGraph ? currentGraph === rootGraph : Boolean(viewingRoot);
+    if (searchedRoot) {
+      // The retarget list is offered only when it actually names ids: on a graph
+      // whose only node is the missing one it degrades to "has no nodes", which
+      // would contradict the sentence right before it.
+      const retarget = ids.startsWith(CURRENT_IDS_PREFIX)
+        ? ids
+        : "Re-read with panel_graph_outline before retrying.";
+      return (
+        `${base} — but node ${nodeId} IS on the root graph, and the root graph is what ` +
+        `you are VIEWING, so this is NOT a subgraph scope problem: panel_exit_subgraph ` +
+        `would answer "already at root" and change nothing. The root graph's node list ` +
+        `holds ${nodeId} while the id lookup this write uses did not resolve it, so the ` +
+        `id and that graph's index disagree. ` +
+        retarget
+      );
+    }
     return (
       `${base}. Node ${nodeId} is on the ROOT graph, but you are currently inside a ` +
       `subgraph — the write applies to the graph you are VIEWING, not the whole ` +
