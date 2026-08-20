@@ -112,13 +112,13 @@ function chain({ linksAs = "map" } = {}) {
 test("a detached boundary NEIGHBOUR is found — that is the destructive case", () => {
   const { graph, n1, n2, n3 } = chain();
   n1.graph = null; // node 1 is outside the selection; the reconnect loop touches it
-  assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [1]);
+  assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [{ id: 1, role: "neighbour" }]);
 });
 
 test("a detached SELECTED node is found too", () => {
   const { graph, n2, n3 } = chain();
   n2.graph = null;
-  assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [2]);
+  assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [{ id: 2, role: "selected" }]);
 });
 
 test("a healthy chain produces no finding", () => {
@@ -130,7 +130,11 @@ test("neighbours are found through a serialized link table as well as a live Map
   for (const linksAs of ["map", "tuples", "object"]) {
     const { graph, n1, n2, n3 } = chain({ linksAs });
     n1.graph = null;
-    assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [1], `link table: ${linksAs}`);
+    assert.deepEqual(
+      detachedConversionNodes(graph, [n2, n3]),
+      [{ id: 1, role: "neighbour" }],
+      `link table: ${linksAs}`,
+    );
   }
 });
 
@@ -166,11 +170,46 @@ test("an empty selection produces no finding", () => {
 });
 
 test("the refusal states the graph was not touched, and names the nodes", () => {
-  const msg = detachedConversionRefusal({ what: "panel_create_subgraph", detached: [1] });
+  const msg = detachedConversionRefusal({
+    what: "panel_create_subgraph",
+    detached: [{ id: 1, role: "neighbour" }],
+  });
   assert.match(msg, /was NOT run and the graph is unchanged/);
-  assert.match(msg, /Node 1 /);
+  assert.match(msg, /node 1 wired to it/);
   // It must carry the string the reporter would search for.
   assert.match(msg, /Attempted to access LGraph reference that was null or undefined\./);
+});
+
+test("the refusal names the consequence of the ROLE it found, not the other one", () => {
+  // gate r3 P1: one sentence was emitted for both, and it described the neighbour
+  // outcome. The selected-node path throws at disconnectInput — before the removal
+  // loop — so "already removed the nodes you selected" was a state it never reaches.
+  const picked = detachedConversionRefusal({
+    what: "panel_create_subgraph",
+    detached: [{ id: 2, role: "selected" }],
+  });
+  assert.match(picked, /node 2 in your selection/);
+  assert.match(picked, /throw at disconnectInput/);
+  assert.match(picked, /registered a subgraph definition/);
+  assert.doesNotMatch(picked, /the nodes you selected are gone/);
+  assert.doesNotMatch(picked, /wired to nothing/);
+
+  const neighbour = detachedConversionRefusal({
+    what: "panel_subgraph_group",
+    detached: [{ id: 1, role: "neighbour" }],
+  });
+  assert.match(neighbour, /in the reconnect pass/);
+  assert.match(neighbour, /the nodes you selected are gone/);
+  assert.doesNotMatch(neighbour, /throw at disconnectInput/);
+
+  // Both roles present: both consequences stated, neither invented.
+  const both = detachedConversionRefusal({
+    what: "panel_create_subgraph",
+    detached: [{ id: 2, role: "selected" }, { id: 1, role: "neighbour" }],
+  });
+  assert.match(both, /node 2 in your selection, and node 1 wired to it/);
+  assert.match(both, /throw at disconnectInput/);
+  assert.match(both, /in the reconnect pass/);
 });
 
 /* -------------------------------------------------------------------------- */
@@ -476,4 +515,185 @@ test("the runner refuses BEFORE the conversion and keeps beforeChange/afterChang
   assert.ok(fn.includes("graph.afterChange?.()"), "afterChange must still be called");
   assert.ok(fn.includes("finally"), "afterChange must stay in a finally");
   assert.ok(fn.includes("{ cause: err }"), "the frontend's own error must be kept as the cause");
+});
+
+/* -------------------------------------------------------------------------- */
+/* 6. the runner EXECUTED, not read                                            */
+/*                                                                             */
+/* gate r3 P1: everything above pinned the helpers, and section 5 pinned the    */
+/* call sites — as REGEXES over source text, which an inert guard satisfies.    */
+/* `if (detached.length)` → `if (detached.length > 2)` passed the whole 5,799-  */
+/* test suite while the exact #1463 state reached convertToSubgraph and         */
+/* destroyed the selection. These drive the shipped runner instead.             */
+/* -------------------------------------------------------------------------- */
+
+/** The shipped `convertSelectionToSubgraph`, extracted from the monolith and wired to
+ *  the REAL lib helpers — the same pattern subgraph-stale-outline.test.mjs uses on the
+ *  two executors. A stub would defeat the point of this section. */
+const runner = (() => {
+  const match = src()
+    .replace(/\r\n/g, "\n")
+    .match(/function convertSelectionToSubgraph\(\{ graph, canvas, nodes, what \}\) \{[\s\S]*?\n\}/);
+  assert.ok(match, "could not locate convertSelectionToSubgraph in panel source");
+  return new Function(
+    "detachedConversionNodes",
+    "detachedConversionRefusal",
+    "conversionSnapshot",
+    "conversionThrowReport",
+    `return ${match[0]};`,
+  )(detachedConversionNodes, detachedConversionRefusal, conversionSnapshot, conversionThrowReport);
+})();
+
+/** A graph/canvas pair that records what the runner did to it.
+ *
+ *  `wrapped` decides WHERE `convertToSubgraph` lives. A stock frontend carries it on
+ *  `LGraph.prototype`, so the default puts it on a prototype — hanging the fake straight
+ *  off the graph object would make every rig look monkey-patched to the snapshot, and
+ *  the confident verdict would be unreachable in these tests for the wrong reason. */
+function rig({ convert, noSelectionApi = false, wrapped = false } = {}) {
+  const { graph: base, n1, n2, n3, n4 } = chain();
+  const calls = [];
+  let graph;
+  const convertToSubgraph = (items) => {
+    calls.push("convertToSubgraph");
+    return convert
+      ? convert(items, graph)
+      : { node: { id: 99 }, subgraph: { name: "New Subgraph" } };
+  };
+  graph = Object.create(wrapped ? {} : { convertToSubgraph });
+  Object.assign(graph, {
+    getNodeById: (id) => base.getNodeById(id),
+    links: base.links,
+    subgraphs: base.subgraphs,
+    beforeChange: () => calls.push("beforeChange"),
+    afterChange: () => calls.push("afterChange"),
+  });
+  if (wrapped) graph.convertToSubgraph = convertToSubgraph;
+  for (const n of [n1, n2, n3, n4]) n.graph = graph;
+  const canvas = { selectedItems: new Set() };
+  if (!noSelectionApi) {
+    canvas.selectItems = (items) => {
+      calls.push("selectItems");
+      canvas.selectedItems = new Set(items);
+    };
+  }
+  return { graph, canvas, calls, n1, n2, n3, n4 };
+}
+
+test("EXECUTED: a detached NEIGHBOUR is refused and the frontend is never called", () => {
+  const { graph, canvas, calls, n1, n2, n3 } = rig();
+  n1.graph = null;
+  assert.throws(
+    () => runner({ graph, canvas, nodes: [n2, n3], what: "panel_create_subgraph" }),
+    /was NOT run and the graph is unchanged/,
+  );
+  assert.ok(!calls.includes("convertToSubgraph"), "the conversion must not have been attempted");
+  assert.ok(!calls.includes("beforeChange"), "and no change window must have been opened");
+});
+
+test("EXECUTED: a detached SELECTED node is refused and the frontend is never called", () => {
+  const { graph, canvas, calls, n2, n3 } = rig();
+  n2.graph = null;
+  assert.throws(
+    () => runner({ graph, canvas, nodes: [n2, n3], what: "panel_subgraph_group" }),
+    /registered a subgraph definition/,
+  );
+  assert.ok(!calls.includes("convertToSubgraph"));
+});
+
+test("EXECUTED: a healthy selection is selected, converted, and returned unchanged", () => {
+  const { graph, canvas, calls, n2, n3 } = rig();
+  const res = runner({ graph, canvas, nodes: [n2, n3], what: "panel_create_subgraph" });
+  assert.equal(res.node.id, 99, "the frontend's own result must come back untouched");
+  assert.deepEqual(calls, ["selectItems", "beforeChange", "convertToSubgraph", "afterChange"]);
+  assert.deepEqual([...canvas.selectedItems], [n2, n3], "the runner must select what it was given");
+});
+
+test("EXECUTED: a frontend with no selection API is refused, not fallen through", () => {
+  const { graph, canvas, calls, n2, n3 } = rig({ noSelectionApi: true });
+  canvas.selectedItems = new Set([graph.getNodeById(1)]); // a stale selection to convert
+  assert.throws(
+    () => runner({ graph, canvas, nodes: [n2, n3], what: "panel_create_subgraph" }),
+    /exposes no selection API/,
+  );
+  assert.ok(!calls.includes("convertToSubgraph"), "the stale selection must not be converted");
+});
+
+test("EXECUTED: a destructive throw is reported as CHANGED, with the cause kept", () => {
+  const original = new Error("Attempted to access LGraph reference that was null or undefined.");
+  const { graph, canvas, calls, n2, n3 } = rig({
+    convert: (_items, g) => {
+      // Reproduce the shipped order: definition registered, selected nodes removed.
+      g.subgraphs.set("new-def", {});
+      const byId = new Map([[1, g.getNodeById(1)], [4, g.getNodeById(4)]]);
+      g.getNodeById = (id) => byId.get(id) ?? null;
+      throw original;
+    },
+  });
+  try {
+    runner({ graph, canvas, nodes: [n2, n3], what: "panel_create_subgraph" });
+    assert.fail("the runner must rethrow");
+  } catch (err) {
+    assert.match(err.message, /HAS CHANGED/);
+    assert.match(err.message, /2 of the 2 node\(s\) you selected \(2, 3\)/);
+    assert.match(err.message, /1 subgraph definition\(s\) were registered/);
+    assert.ok(err.message.includes(original.message), "the frontend's wording must survive");
+    assert.equal(err.cause, original, "the original error must be the cause");
+  }
+  assert.ok(calls.includes("afterChange"), "afterChange must still run on the throw path");
+});
+
+test("EXECUTED: a throw that moved nothing is reported as unchanged", () => {
+  const original = new Error("Attempted to access LGraph reference that was null or undefined.");
+  const { graph, canvas, n2, n3 } = rig({
+    convert: () => {
+      throw original;
+    },
+  });
+  assert.throws(
+    () => runner({ graph, canvas, nodes: [n2, n3], what: "panel_create_subgraph" }),
+    (err) => {
+      assert.match(err.message, /nothing the panel can read moved/);
+      assert.doesNotMatch(err.message, /HAS CHANGED/);
+      return true;
+    },
+  );
+});
+
+test("EXECUTED: the same still graph under a WRAPPED method withdraws the verdict", () => {
+  // Identical to the test above except where convertToSubgraph lives. Nothing the
+  // snapshot reads moved either way; only the wrapper changes what may be claimed.
+  const { graph, canvas, n2, n3 } = rig({
+    wrapped: true,
+    convert: () => {
+      throw new Error("Attempted to access LGraph reference that was null or undefined.");
+    },
+  });
+  assert.throws(
+    () => runner({ graph, canvas, nodes: [n2, n3], what: "panel_create_subgraph" }),
+    (err) => {
+      assert.match(err.message, /could NOT establish whether the graph changed/);
+      assert.doesNotMatch(err.message, /nothing the panel can read moved/);
+      return true;
+    },
+  );
+});
+
+test("EXECUTED: a link table the wrapper grew is reported as CHANGED", () => {
+  // The gate r1 P1 state, driven end to end: nodes and definitions untouched, links not.
+  const { graph, canvas, n2, n3 } = rig({
+    wrapped: true,
+    convert: (_items, g) => {
+      g.links.set(99, { id: 99, origin_id: 1, target_id: 4 });
+      throw new Error("Attempted to access LGraph reference that was null or undefined.");
+    },
+  });
+  assert.throws(
+    () => runner({ graph, canvas, nodes: [n2, n3], what: "panel_create_subgraph" }),
+    (err) => {
+      assert.match(err.message, /HAS CHANGED/);
+      assert.match(err.message, /the link table went from 3 to 4 entries/);
+      return true;
+    },
+  );
 });

@@ -466,9 +466,16 @@ function linkedNeighborIds(node, lookup) {
 }
 
 /**
- * Ids of nodes involved in this conversion that the graph OWNS but that do not point
- * back at it — the state that provably throws `NullGraphError` out of
- * `convertToSubgraph`, one of them destructively.
+ * Nodes involved in this conversion that the graph OWNS but that do not point back at
+ * it — the state that provably throws `NullGraphError` out of `convertToSubgraph`.
+ *
+ * Each entry carries its `role`, because the two roles fail DIFFERENTLY and the refusal
+ * has to say which. Read out of the shipped bundle's `LGraph.ts` on this install:
+ * `createSubgraph` @1792 → `disconnectInput` @1807 → `for (const node of nodes)
+ * this.remove(node)` @1817 → `this.add(subgraphNode)` @1858. A detached node in the
+ * SELECTION throws at 1807 — a definition is already registered, nothing is removed yet.
+ * A detached NEIGHBOUR survives that loop and throws in the reconnect that follows 1858,
+ * by which point the selected nodes are gone and the wrapper exists unwired.
  *
  * Ownership is proved by NODE identity (`getNodeById(id)` returns this very object),
  * never by graph identity. `node.graph !== graph` would read a Vue proxy of the live
@@ -487,35 +494,72 @@ export function detachedConversionNodes(graph, nodes) {
   const lookup = linkLookup(graph?.links);
   const found = [];
   const seen = new Set();
-  const consider = (node) => {
+  const consider = (node, role) => {
     if (!node || seen.has(node)) return;
     seen.add(node);
     if (!owns(node)) return;
-    if (node.graph == null) found.push(node.id);
+    if (node.graph == null) found.push({ id: node.id, role });
   };
+  for (const node of selection) consider(node, "selected");
   for (const node of selection) {
-    consider(node);
-    for (const id of linkedNeighborIds(node, lookup)) consider(graph.getNodeById(id));
+    for (const id of linkedNeighborIds(node, lookup)) consider(graph.getNodeById(id), "neighbour");
   }
   return found;
 }
 
 /** The pre-flight refusal. Raised BEFORE `convertToSubgraph` is called, so it is the
- *  one report in this file that can promise the canvas is untouched. */
+ *  one report in this file that can promise the canvas is untouched.
+ *
+ *  It names the consequence PER ROLE. A single sentence for both was wrong for one of
+ *  them (gate r3 P1): a detached selected node throws before the removal loop, so
+ *  "after it has already removed the nodes you selected" described a state that path
+ *  never reaches, while the state it DOES leave — a registered subgraph definition —
+ *  went unmentioned. */
 export function detachedConversionRefusal({ what, detached }) {
   const bad = Array.isArray(detached) ? detached : [];
-  const one = bad.length === 1;
+  const idsOf = (role) =>
+    bad.filter((entry) => entry?.role === role).map((entry) => entry?.id);
+  const picked = idsOf("selected");
+  const neighbours = idsOf("neighbour");
+  const listing = [];
+  if (picked.length) {
+    listing.push(
+      `node${picked.length === 1 ? "" : "s"} ${picked.join(", ")} in your selection`,
+    );
+  }
+  if (neighbours.length) {
+    listing.push(
+      `node${neighbours.length === 1 ? "" : "s"} ${neighbours.join(", ")} wired to it`,
+    );
+  }
+  const who = listing.length ? listing.join(", and ") : `node(s) ${bad.map((e) => e?.id).join(", ")}`;
+  // What the frontend would leave behind, stated only for the roles actually present.
+  const consequence = [];
+  if (picked.length) {
+    consequence.push(
+      `a detached node in the SELECTION makes it throw at disconnectInput, which runs after ` +
+        `it has already registered a subgraph definition — so you would be left with a ` +
+        `definition on the workflow and no node to show for it`,
+    );
+  }
+  if (neighbours.length) {
+    consequence.push(
+      `a detached node WIRED to the selection makes it throw later still, in the reconnect ` +
+        `pass, by which point the nodes you selected are gone and the wrapper it built is ` +
+        `sitting there wired to nothing`,
+    );
+  }
   return (
-    `${what} was NOT run and the graph is unchanged. Node${one ? "" : "s"} ${bad.join(", ")} ` +
-    `${one ? "is" : "are"} listed on this graph but ${one ? "does" : "do"} not reference it ` +
-    `back (node.graph is unset), and ComfyUI's convertToSubgraph throws "Attempted to access ` +
-    `LGraph reference that was null or undefined." on exactly that — after it has already ` +
-    `removed the nodes you selected, leaving a half-built subgraph wired to nothing ` +
-    `(comfyui-mcp-panel#1463). Refusing here is what keeps that from happening. This is a ` +
-    `stale canvas, not a bad selection: it follows a ComfyUI restart, or an extension ` +
-    `detaching a node without removing it. Reload the ComfyUI page to rebuild the graph ` +
-    `(save first — panel_save_workflow), then retry. Every other panel tool keeps working ` +
-    `meanwhile; subgraph conversion is the one that touches this back-reference.`
+    `${what} was NOT run and the graph is unchanged. The graph lists ${who}, but ` +
+    `${bad.length === 1 ? "it does" : "they do"} not reference it back (node.graph is ` +
+    `unset), and ComfyUI's convertToSubgraph throws "Attempted to access LGraph reference ` +
+    `that was null or undefined." on exactly that (comfyui-mcp-panel#1463). Where it throws ` +
+    `decides what you are left with: ${consequence.join("; ")}. Refusing here is what keeps ` +
+    `either from happening. This is a stale canvas, not a bad selection: it follows a ` +
+    `ComfyUI restart, or an extension detaching a node without removing it. Reload the ` +
+    `ComfyUI page to rebuild the graph (save first — panel_save_workflow), then retry. ` +
+    `Every other panel tool keeps working meanwhile; subgraph conversion is the one that ` +
+    `touches this back-reference.`
   );
 }
 
