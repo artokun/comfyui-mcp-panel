@@ -25079,6 +25079,14 @@ function describeCommand(cmd, msg, reply) {
       // the result. Given that this PR's whole value is telling the truth about what was and
       // was not validated, an over-claimed disclosure is worse here than a missing one.
       const railValidatedUnreadable = r.promoted_rail_validated === true;
+      // #1492: an instance-scoped promoted write deliberately leaves the SHARED subgraph
+      // definition alone, which also means the inner widget's own callback never ran. When
+      // that callback does more than store a value — the reported one flips another node
+      // between ACTIVE and BYPASS — the graph is left half-changed, and rendered as a plain
+      // "Set …" success the one line a user reads says the opposite. Read as DATA off the
+      // field the lib emits on exactly that path; never pattern-matched from the note's
+      // prose, which is English-only here and would disarm the check in 11 of 12 locales.
+      const innerCallbackNotInvoked = r.set?.promoted_from?.inner_callback_not_invoked === true;
       // One base clause for every variant, so a translated warning line can never drift
       // from the plain one — the disclosure is appended, exactly as the English did.
       const setLine = tr("panel.set_widget", "Set {widget} = {value} on node {node_id}", {
@@ -25101,7 +25109,7 @@ function describeCommand(cmd, msg, reply) {
             detail: wasPrevious,
           }
         : {
-            icon: writeDisclosed || unvalidatedUnreadable ? "pi-exclamation-triangle" : "pi-sliders-h",
+            icon: innerCallbackNotInvoked || writeDisclosed || unvalidatedUnreadable ? "pi-exclamation-triangle" : "pi-sliders-h",
             text:
               setLine +
               (unvalidatedUnreadable
@@ -25125,6 +25133,12 @@ function describeCommand(cmd, msg, reply) {
                       "panel.set_widget_threw_while_applying",
                       " — requested value verified in effect, but an exception was thrown while applying it; side effects may not have run or completed",
                     )
+                : "") +
+              (innerCallbackNotInvoked
+                ? tr(
+                    "panel.set_widget_inner_callback_not_invoked",
+                    " — value in effect on this subgraph instance, but the shared inner node's own callback did NOT run; anything it drives (another node's mode, dependent widgets) may still be stale",
+                  )
                 : ""),
             detail: wasPrevious,
           };

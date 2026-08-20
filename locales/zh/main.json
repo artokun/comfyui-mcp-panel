@@ -389,6 +389,7 @@
       "mcp_did_not_open_in_time": "MCP 未在 90 秒内打开。请检查终端中的启动错误，然后重试连接。",
       "multiple_ready_providers_found": "检测到多个可用服务商。请选择此面板要使用的一个。",
       "not_now": "暂不",
+      "set_widget_inner_callback_not_invoked": " —— 值已在该子图实例上生效，但共享内部节点自己的回调并未执行；它所驱动的内容（其他节点的模式、依赖控件）可能仍是旧的",
       "starting_mcp": "正在启动 MCP…",
       "use_provider": "使用此服务商",
       "click_to_copy": "点击复制",

@@ -37,7 +37,7 @@ const ROOT_GRAPH_ID = "c4a254bb-935e-4013-b380-5e36954de4b0";
  * factory for instances of it — the reporter's shape: several wrappers, one
  * definition, a promoted `width`.
  */
-function makeReusableSubgraph({ definitionValue = 512, railWritesDefinition = false } = {}) {
+function makeReusableSubgraph({ definitionValue = 512, railWritesDefinition = false, innerHasCallback = true } = {}) {
   const events = { innerCallback: [], railCallback: [], railSets: [] };
   const inner = {
     id: 10,
@@ -47,9 +47,16 @@ function makeReusableSubgraph({ definitionValue = 512, railWritesDefinition = fa
         name: "width",
         type: "INT",
         value: definitionValue,
-        callback(next) {
-          events.innerCallback.push(next);
-        },
+        // #1492: a widget with NO callback has nothing for an instance-scoped write to
+        // skip, so it must produce NO disclosure. The fixture has to be able to build
+        // that shape, or the "does not over-claim" test below cannot exist at all.
+        ...(innerHasCallback
+          ? {
+              callback(next) {
+                events.innerCallback.push(next);
+              },
+            }
+          : {}),
       },
     ],
   };
@@ -388,4 +395,198 @@ test("#1707: a frontend with no per-instance key keeps the old behaviour, and th
   assert.equal(set.node_id, 10, "the inner node is where the value landed");
   assert.equal(set.promoted_from.value_scope, "subgraph_definition");
   assert.deepEqual(sg.events.innerCallback, [1024], "the inner widget's callback still fires on this path");
+});
+
+// -------------------------------------------- #1492: the side effects it did NOT run
+
+/**
+ * #1492 — the REPORTED shape, on the same real frontend plumbing as the fixture above
+ * (one shared `Subgraph`, one per-`widgetId` value store, a rail projection that is a
+ * VIEW of that store) but with the inner widget the reporter actually had: a status
+ * switch whose BOOLEAN `enabled` widget does not merely hold a value — its callback
+ * flips ANOTHER node between ACTIVE and BYPASS.
+ *
+ * The ids are the report's own (wrapper 1512, inner switch 2448, switched node 2528),
+ * because the whole defect is that a caller reading a clean success went and found
+ * 2528 still where it was.
+ */
+function makeStatusSwitchSubgraph({ innerCallback = "side-effecting" } = {}) {
+  // LGraphEventMode: 0 = ALWAYS (active), 4 = BYPASS.
+  const ALWAYS = 0;
+  const BYPASS = 4;
+  const switched = { id: 2528, type: "RTXDetailer", mode: ALWAYS };
+  const innerRuns = [];
+  const enabled = { name: "enabled", type: "BOOLEAN", value: true, options: {} };
+  if (innerCallback === "side-effecting") {
+    enabled.callback = (next) => {
+      innerRuns.push(next);
+      switched.mode = next ? ALWAYS : BYPASS;
+    };
+  } else if (innerCallback === "throwing-accessor") {
+    Object.defineProperty(enabled, "callback", {
+      get() {
+        throw new Error("hostile callback accessor");
+      },
+      configurable: true,
+    });
+  }
+  const inner = { id: 2448, type: "DaSiWa_NodeStatusSwitch", widgets: [enabled] };
+  const subgraph = {
+    id: "sg-switch",
+    _nodes: [inner, switched],
+    getNodeById: (id) => (String(id) === "2448" ? inner : String(id) === "2528" ? switched : null),
+  };
+  const store = new Map();
+
+  function instance(id) {
+    const widgetId = `${ROOT_GRAPH_ID}:${encodeURIComponent(String(id))}:${encodeURIComponent("enabled")}`;
+    if (!store.has(widgetId)) {
+      store.set(widgetId, { name: "enabled", type: "BOOLEAN", value: enabled.value, options: {} });
+    }
+    const rail = {
+      get name() {
+        return store.get(widgetId)?.name ?? "enabled";
+      },
+      get type() {
+        return store.get(widgetId)?.type ?? "BOOLEAN";
+      },
+      get options() {
+        return store.get(widgetId)?.options ?? {};
+      },
+      get value() {
+        return store.get(widgetId)?.value;
+      },
+      set value(next) {
+        const state = store.get(widgetId);
+        if (state) state.value = next;
+      },
+      callback(next) {
+        const state = store.get(widgetId);
+        if (state) state.value = next;
+      },
+    };
+    Object.defineProperty(rail, "widgetId", { value: widgetId, enumerable: false, configurable: true });
+    const input = {
+      name: "enabled",
+      widgetId,
+      _widget: rail,
+      widget: { name: "enabled" },
+      _subgraphSlot: { name: "enabled" },
+    };
+    const node = {
+      id,
+      type: "SubgraphNode",
+      subgraph,
+      inputs: [input],
+      get widgets() {
+        return [rail];
+      },
+    };
+    return { node, rail, input, widgetId };
+  }
+
+  return {
+    inner,
+    enabled,
+    switched,
+    store,
+    instance,
+    innerRuns,
+    queuedValue: (inst) => store.get(inst.widgetId)?.value,
+    definition: () => enabled.value,
+  };
+}
+
+const resolveSwitchSource = (_node, subgraphInput) =>
+  subgraphInput?.name === "enabled" ? { sourceNodeId: "2448", sourceWidgetName: "enabled" } : null;
+
+test("#1492: the reported case — the value lands, the inner switch's callback does NOT, and the reply says so", () => {
+  const sg = makeStatusSwitchSubgraph();
+  const wrapper = sg.instance(1512);
+
+  const set = applyWidgetWrite(wrapper.node, "enabled", false, { resolveSource: resolveSwitchSource });
+
+  // Unchanged and correct: the value IS in effect where queue compilation reads it,
+  // and the shared definition every sibling instance reads did not move.
+  assert.equal(sg.queuedValue(wrapper), false);
+  assert.equal(sg.definition(), true, "the shared definition is deliberately untouched");
+  assert.equal(set.promoted_from.value_scope, "instance");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+
+  // The fact the old reply hid. The switch never ran, so the node it drives is still
+  // ACTIVE while the caller — told parent_widget_synced:true — believes it is bypassed.
+  assert.deepEqual(sg.innerRuns, [], "the shared definition's callback is not invoked, by design");
+  assert.equal(sg.switched.mode, 0, "so the node that callback drives did NOT move");
+
+  // …now disclosed, as DATA plus an actionable note.
+  assert.equal(set.promoted_from.inner_callback_not_invoked, true);
+  assert.match(set.promoted_from.inner_callback_note, /was not invoked/);
+  assert.match(set.promoted_from.inner_callback_note, /2448/, "names the inner node the caller must inspect");
+  assert.match(set.promoted_from.inner_callback_note, /DaSiWa_NodeStatusSwitch/);
+  assert.match(
+    set.promoted_from.inner_callback_note,
+    /panel_set_node_mode/,
+    "and the remedy the reporter had to find by hand",
+  );
+  // It must not overstate: the write itself succeeded and is not being called into doubt.
+  assert.equal(set.write_warning, undefined, "nothing threw — this is not the #639 disclosure");
+});
+
+test("#1492: a shared inner widget with NO callback discloses NOTHING — the field marks a real skip, not the path", () => {
+  // The over-claim to avoid. An unconditional flag on every instance-scoped write would
+  // fire on the stock EmptyLatentImage case, where nothing whatsoever was skipped — and
+  // a disclosure that is always present is one a caller learns to ignore.
+  const sg = makeReusableSubgraph({ definitionValue: 512, innerHasCallback: false });
+  const target = sg.instance(293);
+
+  const set = applyWidgetWrite(target.node, "width", 1024, { resolveSource });
+
+  assert.equal(set.promoted_from.value_scope, "instance");
+  assert.equal(sg.queuedValue(target), 1024);
+  assert.equal("inner_callback_not_invoked" in set.promoted_from, false, "nothing skipped ⇒ nothing disclosed");
+  assert.equal("inner_callback_note" in set.promoted_from, false);
+});
+
+test("#1492: the definition-scoped path DOES invoke the inner callback, so it must never claim otherwise", () => {
+  const sg = makeReusableSubgraph({ definitionValue: 512 });
+  const legacy = sg.instance(293, { instanceKey: false });
+
+  const set = applyWidgetWrite(legacy.node, "width", 1024, { resolveSource });
+
+  assert.equal(set.promoted_from.value_scope, "subgraph_definition");
+  assert.deepEqual(sg.events.innerCallback, [1024], "it ran, so there is nothing to disclose");
+  assert.equal("inner_callback_not_invoked" in set.promoted_from, false);
+});
+
+test("#1492: a plain non-promoted write is byte-identical — its own callback ran and there is no promotion to describe", () => {
+  const runs = [];
+  const node = {
+    id: 7,
+    type: "EmptyLatentImage",
+    widgets: [{ name: "width", type: "INT", value: 512, callback: (next) => runs.push(next) }],
+  };
+
+  const set = applyWidgetWrite(node, "width", 1024);
+
+  assert.deepEqual(runs, [1024]);
+  assert.equal(set.promoted_from, undefined);
+  assert.equal(set.inner_callback_not_invoked, undefined);
+});
+
+test("#1492: an UNREADABLE inner callback discloses too — only ABSENCE licenses silence", () => {
+  // `callback` can be an accessor. A throw while merely CLASSIFYING must not fail a
+  // write that is otherwise fine and verified; and it is not evidence that there is no
+  // callback, so treating it as absence would restore exactly the silence this fixes.
+  const sg = makeStatusSwitchSubgraph({ innerCallback: "throwing-accessor" });
+  const wrapper = sg.instance(1512);
+
+  const set = applyWidgetWrite(wrapper.node, "enabled", false, { resolveSource: resolveSwitchSource });
+
+  assert.equal(sg.queuedValue(wrapper), false, "the write still succeeds");
+  assert.equal(set.promoted_from.inner_callback_not_invoked, true);
+  assert.match(
+    set.promoted_from.inner_callback_note,
+    /could not even be READ/,
+    "and the note reports what was observed rather than claiming a callback exists",
+  );
 });

@@ -389,6 +389,7 @@
       "mcp_did_not_open_in_time": "MCP 未在 90 秒內開啟。請檢查終端機中的啟動錯誤，然後重試連線。",
       "multiple_ready_providers_found": "偵測到多個可用供應商。請選擇此面板要使用的一個。",
       "not_now": "暫時不要",
+      "set_widget_inner_callback_not_invoked": " —— 數值已在這個子圖實例上生效，但共用的內部節點自己的回呼並沒有執行；它所驅動的東西（其他節點的模式、相依控制項）可能還是舊的",
       "starting_mcp": "正在啟動 MCP…",
       "use_provider": "使用此供應商",
       "click_to_copy": "點一下複製",

@@ -1575,6 +1575,41 @@ export function applyWidgetWrite(
   // always did.
   const boundProperty = boundPropertyState(valueNode, valueWidget);
   const previousPropertyClone = boundProperty?.reachable ? deepClone(boundProperty.previous) : undefined;
+  // #1492 — WHAT AN INSTANCE-SCOPED PROMOTED WRITE DELIBERATELY DOES NOT DO.
+  //
+  // On that path the shared subgraph DEFINITION is left exactly as it was (see the
+  // envelope below), and so is the inner widget's OWN callback: it is never invoked,
+  // because invoking it would run a SHARED node's side effects for an edit made on
+  // ONE instance. That trade is right and it was also SILENT — the reply carried
+  // `parent_widget_synced: true` and `value_scope: "instance"` and nothing else, so a
+  // caller whose inner widget does more than store a value read a clean success while
+  // the things that callback drives stayed exactly as they were. The reported case: a
+  // promoted BOOLEAN feeding a status-switch node that flips ANOTHER node's mode — the
+  // wrapper's controls moved, the bypassed/active nodes did not, and nothing said so.
+  //
+  // So OBSERVE whether there was a callback to skip, and disclose it when there was.
+  // Read ONCE and BEFORE the envelope: the rail's callback can install or remove one,
+  // and the claim is about the callback this write declined to invoke — not about
+  // whatever happens to be on the widget afterwards.
+  //
+  // Read TOTALLY. `callback` may be an accessor, and a throw while merely CLASSIFYING
+  // must never fail a write that is otherwise fine. A throw is also not evidence of
+  // ABSENCE, and absence is the only thing that justifies staying silent — so an
+  // unreadable callback discloses too, worded so it never claims one exists.
+  //
+  // Scoped to `instanceScoped`. On every other path the inner widget IS the written
+  // widget and its callback fires as it always did, so those replies are unchanged.
+  let innerCallbackSkipped = false;
+  let innerCallbackUnreadable = false;
+  if (instanceScoped) {
+    try {
+      const innerCallback = w.callback;
+      innerCallbackSkipped = innerCallback !== null && innerCallback !== undefined;
+    } catch {
+      innerCallbackSkipped = true;
+      innerCallbackUnreadable = true;
+    }
+  }
   // The ACTUAL serialization binding for an unlinked subgraph input is its
   // `widgetId` (the widget-value STORE key that queue compilation reads). A callback
   // could keep the SAME host input and projection objects but re-point `widgetId` to
@@ -2404,10 +2439,78 @@ export function applyWidgetWrite(
             // path — the failure branch above rolls back rather than let "instance" stand
             // for a write that moved the definition.
             value_scope: valueScope,
+            // #1492 — the side effects this write did NOT run, stated as DATA next to
+            // the scope decision that caused it. Emitted ONLY when a callback was
+            // actually observed on the shared inner widget (or could not be read at
+            // all): an instance-scoped write of a plain stock widget skipped nothing,
+            // and an unconditional flag there would train a caller to ignore the one
+            // case that matters. Every definition-scoped, non-promoted and
+            // callback-free reply is byte-identical to what it always was.
+            ...(innerCallbackSkipped
+              ? {
+                  inner_callback_not_invoked: true,
+                  inner_callback_note: innerCallbackNotInvokedNote({
+                    widgetName: w?.name,
+                    innerNodeId: targetNode?.id,
+                    innerNodeType: targetNode?.type,
+                    innerValue: previous,
+                    subgraphNodeId: node?.id,
+                    unreadable: innerCallbackUnreadable,
+                  }),
+                }
+              : {}),
           },
         }
       : {}),
   };
+}
+
+/**
+ * #1492 — say what an instance-scoped promoted write left undone, and what to do about it.
+ *
+ * The value itself IS in effect: it landed on the wrapper's own promoted-value store,
+ * which is what queue compilation reads for an unlinked promoted input. What did not
+ * happen is the inner (shared definition) widget's own callback, and a callback that
+ * mutates OTHER nodes — a status switch flipping a branch between ACTIVE and BYPASS is
+ * the reported one — leaves the graph in a state no field on the old reply described.
+ *
+ * WORDED FOR WHAT IS ESTABLISHED, not for what is likely:
+ *   * "was not invoked" — observed, not inferred: this path never calls it.
+ *   * it does NOT claim the callback has side effects. Plenty do nothing but store a
+ *     value, and telling every caller their graph is stale would be its own false alarm.
+ *   * on the unreadable branch it does not claim a callback EXISTS, because the read
+ *     that would have established it threw.
+ *
+ * The remedy is named because the report's own workaround was to drive the affected
+ * nodes by hand and it had to be discovered: `panel_set_node_mode` for a node mode,
+ * `panel_enter_subgraph` to look at the inner nodes. Deliberately NOT a refusal — the
+ * write is correct and the caller usually wants exactly it.
+ */
+export function innerCallbackNotInvokedNote({
+  widgetName,
+  innerNodeId,
+  innerNodeType,
+  innerValue,
+  subgraphNodeId,
+  unreadable = false,
+} = {}) {
+  const inner = `node ${innerNodeId}${innerNodeType ? ` (${innerNodeType})` : ""}`;
+  return (
+    `The value IS in effect on subgraph node ${subgraphNodeId} — it was written to this ` +
+    `instance's own promoted-value store, which is what serializes at queue time. What this ` +
+    `write did NOT do is run the shared subgraph definition's inner widget callback: ` +
+    `"${widgetName}" on ${inner} still holds ${JSON.stringify(innerValue)} and its own callback ` +
+    (unreadable
+      ? `could not even be READ here, so it certainly was not invoked. `
+      : `was not invoked. `) +
+    `That is deliberate — the inner node is SHARED by every instance of this subgraph, so ` +
+    `running its callback for an edit made on one instance would apply that instance's change ` +
+    `to all of them. But if that callback does more than store a value — toggling another ` +
+    `node's mode, bypassing a branch, refreshing dependent widgets — none of it ran, and the ` +
+    `nodes it drives are still in their PREVIOUS state. Check them before treating this write ` +
+    `as complete: panel_enter_subgraph to inspect the inner nodes, and panel_set_node_mode to ` +
+    `set a node ACTIVE/BYPASS/MUTE explicitly.`
+  );
 }
 
 /**

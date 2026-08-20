@@ -419,6 +419,7 @@
       "mcp_did_not_open_in_time": "MCP ne s'est pas ouvert dans les 90 secondes. Consultez l'erreur de démarrage dans le terminal, puis réessayez Connecter.",
       "multiple_ready_providers_found": "Plusieurs fournisseurs prêts ont été trouvés. Choisissez celui que ce panneau doit utiliser.",
       "not_now": "Pas maintenant",
+      "set_widget_inner_callback_not_invoked": " — valeur appliquée sur cette instance du sous-graphe, mais le rappel propre au nœud interne partagé n'a PAS été exécuté ; ce qu'il pilote (le mode d'un autre nœud, des widgets dépendants) peut donc rester obsolète",
       "starting_mcp": "Démarrage de MCP…",
       "use_provider": "Utiliser ce fournisseur",
       "click_to_copy": "Cliquer pour copier",
