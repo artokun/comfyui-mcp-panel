@@ -534,6 +534,35 @@ test("#1519: a widget with NO options does not break the wrapper's optional read
   assert.deepEqual(seen, [{ min: undefined, widgetName: "text" }]);
 });
 
+test("#1519: a node whose `inputs` is a THROWING accessor still gets its hook fired", () => {
+  // The slot snapshot is instrumentation, not a precondition. A node that defines its
+  // slots as accessors is exactly the kind of node this route exists for, and letting
+  // the BEFORE snapshot abort the route would leave behind the stale slots it fixes —
+  // dressed up as a machinery failure.
+  let fired = 0;
+  const node = {
+    id: 32,
+    type: "N",
+    widgets: [{ name: "w", type: "number", value: 1 }],
+    outputs: [],
+    onWidgetChanged() {
+      fired++;
+    },
+  };
+  Object.defineProperty(node, "inputs", {
+    get() {
+      throw new Error("slots are computed");
+    },
+  });
+
+  const set = applyWidgetWrite(node, "w", 5, HOOKS);
+
+  assert.equal(fired, 1, "the hook must fire even when the slots cannot be read");
+  assert.equal(set.value, 5);
+  assert.equal(set.widget_changed_hook_failed, undefined);
+  assert.equal(set.widget_changed_slots, undefined, "an unreadable snapshot claims nothing either way");
+});
+
 // ---- the helper's own contract ---------------------------------------------
 
 test("#1519: fireNodeWidgetChanged never throws, whatever it is handed", () => {

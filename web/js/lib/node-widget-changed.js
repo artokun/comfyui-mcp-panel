@@ -100,9 +100,30 @@ function slotNames(list) {
   }
 }
 
-/** The node's input AND output slot names. Never throws. */
+/**
+ * The node's input AND output slot names. Never throws.
+ *
+ * The `inputs`/`outputs` READS are inside the try, not just the list walk: a pack that
+ * rebuilds slots is exactly the kind of node that defines them as accessors, and a throw
+ * from the BEFORE snapshot would abort this route before the hook ever fired — reporting
+ * a machinery failure while leaving behind the stale slots this file exists to fix. A
+ * snapshot that could not be taken yields empty lists, which compare equal to the other
+ * side's and so claim nothing either way.
+ */
 function slotSnapshot(node) {
-  return { inputs: slotNames(node?.inputs), outputs: slotNames(node?.outputs) };
+  let inputs = [];
+  let outputs = [];
+  try {
+    inputs = slotNames(node?.inputs);
+  } catch {
+    inputs = [];
+  }
+  try {
+    outputs = slotNames(node?.outputs);
+  } catch {
+    outputs = [];
+  }
+  return { inputs, outputs };
 }
 
 function sameNames(a, b) {
