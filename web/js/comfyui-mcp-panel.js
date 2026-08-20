@@ -656,6 +656,7 @@ import {
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
+import { prunedRetryNote } from "./lib/partial-run-prune.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import {
   normalizeModels,
@@ -16103,6 +16104,25 @@ const GRAPH_TOOL_EXECUTORS = {
     if (partialTargets && runScopeResult?.overrunBlocked > 0) {
       accept.extra_dispatch_blocked = runScopeResult.overrunBlocked;
       accept.extra_dispatch_note = runScopeResult.overrunNote;
+    }
+    // comfyui-mcp#1871 — this run queued only because a SECOND post left out the
+    // nodes the caller's own scope excluded. ComfyUI validates that every node in
+    // the posted prompt resolves to an installed class before it narrows execution
+    // to partial_execution_targets, so one unavailable pack on another branch
+    // refuses a run-to-node that never touches it.
+    //
+    // A DISCLOSURE, not a failure: the branch that was asked for is queued and
+    // running. But the caller must not be left believing this ComfyUI is healthy —
+    // their next FULL run will still fail on the same node — and an agent that
+    // cannot see the extra round trip cannot report it either.
+    if (partialTargets && runScopeResult?.prunedRetry) {
+      const pr = runScopeResult.prunedRetry;
+      accept.excluded_nodes_omitted = Array.isArray(pr.removed) ? pr.removed : [];
+      accept.excluded_nodes_note = prunedRetryNote({
+        toNodeId: to_node_id,
+        namedNode: pr.namedNode,
+        removed: pr.removed,
+      });
     }
     // #985 — a WHOLE-GRAPH run hands prompt construction to ComfyUI, and ComfyUI
     // applies a subgraph wrapper's mute/bypass only at the TOP level: a wrapper
