@@ -676,3 +676,106 @@ test("#1444 setSize/onResize inflation is rolled back, not reported as success",
   assert.deepEqual([node.size[0], node.size[1]], beforeSize);
   assert.deepEqual(events.filter((e) => e === "before" || e === "after"), ["before", "after"]);
 });
+
+/** A node whose stored body height is ZERO — the shape #1872 reported (a collapsed
+ *  CreateVideo serialized as size [225, 0]). Zero height is the node's OWN stored
+ *  geometry, not something a presentation edit asked for. */
+test("#1872 a title-only edit lands on a node whose stored height is zero", () => {
+  const node = makeNode(35, { pos: [1520, 380], size: [225, 0] });
+  node.flags.collapsed = true;
+  // Real LiteGraph clamping: setSize would raise the height. A title edit must
+  // never reach it, so leave it as the trap it is.
+  node.setSize = () => { throw new Error("setSize must not run for a title-only edit"); };
+  const { fn } = setup([node]);
+
+  const result = fn({ node_id: 35, title: "SCENE 1 - Create Video" });
+
+  assert.equal(node.title, "SCENE 1 - Create Video");
+  assert.deepEqual([node.size[0], node.size[1]], [225, 0], "an untouched size must not be normalized");
+  assert.equal(result.edited[0].after.title, "SCENE 1 - Create Video");
+  assert.deepEqual(result.edited[0].after.size, [225, 0]);
+});
+
+test("#1872 a move on a zero-height node restores the shared Rectangle instead of refusing", () => {
+  const node = makeRectBackedNode(35, { pos: [1520, 380], size: [225, 0] });
+  node.flags.collapsed = true;
+  const graph = {
+    beforeChange: () => {},
+    afterChange: () => {},
+    setDirtyCanvas: () => {},
+    getNodeById: (id) => (id === 35 ? node : null),
+  };
+  const edit = realGraphEditNode(
+    () => ({ graph, LG: { LGraphCanvas: { node_colors: {} } } }),
+    (_g, id) => { if (id !== 35) throw new Error(`No node with id ${id}`); return node; },
+    refreshNodeArea,
+    () => [],
+    () => null,
+    () => null,
+  );
+
+  const result = edit({ node_id: 35, pos: [400, 500], title: "SCENE 1 - Create Video" });
+
+  assert.deepEqual([node.pos[0], node.pos[1]], [400, 500]);
+  assert.deepEqual([node.size[0], node.size[1]], [225, 0], "updateArea inflation must be put back, not accepted");
+  assert.equal(node.title, "SCENE 1 - Create Video");
+  assert.deepEqual(result.edited[0].after.size, [225, 0]);
+});
+
+/** The postcondition this branch actually owes the caller: an untouched size ends
+ *  where it started. Judged against the SNAPSHOT — an absolute range let a drifted
+ *  size through whenever the drifted number happened to look like a node size. */
+test("#1872 refuses when an untouched size drifted and will not go back", () => {
+  let height = 80;
+  const node = {
+    id: 7,
+    pos: [100, 200],
+    title: "Node 7",
+    flags: {},
+    get size() { return [225, height]; },
+    // A widget minimum well above the captured height: restoration cannot land.
+    set size(v) { height = Math.max(600, v[1]); },
+    setSize(s) { this.size = s; },
+    updateArea() { height = this.pos[1] + height; },
+  };
+  const graph = {
+    beforeChange: () => {},
+    afterChange: () => {},
+    setDirtyCanvas: () => {},
+    getNodeById: (id) => (id === 7 ? node : null),
+  };
+  const edit = realGraphEditNode(
+    () => ({ graph, LG: { LGraphCanvas: { node_colors: {} } } }),
+    (_g, id) => { if (id !== 7) throw new Error(`No node with id ${id}`); return node; },
+    refreshNodeArea,
+    () => [],
+    () => null,
+    () => null,
+  );
+
+  assert.throws(
+    () => edit({ node_id: 7, pos: [400, 500] }),
+    (error) => {
+      assert.match(error.message, /could not be restored/);
+      assert.doesNotMatch(
+        error.message,
+        /two positive numbers/,
+        "the caller supplied no size — do not blame their arguments",
+      );
+      // updateArea drifted the height to pos.y + h = 580; the failed restore then
+      // left the setter's own 600px minimum behind. Report what was OBSERVED, not
+      // the number our own failed write produced.
+      assert.match(error.message, /\[225, 580\]/, "the message must name the observed drift");
+      assert.doesNotMatch(error.message, /600/, "600 is this guard's failed write, not the drift");
+      assert.doesNotMatch(
+        error.message,
+        /rolled back/,
+        "size is exactly what would not go back — do not promise a rollback of it",
+      );
+      return true;
+    },
+  );
+  assert.equal(node.title, "Node 7");
+  assert.equal(node.pos[0], 100, "every field the guard CAN restore is restored");
+  assert.equal(node.pos[1], 200);
+});
