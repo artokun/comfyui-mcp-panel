@@ -207,6 +207,111 @@ export function restorePromotedInstanceWidgets(rootGraph, snapshot) {
 }
 
 /**
+ * Named `widgets_values_named` map from a serialized node, or null when the
+ * file did not carry one. Positional `widgets_values` is the fallback — it is
+ * what older saves (and a frontend with named restore off) have — zipped with
+ * the LIVE rail names after configure has built them.
+ */
+function savedHostWidgetMap(savedNode, liveNode) {
+  const named = savedNode?.widgets_values_named;
+  if (named && typeof named === "object" && !Array.isArray(named)) {
+    const out = {};
+    for (const [key, value] of Object.entries(named)) {
+      if (typeof key === "string" && key) out[key] = value;
+    }
+    if (Object.keys(out).length) return out;
+  }
+  const positional = savedNode?.widgets_values;
+  if (!Array.isArray(positional)) return {};
+  const names = [];
+  try {
+    for (const rail of liveNode?.widgets ?? []) {
+      if (rail && typeof rail.name === "string" && rail.name) names.push(rail.name);
+    }
+  } catch {
+    return {};
+  }
+  const out = {};
+  for (let i = 0; i < names.length && i < positional.length; i++) {
+    out[names[i]] = positional[i];
+  }
+  return out;
+}
+
+function savedDefinitionsById(savedGraph) {
+  const byId = new Map();
+  for (const def of savedGraph?.definitions?.subgraphs ?? []) {
+    if (def?.id != null) byId.set(String(def.id), def);
+  }
+  return byId;
+}
+
+/**
+ * #874 remaining load path — `panel_load_workflow` / `graph_load` of a saved
+ * subgraph host.
+ *
+ * ComfyUI's `SubgraphNode.configure` (frontend 1.49.6 and current master)
+ * recreates host inputs from the definition, then `_setWidget` seeds the
+ * per-instance store from the INNER widget. `_applyPromotedWidgetValues` is a
+ * no-op while those inputs still have no `widgetId`. The file's
+ * `widgets_values` / `widgets_values_named` survive on disk and the load
+ * reports `loaded:true`, but the live host shows definition defaults for
+ * prompt, dimensions, length, and selectors. Seed/fps can remain because they
+ * are not rebuilt the same way.
+ *
+ * After `loadGraphData` the rails exist and have widgetIds. Re-apply the FILE's
+ * host values onto those instance rails — never the shared inner widget.
+ *
+ * @returns {{ restored: number, skipped: number }}
+ */
+export function applySavedSubgraphHostWidgets(liveRoot, savedGraph) {
+  const result = { restored: 0, skipped: 0 };
+  if (!liveRoot || !savedGraph || typeof savedGraph !== "object") return result;
+  const defs = savedDefinitionsById(savedGraph);
+
+  const applyInGraph = (liveGraph, savedNodes) => {
+    if (!liveGraph || !Array.isArray(savedNodes)) return;
+    const savedById = new Map();
+    for (const node of savedNodes) {
+      if (node?.id != null) savedById.set(String(node.id), node);
+    }
+    let liveNodes;
+    try {
+      liveNodes = liveGraph._nodes;
+    } catch {
+      return;
+    }
+    if (!Array.isArray(liveNodes)) return;
+    for (const live of liveNodes) {
+      if (!live?.subgraph) continue;
+      const saved = savedById.get(String(live.id));
+      if (saved) {
+        const values = savedHostWidgetMap(saved, live);
+        const entries = Object.entries(values).map(([widgetName, value]) => ({
+          nodeId: live.id,
+          widgetName,
+          value: cloneValue(value),
+          widgetId: null,
+        }));
+        if (entries.length) {
+          const one = restorePromotedInstanceWidgets(
+            { _nodes: [live] },
+            { subgraph: live.subgraph, entries },
+          );
+          result.restored += one.restored;
+          result.skipped += one.skipped;
+        }
+      }
+      const def = defs.get(String(live.subgraph.id ?? live.type ?? ""));
+      if (def) applyInGraph(live.subgraph, def.nodes);
+    }
+  };
+
+  applyInGraph(liveRoot, savedGraph.nodes);
+  return result;
+}
+
+/**
  * Snapshot instance-scoped promoted rails, run `fn`, then restore. Used around
  * inner-graph mutations (and exit) so a definition replace cannot keep the
  * empty rails it just wrote. `fn` may be sync or async.

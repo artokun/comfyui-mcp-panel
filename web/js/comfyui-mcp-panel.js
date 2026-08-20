@@ -234,7 +234,10 @@ import {
   materializedValuesNote,
   findDivergentPromotedValues,
 } from "./lib/unpack-promoted-values.js";
-import { withPreservedPromotedInstanceWidgets } from "./lib/subgraph-instance-widgets.js";
+import {
+  withPreservedPromotedInstanceWidgets,
+  applySavedSubgraphHostWidgets,
+} from "./lib/subgraph-instance-widgets.js";
 import {
   snapshotExternalLinks,
   verifyExternalLinks,
@@ -13677,6 +13680,16 @@ const GRAPH_TOOL_EXECUTORS = {
     const { restored: retriedNodes, failed: unrestoredNodes } = isolation?.failures?.length
       ? retryNodeRestores(app?.graph, isolation.failures)
       : { restored: [], failed: [] };
+    // #874 remaining load path — SubgraphNode.configure seeds host rails from
+    // INNER definition widgets, so a saved subgraph host lands at defaults
+    // (prompt, dimensions, length, selectors) while the file still holds the
+    // edited values. Rails exist after this load; write the FILE's host values
+    // back. Best-effort: a hostile rail must not fail a load that already landed.
+    try {
+      applySavedSubgraphHostWidgets(app?.graph, clone);
+    } catch {
+      /* live graph stays as loadGraphData left it */
+    }
     // comfyui-mcp#1478 (defect 1) — REPORT THE IDENTITY THIS LOAD LANDED ON.
     //
     // `activeWorkflow` was captured before the load and passed to loadGraphData as the
@@ -18147,6 +18160,11 @@ const GRAPH_TOOL_EXECUTORS = {
           beginWorkflowReloadStep(reloadGuardToken);
           try {
             await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
+            try {
+              applySavedSubgraphHostWidgets(app?.graph, diskGraph);
+            } catch {
+              /* live graph stays as the file load left it */
+            }
           } finally {
             endWorkflowReloadStep(reloadGuardToken);
           }
@@ -18196,6 +18214,21 @@ const GRAPH_TOOL_EXECUTORS = {
       // holder reopens the canvas.
       releaseWorkflowReloadGuard(reloadGuardToken);
       releaseCanvasInteractionLock(priorInteraction, canvasView);
+    }
+    // #874 — a FIRST-TIME open loads through ComfyUI's openWorkflow, which runs
+    // the same SubgraphNode.configure that drops host widgets_values. Apply the
+    // FILE's host values AFTER content proof so a widget rewrite cannot fail the
+    // open, and only when this tab was not already open (an already-open tab
+    // may hold unsaved edits the file does not). Skip if the disk re-read
+    // already applied the on-disk graph.
+    if (!openFailed && !rebindFailed && !wasOpen && !reloaded) {
+      try {
+        const raw = target.originalContent ?? target.content;
+        const saved = typeof raw === "string" ? JSON.parse(raw) : raw;
+        applySavedSubgraphHostWidgets(app?.graph, saved);
+      } catch {
+        /* unreadable file content — live graph stays as the frontend left it */
+      }
     }
     if (openFailed) throw failOpen(openFailed);
     if (rebindFailed) {
@@ -18518,6 +18551,11 @@ const GRAPH_TOOL_EXECUTORS = {
       serializeCanvas: () => host?.graph?.serialize?.() ?? null,
       loadGraph: async (graph, target) => {
         await host.loadGraphData(graph, true, true, target, { __cmcpKeepInstance: true });
+        try {
+          applySavedSubgraphHostWidgets(host?.graph, graph);
+        } catch {
+          /* live graph stays as the file load left it */
+        }
       },
       rebaseline: async (target, diskText) => {
         try {

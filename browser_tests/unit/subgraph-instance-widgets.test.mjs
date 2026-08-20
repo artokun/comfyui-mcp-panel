@@ -17,6 +17,7 @@ import {
   snapshotPromotedInstanceWidgets,
   restorePromotedInstanceWidgets,
   withPreservedPromotedInstanceWidgets,
+  applySavedSubgraphHostWidgets,
 } from "../../web/js/lib/subgraph-instance-widgets.js";
 
 const ROOT_GRAPH_ID = "c4a254bb-935e-4013-b380-5e36954de4b0";
@@ -218,5 +219,143 @@ test("#1827 the dispatcher snapshots before a subgraph mutation and restores aft
     SRC,
     /visibleMutationTarget\.graph !== visibleMutationTarget\.rootGraph/,
     "preserve only while INSIDE a subgraph — the reported enter/mutate/exit path",
+  );
+});
+
+/**
+ * #874 load path — a saved subgraph host whose JSON still has the edited
+ * widgets_values_named, after ComfyUI configure reseeds the rails from the
+ * inner definition.
+ */
+const WAN_SG_ID = "11111111-2222-3333-4444-555555555555";
+
+function makeLoadedHost({ savedNamed, definitionDefaults, positional }) {
+  const inner = {
+    id: 10,
+    type: "CLIPTextEncode",
+    widgets: Object.entries(definitionDefaults).map(([name, value]) => ({ name, value })),
+  };
+  const subgraph = { id: WAN_SG_ID, _nodes: [inner] };
+  const store = new Map();
+  const rails = [];
+  const inputs = [];
+  for (const [name, defValue] of Object.entries(definitionDefaults)) {
+    const widgetId = `${ROOT_GRAPH_ID}:${encodeURIComponent("116")}:${encodeURIComponent(name)}`;
+    store.set(widgetId, { name, value: defValue });
+    const rail = {
+      name,
+      get widgetId() {
+        return widgetId;
+      },
+      get value() {
+        return store.get(widgetId)?.value;
+      },
+      set value(next) {
+        const state = store.get(widgetId);
+        if (state) state.value = next;
+      },
+      callback(next) {
+        const state = store.get(widgetId);
+        if (state) state.value = next;
+      },
+    };
+    rails.push(rail);
+    inputs.push({ name, widgetId, _widget: rail });
+  }
+  const live = {
+    id: 116,
+    type: WAN_SG_ID,
+    subgraph,
+    inputs,
+    get widgets() {
+      return rails;
+    },
+  };
+  const saved = {
+    id: 116,
+    type: WAN_SG_ID,
+    ...(positional ? { widgets_values: positional } : {}),
+    ...(savedNamed ? { widgets_values_named: savedNamed } : {}),
+  };
+  return {
+    live,
+    inner,
+    liveRoot: { _nodes: [live] },
+    savedGraph: {
+      nodes: [saved],
+      definitions: { subgraphs: [{ id: WAN_SG_ID, nodes: [inner] }] },
+    },
+    rail: (name) => rails.find((r) => r.name === name),
+  };
+}
+
+test("#874 a saved subgraph host keeps its named widgets, not definition defaults", () => {
+  const savedNamed = {
+    prompt: "a vaporwave alley at dusk",
+    width: 1280,
+    height: 704,
+    length: 81,
+    unet_name: "wan_high.safetensors",
+    seed: 42,
+    fps: 16,
+  };
+  const definitionDefaults = {
+    prompt: "DEFINITION-DEFAULT-PROMPT",
+    width: 832,
+    height: 480,
+    length: 49,
+    unet_name: "wan_default.safetensors",
+    seed: 0,
+    fps: 16,
+  };
+  const fx = makeLoadedHost({ savedNamed, definitionDefaults });
+  assert.equal(fx.rail("prompt").value, definitionDefaults.prompt, "configure left the definition default");
+  applySavedSubgraphHostWidgets(fx.liveRoot, fx.savedGraph);
+  for (const [name, want] of Object.entries(savedNamed)) {
+    assert.equal(fx.rail(name).value, want, `${name} must be the FILE's value`);
+  }
+  assert.equal(fx.inner.widgets[0].value, "DEFINITION-DEFAULT-PROMPT", "the shared definition must not move");
+});
+
+test("#874 positional widgets_values apply when the file has no named map", () => {
+  const definitionDefaults = { prompt: "DEFAULT", width: 832, length: 49 };
+  const positional = ["SAVED-PROMPT", 1280, 81];
+  const fx = makeLoadedHost({ definitionDefaults, positional });
+  applySavedSubgraphHostWidgets(fx.liveRoot, fx.savedGraph);
+  assert.equal(fx.rail("prompt").value, positional[0]);
+  assert.equal(fx.rail("width").value, positional[1]);
+  assert.equal(fx.rail("length").value, positional[2]);
+});
+
+test("#874 named values win when the file carries both maps", () => {
+  const savedNamed = { prompt: "NAMED-PROMPT", width: 1280 };
+  const positional = ["POSITIONAL-PROMPT", 640];
+  const definitionDefaults = { prompt: "DEFAULT", width: 832 };
+  const fx = makeLoadedHost({ savedNamed, definitionDefaults, positional });
+  applySavedSubgraphHostWidgets(fx.liveRoot, fx.savedGraph);
+  assert.equal(fx.rail("prompt").value, savedNamed.prompt);
+  assert.equal(fx.rail("width").value, savedNamed.width);
+});
+
+test("#874 a missing host or empty saved graph is a no-op, not a throw", () => {
+  const fx = makeLoadedHost({
+    savedNamed: { prompt: "SAVED" },
+    definitionDefaults: { prompt: "DEFAULT" },
+  });
+  assert.deepEqual(applySavedSubgraphHostWidgets(null, fx.savedGraph), { restored: 0, skipped: 0 });
+  assert.deepEqual(applySavedSubgraphHostWidgets(fx.liveRoot, null), { restored: 0, skipped: 0 });
+  assert.equal(fx.rail("prompt").value, "DEFAULT");
+});
+
+test("#874 graph_load and the disk-reload open path both re-apply saved host widgets", () => {
+  assert.match(
+    SRC,
+    /applySavedSubgraphHostWidgets\(app\?\.graph, clone\)/,
+    "graph_load — panel_load_workflow — must re-apply the FILE after loadGraphData",
+  );
+  assert.match(
+    SRC,
+    /applySavedSubgraphHostWidgets\(app\?\.graph, diskGraph\)/,
+    "workflow_open's on-disk reload must re-apply the FILE after loadGraphData",
   );
 });
