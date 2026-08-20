@@ -15054,12 +15054,20 @@ const GRAPH_TOOL_EXECUTORS = {
         } else if (snap.size.length >= 2) {
           // #1444 — a move/title/color must not let updateArea rewrite size from
           // a shared Rectangle (height becomes y, then tens of thousands).
+          // #1872 — the caller supplied no size, so the ONLY thing this branch
+          // owes them is that the node's own geometry ends where it started.
+          // Judge that against the SNAPSHOT, never against an absolute sanity
+          // range: a node can legitimately carry a zero body height in its
+          // stored size (the reporter's collapsed CreateVideo serialized
+          // [225, 0]), and sizeSane rejected it, so a title-only edit was
+          // refused over a size the caller never touched.
           const now = pair(node.size);
           if (!now || now[0] !== snap.size[0] || now[1] !== snap.size[1]) {
-            writeSize(node, snap.size);
-          }
-          if (!sizeSane(pair(node.size))) {
-            throw new Error("size must be two positive numbers within a reasonable canvas range");
+            if (!writeSize(node, snap.size)) {
+              throw new Error(
+                `node ${node.id} size drifted to [${pair(node.size) ?? []}] during this edit and could not be restored to its previous [${snap.size[0]}, ${snap.size[1]}] — the edit was rolled back`,
+              );
+            }
           }
         }
         if (own("title")) node.title = args.title;
