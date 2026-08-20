@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.25] - 2026-08-20
+
+### Fixed
+- a title-only edit is judged against the node's own snapshot, not a size range (#1509)
+- a later phase must not speak for a run that obtained no /object_info (#1508)
+
+### Changed
+- EXECUTE the rider, so its workflow-key gate can be watched to fail (#1505)
+
+
 ## [0.15.24] - 2026-08-20
 
 ### Fixed
