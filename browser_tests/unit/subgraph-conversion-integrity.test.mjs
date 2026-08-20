@@ -41,6 +41,10 @@ import {
   disconnectedBoundaryInputs,
   brokenConversionRefusal,
   brokenConversionWarning,
+  detachedConversionNodes,
+  detachedConversionRefusal,
+  conversionSnapshot,
+  conversionThrowReport,
 } from "../../web/js/lib/subgraph-conversion-integrity.js";
 
 const src = () =>
@@ -434,10 +438,28 @@ test("#1571 the advisory findings reach the reported payload on both paths", () 
 });
 
 test("#1571 the guard is imported, not shadowed by a local stub", () => {
-  assert.match(
-    src(),
-    /import \{\s*danglingInputLinks,\s*disconnectedBoundaryInputs,\s*brokenConversionRefusal,\s*brokenConversionWarning,\s*\} from "\.\/lib\/subgraph-conversion-integrity\.js";/,
+  // Name-by-name rather than as one frozen block: #1463 added four more exports to the
+  // same import, and an exact-block match would have failed on that without any of these
+  // four guards having changed. What must not drift is that each one comes from the lib
+  // and is not re-declared in the monolith.
+  const s = src();
+  const imported = s.match(
+    /import \{([\s\S]*?)\} from "\.\/lib\/subgraph-conversion-integrity\.js";/,
   );
+  assert.ok(imported, "the integrity guards must be imported from the lib");
+  for (const name of [
+    "danglingInputLinks",
+    "disconnectedBoundaryInputs",
+    "brokenConversionRefusal",
+    "brokenConversionWarning",
+  ]) {
+    assert.ok(imported[1].includes(name), `${name} must be imported from the lib`);
+    assert.doesNotMatch(
+      s,
+      new RegExp(`\\r?\\nfunction ${name}\\(`),
+      `${name} must not be shadowed by a local stub`,
+    );
+  }
 });
 
 // ── BEHAVIOUR, through the REAL shipped executor. The wiring tests above prove the calls
@@ -459,6 +481,13 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
     /function subgraphConversionAdvisories\(\{ disconnected, dangling, warning \}\) \{[\s\S]*?\r?\n\}/,
   );
   assert.ok(landed && serializable && advisories, "the conversion guards must be locatable");
+  // #1463 — the executors reach convertToSubgraph through this runner now. Injected from
+  // the REAL source for the same reason as the guards above: a stub would let a
+  // regression in it pass every test in this file.
+  const runner = s.match(
+    /function convertSelectionToSubgraph\(\{ graph, canvas, nodes, what \}\) \{[\s\S]*?\r?\n\}/,
+  );
+  assert.ok(runner, "could not locate convertSelectionToSubgraph in panel source");
   const graph = {
     _nodes: [wrapper],
     getNodeById: (id) => ({ id: Number(id) }),
@@ -474,6 +503,7 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
     "syncGraphNodeAreas",
     "groupMemberNodes",
     "clearStaleRedFlagsAfterSubgraphConversion",
+    "convertSelectionToSubgraph",
     "assertSubgraphNodeLanded",
     "assertSubgraphConversionSerializable",
     "subgraphConversionAdvisories",
@@ -484,6 +514,13 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
     () => {},
     () => [{ id: 192 }, { id: 265 }, { id: 273 }],
     () => {},
+    new Function(
+      "detachedConversionNodes",
+      "detachedConversionRefusal",
+      "conversionSnapshot",
+      "conversionThrowReport",
+      `return ${runner[0]};`,
+    )(detachedConversionNodes, detachedConversionRefusal, conversionSnapshot, conversionThrowReport),
     new Function(`return ${landed[0]};`)(),
     new Function(
       "danglingInputLinks",
