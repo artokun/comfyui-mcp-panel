@@ -87,34 +87,41 @@
 const has = (map, key) => Object.prototype.hasOwnProperty.call(map, key);
 
 /**
- * Every prompt node id referenced as a LINK by one input value.
+ * The prompt node id one input value depends on, or null.
  *
- * ComfyUI's API prompt encodes a link as a two-element array `[node_id, output_index]`,
- * and `execution.validate_inputs` reads `val[0]` as the upstream node id. That is the
- * shape matched here.
+ * The predicate is ComfyUI's, not an approximation of it. Both consumers of a posted
+ * prompt read a dependency from the input value ITSELF — never from anything nested
+ * inside it:
  *
- * The direction of error is deliberate and one-way: this is used to decide what to KEEP,
- * so over-matching keeps a node that did not need to be kept (harmless — the run is
- * unchanged, it just prunes less) while under-matching drops a node the branch needs and
- * turns a working run into "Required input is missing". So a widget value that merely
- * LOOKS like a link (`[3, 0]` on a node whose id is "3") keeps node 3, and container
- * values are scanned recursively in case a pack ever nests links in a list or object —
- * neither can remove a dependency, only add one.
+ *   comfy_execution/graph_utils.py  is_link(obj): a list, length 2, obj[0] a str,
+ *                                   obj[1] an int/float. Used by the executor's
+ *                                   get_input_data and by the cache-key walk.
+ *   execution.py validate_inputs    `if isinstance(val, list)` -> length 2 -> `o_id =
+ *                                   val[0]` -> `prompt[o_id]['class_type']`, an
+ *                                   UNGUARDED lookup that raises when the id is absent.
+ *
+ * The second is the broader of the two and is the one the closure must satisfy: a node
+ * referenced by a top-level two-element list has to survive the prune, or the retry dies
+ * as an exception_during_validation. Hence `String(value[0])` plus a membership test
+ * rather than is_link's stricter typing — that keeps a superset of what the executor
+ * walks, which is the safe side. The length-2 requirement is NOT loosened for the same
+ * reason in reverse: validate_inputs never looks up a longer list, so treating one as a
+ * dependency would be an over-keep (see below).
+ *
+ * NOTHING is scanned recursively (codex gate r1, P1). A widget value can be an arbitrary
+ * object, and `{config:{coordinates:["56", 0]}}` on a node in the branch would have
+ * pulled node 56 into the closure. That is not a harmless over-keep:
+ * `prunedRetryForRejection` declines to retry when the node ComfyUI named is INSIDE the
+ * closure, so an unrelated coordinate pair would silently reinstate the very refusal
+ * this module exists to remove. Neither ComfyUI consumer looks inside a value, so
+ * neither does this.
  */
-function linkedIds(value, promptMap, out, depth = 0) {
-  if (depth > 4 || value == null || typeof value !== "object") return;
-  if (Array.isArray(value)) {
-    if (value.length === 2 && (typeof value[0] === "string" || typeof value[0] === "number")) {
-      const key = String(value[0]);
-      if (has(promptMap, key)) {
-        out.add(key);
-        return; // a matched link is fully consumed; its index is not a container
-      }
-    }
-    for (const v of value) linkedIds(v, promptMap, out, depth + 1);
-    return;
-  }
-  for (const v of Object.values(value)) linkedIds(v, promptMap, out, depth + 1);
+function linkedId(value, promptMap) {
+  if (!Array.isArray(value) || value.length !== 2) return null;
+  const raw = value[0];
+  if (raw == null || typeof raw === "object") return null;
+  const key = String(raw);
+  return has(promptMap, key) ? key : null;
 }
 
 /**
@@ -141,16 +148,17 @@ export function upstreamClosure(promptMap, rootIds) {
     const entry = promptMap[id];
     const inputs = entry && typeof entry === "object" ? entry.inputs : null;
     if (!inputs || typeof inputs !== "object") continue;
-    const found = new Set();
     try {
-      linkedIds(inputs, promptMap, found);
+      for (const value of Object.values(inputs)) {
+        const dep = linkedId(value, promptMap);
+        if (dep != null && !keep.has(dep)) stack.push(dep);
+      }
     } catch {
-      // A hostile/exotic inputs object must not take down the run. An input we could
-      // not read contributes no dependency, and the verification in
-      // prunedScopedPromptBody is what stops a half-read closure from being posted.
+      // A hostile/exotic inputs object (a throwing getter) must not take down the run.
+      // An input that could not be read contributes no dependency, and the verification
+      // in prunedScopedPromptBody is what stops a half-read closure from being posted.
       continue;
     }
-    for (const dep of found) if (!keep.has(dep)) stack.push(dep);
   }
   return keep;
 }

@@ -120,19 +120,51 @@ test("#1871 upstreamClosure terminates on a link cycle", () => {
   assert.deepEqual([...keep].sort(), ["a", "b"]);
 });
 
-test("#1871 upstreamClosure errs toward KEEPING: a nested or ambiguous value that names a real node keeps it", () => {
+test("#1871 upstreamClosure reads a dependency the way ComfyUI does — the input value ITSELF, never something nested inside it", () => {
+  // codex gate r1, P1. A widget value can be an arbitrary object, and scanning into it
+  // pulled unrelated nodes into the closure. That is not a harmless over-keep: the retry
+  // is declined when the node ComfyUI named is inside the closure, so a coordinate pair
+  // in some node's settings would silently reinstate the refusal this module removes.
+  //
+  // Neither ComfyUI consumer looks inside a value: comfy_execution/graph_utils.is_link
+  // tests the value, and execution.validate_inputs reads `val[0]` of the value.
   const odd = {
     "1": { class_type: "Loader", inputs: {} },
-    "2": { class_type: "Weird", inputs: { many: [["1", 0], ["3", 0]], opts: { a: ["4", 0] } } },
+    "2": {
+      class_type: "Weird",
+      inputs: {
+        image: ["1", 0], // a real link — kept
+        config: { coordinates: ["56", 0] }, // widget data — NOT a link
+        many: [["3", 0], ["4", 0]], // a list of pairs is not a link either
+      },
+    },
     "3": { class_type: "Other", inputs: {} },
     "4": { class_type: "Another", inputs: {} },
-    "5": { class_type: "Unrelated", inputs: {} },
+    "56": { class_type: "TopazUpscale", inputs: {} },
   };
-  const keep = upstreamClosure(odd, ["2"]);
-  // A pack that nests links in a list or an object still gets its dependencies. The
-  // failure this rules out is dropping one, which would break a run that used to work.
-  assert.deepEqual([...keep].sort(), ["1", "2", "3", "4"]);
-  assert.equal(keep.has("5"), false);
+  assert.deepEqual([...upstreamClosure(odd, ["2"])].sort(), ["1", "2"]);
+});
+
+test("#1871 upstreamClosure does not treat a longer list as a dependency — validate_inputs never looks one up", () => {
+  // `len(val) != 2` is an error there, not a lookup, so the node is not needed. Keeping
+  // it would be an over-keep, and an over-keep of the refused node suppresses the retry.
+  const g = {
+    "7": { class_type: "Loader", inputs: {} },
+    "8": { class_type: "Consumer", inputs: { x: ["7", 0, 99], y: ["7"] } },
+  };
+  assert.deepEqual([...upstreamClosure(g, ["8"])], ["8"]);
+});
+
+test("#1871 upstreamClosure keeps a node referenced by a top-level pair even when the id is not a STRING — validate_inputs looks it up unguarded", () => {
+  // execution.py validate_inputs does `o_id = val[0]; prompt[o_id]['class_type']` for
+  // ANY length-2 list input. Keeping a superset of what the executor's stricter is_link
+  // walks is the safe side: pruning such a node away would turn the retry into an
+  // exception_during_validation.
+  const g = {
+    "7": { class_type: "Loader", inputs: {} },
+    "8": { class_type: "Consumer", inputs: { x: [7, 0] } },
+  };
+  assert.deepEqual([...upstreamClosure(g, ["8"])].sort(), ["7", "8"]);
 });
 
 test("#1871 upstreamClosure ignores a link-shaped value naming a node that is not in the prompt", () => {
@@ -224,6 +256,26 @@ test("#1871 prunedRetryForRejection: the reported case — a 400 naming an out-o
   assert.equal(out.namedNode, "56");
   assert.deepEqual(out.removed.sort(), ["56", "57"]);
   assert.deepEqual(Object.keys(JSON.parse(out.text).prompt).sort(), ["1", "2", "3", "40", "43"]);
+});
+
+test("#1871 prunedRetryForRejection: a widget value that merely CONTAINS the refused node's id does not suppress the retry", () => {
+  // codex gate r1, P1 — the regression this pins. Node 43's settings hold a coordinate
+  // pair `["56", 0]` nested in an object. Scanning into widget values put 56 in the
+  // closure, so the retry was declined and the reporter's refusal came straight back.
+  const withWidgetData = {
+    ...TWO_BRANCH,
+    "43": { class_type: "SaveImage", inputs: { images: ["40", 0], meta: { crop: ["56", 0] } } },
+  };
+  const keep = upstreamClosure(withWidgetData, ["43"]);
+  assert.equal(keep.has("56"), false, "a nested pair is widget data, not a dependency");
+  return prunedRetryForRejection(
+    jsonResponse(400, rejection(56)),
+    bodyFor(withWidgetData, ["43"]),
+    ["43"],
+  ).then((out) => {
+    assert.ok(out, "the run is still retried");
+    assert.deepEqual(out.removed.sort(), ["56", "57"]);
+  });
 });
 
 test("#1871 prunedRetryForRejection: a missing node INSIDE the requested branch is NOT retried — pruning cannot fix it and the clear answer is the useful one", async () => {
