@@ -558,8 +558,11 @@ export function detachedConversionRefusal({ what, detached }) {
     `either from happening. This is a stale canvas, not a bad selection: it follows a ` +
     `ComfyUI restart, or an extension detaching a node without removing it. Reload the ` +
     `ComfyUI page to rebuild the graph (save first — panel_save_workflow), then retry. ` +
-    `Every other panel tool keeps working meanwhile; subgraph conversion is the one that ` +
-    `touches this back-reference.`
+    // NOT "every other panel tool keeps working meanwhile" (gate r4): a detached node
+    // throws out of the disconnect paths too, so that would be another claim wider than
+    // anything measured here — the exact habit this file exists to break.
+    `Tools that never ask this node to do graph work are unaffected, but anything that ` +
+    `disconnects or removes it can hit the same throw.`
   );
 }
 

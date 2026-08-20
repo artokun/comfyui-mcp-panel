@@ -210,6 +210,13 @@ test("the refusal names the consequence of the ROLE it found, not the other one"
   assert.match(both, /node 2 in your selection, and node 1 wired to it/);
   assert.match(both, /throw at disconnectInput/);
   assert.match(both, /in the reconnect pass/);
+
+  // gate r4: "every other panel tool keeps working meanwhile" was not true either — a
+  // detached node throws out of the disconnect paths too. Same habit, smaller stakes.
+  for (const msg of [picked, neighbour, both]) {
+    assert.doesNotMatch(msg, /Every other panel tool keeps working/);
+    assert.match(msg, /anything that disconnects or removes it can hit the same throw/);
+  }
 });
 
 /* -------------------------------------------------------------------------- */
