@@ -50,7 +50,7 @@ function buildDiff() {
   const factory = new Function(
     "slotRenameLines",
     "canonicalNodeId",
-    `${body}\nreturn { diffGraphsForAgent, widgetName, resolvedWidgetName };`,
+    `${body}\nreturn { diffGraphsForAgent, resolvedWidgetName };`,
   );
   return factory(slotRenameLines, canonicalNodeId);
 }

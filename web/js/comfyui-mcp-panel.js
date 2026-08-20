@@ -8885,21 +8885,20 @@ const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
 // Serialized link = [id, origin_id, origin_slot, target_id, target_slot, type].
 // Compare by ENDPOINTS (link ids churn on every edit), not by id.
 const linkKey = (l) => `${l[1]}:${l[2]}->${l[3]}:${l[4]}`;
-// The live widget's NAME for a serialized `widgets_values` index, or null when it
-// cannot be resolved. Separate from widgetName() below because the two answers are
-// used differently: the DISPLAY falls back to a positional `#i`, while a #1498
-// claim must not be recorded at all without a name — the reconciliation looks the
-// widget back up BY NAME, exactly as the graph readers key it, and `#3` is not a
-// name any reader would find.
+// The live widget's NAME for a serialized `widgets_values` index, or NULL when it
+// cannot be resolved.
+//
+// #1498 — null rather than the old `#i` fallback, because the two answers are not
+// interchangeable any more. The DISPLAY still falls back to the positional `#i`, at
+// the one line that renders it; a CLAIM must not be recorded without a name at all,
+// since the reconciliation looks the widget back up BY NAME — exactly as the graph
+// readers key it — and `#3` is not a name any reader would find.
 function resolvedWidgetName(liveGraph, nodeId, i) {
   try {
     const w = liveGraph?.getNodeById?.(canonicalNodeId(nodeId))?.widgets?.[i];
     if (w && typeof w.name === "string" && w.name) return w.name;
   } catch {}
   return null;
-}
-function widgetName(liveGraph, nodeId, i) {
-  return resolvedWidgetName(liveGraph, nodeId, i) ?? `#${i}`;
 }
 function shortVal(v) {
   const s = String(typeof v === "string" ? v : (JSON.stringify(v) ?? "")).replace(/\s+/g, " ");
