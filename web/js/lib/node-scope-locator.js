@@ -31,6 +31,26 @@
  * unexpected shape simply ends that branch — a diagnostic that throws would replace a
  * bad error with a worse one.
  *
+ * NOT-FOUND AND COULD-NOT-LOOK ARE DIFFERENT ANSWERS (#1501). Failing closed is right;
+ * reporting the failure as a finding is not. `null` used to mean all three of "searched
+ * every scope and it is absent", "the walk threw part-way", and "that id is not a shape
+ * I can look up" — and the only one of the three the caller could spell was the first:
+ * "The id may be from a different workflow, or the node was removed." So a malformed
+ * graph or a throwing getter on a third-party node was published to the agent as a
+ * positive statement about the node's ABSENCE. The walk reads arbitrary third-party node
+ * objects (`n.subgraph`, `n.title`, `n.type`), so this is reachable rather than
+ * theoretical. `null` now means only "searched and absent"; "could not look" comes back
+ * as `{ unsearchable }` and the message says so instead of guessing.
+ *
+ * A QUALIFIED ID IS A REAL ID (#1501, artokun/comfyui-mcp#1425). The walk matched on
+ * `Number(id)`, so `120:104` — the form the READ tools deliberately hand out once a
+ * subgraph has been unpacked — came out NaN and the locator returned before searching
+ * anything. The node existed, was addressable, and the diagnostic said it was from a
+ * different workflow: worse than silence, because it points the reader at a
+ * workflow-identity problem that does not exist. Ids are now compared the way
+ * `canonicalNodeId` resolves them — a qualified id by its string key, everything else
+ * numerically, exactly as before.
+ *
  * `MAX_DEPTH` IS THE SAFETY PROPERTY; `seen` IS AN OPTIMIZATION. Worth stating because
  * the reverse is the natural assumption. `MAX_DEPTH` bounds the one case nothing else
  * does — an unbounded ACYCLIC chain, where every level is a distinct object and `seen`
@@ -45,6 +65,8 @@
  * the only one, because picking one and calling it "the" location would be a guess
  * with a plausible-looking shape.
  */
+
+import { isQualifiedNodeId } from "./node-id.js";
 
 /** Depth guard for a pathological/looping graph. Real workflows nest a handful deep. */
 const MAX_DEPTH = 12;
@@ -69,24 +91,54 @@ function nodesOf(graph) {
 }
 
 /**
+ * Why a search produced no location. Both mean "I could not look", never "it is
+ * not there" — see the `{ unsearchable }` note in the module header.
+ *
+ * `"walk-threw"`  the graph walk raised part-way through; scopes remain unsearched.
+ * `"id-shape"`    the id is neither an integer nor a subgraph-qualified id, so there
+ *                 was no key to look for and nothing was searched at all.
+ */
+const UNSEARCHABLE_REASONS = ["walk-threw", "id-shape"];
+
+/** True for the "could not look" result, so a caller can never mistake it for a miss. */
+export function isUnsearchable(result) {
+  return Boolean(result) && UNSEARCHABLE_REASONS.includes(result.unsearchable);
+}
+
+/**
  * Find a node by its LOCAL id anywhere in the workflow, reporting the route to it.
  *
+ * THREE ANSWERS, NOT TWO (#1501). `null` means the search RAN and the id is absent —
+ * only a caller holding that value may say the node is not here. A `{ unsearchable }`
+ * result means the search could not run or could not finish, and the caller must say
+ * that instead of guessing at absence.
+ *
  * @param {object} rootGraph the workflow's root graph
- * @param {number|string} nodeId the local id being looked up
- * @returns {null | {scope: "root"|"subgraph", hostPath: Array<{id: any, title: string}>}}
+ * @param {number|string} nodeId the local id being looked up — an integer, a numeric
+ *   string, or a subgraph-qualified id such as `"120:104"` (comfyui-mcp#1425)
+ * @returns {null | {unsearchable: string} | {scope: "root"|"subgraph", hostPath: Array<{id: any, title: string}>}}
  *   `hostPath` is the chain of subgraph HOST nodes to enter, outermost first; empty
  *   for a node on the root graph.
  */
 export function locateNodeAcrossScopes(rootGraph, nodeId) {
-  const target = Number(nodeId);
-  if (!Number.isFinite(target)) return null;
+  // A qualified id is a LiteGraph object key, matched as the string it is; anything
+  // else keeps the numeric comparison unchanged, so a plain id behaves exactly as
+  // before (including the numeric-string surface: `Number("5548") === 5548`, and live
+  // ComfyUI ids really are strings). Parsing a qualified id is the one thing that must
+  // not happen — `parseInt("263:78")` is 263, a different real node.
+  const qualified = isQualifiedNodeId(nodeId);
+  const target = qualified ? nodeId : Number(nodeId);
+  if (!qualified && !Number.isFinite(target)) return { unsearchable: "id-shape" };
+  const matches = qualified
+    ? (n) => n?.id != null && String(n.id) === target
+    : (n) => Number(n?.id) === target;
   const seen = new Set();
 
   const walk = (graph, hostPath, depth) => {
     if (!graph || depth > MAX_DEPTH || seen.has(graph)) return null;
     seen.add(graph);
     for (const n of nodesOf(graph)) {
-      if (Number(n?.id) === target) {
+      if (matches(n)) {
         return { scope: hostPath.length ? "subgraph" : "root", hostPath };
       }
     }
@@ -103,7 +155,8 @@ export function locateNodeAcrossScopes(rootGraph, nodeId) {
   try {
     return walk(rootGraph, [], 0);
   } catch {
-    return null; // a diagnostic must never throw
+    // Still non-throwing — but no longer indistinguishable from a completed search.
+    return { unsearchable: "walk-threw" };
   }
 }
 
@@ -191,6 +244,25 @@ export function describeMissingNode(nodeId, rootGraph, viewingRoot, currentGraph
   if (!rootGraph) return ids ? `${base}. ${ids}` : base;
 
   const found = locateNodeAcrossScopes(rootGraph, nodeId);
+
+  // #1501 — "I could not look" must never be published as "it is not there". Both of
+  // these used to fall into the genuine-miss branch below and assert absence.
+  if (isUnsearchable(found)) {
+    const why =
+      found.unsearchable === "id-shape"
+        ? `no wider search was possible: ${JSON.stringify(String(nodeId))} is not an id ` +
+          `shape this panel can look up (expected an integer, or a subgraph-qualified ` +
+          `id such as 120:104 — the form the read tools emit once a subgraph is unpacked)`
+        : `the wider search could NOT be completed: reading this workflow's graph threw ` +
+          `part-way through, so some scopes were never searched`;
+    return (
+      `${base} — and ${why}. Whether node ${nodeId} exists in another scope is ` +
+      `UNKNOWN: this is NOT a statement that it was removed or that the id belongs to ` +
+      `a different workflow. ` +
+      (ids || `Re-read with panel_graph_outline before retrying.`)
+    );
+  }
+
   if (!found) {
     const subs = countSubgraphs(rootGraph);
     return (

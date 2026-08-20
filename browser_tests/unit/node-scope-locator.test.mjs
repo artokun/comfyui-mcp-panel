@@ -4,6 +4,7 @@ import {
   locateNodeAcrossScopes,
   countSubgraphs,
   describeMissingNode,
+  isUnsearchable,
 } from "../../web/js/lib/node-scope-locator.js";
 
 /**
@@ -82,9 +83,14 @@ test("a DEEP acyclic chain is bounded — `seen` never fires when every level is
 test("malformed graphs never throw — a diagnostic must not fail", () => {
   for (const bad of [null, undefined, 42, "x", {}, { _nodes: "nope" }]) {
     assert.doesNotThrow(() => locateNodeAcrossScopes(bad, 1));
+    // These are searchABLE — there is simply nothing in them. A completed search
+    // that found nothing is `null`, and stays `null`.
     assert.equal(locateNodeAcrossScopes(bad, 1), null);
   }
-  assert.equal(locateNodeAcrossScopes(sub([node(1)]), "not-a-number"), null);
+  // …whereas an id the walk cannot key on was never searched at all (#1501).
+  assert.deepEqual(locateNodeAcrossScopes(sub([node(1)]), "not-a-number"), {
+    unsearchable: "id-shape",
+  });
 });
 
 // ── the message ───────────────────────────────────────────────────────────
@@ -258,6 +264,121 @@ test("#1298 a current graph with no root still names live ids", () => {
 test("#1298 current-id listing never throws", () => {
   const root = { get _nodes() { throw new Error("boom"); } };
   assert.doesNotThrow(() => describeMissingNode(1, root, true));
+});
+
+// ── #1501 "could not look" is not "it is not there" ───────────────────────
+//
+// The same shape as #1495 twice more: a diagnostic that cannot find a node reported
+// "it does not exist" when what happened was "I could not look". `null` was doing
+// three jobs — searched-and-absent, the walk threw, and the id was not a shape the
+// walk could key on — and the caller could only spell the first of them.
+
+test("#1501 a walk that THREW is not reported as a completed search", () => {
+  // The issue's own scenario: the walk touches arbitrary third-party node objects,
+  // so `n.subgraph` can throw. Before, that came back as `null` — identical to a
+  // finished search that found nothing.
+  const hostile = { id: 9, get subgraph() { throw new Error("third-party getter"); } };
+  const root = sub([node(1), hostile]);
+  const result = locateNodeAcrossScopes(root, 999);
+  assert.ok(isUnsearchable(result), "a thrown walk must not masquerade as a miss");
+  assert.equal(result.unsearchable, "walk-threw");
+  assert.notEqual(result, null);
+});
+
+test("#1501 a thrown walk still never throws out of the diagnostic", () => {
+  const root = { get _nodes() { throw new Error("boom"); } };
+  assert.doesNotThrow(() => locateNodeAcrossScopes(root, 1));
+  assert.doesNotThrow(() => describeMissingNode(1, root, true, root));
+});
+
+test("#1501 a thrown walk says UNKNOWN instead of claiming the node is gone", () => {
+  const hostile = { id: 9, type: "Hostile", get subgraph() { throw new Error("nope"); } };
+  const root = sub([node(1, { type: "CheckpointLoaderSimple" }), hostile]);
+  const msg = describeMissingNode(999, root, true, root);
+  assert.match(msg, /^No node with id 999/);
+  // The three lies, gone.
+  assert.ok(!/may be from a different workflow/.test(msg), "it never searched for that");
+  assert.ok(!/the node was removed/.test(msg), "absence was never established");
+  assert.ok(!/not in any other scope either/.test(msg), "other scopes went unsearched");
+  // …replaced by what actually happened.
+  assert.match(msg, /could NOT be completed/);
+  assert.match(msg, /UNKNOWN/);
+  // and it still hands back something the caller can act on
+  assert.match(msg, /1 \(CheckpointLoaderSimple\)/);
+});
+
+test("#1501 an id shape the walk cannot key on is not searched, and says so", () => {
+  const root = sub([node(1, { type: "KSampler" })]);
+  const msg = describeMissingNode("not-a-number", root, true, root);
+  assert.match(msg, /^No node with id not-a-number/);
+  assert.ok(!/may be from a different workflow/.test(msg));
+  assert.ok(!/not in any other scope either/.test(msg));
+  assert.match(msg, /no wider search was possible/);
+  assert.match(msg, /subgraph-qualified/);
+  assert.match(msg, /UNKNOWN/);
+});
+
+test("#1501 a genuine miss is still a genuine miss — the fix does not blanket everything", () => {
+  // Load-bearing: if "unknown" swallowed the real absence case too, #1298's retarget
+  // path would be lost and the message would stop being actionable.
+  const root = sub([node(1), node(9, { subgraph: sub([node(2)]) })]);
+  const msg = describeMissingNode(999, root, true);
+  assert.equal(isUnsearchable(locateNodeAcrossScopes(root, 999)), false);
+  assert.equal(locateNodeAcrossScopes(root, 999), null);
+  assert.match(msg, /not in any other scope either/);
+  assert.match(msg, /may be from a different workflow/);
+  assert.ok(!/UNKNOWN/.test(msg));
+});
+
+// ── #1501 a QUALIFIED id is a real id (artokun/comfyui-mcp#1425) ──────────
+//
+// `Number("120:104")` is NaN, so the locator returned before searching anything and
+// the caller announced a workflow-identity problem for an id shape the read tools
+// deliberately hand out after a subgraph is unpacked.
+
+test("#1501 a qualified id on the root graph is FOUND, not blamed on another workflow", () => {
+  const root = sub([node("120:104", { type: "KSampler" }), node("120:113", { type: "VAEDecode" })]);
+  const hit = locateNodeAcrossScopes(root, "120:104");
+  assert.equal(hit.scope, "root");
+  assert.deepEqual(hit.hostPath, []);
+  const msg = describeMissingNode("120:104", root, true, root);
+  assert.ok(!/may be from a different workflow/.test(msg), "it came from this graph");
+  assert.ok(!/not in any other scope either/.test(msg));
+  assert.match(msg, /IS on the root graph/);
+});
+
+test("#1501 a qualified id inside a subgraph gets the route, like any other id", () => {
+  const inner = sub([node("263:78", { type: "CLIPTextEncode" })]);
+  const root = sub([node(1), node(9, { title: "Refiner", subgraph: inner })]);
+  const hit = locateNodeAcrossScopes(root, "263:78");
+  assert.equal(hit.scope, "subgraph");
+  assert.deepEqual(hit.hostPath, [{ id: 9, title: "Refiner" }]);
+  const msg = describeMissingNode("263:78", root, true, root);
+  assert.match(msg, /lives INSIDE a subgraph/);
+  assert.match(msg, /panel_enter_subgraph\(9\)/);
+});
+
+test("#1501 a qualified id that really is absent still reports a completed search", () => {
+  const root = sub([node("120:104")]);
+  assert.equal(locateNodeAcrossScopes(root, "999:1"), null);
+  assert.match(describeMissingNode("999:1", root, true), /not in any other scope either/);
+});
+
+test("#1501 a qualified id is never PARSED into the different node its prefix names", () => {
+  // `parseInt("120:104")` is 120 — a real, different node. Matching it would turn a
+  // loud miss into a confident pointer at the wrong node.
+  const root = sub([node(120, { type: "Host" }), node(104, { type: "Other" })]);
+  assert.equal(locateNodeAcrossScopes(root, "120:104"), null);
+  // and the reverse: a plain id must not be answered by a qualified node
+  assert.equal(locateNodeAcrossScopes(sub([node("120:104")]), 120), null);
+});
+
+test("#1501 plain and numeric-string ids are matched exactly as before", () => {
+  // Live ComfyUI ids are strings, so the numeric comparison is the load-bearing one.
+  const root = sub([node("5548", { type: "SaveImage" })]);
+  assert.equal(locateNodeAcrossScopes(root, 5548).scope, "root");
+  assert.equal(locateNodeAcrossScopes(root, "5548").scope, "root");
+  assert.equal(locateNodeAcrossScopes(sub([node(7)]), 7).scope, "root");
 });
 
 // ── WIRING ────────────────────────────────────────────────────────────────
