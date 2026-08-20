@@ -69,6 +69,22 @@ function targetPath(wf, base) {
   return normalizePath(`${directoryOf(wf)}${base}${workflowExt(wf)}`);
 }
 
+/** #1535 — TRUE when this workflow's own file already sits at the ".app.json" sibling of
+ *  `base`, i.e. its path is exactly what targetPath() would produce for `base` if the
+ *  mode said "app". That is the one state in which the filename+mode reconstruction is
+ *  LOSSY: getFilenameDetails strips the compound ".app.json", so `filename` carries no
+ *  ".app" to rebuild it from, and `initialMode` — read from the file's own
+ *  `extra.linearMode` at load — has nothing to say about a workflow whose App Mode was
+ *  configured afterwards. Comparing full paths (not suffixes) keeps this to the workflow's
+ *  OWN file: a different directory, a different stem, or an external/URL-derived path
+ *  (directoryOf redirects those to the workflows root) simply does not match. */
+function pathIsAppSuffixedSiblingOf(wf, base) {
+  if (!base) return false;
+  const path = normalizePath(wf?.path);
+  if (!path) return false;
+  return normalizePath(`${directoryOf(wf)}${base}${APP_JSON_EXT}`) === path;
+}
+
 /** A readable, TOTAL description of a thrown value for an error message. Deliberately
  *  local and defensive: `String(err)` on a plain object yields "[object Object]", and
  *  `JSON.stringify` returns UNDEFINED for an object whose `toJSON()` does — so neither is
@@ -651,14 +667,60 @@ export async function saveActiveWorkflow(
   // strip it again to "Foo" and misjudge a Save-As to "Foo" as an in-place save.
   //
   // The effective target name is the explicit/auto name for a Save-As, else the
-  // workflow's CURRENT name — because even a no-name save relocates when the
-  // mode-derived extension differs from the on-disk path (P0-b): an on-disk
+  // workflow's CURRENT name — because even a no-name save can land somewhere else when
+  // the mode-derived extension differs from the on-disk path (P0-b): an on-disk
   // "Foo.json" opened with initialMode "app" has a mode-derived target of
-  // "Foo.app.json", so a plain `saveWorkflow` would MOVE "Foo.json" → "Foo.app.json"
-  // and consume the source. targetPath() applies the mode-correct extension.
+  // "Foo.app.json", so it is a RELOCATION and must go down the copy path rather than
+  // let ComfyUI's own service-level saveWorkflow MOVE "Foo.json" → "Foo.app.json" and
+  // consume the source (#226). targetPath() applies the mode-correct extension.
   const currentPath = normalizePath(wf.path);
   const effectiveName = desired || currentName;
-  const finalTargetPath = effectiveName ? targetPath(wf, effectiveName) : "";
+  // #1535 — EXCEPT that the reconstruction cannot round-trip a ".app.json" file, and a
+  // NO-NAME save of one was forking a plain ".json" beside it.
+  //
+  // The frontend's own getFilenameDetails strips the COMPOUND ".app.json" suffix, so a
+  // workflow at "workflows/X.app.json" reports `filename` "X" — the ".app" survives only
+  // in `path`. `initialMode` is the other half of the reconstruction, and it is populated
+  // from the FILE's `extra.linearMode` at load time; for a file whose App Mode was
+  // configured AFTER it was opened it stays unset (or "graph"), because
+  // graph_configure_app_mode writes `extra.linearMode` on the live root and never touches
+  // `initialMode`. Both halves then say "plain", the target came out "workflows/X.json",
+  // that read as a relocation, and the save routed itself down the Save-As COPY path: a
+  // NEW X.json appeared holding the caller's App Mode configuration, the reply said
+  // `saved_as: true`, and the X.app.json the caller was editing was never written. The
+  // caller is told the save succeeded while its work sits in a file it is not editing.
+  //
+  // The path is the identity that ROUND-TRIPS to the file on disk, so for a no-name save
+  // it wins — and the in-place branch really does write it: `saveInPlace` calls
+  // `svc.saveWorkflow(wf)`, where `svc` is the workflow STORE (`extensionManager.workflow`
+  // exposes saveAs / renameWorkflow / openWorkflows, not the service's saveWorkflowAs).
+  // The store's saveWorkflow is `wf.save()` → `UserFile.save({force:true})`, a write to
+  // `this.path`. Verified by execution on ComfyUI 0.33.2 / frontend 1.49.6 rather than by
+  // reading it: driven to `path` "workflows/X.app.json" with `initialMode` unset and
+  // `extra.linearMode` true, `svc.saveWorkflow(wf)` wrote X.app.json, left `wf.path`
+  // unchanged, and created no X.json beside it.
+  //
+  // DELIBERATELY ONE DIRECTION. The mirror case — an on-disk "Foo.json" whose content
+  // declares app mode, so the mode-derived target is "Foo.app.json" — is NOT changed and
+  // still goes down the non-destructive copy route (P0-b). That direction produces a file
+  // whose extension AGREES with its own content and leaves the source intact; this one
+  // produced a ".json" holding `linearMode: true`, an extension contradicting its content,
+  // while abandoning the consistent file that already existed. Only the lossy direction is
+  // repaired here.
+  //
+  // Everything else is untouched by construction: an EXPLICIT name still resolves through
+  // targetPath (that is how a ".app.json" is created in the first place, and re-deriving
+  // its extension from the source would turn `name:"X.app"` into "X.app.app.json"), a
+  // never-persisted tab still has its first file PLACED by targetPath (which also leaves
+  // grounding — it only ever saves a never-persisted workflow — alone), and an
+  // external/URL-derived source cannot match, because directoryOf() redirects those to
+  // the workflows root so the equality below can never hold for them.
+  const finalTargetPath =
+    !desired && !wasUnsaved && pathIsAppSuffixedSiblingOf(wf, currentName)
+      ? currentPath
+      : effectiveName
+        ? targetPath(wf, effectiveName)
+        : "";
 
   // A safe save requires a RESOLVED, non-empty target path. Without one — e.g. a
   // persisted workflow whose filename is empty/unresolved and no name was given —
