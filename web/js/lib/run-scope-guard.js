@@ -1119,10 +1119,31 @@ export function scopeDispatchError({ toNodeId, detail, verified, batch }) {
   );
 }
 
-// Capture the #358 top-level rejection / #370 prompt_id out of a /prompt
-// response that is ATTRIBUTED to this run. prompt_id is normalized to a string
-// at capture (0 and "0" are the same run).
-async function captureRunResponse(res, { onRejection, onPromptId }) {
+/**
+ * #1504 — node_errors on an ACCEPTED (200) reply are dropped outputs, not a refusal.
+ *
+ * ComfyUI's `validate_prompt` validates each output independently and keeps the ones
+ * that pass (`good_outputs`). When at least one survives, server.py takes the
+ * `if valid[0]:` branch — it mints a prompt id, calls `prompt_queue.put(...)`, and
+ * answers
+ *
+ *     web.json_response({"prompt_id": …, "number": …, "node_errors": valid[3]})
+ *
+ * with status **200**. So an accepted, already-executing prompt can carry a populated
+ * `node_errors` map naming the outputs it dropped ("Output will be ignored").
+ *
+ * That map is ALSO what the frontend stores: `app.queuePrompt` calls
+ * `recordNodeErrors(res.node_errors)` on the resolved (200) response, so
+ * `app.lastNodeErrors` is populated for a run that is on the GPU right now. Reading
+ * only that channel is what made graph_run answer "ComfyUI refused to queue the
+ * workflow" for six VAEDecode nodes whose branches were bypassed — while the render
+ * they belonged to was running, and every following graph read came back QUEUE BUSY.
+ *
+ * The 200 body is the authoritative, non-stale source for both halves: it says a
+ * prompt id was minted AND which outputs were dropped, in one structured receipt.
+ * `lastNodeErrors` cannot distinguish those two cases at all.
+ */
+async function captureRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors }) {
   try {
     const body = await res.clone().json();
     if (res.status !== 200) {
@@ -1131,9 +1152,18 @@ async function captureRunResponse(res, { onRejection, onPromptId }) {
       }
     } else if (body && body.prompt_id != null) {
       onPromptId?.(String(body.prompt_id));
+      reportAcceptedNodeErrors(body, onAcceptedNodeErrors);
     }
   } catch {
     // non-JSON body / clone unsupported — the caller falls back to lastNodeErrors.
+  }
+}
+
+/** Forward a 200 reply's non-empty `node_errors` (the #1504 partial-validation drops). */
+function reportAcceptedNodeErrors(body, onAcceptedNodeErrors) {
+  const ne = body?.node_errors;
+  if (ne && typeof ne === "object" && !Array.isArray(ne) && Object.keys(ne).length) {
+    onAcceptedNodeErrors?.(ne);
   }
 }
 
@@ -1143,13 +1173,14 @@ async function captureRunResponse(res, { onRejection, onPromptId }) {
 // captured through the established #358 channel); "malformed" for anything
 // else (2xx without a prompt_id, non-200 without a rejection body, unparseable
 // body, missing response). Only "accepted" may ever count as verified.
-async function classifyRunResponse(res, { onRejection, onPromptId }) {
+async function classifyRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors }) {
   if (!res) return "malformed";
   try {
     const body = await res.clone().json();
     if (res.status === 200) {
       if (body && body.prompt_id != null) {
         onPromptId?.(String(body.prompt_id));
+        reportAcceptedNodeErrors(body, onAcceptedNodeErrors); // #1504
         return "accepted";
       }
       return "malformed";
@@ -1172,11 +1203,16 @@ async function classifyRunResponse(res, { onRejection, onPromptId }) {
  * that error exists; and EVERY accepted prompt_id is captured for the recovery
  * ledger. Installed only for the duration of the queuePrompt call.
  */
-export function createRunFetchInterceptor({ origFetchApi, onRejection = null, onPromptId = null } = {}) {
+export function createRunFetchInterceptor({
+  origFetchApi,
+  onRejection = null,
+  onPromptId = null,
+  onAcceptedNodeErrors = null,
+} = {}) {
   return async function runFetchInterceptor(route, options) {
     const res = await origFetchApi(route, options);
     if (isPromptPost(route, options) && res) {
-      await captureRunResponse(res, { onRejection, onPromptId });
+      await captureRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors });
     }
     return res;
   };
@@ -1224,6 +1260,7 @@ export function createScopedRunGuard({
   repairScope = false,
   onRejection = null,
   onPromptId = null,
+  onAcceptedNodeErrors = null,
   onScopeDropped = null,
 } = {}) {
   const expected = (execIds ?? []).map(String);
@@ -1391,7 +1428,11 @@ export function createScopedRunGuard({
         notify();
         throw err; // the frontend sees exactly the failure it would have seen
       }
-      const verdict = await classifyRunResponse(res, { onRejection, onPromptId });
+      const verdict = await classifyRunResponse(res, {
+        onRejection,
+        onPromptId,
+        onAcceptedNodeErrors,
+      });
       // The request DID leave, so the reservation is now settled into a
       // definite outcome. A malformed response keeps the slot consumed on
       // purpose: the post reached ComfyUI and MAY have queued, and re-forwarding
@@ -1586,6 +1627,7 @@ export async function dispatchScopedRun({
   queueMark = null,
   onRejection = null,
   onPromptId = null,
+  onAcceptedNodeErrors = null,
 } = {}) {
   const mark = queueMark ?? newScopedQueueMark();
   // CHAIN COMPOSITION (codex gate r8). Both the entry-time capture below and
@@ -1709,6 +1751,7 @@ export async function dispatchScopedRun({
       repairScope: repair,
       onRejection,
       onPromptId,
+      onAcceptedNodeErrors,
     });
     apiTarget.fetchApi = guard;
     try {

@@ -31,13 +31,19 @@
  *   for a run-to-node partial run, naming the target the panel ALREADY verified
  *   advertises `output_node:true`. Used to explain a `prompt_no_outputs` refusal
  *   (#699) instead of passing the bare backend string through.
- * @returns {null | {queued:false, error?:string, error_type?:string, node_errors?:object}}
+ * @param {(string|number)[]} [args.acceptedPromptIds]  Every prompt_id ComfyUI MINTED
+ *   during this run, read out of a 200 POST /prompt body (#1504). A minted id is a
+ *   receipt of acceptance, not a flag the panel set, so it decides the verdict over
+ *   any per-node errors that accompany it.
+ * @returns {null | {queued:false, error?:string, error_type?:string, node_errors?:object,
+ *   prompt_id?:string, prompt_ids?:string[]}}
  *   `null` ⇒ accepted (report queued). Otherwise the failure to return verbatim.
  */
 export function summarizePromptRejection({
   rejection = null,
   lastNodeErrors = null,
   runToNode = null,
+  acceptedPromptIds = [],
 } = {}) {
   const topError = rejection && typeof rejection === "object" ? rejection.error ?? null : null;
   // Prefer the node_errors carried on the rejection body itself; fall back to
@@ -49,7 +55,36 @@ export function summarizePromptRejection({
   // No top-level error AND no per-node errors ⇒ the prompt was accepted.
   if (!hasTopError(topError) && !nodeErrors) return null;
 
+  // #1504 — A MINTED PROMPT ID OUTRANKS node_errors.
+  //
+  // ComfyUI validates each output independently. When some fail but at least one
+  // survives, `validate_prompt` returns True, server.py queues the prompt, and the
+  // reply is a **200** carrying `prompt_id` AND the `node_errors` for the outputs it
+  // dropped. The frontend records those on `app.lastNodeErrors` just the same, so the
+  // per-node channel alone cannot tell "refused" from "accepted, minus two branches".
+  //
+  // Reported as a refusal it produced the exact mismatch of #1504: six bypassed
+  // VAEDecode branches were surfaced as "ComfyUI refused to queue the workflow" while
+  // the render was on the GPU, and every subsequent graph call came back QUEUE BUSY —
+  // the caller was told nothing had been queued by the very run that was blocking it.
+  //
+  // The asymmetry that makes this safe is the same one mcp#944 relies on: `queued` is a
+  // flag the panel sets, but a prompt_id is an identifier ComfyUI MINTED, and server.py
+  // mints one only inside the `if valid[0]:` branch, after `prompt_queue.put(...)`. So
+  // an id present ⇒ work was accepted. #358 does not regress: a pure top-level rejection
+  // is a 400 that mints nothing, leaving this list empty.
+  //
+  // A top-level error still wins, because the two claims then contradict each other and
+  // this module must not pick a side — it reports BOTH (the ids ride along on the result)
+  // and lets the orchestrator send the caller to the queue to settle it.
+  const acceptedIds = normalizeAcceptedIds(acceptedPromptIds);
+  if (acceptedIds.length && !hasTopError(topError)) return null;
+
   const result = { queued: false };
+  if (acceptedIds.length) {
+    result.prompt_id = acceptedIds[0];
+    if (acceptedIds.length > 1) result.prompt_ids = [...acceptedIds];
+  }
   if (hasTopError(topError)) {
     result.error = formatTopError(topError);
     const type = typeof topError === "object" && topError ? topError.type : null;
@@ -125,6 +160,17 @@ function hasTopError(err) {
   return Boolean(err);
 }
 
+/** Accepted prompt ids as a deduped, order-preserving list of non-blank strings. */
+function normalizeAcceptedIds(ids) {
+  const out = [];
+  for (const raw of Array.isArray(ids) ? ids : []) {
+    if (raw == null) continue; // but 0 is a real id — only null/undefined are dropped
+    const id = String(raw).trim();
+    if (id !== "" && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
 function normalizeNodeErrors(ne) {
   if (ne && typeof ne === "object" && !Array.isArray(ne) && Object.keys(ne).length) return ne;
   return null;
@@ -137,12 +183,26 @@ function normalizeNodeErrors(ne) {
  * both depend on this. `prompt_id` is the first accepted id; `prompt_ids` is only
  * added for a batch that queued more than one.
  *
+ * #1504 — an accepted run may have DROPPED some outputs. ComfyUI reports those on the
+ * 200 body's `node_errors`, and they are reported here verbatim, on an otherwise normal
+ * accept. This is deliberately loud rather than silent: the failure it replaces claimed
+ * the whole run was refused, and staying quiet would be the opposite error — the caller
+ * would wait for a file that will never be written. The orchestrator renders it as the
+ * mcp#944 "[PARTIAL] … the remaining outputs ARE executing" disclosure, which until now
+ * was unreachable from the panel because the panel never sent a prompt_id alongside them.
+ *
  * @param {object} args
  * @param {number} args.batchCount
  * @param {(string|null)[]} [args.promptIds]  Accepted prompt_ids, in queue order.
  * @param {number|null} [args.ranToNode]      Present for a run-to-node partial run.
+ * @param {object|null} [args.droppedOutputs] `node_errors` from the ACCEPTED 200 reply.
  */
-export function buildQueueAcceptResult({ batchCount, promptIds = [], ranToNode = null } = {}) {
+export function buildQueueAcceptResult({
+  batchCount,
+  promptIds = [],
+  ranToNode = null,
+  droppedOutputs = null,
+} = {}) {
   // NORMALIZE to strings at this ingestion boundary (drop null/undefined) so the
   // reported prompt_id(s), and everything that later reconciles against them, are
   // string-vs-string — a numeric /prompt id can't slip through as a number (#370).
@@ -152,12 +212,14 @@ export function buildQueueAcceptResult({ batchCount, promptIds = [], ranToNode =
       (Array.isArray(promptIds) ? promptIds : []).filter((x) => x != null).map((x) => String(x)),
     ),
   ];
+  const dropped = normalizeNodeErrors(droppedOutputs);
   return {
     queued: true,
     batch_count: batchCount,
     ...(ids.length ? { prompt_id: ids[0] } : {}),
     ...(ids.length > 1 ? { prompt_ids: [...ids] } : {}),
     ...(ranToNode != null ? { ran_to_node: ranToNode } : {}),
+    ...(dropped ? { node_errors: dropped } : {}),
   };
 }
 
