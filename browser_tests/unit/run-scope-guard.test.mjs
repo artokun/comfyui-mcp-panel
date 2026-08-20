@@ -3433,3 +3433,210 @@ test("#752 a build that reads ONLY partialExecutionTargets is served NATIVELY, n
     stop()
   }
 })
+
+// ---------------------------------------------------------------------------
+// comfyui-mcp#1871 — a run-to-node refused over a node on ANOTHER branch.
+//
+// ComfyUI's validate_prompt checks that every node in the POSTED prompt resolves
+// to an installed class before it narrows execution to partial_execution_targets
+// (0.33.2 execution.py: the two early returns come three lines above the
+// `x in partial_execution_list` test). So the reporter's Topaz nodes 56/57 — not
+// upstream of the node 43 they asked for, and never going to execute — refused the
+// whole run.
+//
+// These drive the REAL orchestration: dispatchScopedRun through a mock frontend and
+// a server double that answers exactly as ComfyUI 0.33.2 does.
+// ---------------------------------------------------------------------------
+
+// One checkpoint, two independent output branches. 43 is the branch asked for.
+const TWO_BRANCH_OUTPUT = {
+  "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "sd.safetensors" } },
+  "3": { class_type: "KSampler", inputs: { model: ["1", 0], seed: 42 } },
+  "40": { class_type: "VAEDecode", inputs: { samples: ["3", 0], vae: ["1", 2] } },
+  "43": { class_type: "SaveImage", inputs: { images: ["40", 0] } },
+  "56": { class_type: "TopazUpscale", inputs: { image: ["40", 0] } },
+  "57": { class_type: "SaveImage", inputs: { images: ["56", 0] } },
+};
+
+// ComfyUI's own rejection shape for a class it cannot resolve (execution.py 0.33.2).
+const missingNodeRejection = (nodeId, classType) => ({
+  error: {
+    type: "missing_node_type",
+    message: `Node '${classType}' not found. The custom node may not be installed.`,
+    details: `Node ID '#${nodeId}'`,
+    extra_info: { node_id: String(nodeId), class_type: classType, node_title: classType },
+  },
+  node_errors: {},
+});
+
+test("#1871 integration: ComfyUI refuses over an out-of-scope node ⇒ ONE pruned re-post queues the requested branch", async () => {
+  const stop = keepAlive();
+  try {
+    let n = 0;
+    const server = makeServer(async () => {
+      n++;
+      // First post: the whole prompt, refused over node 56 — exactly the report.
+      if (n === 1) return jsonResponse(400, missingNodeRejection(56, "TopazUpscale"));
+      return jsonResponse(200, { prompt_id: "srv-pruned" });
+    });
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    const ids = [];
+    const rejections = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["43"], batch: 1, toNodeId: 43,
+      onPromptId: (p) => ids.push(p),
+      onRejection: (r) => rejections.push(r),
+    });
+
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.verified, 1);
+    assert.deepEqual(ids, ["srv-pruned"]);
+    // The refusal that queued nothing must NOT be reported as this run's outcome —
+    // graph_run turns a captured rejection into a failure, and the run succeeded.
+    assert.deepEqual(rejections, [], "the superseded refusal is not surfaced as the run's verdict");
+
+    assert.equal(server.calls.length, 2, "exactly one extra post — never a loop");
+    const first = JSON.parse(server.calls[0].options.body);
+    const second = JSON.parse(server.calls[1].options.body);
+    assert.deepEqual(Object.keys(first.prompt).sort(), ["1", "3", "40", "43", "56", "57"]);
+    assert.deepEqual(
+      Object.keys(second.prompt).sort(),
+      ["1", "3", "40", "43"],
+      "the second post carries the backward closure of node 43 and nothing else",
+    );
+    assert.deepEqual(second.partial_execution_targets, ["43"], "the scope still travels");
+    assert.equal(second.number, result.queueMark, "the pruned post still carries THIS run's identity");
+
+    // DISCLOSED, not silent: the caller is told their ComfyUI refused the first post.
+    assert.deepEqual(result.prunedRetry.removed.sort(), ["56", "57"]);
+    assert.equal(result.prunedRetry.namedNode, "56");
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 integration: a missing node INSIDE the requested branch is reported, not retried", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer(async () => jsonResponse(400, missingNodeRejection(40, "VAEDecode")));
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    const rejections = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["43"], batch: 1, toNodeId: 43,
+      onRejection: (r) => rejections.push(r),
+    });
+    assert.equal(server.calls.length, 1, "pruning cannot fix it, so nothing is re-posted");
+    assert.equal(result.prunedRetry, null);
+    assert.equal(rejections.length, 1);
+    assert.equal(rejections[0].error.extra_info.node_id, "40", "the caller gets the answer that matters");
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 integration: a run ComfyUI ACCEPTS is untouched — one post, no prune, even with a prunable other branch", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["43"], batch: 1, toNodeId: 43 });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(server.calls.length, 1, "the happy path never pays a second round trip");
+    assert.equal(result.prunedRetry, null);
+    // The prompt ComfyUI received is the one the frontend built — the other branch is
+    // still in it, so its cached outputs are not evicted by this run (execution.py
+    // set_prompt(prompt.keys()) + clean_unused).
+    assert.deepEqual(Object.keys(JSON.parse(server.calls[0].options.body).prompt).sort(), [
+      "1", "3", "40", "43", "56", "57",
+    ]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 integration: when the pruned post is ALSO refused, the SECOND rejection is the one reported", async () => {
+  const stop = keepAlive();
+  try {
+    let n = 0;
+    const server = makeServer(async () => {
+      n++;
+      if (n === 1) return jsonResponse(400, missingNodeRejection(56, "TopazUpscale"));
+      return jsonResponse(400, missingNodeRejection(3, "KSampler"));
+    });
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    const rejections = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["43"], batch: 1, toNodeId: 43,
+      onRejection: (r) => rejections.push(r),
+    });
+    assert.equal(server.calls.length, 2);
+    assert.equal(result.verified, 0);
+    assert.equal(rejections.length, 1, "one verdict, not two");
+    assert.equal(
+      rejections[0].error.extra_info.node_id,
+      "3",
+      "the reported blocker is the one inside the requested branch",
+    );
+    assert.equal(result.prunedRetry.namedNode, "56", "the superseded refusal is still disclosed");
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 integration: an UNSCOPED run is never pruned — the caller asked for the whole graph", async () => {
+  const stop = keepAlive();
+  try {
+    let n = 0;
+    const server = makeServer(async () => {
+      n++;
+      return jsonResponse(400, missingNodeRejection(56, "TopazUpscale"));
+    });
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: TWO_BRANCH_OUTPUT });
+    // The unscoped path uses the historical capture wrap, which has no scope and no
+    // prune: a full run that names a missing node is a real failure of what was asked.
+    const rejections = [];
+    apiTarget.fetchApi = createRunFetchInterceptor({
+      origFetchApi: server,
+      onRejection: (r) => rejections.push(r),
+    });
+    await app.queuePrompt(0, 1, undefined);
+    assert.equal(server.calls.length, 1);
+    assert.equal(rejections.length, 1);
+    assert.equal(n, 1);
+  } finally {
+    stop();
+  }
+});
+
+test("#1871 WIRING: graph_run actually RENDERS the pruned-retry disclosure into the run result", () => {
+  // The guard can record the retry perfectly and the caller still never hear about
+  // it — a one-line assignment in the reply builder is exactly the kind of install
+  // a lib-level test cannot see. So this asserts on the call site itself.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8");
+  assert.match(
+    source,
+    /import \{ prunedRetryNote \} from "\.\/lib\/partial-run-prune\.js";/,
+    "the panel imports the note builder",
+  );
+  const start = source.indexOf("runScopeResult?.prunedRetry");
+  assert.ok(start > 0, "the reply builder reads the recorded retry");
+  const raw = source.slice(start, source.indexOf("\n    }", start));
+  assert.match(raw, /accept\.excluded_nodes_omitted/, "the omitted node ids reach the result");
+  assert.match(raw, /accept\.excluded_nodes_note = prunedRetryNote\(/, "and the sentence is built from them");
+  assert.match(raw, /toNodeId: to_node_id/, "the note names the node the caller asked for");
+  assert.match(raw, /namedNode: pr\.namedNode/, "and the node ComfyUI refused");
+  // codex gate r2, P1 — the note says the pruned prompt is the one ComfyUI ACCEPTED.
+  // A retry that was itself refused must never reach it, and that must be true of
+  // this line rather than of three early returns further up.
+  assert.match(
+    source.slice(start - 200, start + 120),
+    /runScopeResult\.verified > 0/,
+    "the acceptance claim is gated on a post ComfyUI actually accepted",
+  );
+});

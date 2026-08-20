@@ -5,6 +5,13 @@ import { tr } from "./i18n.js";
 // input its handler overwrites) already live in scoped-batch-seed.js; this file
 // imports the verdict rather than restating them.
 import { rgthreeQueueTimeSeedInput } from "./scoped-batch-seed.js";
+// comfyui-mcp#1871 — ComfyUI's prompt validation requires EVERY node in the posted
+// prompt to resolve to an installed class before it narrows execution to
+// partial_execution_targets, so one unavailable pack on an unrelated branch vetoes a
+// run-to-node of a branch that does not touch it. The measured upstream facts, the
+// backward-closure walk, and the structured test that licenses a second post live in
+// partial-run-prune.js; this file imports the verdict.
+import { prunedRetryForRejection } from "./partial-run-prune.js";
 // #1273 — the THIRD volatility signal: cg-use-everywhere materialises its
 // broadcast links into the prompt inside its own queuePrompt patch, so the
 // inputs it will inject are queue-time volatile too. The measured facts about
@@ -1221,7 +1228,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null, repairedFromKeys: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null, repairedFromKeys: null, prunedRetry: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -1349,6 +1356,20 @@ export function createScopedRunGuard({
       let res;
       try {
         res = await origFetchApi(route, forwardOptions);
+        // comfyui-mcp#1871 — ComfyUI refuses a prompt whose OTHER branch names a class
+        // this server does not have, before it ever looks at partial_execution_targets.
+        // That refusal queued nothing (structured proof: non-2xx, a top-level `error`,
+        // no prompt_id), and the node it names is one this run's own scope excluded —
+        // so the requested branch gets ONE more post, with the excluded nodes left out.
+        // Null for every other outcome, including an accepted prompt: a run ComfyUI
+        // takes never reaches a second post, and the response below is the first one.
+        const retry = await prunedRetryForRejection(res, forwardOptions?.body, expected);
+        if (retry) {
+          // Record BEFORE the post, so a retry that throws is still disclosed as having
+          // been attempted rather than vanishing into the dispatch-failure message.
+          state.prunedRetry = { namedNode: retry.namedNode, removed: retry.removed };
+          res = await origFetchApi(route, { ...forwardOptions, body: retry.text });
+        }
       } catch (err) {
         // INDETERMINATE, not "never arrived" (codex gate r6). A fetch can throw
         // after ComfyUI already received and queued the prompt — a reset while
@@ -1813,6 +1834,10 @@ export async function dispatchScopedRun({
     }
     // r6: the dispatch itself failed (fetch threw / malformed response) —
     // terminal, truthful, NEVER queued:true.
+    // comfyui-mcp#1871 — every terminal return carries `prunedRetry`: when ComfyUI
+    // refused the first post over a node on ANOTHER branch and the run only queued
+    // because a second post left that branch out, this is the only place the caller
+    // can learn it happened. Null on every run that was accepted first time.
     if (guard.state.failed != null) {
       return {
         outcome: "failed",
@@ -1820,6 +1845,7 @@ export async function dispatchScopedRun({
         verified: guard.state.observed,
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
+        prunedRetry: guard.state.prunedRetry,
         error: guard.state.failed +
           (!retireGuard
             ? " The scope guard stays installed as a sentinel for the rest of this page session."
@@ -1839,6 +1865,7 @@ export async function dispatchScopedRun({
         repairedFromKeys: guard.state.repairedFromKeys,
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
+        prunedRetry: guard.state.prunedRetry,
       };
     }
     // The FULL batch verified — genuinely dispatched (r5: never on a partial).
@@ -1865,6 +1892,7 @@ export async function dispatchScopedRun({
         overrunNote: guard.state.overrunError,
         indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
+        prunedRetry: guard.state.prunedRetry,
       };
     }
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
@@ -1891,6 +1919,7 @@ export async function dispatchScopedRun({
       verified: guard.state.observed,
       indeterminate: guard.state.indeterminate,
       volatileInputs: volatileList,
+      prunedRetry: guard.state.prunedRetry,
       error: scopePartialBatchError({
         toNodeId,
         verified: guard.state.observed,
