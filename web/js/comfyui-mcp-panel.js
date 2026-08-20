@@ -15067,12 +15067,17 @@ const GRAPH_TOOL_EXECUTORS = {
               // Name the drift that was OBSERVED — the reading taken BEFORE the restore
               // attempt. Re-reading node.size here would report whatever the failed
               // writeSize left behind (a widget-minimum clamp), which is our own number
-              // rather than the drift the caller needs to see. And do not promise a
-              // rollback: the size is precisely what would not go back. Every other
-              // captured field is restored below, and the edit is refused.
+              // rather than the drift the caller needs to see.
+              //
+              // State NOTHING about where the size ends up. It is not the captured value
+              // (that is what just failed to go back), and it is not the value this write
+              // left either: the catch below runs restore(), which writes size AGAIN and
+              // then re-runs refreshNodeArea/updateArea — measured, that carries the
+              // fixture from 580 to 600 to 800. Any final-state claim here is a number
+              // this line never observed, so send the caller to re-read instead.
               const drifted = now ? `[${now[0]}, ${now[1]}]` : "an unreadable value";
               throw new Error(
-                `node ${node.id} size drifted to ${drifted} during this edit and could not be restored to its previous [${snap.size[0]}, ${snap.size[1]}] — the edit was refused and its size left where the restore attempt landed`,
+                `node ${node.id} size drifted to ${drifted} during this edit and could not be restored to its previous [${snap.size[0]}, ${snap.size[1]}] — the edit was refused; re-read this node's geometry before relying on it`,
               );
             }
           }
