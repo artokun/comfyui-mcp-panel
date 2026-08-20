@@ -7391,6 +7391,20 @@ async function buildVideoStoryboard(url) {
     // 5%–95% default skipped title/end cards on a concat file.
     const sampleAt = storyboardSampleTimes(duration, n);
 
+    // THE POSTER, taken from the pass that is already decoding this video.
+    //
+    // A video card needs a still for three separate jobs — the previews-OFF
+    // placeholder, the space reservation that prevents CLS, and the `poster`
+    // that stops the pause/unmount cycle flashing gray on return — and until now
+    // each was paid for separately or not at all: the placeholder opened a whole
+    // media pipeline for `preload="metadata"`, and the wrapper reserved a GUESSED
+    // 16/9 that `loadedmetadata` then corrected, shifting every card below it.
+    //
+    // This function has already loaded and seeked the video, so frame 0 is
+    // sitting in the decoder. Drawing it to a second canvas costs one more
+    // drawImage and no extra decode, and it carries the REAL dimensions, which is
+    // what turns the guessed ratio into an exact one.
+    let posterCanvas = null;
     let painted = 0;
     for (let i = 0; i < n; i += 1) {
       const t = sampleAt[i];
@@ -7409,6 +7423,24 @@ async function buildVideoStoryboard(url) {
         painted += 1;
       } catch {
         continue; // a single bad frame shouldn't kill the sheet
+      }
+      // The FIRST frame that actually painted — not `i === 0`, because a video
+      // whose opening frame refuses to seek `continue`s above and would leave the
+      // poster null while the sheet is perfectly good. Any real frame beats no
+      // poster, so take the earliest one that worked.
+      if (!posterCanvas) {
+        try {
+          const pc = document.createElement("canvas");
+          pc.width = vw;
+          pc.height = vh;
+          const pctx = pc.getContext("2d");
+          if (pctx) {
+            pctx.drawImage(video, 0, 0, vw, vh);
+            posterCanvas = pc;
+          }
+        } catch {
+          posterCanvas = null; // a poster is an optimisation; never fail the sheet for it
+        }
       }
       if (STORYBOARD.LABEL) {
         ctx.font = "10px monospace";
@@ -7434,6 +7466,18 @@ async function buildVideoStoryboard(url) {
     } catch {
       // A Blob implementation that refuses extra properties leaves the count
       // absent, which callers must treat as unknown — never as the capacity.
+    }
+    // Ride along on the sheet blob, exactly like paintedFrames above, so this
+    // adds no new return shape for any existing caller to handle. Absent is a
+    // legal answer: every consumer must fall back to the metadata placeholder.
+    if (posterCanvas) {
+      try {
+        const posterBlob = await new Promise((resolve) => posterCanvas.toBlob(resolve, "image/png"));
+        if (posterBlob) blob.posterBlob = posterBlob;
+      } catch {
+        // Same tainted-canvas case the sheet encode guards against; the sheet
+        // already succeeded, so a poster failure must not undo it.
+      }
     }
     return blob;
   } catch {
@@ -29564,6 +29608,53 @@ function buildPanel() {
     );
     return _videoIO;
   }
+
+  // TWO-STAGE VISIBILITY. The observer above is all-or-nothing: cross its
+  // boundary and the <video> is destroyed, cross back and it is rebuilt from
+  // scratch — so a small scroll pays a full teardown + remount, and the clip
+  // restarts. But the expensive thing about an on-screen video is not existing,
+  // it is DECODING, and that can be stopped instantly and resumed for free.
+  //
+  // So the two costs get two triggers:
+  //   PARTIALLY hidden (<90% visible) → pause. Decode stops, the element and
+  //     its buffers stay, currentTime is kept, resuming is a play() call.
+  //   FULLY hidden (+ the 300px band above) → unmount. The memory win, paid
+  //     only once the card is properly gone rather than merely nudged.
+  //
+  // The 300px hysteresis between the two is deliberate: pausing is cheap and
+  // reversible, so it can fire eagerly, while unmounting is not and should not
+  // fire on a scroll the user is about to undo.
+  let _videoPlayIO = null;
+  function videoPlaybackObserver() {
+    if (_videoPlayIO) return _videoPlayIO;
+    _videoPlayIO = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const holder = e.target;
+          const v = holder._video;
+          if (!v) continue; // not mounted (or already unmounted) — nothing to pause
+          // A card the user explicitly paused stays paused: resuming it here
+          // would override a deliberate act with a scroll.
+          if (e.intersectionRatio >= 0.9) {
+            if (holder._pausedByVisibility) {
+              holder._pausedByVisibility = false;
+              // play() rejects when the element was torn down between frames;
+              // that is the unmount path doing its job, not an error.
+              try { v.play?.()?.catch?.(() => {}); } catch { /* best-effort */ }
+            }
+          } else if (!v.paused) {
+            holder._pausedByVisibility = true;
+            try { v.pause(); } catch { /* best-effort */ }
+          }
+        }
+      },
+      // rootMargin 0: "hidden" here means hidden in the ACTUAL viewport, not in
+      // the mount observer's expanded band, or a card could pause while still
+      // fully visible.
+      { root: log, rootMargin: "0px", threshold: [0, 0.9] },
+    );
+    return _videoPlayIO;
+  }
   function mountHolderVideo(holder) {
     if (holder._video) return; // already live
     // #909 — a failure is TERMINAL for this source (codex). `data-src` survives the error
@@ -29593,6 +29684,10 @@ function buildPanel() {
     // #1270 — metadata-only preload is what reports the first clip of a concat
     // MP4 as the whole duration. Load enough of the source that seekable covers it.
     v.preload = "auto";
+    // With the two-stage observer a card is torn down and rebuilt routinely, and
+    // every rebuild shows gray until the first frame decodes. The poster fills
+    // exactly that gap — it is the frame the player is about to paint anyway.
+    if (holder.dataset.poster) v.poster = holder.dataset.poster;
     v.src = holder.dataset.src;
     v.style.cssText = "width:100%;display:block;border-radius:6px;";
     v.addEventListener("loadedmetadata", () => {
@@ -29655,8 +29750,92 @@ function buildPanel() {
     holder.textContent = "";
     holder.appendChild(v);
     holder._video = v;
+    // Register for the pause stage HERE rather than at the call sites: this is
+    // the function that creates `_video`, so a mount can never forget to arm the
+    // thing that pauses it. Observing the HOLDER (never `v`) is what makes the
+    // player swappable — the observation target has to outlive the element it
+    // controls, or unmounting would destroy the observer's own target and the
+    // card could never come back.
+    videoPlaybackObserver().observe(holder);
     v.play?.().catch(() => {}); // muted autoplay is allowed; ignore if the browser blocks it
   }
+  // POSTER BACK-FILL (video URL → poster URL).
+  //
+  // The poster cannot be an argument to paintVideo: it comes from the storyboard
+  // pass, which is async and lands AFTER the card is painted — the very ordering
+  // that made the video card mount late in the first place. So the card registers
+  // itself here and the storyboard calls back when the asset exists.
+  //
+  // Keyed by video URL rather than by card, because the same video can be painted
+  // more than once (a thread switch replays recorded media) and every copy wants
+  // the poster. Holders are held in a Set per URL and dropped when their card
+  // leaves the DOM, so this cannot pin detached nodes for the session's life.
+  const _videoPosters = new Map();
+  const _videoHolders = new Map();
+
+  function registerVideoHolder(url, holder) {
+    if (!url || !holder) return;
+    let set = _videoHolders.get(url);
+    if (!set) {
+      set = new Set();
+      _videoHolders.set(url, set);
+    }
+    set.add(holder);
+    const known = _videoPosters.get(url);
+    if (known) applyPosterToHolder(holder, known);
+  }
+
+  /** Put a known poster on one holder: exact aspect-ratio, live-player poster,
+   *  and an <img> placeholder in place of the metadata-loading <video>. */
+  function applyPosterToHolder(holder, posterUrl) {
+    if (!holder || !posterUrl || holder.dataset.poster === posterUrl) return;
+    holder.dataset.poster = posterUrl;
+    // EXACT space reservation. `naturalWidth/Height` come from an <img> decode,
+    // which costs nothing like a video pipeline, and replace the guessed 16/9
+    // before any player exists — so the correction that used to shift the log
+    // never happens.
+    const probe = new Image();
+    probe.addEventListener("load", () => {
+      if (probe.naturalWidth && probe.naturalHeight) {
+        holder.style.aspectRatio = `${probe.naturalWidth} / ${probe.naturalHeight}`;
+      }
+    });
+    probe.src = posterUrl;
+    // A mounted player gets it too: with the pause/unmount cycle a card is torn
+    // down and rebuilt routinely, and without a poster each rebuild flashes gray
+    // until the first frame decodes.
+    if (holder._video) {
+      try { holder._video.poster = posterUrl; } catch { /* best-effort */ }
+    }
+    // An OFF placeholder showing the metadata <video> can now become a true
+    // image — the RAM win this setting promised and did not deliver.
+    const ph = holder.querySelector("video[data-cmcp-placeholder]");
+    if (ph) {
+      const img = document.createElement("img");
+      img.src = posterUrl;
+      img.alt = "";
+      img.style.cssText = "width:100%;display:block;border-radius:6px;pointer-events:none;";
+      ph.replaceWith(img);
+    }
+  }
+
+  /** Called by the storyboard pass once the poster asset exists. */
+  function applyVideoPoster(videoUrl, posterUrl) {
+    if (!videoUrl || !posterUrl) return;
+    _videoPosters.set(videoUrl, posterUrl);
+    const set = _videoHolders.get(videoUrl);
+    if (!set) return;
+    for (const holder of [...set]) {
+      // Drop holders whose card is gone rather than keep writing to detached nodes.
+      if (!holder.isConnected) {
+        set.delete(holder);
+        continue;
+      }
+      applyPosterToHolder(holder, posterUrl);
+    }
+    if (!set.size) _videoHolders.delete(videoUrl);
+  }
+
   function unmountHolderVideo(holder) {
     const v = holder._video;
     if (!v) return;
@@ -29675,6 +29854,18 @@ function buildPanel() {
     }
     v.remove();
     holder._video = null; // holder keeps its learned aspect-ratio → gray placeholder fills it
+    // The pause stage has nothing left to pause; stop watching until a remount
+    // arms it again, and drop the flag so a returning card is not treated as
+    // "paused by the previous scroll".
+    videoPlaybackObserver().unobserve(holder);
+    holder._pausedByVisibility = false;
+    // NO CLS ON UNMOUNT. The wrapper must keep occupying exactly the space the
+    // player did — collapsing it would shift every card below, and the mount
+    // observer's own geometry with it, which is how a teardown turns into a
+    // scroll jump. `loadedmetadata` writes the REAL ratio onto the holder and it
+    // survives here because only the child is removed; this is the belt-and-
+    // braces for a source whose metadata never arrived.
+    if (!holder.style.aspectRatio) holder.style.aspectRatio = "16 / 9";
   }
 
   // #1280 — the placeholder a video card gets when "Video previews in chat" is
@@ -29695,13 +29886,27 @@ function buildPanel() {
     const label = tr("panel.video_preview_off_click_to_view", "Video preview off — click to view");
     holder.title = label;
     holder.setAttribute("aria-label", label);
-    const v = document.createElement("video");
-    v.muted = true;
-    v.setAttribute("muted", "");
-    v.preload = "metadata"; // headers + first frame; never the full decode
-    v.src = url;
-    v.playsInline = true;
-    // Clicks belong to the holder (→ lightbox), not the inert first frame.
+    // PREFER A REAL IMAGE. When the poster exists we can show the first frame
+    // with an <img>, which opens no media pipeline at all — the RAM this setting
+    // exists to save, actually saved. The <video preload="metadata"> below stays
+    // as the fallback for a card whose storyboard has not finished (or failed):
+    // it is far cheaper than a live player, just not free.
+    const posterUrl = holder.dataset.poster;
+    const v = posterUrl ? document.createElement("img") : document.createElement("video");
+    if (posterUrl) {
+      v.src = posterUrl;
+      v.alt = "";
+    } else {
+      v.muted = true;
+      v.setAttribute("muted", "");
+      v.preload = "metadata"; // headers + first frame; never the full decode
+      v.src = url;
+      v.playsInline = true;
+      // Tagged so a poster arriving later can find this element and swap it for
+      // an <img> in place (see applyPosterToHolder).
+      v.dataset.cmcpPlaceholder = "1";
+    }
+    // Clicks belong to the holder (→ inline play), not the inert first frame.
     v.style.cssText = "width:100%;display:block;border-radius:6px;pointer-events:none;";
     // Facts line over the bottom of the frame: the filename at once, the
     // duration filled in when the metadata lands.
@@ -29719,11 +29924,43 @@ function buildPanel() {
       if (line) facts.textContent = line;
     });
     // No error listener: a source whose even METADATA fails keeps the filename
-    // on a gray box, and the click still opens the lightbox — which is where a
+    // on a gray box, and the click still opens the player — which is where a
     // decode verdict belongs, not on a card that never promised to play.
     holder.appendChild(v);
     holder.appendChild(facts);
-    holder.addEventListener("click", (e) => { e.stopPropagation(); openLightboxFromCard(card); });
+    // #1280 followup — the request was "first frame + a PLAY BUTTON that turns
+    // the video on"; this sent the click to the LIGHTBOX instead, so OFF meant
+    // "watch it somewhere else" rather than "watch it here, when you ask". The
+    // lightbox is still one click away on the ⛶ button, which is where a
+    // full-size affordance belongs; the card's own surface now does what a play
+    // button on a poster frame is universally expected to do.
+    const play = document.createElement("div");
+    play.className = "cmcp-video-play";
+    play.setAttribute("aria-hidden", "true");
+    play.textContent = "▶";
+    play.style.cssText =
+      "position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);pointer-events:none;" +
+      "width:3rem;height:3rem;border-radius:50%;background:rgba(0,0,0,0.55);color:#fff;" +
+      "display:flex;align-items:center;justify-content:center;font-size:1.25rem;line-height:1;" +
+      "padding-left:0.15rem;box-sizing:border-box;";
+    holder.appendChild(play);
+    holder.addEventListener("click", (e) => {
+      e.stopPropagation();
+      // Swap the inert poster for the real player IN PLACE. mountHolderVideo
+      // refuses to run twice (`holder._video`), and the poster <video>/facts/
+      // badge are this function's own nodes, so clearing them here cannot
+      // discard anything the live player needs — it reads `holder.dataset.src`.
+      if (holder._video) return;
+      holder.replaceChildren();
+      holder.style.cursor = "";
+      holder.removeAttribute("title");
+      holder.removeAttribute("aria-label");
+      mountHolderVideo(holder);
+      // Hand it to the observer only NOW. Before the click this card was opted
+      // OUT of decoding, and observing it then would have let a scroll-in mount
+      // the very player the setting says not to mount.
+      videoObserver().observe(holder);
+    });
   }
 
   function paintVideo(url, name) {
@@ -29740,6 +29977,12 @@ function buildPanel() {
     holder.dataset.src = url;
     holder.style.cssText =
       "width:100%;aspect-ratio:16 / 9;border-radius:6px;background:var(--p-content-hover-background,#2a2a2e);";
+    // Register BEFORE either surface is chosen: if this video's poster is already
+    // known (a replayed card, or a second copy of the same file), the exact
+    // aspect-ratio lands now and the placeholder below can be a real image
+    // instead of a metadata-loading <video>. The 16/9 above is only ever the
+    // reservation for a video whose poster has not arrived yet.
+    registerVideoHolder(url, holder);
     card.appendChild(holder);
     // A video's own surface is owned by its native controls, so it can't be
     // "click to zoom" like an image — give it a dedicated expand button that opens
@@ -29776,6 +30019,20 @@ function buildPanel() {
     // deferred to the lightbox. Read at paint time, so already-painted cards
     // keep whichever surface they were painted with.
     if (videoPreviewsEnabled(getSetting(SETTING_VIDEO_PREVIEWS))) {
+      // #1280 followup — MOUNT NOW, then observe. `observe()` alone made the
+      // first paint depend on the IntersectionObserver's first callback, which
+      // is async and lands AFTER the caller has appended whatever comes next: a
+      // run completion paints the video card and then immediately paints the
+      // storyboard contact sheet, so by the time the callback runs the video can
+      // already be scrolled out of `root: log` and is never mounted. The card
+      // stays the gray 16/9 placeholder box forever — reported as "previews
+      // stopped showing, the toggle is ON".
+      //
+      // A card being painted is BY DEFINITION at the bottom of the log, i.e. the
+      // one place we do not need an observer to tell us is visible. So mount it
+      // directly and keep observing for the later scroll-out/scroll-in cycle,
+      // which is the memory management the observer actually exists for.
+      mountHolderVideo(holder);
       videoObserver().observe(holder);
     } else {
       paintVideoPlaceholder(holder, card, url, name);
@@ -32455,6 +32712,10 @@ function buildPanel() {
         buildVideoStoryboard,
         uploadBlobToInput,
         storyboardFrameCount,
+        // panel_show_media paints video cards through the same painter, so it
+        // wants the same poster back-fill — otherwise a shown video keeps the
+        // guessed ratio and the metadata placeholder while a queued one does not.
+        applyVideoPoster,
         humanizeBytes,
         fetchMediaBytes: fetchImageBytes,
         videoStoryboardEnabled: prefs.videoStoryboard !== false,
@@ -33404,6 +33665,10 @@ function buildPanel() {
           uploadBlobToInput,
           storyboardFrameCount,
           paintImage,
+          // The card is already in the log by the time the storyboard resolves,
+          // so the poster it produced is handed back by video URL rather than
+          // passed down at paint time.
+          applyVideoPoster,
           videoStoryboardEnabled: prefs.videoStoryboard !== false,
           // #609 — Blind mode strips images at the sendFrame gate below; the
           // storyboard note must not ask for a visual review of pixels the

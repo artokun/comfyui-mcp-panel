@@ -64,6 +64,7 @@ export async function composeRunCompletionFrame(
     uploadBlobToInput,
     storyboardFrameCount,
     paintImage,
+    applyVideoPoster,
     videoStoryboardEnabled = true,
     // Will the agent actually RECEIVE the pixels on this frame? Blind mode
     // (#90/#174) strips `images` at the sendFrame gate — the note must not
@@ -179,6 +180,7 @@ export async function composeRunCompletionFrame(
         uploadBlobToInput,
         storyboardFrameCount,
         paintImage,
+        applyVideoPoster,
         videoStoryboardEnabled,
         duration,
         finishedClock,
@@ -484,6 +486,7 @@ async function buildVideoSegment(v, deps) {
     uploadBlobToInput,
     storyboardFrameCount,
     paintImage,
+    applyVideoPoster,
     videoStoryboardEnabled,
     duration,
     finishedClock,
@@ -556,6 +559,22 @@ async function buildVideoSegment(v, deps) {
       }
       const n = storyboardFrameCount();
       const sizeStr = humanizeBytes(await fetchImageBytes(imageViewUrl(m)));
+      // THE POSTER rides along on the sheet blob (see buildVideoStoryboard), from
+      // the same decode. Upload it beside the sheet and hand it back to the card,
+      // which has already been painted by the time we get here — the card cannot
+      // receive it as an argument, so this is a back-fill by video URL.
+      //
+      // Entirely best-effort: a card with no poster keeps the metadata
+      // placeholder and the guessed ratio, which is exactly the behaviour before
+      // this existed. Nothing below may fail the storyboard for it.
+      if (blob.posterBlob && typeof applyVideoPoster === "function") {
+        try {
+          const posterRef = await uploadBlobToInput(blob.posterBlob, `poster_${base}.png`, { type: "temp" });
+          if (posterRef) applyVideoPoster(imageViewUrl(m), imageViewUrl(posterRef));
+        } catch (err) {
+          warn("[cmcp] storyboard: poster upload failed:", err);
+        }
+      }
       // Show the user the contact sheet next to the <video> player.
       paintImage(imageViewUrl(ref), `Storyboard · ${n} frames`);
       // #609 — the review request is lawful ONLY when the storyboard pixels
