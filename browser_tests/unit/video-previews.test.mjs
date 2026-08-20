@@ -47,6 +47,36 @@ test("#1280: paintVideo consults the setting and falls back to the live player",
     /videoObserver\(\)\.observe\(holder\)/,
     "previews ON keeps the lazy live player",
   );
+  // #1280 followup — MOUNTING MUST NOT WAIT FOR THE OBSERVER.
+  //
+  // `observe()` alone made the first paint depend on the IntersectionObserver's
+  // first callback, which is async and lands after the caller has appended
+  // whatever comes next. A run completion paints the video card and then
+  // immediately paints the storyboard contact sheet, so the video can already be
+  // out of `root: log` by the time the callback runs — it never mounts, and the
+  // card stays the gray 16/9 box. Reported as "previews stopped showing" with
+  // the toggle ON, which no assertion here could see, because "the branch exists
+  // and calls observe" was true the whole time.
+  // The leading boundary is load-bearing: paintVideo ALSO contains
+  // `unmountHolderVideo(holder)` (the collapse handler), and that string
+  // CONTAINS `mountHolderVideo(holder)`. A bare substring/regex match is
+  // therefore satisfied by the unmount call and passes with the mount deleted —
+  // which is exactly what it did until a mutation run caught it.
+  const MOUNT_CALL = /(?<![A-Za-z])mountHolderVideo\(holder\)/;
+  assert.match(
+    paint,
+    MOUNT_CALL,
+    "previews ON must mount the player at paint time, not only observe for it",
+  );
+  // ORDER is the assertion, not mere presence: mounting AFTER the observe call
+  // would still leave the first paint racing the callback.
+  const mountAt = paint.search(MOUNT_CALL);
+  const observeAt = paint.indexOf("videoObserver().observe(holder)");
+  assert.ok(mountAt >= 0 && observeAt >= 0, "both calls must be present");
+  assert.ok(
+    mountAt < observeAt,
+    "the direct mount must come before the observe, so the first paint never waits on it",
+  );
   assert.match(
     paint,
     /paintVideoPlaceholder\(holder, card, url, name\)/,
@@ -54,7 +84,7 @@ test("#1280: paintVideo consults the setting and falls back to the live player",
   );
 });
 
-test("#1280: the placeholder never autoplays and stays reachable via the lightbox", () => {
+test("#1280: the placeholder never autoplays and plays INLINE on click", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const placeholder = src.slice(
     src.indexOf("function paintVideoPlaceholder(holder, card, url, name) {"),
@@ -66,7 +96,29 @@ test("#1280: the placeholder never autoplays and stays reachable via the lightbo
   assert.match(placeholder, /v\.preload = "metadata"/, "metadata-only load is the whole point");
   assert.ok(!/v\.autoplay\s*=\s*true/.test(placeholder), "a placeholder must not autoplay");
   assert.ok(!/v\.loop\s*=\s*true/.test(placeholder), "a placeholder must not loop");
-  // The video stays REACHABLE: clicking the card opens the same lightbox the
-  // expand button does.
-  assert.match(placeholder, /openLightboxFromCard\(card\)/, "click opens the lightbox");
+  // #1280 followup — THE REQUESTED BEHAVIOUR IS A PLAY BUTTON, NOT A LIGHTBOX.
+  //
+  // The feature asked for was: previews OFF shows the first frame with a play
+  // button, and pressing it turns the video on. This shipped sending the click
+  // to the lightbox instead, so OFF meant "watch it somewhere else" rather than
+  // "watch it here, when you ask". The old assertion pinned the wrong behaviour
+  // in place, which is why nothing caught the mismatch: it asserted the code did
+  // what it did, not what it was for.
+  assert.match(placeholder, /cmcp-video-play/, "the poster must carry a play affordance");
+  assert.match(
+    placeholder,
+    /mountHolderVideo\(holder\)/,
+    "clicking the poster must mount the real player IN PLACE",
+  );
+  assert.ok(
+    !/openLightboxFromCard\(card\)/.test(placeholder),
+    "the card's own surface plays inline; the lightbox belongs to the ⛶ button",
+  );
+  // Opting in is what earns observation: observing an opted-OUT card would let a
+  // later scroll-in mount the very player the setting says not to mount.
+  assert.match(
+    placeholder,
+    /videoObserver\(\)\.observe\(holder\)/,
+    "once the user presses play, the card joins the normal unmount/remount cycle",
+  );
 });
