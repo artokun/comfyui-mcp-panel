@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.28] - 2026-08-20
+
+### Fixed
+- panel_set_widget retains VHS_LoadVideo custom dimensions (#1534)
+
+
 ## [0.15.27] - 2026-08-20
 
 ### Fixed
