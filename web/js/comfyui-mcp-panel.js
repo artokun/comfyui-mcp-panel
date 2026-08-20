@@ -35342,12 +35342,17 @@ function buildPanel() {
     // status was the only channel left and nothing consulted it. Result: the tab dialled
     // its compiled default forever while status advertised the port actually bound.
     const secure = location.protocol === "https:" ? await fetchAdvertisedBridgeUrl() : null;
-    const statusBridgeUrl =
-      location.protocol === "https:" ? null : (await readOrchestratorStatus())?.bridge_url;
+    // status.bridge_url names the port THIS ComfyUI was configured to probe, not where
+    // the orchestrator bound (__init__.py:64/928 — an import-time constant with no
+    // mutator). `running` is the corroboration that something actually answered there,
+    // and it rides in the same payload; without it an adopt can move a live tab onto a
+    // dead port and never come back.
+    const status = location.protocol === "https:" ? null : await readOrchestratorStatus();
     const next = pickAdvertisedBridgeUrl({
       protocol: location.protocol,
       secureUrl: secure,
-      statusBridgeUrl,
+      statusBridgeUrl: status?.bridge_url,
+      statusRunning: status?.running,
       currentUrl: client.currentUrl(),
     });
     if (!next) return;

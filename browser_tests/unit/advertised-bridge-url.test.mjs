@@ -1,14 +1,19 @@
 /**
- * panel#1486 — a clean install could not connect when the orchestrator bound a port
- * other than 9180.
+ * panel#1486 — a clean install could not connect: the panel dialled ws://127.0.0.1:9180
+ * forever while /comfyui_mcp_panel/status named ws://127.0.0.1:9181.
  *
- * Both sides default to 9180, so the panel's compiled fallback was never stale. The gap
- * was adoption: the orchestrator advertises the port it ACTUALLY bound via
- * `/comfyui_mcp_panel/status`, and the only two readers of an advertised `bridge_url`
- * were POST responses (the panel's own launcher start, and the auto-reclaim). An
- * orchestrator started externally — `npx comfyui-mcp connect` in a terminal — sends
- * neither, and the remaining reader was `https:`-gated and `wss://`-only for the tunnel.
- * So the tab dialled `ws://127.0.0.1:9180` forever while status said 9181.
+ * WHAT STATUS ACTUALLY SAYS, because the obvious reading is wrong and the first version
+ * of this fix was built on it. `bridge_url` is not a report of where the orchestrator
+ * bound — it is `ws://{_BRIDGE_HOST}:{_BRIDGE_PORT}` (`__init__.py:928`) where
+ * `_BRIDGE_PORT` is an import-time constant of the ComfyUI process (`__init__.py:64`)
+ * with one writer and no `global` declaration. It names the port THIS ComfyUI was
+ * configured to probe. An orchestrator that finds 9180 held and binds 9181 is invisible
+ * to it, and nothing in the panel can discover that — see the last test.
+ *
+ * The bug this DOES fix: ComfyUI configured for a non-default port, the orchestrator on
+ * that same port, and a panel with no reader for a plain `ws://` advertisement at all —
+ * adoption existed only on two POST responses (launcher start, auto-reclaim), which an
+ * externally started orchestrator never sends, plus a tunnel reader gated to https+wss.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -28,11 +33,10 @@ test("#1486: a loopback ws:// advertisement is adoptable", () => {
     "ws://127.0.0.1:9181/",
     "ws://localhost:9181",
     "ws://[::1]:9181",
-    "ws://127.0.0.1", // no port — still loopback
+    "ws://127.0.0.1",
   ]) {
     assert.equal(acceptableLoopbackBridgeUrl(url), url, url);
   }
-  // Surrounding whitespace is not a different endpoint.
   assert.equal(acceptableLoopbackBridgeUrl("  ws://127.0.0.1:9181  "), "ws://127.0.0.1:9181");
 });
 
@@ -42,8 +46,10 @@ test("#1486: a NON-loopback advertisement is never adopted", () => {
   for (const url of [
     "ws://192.168.1.50:9181",
     "ws://evil.example.com:9181",
-    "ws://127.0.0.1.example.com:9181", // prefix that only LOOKS like loopback
-    "wss://127.0.0.1:9181", // the tunnel path, which has its own reader and token handling
+    "ws://127.0.0.1.example.com:9181",
+    "ws://localhost@evil.com",
+    "ws://localhost:9180@evil.com",
+    "wss://127.0.0.1:9181",
     "http://127.0.0.1:9181",
     "",
     "   ",
@@ -55,23 +61,60 @@ test("#1486: a NON-loopback advertisement is never adopted", () => {
   }
 });
 
-test("#1486: the reporter's exact case adopts the advertised port", () => {
-  // Status says 9181; the tab is dialling its compiled 9180 default.
-  const next = pickAdvertisedBridgeUrl({
-    protocol: "http:",
-    secureUrl: null,
-    statusBridgeUrl: "ws://127.0.0.1:9181",
-    currentUrl: "ws://127.0.0.1:9180",
-  });
-  assert.equal(next, "ws://127.0.0.1:9181");
+test("#1486: the reported case adopts the port ComfyUI is configured for", () => {
+  // ComfyUI has COMFYUI_MCP_BRIDGE_PORT=9181, the orchestrator is on 9181, `running`
+  // corroborates it, and the tab is stuck on its compiled 9180 default.
+  assert.equal(
+    pickAdvertisedBridgeUrl({
+      protocol: "http:",
+      statusBridgeUrl: "ws://127.0.0.1:9181",
+      statusRunning: true,
+      currentUrl: "ws://127.0.0.1:9180",
+    }),
+    "ws://127.0.0.1:9181",
+  );
 });
 
-test("#1486: an advertisement matching what is already dialled changes nothing", () => {
-  // Otherwise every poll would churn the socket for a no-op.
+test("#1486: an UNCORROBORATED advertisement never moves a tab off a live bridge", () => {
+  // The regression the first version of this fix introduced. ComfyUI's env says 9181;
+  // the orchestrator actually took 9180 and the tab is correctly on it. Adopting 9181
+  // sends the tab to a dead port — and the tick after that sees the advertisement equal
+  // to the current URL, returns null, and never comes back. `running` is exactly the
+  // fact that separates these, and it is in the same payload.
+  assert.equal(
+    pickAdvertisedBridgeUrl({
+      protocol: "http:",
+      statusBridgeUrl: "ws://127.0.0.1:9181",
+      statusRunning: false,
+      currentUrl: "ws://127.0.0.1:9180",
+    }),
+    null,
+  );
+  // An older pack that cannot say, or anything non-boolean, is not corroboration either.
+  for (const running of [undefined, null, "true", 1, {}]) {
+    assert.equal(
+      pickAdvertisedBridgeUrl({
+        protocol: "http:",
+        statusBridgeUrl: "ws://127.0.0.1:9181",
+        statusRunning: running,
+        currentUrl: "ws://127.0.0.1:9180",
+      }),
+      null,
+      String(running),
+    );
+  }
+});
+
+test("#1486: a port SHIFT is invisible to status, and this fix does not claim otherwise", () => {
+  // Orchestrator found 9180 held and bound 9181. `_BRIDGE_PORT` is an import-time
+  // constant, so status still says 9180 — identical to what the tab already dials.
+  // Nothing here can repair that case, and pretending to would be the false claim the
+  // first version of this fix made.
   assert.equal(
     pickAdvertisedBridgeUrl({
       protocol: "http:",
       statusBridgeUrl: "ws://127.0.0.1:9180",
+      statusRunning: true,
       currentUrl: "ws://127.0.0.1:9180",
     }),
     null,
@@ -79,34 +122,32 @@ test("#1486: an advertisement matching what is already dialled changes nothing",
 });
 
 test("#1486: the https/tunnel path keeps its existing precedence", () => {
-  // On an https page the secure wss URL still wins, and a plain loopback advertisement
-  // is NOT substituted for it — that path is token-gated and changing it is a separate
-  // question from this fix.
   assert.equal(
     pickAdvertisedBridgeUrl({
       protocol: "https:",
       secureUrl: "wss://tunnel.example/bridge?token=x",
       statusBridgeUrl: "ws://127.0.0.1:9181",
+      statusRunning: true,
       currentUrl: "ws://127.0.0.1:9180",
     }),
     "wss://tunnel.example/bridge?token=x",
   );
-  // And with no secure URL yet, an https page adopts NOTHING rather than downgrading.
+  // With no secure URL yet an https page adopts NOTHING rather than downgrading.
   assert.equal(
     pickAdvertisedBridgeUrl({
       protocol: "https:",
       secureUrl: null,
       statusBridgeUrl: "ws://127.0.0.1:9181",
+      statusRunning: true,
       currentUrl: "ws://127.0.0.1:9180",
     }),
     null,
   );
 });
 
-test("#1486 WIRING: the non-https path actually reads status, and the guard still runs first", () => {
-  // A helper that decides correctly and is never called fixes nothing. The old code
-  // returned on `location.protocol !== "https:"` BEFORE reading anything, so the
-  // regression to guard against is that early return coming back.
+test("#1486 WIRING: the non-https path reads status, passes `running`, and keeps the guard first", () => {
+  // A helper that decides correctly and is never called fixes nothing; a helper handed
+  // only half the payload re-introduces the wedge above.
   const src = readFileSync(PANEL_JS, "utf8");
   const fn = src.slice(
     src.indexOf("async function reclaimAdvertisedBridgeUrl()"),
@@ -120,10 +161,8 @@ test("#1486 WIRING: the non-https path actually reads status, and the guard stil
     "the early return that made a loopback advertisement unreadable must not come back",
   );
   assert.match(fn, /readOrchestratorStatus\(\)/, "the non-https path reads the advertisement");
-  assert.match(fn, /pickAdvertisedBridgeUrl\(/, "and routes it through the decision helper");
-
-  // The manual-override guard must still precede any adoption: a user-typed Advanced
-  // Bridge URL is never clobbered, and moving the https gate must not have reordered it.
+  assert.match(fn, /statusRunning: status\?\.running/, "and passes the corroboration with it");
+  assert.match(fn, /pickAdvertisedBridgeUrl\(/, "routed through the decision helper");
   assert.ok(
     fn.indexOf("if (manualOverride) return;") < fn.indexOf("pickAdvertisedBridgeUrl("),
     "manual override is checked before anything is adopted",
