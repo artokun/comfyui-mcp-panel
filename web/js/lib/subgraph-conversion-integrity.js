@@ -355,3 +355,220 @@ export function brokenConversionWarning({ what, subgraphNodeId, dangling, discon
     `${boundaryNote(loose)}${recoveryAdvice()}`
   );
 }
+
+/* ===========================================================================
+ * #1463 — a conversion that THROWS must say whether the graph changed.
+ *
+ * Everything above answers "the conversion RETURNED — is what it produced sound?".
+ * This half answers the question that was never asked: `convertToSubgraph` threw,
+ * so what is on the canvas now?
+ *
+ * ## What was measured
+ *
+ * Driven in a real browser against the ComfyUI on this machine, root graph `1→2→3→4`
+ * wired in a chain, converting the middle pair `[2, 3]` with node 1's `graph`
+ * back-reference cleared:
+ *
+ *     nodes before: 1,2,3,4        subgraph definitions: 0
+ *     → convertToSubgraph throws "Attempted to access LGraph reference that was
+ *       null or undefined."
+ *     nodes after:  1,4,5          subgraph definitions: 1
+ *     node 5 is the new subgraph node; its input link is `null`
+ *
+ * Nodes 2 and 3 are GONE, a subgraph definition is registered, and the wrapper the
+ * conversion got as far as creating was never wired back to node 1 — and the only
+ * thing the caller was told is the bare frontend message. #1463's reporter read that
+ * as "no other side effects" and retried three times.
+ *
+ * The same message is also reachable with NOTHING mutated: the frontend throws out of
+ * `disconnectInput`/`disconnectOutput` too, which run before the removal loop, and an
+ * extension that wraps `convertToSubgraph` can throw before the frontend's own code
+ * runs at all (cg-use-everywhere replaces `app.graph.convertToSubgraph` with a pre-pass
+ * that analyses the whole graph first — its frames are in the reproduction's stack).
+ * One message, two opposite states, and the caller's correct next move differs
+ * completely between them. So measure it instead of guessing.
+ *
+ * ## Why `node.graph == null` is the one condition worth naming
+ *
+ * `NullGraphError` is thrown by litegraph wherever a node is asked to do graph work
+ * while its own `graph` back-reference is unset. On the conversion path that is
+ * reachable for a node the graph still lists — `LGraph.remove` sets `node.graph = null`
+ * BEFORE it splices the node out of `_nodes`, and `node.graph` is a plain settable
+ * property any extension can clear. A SELECTED node in that state throws before
+ * anything is mutated; a boundary NEIGHBOUR in that state throws in the reconnect
+ * loop, which is the destructive case measured above. Both were reproduced in-browser.
+ * ========================================================================= */
+
+/** Read a link table in any of the shapes {@link readLinkIds} accepts, by id. */
+function linkLookup(links) {
+  if (!links) return () => null;
+  if (typeof links.get === "function") return (id) => (id == null ? null : (links.get(id) ?? null));
+  if (Array.isArray(links)) {
+    const byId = new Map();
+    for (const link of links) {
+      if (Array.isArray(link)) {
+        if (link[0] != null) byId.set(String(link[0]), link);
+      } else if (link && typeof link === "object" && link.id != null) {
+        byId.set(String(link.id), link);
+      }
+    }
+    return (id) => (id == null ? null : (byId.get(String(id)) ?? null));
+  }
+  if (typeof links === "object") return (id) => (id == null ? null : (links[id] ?? null));
+  return () => null;
+}
+
+const linkOriginId = (link) => link?.origin_id ?? (Array.isArray(link) ? link[1] : undefined);
+const linkTargetId = (link) => link?.target_id ?? (Array.isArray(link) ? link[3] : undefined);
+
+/** Ids of the nodes directly wired to `node` — the boundary neighbours a conversion
+ *  has to disconnect and re-attach, and therefore the ones whose detachment is fatal. */
+function linkedNeighborIds(node, links) {
+  const lookup = linkLookup(links);
+  const ids = new Set();
+  for (const input of Array.isArray(node?.inputs) ? node.inputs : []) {
+    const id = linkOriginId(lookup(input?.link));
+    if (id != null) ids.add(id);
+  }
+  for (const output of Array.isArray(node?.outputs) ? node.outputs : []) {
+    for (const linkId of Array.isArray(output?.links) ? output.links : []) {
+      const id = linkTargetId(lookup(linkId));
+      if (id != null) ids.add(id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Ids of nodes involved in this conversion that the graph OWNS but that do not point
+ * back at it — the state that provably throws `NullGraphError` out of
+ * `convertToSubgraph`, one of them destructively.
+ *
+ * Ownership is proved by NODE identity (`getNodeById(id)` returns this very object),
+ * never by graph identity. `node.graph !== graph` would read a Vue proxy of the live
+ * root as a foreign graph and refuse every conversion on a reactive frontend — the
+ * same proxy/raw duality as #558. Only a NULLISH back-reference counts, because only
+ * that is unambiguous: the graph lists the node, the node denies the graph.
+ *
+ * Returns `[]` for anything unreadable — a graph this cannot inspect must fall through
+ * to the conversion, not be refused by it.
+ */
+export function detachedConversionNodes(graph, nodes) {
+  const selection = Array.isArray(nodes) ? nodes : [];
+  if (!selection.length) return [];
+  if (typeof graph?.getNodeById !== "function") return [];
+  const owns = (node) => node?.id != null && graph.getNodeById(node.id) === node;
+  const found = [];
+  const seen = new Set();
+  const consider = (node) => {
+    if (!node || seen.has(node)) return;
+    seen.add(node);
+    if (!owns(node)) return;
+    if (node.graph == null) found.push(node.id);
+  };
+  for (const node of selection) {
+    consider(node);
+    for (const id of linkedNeighborIds(node, graph?.links)) consider(graph.getNodeById(id));
+  }
+  return found;
+}
+
+/** The pre-flight refusal. Raised BEFORE `convertToSubgraph` is called, so it is the
+ *  one report in this file that can promise the canvas is untouched. */
+export function detachedConversionRefusal({ what, detached }) {
+  const bad = Array.isArray(detached) ? detached : [];
+  const one = bad.length === 1;
+  return (
+    `${what} was NOT run and the graph is unchanged. Node${one ? "" : "s"} ${bad.join(", ")} ` +
+    `${one ? "is" : "are"} listed on this graph but ${one ? "does" : "do"} not reference it ` +
+    `back (node.graph is unset), and ComfyUI's convertToSubgraph throws "Attempted to access ` +
+    `LGraph reference that was null or undefined." on exactly that — after it has already ` +
+    `removed the nodes you selected, leaving a half-built subgraph wired to nothing ` +
+    `(comfyui-mcp-panel#1463). Refusing here is what keeps that from happening. This is a ` +
+    `stale canvas, not a bad selection: it follows a ComfyUI restart, or an extension ` +
+    `detaching a node without removing it. Reload the ComfyUI page to rebuild the graph ` +
+    `(save first — panel_save_workflow), then retry. Every other panel tool keeps working ` +
+    `meanwhile; subgraph conversion is the one that touches this back-reference.`
+  );
+}
+
+/**
+ * What of this conversion is still on the graph.
+ *
+ * `present` is compared by node IDENTITY, not by id, so an id the frontend later
+ * re-issues cannot read as "the node survived".
+ */
+export function conversionSnapshot(graph, nodes) {
+  const present = [];
+  const readable = typeof graph?.getNodeById === "function";
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (node?.id == null) continue;
+    if (!readable || graph.getNodeById(node.id) === node) present.push(node.id);
+  }
+  const definitions = graph?.subgraphs?.size;
+  return {
+    present,
+    readable,
+    definitions: typeof definitions === "number" ? definitions : null,
+  };
+}
+
+/**
+ * The report for a conversion that threw.
+ *
+ * It leads with the verdict the caller acts on — did the graph change? — because that,
+ * not the frontend's wording, decides whether a retry is safe. The frontend's message
+ * is carried through VERBATIM and quoted: it is the only greppable thing #1463's
+ * reporter had, and dropping it would break every existing search for it.
+ */
+export function conversionThrowReport({ what, message, before, after }) {
+  const raw = typeof message === "string" && message.trim() ? message.trim() : "(no message)";
+  const beforeIds = Array.isArray(before?.present) ? before.present : [];
+  const afterIds = Array.isArray(after?.present) ? after.present : [];
+  const removed = beforeIds.filter((id) => !afterIds.includes(id));
+  const addedDefs =
+    typeof before?.definitions === "number" && typeof after?.definitions === "number"
+      ? after.definitions - before.definitions
+      : null;
+  const tail =
+    `The throw came from ComfyUI's own convertToSubgraph — the panel calls that method, it ` +
+    `does not implement it, and extensions are free to replace it — so the wording quoted ` +
+    `above is not necessarily litegraph's.`;
+
+  if (removed.length || (addedDefs != null && addedDefs > 0)) {
+    const lost = removed.length
+      ? `${removed.length} of the ${beforeIds.length} node(s) you selected (${removed.join(", ")}) ` +
+        `${removed.length === 1 ? "is" : "are"} already off the canvas`
+      : `every node you selected is still on the canvas`;
+    const defs =
+      addedDefs != null && addedDefs > 0
+        ? `, and ${addedDefs} subgraph definition(s) were registered`
+        : "";
+    return (
+      `${what} FAILED PART WAY THROUGH and the graph HAS CHANGED — do not retry blindly. ` +
+      `${lost}${defs}. Whatever wrapper the conversion got as far as creating was never ` +
+      `finished, so it can be sitting on the canvas wired to nothing. ComfyUI's ` +
+      `convertToSubgraph threw: "${raw}". Undo the conversion in ComfyUI (Ctrl+Z) or reload ` +
+      `the workflow, then re-read the graph (panel_graph_outline) before doing anything ` +
+      `else — the node ids you passed no longer describe the canvas. ${tail}`
+    );
+  }
+
+  if (!before?.readable || !after?.readable) {
+    return (
+      `${what} failed, and the panel could NOT establish whether the graph changed — this ` +
+      `frontend does not expose the node lookup that check needs, so treat the canvas as ` +
+      `unknown rather than untouched. ComfyUI's convertToSubgraph threw: "${raw}". Re-read ` +
+      `the graph (panel_graph_outline) before retrying. ${tail}`
+    );
+  }
+
+  return (
+    `${what} failed and the graph is UNCHANGED — all ${beforeIds.length} selected node(s) ` +
+    `are still on the canvas and no subgraph was created, so there is nothing to undo. ` +
+    `ComfyUI's convertToSubgraph threw: "${raw}". A straight retry will hit the same thing; ` +
+    `the selection itself is intact, so this is about the state of the canvas, not the nodes ` +
+    `you named. Reloading the ComfyUI page rebuilds the graph and clears the stale-canvas ` +
+    `form of this (save first — panel_save_workflow). ${tail}`
+  );
+}

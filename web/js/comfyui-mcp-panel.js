@@ -382,6 +382,10 @@ import {
   disconnectedBoundaryInputs,
   brokenConversionRefusal,
   brokenConversionWarning,
+  detachedConversionNodes,
+  detachedConversionRefusal,
+  conversionSnapshot,
+  conversionThrowReport,
 } from "./lib/subgraph-conversion-integrity.js";
 import {
   classifyWorkflowRefresh,
@@ -9283,6 +9287,46 @@ function clearStaleRedFlag(node, { app, graph, rootGraph }) {
  *
  *  Presence is checked on the LIVE graph, not just on the returned object: a result
  *  carrying a node that never landed is exactly the case a truthful report must catch. */
+/** Run the frontend's conversion so that a THROW is as informative as a return.
+ *
+ *  #1463 — both tools called `graph.convertToSubgraph()` bare, so the caller got the
+ *  frontend's raw exception and nothing else. That is not enough to act on, because
+ *  the SAME exception is reachable from both sides of the mutation: driven in a
+ *  browser, a detached boundary neighbour makes it throw in the reconnect loop with
+ *  the selected nodes ALREADY REMOVED and a subgraph definition already registered,
+ *  while a detached selected node (and any extension pre-pass wrapping the method)
+ *  throws with the canvas untouched. #1463's reporter read the bare message as "no
+ *  other side effects" and retried three times.
+ *
+ *  So: refuse up front on the one state that provably causes it and would cause the
+ *  destructive half, and otherwise measure the graph either side of the call and
+ *  report which of the two happened. The frontend's own message is always quoted
+ *  verbatim inside the result and kept as `cause`, so nothing greppable is lost.
+ *
+ *  `beforeChange`/`afterChange` stay paired exactly as before — the report is added
+ *  around them, not in place of them. */
+function convertSelectionToSubgraph({ graph, canvas, nodes, what }) {
+  const detached = detachedConversionNodes(graph, nodes);
+  if (detached.length) throw new Error(detachedConversionRefusal({ what, detached }));
+  const before = conversionSnapshot(graph, nodes);
+  graph.beforeChange?.();
+  try {
+    return graph.convertToSubgraph(canvas.selectedItems);
+  } catch (err) {
+    throw new Error(
+      conversionThrowReport({
+        what,
+        message: err?.message ?? String(err),
+        before,
+        after: conversionSnapshot(graph, nodes),
+      }),
+      { cause: err },
+    );
+  } finally {
+    graph.afterChange?.();
+  }
+}
+
 function assertSubgraphNodeLanded(res, graph, what) {
   const node = res?.node;
   const id = node?.id;
@@ -18098,13 +18142,13 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!ns.length) throw new Error("provide node_ids to group into a subgraph");
     if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
     else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
-    graph.beforeChange?.();
-    let res;
-    try {
-      res = graph.convertToSubgraph(canvas.selectedItems);
-    } finally {
-      graph.afterChange?.();
-    }
+    // #1463 — a THROW here is reported with a mutation verdict, not raw.
+    const res = convertSelectionToSubgraph({
+      graph,
+      canvas,
+      nodes: ns,
+      what: "panel_create_subgraph",
+    });
     clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     graph.setDirtyCanvas?.(true, true);
     // `node_id: null` inside a `subgraph:` payload reads as a success with a missing
@@ -18147,13 +18191,14 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
     else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
-    graph.beforeChange?.();
-    let res;
-    try {
-      res = graph.convertToSubgraph(canvas.selectedItems);
-    } finally {
-      graph.afterChange?.();
-    }
+    // #1463 — same throw-side reporting as panel_create_subgraph. Both entry points
+    // failed identically in that report, so neither may keep the bare re-throw.
+    const res = convertSelectionToSubgraph({
+      graph,
+      canvas,
+      nodes: ns,
+      what: "panel_subgraph_group",
+    });
     clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     graph.setDirtyCanvas?.(true, true);
     // Same guard as panel_create_subgraph: a conversion that produced no node must
