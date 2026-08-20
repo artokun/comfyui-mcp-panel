@@ -1459,6 +1459,31 @@ test("#608: a client route that RESOLVES NOTHING falls through to the raw route"
   assert.equal(verdict.refreshed, true, "a client route that returned nothing left the question open");
 });
 
+test("#608: a client answer that is not a SCHEMA leaves the question open", async () => {
+  // The clauses beside `!defs`. `fetchNodeDefsWithRetry` hands back whatever unusable value
+  // it exhausted on, so an array or a primitive arrives here truthy — and `defsObtained` is
+  // `!!defs`, so the run would go on to register it and report refreshed:true over a payload
+  // that defines nothing. Only the REGISTERED payload can tell the two apart, which is why
+  // this asserts on that rather than on the verdict.
+  let fetched = null;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async (defs) => {
+        fetched = defs;
+      },
+      refreshComboInNodes: async () => {},
+    },
+    apiValue: {
+      getNodeDefs: async () => ["not", "a", "schema"],
+      fetchApi: async () => okResponse({ SomeNode: {} }),
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, true);
+  assert.deepEqual(fetched, { SomeNode: {} }, "the array is not a schema — the raw route answered instead");
+});
+
 test("#608: an EMPTY client answer is an ANSWER — the raw route is NOT consulted", async () => {
   // The oracle's rule, mirrored deliberately: a client expressing deny-all as {} has
   // ANSWERED, and overruling it with a broader schema is the one direction this fallback
