@@ -769,13 +769,19 @@ test("#1872 refuses when an untouched size drifted and will not go back", () => 
       assert.doesNotMatch(error.message, /600/, "600 is this guard's failed write, not the drift");
       assert.doesNotMatch(
         error.message,
-        /rolled back/,
-        "size is exactly what would not go back — do not promise a rollback of it",
+        /rolled back|left where|unchanged/,
+        "size is exactly what would not go back — claim nothing about where it ended",
       );
+      // The refusal must not name a final size at all. restore() writes size a
+      // SECOND time and re-runs updateArea, so neither this guard's failed write
+      // (600) nor anything else is a state the throwing line ever observed.
+      assert.doesNotMatch(error.message, /600|800/, "no final-state number this line never read");
       return true;
     },
   );
   assert.equal(node.title, "Node 7");
   assert.equal(node.pos[0], 100, "every field the guard CAN restore is restored");
   assert.equal(node.pos[1], 200);
+  // Measured, not assumed: this is why the message may not describe the size.
+  assert.equal(node.size[1], 800, "restore() moves size again after the refusal");
 });
