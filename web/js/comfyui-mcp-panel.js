@@ -15064,8 +15064,15 @@ const GRAPH_TOOL_EXECUTORS = {
           const now = pair(node.size);
           if (!now || now[0] !== snap.size[0] || now[1] !== snap.size[1]) {
             if (!writeSize(node, snap.size)) {
+              // Name the drift that was OBSERVED — the reading taken BEFORE the restore
+              // attempt. Re-reading node.size here would report whatever the failed
+              // writeSize left behind (a widget-minimum clamp), which is our own number
+              // rather than the drift the caller needs to see. And do not promise a
+              // rollback: the size is precisely what would not go back. Every other
+              // captured field is restored below, and the edit is refused.
+              const drifted = now ? `[${now[0]}, ${now[1]}]` : "an unreadable value";
               throw new Error(
-                `node ${node.id} size drifted to [${pair(node.size) ?? []}] during this edit and could not be restored to its previous [${snap.size[0]}, ${snap.size[1]}] — the edit was rolled back`,
+                `node ${node.id} size drifted to ${drifted} during this edit and could not be restored to its previous [${snap.size[0]}, ${snap.size[1]}] — the edit was refused and its size left where the restore attempt landed`,
               );
             }
           }

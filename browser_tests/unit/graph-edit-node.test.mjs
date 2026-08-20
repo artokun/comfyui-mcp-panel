@@ -762,8 +762,20 @@ test("#1872 refuses when an untouched size drifted and will not go back", () => 
         /two positive numbers/,
         "the caller supplied no size — do not blame their arguments",
       );
+      // updateArea drifted the height to pos.y + h = 580; the failed restore then
+      // left the setter's own 600px minimum behind. Report what was OBSERVED, not
+      // the number our own failed write produced.
+      assert.match(error.message, /\[225, 580\]/, "the message must name the observed drift");
+      assert.doesNotMatch(error.message, /600/, "600 is this guard's failed write, not the drift");
+      assert.doesNotMatch(
+        error.message,
+        /rolled back/,
+        "size is exactly what would not go back — do not promise a rollback of it",
+      );
       return true;
     },
   );
-  assert.deepEqual(node.title, "Node 7");
+  assert.equal(node.title, "Node 7");
+  assert.equal(node.pos[0], 100, "every field the guard CAN restore is restored");
+  assert.equal(node.pos[1], 200);
 });
