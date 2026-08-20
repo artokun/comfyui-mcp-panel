@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.17] - 2026-08-20
+
+### Fixed
+- key the requested name and the canvas name with the operation each needs (#1462)
+
+### Changed
+- watch dependencies for advisories, weekly and grouped (#1464)
+
+
 ## [0.15.16] - 2026-08-20
 
 ### Fixed
