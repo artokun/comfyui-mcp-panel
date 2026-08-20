@@ -27,8 +27,8 @@ import { makeCommandBudget } from "./command-budget.js";
 // frontend strips the directory and the .json/.app.json suffix, so "Foo.json" and
 // "Foo" are the same workflow and must not read as a moved canvas.
 // #1459 — it applies to the REQUESTED name only. The frontend's `filename` has
-// already had its extension removed, and stripping it twice collapses distinct
-// workflows onto one key (see describeWorkflowSaveTimeout).
+// already had one trailing extension removed, and stripping it again collapses
+// distinct workflows onto one key (see describeWorkflowSaveTimeout).
 import { baseName } from "./workflow-save.js";
 
 /** Whole-command deadline `workflow_save` / `workflow_save_as` take. */
@@ -104,10 +104,11 @@ export function describeWorkflowSaveTimeout({
   // #1459 — but the two sides arrive normalized to DIFFERENT degrees, so one shared
   // helper cannot key both. `requested` is the caller's raw string and may still carry
   // a directory and a ".json"/".app.json" suffix — exactly what the save layer strips
-  // with baseName() before it builds the target path. `filename` is the frontend's
-  // ALREADY extension-stripped name (UserFile → getPathDetails → getFilenameDetails),
-  // so only the directory is left to drop. Running it through baseName() too strips it
-  // a SECOND time — the same double-strip workflow-save.js:650 documents as unsafe:
+  // with baseName() before it builds the target path. `filename` has already had ONE
+  // trailing extension removed by the frontend (UserFile → getPathDetails →
+  // getFilenameDetails), so the directory is the only part of it still safe to drop.
+  // Running it through baseName() too strips it a SECOND time — the same double-strip
+  // workflow-save.js:650 documents as unsafe:
   // a file on disk at "…/Foo.json.json" reports filename "Foo.json", which stripped
   // again reads "Foo" and matches a requested "Foo". A genuinely different workflow
   // then passes as the destination, the "not the save's destination" disclosure is
@@ -120,7 +121,14 @@ export function describeWorkflowSaveTimeout({
   };
   /** Key a caller-supplied name: both the directory and the extension are presentation. */
   const requestedKey = (v) => baseName(dropDir(v));
-  /** Key a frontend-derived `filename`: its extension is already gone. Drop only the directory. */
+  // KNOWN AND UNCHANGED: getFilenameDetails removes one extension, not the compound
+  // ".app.json" — an app-mode workflow on disk at "Foo.app.json" reports filename
+  // "Foo.app", which no longer keys equal to a requested "Foo". That mismatch predates
+  // this change and is identical before and after it; activeKey deliberately does not
+  // paper over it, because ".app" is also a legal thing to call a workflow and guessing
+  // wrong here is the very failure mode above. Not normalizing it costs at most an extra
+  // "cannot say which file" disclosure, which is the safe direction to be wrong in.
+  /** Key a frontend-derived `filename`: drop the directory and NOTHING else. */
   const activeKey = (v) => dropDir(v);
   const dest = str(requested);
   const active = str(filename);
