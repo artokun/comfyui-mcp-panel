@@ -443,39 +443,76 @@ function linkLookup(links) {
 }
 
 const linkOriginId = (link) => link?.origin_id ?? (Array.isArray(link) ? link[1] : undefined);
-const linkTargetId = (link) => link?.target_id ?? (Array.isArray(link) ? link[3] : undefined);
 
-/** Ids of the nodes directly wired to `node` — the boundary neighbours a conversion
- *  has to disconnect and re-attach, and therefore the ones whose detachment is fatal.
+/**
+ * Ids of the nodes FEEDING `node` — its upstream producers.
  *
- *  Takes a prepared `lookup` rather than the link table, so a caller sweeping a whole
- *  selection indexes a serialized (array) table once instead of once per node. */
-function linkedNeighborIds(node, lookup) {
+ * Deliberately not "everything wired to it" (gate r5 P1). Direction decides whether a
+ * detached neighbour is fatal, and only the upstream side is, read out of the installed
+ * frontend's own sourcemapped litegraph:
+ *
+ *   - Upstream: the reconnect is `outputNode.connectSlots(output, subgraphNode, …)`
+ *     (`LGraph.ts`), where `outputNode` is the OUTSIDE producer — and `connectSlots`
+ *     opens with `const { graph } = this; if (!graph) throw new NullGraphError()`
+ *     (`LGraphNode.ts`). A detached producer therefore throws, after the selected nodes
+ *     have already been removed. That is #1463's destructive case, and the one measured
+ *     in the browser.
+ *   - Downstream: the reconnect is `subgraphNode.connectSlots(output, inputNode, …)` —
+ *     `this` is the freshly added wrapper, whose graph is set. Nothing reads the
+ *     consumer's `graph`: `disconnectOutput` dereferences only `this.graph` and writes
+ *     `target.inputs[slot].link = null`, and `connectSlots`' one call into the consumer,
+ *     `inputNode.disconnectInput(...)`, is gated on that same link being non-null, which
+ *     `disconnectOutput` has already cleared. A detached consumer converts fine.
+ *
+ * Sweeping both directions and refusing on either would block a conversion the frontend
+ * completes — a worse outcome than the bug, in the exact pathological state this feature
+ * exists for.
+ *
+ * Takes a prepared `lookup` rather than the link table, so a caller sweeping a whole
+ * selection indexes a serialized (array) table once instead of once per node.
+ */
+function upstreamProducerIds(node, lookup) {
   const ids = new Set();
   for (const input of Array.isArray(node?.inputs) ? node.inputs : []) {
     const id = linkOriginId(lookup(input?.link));
     if (id != null) ids.add(id);
   }
-  for (const output of Array.isArray(node?.outputs) ? node.outputs : []) {
-    for (const linkId of Array.isArray(output?.links) ? output.links : []) {
-      const id = linkTargetId(lookup(linkId));
-      if (id != null) ids.add(id);
-    }
-  }
   return ids;
+}
+
+/** Does the conversion ever ask this node to disconnect anything?
+ *
+ *  A SELECTED node is only dereferenced through `disconnectInput`/`disconnectOutput`,
+ *  and both are reached per-link — `LGraph.remove` calls them only for slots that carry
+ *  one. A detached node with no links at all converts cleanly (measured: two detached,
+ *  unlinked nodes wrap without error), so refusing it would be over-refusal. */
+function carriesAnyLink(node) {
+  for (const input of Array.isArray(node?.inputs) ? node.inputs : []) {
+    if (input?.link != null) return true;
+  }
+  for (const output of Array.isArray(node?.outputs) ? node.outputs : []) {
+    if (Array.isArray(output?.links) && output.links.length) return true;
+  }
+  return false;
 }
 
 /**
  * Nodes involved in this conversion that the graph OWNS but that do not point back at
  * it — the state that provably throws `NullGraphError` out of `convertToSubgraph`.
  *
- * Each entry carries its `role`, because the two roles fail DIFFERENTLY and the refusal
- * has to say which. Read out of the shipped bundle's `LGraph.ts` on this install:
- * `createSubgraph` @1792 → `disconnectInput` @1807 → `for (const node of nodes)
+ * Two roles only, and each carries its own consequence, because they fail DIFFERENTLY
+ * and the refusal has to say which. Read out of the shipped bundle's `LGraph.ts` on this
+ * install: `createSubgraph` @1792 → `disconnectInput` @1807 → `for (const node of nodes)
  * this.remove(node)` @1817 → `this.add(subgraphNode)` @1858. A detached node in the
  * SELECTION throws at 1807 — a definition is already registered, nothing is removed yet.
- * A detached NEIGHBOUR survives that loop and throws in the reconnect that follows 1858,
- * by which point the selected nodes are gone and the wrapper exists unwired.
+ * A detached upstream PRODUCER survives that loop and throws in the reconnect that
+ * follows 1858, by which point the selected nodes are gone and the wrapper exists
+ * unwired.
+ *
+ * A detached downstream CONSUMER is deliberately absent: the conversion never reads its
+ * `graph`, so refusing on it would block a conversion the frontend completes. See
+ * {@link upstreamProducerIds} for that trace, and {@link carriesAnyLink} for the
+ * matching narrowing on the selection side.
  *
  * Ownership is proved by NODE identity (`getNodeById(id)` returns this very object),
  * never by graph identity. `node.graph !== graph` would read a Vue proxy of the live
@@ -498,11 +535,16 @@ export function detachedConversionNodes(graph, nodes) {
     if (!node || seen.has(node)) return;
     seen.add(node);
     if (!owns(node)) return;
-    if (node.graph == null) found.push({ id: node.id, role });
+    if (node.graph != null) return;
+    // A selected node is only dereferenced per-link; an unlinked one converts cleanly.
+    if (role === "selected" && !carriesAnyLink(node)) return;
+    found.push({ id: node.id, role });
   };
+  // Selection first, so a node that is both selected and someone's producer is reported
+  // once, under the role whose consequence lands first.
   for (const node of selection) consider(node, "selected");
   for (const node of selection) {
-    for (const id of linkedNeighborIds(node, lookup)) consider(graph.getNodeById(id), "neighbour");
+    for (const id of upstreamProducerIds(node, lookup)) consider(graph.getNodeById(id), "producer");
   }
   return found;
 }
@@ -520,16 +562,16 @@ export function detachedConversionRefusal({ what, detached }) {
   const idsOf = (role) =>
     bad.filter((entry) => entry?.role === role).map((entry) => entry?.id);
   const picked = idsOf("selected");
-  const neighbours = idsOf("neighbour");
+  const producers = idsOf("producer");
   const listing = [];
   if (picked.length) {
     listing.push(
       `node${picked.length === 1 ? "" : "s"} ${picked.join(", ")} in your selection`,
     );
   }
-  if (neighbours.length) {
+  if (producers.length) {
     listing.push(
-      `node${neighbours.length === 1 ? "" : "s"} ${neighbours.join(", ")} wired to it`,
+      `node${producers.length === 1 ? "" : "s"} ${producers.join(", ")} feeding it`,
     );
   }
   const who = listing.length ? listing.join(", and ") : `node(s) ${bad.map((e) => e?.id).join(", ")}`;
@@ -542,9 +584,9 @@ export function detachedConversionRefusal({ what, detached }) {
         `definition on the workflow and no node to show for it`,
     );
   }
-  if (neighbours.length) {
+  if (producers.length) {
     consequence.push(
-      `a detached node WIRED to the selection makes it throw later still, in the reconnect ` +
+      `a detached node FEEDING the selection makes it throw later still, in the reconnect ` +
         `pass, by which point the nodes you selected are gone and the wrapper it built is ` +
         `sitting there wired to nothing`,
     );

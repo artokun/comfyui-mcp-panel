@@ -40,10 +40,21 @@
 // wrong, which is worse. The confident verdict is now gated on the link table too, and on
 // nothing having replaced `convertToSubgraph` on the graph object.
 //
+// ## The refusal that may NOT be made (gate P1 on the second version)
+//
+// It then swept every neighbour. Direction decides fatality: the input-side reconnect is
+// `outputNode.connectSlots(output, subgraphNode, …)` — `this` is the OUTSIDE producer, so
+// a detached producer throws — while the output-side one is
+// `subgraphNode.connectSlots(output, inputNode, …)`, where `this` is the new wrapper and
+// nothing ever reads the consumer's graph. Refusing on a detached consumer blocked a
+// conversion the frontend completes, in the exact pathological state this feature is for.
+// Only upstream producers, and only selected nodes that actually carry a link, are fatal.
+//
 // ## What is pinned here
 //
 // 1. The pre-flight names the one condition that provably causes this, on the SELECTION
-//    and on its boundary NEIGHBOURS, and refuses before anything is mutated.
+//    and on its upstream PRODUCERS, refuses before anything is mutated — and refuses
+//    neither a downstream consumer nor an unlinked selected node.
 // 2. It refuses ONLY on a nullish back-reference — never on graph identity, which on a
 //    reactive frontend would read a Vue proxy of the live root as a foreign graph and
 //    refuse every conversion (the #558 proxy/raw duality).
@@ -77,7 +88,8 @@ const code = () =>
     .join("\n");
 
 /** The chain measured in the browser: 1→2→3→4, links 10/11/12, live-litegraph `Map`
- *  link table. Selecting [2, 3] makes 1 and 4 the boundary neighbours. */
+ *  link table. Selecting [2, 3] makes node 1 the upstream PRODUCER and node 4 the
+ *  downstream CONSUMER — the two that fail differently. */
 function chain({ linksAs = "map" } = {}) {
   const n1 = { id: 1, inputs: [], outputs: [{ links: [10] }] };
   const n2 = { id: 2, inputs: [{ link: 10 }], outputs: [{ links: [11] }] };
@@ -109,10 +121,10 @@ function chain({ linksAs = "map" } = {}) {
 /* 1. the pre-flight finds the condition that throws                           */
 /* -------------------------------------------------------------------------- */
 
-test("a detached boundary NEIGHBOUR is found — that is the destructive case", () => {
+test("a detached upstream PRODUCER is found — that is the destructive case", () => {
   const { graph, n1, n2, n3 } = chain();
-  n1.graph = null; // node 1 is outside the selection; the reconnect loop touches it
-  assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [{ id: 1, role: "neighbour" }]);
+  n1.graph = null; // node 1 feeds the selection; the reconnect calls connectSlots ON it
+  assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [{ id: 1, role: "producer" }]);
 });
 
 test("a detached SELECTED node is found too", () => {
@@ -126,13 +138,13 @@ test("a healthy chain produces no finding", () => {
   assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), []);
 });
 
-test("neighbours are found through a serialized link table as well as a live Map", () => {
+test("producers are found through a serialized link table as well as a live Map", () => {
   for (const linksAs of ["map", "tuples", "object"]) {
     const { graph, n1, n2, n3 } = chain({ linksAs });
     n1.graph = null;
     assert.deepEqual(
       detachedConversionNodes(graph, [n2, n3]),
-      [{ id: 1, role: "neighbour" }],
+      [{ id: 1, role: "producer" }],
       `link table: ${linksAs}`,
     );
   }
@@ -141,6 +153,41 @@ test("neighbours are found through a serialized link table as well as a live Map
 /* -------------------------------------------------------------------------- */
 /* 2. it refuses on nothing else                                               */
 /* -------------------------------------------------------------------------- */
+
+test("a detached DOWNSTREAM consumer is NOT refused — the conversion survives it", () => {
+  // gate r5 P1. Direction decides fatality, and the first version swept both, so a
+  // conversion the frontend completes was hard-refused with a destructive-sounding
+  // reason. Read out of the installed frontend: the output-side reconnect is
+  // `subgraphNode.connectSlots(output, inputNode, …)` — `this` is the freshly added
+  // wrapper, never the consumer — and `disconnectOutput` dereferences only `this.graph`
+  // while writing `target.inputs[slot].link = null`. Nothing reads the consumer's graph.
+  const { graph, n2, n3, n4 } = chain();
+  n4.graph = null; // node 4 consumes the selection's output
+  assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), []);
+});
+
+test("a detached node that is BOTH a consumer and a producer is still refused", () => {
+  // Direction is per-edge, not per-node: if it feeds anything selected, it is fatal.
+  const { graph, n1, n2, n3, n4 } = chain();
+  n1.graph = null;
+  n4.graph = null;
+  assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [{ id: 1, role: "producer" }]);
+});
+
+test("a detached SELECTED node with no links at all is not refused", () => {
+  // Measured in-browser: two detached, unlinked nodes wrap without error, because a
+  // selected node is only dereferenced through disconnectInput/disconnectOutput and
+  // LGraph.remove reaches those per-link.
+  const loose = { id: 7, inputs: [], outputs: [{ links: [] }], graph: null };
+  const byId = new Map([[7, loose]]);
+  const graph = { getNodeById: (id) => byId.get(id) ?? null, links: new Map(), subgraphs: new Map() };
+  assert.deepEqual(detachedConversionNodes(graph, [loose]), []);
+
+  // …but one carrying a single link is.
+  const wired = { id: 8, inputs: [{ link: 10 }], outputs: [], graph: null };
+  byId.set(8, wired);
+  assert.deepEqual(detachedConversionNodes(graph, [wired]), [{ id: 8, role: "selected" }]);
+});
 
 test("a node whose graph is a DIFFERENT object is never reported", () => {
   // On a reactive frontend `node.graph` and the graph handed to a command can be a Vue
@@ -172,16 +219,16 @@ test("an empty selection produces no finding", () => {
 test("the refusal states the graph was not touched, and names the nodes", () => {
   const msg = detachedConversionRefusal({
     what: "panel_create_subgraph",
-    detached: [{ id: 1, role: "neighbour" }],
+    detached: [{ id: 1, role: "producer" }],
   });
   assert.match(msg, /was NOT run and the graph is unchanged/);
-  assert.match(msg, /node 1 wired to it/);
+  assert.match(msg, /node 1 feeding it/);
   // It must carry the string the reporter would search for.
   assert.match(msg, /Attempted to access LGraph reference that was null or undefined\./);
 });
 
 test("the refusal names the consequence of the ROLE it found, not the other one", () => {
-  // gate r3 P1: one sentence was emitted for both, and it described the neighbour
+  // gate r3 P1: one sentence was emitted for both, and it described the producer
   // outcome. The selected-node path throws at disconnectInput — before the removal
   // loop — so "already removed the nodes you selected" was a state it never reaches.
   const picked = detachedConversionRefusal({
@@ -194,26 +241,26 @@ test("the refusal names the consequence of the ROLE it found, not the other one"
   assert.doesNotMatch(picked, /the nodes you selected are gone/);
   assert.doesNotMatch(picked, /wired to nothing/);
 
-  const neighbour = detachedConversionRefusal({
+  const producer = detachedConversionRefusal({
     what: "panel_subgraph_group",
-    detached: [{ id: 1, role: "neighbour" }],
+    detached: [{ id: 1, role: "producer" }],
   });
-  assert.match(neighbour, /in the reconnect pass/);
-  assert.match(neighbour, /the nodes you selected are gone/);
-  assert.doesNotMatch(neighbour, /throw at disconnectInput/);
+  assert.match(producer, /in the reconnect pass/);
+  assert.match(producer, /the nodes you selected are gone/);
+  assert.doesNotMatch(producer, /throw at disconnectInput/);
 
   // Both roles present: both consequences stated, neither invented.
   const both = detachedConversionRefusal({
     what: "panel_create_subgraph",
-    detached: [{ id: 2, role: "selected" }, { id: 1, role: "neighbour" }],
+    detached: [{ id: 2, role: "selected" }, { id: 1, role: "producer" }],
   });
-  assert.match(both, /node 2 in your selection, and node 1 wired to it/);
+  assert.match(both, /node 2 in your selection, and node 1 feeding it/);
   assert.match(both, /throw at disconnectInput/);
   assert.match(both, /in the reconnect pass/);
 
   // gate r4: "every other panel tool keeps working meanwhile" was not true either — a
   // detached node throws out of the disconnect paths too. Same habit, smaller stakes.
-  for (const msg of [picked, neighbour, both]) {
+  for (const msg of [picked, producer, both]) {
     assert.doesNotMatch(msg, /Every other panel tool keeps working/);
     assert.match(msg, /anything that disconnects or removes it can hit the same throw/);
   }
