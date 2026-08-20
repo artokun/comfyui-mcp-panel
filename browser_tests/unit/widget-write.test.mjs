@@ -751,6 +751,127 @@ test("numeric widget REJECTS non-numeric JSON types (array/object/bool/blank), a
   assert.equal(applyWidgetWrite(mk(), "steps", "5", HOOKS).value, 5);
 });
 
+// ---- #1533: VHS_LoadVideo custom_width/custom_height must RETAIN the write ----
+//
+// Video Helper Suite's VHSINT callback (web/js/VHS.core.js getCustomWidgets.VHSINT)
+// snaps with `Math.round((v - mod) / step) * step + mod`. custom_width/custom_height
+// declare `disable: 0` and no `step`. When the format preset has not injected a
+// dim-step, `step` is undefined, that formula stores NaN, and JSON.stringify(NaN)
+// is `"null"` — panel_set_widget reported "applied and immediately became null".
+// The callback below is that pack function, not a stand-in that merely sets null.
+
+function vhsIntCallback(v) {
+  if (this.options.max && v > this.options.max) {
+    v = this.options.max;
+  }
+  if (this.options.min && v < this.options.min) {
+    v = this.options.min;
+  }
+  if (v == 0) {
+    return;
+  }
+  const s = this.options.step;
+  const sh = this.options.mod ?? 0;
+  this.value = Math.round((v - sh) / s) * s + sh;
+}
+
+function vhsDimensionWidget(name, extra = {}) {
+  const { options: extraOptions, ...rest } = extra;
+  const options = { default: 0, min: 0, max: 8192, disable: 0, ...extraOptions };
+  return {
+    name,
+    type: "VHS.ANNOTATED",
+    value: 0,
+    options,
+    config: ["INT", options],
+    callback: vhsIntCallback,
+    ...rest,
+  };
+}
+
+test("#1533: VHS.ANNOTATED is a numeric widget (custom_width is not litegraph 'int')", () => {
+  assert.equal(isNumericWidget(vhsDimensionWidget("custom_width")), true);
+  assert.equal(isNumericWidget({ name: "t", type: "VHS.TIMESTAMP", config: ["FLOAT", {}] }), true);
+  assert.equal(isNumericWidget({ name: "n", config: ["INT", { min: 0 }] }), true);
+});
+
+test("#1533: panel_set_widget retains VHS_LoadVideo custom_width when the VHSINT callback has no step", () => {
+  const width = vhsDimensionWidget("custom_width");
+  const node = { id: 12, type: "VHS_LoadVideo", widgets: [width] };
+  const set = applyWidgetWrite(node, "custom_width", 1280, HOOKS);
+  assert.equal(set.value, 1280);
+  assert.equal(width.value, 1280);
+});
+
+test("#1533: panel_set_widget retains VHS_LoadVideo custom_height the same way", () => {
+  const height = vhsDimensionWidget("custom_height");
+  const node = { id: 12, type: "VHS_LoadVideo", widgets: [height] };
+  const set = applyWidgetWrite(node, "custom_height", 720, HOOKS);
+  assert.equal(set.value, 720);
+  assert.equal(height.value, 720);
+});
+
+test("#1533: a numeric string still lands (VHS.ANNOTATED is coerced as INT)", () => {
+  const width = vhsDimensionWidget("custom_width");
+  const node = { id: 12, type: "VHS_LoadVideo", widgets: [width] };
+  const set = applyWidgetWrite(node, "custom_width", "1920", HOOKS);
+  assert.equal(set.value, 1920);
+  assert.equal(width.value, 1920);
+});
+
+test("#1533: writing 0 (VHS disable sentinel) keeps 0 — the callback returns without snapping", () => {
+  const width = vhsDimensionWidget("custom_width");
+  width.value = 1280;
+  const node = { id: 12, type: "VHS_LoadVideo", widgets: [width] };
+  const set = applyWidgetWrite(node, "custom_width", 0, HOOKS);
+  assert.equal(set.value, 0);
+  assert.equal(width.value, 0);
+});
+
+test("#1533: a format-injected step still snaps, and the snap is reported as normalization", () => {
+  // AnimateDiff injects step 8. 1281 → 1280 is the pack's own grid, not a failed write.
+  const width = vhsDimensionWidget("custom_width", { options: { step: 8 } });
+  const node = { id: 12, type: "VHS_LoadVideo", widgets: [width] };
+  const set = applyWidgetWrite(node, "custom_width", 1281, HOOKS);
+  assert.equal(width.value, 1280);
+  assert.equal(set.value, 1280);
+  assert.equal(set.normalized, true);
+  assert.equal(set.requested_value, 1281);
+});
+
+test("#1533: a Vue-style callback that stores null for a finite number is restored too", () => {
+  const width = vhsDimensionWidget("custom_width");
+  width.callback = function () {
+    this.value = null;
+  };
+  const node = { id: 12, type: "VHS_LoadVideo", widgets: [width] };
+  const set = applyWidgetWrite(node, "custom_width", 832, HOOKS);
+  assert.equal(set.value, 832);
+  assert.equal(width.value, 832);
+});
+
+test("#1533: a numeric callback that drifts to a different finite number is still a failed write", () => {
+  const node = {
+    id: 1,
+    type: "N",
+    widgets: [
+      {
+        name: "n",
+        type: "INT",
+        value: 1,
+        callback() {
+          this.value = 99;
+        },
+      },
+    ],
+  };
+  assert.throws(
+    () => applyWidgetWrite(node, "n", 20, HOOKS),
+    (err) => err instanceof WidgetWriteError && /did not retain the requested value/.test(err.message),
+  );
+  assert.equal(node.widgets[0].value, 1, "rolled back to the prior value");
+});
+
 test("boolean widget coerces true/false strings and rejects garbage", () => {
   assert.equal(applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "e", type: "toggle", value: false }] }, "e", "true", HOOKS).value, true);
   assert.throws(() => applyWidgetWrite({ id: 1, type: "N", widgets: [{ name: "e", type: "toggle", value: false }] }, "e", "maybe", HOOKS), WidgetWriteError);

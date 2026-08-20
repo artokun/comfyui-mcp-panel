@@ -258,9 +258,42 @@ function optionLabelIndex(options, value) {
 }
 
 // litegraph "number"/"slider" and Comfy "INT"/"FLOAT" all render numeric.
+// VHS annotated INT/FLOAT widgets (#1533) use type "VHS.ANNOTATED" / "VHS.TIMESTAMP"
+// rather than those names; they still store a number (custom_width/custom_height
+// on VHS_LoadVideo) and their callback snaps one. `config[0]` is the backend
+// declared type VHS stashes on the widget (`["INT", {…}]`).
 export function isNumericWidget(widget) {
   const t = String(widget?.type ?? "").toLowerCase();
-  return t === "number" || t === "slider" || t === "int" || t === "float";
+  if (t === "number" || t === "slider" || t === "int" || t === "float") return true;
+  if (t === "vhs.annotated" || t === "vhs.timestamp") return true;
+  const cfg0 = Array.isArray(widget?.config) ? widget.config[0] : null;
+  return cfg0 === "INT" || cfg0 === "FLOAT";
+}
+
+/**
+ * #1533 — put a finite number back when the widget's own callback stored
+ * null/NaN/Infinity in its place.
+ *
+ * VHSINT (Video Helper Suite `getCustomWidgets.VHSINT`, type `VHS.ANNOTATED`)
+ * snaps with `Math.round((v - mod) / step) * step + mod`. VHS_LoadVideo's
+ * `custom_width`/`custom_height` declare `disable: 0` and no `step`; when the
+ * format preset has not injected a dim-step, `step` is undefined, that formula
+ * stores NaN, and `JSON.stringify(NaN)` is `"null"` — the write "applied and
+ * immediately became null". An INT widget cannot hold NaN/null; the assignment
+ * already put the number there, so restore it. A callback that stored a
+ * DIFFERENT finite number is still drift (#240 / #805).
+ */
+function restoreFiniteNumberIfUnstored(widget, expected) {
+  if (!widget || typeof expected !== "number" || !Number.isFinite(expected)) return;
+  let actual;
+  try {
+    actual = widget.value;
+  } catch {
+    return;
+  }
+  if (actual == null || (typeof actual === "number" && !Number.isFinite(actual))) {
+    widget.value = expected;
+  }
 }
 
 export function isBooleanWidget(widget) {
@@ -1763,6 +1796,12 @@ export function applyWidgetWrite(
       reflectApply(widgetCallback, valueWidget, callbackArgs);
       threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
     }
+    // #1533 — AFTER the callback, still inside this envelope so afterChange
+    // captures the restored number. A VHSINT missing-step snap stores NaN (and a
+    // Vue setter may coerce that to null); neither is a retained INT value.
+    restoreFiniteNumberIfUnstored(valueWidget, expected);
+    if (parentWidget) restoreFiniteNumberIfUnstored(parentWidget, expected);
+    for (const dw of displayWidgets) restoreFiniteNumberIfUnstored(dw, expected);
   } catch (err) {
     // #639 (codex round-3 + delta-gate): WHICH construct threw is not recorded for
     // anything but the callback invocation — a value setter can invoke the callback
