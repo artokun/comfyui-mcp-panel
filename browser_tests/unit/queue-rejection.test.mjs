@@ -252,3 +252,184 @@ test("WIRING: graph_run passes the run-to-node target into the summary", async (
   assert.ok(src.includes("runToNode: runToNodeInfo,"),
     "summarizePromptRejection must receive the run-to-node target");
 });
+
+// ── #1504: a MINTED prompt_id outranks node_errors ─────────────────────────
+//
+// panel_run answered
+//
+//   ComfyUI refused to queue the workflow
+//   - VAEDecode (node 36): Required input is missing (samples)   … ×6
+//
+// and the ComfyUI queue showed `running: 1`, prompt b01ba287-…, `pending: 0` at the
+// same instant. Every following graph read/edit was then rejected with QUEUE BUSY —
+// by the very render the caller had just been told did not exist.
+//
+// Both statements came from ONE reply. ComfyUI validates each output independently
+// (execution.validate_prompt); when some fail but at least one survives it logs
+// "Output will be ignored", returns valid[0]=True, and server.py takes the
+// `if valid[0]:` branch — prompt_queue.put(...), then
+//
+//     web.json_response({"prompt_id": …, "number": …, "node_errors": valid[3]})
+//
+// at status **200**. The reported workflow had several output branches with some
+// disabled through node modes, so its bypassed VAEDecode branches are exactly the
+// ones ComfyUI dropped.
+//
+// The panel could not tell the two apart because the frontend funnels both channels
+// into one place: app.queuePrompt calls recordNodeErrors(res.node_errors) on the
+// RESOLVED (200) response too, so app.lastNodeErrors is populated for a prompt that
+// is on the GPU. The verdict now takes the minted prompt_id — a receipt ComfyUI
+// issues only after queueing — over that ambiguous channel.
+
+// The six bypassed VAEDecode branches from the report, in ComfyUI node_errors shape.
+const DROPPED_VAE_DECODES = Object.fromEntries(
+  [36, 41, 57, 60, 63, 66].map((id) => [
+    String(id),
+    {
+      class_type: "VAEDecode",
+      dependent_outputs: [],
+      errors: [
+        { type: "required_input_missing", message: "Required input is missing", details: "samples" },
+      ],
+    },
+  ]),
+);
+const RUNNING_PROMPT_ID = "b01ba287-500f-418d-b2e1-353c891065f1";
+
+test("#1504: node_errors beside a MINTED prompt_id is an accepted partial run, NOT a refusal", () => {
+  const verdict = summarizePromptRejection({
+    rejection: null, // 200 — nothing was captured on the non-200 rejection channel
+    lastNodeErrors: DROPPED_VAE_DECODES, // …but the frontend stored the 200 node_errors here
+    acceptedPromptIds: [RUNNING_PROMPT_ID],
+  });
+  assert.equal(
+    verdict,
+    null,
+    "ComfyUI minted a prompt id, so this prompt IS queued — the node_errors name dropped outputs",
+  );
+});
+
+test("#1504: the accept result reports the dropped outputs alongside the prompt_id", () => {
+  // This is the mcp#944 shape — `queued:true` + prompt_id + node_errors, with NO
+  // top-level error — which the orchestrator renders as its "[PARTIAL] ComfyUI
+  // ACCEPTED this prompt and is running it, but it dropped N output(s)" disclosure.
+  // That disclosure has existed since mcp v0.50.2 and was unreachable from here,
+  // because the panel sent node_errors with no prompt_id beside them.
+  const r = buildQueueAcceptResult({
+    batchCount: 1,
+    promptIds: [RUNNING_PROMPT_ID],
+    droppedOutputs: DROPPED_VAE_DECODES,
+  });
+  assert.equal(r.queued, true);
+  assert.equal(r.prompt_id, RUNNING_PROMPT_ID);
+  assert.deepEqual(r.node_errors, DROPPED_VAE_DECODES);
+  assert.equal(r.error, undefined, "no top-level error: the prompt was accepted");
+});
+
+test("#1504: a clean accept says nothing about dropped outputs", () => {
+  // The disclosure is loud, so it must never fire on a run that dropped nothing.
+  for (const dropped of [null, undefined, {}, [], "nope", 0]) {
+    const r = buildQueueAcceptResult({ batchCount: 1, promptIds: ["p1"], droppedOutputs: dropped });
+    assert.equal(
+      r.node_errors,
+      undefined,
+      `no node_errors for droppedOutputs=${JSON.stringify(dropped)}`,
+    );
+  }
+});
+
+test("#1504 does NOT regress #358: a top-level rejection is still a refusal", () => {
+  // The #358 shape is a 400, which mints nothing — acceptedPromptIds is empty and
+  // the verdict is untouched.
+  const verdict = summarizePromptRejection({
+    rejection: { error: MISSING_NODE_TYPE, node_errors: {} },
+    lastNodeErrors: {},
+    acceptedPromptIds: [],
+  });
+  assert.ok(verdict);
+  assert.equal(verdict.queued, false);
+  assert.equal(verdict.error_type, "missing_node_type");
+  assert.equal(verdict.prompt_id, undefined);
+});
+
+test("#1504: node_errors with NO minted prompt_id is still a refusal (unchanged)", () => {
+  // A genuine 400 validation refusal: every output failed, nothing was queued.
+  const verdict = summarizePromptRejection({
+    rejection: { error: null, node_errors: DROPPED_VAE_DECODES },
+    lastNodeErrors: {},
+  });
+  assert.ok(verdict, "with no receipt of acceptance the per-node errors still mean refused");
+  assert.equal(verdict.queued, false);
+  assert.deepEqual(verdict.node_errors, DROPPED_VAE_DECODES);
+});
+
+test("#1504: a top-level error PLUS a minted id stays a refusal, but carries the id", () => {
+  // A batch whose first prompt was accepted and whose second was refused. The two
+  // claims contradict each other, so the verdict does not silently pick the happy
+  // one — it reports the refusal AND the id, which the orchestrator turns into its
+  // "[UNCERTAIN] … a render may already be in flight, do NOT re-run" answer. Losing
+  // the id here is what sends a caller to re-queue work that is already rendering.
+  const verdict = summarizePromptRejection({
+    rejection: { error: MISSING_NODE_TYPE, node_errors: {} },
+    lastNodeErrors: {},
+    acceptedPromptIds: ["p1", "p2"],
+  });
+  assert.ok(verdict);
+  assert.equal(verdict.queued, false);
+  assert.equal(verdict.prompt_id, "p1");
+  assert.deepEqual(verdict.prompt_ids, ["p1", "p2"]);
+});
+
+test("#1504: accepted ids are normalized like every other id boundary (#370)", () => {
+  // 0 is a real prompt id, and 0 / "0" are the same run.
+  assert.equal(
+    summarizePromptRejection({ lastNodeErrors: DROPPED_VAE_DECODES, acceptedPromptIds: [0] }),
+    null,
+    "the falsy-but-valid id 0 is still a receipt of acceptance",
+  );
+  const v = summarizePromptRejection({
+    rejection: { error: MISSING_NODE_TYPE },
+    acceptedPromptIds: [0, "0", null, "  ", undefined, 7],
+  });
+  assert.deepEqual(v.prompt_ids, ["0", "7"], "deduped after string normalization; blanks dropped");
+});
+
+test("#1504: an absent acceptedPromptIds argument leaves every caller verdict unchanged", () => {
+  // Callers that never pass the new argument (and any odd value) must behave
+  // exactly as before — the receipt only ever ADDS acceptance evidence.
+  for (const ids of [undefined, null, [], "p1", 5, {}]) {
+    const v = summarizePromptRejection({
+      rejection: null,
+      lastNodeErrors: { 7: { errors: [{ message: "required input missing" }] } },
+      acceptedPromptIds: ids,
+    });
+    assert.ok(v, `acceptedPromptIds=${JSON.stringify(ids)} must not be read as an acceptance`);
+    assert.equal(v.queued, false);
+  }
+});
+
+test("WIRING #1504: graph_run captures the 200 node_errors and hands the ids to the verdict", async () => {
+  // The tests above prove the verdict is right; none prove graph_run REACHES it.
+  // graph_run lives on a module-private handler map in the monolith and needs a
+  // live app, so pin the three lines the fix depends on. Without any one of them
+  // every test above stays green while panel_run still reports the refusal.
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  // …captured from the 200 body on BOTH dispatch paths (unscoped + run-to-node),
+  assert.equal(
+    src.split("onAcceptedNodeErrors: captureAcceptedNodeErrors,").length - 1,
+    2,
+    "both the unscoped interceptor and the scoped dispatch must capture accepted node_errors",
+  );
+  // …the minted ids reach the verdict (without this the refusal returns),
+  assert.ok(
+    src.includes("acceptedPromptIds: queuedPromptIds,"),
+    "summarizePromptRejection must receive the prompt_ids ComfyUI minted",
+  );
+  // …and the dropped outputs reach the accept result (without this the caller is
+  // never told which outputs will produce no file).
+  assert.ok(
+    src.includes("droppedOutputs: acceptedNodeErrors,"),
+    "buildQueueAcceptResult must receive the dropped outputs",
+  );
+});

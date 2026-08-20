@@ -3640,3 +3640,100 @@ test("#1871 WIRING: graph_run actually RENDERS the pruned-retry disclosure into 
     "the acceptance claim is gated on a post ComfyUI actually accepted",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #1504 — node_errors on an ACCEPTED (200) reply
+// ---------------------------------------------------------------------------
+//
+// ComfyUI validates each output independently. When some fail but at least one
+// survives, server.py queues the prompt and answers **200** with `prompt_id` AND
+// the `node_errors` for the outputs it dropped. Those errors are not a refusal,
+// and the capture layer is the only place that can still tell the difference:
+// the frontend records a 200 reply node_errors onto app.lastNodeErrors exactly
+// like a rejection, so by the time graph_run reads that field the distinction is
+// gone. These pin that the 200 body is read for BOTH facts, on BOTH dispatch
+// paths, and that a rejection is still never manufactured from a 200.
+
+const PARTIAL_NODE_ERRORS = {
+  36: {
+    class_type: "VAEDecode",
+    dependent_outputs: [],
+    errors: [{ type: "required_input_missing", message: "Required input is missing", details: "samples" }],
+  },
+};
+
+test("#1504 unscoped interceptor: a 200 with node_errors yields prompt_id + ACCEPTED drops, never a rejection", async () => {
+  const spy = makeServer(async () =>
+    jsonResponse(200, { prompt_id: "p-partial", number: 1, node_errors: PARTIAL_NODE_ERRORS }),
+  );
+  let rejection = null;
+  const ids = [];
+  const dropped = [];
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: spy,
+    onRejection: (r) => (rejection = r),
+    onPromptId: (p) => ids.push(p),
+    onAcceptedNodeErrors: (ne) => dropped.push(ne),
+  });
+  await intercepted(...promptPost({ prompt: {} }));
+  assert.equal(rejection, null, "a 200 is an acceptance — the rejection channel must stay empty");
+  assert.deepEqual(ids, ["p-partial"], "the minted id is the receipt that this prompt IS queued");
+  assert.deepEqual(dropped, [PARTIAL_NODE_ERRORS], "the dropped outputs come from the 200 body");
+});
+
+test("#1504 unscoped interceptor: a clean 200 reports NO drops", async () => {
+  // Empty / absent / non-object node_errors must never fire the partial disclosure.
+  for (const node_errors of [undefined, null, {}, [], "no"]) {
+    const dropped = [];
+    const intercepted = createRunFetchInterceptor({
+      origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: "p1", node_errors })),
+      onAcceptedNodeErrors: (ne) => dropped.push(ne),
+    });
+    await intercepted(...promptPost({ prompt: {} }));
+    assert.deepEqual(dropped, [], `node_errors=${JSON.stringify(node_errors)} is not a drop`);
+  }
+});
+
+test("#1504 interceptor: a 400 rejection body is NOT reported as accepted drops", async () => {
+  // The #358 channel is unchanged: a refusal mints nothing, so nothing may reach
+  // the accepted-drops channel or the caller would be told a refused prompt is running.
+  const dropped = [];
+  let rejection = null;
+  const intercepted = createRunFetchInterceptor({
+    origFetchApi: makeServer(async () => jsonResponse(400, { error: null, node_errors: PARTIAL_NODE_ERRORS })),
+    onRejection: (r) => (rejection = r),
+    onAcceptedNodeErrors: (ne) => dropped.push(ne),
+  });
+  await intercepted(...promptPost({ prompt: {} }));
+  assert.deepEqual(dropped, [], "a non-200 never produces accepted drops");
+  assert.deepEqual(rejection.node_errors, PARTIAL_NODE_ERRORS, "it stays a rejection");
+});
+
+test("#1504 integration: a SCOPED run reports the outputs ComfyUI dropped from the prompt it queued", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = {
+      fetchApi: makeServer(async () =>
+        jsonResponse(200, { prompt_id: "p-scoped", number: 1, node_errors: PARTIAL_NODE_ERRORS }),
+      ),
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    const ids = [];
+    const dropped = [];
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+      onAcceptedNodeErrors: (ne) => dropped.push(ne),
+    });
+    assert.equal(result.outcome, "dispatched", "a partial-validation 200 is still a real dispatch");
+    assert.equal(result.verified, 1, "it counts as VERIFIED: ComfyUI accepted and is running it");
+    assert.deepEqual(ids, ["p-scoped"]);
+    assert.deepEqual(dropped, [PARTIAL_NODE_ERRORS]);
+  } finally {
+    stop();
+  }
+});

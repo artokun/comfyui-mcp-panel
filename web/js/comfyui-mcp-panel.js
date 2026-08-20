@@ -15795,6 +15795,19 @@ const GRAPH_TOOL_EXECUTORS = {
       // are the same run) so #370 reconcile stays string-vs-string.
       if (!queuedPromptIds.includes(pid)) queuedPromptIds.push(pid);
     };
+    // #1504 — node_errors that arrived on an ACCEPTED (200) reply: the outputs
+    // ComfyUI dropped from a prompt it queued anyway ("Output will be ignored").
+    // Read from the response body, NOT from app.lastNodeErrors, because the
+    // frontend stores both channels in the same place: it calls
+    // recordNodeErrors(res.node_errors) on the resolved 200 too, so
+    // lastNodeErrors cannot distinguish a refusal from an accepted partial run —
+    // which is precisely how a running render came back as "refused to queue".
+    // Merged across a batch (first entry per node id wins) because each of the N
+    // prompts gets its own reply and any of them may drop outputs.
+    let acceptedNodeErrors = null;
+    const captureAcceptedNodeErrors = (ne) => {
+      acceptedNodeErrors = { ...(ne ?? {}), ...(acceptedNodeErrors ?? {}) };
+    };
     // #445: guard the VHS null-widget serialization crash. ComfyUI core / node
     // extensions (notably VHS_VideoCombine) serialize EVERY node's widgets when
     // building the prompt — even unused branches, even under "run to node" — and
@@ -15854,6 +15867,7 @@ const GRAPH_TOOL_EXECUTORS = {
           origFetchApi,
           onRejection: captureRejection,
           onPromptId: capturePromptId,
+          onAcceptedNodeErrors: captureAcceptedNodeErrors,
           // #985 — keep each prompt AS SUBMITTED AND ACCEPTED. Re-deriving one
           // afterwards with a second app.graphToPrompt() would describe a different
           // compilation than the one ComfyUI accepted, and that call is not read-only.
@@ -15879,6 +15893,7 @@ const GRAPH_TOOL_EXECUTORS = {
         toNodeId: to_node_id,
         onRejection: captureRejection,
         onPromptId: capturePromptId,
+        onAcceptedNodeErrors: captureAcceptedNodeErrors,
       });
     }
     // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
@@ -15982,6 +15997,10 @@ const GRAPH_TOOL_EXECUTORS = {
       rejection: promptRejection,
       lastNodeErrors: app.lastNodeErrors,
       runToNode: runToNodeInfo,
+      // #1504 — the prompt_id(s) ComfyUI MINTED for this run. A minted id is a
+      // receipt of acceptance, so per-node errors that arrive beside one are
+      // dropped outputs, not a refusal of the whole prompt.
+      acceptedPromptIds: queuedPromptIds,
     });
     if (rejection) return rejection;
     // Surface the queued prompt_id(s) so the agent can correlate/track the run —
@@ -15991,6 +16010,8 @@ const GRAPH_TOOL_EXECUTORS = {
       batchCount: batch,
       promptIds: queuedPromptIds,
       ranToNode: partialTargets ? Number(to_node_id) : null,
+      // #1504 — outputs ComfyUI dropped from the prompt it queued.
+      droppedOutputs: acceptedNodeErrors,
     });
     // #988 — attach the PRE-dispatch finding.
     const repeatingNote = scopedBatchSeedNote(repeatingControls, batch);
