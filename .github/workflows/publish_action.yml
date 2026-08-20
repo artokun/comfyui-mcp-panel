@@ -12,13 +12,13 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ---- Gate: never publish a broken pack to the Registry. -------------
       # web/js is served live and a broken save crashes the whole ComfyUI
       # frontend; these checks mirror ci.yml and run BEFORE publish. A failed
       # step aborts the job, so the publish step below only runs if all pass.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -147,7 +147,7 @@ jobs:
       # absent — silently skipped its bundle assertions here while being mandatory in CI.
       # A publish path where a test quietly downgrades itself to a no-op is worse than one
       # that omits the test, because the summary still says it ran.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
