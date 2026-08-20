@@ -6,8 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.22] - 2026-08-20
+
 ### Fixed
 - a Manager install queue that stays `in_progress` with no count change is reported as a silent stall, not as progress: `panel_node_queue_status` still attaches Manager's real counts, names any in-progress pack, and after two minutes of the same fingerprint tells you to verify with `panel_list_nodes` instead of waiting forever (#1480)
+
+### Fixed
+- a silent Manager in_progress is named as a stall, not as progress (#1483)
+
 
 ## [0.15.21] - 2026-08-20
 
