@@ -9277,16 +9277,6 @@ function clearStaleRedFlag(node, { app, graph, rootGraph }) {
  * wrapper but does not revalidate their sticky red flags. Re-adjudicate only
  * those direct neighbours; never the wrapper or the nodes moved inside it.
  */
-/** Confirm `convertToSubgraph` actually produced a subgraph NODE on this graph.
- *
- *  Both conversion tools reported `node_id: res?.node?.id ?? null` — so a conversion
- *  that produced nothing returned `{subgraph: {node_id: null, name: null, …}}` with no
- *  error, which reads as "a subgraph was created". The sibling graph_add_subgraph
- *  already guards this ("don't report a fake success if deserialize produced
- *  nothing"); this is the same rule applied to the two paths that were missing it.
- *
- *  Presence is checked on the LIVE graph, not just on the returned object: a result
- *  carrying a node that never landed is exactly the case a truthful report must catch. */
 /** Run the frontend's conversion so that a THROW is as informative as a return.
  *
  *  #1463 — both tools called `graph.convertToSubgraph()` bare, so the caller got the
@@ -9327,6 +9317,16 @@ function convertSelectionToSubgraph({ graph, canvas, nodes, what }) {
   }
 }
 
+/** Confirm `convertToSubgraph` actually produced a subgraph NODE on this graph.
+ *
+ *  Both conversion tools reported `node_id: res?.node?.id ?? null` — so a conversion
+ *  that produced nothing returned `{subgraph: {node_id: null, name: null, …}}` with no
+ *  error, which reads as "a subgraph was created". The sibling graph_add_subgraph
+ *  already guards this ("don't report a fake success if deserialize produced
+ *  nothing"); this is the same rule applied to the two paths that were missing it.
+ *
+ *  Presence is checked on the LIVE graph, not just on the returned object: a result
+ *  carrying a node that never landed is exactly the case a truthful report must catch. */
 function assertSubgraphNodeLanded(res, graph, what) {
   const node = res?.node;
   const id = node?.id;
