@@ -204,6 +204,29 @@ export function packsProvidingType(nodeMap, forType) {
 }
 
 /**
+ * How many packs a node-map payload actually let us CHECK — entries carrying a
+ * class-name array.
+ *
+ * Counted rather than assumed because a 200 is not a catalogue. #808 measured this
+ * on the search path: ComfyUI-Manager answers `{}` when it built its list from none
+ * of channel, cache or bundled copy, and a captive proxy can answer 200 with a
+ * sign-in page. Both survive a `typeof === "object"` test, and treating either as a
+ * consulted map turns "we did not check" into "we checked and found nothing" — the
+ * same class of unearned claim #1544 is about, one layer down.
+ *
+ * @param {unknown} nodeMap raw `/customnode/getmappings` payload
+ * @returns {number}
+ */
+export function nodeMapPackCount(nodeMap) {
+  if (!nodeMap || typeof nodeMap !== "object" || Array.isArray(nodeMap)) return 0;
+  let n = 0;
+  for (const val of Object.values(nodeMap)) {
+    if (Array.isArray(val) && Array.isArray(val[0])) n++;
+  }
+  return n;
+}
+
+/**
  * The failures a note would actually name: log failures minus the ones the live
  * backend contradicts (#1447), and none at all for a subgraph UUID (#1523).
  *
@@ -297,9 +320,18 @@ export function importFailureNote(failed, opts = {}) {
   // check came up short is stated exactly: a map that was read and did not link the
   // pack is different evidence from a map that could not be read at all, and the
   // reader's next step differs accordingly.
-  const why =
-    o.nodeMap && typeof o.nodeMap === "object"
-      ? `ComfyUI-Manager's node map does not link ${plural ? "them" : "it"} to that type`
+  // #808's lesson, applied to ownership: a 200 is not a catalogue. Manager answers
+  // `{}` when it assembled its list from none of its three sources, and a proxy can
+  // answer 200 with something that is not a catalogue at all. Both are objects, so
+  // "did we get a map" cannot be `typeof === object` — that would report "the map
+  // does not link it to that type" about a map that listed nothing, asserting a
+  // check that never ran. Count the packs the payload actually let us check.
+  const checkable = nodeMapPackCount(o.nodeMap);
+  const gotAnObject = !!o.nodeMap && typeof o.nodeMap === "object";
+  const why = checkable
+    ? `ComfyUI-Manager's node map does not link ${plural ? "them" : "it"} to that type`
+    : gotAnObject
+      ? `ComfyUI-Manager returned no usable node catalogue, so ownership could not be checked`
       : `ComfyUI-Manager's node map could not be read, so ownership was not checked`;
   return (
     ` SEPARATE ISSUE, not the cause of this missing type: ComfyUI reported that ` +

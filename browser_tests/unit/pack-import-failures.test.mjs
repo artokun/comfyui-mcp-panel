@@ -24,6 +24,7 @@ import {
   readPackImportFailures,
   dropLivePackImportFailures,
   packsProvidingType,
+  nodeMapPackCount,
 } from "../../web/js/lib/pack-import-failures.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -635,4 +636,38 @@ test("#1544 WIRING: the add-node guard is handed the Manager node map", () => {
     /readNodeMap: \(\) => managerGet\("customnode\/getmappings\?mode=cache"\)/,
     "panel_add_node must fetch the ownership map, or #1544 ships as dead code",
   );
+});
+
+test("#1544 a 200 that is not a catalogue is NOT a completed ownership check", () => {
+  // #808's finding, one layer down. Manager answers `{}` when it assembled its list
+  // from none of channel, cache or bundled copy; a captive proxy answers 200 with a
+  // sign-in page. Both are objects. Reporting "the node map does not link it to that
+  // type" about either asserts a check that never ran — the same unearned claim
+  // #1544 exists to stop.
+  const forEmpty = (nodeMap) =>
+    importFailureNote(["coldinfire_fal_privacy"], {
+      forType: "PreviewVideo",
+      liveDefs: CORE_ONLY_DEFS,
+      nodeMap,
+    });
+
+  for (const payload of [{}, { error: "sign in" }, { "some-pack": { title: "no class list" } }]) {
+    const note = forEmpty(payload);
+    assert.match(note, /returned no usable node catalogue, so ownership could not be checked/);
+    assert.doesNotMatch(note, /does not link it to that type/);
+    assert.match(note, /SEPARATE ISSUE/, "still non-causal either way");
+  }
+
+  // A populated catalogue that genuinely lacks the link keeps the stronger wording.
+  assert.match(forEmpty(NODE_MAP), /does not link it to that type/);
+});
+
+test("#1544 nodeMapPackCount counts what is checkable, not what is present", () => {
+  assert.equal(nodeMapPackCount(NODE_MAP), 3);
+  assert.equal(nodeMapPackCount({}), 0);
+  assert.equal(nodeMapPackCount({ error: "sign in" }), 0);
+  assert.equal(nodeMapPackCount({ pack: [["A"], {}], broken: { no: "classes" } }), 1);
+  assert.equal(nodeMapPackCount(null), 0);
+  assert.equal(nodeMapPackCount("<html>"), 0);
+  assert.equal(nodeMapPackCount([["A"]]), 0, "an array payload carries no class list we can read");
 });
