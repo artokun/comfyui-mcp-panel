@@ -6,8 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.29] - 2026-08-20
+
 ### Fixed
-- a timestamp-less transcript longer than the local shadow keeps the order it was written in (#1536)
+- a no-name save of a .app.json workflow writes that file, not a plain .json fork (#1538)
+- a long timestamp-less transcript keeps the order it was written in (#1536 / #1539)
+
 
 ## [0.15.28] - 2026-08-20
 
