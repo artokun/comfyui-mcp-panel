@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- adding an unknown node type no longer reports an unrelated ReActor import failure when that pack currently provides other live types (#1447)
+
 ## [0.15.15] - 2026-08-20
 
 ### Fixed
