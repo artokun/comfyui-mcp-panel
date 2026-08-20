@@ -13022,6 +13022,11 @@ const GRAPH_TOOL_EXECUTORS = {
       // add never pays for it. A pack that failed to import looks exactly like a
       // pack that is not installed, and the refusal used to name only the latter.
       readImportFailures: () => readPackImportFailures(api),
+      // #1523 — subgraph UUIDs are never in /object_info. The live workflow's
+      // subgraphs registry is the oracle that distinguishes a loaded SAM3
+      // subgraph from a missing backend pack. capturedContext is already in
+      // hand; no extra graph probe.
+      getRootGraph: () => capturedContext?.rootGraph ?? capturedContext?.graph,
       });
     try {
       await resolveAddNode();

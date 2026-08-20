@@ -37,6 +37,103 @@ export function isRegisteredNodeType(registry, type) {
   return Object.prototype.hasOwnProperty.call(registry, type);
 }
 
+// RFC-4122 UUID — ComfyUI mints these as subgraph *type* ids. Backend class_types
+// are human-readable names; a well-formed UUID is therefore not a missing pack.
+export const SUBGRAPH_UUID_RE =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+export function isSubgraphUuidType(type) {
+  return typeof type === "string" && SUBGRAPH_UUID_RE.test(type);
+}
+
+function subgraphRegistryHas(reg, type) {
+  if (!reg || type == null) return false;
+  try {
+    if (typeof reg.has === "function" && reg.has(type)) return true;
+    if (typeof reg.get === "function" && reg.get(type)) return true;
+    if (
+      typeof reg === "object" &&
+      !Array.isArray(reg) &&
+      Object.prototype.hasOwnProperty.call(reg, type)
+    ) {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Positive proof the live workflow already holds this subgraph definition.
+ *
+ * Prefers the root graph's `subgraphs` registry (uuid → Subgraph Map on real
+ * LiteGraph builds), then walks nested instances. Fail closed on anything
+ * unreadable — a guess here would authorize LiteGraph to mint a placeholder.
+ */
+export function subgraphTypeIsLoaded(rootGraph, type) {
+  if (!isSubgraphUuidType(type) || !rootGraph || typeof rootGraph !== "object") return false;
+  try {
+    if (subgraphRegistryHas(rootGraph.subgraphs, type)) return true;
+    const seen = new WeakSet();
+    const walk = (graph) => {
+      if (!graph || typeof graph !== "object" || seen.has(graph)) return false;
+      seen.add(graph);
+      if (graph.id != null && String(graph.id) === type) return true;
+      if (subgraphRegistryHas(graph.subgraphs, type)) return true;
+      for (const node of graph._nodes ?? graph.nodes ?? []) {
+        if (!node || typeof node !== "object") continue;
+        if (typeof node.type === "string" && node.type === type) return true;
+        const sub = node.subgraph;
+        if (sub && (String(sub.id) === type || walk(sub))) return true;
+      }
+      return false;
+    };
+    return walk(rootGraph);
+  } catch {
+    return false;
+  }
+}
+
+function subgraphDefinitionLoaded(class_type, opts) {
+  if (!opts || typeof opts !== "object") return false;
+  if (typeof opts.isLoadedSubgraphType === "function") {
+    try {
+      return opts.isLoadedSubgraphType(class_type) === true;
+    } catch {
+      return false;
+    }
+  }
+  let root = null;
+  try {
+    root = typeof opts.getRootGraph === "function" ? opts.getRootGraph() : opts.getRootGraph;
+  } catch {
+    root = null;
+  }
+  return subgraphTypeIsLoaded(root, class_type);
+}
+
+/**
+ * The refusal `assertAddNodeResolvableRefreshing` throws for a UUID class_type
+ * that is not both loaded in the live workflow and registered in LiteGraph.
+ * Exported so tests drive this wording rather than restating it.
+ */
+export function subgraphUuidAddRefusal(class_type, { loaded = false, registered = false } = {}) {
+  const what =
+    loaded && !registered
+      ? `This workflow already has that subgraph definition loaded, but this tab has not ` +
+        `registered the class LiteGraph needs to construct a new instance — copy an existing ` +
+        `instance on the canvas rather than adding by type.`
+      : `Subgraph definitions live in the workflow (or the subgraph library), never in ` +
+        `/object_info. Copy an existing instance if one is on the canvas, or list library ` +
+        `blueprints with panel_list_subgraphs and add with panel_add_subgraph.`;
+  return (
+    `Cannot add "${class_type}": it is a subgraph type, not a ComfyUI backend node — ` +
+    `the backend never lists subgraph UUIDs in /object_info. ${what} ` +
+    `Refusing to add rather than let LiteGraph mint an unresolved placeholder node (#1523).`
+  );
+}
+
 /** True once ComfyUI's backend node definitions have been registered (i.e.
  *  /object_info loaded). False means the backend is unreachable / defs unloaded,
  *  so no Comfy class_type can be resolved and writes must fail rather than
@@ -448,6 +545,14 @@ export function assertAddNodeResolvable(registry, class_type) {
  *                        graph_set_widget. REQUIRED for the frontend-only exemption:
  *                        omit it and NOTHING absent from fresh /object_info is ever
  *                        exempted (fail closed, pre-#496 behaviour).
+ *   getRootGraph       : optional () => the live root graph. #1523 uses it (via
+ *                        subgraphTypeIsLoaded) to recognize a UUID subgraph already
+ *                        loaded in this workflow — those types are never in
+ *                        /object_info, so the backend oracle alone cannot authorize
+ *                        them. Omit it (and isLoadedSubgraphType) and a UUID is
+ *                        still diagnosed as a subgraph rather than a missing pack,
+ *                        but is not addable.
+ *   isLoadedSubgraphType : optional (type) => boolean override for that lookup.
  */
 export async function assertAddNodeResolvableRefreshing(getRegistry, class_type, opts = {}) {
   // #775 — `readImportFailures` is injected and awaited ONLY on the refusal path,
@@ -549,6 +654,27 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
             `let LiteGraph mint an unresolved placeholder node (#458).`,
         );
       }
+      // #1523 — a subgraph UUID is never in /object_info (registerSubgraphNodeDef
+      // synthesizes the class locally from the workflow's definitions). Treating
+      // that absence as "unknown backend node" then appending whichever pack
+      // failed to import (ReActor, on the reporter's canvas) is the misdiagnosis:
+      // no custom-node pack owns a UUID type. Loaded + registered ⇒ addable;
+      // anything else gets subgraph-specific copy/library advice, never a pack
+      // import note. The ever-seen gate above still refuses a type the backend
+      // actually reported earlier this session.
+      if (isSubgraphUuidType(class_type)) {
+        const loaded = subgraphDefinitionLoaded(class_type, opts);
+        const registered = isRegisteredNodeType(readRegistry(), class_type);
+        if (
+          typeof wasTypeEverDefined === "function" &&
+          verdict === "never-seen" &&
+          loaded &&
+          registered
+        ) {
+          return;
+        }
+        throw new Error(subgraphUuidAddRefusal(class_type, { loaded, registered }));
+      }
       // Not defined by the current backend (never installed, or its pack was
       // removed). Fail closed even if a stale registry entry survives (#458/P1-C).
       // #741: the pointer must be a tool that searches node CLASSES
@@ -564,6 +690,8 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // #1447 — pass the live map and the requested type so a pack that currently
       // provides nodes (ReActorFaceSwap just added) is not named as the reason a
       // different type (VideoToImages) is missing.
+      // #1523 — UUID types never reach here (handled above). Remaining failures
+      // still do not prove ownership of the requested type.
       let failedNote = "";
       if (typeof readImportFailures === "function") {
         try {
