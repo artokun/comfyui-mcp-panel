@@ -380,13 +380,35 @@ export function brokenConversionWarning({ what, subgraphNodeId, dangling, discon
  * thing the caller was told is the bare frontend message. #1463's reporter read that
  * as "no other side effects" and retried three times.
  *
- * The same message is also reachable with NOTHING mutated: the frontend throws out of
- * `disconnectInput`/`disconnectOutput` too, which run before the removal loop, and an
- * extension that wraps `convertToSubgraph` can throw before the frontend's own code
- * runs at all (cg-use-everywhere replaces `app.graph.convertToSubgraph` with a pre-pass
- * that analyses the whole graph first — its frames are in the reproduction's stack).
- * One message, two opposite states, and the caller's correct next move differs
- * completely between them. So measure it instead of guessing.
+ * The same message is also reachable with the graph barely touched — the frontend
+ * throws out of `disconnectInput`/`disconnectOutput` too, which run before the removal
+ * loop — so the caller's correct next move differs completely between two failures that
+ * read identically. Measure it instead of guessing.
+ *
+ * ## What "unchanged" may NOT be claimed from (gate P1)
+ *
+ * The first version of this said "the graph is UNCHANGED … nothing to undo" whenever the
+ * selected nodes were still present and no definition had been registered. That is a
+ * POSITIVE claim from two surfaces, and it is false wherever the mutation happened on a
+ * third:
+ *
+ *   - `LGraph.convertToSubgraph` is a plain instance-assignable method, and extensions
+ *     replace it. cg-use-everywhere sets `app.graph.convertToSubgraph` to a wrapper that
+ *     calls `convert_to_links(...)` — real link mutation — then delegates, then calls
+ *     `mods.restorer()` OUTSIDE a `finally`. Any throw from the delegate leaves the
+ *     injected links behind, with every node and definition exactly where it was.
+ *   - The measured, unwrapped order inside `_convertToSubgraphImpl` is
+ *     `createSubgraph` (definition registered) BEFORE the `disconnectInput` loop. So a
+ *     detached SELECTED node does NOT throw with the canvas untouched: driven in a
+ *     browser through `LGraph.prototype.convertToSubgraph` (bypassing the installed
+ *     wrapper), `nodes 1,2,3,4 → 1,2,3,4` but `subgraph defs 0 → 1`. The definition
+ *     count is what catches that, and this file must keep counting it.
+ *
+ * So the confident verdict is gated on there being nothing unobserved: node presence,
+ * the definition count and the link-table size all readable and all identical, AND no
+ * wrapper installed on the graph (detected as `convertToSubgraph` being an OWN property
+ * of the instance — verified true on this install, where the method also exists on the
+ * prototype). Anything else is reported as UNKNOWN, which is weaker but true.
  *
  * ## Why `node.graph == null` is the one condition worth naming
  *
@@ -394,9 +416,11 @@ export function brokenConversionWarning({ what, subgraphNodeId, dangling, discon
  * while its own `graph` back-reference is unset. On the conversion path that is
  * reachable for a node the graph still lists — `LGraph.remove` sets `node.graph = null`
  * BEFORE it splices the node out of `_nodes`, and `node.graph` is a plain settable
- * property any extension can clear. A SELECTED node in that state throws before
- * anything is mutated; a boundary NEIGHBOUR in that state throws in the reconnect
- * loop, which is the destructive case measured above. Both were reproduced in-browser.
+ * property any extension can clear. A SELECTED node in that state throws at
+ * `disconnectInput`, after a definition has been registered; a boundary NEIGHBOUR in
+ * that state throws in the reconnect loop, after the selected nodes have been removed —
+ * the destructive case measured above. Both were reproduced in-browser, which is why
+ * the pre-flight refuses on either rather than only on the selection.
  * ========================================================================= */
 
 /** Read a link table in any of the shapes {@link readLinkIds} accepts, by id. */
@@ -495,11 +519,31 @@ export function detachedConversionRefusal({ what, detached }) {
   );
 }
 
+/** Number of entries in a link table of any accepted shape, or `null` if it cannot be
+ *  counted. The live graph exposes a Map-like with a numeric `.size` (measured). */
+function linkTableSize(graph) {
+  const links = graph?.links;
+  if (!links) return null;
+  if (typeof links.size === "number") return links.size;
+  if (Array.isArray(links)) return links.length;
+  if (typeof links === "object") return Object.keys(links).length;
+  return null;
+}
+
 /**
  * What of this conversion is still on the graph.
  *
+ * Three surfaces, because two were not enough (see the header): the selected nodes, the
+ * subgraph-definition count, and the size of the link table — that last one being the
+ * only thing that sees a wrapper which rewires links and throws before undoing it.
+ *
  * `present` is compared by node IDENTITY, not by id, so an id the frontend later
  * re-issues cannot read as "the node survived".
+ *
+ * `wrapped` records that something replaced `convertToSubgraph` on this graph OBJECT.
+ * On a stock frontend the method lives on `LGraph.prototype`, so an own property means
+ * an extension is in the call path and can mutate outside everything measured here. It
+ * does not make the report wrong; it makes the confident verdict unavailable.
  */
 export function conversionSnapshot(graph, nodes) {
   const present = [];
@@ -513,6 +557,8 @@ export function conversionSnapshot(graph, nodes) {
     present,
     readable,
     definitions: typeof definitions === "number" ? definitions : null,
+    links: linkTableSize(graph),
+    wrapped: !!graph && Object.prototype.hasOwnProperty.call(graph, "convertToSubgraph"),
   };
 }
 
@@ -523,55 +569,97 @@ export function conversionSnapshot(graph, nodes) {
  * not the frontend's wording, decides whether a retry is safe. The frontend's message
  * is carried through VERBATIM and quoted: it is the only greppable thing #1463's
  * reporter had, and dropping it would break every existing search for it.
+ *
+ * Three verdicts, and the ONLY confident one is the negative. "Changed" needs a single
+ * piece of positive evidence; "unchanged" needs every surface readable, every surface
+ * still, and nothing in the call path that could have moved a surface this cannot see.
+ * Everything else is UNKNOWN — a weaker answer than the old bare exception in tone, but
+ * unlike a false "nothing to undo" it never sends the caller the wrong way.
  */
 export function conversionThrowReport({ what, message, before, after }) {
   const raw = typeof message === "string" && message.trim() ? message.trim() : "(no message)";
   const beforeIds = Array.isArray(before?.present) ? before.present : [];
   const afterIds = Array.isArray(after?.present) ? after.present : [];
   const removed = beforeIds.filter((id) => !afterIds.includes(id));
+  const num = (v) => (typeof v === "number" ? v : null);
   const addedDefs =
-    typeof before?.definitions === "number" && typeof after?.definitions === "number"
+    num(before?.definitions) != null && num(after?.definitions) != null
       ? after.definitions - before.definitions
       : null;
+  const linkDelta =
+    num(before?.links) != null && num(after?.links) != null ? after.links - before.links : null;
   const tail =
     `The throw came from ComfyUI's own convertToSubgraph — the panel calls that method, it ` +
     `does not implement it, and extensions are free to replace it — so the wording quoted ` +
     `above is not necessarily litegraph's.`;
 
-  if (removed.length || (addedDefs != null && addedDefs > 0)) {
-    const lost = removed.length
-      ? `${removed.length} of the ${beforeIds.length} node(s) you selected (${removed.join(", ")}) ` +
-        `${removed.length === 1 ? "is" : "are"} already off the canvas`
-      : `every node you selected is still on the canvas`;
-    const defs =
-      addedDefs != null && addedDefs > 0
-        ? `, and ${addedDefs} subgraph definition(s) were registered`
-        : "";
+  // CHANGED — any one positive observation is enough, and each is stated as measured.
+  const evidence = [];
+  if (removed.length) {
+    evidence.push(
+      `${removed.length} of the ${beforeIds.length} node(s) you selected (${removed.join(", ")}) ` +
+        `${removed.length === 1 ? "is" : "are"} already off the canvas`,
+    );
+  }
+  if (addedDefs != null && addedDefs > 0) {
+    evidence.push(`${addedDefs} subgraph definition(s) were registered`);
+  }
+  if (linkDelta != null && linkDelta !== 0) {
+    evidence.push(`the link table went from ${before.links} to ${after.links} entries`);
+  }
+  if (evidence.length) {
+    const halfBuilt = removed.length
+      ? ` Whatever wrapper the conversion got as far as creating was never finished, so it ` +
+        `can be sitting on the canvas wired to nothing.`
+      : "";
     return (
       `${what} FAILED PART WAY THROUGH and the graph HAS CHANGED — do not retry blindly. ` +
-      `${lost}${defs}. Whatever wrapper the conversion got as far as creating was never ` +
-      `finished, so it can be sitting on the canvas wired to nothing. ComfyUI's ` +
-      `convertToSubgraph threw: "${raw}". Undo the conversion in ComfyUI (Ctrl+Z) or reload ` +
-      `the workflow, then re-read the graph (panel_graph_outline) before doing anything ` +
-      `else — the node ids you passed no longer describe the canvas. ${tail}`
+      `${evidence.join("; ")}.${halfBuilt} ComfyUI's convertToSubgraph threw: "${raw}". Undo ` +
+      `the conversion in ComfyUI (Ctrl+Z) or reload the workflow, then re-read the graph ` +
+      `(panel_graph_outline) before doing anything else — what you passed may no longer ` +
+      `describe the canvas. ${tail}`
     );
   }
 
+  // What could have moved without this being able to see it. A confident "unchanged" is
+  // only available when this list is empty.
+  const blind = [];
   if (!before?.readable || !after?.readable) {
+    blind.push("this frontend does not expose the node lookup the presence check needs");
+  }
+  if (num(before?.definitions) == null || num(after?.definitions) == null) {
+    blind.push("its subgraph definitions could not be counted");
+  }
+  if (linkDelta == null) {
+    blind.push("its link table could not be counted");
+  }
+  if (before?.wrapped || after?.wrapped) {
+    blind.push(
+      "an extension has replaced convertToSubgraph on this graph, and such a wrapper can " +
+        "rewire links before delegating and throw before it undoes them",
+    );
+  }
+  if (blind.length) {
+    const measured =
+      before?.readable && after?.readable
+        ? `All ${beforeIds.length} node(s) you selected are still on the canvas. `
+        : "";
     return (
-      `${what} failed, and the panel could NOT establish whether the graph changed — this ` +
-      `frontend does not expose the node lookup that check needs, so treat the canvas as ` +
-      `unknown rather than untouched. ComfyUI's convertToSubgraph threw: "${raw}". Re-read ` +
-      `the graph (panel_graph_outline) before retrying. ${tail}`
+      `${what} failed, and the panel could NOT establish whether the graph changed — treat ` +
+      `the canvas as unknown rather than untouched. ${measured}What it cannot rule out: ` +
+      `${blind.join("; ")}. ComfyUI's convertToSubgraph threw: "${raw}". Re-read the graph ` +
+      `(panel_graph_outline) before retrying. ${tail}`
     );
   }
 
   return (
-    `${what} failed and the graph is UNCHANGED — all ${beforeIds.length} selected node(s) ` +
-    `are still on the canvas and no subgraph was created, so there is nothing to undo. ` +
-    `ComfyUI's convertToSubgraph threw: "${raw}". A straight retry will hit the same thing; ` +
-    `the selection itself is intact, so this is about the state of the canvas, not the nodes ` +
-    `you named. Reloading the ComfyUI page rebuilds the graph and clears the stale-canvas ` +
-    `form of this (save first — panel_save_workflow). ${tail}`
+    `${what} failed and nothing the panel can read moved: all ${beforeIds.length} selected ` +
+    `node(s) are still on the canvas, no subgraph definition was registered, the link table ` +
+    `is unchanged at ${after.links} entries, and nothing has replaced convertToSubgraph on ` +
+    `this graph. There is nothing to undo. ComfyUI's convertToSubgraph threw: "${raw}". A ` +
+    `straight retry will hit the same thing; the selection itself is intact, so this is about ` +
+    `the state of the canvas, not the nodes you named. Reloading the ComfyUI page rebuilds ` +
+    `the graph and clears the stale-canvas form of this (save first — panel_save_workflow). ` +
+    `${tail}`
   );
 }
