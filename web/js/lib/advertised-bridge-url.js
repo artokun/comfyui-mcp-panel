@@ -24,6 +24,14 @@
 // sends the tab to 9181 where nothing listens — and the next tick sees the
 // advertisement already equal to the current URL, so it never comes back.
 
+// ONE KNOWN LIMIT OF THAT CORROBORATION: `running` is ComfyUI probing ITS OWN
+// loopback, while the URL adopted here is dialled in the BROWSER's. Where those
+// namespaces differ — WSL, a LAN-served ComfyUI, an SSH tunnel — a true `running`
+// says a listener exists server-side, not client-side. It takes a non-default
+// COMFYUI_MCP_BRIDGE_PORT *and* split namespaces to reach, it only affects a tab
+// already failing to reconnect, and `persist: false` means any Connect or reload
+// resets to configuredBridgeUrlFor — so it degrades nothing that was working.
+
 /** ws:// on loopback only. */
 const LOOPBACK_WS = /^ws:\/\/(127\.0\.0\.1|\[::1\]|localhost)(:\d+)?(\/|$)/i;
 
