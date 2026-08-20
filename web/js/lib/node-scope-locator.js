@@ -46,6 +46,8 @@
  * with a plausible-looking shape.
  */
 
+import { canonicalNodeId } from "./node-id.js";
+
 /** Depth guard for a pathological/looping graph. Real workflows nest a handful deep. */
 const MAX_DEPTH = 12;
 
@@ -69,24 +71,33 @@ function nodesOf(graph) {
 }
 
 /**
- * Find a node by its LOCAL id anywhere in the workflow, reporting the route to it.
+ * Find a node by its local integer or subgraph-qualified id anywhere in the
+ * workflow, reporting the route to it.
  *
  * @param {object} rootGraph the workflow's root graph
- * @param {number|string} nodeId the local id being looked up
- * @returns {null | {scope: "root"|"subgraph", hostPath: Array<{id: any, title: string}>}}
+ * @param {number|string} nodeId the id being looked up
+ * @returns {null | {scope: "root"|"subgraph", hostPath: Array<{id: any, title: string}>} | {undetermined: "threw"|"unparseable"}}
  *   `hostPath` is the chain of subgraph HOST nodes to enter, outermost first; empty
  *   for a node on the root graph.
+ *   `null` is a completed search that found nothing. `undetermined` is the
+ *   distinct "could not look" answer (#1501): the walk threw, or the id is not
+ *   a searchable local/qualified form. Callers must not treat it as a miss.
  */
 export function locateNodeAcrossScopes(rootGraph, nodeId) {
-  const target = Number(nodeId);
-  if (!Number.isFinite(target)) return null;
+  // #1425 / #1501 — a qualified id (`120:104`) is not a finite number. Number()
+  // here used to return null before searching, and the consumer spelled that as
+  // "may be from a different workflow". Use the same identity the writes use.
+  const target = canonicalNodeId(nodeId);
+  if (typeof target === "number" && !Number.isFinite(target)) {
+    return { undetermined: "unparseable" };
+  }
   const seen = new Set();
 
   const walk = (graph, hostPath, depth) => {
     if (!graph || depth > MAX_DEPTH || seen.has(graph)) return null;
     seen.add(graph);
     for (const n of nodesOf(graph)) {
-      if (Number(n?.id) === target) {
+      if (n?.id != null && canonicalNodeId(n.id) === target) {
         return { scope: hostPath.length ? "subgraph" : "root", hostPath };
       }
     }
@@ -103,7 +114,9 @@ export function locateNodeAcrossScopes(rootGraph, nodeId) {
   try {
     return walk(rootGraph, [], 0);
   } catch {
-    return null; // a diagnostic must never throw
+    // a diagnostic must never throw — but null is "searched and absent", and
+    // the consumer used to publish that as a fact about the node (#1501)
+    return { undetermined: "threw" };
   }
 }
 
@@ -191,6 +204,19 @@ export function describeMissingNode(nodeId, rootGraph, viewingRoot, currentGraph
   if (!rootGraph) return ids ? `${base}. ${ids}` : base;
 
   const found = locateNodeAcrossScopes(rootGraph, nodeId);
+  // #1501 — `null` used to mean three things (absent, threw, unparseable) and
+  // this branch could only spell one of them. An inconclusive walk must not
+  // claim the node is missing from the workflow.
+  if (found?.undetermined) {
+    const detail =
+      found.undetermined === "unparseable"
+        ? `${nodeId} is not a local integer or a subgraph-qualified id (e.g. 120:104), so the other scopes were not searched`
+        : `a walk of the other scopes threw before it finished, so their contents were not determined`;
+    return (
+      `${base} — this is not a finding that the node is absent from the rest of the workflow: ${detail}. ` +
+      (ids || `Re-read with panel_graph_outline before retrying.`)
+    );
+  }
   if (!found) {
     const subs = countSubgraphs(rootGraph);
     return (
