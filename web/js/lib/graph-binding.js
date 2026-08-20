@@ -1009,6 +1009,23 @@ export function openContentDifferenceIsPresentationOnly({ comparable, surfaces, 
 }
 
 /**
+ * #1477 — the live root differs from what was loaded ONLY on `definitions`.
+ *
+ * Binding (instance, marker, identity) is a separate question, already proven by
+ * the time this is asked. A previous-workflow graph (#1111/#1089) disagrees on
+ * `nodes` / `links` / `groups`, not on this surface alone. So a definitions-only
+ * mismatch is a frontend id rewrite (or an unaccounted cousin of one), not a
+ * wrong canvas, and it must not leave the session fenced to the prior workflow.
+ *
+ * It does NOT claim the subgraph internals are the file's. Callers disclose.
+ */
+export function openContentDifferenceIsDefinitionsOnly({ comparable, surfaces } = {}) {
+  if (comparable !== true) return false;
+  const unique = Array.isArray(surfaces) ? [...new Set(surfaces)] : [];
+  return unique.length === 1 && unique[0] === "definitions";
+}
+
+/**
  * Did this open apply COMPLETELY, leaving only per-node fields the frontend rewrote?
  * (panel#1283 / #1285 / #1307 / #1330, comfyui-mcp#1705)
  *
@@ -1111,6 +1128,22 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     // Never inferred from an absent comparison: `comparable:false` means no
     // comparison happened, which is not evidence either way.
     if (diff?.comparable !== true) return NOT_PROVEN;
+    // panel#1283 family — the surfaces still UNEXPLAINED, which is what #1588's second
+    // round established the reassurance's own predicate must read. `definitions` differs
+    // on every open of a workflow containing subgraphs (#886: link ids are regenerated),
+    // and `describeGraphStateDifference` has already run the SAME fail-closed predicate
+    // the strict proof below trusts to decide whether THIS difference is only that. A
+    // surface that predicate accounted for is not a second unexplained difference, and
+    // comfyui-mcp#1705 is precisely the shape that fails on it: `nodes, definitions`.
+    //
+    // #1477 — computed BEFORE presentationOnly so that ground can read the same list.
+    // Passing the RAW surfaces made a cosmetic-only node rewrite plus an accounted
+    // `definitions` difference fail presentation-only (unique length 2), so a faithful
+    // tab-switch onto a subgraph workflow still refused as root-workflow-uuid-mismatch.
+    const accounted = Array.isArray(diff.accountedSurfaces) ? diff.accountedSurfaces : [];
+    const unexplainedSurfaces = (Array.isArray(diff.surfaces) ? diff.surfaces : []).filter(
+      (s) => !accounted.includes(s),
+    );
     // #1623 — the WEAKER question ("could anything authored have been lost"), asked
     // off THE SAME SNAPSHOT the strict proof below reads. Answering it from a second
     // serialization would reopen exactly the hole the frozen snapshot closes: a
@@ -1142,20 +1175,9 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
       loadRanToCompletion !== false &&
       openContentDifferenceIsPresentationOnly({
         comparable: true,
-        surfaces: diff.surfaces,
+        surfaces: unexplainedSurfaces,
         nodeDifference: diff.nodeDifference,
       });
-    // panel#1283 family — the surfaces still UNEXPLAINED, which is what #1588's second
-    // round established the reassurance's own predicate must read. `definitions` differs
-    // on every open of a workflow containing subgraphs (#886: link ids are regenerated),
-    // and `describeGraphStateDifference` has already run the SAME fail-closed predicate
-    // the strict proof below trusts to decide whether THIS difference is only that. A
-    // surface that predicate accounted for is not a second unexplained difference, and
-    // comfyui-mcp#1705 is precisely the shape that fails on it: `nodes, definitions`.
-    const accounted = Array.isArray(diff.accountedSurfaces) ? diff.accountedSurfaces : [];
-    const unexplainedSurfaces = (Array.isArray(diff.surfaces) ? diff.surfaces : []).filter(
-      (s) => !accounted.includes(s),
-    );
     // The load RAN TO COMPLETION, so the mid-`configure()` partial load the strict
     // refusal rests on did not happen here. Weaker than `presentationOnly` about the
     // fields (it names them rather than vouching for them) and stronger about the LOAD
@@ -1310,6 +1332,11 @@ export function graphRootMismatchesActiveWorkflow({ rootGraph, activeWorkflow } 
   // belongs to a different tab.
   if (activeWorkflow?.isModified === true) return false;
   const activeState = activeWorkflowCurrentState(activeWorkflow);
+  // #1477 — a definitions-only (or presentation-only) rewrite is THIS workflow's
+  // canvas, not a different graph. Byte-shape treats regenerated subgraph ids as
+  // a mismatch, so after the tab-switch rebind restamped the tag the shape guard
+  // still refused panel_graph_outline. Same proof the rebind already asked.
+  if (graphRootAgreesWithActiveState(rootGraph, activeState)) return false;
   const expected = activeState?.nodes;
   const live = rootGraph?._nodes;
   if (!Array.isArray(expected) || !Array.isArray(live)) return false;
@@ -2482,6 +2509,28 @@ export function graphCommandMayMutateWorkflow(command) {
  *     keeps the pre-seal fail-closed behaviour.
  * Returns true only when it actually wrote the stamp.
  */
+
+/**
+ * #1477 — does this root agree with the workflow's current state enough to
+ * prove it is THAT workflow's canvas?
+ *
+ * Byte-identity is too strict after a tab switch: subgraph definition ids are
+ * regenerated on the live canvas while the tracker still holds the saved ids.
+ * This is the same bar `workflow_open` uses to decide the canvas is this
+ * workflow (`proven` or `presentationOnly`), plus definitions-only — a previous
+ * workflow's graph disagrees on root nodes or links, not on this surface alone.
+ */
+function graphRootAgreesWithActiveState(rootGraph, state) {
+  if (state == null) return false;
+  const proof = graphRootReproducesStateContent({ rootGraph, state });
+  if (proof.proven === true || proof.presentationOnly === true) return true;
+  const diff = describeGraphStateDifference({ rootGraph, state });
+  return openContentDifferenceIsDefinitionsOnly({
+    comparable: diff.comparable,
+    surfaces: diff.surfaces,
+  });
+}
+
 /**
  * POSITIVE proof that the live root graph IS the active workflow's own canvas,
  * from its CONTENT alone — independent of whatever identity tag it happens to
@@ -2493,8 +2542,15 @@ export function graphCommandMayMutateWorkflow(command) {
  *   - ROOT scope: a descended subgraph is not the workflow's root canvas;
  *   - CLEAN tab: a dirty tracker's state can lag the real canvas (#545), so it
  *     cannot prove anything about it;
- *   - the root must serialize EQUAL to the workflow's own CURRENT state — not
- *     its load baseline, which legitimately differs from an edited canvas;
+ *   - the root must reproduce the workflow's own CURRENT state — not its load
+ *     baseline, which legitimately differs from an edited canvas. Byte-identity
+ *     (`graphRootMatchesState`) is too strict here: a tab switch onto a workflow
+ *     containing subgraphs regenerates definition link/node ids on the live
+ *     canvas (#886/#1706) while the tracker still holds the saved ids, so the
+ *     canvas IS this workflow's and a stale previous-tab tag still refused every
+ *     graph tool (#1477). `graphRootReproducesStateContent` is the same proof
+ *     `workflow_open` already trusts, and it still fails closed on a foreign
+ *     node set, a rewired link, or a widget-value change;
  *   - EXCLUSIVE: two clean, separately open DUPLICATE tabs can carry
  *     byte-identical state, and equality alone cannot tell the active tab's
  *     canvas from its twin's. The caller establishes this by enumerating the
@@ -2511,7 +2567,7 @@ export function rootContentProvesActiveWorkflow({
     if (proofExclusive !== true) return false;
     if (!rootGraph || !activeWorkflow) return false;
     if (activeWorkflow.isModified === true) return false;
-    return graphRootMatchesState({ rootGraph, state: activeWorkflowCurrentState(activeWorkflow) });
+    return graphRootAgreesWithActiveState(rootGraph, activeWorkflowCurrentState(activeWorkflow));
   } catch {
     return false;
   }
@@ -2542,7 +2598,9 @@ export function contentProofExclusiveAmongOpen({ rootGraph, others } = {}) {
       if (other.isModified === true) return false;
       const state = activeWorkflowCurrentState(other);
       if (state == null) return false; // no readable state — same reason
-      if (graphRootMatchesState({ rootGraph, state })) return false; // a proven twin
+      // Same comparison the proof uses (#1477): a twin that only disagrees by
+      // definition renumbering is still a twin.
+      if (graphRootAgreesWithActiveState(rootGraph, state)) return false;
     }
     return true;
   } catch {
@@ -2599,7 +2657,7 @@ export function rootContentProvesActiveWorkflowDespiteEdits({
     const state = activeWorkflowCurrentState(activeWorkflow);
     if (state == null) return false;
     if (serializedStateProvenEmpty(state)) return false;
-    return graphRootMatchesState({ rootGraph, state });
+    return graphRootAgreesWithActiveState(rootGraph, state);
   } catch {
     return false;
   }
