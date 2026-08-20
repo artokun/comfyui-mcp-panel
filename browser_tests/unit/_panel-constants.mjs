@@ -121,6 +121,16 @@ export const NODE_DEFS_FETCH_SHARE = (() => {
 })();
 
 /**
+ * #608 — the client route's share of the FETCH phase, read as the panel states it. A
+ * hardcoded 0.5 here would keep agreeing with itself after the panel moved the reserve,
+ * which is the trap this whole file exists for.
+ */
+export const NODE_DEFS_CLIENT_ROUTE_SHARE = readPanelNumber(
+  /const NODE_DEFS_CLIENT_ROUTE_SHARE = ([\d.]+);/,
+  "the client route's share of the fetch phase",
+);
+
+/**
  * The panel's sentinel for "this call did not answer", mirrored so a rebuilt executor
  * compares against the same value its injected `boundedGetNodeDefs` resolves.
  */

@@ -38,10 +38,12 @@ import {
 } from "../../web/js/lib/node-def-refresh.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { fetchWholeObjectInfo } from "../../web/js/lib/object-info-oracle.js";
 import { REFRESH_NODES_EXECUTOR_DEPS } from "./_panel-constants.mjs";
 import {
   COMBO_NO_ANSWER,
   COMBO_OK,
+  NODE_DEFS_CLIENT_ROUTE_SHARE,
   NODE_DEFS_FETCH_SHARE,
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
@@ -237,6 +239,10 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE",
+    // #608 — the second transport the fetch phase falls through to, and the reserve that
+    // reaches it. Real, for the reason node-def-refresh.test.mjs states at its own copy.
+    "NODE_DEFS_CLIENT_ROUTE_SHARE",
+    "fetchWholeObjectInfo",
     "nodeDefsBudgetLeft",
     "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
@@ -284,6 +290,8 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_RUN_BUDGET_MS,
     NODE_DEFS_FETCH_SHARE,
+    NODE_DEFS_CLIENT_ROUTE_SHARE,
+    fetchWholeObjectInfo,
       nodeDefsBudgetLeft,
     monotonicNow,
     NODE_DEFS_RETRY_DELAYS_MS,

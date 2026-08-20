@@ -16,12 +16,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { fetchWholeObjectInfo } from "../../web/js/lib/object-info-oracle.js";
 
 // #1180 — READ from the panel, never restated. Shared with the other harnesses that
 // rebuild shipped functions, so one copy of a constant cannot drift from another.
 import {
   COMBO_NO_ANSWER,
   COMBO_OK,
+  NODE_DEFS_CLIENT_ROUTE_SHARE,
   NODE_DEFS_FETCH_SHARE,
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
@@ -431,6 +433,11 @@ function buildRegisterComfyNodeDefs({
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE",
+    // #608 — the second transport and the reserve that reaches it. The REAL oracle, not a
+    // double: a stub would let this harness agree with itself about the one thing the
+    // fallback has to get right, which is asking a DIFFERENT route the same question.
+    "NODE_DEFS_CLIENT_ROUTE_SHARE",
+    "fetchWholeObjectInfo",
     "nodeDefsBudgetLeft",
     "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS",
@@ -478,6 +485,8 @@ function buildRegisterComfyNodeDefs({
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_RUN_BUDGET_MS,
     NODE_DEFS_FETCH_SHARE,
+    NODE_DEFS_CLIENT_ROUTE_SHARE,
+    fetchWholeObjectInfo,
       // #1193 — ONE clock for the deadline and the arithmetic that reads it. The shared
     // helper reads the REAL monotonicNow; a fake-clock deadline measured against it is a
     // different bound than the one the panel arms (its own nodeDefsBudgetLeft shares the
@@ -1360,4 +1369,229 @@ test("#1180: a combo refresh that rejects with a FALSY value is still a failure"
     "registration succeeded here — blaming it is the defect this phase guard exists to prevent",
   );
   assert.equal(getConfirmed(), false, "an unrefreshed combo list must not be trusted");
+});
+
+// ---------------------------------------------------------------------------
+// #608 — the fetch phase's SECOND transport
+//
+// Reported on comfyui-mcp 0.52.26 / ComfyUI 0.33.0 / frontend 1.49.6: after installing
+// custom nodes and restarting, panel_refresh_nodes returned object_info_fetch_failed —
+// "api.getNodeDefs() did not answer within this refresh's remaining budget" — repeatedly,
+// while the same /object_info was being served to a different transport at that moment.
+// `lib/object-info-oracle.js` has asked a second route since #982 and `graph_get_object_info`
+// uses it; this refresh had one route and no way to ask again.
+//
+// Driven through the EXTRACTED shipping function with the REAL oracle, so deleting the
+// fallback from the panel fails these rather than a re-implementation of it.
+// ---------------------------------------------------------------------------
+
+/** A Response-like double for `api.fetchApi("/object_info")`, built from a real shape. */
+const okResponse = (defs) => ({ ok: true, status: 200, json: async () => defs });
+
+test("#608: a client route that NEVER ANSWERS falls through to the raw route", async () => {
+  // The reported failure exactly: getNodeDefs does not throw, it simply never settles.
+  // Before the fallback this ended the command with object_info_fetch_failed.
+  const timers = virtualTimers();
+  let fetched = null;
+  const { registerComfyNodeDefs, getConfirmed } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async (defs) => {
+        fetched = defs;
+      },
+      refreshComboInNodes: async () => {},
+    },
+    apiValue: {
+      getNodeDefs: () => new Promise(() => {}),
+      fetchApi: async (route) => {
+        assert.equal(route, "/object_info", "the WHOLE schema, never the per-class route");
+        return okResponse({ FreshlyInstalledNode: {} });
+      },
+    },
+    timers,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks(300);
+  assert.equal(timers.armed().length, 1, "the client route's attempt must be bounded");
+  timers.fireAll();
+  const verdict = await orFail(running, "the fetch phase never reached its second route");
+
+  assert.equal(verdict.refreshed, true, "the raw route answered — the refresh succeeded");
+  assert.deepEqual(fetched, { FreshlyInstalledNode: {} }, "…and the FALLBACK payload is what got registered");
+  assert.equal(getConfirmed(), true);
+});
+
+test("#608: a client route that THREW falls through to the raw route", async () => {
+  // #982's own shape: the frontend client fails where the HTTP route does not.
+  let fetched = null;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async (defs) => {
+        fetched = defs;
+      },
+      refreshComboInNodes: async () => {},
+    },
+    apiValue: {
+      getNodeDefs: async () => {
+        throw new TypeError("Failed to fetch");
+      },
+      fetchApi: async () => okResponse({ SomeNode: {} }),
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, true);
+  assert.deepEqual(fetched, { SomeNode: {} });
+});
+
+test("#608: a client route that RESOLVES NOTHING falls through to the raw route", async () => {
+  // `fetchNodeDefsWithRetry` hands back the unusable value rather than throwing when it
+  // exhausts on one, so this arrives at the fallback WITHOUT a caught error — a separate
+  // path from the two above, and the one that used to produce object_info_unavailable.
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => null,
+      fetchApi: async () => okResponse({ SomeNode: {} }),
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.refreshed, true, "a client route that returned nothing left the question open");
+});
+
+test("#608: an EMPTY client answer is an ANSWER — the raw route is NOT consulted", async () => {
+  // The oracle's rule, mirrored deliberately: a client expressing deny-all as {} has
+  // ANSWERED, and overruling it with a broader schema is the one direction this fallback
+  // must never move — the payload also feeds the #458 ever-seen trust root and the #1223
+  // whole-schema snapshot. Only a route that threw or returned NOTHING may be asked again.
+  let fetchApiCalls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => ({}),
+      fetchApi: async () => {
+        fetchApiCalls += 1;
+        return okResponse({ SomeNode: {} });
+      },
+    },
+  });
+  await registerComfyNodeDefs(undefined);
+  assert.equal(fetchApiCalls, 0, "an empty schema is the client's answer, not an absence to route around");
+});
+
+test("#608: the client route is capped at a SHARE of the fetch phase, so the fallback is reachable", async () => {
+  // The reserve is the whole reason the second route gets asked at all: `withTimeout` does
+  // not cancel, so a client route granted the entire fetch phase leaves nothing behind it
+  // and the phase can only report how the first transport failed. Pinned on the ARMED
+  // bound, because a share that quietly returns to 1 passes every other test in this file.
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: { getNodeDefs: () => new Promise(() => {}), fetchApi: async () => okResponse({ A: {} }) },
+    timers,
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks(300);
+  const armed = timers.armed();
+  assert.equal(armed.length, 1, "exactly the client route's attempt");
+  const wholeFetchPhase = NODE_DEFS_RUN_BUDGET_MS * NODE_DEFS_FETCH_SHARE;
+  const clientShare = wholeFetchPhase * NODE_DEFS_CLIENT_ROUTE_SHARE;
+  assert.ok(
+    armed[0].ms <= Math.ceil(clientShare),
+    `the client route must not be granted more than its share (${clientShare}ms), saw ${armed[0].ms}ms`,
+  );
+  assert.ok(
+    armed[0].ms > clientShare * 0.8,
+    `…nor be starved to a floor (saw ${armed[0].ms}ms of ${clientShare}ms)`,
+  );
+  timers.fireAll();
+  await orFail(running, "the run never finished");
+});
+
+test("#608: when BOTH routes fail the refusal names both, and the detail is unchanged", async () => {
+  // The message half. "check that the ComfyUI server process is still running" stood on the
+  // evidence of ONE route, and the reported install had a healthy server answering another
+  // transport at that same moment. The rethrow is deliberately the client route's own
+  // error, so the detail and the phase attribution are exactly what they were before.
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => {
+        throw new TypeError("Failed to fetch");
+      },
+      fetchApi: async () => ({ ok: false, status: 500, json: async () => ({}) }),
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(verdict.detail, /Failed to fetch/, "the client route's own error still words the detail");
+  assert.match(verdict.remedy, /Tried 2 routes/, "both transports are named");
+  assert.match(verdict.remedy, /api\.getNodeDefs\(\) failed: Failed to fetch/);
+  assert.match(verdict.remedy, /GET \/object_info was not OK \(status 500\)/);
+});
+
+test("#608: with no route returning anything, the unavailable verdict names them too", async () => {
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: async () => null,
+      fetchApi: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+    },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.reason, "object_info_unavailable");
+  assert.match(verdict.remedy, /Tried 2 routes/);
+  assert.match(verdict.remedy, /returned no usable schema/, "the client route's outcome, not a fabricated throw");
+  assert.match(verdict.remedy, /status 404/);
+});
+
+test("#608: the verdict prints nothing extra when no routes were recorded", () => {
+  // A caller that does not pass `fetchRouteFailures` must read exactly as it did before,
+  // or every unrelated refusal gains a hollow clause.
+  const before = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: false,
+    comboApiPresent: true,
+    comboRan: false,
+    phase: "fetch",
+    didThrow: true,
+    thrown: new Error("boom"),
+  });
+  assert.doesNotMatch(before.remedy, /Tried /);
+  const after = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: false,
+    comboApiPresent: true,
+    comboRan: false,
+    phase: "fetch",
+    didThrow: true,
+    thrown: new Error("boom"),
+    fetchRouteFailures: ["route one did nothing", "route two did nothing"],
+  });
+  assert.match(after.remedy, /Tried 2 routes: route one did nothing; route two did nothing\./);
+});
+
+test("#608: the fallback is wired to the WHOLE-schema oracle, after the client route", async () => {
+  // Source-level, because two properties here are invisible to behaviour: that the second
+  // route is the shared oracle rather than a hand-rolled fetch (a second timeout helper is
+  // how this repo keeps producing near-duplicate bugs), and that the client route is not
+  // handed to it a second time — which would spend the reserve on the transport that just
+  // failed.
+  const body = extractFunction("async function registerComfyNodeDefs(");
+  assert.match(body, /await fetchWholeObjectInfo\(\{/, "the shared oracle, not a second fetch helper");
+  assert.match(
+    body,
+    /getNodeDefs: null,/,
+    "the client route is NOT re-asked — the retry loop above already is that route",
+  );
+  assert.match(
+    body,
+    /deadlineMs: nodeDefsBudgetLeft\(fetchPhaseDeadline\),/,
+    "the fallback draws on what is LEFT of the fetch phase, never a fresh constant",
+  );
+  // The rethrow must come AFTER the fallback, or the second route is unreachable for the
+  // case that reported this — a client route that throws.
+  const fallbackAt = body.indexOf("await fetchWholeObjectInfo({");
+  const rethrowAt = body.indexOf("if (clientRouteThrew) throw clientRouteError;");
+  assert.ok(fallbackAt > -1 && rethrowAt > fallbackAt, "the client route's error is rethrown only after the retry");
 });
