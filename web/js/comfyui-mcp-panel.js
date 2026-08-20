@@ -1347,6 +1347,11 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // can never be filed under post-restart provenance.
   const runStartedAtEpoch = backendReconnectEpoch;
   let thrown = null;
+  // #608 — what EACH transport did in the fetch phase, in order, when none of them produced
+  // a payload. The verdict appends it, so a refusal names the routes that were actually
+  // tried instead of leaving "check that the ComfyUI server process is still running" to
+  // stand on the evidence of one route out of two (#982's own defect, and #954's).
+  let fetchRouteFailures = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
   // clean one — misattributing the verdict and, worse, setting the shared
@@ -1428,36 +1433,174 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // is deliberately a REAL one when there was one — so the value cannot be asked which
       // kind of failure it represents without undoing that.
       let lastAttemptTimedOut = false;
-      defs = await fetchNodeDefsWithRetry(
-        async () => {
-          // Unreachable as written — `shouldRetry` ends the loop on the first timeout, so
-          // this can never be observed true on entry. Kept because it is the invariant that
-          // makes the flag safe, not a consequence of it: a future `shouldRetry` that
-          // permits one retry after a stall would, without this line, mark every later
-          // attempt as timed out and stop the loop for a reason that had already passed.
-          lastAttemptTimedOut = false;
-          let result;
-          try {
-            result = await boundedGetNodeDefs(nodeDefsBudgetLeft(runDeadline, NODE_DEFS_FETCH_SHARE));
-          } catch (err) {
-            sawRealError = true;
-            lastRealError = err;
-            throw err;
+      // #608 — THE SECOND ROUTE TAKES NOTHING FROM THE FIRST, and this is the whole design
+      // decision, recorded because the obvious alternative was tried and shipped a worse bug
+      // than the one being fixed.
+      //
+      // The first attempt capped the client route at HALF the fetch phase and called the
+      // other half the second route's reserve. That couples two cases which have opposite
+      // remedies. When the SLOW PARTY IS THE BACKEND both transports are slow — the raw
+      // route inherits the same latency — so halving the client route's grant and handing
+      // the remainder to a route that needs just as long rescues nothing and loses what the
+      // first route would have got. Measured against the extracted run with the real oracle,
+      // an /object_info answering in 3,200ms / 3,500ms / 5,500ms went from refreshed:true on
+      // the parent to object_info_fetch_failed on that attempt — a new hard-failure band
+      // across (3,000ms, 6,000ms), with nodeDefsRefreshConfirmed false behind it, which is
+      // what the note at the combo phase says reopens #610's false "model still missing".
+      // 3-6s is not exotic: this repo has measured a 5.4MB /object_info at 7.5s over a
+      // tunnel, and a post-install restart on a remote is exactly when it is slowest.
+      //
+      // So the client route's grant is UNCHANGED from before this issue — it still gets the
+      // whole fetch share, so no install that refreshed before can stop refreshing — and the
+      // second route draws on what is left of the RUN deadline instead. That budget is only
+      // ever spent in the case the client route has ALREADY definitively failed, which is
+      // the case that used to end the command outright, so nothing that worked can lose by
+      // it. The run's total WAITING is still bounded by the one deadline, so #1180's
+      // composition (two serialized runs inside the bridge's read default) is untouched.
+      //
+      // WHAT IT COSTS, stated rather than left to be found: when the fallback is consulted
+      // it spends time the combo phase would otherwise have had. That is the right trade
+      // and not a close one — a missing payload is a hard refreshed:false, while an
+      // abandoned combo call is a DISCLOSURE (#1193: the reapply sweep has already rebuilt
+      // every live combo from this run's payload, so the verdict is refreshed:true with
+      // combo_refresh_confirmed:false). A degraded confirmation beats no refresh at all.
+      //
+      // NOT RACED. Issuing both routes together would avoid the wait entirely, and it is
+      // declined on this path's own evidence: an abandoned request is NOT cancelled, so a
+      // race puts two whole-document downloads (5.4MB measured) on the same link and makes
+      // the slow case slower — the exact contention the retry schedule's shouldRetry was
+      // added to stop. Sequential-after-a-definite-failure spends nothing on the healthy
+      // path, which is every path that works today.
+      // The client route's failure is HELD, not propagated, so the second route is reached
+      // at all — and rethrown UNCHANGED if that one fails too, so the verdict's `detail`
+      // and the attribution above it are exactly what they were before this fallback
+      // existed. A stall must not become a vaguer failure on the way to a second attempt.
+      let clientRouteThrew = false;
+      let clientRouteError = null;
+      try {
+        defs = await fetchNodeDefsWithRetry(
+          async () => {
+            // Unreachable as written — `shouldRetry` ends the loop on the first timeout, so
+            // this can never be observed true on entry. Kept because it is the invariant that
+            // makes the flag safe, not a consequence of it: a future `shouldRetry` that
+            // permits one retry after a stall would, without this line, mark every later
+            // attempt as timed out and stop the loop for a reason that had already passed.
+            lastAttemptTimedOut = false;
+            let result;
+            try {
+              result = await boundedGetNodeDefs(nodeDefsBudgetLeft(runDeadline, NODE_DEFS_FETCH_SHARE));
+            } catch (err) {
+              sawRealError = true;
+              lastRealError = err;
+              throw err;
+            }
+            if (result === NODE_DEFS_NO_ANSWER) {
+              lastAttemptTimedOut = true;
+              if (sawRealError) throw lastRealError;
+              throw new Error("api.getNodeDefs() did not answer within this refresh's remaining budget");
+            }
+            return result;
+          },
+          {
+            delays: NODE_DEFS_RETRY_DELAYS_MS,
+            // An abandoned attempt is still downloading the whole document. Retrying it races
+            // the retry against its own predecessor; an instantly-refused one costs nothing.
+            shouldRetry: () => !lastAttemptTimedOut,
+          },
+        );
+      } catch (err) {
+        clientRouteThrew = true;
+        clientRouteError = err;
+        defs = null;
+      }
+      // #608 — THE SECOND TRANSPORT, on the terms #982 set and #1161 bounded.
+      //
+      // Same question, different route: the WHOLE document, never the per-class
+      // `/object_info/<Type>` one — the oracle's header says why that is not
+      // interchangeable, and this path files what it fetched in the whole-schema snapshot
+      // (#1223), which is exactly the reader a single-class payload would poison.
+      //
+      // AN EMPTY `{}` IS AN ANSWER, NOT AN ABSENCE, and this mirrors the oracle rather than
+      // `objectInfoLooksTransient`, which the two modules genuinely disagree about. A client
+      // expressing deny-all as an empty map has ANSWERED, and consulting the raw route would
+      // overrule it with a broader schema — the one direction a fallback must never move,
+      // because this payload also feeds the #458 ever-seen trust root. So only a route that
+      // THREW or returned NOTHING (null/undefined/a non-object) leaves the question open,
+      // and only that is asked again here. An empty map keeps the behaviour it has always
+      // had on this path.
+      //
+      // `Object.keys` is deliberately not consulted: it invokes a Proxy's ownKeys trap and
+      // can throw, and this classification sits outside the oracle's guards.
+      //
+      // A FRONTEND WITH NO `getNodeDefs` AT ALL still reports object_info_unavailable and is
+      // NOT rescued here — the outer guard is unchanged. That is a real gap and it is left
+      // open deliberately: nothing has reported it, the reported install has the client
+      // route and it is the one that fails, and widening the entry condition would change
+      // what a build without the API is told on evidence nobody has.
+      if (clientRouteThrew || !defs || typeof defs !== "object" || Array.isArray(defs)) {
+        const {
+          defs: fallbackDefs,
+          failures: fallbackFailures,
+          outcomes: fallbackOutcomes,
+        } = await fetchWholeObjectInfo({
+          // ALREADY ASKED. The loop above IS the client route — with this path's own retry
+          // schedule, its bound and its error attribution — so handing it to the oracle
+          // again would spend the reserve on the transport that just failed.
+          getNodeDefs: null,
+          // `api.fetchApi` defaults to `cache: "no-cache"` (read from the shipped client,
+          // comfyui-frontend-package 1.48.7 on this rig), where `getNodeDefs` overrides it
+          // to `no-store`. Both revalidate with the server, so this cannot answer a REFRESH
+          // out of the HTTP cache with the pre-install schema — which would be worse than
+          // failing, since it would report refreshed:true over the definitions the caller
+          // just installed a pack to replace.
+          fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+          // WHAT IS LEFT OF THE RUN, not of the fetch phase. The fetch phase's own share
+          // has by definition been spent by the route that just failed, so sizing this from
+          // it hands the second transport the 1ms floor — a bound that only a synchronous
+          // double beats and no real /object_info ever does.
+          deadlineMs: nodeDefsBudgetLeft(runDeadline),
+        });
+        if (fallbackDefs) {
+          // The question is answered. The run continues exactly as it would have on a
+          // client-route success — recorded, snapshotted, registered, reapplied — because
+          // the fallback changes the transport and never the question.
+          defs = fallbackDefs;
+          clientRouteThrew = false;
+          clientRouteError = null;
+        } else {
+          // Neither route produced a payload. Record what each one did so the verdict can
+          // say it: the client route's sentence is built HERE because the oracle was handed
+          // no client transport and would otherwise report one it never had, and the http
+          // entries are selected by their TAG, never by matching their prose (#1223).
+          let clientSentence = "api.getNodeDefs() returned no usable schema";
+          if (clientRouteThrew) {
+            // Reading `.message` — and `String()` — off a thrown value can itself throw
+            // (a getter-backed subclass, a hostile toString), and this is a diagnostic
+            // path in a function whose callers await it without a catch of their own.
+            let raw = "";
+            try {
+              raw =
+                clientRouteError instanceof Error
+                  ? clientRouteError.message
+                  : clientRouteError == null
+                    ? ""
+                    : String(clientRouteError);
+            } catch {
+              raw = "(an unprintable value)";
+            }
+            clientSentence = raw ? `api.getNodeDefs() failed: ${raw}` : "api.getNodeDefs() failed";
           }
-          if (result === NODE_DEFS_NO_ANSWER) {
-            lastAttemptTimedOut = true;
-            if (sawRealError) throw lastRealError;
-            throw new Error("api.getNodeDefs() did not answer within this refresh's remaining budget");
-          }
-          return result;
-        },
-        {
-          delays: NODE_DEFS_RETRY_DELAYS_MS,
-          // An abandoned attempt is still downloading the whole document. Retrying it races
-          // the retry against its own predecessor; an instantly-refused one costs nothing.
-          shouldRetry: () => !lastAttemptTimedOut,
-        },
-      );
+          fetchRouteFailures = [
+            clientSentence,
+            ...(Array.isArray(fallbackFailures) ? fallbackFailures : []).filter(
+              (_, i) => fallbackOutcomes?.[i]?.route === "http",
+            ),
+          ];
+        }
+      }
+      // Rethrown here rather than at the catch, so the phase attribution, the verdict's
+      // reason and its detail are untouched for the case where both routes failed.
+      if (clientRouteThrew) throw clientRouteError;
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.
@@ -1750,6 +1893,9 @@ async function registerComfyNodeDefs(preloadedDefs) {
     phase,
     didThrow,
     thrown,
+    // #608 — what every transport in the fetch phase did, so a refusal about /object_info
+    // names the routes it actually tried.
+    fetchRouteFailures,
   });
   // #1275 — VERIFY the refresh was ADDITIVE over the live graph.
   //

@@ -15,6 +15,11 @@
 // Pure: every input is observed by the caller and passed in.
 
 import { nodeInventoryLabel } from "./graph-node-inventory.js";
+// #608 — the ONE renderer for "what each route did", shared with the two other refusals
+// that already print it (`graph_get_object_info` and the set_widget fence). It caps the
+// entry count and sanitizes each sentence, which matters here because a caller can hand
+// this text a backend or extension produced.
+import { objectInfoOracleFailureNote } from "./object-info-oracle.js";
 
 /** Stable reason tokens for a node-def refresh that is NOT confirmed fresh. */
 export const NODE_DEF_REFRESH_REASONS = Object.freeze({
@@ -70,6 +75,13 @@ function detailSuffix(thrown) {
  *   didThrow?: boolean,        // a throw happened at all — tracked independently of
  *                              // the caught VALUE, which can be falsy (throw null)
  *   thrown?: any,              // the error a phase threw, if any
+ *   fetchRouteFailures?: string[]|null, // #608 — what EACH transport the fetch phase has
+ *                              // tried actually did, in order, when none of them produced
+ *                              // a payload. The fetch-phase remedies name them: before
+ *                              // this, "check that the ComfyUI server process is still
+ *                              // running" was printed on the evidence of one route, and
+ *                              // the reported install had a healthy server answering a
+ *                              // different transport at that same moment.
  * }} o
  * @returns {{ refreshed: boolean, reason: string, remedy?: string, detail?: string }}
  */
@@ -84,9 +96,13 @@ export function describeNodeDefRefresh({
   phase = "done",
   didThrow,
   thrown = null,
+  fetchRouteFailures = null,
 } = {}) {
   // Backstop for a caller that predates didThrow: a truthy caught value implies it.
   const failed = didThrow === true || !!thrown;
+  // #608 — "" when the caller recorded nothing, so a caller that does not pass this reads
+  // exactly as it did before rather than gaining an empty clause.
+  const routesNote = objectInfoOracleFailureNote(fetchRouteFailures);
   // The registration clause the combo-failure remedies are allowed to make:
   // "WERE re-registered" only when the registration call observably ran.
   const registrationClause = defsRegistered
@@ -127,9 +143,13 @@ export function describeNodeDefRefresh({
             "so the refresh is NOT confirmed. Reload the ComfyUI tab, then retry.";
     const remedy =
       reason === NODE_DEF_REFRESH_REASONS.OBJECT_INFO_FETCH_FAILED
-        ? "The /object_info fetch failed, so nothing was refreshed. The backend may still be " +
-          "restarting — retry once it answers, and if it never does, check that the ComfyUI " +
-          "server process is still running."
+        ? "The /object_info fetch failed on every transport this panel has, so nothing was " +
+          "refreshed. The backend may still be restarting — retry once it answers, and if it " +
+          "never does, check that the ComfyUI server process is still running." +
+          // #608 — the routes, appended rather than folded into the sentence above: which
+          // ones were tried is EVIDENCE, and it is what separates "one client call did not
+          // answer" (where the server is usually fine, and was) from "nothing answers".
+          routesNote
         : reason === NODE_DEF_REFRESH_REASONS.COMBO_REFRESH_FAILED
           ? `${registrationClause}, but refreshing the ` +
             "combo lists failed, so dropdown options may still be stale. Retry; if it keeps " +
@@ -144,9 +164,13 @@ export function describeNodeDefRefresh({
       reason: NODE_DEF_REFRESH_REASONS.OBJECT_INFO_UNAVAILABLE,
       remedy:
         "The panel could not obtain /object_info from the ComfyUI backend (this frontend exposes " +
-        "no getNodeDefs, or it returned nothing), so node definitions and combo lists were NOT " +
-        "refreshed. If the backend is mid-restart, retry once it is up; otherwise reload the " +
-        "ComfyUI tab.",
+        "no getNodeDefs, or no route returned anything usable), so node definitions and combo " +
+        "lists were NOT refreshed. If the backend is mid-restart, retry once it is up; " +
+        "otherwise reload the ComfyUI tab." +
+        // #608 — the same evidence, on the branch a route reached by RESOLVING nothing lands
+        // in. This one never carried a detail at all, so the routes are the only thing that
+        // can tell a caller which transport it was.
+        routesNote,
     };
   }
   if (!defsRegistered) {
