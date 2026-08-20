@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- loading a saved workflow no longer resets a subgraph host's prompt, dimensions, length, and selectors to definition defaults (#874)
 - panel_add_node names a failed custom-node pack as the reason a type is missing only when ComfyUI-Manager's node map says that pack provides it; an unproven failure is reported as a separate issue rather than the cause (#1544)
 
 ## [0.15.30] - 2026-08-20
