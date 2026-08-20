@@ -989,6 +989,205 @@ test('P0-b: no-name save of an on-disk app-mode workflow COPIES to .app.json, so
 })
 
 // ---------------------------------------------------------------------------
+// #1535 — the MIRROR of P0-b, and the direction that loses work.
+//
+// A workflow whose file is ALREADY at "<stem>.app.json". The frontend's
+// getFilenameDetails strips the compound suffix, so `filename` is "<stem>" with the
+// ".app" living only in `path`; `initialMode` is read from the FILE's extra.linearMode at
+// load, so a workflow configured into App Mode AFTER it was opened still reads unset (or
+// "graph"). The filename+mode reconstruction therefore produced "<stem>.json", the save
+// read that as a relocation, and a no-name save FORKED a new plain .json holding the
+// caller's work while the .app.json it was editing went unwritten.
+//
+// Both spellings of the mode are covered, because they are two different production
+// states and only one of them is what a fresh file produces: `undefined` (the file has no
+// extra.linearMode at all — reproduced live) and `"graph"` (the file says
+// linearMode:false — what the issue reporter's file held on disk).
+for (const [label, initialMode] of [
+  ['mode never populated (no extra.linearMode in the file)', undefined],
+  ['mode read as "graph" (the file says linearMode:false)', 'graph']
+]) {
+  test(`#1535: a NO-NAME save of a workflow on disk at "<stem>.app.json" writes THAT file — ${label}`, async () => {
+    const active = {
+      path: 'workflows/Anima Turbo.app.json',
+      // What getFilenameDetails reports for that path: the compound suffix is stripped
+      // whole, so nothing here carries the ".app".
+      filename: 'Anima Turbo',
+      directory: 'workflows',
+      initialMode,
+      isPersisted: true,
+      isTemporary: false
+    }
+    const svc = makeFaithfulService({ files: [active.path], active })
+
+    const saved = await saveActiveWorkflow(svc, undefined, {
+      autoWorkflowName: () => 'Untitled',
+      existsOnDisk: async (p) => svc.disk.has(p)
+    })
+
+    assert.equal(saved, 'Anima Turbo')
+    // The file the caller was editing is the file that was written...
+    assert.ok(
+      svc.calls.some((c) => c[0] === 'saveWorkflow' && c[1] === 'workflows/Anima Turbo.app.json'),
+      'the write must target the .app.json the workflow occupies'
+    )
+    assert.ok(svc.disk.has('workflows/Anima Turbo.app.json'), 'the .app.json is still on disk')
+    // ...and no orphan was created beside it holding that work.
+    assert.ok(
+      !svc.disk.has('workflows/Anima Turbo.json'),
+      'a no-name save must not fork a plain .json — that is the reported data divergence'
+    )
+    assert.ok(!svc.calls.some((c) => c[0] === 'saveAs'), 'not a Save-As: nothing was copied')
+    assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'and nothing was moved (#226)')
+  })
+}
+
+test('#1535: the in-place classification is the SAVE OUTCOME, so the reply cannot report a Save-As', async () => {
+  // describeSaveOutcome reads the mode the save DECIDED. If the fork route were taken it
+  // would record "save-as-copy" and the reply would carry `saved_as: true` — the field
+  // that told the reporter a NEW file held their work. Assert the recorded mode, not just
+  // the disk, so a future change that writes the right file but still announces a copy is
+  // caught here rather than by a reader of the reply.
+  const active = {
+    path: 'workflows/Anima Turbo.app.json',
+    filename: 'Anima Turbo',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+  const details = {}
+
+  await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk: async (p) => svc.disk.has(p),
+    details
+  })
+
+  assert.equal(details.mode, 'in-place', 'a no-name save of its own file is an in-place save')
+  assert.equal(details.targetPath, 'workflows/Anima Turbo.app.json', 'and it names that file')
+  assert.deepEqual(describeSaveOutcome(details), {}, 'so the reply carries no saved_as/copied_from')
+})
+
+test('#1535 stays in ONE direction: an EXPLICIT name is still placed by the mode, not by the source suffix', async () => {
+  // The agent-visible way to create an app file is `panel_save_workflow({name:"X.app"})`.
+  // If the ".app" already on the SOURCE path were folded into the extension for named
+  // saves too, that call would land at "X.app.app.json" once the active workflow is itself
+  // an app file. It must not: only the NO-NAME case reads the path.
+  const active = {
+    path: 'workflows/Anima Turbo.app.json',
+    filename: 'Anima Turbo',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+
+  const saved = await saveActiveWorkflow(svc, 'Anima Turbo v2.app', {
+    existsOnDisk: async (p) => svc.disk.has(p)
+  })
+
+  // The copy route reports the FRONTEND's display name for the file it produced
+  // (baseName of the new tab's filename), which is unchanged by this fix and is why the
+  // ".app" is absent here — the file, asserted below, is what matters.
+  assert.equal(saved, 'Anima Turbo v2')
+  assert.ok(svc.disk.has('workflows/Anima Turbo v2.app.json'), 'the named copy lands where the caller asked')
+  assert.ok(!svc.disk.has('workflows/Anima Turbo v2.app.app.json'), 'never a doubled suffix')
+  assert.ok(svc.disk.has('workflows/Anima Turbo.app.json'), 'and the source survives (#226)')
+})
+
+// --- the three boundary guards, each pinned by the case that DISTINGUISHES it. ---
+// Written from mutation results: dropping any one of them left the suite green, so each
+// of these exists to make that mutant die rather than to restate the fix.
+
+test('#1535 boundary: an EXPLICIT name matching the source stem is still a Save-As, not an in-place write', async () => {
+  // `panel_save_workflow({name:"Anima Turbo"})` while editing "Anima Turbo.app.json". The
+  // stem is IDENTICAL, so a path-reading rule that forgot to require "no name given"
+  // would classify it in-place and overwrite the .app.json instead of producing the file
+  // the caller asked for. An explicit name is a destination, and the mode picks its
+  // extension.
+  const active = {
+    path: 'workflows/Anima Turbo.app.json',
+    filename: 'Anima Turbo',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+
+  await saveActiveWorkflow(svc, 'Anima Turbo', { existsOnDisk: async (p) => svc.disk.has(p) })
+
+  assert.ok(svc.disk.has('workflows/Anima Turbo.json'), 'the caller got the file it named')
+  assert.ok(svc.disk.has('workflows/Anima Turbo.app.json'), 'and the source was not consumed (#226)')
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'routed to the copy path')
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow' && c[1] === 'workflows/Anima Turbo.app.json'),
+    'the source file was never written in place'
+  )
+})
+
+test('#1535 boundary: a tab that READS unsaved stays on the collision-checked route, even at a .app.json path', async () => {
+  // #215 drift makes `isTemporary` unreliable in BOTH directions, and the destructive one
+  // is a genuinely never-persisted tab that reads persisted: the in-place branch writes
+  // `wf.path` with force, so it would clobber whatever already occupies that path instead
+  // of going through the first-save route's absent-oracle + overwrite:false collision
+  // check. Anything that cannot prove it is already its own file on disk stays on the
+  // checked route — the same fail-safe direction the rest of this module takes.
+  const active = {
+    path: 'workflows/Drifted.app.json',
+    filename: 'Drifted',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: false, // drifted / never-persisted — indistinguishable here
+    isTemporary: true
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+
+  await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk: async (p) => svc.disk.has(p)
+  })
+
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'went through the collision-checked copy route')
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow' && c[1] === 'workflows/Drifted.app.json'),
+    'never took the unchecked in-place write on a tab whose persistence is unproven'
+  )
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'and nothing was moved (#226)')
+})
+
+test('#1535 boundary: a filename that no longer matches the path does NOT authorize writing that path', async () => {
+  // The rule is FULL-PATH equality with this workflow's own ".app.json" sibling, not "the
+  // path happens to end in .app.json". A tab whose `filename` has moved on from its
+  // `path` (a rename in flight) has two different destinations in hand, and the name is
+  // the one the caller last set — so it keeps driving the destination. Matching on the
+  // suffix alone would silently overwrite the file at the OLD path instead.
+  const active = {
+    path: 'workflows/Old Name.app.json',
+    filename: 'Fresh Name',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeFaithfulService({ files: [active.path], active })
+
+  await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk: async (p) => svc.disk.has(p)
+  })
+
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow' && c[1] === 'workflows/Old Name.app.json'),
+    'the file at the stale path must not be written on the strength of its suffix'
+  )
+  assert.ok(svc.disk.has('workflows/Old Name.app.json'), 'and it is still on disk (#226)')
+})
+
+// ---------------------------------------------------------------------------
 // ComfyUI frontend 1.47.x (issue #268). The workflow store no longer exposes
 // `saveWorkflowAs`; it exposes the low-level pair `saveAs(wf, path)` (builds a
 // NEW copy object at `path`, leaving the source object and its file untouched)
