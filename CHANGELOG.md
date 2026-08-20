@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.18] - 2026-08-20
+
+### Fixed
+- pasting a prompt copied out of a document no longer drops every character: a clipboard carrying both a file and text (which is what Word, Outlook, Excel and most web pages produce on Windows) had its text discarded by the file branch, silently and with no placeholder (#1467)
+- a message referencing an attachment whose content is no longer loaded now says so, instead of sending a message that only looks complete (#1467)
+
 ## [0.15.17] - 2026-08-20
 
 ### Fixed
