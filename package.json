@@ -16,11 +16,11 @@
     "i18n:check": "node scripts/i18n-check.mjs"
   },
   "devDependencies": {
-    "@playwright/test": "^1.49.0",
+    "@playwright/test": "^1.62.1",
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
     "typescript": "^5.7.2",
-    "ws": "^8.18.0"
+    "ws": "^8.21.3"
   },
   "dependencies": {
     "zod": "^4.4.3"
