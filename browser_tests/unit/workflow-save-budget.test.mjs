@@ -16,6 +16,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
@@ -438,4 +440,143 @@ test("#1455: with no flags readable the reply does not reason about a flag it ne
   assert.match(text, /UNDETERMINED/);
   // The modified:false rationale belongs to a reading that did not happen.
   assert.doesNotMatch(text, /never dirty/);
+});
+
+// ---------------------------------------------------------------------------
+// #1459 — the two sides of the comparison are normalized to DIFFERENT degrees.
+//
+// The fixture is the repo's own documented double-extension shape (the same one
+// workflow-save.test.mjs uses for the #226 rename hazard): a file persisted at
+// "workflows/Foo.json.json" reports filename "Foo.json", because ComfyUI's
+// getFilenameDetails has already taken the final ".json" off. Stripping it AGAIN
+// on this side keys it as "Foo" — colliding with a genuinely different workflow.
+// ---------------------------------------------------------------------------
+
+test("#1459: an externally-placed Foo.json.json is NOT the destination of a save to Foo", () => {
+  // The canvas holds "workflows/Foo.json.json" (filename "Foo.json"); the save was
+  // asked for "Foo", which the save layer resolves to "workflows/Foo.json". Two
+  // different files. Double-stripping the canvas name makes them read as one, which
+  // suppresses the disclosure AND prints the source's flags as the target's.
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: false,
+    persisted: true,
+    filename: "Foo.json",
+    requested: "Foo",
+  });
+  assert.match(text, /not the save's destination/, "the canvas is a different file and must be disclosed as one");
+  assert.match(text, /The active workflow is "Foo\.json"/);
+  assert.match(text, /do not describe "Foo"/);
+  // The foreign flags belong to the source. Printing them here is the wrong-target
+  // claim this whole chain exists to prevent.
+  assert.doesNotMatch(text, /persisted:true/);
+  assert.doesNotMatch(text, /modified:false/);
+});
+
+test("#1459: the reply for a double-extension canvas names the REQUESTED destination", () => {
+  // `subject` picks the frontend name only when the two are the same workflow. With
+  // the double-strip, "Foo.json" wins the subject slot and the reply is headed with
+  // a file the caller never asked to write.
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: true,
+    persisted: true,
+    filename: "Foo.json",
+    requested: "Foo",
+  });
+  assert.match(text, /for "Foo"\. /, "headed with the destination, not the canvas");
+  assert.doesNotMatch(text, /for "Foo\.json"/);
+});
+
+test("#1459: an un-named save that moved between Foo.json.json and Foo.json is undeterminable", () => {
+  // Both sides are frontend-derived here: the canvas moved from the double-extension
+  // file (filename "Foo.json") to a real "workflows/Foo.json" (filename "Foo"). Those
+  // are two workflows; double-stripping keys them both to "Foo", so the "which file
+  // does the hung write target?" disclosure is skipped and the reply falls through to
+  // the in-place case — reporting flags that describe neither write with confidence.
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: false,
+    persisted: true,
+    filename: "Foo",
+    previousActive: "Foo.json",
+  });
+  assert.match(text, /cannot be determined from here/);
+  assert.match(text, /changed from "Foo\.json" to "Foo"/);
+});
+
+test("#1459: the #1455 requested-name normalization is unchanged — directory and extension still strip", () => {
+  // The fix must narrow ONLY the frontend side. Every requested spelling that #1455
+  // taught to match a bare canvas name still has to match, or this trades one
+  // wrong-target reply for another.
+  for (const requested of ["Foo", "Foo.json", "workflows/Foo.json", "workflows\\Foo.json", " Foo ", "Foo.app.json"]) {
+    const text = describeWorkflowSaveTimeout({
+      budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+      modified: true,
+      persisted: false,
+      filename: "Foo",
+      requested,
+    });
+    assert.doesNotMatch(text, /not the save's destination/, requested + " is the canvas");
+    assert.match(text, /modified:true/, requested + " keeps the dirty observation");
+  }
+});
+
+test("#1459: a directory on the frontend name is still dropped, without touching the extension", () => {
+  // activeKey drops the directory and nothing else. "workflows/Foo" is the canvas for
+  // a requested "Foo"; "workflows/Foo.json" (a double-extension file) is not.
+  const same = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: true,
+    persisted: false,
+    filename: "workflows/Foo",
+    requested: "Foo",
+  });
+  assert.doesNotMatch(same, /not the save's destination/);
+
+  const different = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: true,
+    persisted: false,
+    filename: "workflows/Foo.json",
+    requested: "Foo",
+  });
+  assert.match(different, /not the save's destination/);
+});
+
+test("#1459 SOURCE: the frontend-derived name is never run through baseName", () => {
+  // The whole defect is one helper applied to both sides, and a helper-level test cannot
+  // see WHICH helper a call site chose — swapping activeKey back to requestedKey at any
+  // one of the three sites is invisible to every assertion above that does not happen to
+  // exercise that exact branch. Assert on the shipped source instead.
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/lib/workflow-save-budget.js", import.meta.url)),
+    "utf8",
+  );
+  // Comments talk ABOUT baseName() at length; only real code counts.
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const body = code.slice(code.indexOf("export function describeWorkflowSaveTimeout"));
+
+  assert.equal(body.includes("nameKey("), false, "the shared over-stripping helper is gone");
+  assert.equal(
+    (body.match(/requestedKey\((?:active|prior)\)/g) ?? []).length,
+    0,
+    "a frontend-derived name must never take the extension-stripping key",
+  );
+  assert.equal(
+    (body.match(/activeKey\(dest\)/g) ?? []).length,
+    0,
+    "the raw requested name must never take the directory-only key",
+  );
+  // Every comparison the reply branches on is keyed, and keyed with the RIGHT side's key.
+  assert.match(body, /activeKey\(prior\) !== activeKey\(active\)/, "case 3 keys both frontend names");
+  assert.match(body, /requestedKey\(dest\) === activeKey\(active\)/, "the subject picks per-side keys");
+  assert.match(body, /activeKey\(active\) !== requestedKey\(dest\)/, "the disclosure branch keys per side");
+  // And requestedKey is the ONLY thing in this module allowed to strip an extension.
+  assert.match(code, /const requestedKey = \(v\) => baseName\(dropDir\(v\)\)/);
+  assert.equal(
+    (code.match(/baseName\(/g) ?? []).length,
+    1,
+    "exactly one baseName call site — the requested-name key",
+  );
 });
