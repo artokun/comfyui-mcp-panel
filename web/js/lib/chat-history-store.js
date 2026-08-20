@@ -938,17 +938,82 @@ export function retainBoundedThreads(threads, limit, protectedThreadIds = []) {
 }
 
 /**
- * Where each message already sat, by id — the order those records were actually
- * written in. Built from the source lists in the order they are handed over, so
- * the first list defines the baseline and later ones extend it.
+ * First-seen id order of one source list. Used as input to the two-sequence
+ * merge below; a single-list caller (importPayload) is an identity.
+ */
+function messageIdsInOrder(list) {
+  const ids = [];
+  const seen = new Set();
+  for (const message of Array.isArray(list) ? list : []) {
+    if (!message || seen.has(message.id)) continue;
+    seen.add(message.id);
+    ids.push(message.id);
+  }
+  return ids;
+}
+
+/**
+ * Order-preserving merge of two id sequences.
+ *
+ * Shared ids are alignment points. An id unique to one sequence splices in
+ * after its nearest common predecessor rather than after every id from the
+ * other list. When the sequences disagree on the order of a shared pair, the
+ * second sequence wins — at the mergeThreadMessages call that is `newer`.
+ *
+ * Concatenating the lists and ranking first-seen (#1530) only preserves order
+ * when the first list is a prefix of the second. Production is often the other
+ * way around: `_writeLocalSnapshot` stores `thread.msgs.slice(-LOCAL_SHADOW_MESSAGES)`,
+ * so the local shadow is a TAIL, and the panel restore then merges that tail
+ * with the IndexedDB copy. `older`/`newer` is chosen by `updatedAt`, not by
+ * argument position, so swapping the concatenation is the exact mirror failure.
+ * Walk both instead (#1536).
+ */
+function mergeSequenceIds(left, right) {
+  if (!left.length) return right.slice();
+  if (!right.length) return left.slice();
+  const inLeft = new Set(left);
+  const inRight = new Set(right);
+  const emitted = new Set();
+  const merged = [];
+  const emit = (id) => {
+    if (emitted.has(id)) return;
+    emitted.add(id);
+    merged.push(id);
+  };
+  let i = 0;
+  let j = 0;
+  while (i < left.length || j < right.length) {
+    while (i < left.length && (emitted.has(left[i]) || !inRight.has(left[i]))) {
+      emit(left[i++]);
+    }
+    while (j < right.length && (emitted.has(right[j]) || !inLeft.has(right[j]))) {
+      emit(right[j++]);
+    }
+    if (i < left.length && j < right.length) {
+      if (left[i] === right[j]) {
+        emit(left[i]);
+        i += 1;
+        j += 1;
+      } else {
+        emit(right[j++]);
+      }
+      continue;
+    }
+    while (i < left.length) emit(left[i++]);
+    while (j < right.length) emit(right[j++]);
+  }
+  return merged;
+}
+
+/**
+ * Where each message sits after an order-preserving merge of the source lists.
+ * Folded left-to-right so a single list (the import path) keeps its own order.
  */
 function messagePositions(...lists) {
+  let merged = [];
+  for (const list of lists) merged = mergeSequenceIds(merged, messageIdsInOrder(list));
   const rank = new Map();
-  for (const list of lists) {
-    for (const message of Array.isArray(list) ? list : []) {
-      if (message && !rank.has(message.id)) rank.set(message.id, rank.size);
-    }
-  }
+  for (const id of merged) rank.set(id, rank.size);
   return rank;
 }
 
@@ -976,6 +1041,11 @@ function messagePositions(...lists) {
  * import each carried their own copy of the same two-term rule, so fixing only
  * the one this issue arrived through would have left an import able to write the
  * scrambled order straight back into a thread the merge had just repaired.
+ *
+ * The rank itself is an order-preserving two-sequence merge (#1536), not a
+ * first-seen walk of `[...oldMessages, ...newMessages]`. That concatenation
+ * only preserves order when `older` is a prefix of `newer`; the local shadow
+ * is a tail.
  */
 function compareMessageOrder(rank) {
   return (left, right) =>

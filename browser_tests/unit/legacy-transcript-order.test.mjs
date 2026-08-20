@@ -154,3 +154,80 @@ test('#1516: importing an exported pre-v3 transcript keeps its order', () => {
   assert.ok(thread, 'the archived thread should import')
   assert.deepEqual(thread.msgs.map((m) => m.text), CONVERSATION)
 })
+
+/**
+ * #1536 — #1530 ranked by first-seen position in `[...oldMessages, ...newMessages]`,
+ * which is only order-preserving when `older` is a prefix of `newer`. Production
+ * is the other shape: `_writeLocalSnapshot` stores `thread.msgs.slice(-200)` while
+ * IndexedDB holds the whole thread, and the panel restore then merges those two
+ * via `mergeHistorySnapshots({ threads: inMemoryTail }, loadedFull)`.
+ *
+ * `older`/`newer` is chosen by `updatedAt`, not argument position, so swapping
+ * the concatenation is the exact mirror failure. These tests pin the three
+ * shapes the merge must survive, driving `mergeHistorySnapshots` the way the
+ * restore path does. Messages already have ids (post-migration) and createdAt
+ * still floored at 1 — that is the record the truncated shadow actually holds.
+ */
+function migratedThread(texts, updatedAt) {
+  return {
+    id: THREAD_ID,
+    ts: 1_700_000_000_000,
+    updatedAt,
+    workflowKey: 'panel:global',
+    schemaVersion: 3,
+    msgs: texts.map((text) => ({
+      id: `id:${text}`,
+      role: CONVERSATION.indexOf(text) % 2 === 0 ? 'user' : 'agent',
+      text,
+      createdAt: 1
+    }))
+  }
+}
+
+function mergeByRecency(olderTexts, newerTexts) {
+  const older = migratedThread(olderTexts, 1_000)
+  const newer = migratedThread(newerTexts, 2_000)
+  // Production may pass the snapshots in either order; updatedAt decides.
+  const forward = mergeHistorySnapshots({ threads: [older], meta: {} }, { threads: [newer], meta: {} })
+  const reverse = mergeHistorySnapshots({ threads: [newer], meta: {} }, { threads: [older], meta: {} })
+  assert.deepEqual(textsOf(forward), textsOf(reverse), 'updatedAt, not argument order, must decide older/newer')
+  return forward
+}
+
+test('#1536: older = prefix of newer keeps the stored order (#1530 still holds)', () => {
+  const merged = mergeByRecency(CONVERSATION.slice(0, 3), CONVERSATION)
+  assert.deepEqual(textsOf(merged), CONVERSATION)
+})
+
+test('#1536: older = tail of newer keeps the stored order (local shadow of a long thread)', () => {
+  // Measured against #1530: ["a2","u3","a3","u1","a1","u2"] — the tail ranked
+  // ahead of the head. This is the panel restore: in-memory shadow is the tail,
+  // load() returns the full IndexedDB copy as newer.
+  const merged = mergeByRecency(CONVERSATION.slice(-3), CONVERSATION)
+  assert.deepEqual(textsOf(merged), CONVERSATION)
+})
+
+test('#1536: a newer tail (the load() merge) also keeps the stored order', () => {
+  // The obvious one-token repair — concatenate newer first — fixes the tail-as-older
+  // case and then fails this mirror. load() merges IndexedDB (full) with the local
+  // shadow (tail); when the shadow is rewritten last it can be the newer snapshot.
+  const merged = mergeByRecency(CONVERSATION, CONVERSATION.slice(-3))
+  assert.deepEqual(textsOf(merged), CONVERSATION)
+})
+
+test('#1536: interleaved overlap keeps each sequence\'s relative order', () => {
+  // Measured against #1530: ["u1","u2","u3","a1","a2"] want u1,a1,u2,a2,u3.
+  const interleaved = ['u1', 'a1', 'u2', 'a2', 'u3']
+  const usersOnly = ['u1', 'u2', 'u3']
+  assert.deepEqual(textsOf(mergeByRecency(usersOnly, interleaved)), interleaved)
+  assert.deepEqual(textsOf(mergeByRecency(interleaved, usersOnly)), interleaved)
+})
+
+test('#1536: the panel restore (same updatedAt, tail then full) keeps the stored order', () => {
+  // Same updatedAt: `next.updatedAt >= prev.updatedAt` makes the SECOND snapshot
+  // newer. That is the panel's `mergeHistorySnapshots({ threads: tail }, loaded)`.
+  const tail = migratedThread(CONVERSATION.slice(-3), 1_700_000_000_000)
+  const full = migratedThread(CONVERSATION, 1_700_000_000_000)
+  const merged = mergeHistorySnapshots({ threads: [tail], meta: {} }, { threads: [full], meta: {} })
+  assert.deepEqual(textsOf(merged), CONVERSATION)
+})
