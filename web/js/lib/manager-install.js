@@ -1130,6 +1130,137 @@ export function collectRecentTaskFailures(resp, { limit = 20 } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// #1480 — a silent in_progress is not progress
+// ---------------------------------------------------------------------------
+//
+// /v2/manager/queue/status is an aggregate of counts. A wedged Manager worker
+// keeps answering the same `{total_count:1, in_progress_count:1, is_processing:true}`
+// forever, with no per-task terminal record and no install log. The panel was
+// forwarding that payload as-is — which is the right status, and the wrong
+// conclusion: a poll that never times a silent in_progress reads as "still
+// working, wait longer" for as long as the caller is willing to wait.
+//
+// These helpers do not rewrite Manager's counts and do not manufacture a
+// failure. They measure whether the SAME processing fingerprint has been
+// repeating, and after QUEUE_SILENT_STALL_MS they name that as a stall.
+
+/** Status strings that mean the task has not reached a terminal yet. Narrow
+ *  on purpose: only spellings Manager actually writes for a live task. */
+const TASK_IN_PROGRESS_STATUS = new Set(["in_progress", "running", "pending"]);
+
+/** How long the same processing counts may repeat before a poll names a stall.
+ *  Matches the reported wait (over two minutes of unchanged in_progress). A
+ *  slow-but-alive clone can outlive this; the stall note is a visibility
+ *  warning, never a failure verdict. */
+export const QUEUE_SILENT_STALL_MS = 120_000;
+
+/** Is Manager currently claiming the queue is working? True only on an explicit
+ *  processing flag or a positive in-progress/pending count — a malformed or
+ *  idle status is not processing. */
+export function queueIsProcessing(status) {
+  if (!status || typeof status !== "object" || Array.isArray(status)) return false;
+  if (status.is_processing === true) return true;
+  if (typeof status.in_progress_count === "number" && status.in_progress_count > 0) return true;
+  if (typeof status.pending_count === "number" && status.pending_count > 0) return true;
+  return false;
+}
+
+/** A fingerprint of the processing counts so "the same in_progress repeating"
+ *  is distinguishable from a count that actually moved. Idle/malformed → null. */
+export function queueProgressFingerprint(status) {
+  if (!queueIsProcessing(status)) return null;
+  return [
+    status.is_processing === true ? "1" : "0",
+    Number(status.total_count) || 0,
+    Number(status.done_count) || 0,
+    Number(status.in_progress_count) || 0,
+    Number(status.pending_count) || 0,
+  ].join(":");
+}
+
+/**
+ * Collect the still-running tasks from a /v2/manager/queue/history response.
+ * Only explicit in_progress/running/pending status_str values — never inferred
+ * from a missing terminal, so an unrecognized shape cannot become a live task.
+ */
+export function collectInProgressTasks(resp, { limit = 20 } = {}) {
+  const history =
+    resp && typeof resp === "object" && "history" in resp ? resp.history : resp;
+  if (!history || typeof history !== "object") return [];
+  const items = Array.isArray(history) ? history : Object.values(history);
+  const out = [];
+  for (const item of items) {
+    if (!isTaskHistoryItem(item)) continue;
+    const str = taskStatusStr(item);
+    if (!str) continue;
+    const lower = str.toLowerCase();
+    if (!TASK_IN_PROGRESS_STATUS.has(lower)) continue;
+    if (TASK_SUCCESS_STATUS.has(lower) || TASK_FAILURE_STATUS.has(lower)) continue;
+    out.push({
+      ui_id: typeof item.ui_id === "string" ? item.ui_id : undefined,
+      kind: typeof item.kind === "string" ? item.kind : undefined,
+      id: taskParamId(item),
+    });
+  }
+  return out.slice(-limit);
+}
+
+/**
+ * What to tell a poll whose Manager counts have not moved for stallMs.
+ * Says the in_progress is Manager's own repeating status, not panel-invented
+ * progress, and does NOT claim the task failed — absence of a log is not a
+ * terminal record.
+ */
+export function silentQueueStallNote({ silent_ms, silentMs } = {}) {
+  const ms = typeof silent_ms === "number" ? silent_ms : silentMs;
+  const secs = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  return (
+    `NOTE — the Manager queue has reported the SAME in_progress counts for ${secs}s with no change. ` +
+    `That is Manager's own status, forwarded as-is — it is NOT panel-invented progress, and it is NOT a completion. ` +
+    `A silent in_progress is not proof the install is running. VERIFY with panel_list_nodes; if the pack is still ` +
+    `absent, check the ComfyUI server log for clone/pip activity. Do not restart solely because the queue is still ` +
+    `in_progress — a restart will not finish a wedged clone. If the log is also silent, the Manager worker is stuck.`
+  );
+}
+
+/**
+ * Observes successive /queue/status payloads and times how long the SAME
+ * processing fingerprint has been repeating.
+ *
+ * @param {{stallMs?: number, now?: () => number}} [opts]
+ */
+export function createManagerQueueWatch({ stallMs = QUEUE_SILENT_STALL_MS, now = () => Date.now() } = {}) {
+  let fingerprint = null;
+  let since = 0;
+  return {
+    /**
+     * @param {unknown} status
+     * @returns {{processing: boolean, stalled: boolean, silent_ms: number, fingerprint: string|null}}
+     */
+    observe(status) {
+      const t = now();
+      if (!queueIsProcessing(status)) {
+        fingerprint = null;
+        since = 0;
+        return { processing: false, stalled: false, silent_ms: 0, fingerprint: null };
+      }
+      const fp = queueProgressFingerprint(status);
+      if (fingerprint !== fp) {
+        fingerprint = fp;
+        since = t;
+      }
+      const silentMs = Math.max(0, t - since);
+      return {
+        processing: true,
+        stalled: silentMs >= stallMs,
+        silent_ms: silentMs,
+        fingerprint: fp,
+      };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // comfyui-mcp#1606 — a per-task result on the build that keeps NO task history
 // ---------------------------------------------------------------------------
 //
