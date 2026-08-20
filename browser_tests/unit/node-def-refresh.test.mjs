@@ -23,7 +23,6 @@ import { fetchWholeObjectInfo } from "../../web/js/lib/object-info-oracle.js";
 import {
   COMBO_NO_ANSWER,
   COMBO_OK,
-  NODE_DEFS_CLIENT_ROUTE_SHARE,
   NODE_DEFS_FETCH_SHARE,
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
@@ -413,6 +412,8 @@ function buildRegisterComfyNodeDefs({
   now,
   recordObjectInfoTypes = () => ({}),
   reapplyDefsToLiveNodes = () => {},
+  // #608 — defaults to the REAL oracle. Overridden only to OBSERVE what it is handed.
+  fetchWholeObjectInfo: fetchWholeObjectInfoImpl = fetchWholeObjectInfo,
 }) {
   const body = extractFunction("async function registerComfyNodeDefs(");
   const factory = new Function(
@@ -433,10 +434,10 @@ function buildRegisterComfyNodeDefs({
     "NODE_DEFS_FETCH_TIMEOUT_MS",
     "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE",
-    // #608 — the second transport and the reserve that reaches it. The REAL oracle, not a
-    // double: a stub would let this harness agree with itself about the one thing the
-    // fallback has to get right, which is asking a DIFFERENT route the same question.
-    "NODE_DEFS_CLIENT_ROUTE_SHARE",
+    // #608 — the second transport. The REAL oracle by default, not a double: a stub would
+    // let this harness agree with itself about the one thing the fallback has to get right,
+    // which is asking a DIFFERENT route the same question. A test that needs to OBSERVE the
+    // budget it is handed wraps it rather than replacing it.
     "fetchWholeObjectInfo",
     "nodeDefsBudgetLeft",
     "monotonicNow",
@@ -485,8 +486,7 @@ function buildRegisterComfyNodeDefs({
     NODE_DEFS_FETCH_TIMEOUT_MS,
     NODE_DEFS_RUN_BUDGET_MS,
     NODE_DEFS_FETCH_SHARE,
-    NODE_DEFS_CLIENT_ROUTE_SHARE,
-    fetchWholeObjectInfo,
+    fetchWholeObjectInfoImpl,
       // #1193 — ONE clock for the deadline and the arithmetic that reads it. The shared
     // helper reads the REAL monotonicNow; a fake-clock deadline measured against it is a
     // different bound than the one the panel arms (its own nodeDefsBudgetLeft shares the
@@ -1504,45 +1504,86 @@ test("#608: an EMPTY client answer is an ANSWER — the raw route is NOT consult
   assert.equal(fetchApiCalls, 0, "an empty schema is the client's answer, not an absence to route around");
 });
 
-test("#608: the client route is capped at a SHARE of the fetch phase, so the fallback is reachable", async () => {
-  // The reserve is the whole reason the second route gets asked at all: `withTimeout` does
-  // not cancel, so a client route granted the entire fetch phase leaves nothing behind it
-  // and the phase can only report how the first transport failed. Pinned on the ARMED
-  // bound, because a share that quietly returns to 1 passes every other test in this file.
+test("#608: a SLOW BACKEND still refreshes — the client route keeps its whole share", async () => {
+  // THE REGRESSION THIS FIX SHIPPED ONCE, and the reason the reserve is no longer taken
+  // out of the client route. Capping the client at half the fetch phase and calling the
+  // rest the second route's reserve couples two cases with opposite remedies: when the
+  // SLOW PARTY IS THE BACKEND, the raw route inherits the same latency and cannot rescue
+  // anything with the time the first route was just denied. Measured on the extracted run
+  // with the real oracle, an /object_info answering in 3,200 / 3,500 / 5,500 ms went from
+  // refreshed:true on the parent to object_info_fetch_failed — a new hard-failure band, and
+  // nodeDefsRefreshConfirmed false behind it.
+  //
+  // A FAKE CLOCK, so the grant is an exact number rather than a band: the harness drives
+  // the panel's own nodeDefsBudgetLeft off the same injected clock.
+  let clock = 0;
   const timers = virtualTimers();
+  let resolveClient = null;
+  let fetchApiCalls = 0;
   const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
     appValue: FULL_APP,
-    apiValue: { getNodeDefs: () => new Promise(() => {}), fetchApi: async () => okResponse({ A: {} }) },
+    apiValue: {
+      getNodeDefs: () => new Promise((res) => { resolveClient = res; }),
+      fetchApi: async () => {
+        fetchApiCalls += 1;
+        return okResponse({ Raw: {} });
+      },
+    },
     timers,
+    now: () => clock,
   });
   const running = registerComfyNodeDefs(undefined);
   await drainMicrotasks(300);
   const armed = timers.armed();
-  assert.equal(armed.length, 1, "exactly the client route's attempt");
-  const wholeFetchPhase = NODE_DEFS_RUN_BUDGET_MS * NODE_DEFS_FETCH_SHARE;
-  const clientShare = wholeFetchPhase * NODE_DEFS_CLIENT_ROUTE_SHARE;
-  assert.ok(
-    armed[0].ms <= Math.ceil(clientShare),
-    `the client route must not be granted more than its share (${clientShare}ms), saw ${armed[0].ms}ms`,
+  assert.equal(armed.length, 1, "the client route's attempt must be bounded");
+  assert.equal(
+    armed[0].ms,
+    Math.floor(NODE_DEFS_RUN_BUDGET_MS * NODE_DEFS_FETCH_SHARE),
+    `the client route must keep the WHOLE fetch share, saw ${armed[0].ms}ms`,
   );
-  assert.ok(
-    armed[0].ms > clientShare * 0.8,
-    `…nor be starved to a floor (saw ${armed[0].ms}ms of ${clientShare}ms)`,
-  );
-  // THE RESERVE ITSELF, in absolute milliseconds, because the two assertions above are
-  // written against the share READ FROM THE PANEL and therefore move with it: restoring
-  // NODE_DEFS_CLIENT_ROUTE_SHARE to 1 kept both of them green while leaving the fallback a
-  // one-millisecond budget — the floor `nodeDefsBudgetLeft` returns for an exhausted one,
-  // which in this harness a synchronous double still beats and a real 5MB GET never would.
-  // 1,000ms is twice the ~450ms this repo has measured the raw route at, and the oracle
-  // halves whatever it is given between the response and the body.
-  const reserveMs = wholeFetchPhase - armed[0].ms;
-  assert.ok(
-    reserveMs >= 1000,
-    `the second route must be left a usable reserve, saw ${reserveMs}ms of ${wholeFetchPhase}ms`,
-  );
+  // It answers LATE but inside its grant. Every service time in the band the first attempt
+  // broke — 3,200ms, 3,500ms, 5,500ms of a 6,000ms bound — is this state.
+  clock = 5500;
+  resolveClient({ SomeNode: {} });
+  const verdict = await orFail(running, "a slow but healthy backend never finished");
+  assert.equal(verdict.refreshed, true, "a slow backend that ANSWERS must still refresh");
+  assert.equal(fetchApiCalls, 0, "the second route is for a route that FAILED, never for a slow one");
+});
+
+test("#608: the second route is handed what is LEFT OF THE RUN, not the share the first one spent", async () => {
+  // The fetch phase's own share has by definition been spent by the route that just failed,
+  // so sizing the fallback from it hands it the 1ms floor `nodeDefsBudgetLeft` returns for
+  // an exhausted budget — a bound only a synchronous double beats, never a real /object_info.
+  // The oracle then halves whatever it is given between the response and the body, and this
+  // repo measures the raw route at ~450ms, so anything under ~1s cannot answer.
+  let clock = 0;
+  const timers = virtualTimers();
+  let handedDeadlineMs = null;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: {
+      getNodeDefs: () => new Promise(() => {}), // never settles: the reported case
+      fetchApi: async () => okResponse({ Raw: {} }),
+    },
+    timers,
+    now: () => clock,
+    // WRAPS the real oracle rather than replacing it, so what is asserted is the budget the
+    // shipped call site computes, with the shipped oracle still doing the work.
+    fetchWholeObjectInfo: (opts) => {
+      handedDeadlineMs = opts.deadlineMs;
+      return fetchWholeObjectInfo(opts);
+    },
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks(300);
+  clock = Math.floor(NODE_DEFS_RUN_BUDGET_MS * NODE_DEFS_FETCH_SHARE); // the stall burns its whole grant
   timers.fireAll();
-  await orFail(running, "the run never finished");
+  const verdict = await orFail(running, "the fallback never ran");
+  assert.equal(verdict.refreshed, true, "the raw route answered — the refresh succeeded");
+  assert.ok(
+    handedDeadlineMs >= 1000,
+    `the second route needs a usable budget, got ${handedDeadlineMs}ms`,
+  );
 });
 
 test("#608: when BOTH routes fail the refusal names both, and the detail is unchanged", async () => {
@@ -1623,8 +1664,17 @@ test("#608: the fallback is wired to the WHOLE-schema oracle, after the client r
   );
   assert.match(
     body,
-    /deadlineMs: nodeDefsBudgetLeft\(fetchPhaseDeadline\),/,
-    "the fallback draws on what is LEFT of the fetch phase, never a fresh constant",
+    /deadlineMs: nodeDefsBudgetLeft\(runDeadline\),/,
+    "the fallback draws on what is left of the RUN, never a fresh constant",
+  );
+  // …and specifically NOT the fetch phase's own share, which the route that just failed has
+  // by definition spent. That sizing is what shipped the (3,000ms, 6,000ms) hard-failure
+  // band, and it reads as obviously correct at the call site — so it is pinned as an
+  // ABSENCE too, which is the only way a wrong-but-plausible argument gets caught.
+  assert.doesNotMatch(
+    body,
+    /deadlineMs: nodeDefsBudgetLeft\(runDeadline, NODE_DEFS_FETCH_SHARE\)/,
+    "the second route must not be sized from the share the first route already spent",
   );
   // The rethrow must come AFTER the fallback, or the second route is unreachable for the
   // case that reported this — a client route that throws.

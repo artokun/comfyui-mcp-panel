@@ -1082,38 +1082,6 @@ const NODE_DEFS_RUN_BUDGET_MS = 9000;
  * A share, not a second constant, so the two cannot be changed into disagreement.
  */
 const NODE_DEFS_FETCH_SHARE = 2 / 3;
-/**
- * #608 — the share of the FETCH phase the FRONTEND CLIENT route may consume, so the second
- * transport underneath it is always left something to ask with.
- *
- * REPORTED on comfyui-mcp 0.52.26 / ComfyUI 0.33.0 / frontend 1.49.6, after installing
- * custom nodes and restarting: `panel_refresh_nodes` returned `refreshed:false` /
- * `object_info_fetch_failed` with "api.getNodeDefs() did not answer within this refresh's
- * remaining budget", REPEATEDLY, while the same /object_info document was being served fine
- * to a different transport at the same moment. That rules out a slow BACKEND — a document
- * the server cannot produce in time is slow for every reader — and leaves the client route
- * specifically, which is the exact failure `lib/object-info-oracle.js` was written for in
- * #982 and bounded for in #1161.
- *
- * The asymmetry this closes: `graph_get_object_info` asks that oracle and therefore has a
- * second route, and this refresh — the tool whose whole job is to make a freshly installed
- * pack selectable — had only one. So the panel refused a question it could already answer.
- *
- * WHY NOT SIMPLY A BIGGER BUDGET. That was the other candidate and the evidence excludes
- * it. A bound can only choose HOW to fail against a route that never settles (#1178,
- * three attempts), the run budget is sized against the composition two serialized runs make
- * inside the bridge's read default (NODE_DEFS_RUN_BUDGET_MS), and the reporter's own
- * corroboration is a route that answered PROMPTLY while this one did not answer at all.
- * Raising the number spends longer on the transport that is not working.
- *
- * A HALF, mirroring the oracle's own CLIENT_ROUTE_SHARE rather than inventing a second
- * answer to the same question. What it costs is stated there and is the same here: an
- * install whose client route is merely SLOW — between half the fetch phase and all of it —
- * is now overridden by the raw route instead of waited on. That route measures ~450ms
- * against this rig's 5.4MB document, so the run still succeeds; what changes is which
- * transport served it.
- */
-const NODE_DEFS_CLIENT_ROUTE_SHARE = 0.5;
 //
 // #954's SCHEDULE, UNFORKED. An earlier pass here cut it to a single 200ms delay, reasoning
 // that a bound which does not cancel lets three abandoned attempts download the whole
@@ -1464,18 +1432,44 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // is deliberately a REAL one when there was one — so the value cannot be asked which
       // kind of failure it represents without undoing that.
       let lastAttemptTimedOut = false;
-      // #608 — THE FETCH PHASE IS TWO ROUTES, so its budget is divided BEFORE either runs.
+      // #608 — THE SECOND ROUTE TAKES NOTHING FROM THE FIRST, and this is the whole design
+      // decision, recorded because the obvious alternative was tried and shipped a worse bug
+      // than the one being fixed.
       //
-      // Divided rather than shared, for the reason the oracle's own accounting states: the
-      // client route does not cancel when it is abandoned, so a route granted the whole
-      // phase leaves the second one nothing and the phase can only report how the first
-      // failed. The client route's grant comes off THIS deadline rather than the run's, so
-      // the reserve cannot be spent by a retry schedule either.
-      const fetchPhaseBudgetMs = nodeDefsBudgetLeft(runDeadline, NODE_DEFS_FETCH_SHARE);
-      const fetchPhaseStartedAt = monotonicNow();
-      const fetchPhaseDeadline = fetchPhaseStartedAt + fetchPhaseBudgetMs;
-      const clientRouteDeadline =
-        fetchPhaseStartedAt + Math.max(1, Math.floor(fetchPhaseBudgetMs * NODE_DEFS_CLIENT_ROUTE_SHARE));
+      // The first attempt capped the client route at HALF the fetch phase and called the
+      // other half the second route's reserve. That couples two cases which have opposite
+      // remedies. When the SLOW PARTY IS THE BACKEND both transports are slow — the raw
+      // route inherits the same latency — so halving the client route's grant and handing
+      // the remainder to a route that needs just as long rescues nothing and loses what the
+      // first route would have got. Measured against the extracted run with the real oracle,
+      // an /object_info answering in 3,200ms / 3,500ms / 5,500ms went from refreshed:true on
+      // the parent to object_info_fetch_failed on that attempt — a new hard-failure band
+      // across (3,000ms, 6,000ms), with nodeDefsRefreshConfirmed false behind it, which is
+      // what the note at the combo phase says reopens #610's false "model still missing".
+      // 3-6s is not exotic: this repo has measured a 5.4MB /object_info at 7.5s over a
+      // tunnel, and a post-install restart on a remote is exactly when it is slowest.
+      //
+      // So the client route's grant is UNCHANGED from before this issue — it still gets the
+      // whole fetch share, so no install that refreshed before can stop refreshing — and the
+      // second route draws on what is left of the RUN deadline instead. That budget is only
+      // ever spent in the case the client route has ALREADY definitively failed, which is
+      // the case that used to end the command outright, so nothing that worked can lose by
+      // it. The run's total WAITING is still bounded by the one deadline, so #1180's
+      // composition (two serialized runs inside the bridge's read default) is untouched.
+      //
+      // WHAT IT COSTS, stated rather than left to be found: when the fallback is consulted
+      // it spends time the combo phase would otherwise have had. That is the right trade
+      // and not a close one — a missing payload is a hard refreshed:false, while an
+      // abandoned combo call is a DISCLOSURE (#1193: the reapply sweep has already rebuilt
+      // every live combo from this run's payload, so the verdict is refreshed:true with
+      // combo_refresh_confirmed:false). A degraded confirmation beats no refresh at all.
+      //
+      // NOT RACED. Issuing both routes together would avoid the wait entirely, and it is
+      // declined on this path's own evidence: an abandoned request is NOT cancelled, so a
+      // race puts two whole-document downloads (5.4MB measured) on the same link and makes
+      // the slow case slower — the exact contention the retry schedule's shouldRetry was
+      // added to stop. Sequential-after-a-definite-failure spends nothing on the healthy
+      // path, which is every path that works today.
       // The client route's failure is HELD, not propagated, so the second route is reached
       // at all — and rethrown UNCHANGED if that one fails too, so the verdict's `detail`
       // and the attribution above it are exactly what they were before this fallback
@@ -1493,7 +1487,7 @@ async function registerComfyNodeDefs(preloadedDefs) {
             lastAttemptTimedOut = false;
             let result;
             try {
-              result = await boundedGetNodeDefs(nodeDefsBudgetLeft(clientRouteDeadline));
+              result = await boundedGetNodeDefs(nodeDefsBudgetLeft(runDeadline, NODE_DEFS_FETCH_SHARE));
             } catch (err) {
               sawRealError = true;
               lastRealError = err;
@@ -1559,7 +1553,11 @@ async function registerComfyNodeDefs(preloadedDefs) {
           // failing, since it would report refreshed:true over the definitions the caller
           // just installed a pack to replace.
           fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
-          deadlineMs: nodeDefsBudgetLeft(fetchPhaseDeadline),
+          // WHAT IS LEFT OF THE RUN, not of the fetch phase. The fetch phase's own share
+          // has by definition been spent by the route that just failed, so sizing this from
+          // it hands the second transport the 1ms floor — a bound that only a synchronous
+          // double beats and no real /object_info ever does.
+          deadlineMs: nodeDefsBudgetLeft(runDeadline),
         });
         if (fallbackDefs) {
           // The question is answered. The run continues exactly as it would have on a
