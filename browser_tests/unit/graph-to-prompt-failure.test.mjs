@@ -103,7 +103,7 @@ test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async (
   assert.ok(endOfTry > at, "the pre-flight try block must still be recognisable");
   const block = src.slice(at, endOfTry);
   const guard = block.indexOf("graphToPromptUnusable(built)");
-  const offenders = block.indexOf("unrunnableNodeIds(built)");
+  const offenders = block.indexOf("unrunnableNodeIdsInScope(built, partialTargets)");
   assert.ok(guard > -1, "the unusable-result guard must exist");
   assert.ok(offenders > -1, "the offender check must still exist");
   // ORDER is the fix. Asking for offenders first answers `[]` for an absent result and
@@ -127,7 +127,7 @@ test("#1582 the refusal keeps the prefix its own catch requires", async () => {
 //    the same real-source extraction pattern manager-dialect.test.mjs uses.
 
 /** Pull the pre-flight try/catch out of the monolith and run it with injected deps. */
-async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry = {} }) {
+async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry = {}, partialTargets }) {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
   const marker = src.indexOf("      // Inspect the SERIALIZED prompt");
@@ -141,7 +141,12 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     "app",
     "graph",
     "LG",
-    "unrunnableNodeIds",
+    "unrunnableNodeIdsInScope",
+    // comfyui-mcp#1871 - the block now reads the resolved run-to-node scope. It is a
+    // `let` in graph_run, so leaving it out of the factory would make the extracted body
+    // throw a ReferenceError that the pre-flight catch swallows - and the test would then
+    // see "no refusal" from a pre-flight that never ran at all.
+    "partialTargets",
     "describeUnrunnable",
     "missingNodeRunRefusal",
     "graphToPromptUnusable",
@@ -167,7 +172,8 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     { graphToPrompt },
     { _nodes: viewedNodes ?? nodes },
     { registered_node_types: registry },
-    mod.unrunnableNodeIds,
+    mod.unrunnableNodeIdsInScope,
+    partialTargets,
     mod.describeUnrunnable,
     mod.missingNodeRunRefusal,
     mod.graphToPromptUnusable,
@@ -233,6 +239,83 @@ test("#1582 BEHAVIOUR: the #1460 unrunnable-node refusal still fires", async () 
   assert.match(msg, /^NOT queued:/);
   assert.match(msg, /cannot be executed by the server/);
   assert.match(msg, /GoneNode/);
+});
+
+// ── comfyui-mcp#1871. #1511 took ComfyUI's veto of an excluded branch away: when the
+//    SERVER refuses over a node outside the requested closure, the run is re-posted
+//    without that branch. But the server only gets to refuse if we post, and this
+//    pre-flight refuses first. For the case where a pack is missing ENTIRELY there is no
+//    frontend registration, so no class_type, so this check fires and ComfyUI is never
+//    asked — the retry cannot save a run that never left the browser.
+//
+//    Driven through the SAME extracted pre-flight source: this is a claim about what
+//    production refuses, not about what a helper returns.
+
+// Two independent output branches, the reporter's shape: 43 is the branch asked for,
+// 56/57 are the branch whose pack is not installed at all (hence no class_type).
+const twoBranchPrompt = () => ({
+  output: {
+    "43": { class_type: "PreviewImage", inputs: { images: ["44", 0] } },
+    "44": { class_type: "EmptyImage", inputs: { width: 64, height: 64 } },
+    "56": { inputs: { image: ["57", 0] } },
+    "57": { inputs: {} },
+  },
+  workflow: {},
+});
+const twoBranchNodes = [
+  { id: 43, type: "PreviewImage" },
+  { id: 56, type: "TopazVideoAI" },
+];
+
+test("#1871 BEHAVIOUR: a scoped run is NOT refused for an unrunnable node outside its branch", async () => {
+  const msg = await runPreflight({
+    graphToPrompt: async () => twoBranchPrompt(),
+    nodes: twoBranchNodes,
+    registry: { PreviewImage: {} },
+    partialTargets: ["43"],
+  });
+  assert.equal(msg, "__NO_REFUSAL__", "node 56 is not upstream of 43; the run reaches ComfyUI");
+});
+
+test("#1871 BEHAVIOUR: a scoped run IS still refused for an unrunnable node INSIDE its branch", async () => {
+  // The narrowing must not become a blanket exemption for scoped runs: node 56 is now a
+  // dependency of the requested target, so the run genuinely cannot succeed and #1511's
+  // retry could not rescue it either (it declines when the named node is in the closure).
+  const prompt = twoBranchPrompt();
+  prompt.output["43"].inputs.images = ["56", 0];
+  const msg = await runPreflight({
+    graphToPrompt: async () => prompt,
+    nodes: twoBranchNodes,
+    registry: { PreviewImage: {} },
+    partialTargets: ["43"],
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /TopazVideoAI/);
+});
+
+test("#1871 BEHAVIOUR: a FULL run over the same graph still refuses — the narrowing is scoped-only", async () => {
+  const msg = await runPreflight({
+    graphToPrompt: async () => twoBranchPrompt(),
+    nodes: twoBranchNodes,
+    registry: { PreviewImage: {} },
+    partialTargets: undefined, // no to_node_id ⇒ every node is submitted
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /TopazVideoAI/);
+});
+
+test("#1871 BEHAVIOUR: an unresolvable scope refuses exactly as an unscoped run does", async () => {
+  // A target that is not a key of this prompt means the closure is a guess. Guessing
+  // toward "let it through" would ship a run that cannot succeed; the safe direction is
+  // the behaviour that already exists.
+  const msg = await runPreflight({
+    graphToPrompt: async () => twoBranchPrompt(),
+    nodes: twoBranchNodes,
+    registry: { PreviewImage: {} },
+    partialTargets: ["not-a-node-in-this-prompt"],
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /TopazVideoAI/);
 });
 
 // ── ROOT SCOPE (review, P1). graphToPrompt serializes the WHOLE workflow, so naming
