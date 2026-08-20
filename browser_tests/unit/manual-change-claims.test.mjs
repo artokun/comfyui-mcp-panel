@@ -283,6 +283,92 @@ test("the banner states its AS-OF and that a later live read wins", () => {
   assert.doesNotMatch(banner, /Treat the canvas as being in THIS state now/);
 });
 
+/** The panel's REAL manualChangeSupersededRider, with the module state it reads
+ *  injected as parameters (it only ever reads them). Executed rather than
+ *  regex-matched: the gate on this change killed 8 of 9 mutations off the source
+ *  tests, and the survivor was deleting this function's workflow-key gate — a guard
+ *  no regex assertion can watch fail. */
+function buildRider({ claims, claimsKey, uuid }) {
+  const body = sliceBetween(
+    panelSource(),
+    "function manualChangeSupersededRider(rootGraph) {",
+    "/** #1498 — the PANEL just wrote",
+  );
+  const factory = new Function(
+    "manualChangeClaims",
+    "manualChangeClaimsKey",
+    "workflowStableUuid",
+    "reconcileWidgetClaims",
+    "supersededNote",
+    "canonicalNodeId",
+    `${body}
+return manualChangeSupersededRider;`,
+  );
+  return factory(
+    claims,
+    claimsKey,
+    uuid,
+    reconcileWidgetClaims,
+    supersededNote,
+    canonicalNodeId,
+  );
+}
+
+const graphWith = (widgets) => ({ getNodeById: (id) => (Number(id) === 8 ? { id: 8, widgets } : null) });
+const XFUSER_CLAIM = [
+  { node_id: 8, node_type: "RayInitializerAdvanced", widget: "XFuser_attention", reported: "XFORMERS" },
+];
+
+test("the rider reports the reporter's own case end to end", () => {
+  const rider = buildRider({ claims: XFUSER_CLAIM, claimsKey: "wf-A", uuid: () => "wf-A" });
+  const out = rider(graphWith([{ name: "XFuser_attention", value: "TORCH_EFFICIENT" }]));
+  assert.equal(out.manual_changes_superseded.length, 1);
+  assert.equal(out.manual_changes_superseded[0].now, "TORCH_EFFICIENT");
+  assert.match(out.manual_changes_superseded_note, /THIS read is newer/);
+});
+
+test("the rider REFUSES across a workflow switch", () => {
+  // The claims are root-graph node ids. Checking them against a different workflow's
+  // node of the same id is the wrong-target claim #348/#198 removed from the diff.
+  const rider = buildRider({ claims: XFUSER_CLAIM, claimsKey: "wf-A", uuid: () => "wf-B" });
+  assert.deepEqual(rider(graphWith([{ name: "XFuser_attention", value: "TORCH_EFFICIENT" }])), {});
+});
+
+test("an unreadable identity on either side is a refusal, never an inference", () => {
+  const thrown = buildRider({
+    claims: XFUSER_CLAIM,
+    claimsKey: "wf-A",
+    uuid: () => {
+      throw new Error("no active workflow");
+    },
+  });
+  assert.deepEqual(thrown(graphWith([{ name: "XFuser_attention", value: "TORCH_EFFICIENT" }])), {});
+  const unkeyed = buildRider({ claims: XFUSER_CLAIM, claimsKey: null, uuid: () => "wf-A" });
+  assert.deepEqual(unkeyed(graphWith([{ name: "XFuser_attention", value: "TORCH_EFFICIENT" }])), {});
+});
+
+test("an agreeing canvas, no claims, or no graph adds NO fields at all", () => {
+  const agreeing = buildRider({ claims: XFUSER_CLAIM, claimsKey: "wf-A", uuid: () => "wf-A" });
+  assert.deepEqual(agreeing(graphWith([{ name: "XFuser_attention", value: "XFORMERS" }])), {});
+  assert.deepEqual(
+    buildRider({ claims: [], claimsKey: "wf-A", uuid: () => "wf-A" })(graphWith([])),
+    {},
+  );
+  assert.deepEqual(agreeing(null), {});
+});
+
+test("a graph that throws on lookup does not fail the read", () => {
+  const rider = buildRider({ claims: XFUSER_CLAIM, claimsKey: "wf-A", uuid: () => "wf-A" });
+  assert.deepEqual(
+    rider({
+      getNodeById: () => {
+        throw new Error("graph torn down");
+      },
+    }),
+    {},
+  );
+});
+
 test("both graph reads carry the rider", () => {
   const src = panelSource();
   const outline = sliceBetween(src, "  graph_outline({ max_chars } = {}) {", "\n  graph_query(");
