@@ -13022,6 +13022,15 @@ const GRAPH_TOOL_EXECUTORS = {
       // add never pays for it. A pack that failed to import looks exactly like a
       // pack that is not installed, and the refusal used to name only the latter.
       readImportFailures: () => readPackImportFailures(api),
+      // #1544 — the ownership oracle. Naming a failed pack as the REASON a type is
+      // missing is a causal claim, and the log alone cannot support it: a reporter
+      // asking for PreviewVideo was told an unrelated coldinfire_fal_privacy had
+      // failed to import. ComfyUI-Manager's node map carries each pack's class
+      // names, so it can tie a failure to THIS class_type — or leave it unproven,
+      // which the refusal then states plainly. Same dialect-routed GET (and #605
+      // self-heal) panel_search_nodes uses; the resolver only calls this when a
+      // surviving import failure actually needs adjudicating.
+      readNodeMap: () => managerGet("customnode/getmappings?mode=cache"),
       // #1523 — subgraph UUIDs are never in /object_info. The live workflow's
       // subgraphs registry is the oracle that distinguishes a loaded SAM3
       // subgraph from a missing backend pack. capturedContext is already in
