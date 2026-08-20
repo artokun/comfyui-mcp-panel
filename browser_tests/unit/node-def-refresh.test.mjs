@@ -1682,3 +1682,112 @@ test("#608: the fallback is wired to the WHOLE-schema oracle, after the client r
   const rethrowAt = body.indexOf("if (clientRouteThrew) throw clientRouteError;");
   assert.ok(fallbackAt > -1 && rethrowAt > fallbackAt, "the client route's error is rethrown only after the retry");
 });
+
+// ---------------------------------------------------------------------------
+// #608 — a run that obtained NO payload must say so, whatever a later phase did
+// ---------------------------------------------------------------------------
+
+test("#608: a fallback that ALSO fails leaves the no-payload verdict intact", async () => {
+  // THE SECOND REGRESSION THE GATE CAUGHT, and the one that reached main. With getNodeDefs
+  // resolving null (#1223's NOTHING_RETURNED) and the raw route not answering either,
+  // there is no error to rethrow — so the run falls through to the combo phase with
+  // `defs === null` and a budget the second route has spent. The combo call is abandoned,
+  // which sets `thrown`, and the verdict ladder answered `combo_refresh_failed` with a
+  // remedy false in BOTH halves: definitions "were fetched" when none were, and the
+  // frontend "exposes no registerNodesFromDefs" when it does — registration was skipped
+  // only because there was nothing to register. The parent reported the truthful
+  // `object_info_unavailable`, so the fallback turned a correct answer into a wrong one.
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async () => {},   // PRESENT — the false half of the old remedy
+      refreshComboInNodes: () => new Promise(() => {}), // outlives its starved budget
+    },
+    apiValue: {
+      getNodeDefs: async () => null,
+      fetchApi: () => new Promise(() => {}),   // /object_info never answers
+    },
+    timers,
+    // The oracle gets the SAME virtual timers, so its own bounds are fired here instead of
+    // waited out on a real clock. Still the real oracle — only its clock is injected, which
+    // is the seam it documents for exactly this.
+    fetchWholeObjectInfo: (opts) => fetchWholeObjectInfo({ ...opts, timers }),
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks(300);
+  // Drain and fire until the run settles: the oracle arms its own bounds on these timers
+  // too, and the combo phase arms one after them.
+  for (let i = 0; i < 8; i += 1) {
+    timers.fireAll();
+    await drainMicrotasks(200);
+  }
+  const verdict = await orFail(running, "the run never settled");
+
+  assert.equal(verdict.refreshed, false);
+  assert.equal(
+    verdict.reason,
+    "object_info_unavailable",
+    "no route produced a payload — that is the fact to act on, not what the combo phase did",
+  );
+  assert.doesNotMatch(
+    verdict.remedy,
+    /exposes no registerNodesFromDefs/,
+    "this frontend HAS registerNodesFromDefs — it was skipped for want of a payload",
+  );
+  assert.doesNotMatch(verdict.remedy, /were fetched/, "nothing was fetched");
+  assert.match(verdict.remedy, /Tried 2 routes/, "…and the routes that were tried survive");
+});
+
+test("#608: a payload that DID arrive still lets the combo phase word its own failure", async () => {
+  // The other side of the same guard: keyed on `defsObtained`, so a run that obtained a
+  // payload and then failed at the combo phase is untouched. Without this the fix would
+  // swallow every combo failure into the no-payload token.
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: {
+      graph: null,
+      registerNodesFromDefs: async () => {},
+      refreshComboInNodes: async () => {
+        throw new Error("reloadNodeDefs blew up");
+      },
+    },
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+  });
+  const verdict = await registerComfyNodeDefs(undefined);
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  assert.match(verdict.remedy, /WERE re-registered/, "registration really did run here");
+});
+
+test("#608: the no-payload guard is keyed on defsObtained, not on the phase name", () => {
+  // Unit-level, over the pure verdict, because the executed test above can only reach the
+  // combo phase. The rule is about the PAYLOAD: any phase after the fetch that failed on a
+  // run with nothing to work on reports the missing payload.
+  for (const phase of ["record", "register", "reapply", "combo"]) {
+    const v = describeNodeDefRefresh({
+      appAvailable: true,
+      defsObtained: false,
+      defsRegistered: false,
+      comboApiPresent: true,
+      comboRan: false,
+      phase,
+      didThrow: true,
+      thrown: new Error("boom"),
+      fetchRouteFailures: ["client said nothing", "raw route said nothing"],
+    });
+    assert.equal(v.reason, "object_info_unavailable", `phase ${phase} must not outrank a missing payload`);
+    assert.match(v.remedy, /Tried 2 routes/, `phase ${phase} must keep the routes evidence`);
+  }
+  // The FETCH phase keeps its own, more specific token: that failure IS the missing
+  // payload, and its detail carries what the transport said.
+  const fetchFailed = describeNodeDefRefresh({
+    appAvailable: true,
+    defsObtained: false,
+    comboApiPresent: true,
+    comboRan: false,
+    phase: "fetch",
+    didThrow: true,
+    thrown: new Error("Failed to fetch"),
+  });
+  assert.equal(fetchFailed.reason, "object_info_fetch_failed");
+  assert.match(fetchFailed.detail, /Failed to fetch/);
+});

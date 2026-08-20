@@ -120,9 +120,42 @@ export function describeNodeDefRefresh({
         "refreshed. Reload the ComfyUI tab, then retry.",
     };
   }
+  // #608 — the answer for a run that obtained NO /object_info at all, in one place. Two
+  // branches return it: the ordinary no-payload path below, and a LATER phase that failed
+  // on a run which never had a payload to fail over.
+  const noPayloadRemedy =
+    "The panel could not obtain /object_info from the ComfyUI backend (this frontend exposes " +
+    "no getNodeDefs, or no route returned anything usable), so node definitions and combo " +
+    "lists were NOT refreshed. If the backend is mid-restart, retry once it is up; " +
+    "otherwise reload the ComfyUI tab." +
+    // The routes are the only thing that can tell a caller WHICH transport it was: this
+    // path carries no detail of its own.
+    routesNote;
   if (failed) {
-    const reason =
-      phase === "fetch"
+    // #608 — A LATER PHASE CANNOT SPEAK FOR A RUN THAT NEVER OBTAINED A PAYLOAD, and this
+    // is keyed on `defsObtained` — an input this function is HANDED, not on an assumption
+    // about what else was true.
+    //
+    // Reported by the gate on the fix that made it reachable: with `getNodeDefs` resolving
+    // null (#1223's NOTHING_RETURNED) and the raw route not answering either, the run does
+    // not rethrow — there is no error to rethrow — so it falls through to the combo phase
+    // with `defs === null` and a budget the second route has spent. The combo call is then
+    // abandoned, which sets `thrown`, and this ladder answered `combo_refresh_failed`
+    // with a remedy that was false in BOTH halves: it said definitions "were fetched" when
+    // none were, and that the frontend "exposes no registerNodesFromDefs" when it does —
+    // registration was skipped only because there was nothing to register.
+    //
+    // The combo phase's outcome is not the fact the caller has to act on here, and
+    // `registrationClause` cannot be true on either side of its own ternary when no payload
+    // exists. So the missing payload names the verdict, exactly as it does when nothing
+    // threw at all — the reply for this state is now the same either way.
+    //
+    // PHASE "fetch" IS EXCLUDED and keeps its own token: that failure IS the missing
+    // payload, it is more specific, and its `detail` carries what the transport said.
+    const noPayload = !defsObtained && phase !== "fetch";
+    const reason = noPayload
+      ? NODE_DEF_REFRESH_REASONS.OBJECT_INFO_UNAVAILABLE
+      : phase === "fetch"
         ? NODE_DEF_REFRESH_REASONS.OBJECT_INFO_FETCH_FAILED
         : phase === "combo"
           ? NODE_DEF_REFRESH_REASONS.COMBO_REFRESH_FAILED
@@ -141,8 +174,9 @@ export function describeNodeDefRefresh({
             "persists, reload the ComfyUI tab."
           : "A fresh /object_info was obtained but re-registering the node definitions failed, " +
             "so the refresh is NOT confirmed. Reload the ComfyUI tab, then retry.";
-    const remedy =
-      reason === NODE_DEF_REFRESH_REASONS.OBJECT_INFO_FETCH_FAILED
+    const remedy = noPayload
+      ? noPayloadRemedy
+      : reason === NODE_DEF_REFRESH_REASONS.OBJECT_INFO_FETCH_FAILED
         ? "The /object_info fetch failed on every transport this panel has, so nothing was " +
           "refreshed. The backend may still be restarting — retry once it answers, and if it " +
           "never does, check that the ComfyUI server process is still running." +
@@ -162,15 +196,7 @@ export function describeNodeDefRefresh({
     return {
       refreshed: false,
       reason: NODE_DEF_REFRESH_REASONS.OBJECT_INFO_UNAVAILABLE,
-      remedy:
-        "The panel could not obtain /object_info from the ComfyUI backend (this frontend exposes " +
-        "no getNodeDefs, or no route returned anything usable), so node definitions and combo " +
-        "lists were NOT refreshed. If the backend is mid-restart, retry once it is up; " +
-        "otherwise reload the ComfyUI tab." +
-        // #608 — the same evidence, on the branch a route reached by RESOLVING nothing lands
-        // in. This one never carried a detail at all, so the routes are the only thing that
-        // can tell a caller which transport it was.
-        routesNote,
+      remedy: noPayloadRemedy,
     };
   }
   if (!defsRegistered) {

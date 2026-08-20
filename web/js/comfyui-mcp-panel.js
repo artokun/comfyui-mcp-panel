@@ -1458,12 +1458,28 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // it. The run's total WAITING is still bounded by the one deadline, so #1180's
       // composition (two serialized runs inside the bridge's read default) is untouched.
       //
-      // WHAT IT COSTS, stated rather than left to be found: when the fallback is consulted
-      // it spends time the combo phase would otherwise have had. That is the right trade
-      // and not a close one — a missing payload is a hard refreshed:false, while an
-      // abandoned combo call is a DISCLOSURE (#1193: the reapply sweep has already rebuilt
-      // every live combo from this run's payload, so the verdict is refreshed:true with
-      // combo_refresh_confirmed:false). A degraded confirmation beats no refresh at all.
+      // WHAT IT COSTS, BY CASE — written as an exhaustive split because the first version
+      // of this note stated the benign outcome as though it were general, and it was not.
+      // It said "an abandoned combo call is a DISCLOSURE (#1193)", which requires
+      // comboRebuildCovered(), which requires the reapply sweep, which requires `defs`. So
+      // it was true in the state where the fallback ANSWERS and false in the one state
+      // where the fallback costs the combo phase something and returns nothing. The two
+      // states are enumerated here instead:
+      //
+      //   THE FALLBACK ANSWERS — `defs` exists, the reapply sweep has rebuilt every live
+      //     combo from it, and an abandoned frontend combo call is genuinely a disclosure:
+      //     refreshed:true with combo_refresh_confirmed:false (#1193). A degraded
+      //     confirmation beats no refresh.
+      //   THE FALLBACK ALSO FAILS — `defs` is still null, so nothing was going to be
+      //     registered or reapplied whatever the combo phase did. The run reports the
+      //     MISSING PAYLOAD, and describeNodeDefRefresh keys that on `defsObtained` so a
+      //     starved combo phase cannot speak for it. Without that guard this path answered
+      //     combo_refresh_failed with a remedy false in both halves — see the note there.
+      //
+      // What the caller loses in the second case is TIME: the run can spend its whole
+      // budget before reporting where it once gave up sooner. It is bounded by the same run
+      // deadline, it lands well inside the command budget, and the reply is the same
+      // verdict the parent gave with the routes that were tried now named.
       //
       // NOT RACED. Issuing both routes together would avoid the wait entirely, and it is
       // declined on this path's own evidence: an abandoned request is NOT cancelled, so a
@@ -1547,8 +1563,13 @@ async function registerComfyNodeDefs(preloadedDefs) {
           // schedule, its bound and its error attribution — so handing it to the oracle
           // again would spend the reserve on the transport that just failed.
           getNodeDefs: null,
-          // `api.fetchApi` defaults to `cache: "no-cache"` (read from the shipped client,
-          // comfyui-frontend-package 1.48.7 on this rig), where `getNodeDefs` overrides it
+          // `api.fetchApi` defaults to `cache: "no-cache"` — read from the shipped client on
+          // this rig, comfyui_frontend_package 1.48.7, at
+          // static/assets/api--JY_wdaT.js: `fetchWithUnifiedRemint(this.apiURL(e),
+          // {cache:"no-cache", ...t, headers:n}, !1)`. The filename is content-hashed and
+          // the package is not vendored in this repo, so a reader on another machine will
+          // have a different asset name or no copy at all; the claim is from that build and
+          // is worth re-reading rather than inheriting. There `getNodeDefs` overrides it
           // to `no-store`. Both revalidate with the server, so this cannot answer a REFRESH
           // out of the HTTP cache with the pre-install schema — which would be worse than
           // failing, since it would report refreshed:true over the definitions the caller
