@@ -269,3 +269,76 @@ test("#1126: a value the parent RAIL validated is NOT reported as wholly uncheck
   assert.doesNotMatch(railChecked, /nothing checked the value/);
   assert.doesNotMatch(railChecked, /NOT validated/);
 });
+
+// ------------------------------------------- #1492: the side effects it did NOT run
+
+/** The reported reply shape: wrapper 1512, promoted BOOLEAN, inner status switch 2448. */
+const skippedInnerCallback = (promotedExtra) => ({
+  set: {
+    widget: "enabled_3",
+    value: false,
+    node_id: 1512,
+    previous: true,
+    inner_previous: true,
+    promoted_from: {
+      subgraph_node_id: 1512,
+      inner_node_id: 2448,
+      parent_widget_synced: true,
+      value_scope: "instance",
+      ...promotedExtra,
+    },
+  },
+});
+
+test("#1492: a write that skipped the shared inner callback SAYS SO, with the warning icon", () => {
+  // The card is the one line a user actually reads. Rendered as a plain "Set … " success,
+  // it asserts the opposite of what happened: the value landed on this instance and the
+  // inner switch that flips another node between ACTIVE and BYPASS never ran.
+  __setCatalogForTest("en", {});
+  const card = describeCommand(
+    "graph_set_widget",
+    {},
+    {
+      ok: true,
+      result: skippedInnerCallback({
+        inner_callback_not_invoked: true,
+        inner_callback_note: "…the lib's long-form note, which the card does not print…",
+      }),
+    },
+  );
+  assert.match(card.text, /^Set enabled_3 = false on node 1512/);
+  assert.match(card.text, /the shared inner node's own callback did NOT run/);
+  assert.match(card.text, /may still be stale/);
+  assert.equal(card.icon, "pi-exclamation-triangle", "a half-applied change must not read as a clean success");
+});
+
+test("#1492: an instance-scoped write that skipped NOTHING still renders the plain success line", () => {
+  // The over-claim to avoid on the rendering side. Most instance-scoped promoted writes
+  // skip nothing at all, and a warning triangle on every one of them is a warning nobody
+  // reads by the time the real one arrives.
+  __setCatalogForTest("en", {});
+  const card = describeCommand("graph_set_widget", {}, { ok: true, result: skippedInnerCallback({}) });
+  assert.equal(card.text, "Set enabled_3 = false on node 1512");
+  assert.equal(card.icon, "pi-sliders-h");
+});
+
+test("#1492: the disclosure is TRANSLATED — it renders from the shipped catalog, not from English", () => {
+  // A disclosure that only exists in English is a disclosure eleven of twelve panels do
+  // not show. Driven from the REAL ja catalog on disk, so a key that was added to the
+  // code and never shipped to the locales fails here rather than at a user's screen.
+  const ja = JSON.parse(
+    readFileSync(fileURLToPath(new URL("../../locales/ja/main.json", import.meta.url)), "utf8"),
+  ).comfyuiMcpPanel;
+  const clause = ja.panel.set_widget_inner_callback_not_invoked;
+  assert.ok(clause && clause.length > 0, "ja must ship the disclosure clause");
+  __setCatalogForTest("ja", ja);
+  const card = describeCommand(
+    "graph_set_widget",
+    {},
+    { ok: true, result: skippedInnerCallback({ inner_callback_not_invoked: true }) },
+  );
+  assert.ok(card.text.includes(clause), "the ja card must render the ja clause");
+  assert.doesNotMatch(card.text, /the shared inner node's own callback did NOT run/, "and not the English one");
+  assert.doesNotMatch(card.text, /panel\./, "and never a raw key");
+  __setCatalogForTest("en", {});
+});
