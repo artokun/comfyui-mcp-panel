@@ -32,6 +32,13 @@
  * are the bytes that would have been sent.
  */
 
+// comfyui-mcp#1871 — a scoped run must only be refused for nodes that are IN its scope.
+// The backward-closure walk that decides what "in its scope" means already lives in
+// partial-run-prune.js, where #1511 put it; this file imports the verdict rather than
+// restating it. Two answers to one question is two chances to disagree, and the two
+// places that ask it here are the two ends of the same refusal.
+import { upstreamClosure } from "./partial-run-prune.js";
+
 /** A serialized entry the server cannot execute: no usable `class_type`. */
 function unrunnable(entry) {
   const ct = entry?.class_type;
@@ -54,6 +61,45 @@ export function unrunnableNodeIds(prompt) {
     if (entry && typeof entry === "object" && unrunnable(entry)) ids.push(String(id));
   }
   return ids;
+}
+
+/**
+ * The unrunnable ids a run should actually be REFUSED for (comfyui-mcp#1871).
+ *
+ * #1511 removed ComfyUI's veto of a branch a run-to-node excluded: when the server
+ * refuses over a node outside the requested closure, the run gets one more post with
+ * that branch left out. But the server only gets to refuse if we post at all, and this
+ * pre-flight refuses FIRST — unscoped. So the retry never fires for the case where the
+ * pack is missing ENTIRELY rather than backend-only: no frontend registration means no
+ * `class_type` in the serialized prompt, which is this check's whole trigger. Measured
+ * on main after #1511: `panel_run(to_node_id: 43)` with an unregistered pack on nodes
+ * 56/57 is still refused here, naming 56 and 57, and ComfyUI is never asked.
+ *
+ * The refusal rests on one claim: "a run carrying an unregistered type cannot succeed,
+ * so this blocks no working run." That is true of a full run. It stopped being true of a
+ * run-to-node the moment the excluded branch could be dropped from a retry — the run CAN
+ * succeed, and refusing here is the only thing preventing it.
+ *
+ * So the scope narrows the refusal and nothing else. What it does NOT do:
+ *   - it never adds an id (the result is always a subset of `badIds`);
+ *   - it never narrows a full run — with no targets, today's answer is returned;
+ *   - it never narrows on a guess — when the closure cannot be computed (roots that are
+ *     not keys of this prompt, an unreadable prompt), today's answer is returned.
+ * Every uncertain case therefore refuses exactly as it does now.
+ *
+ * @param {unknown} prompt          graphToPrompt() result, or its `output` map
+ * @param {string[]|null|undefined} targetIds  partial-execution roots, null for a full run
+ * @returns {string[]} ids to refuse for
+ */
+export function unrunnableNodeIdsInScope(prompt, targetIds) {
+  const badIds = unrunnableNodeIds(prompt);
+  if (!badIds.length) return badIds;
+  const roots = Array.isArray(targetIds) ? targetIds.map(String) : [];
+  if (!roots.length) return badIds; // full run — every unrunnable node is submitted
+  const map = prompt?.output && typeof prompt.output === "object" ? prompt.output : prompt;
+  const closure = upstreamClosure(map, roots);
+  if (!closure) return badIds; // cannot tell what is unrelated ⇒ refuse as before
+  return badIds.filter((id) => closure.has(id));
 }
 
 /**

@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   unrunnableNodeIds,
+  unrunnableNodeIdsInScope,
   describeUnrunnable,
   missingNodeRunRefusal,
 } from "../../web/js/lib/missing-node-preflight.js";
@@ -119,7 +120,7 @@ test("#1460 a long list is bounded but says how many were withheld", () => {
 
 test("#1460 WIRING: the preflight reads the SERIALIZED prompt, not the canvas", () => {
   const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
-  assert.match(src, /import \{[\s\S]*?unrunnableNodeIds,[\s\S]*?\} from "\.\/lib\/missing-node-preflight\.js";/);
+  assert.match(src, /import \{[\s\S]*?unrunnableNodeIdsInScope,[\s\S]*?\} from "\.\/lib\/missing-node-preflight\.js";/);
   const at = src.indexOf("const built = await app.graphToPrompt();");
   assert.ok(at > 0, "the preflight must serialize the prompt itself");
   // Bounded by the pre-flight's OWN catch rather than a byte count. A fixed 600 excluded
@@ -129,10 +130,84 @@ test("#1460 WIRING: the preflight reads the SERIALIZED prompt, not the canvas", 
   const endOfTry = src.indexOf("} catch (err) {", at);
   assert.ok(endOfTry > at, "the pre-flight's try block must still be recognisable");
   const block = src.slice(at, endOfTry);
-  assert.match(block, /unrunnableNodeIds\(built\)/);
+  // comfyui-mcp#1871 - and the SCOPE must be handed to it. `unrunnableNodeIdsInScope(built)`
+  // with the second argument dropped compiles, reads correctly, and silently restores the
+  // unscoped refusal for every run-to-node; only naming `partialTargets` here can see that.
+  assert.match(block, /unrunnableNodeIdsInScope\(built, partialTargets\)/);
   // The refuted approach must be gone entirely.
   assert.equal((src.match(/findUnregisteredTypes/g) ?? []).length, 0);
   assert.equal((src.match(/object_info\/\$\{encodeURIComponent\(cls\)\}/g) ?? []).length, 0);
+});
+
+// ── comfyui-mcp#1871: the refusal is narrowed to the requested branch, and to nothing
+//    else. Each case below is a direction the narrowing could go wrong in.
+
+const TWO_BRANCH = {
+  output: {
+    "43": { class_type: "PreviewImage", inputs: { images: ["44", 0] } },
+    "44": { class_type: "EmptyImage", inputs: {} },
+    "56": { inputs: { image: ["57", 0] } }, // pack absent ⇒ no class_type
+    "57": { inputs: {} },
+  },
+};
+
+test("#1871 a scoped run is refused only for unrunnable nodes inside its closure", () => {
+  assert.deepEqual(unrunnableNodeIdsInScope(TWO_BRANCH, ["43"]), []);
+  // …and the SAME prompt, targeted at the broken branch, still names both.
+  assert.deepEqual(unrunnableNodeIdsInScope(TWO_BRANCH, ["56"]), ["56", "57"]);
+});
+
+test("#1871 the narrowing never applies to a full run", () => {
+  for (const targets of [undefined, null, [], "43", 43]) {
+    assert.deepEqual(
+      unrunnableNodeIdsInScope(TWO_BRANCH, targets),
+      ["56", "57"],
+      `targets=${JSON.stringify(targets)} is not a scope`,
+    );
+  }
+});
+
+test("#1871 the narrowing never applies on a guess", () => {
+  // A root that is not a key of this prompt makes the closure unknowable; the honest
+  // answer is the one that already exists, not "probably fine".
+  assert.deepEqual(unrunnableNodeIdsInScope(TWO_BRANCH, ["nope"]), ["56", "57"]);
+  assert.deepEqual(unrunnableNodeIdsInScope(TWO_BRANCH, ["43", "nope"]), ["56", "57"]);
+  assert.deepEqual(unrunnableNodeIdsInScope({ output: null }, ["43"]), []);
+});
+
+test("#1871 the result is always a SUBSET of the unscoped answer", () => {
+  // The narrowing may only ever remove. A version that recomputed the list, or that
+  // reported closure members rather than filtering, could add an id that is perfectly
+  // runnable — and refuse a run for a node that has nothing wrong with it.
+  const all = unrunnableNodeIds(TWO_BRANCH);
+  for (const targets of [["43"], ["56"], ["44"], ["43", "56"], ["nope"], []]) {
+    for (const id of unrunnableNodeIdsInScope(TWO_BRANCH, targets)) {
+      assert.ok(all.includes(id), `${id} was invented for targets ${JSON.stringify(targets)}`);
+    }
+  }
+});
+
+test("#1871 a healthy graph is never refused, scoped or not", () => {
+  const clean = { output: { "1": { class_type: "PreviewImage", inputs: { images: ["2", 0] } }, "2": { class_type: "EmptyImage", inputs: {} } } };
+  assert.deepEqual(unrunnableNodeIdsInScope(clean, ["1"]), []);
+  assert.deepEqual(unrunnableNodeIdsInScope(clean, undefined), []);
+});
+
+test("#1871 WIRING: the run-to-node target is RESOLVED before the pre-flight reads it", () => {
+  // `partialTargets` is a `let` in graph_run. If the resolve block ever moves back below
+  // the pre-flight, the call site hits the temporal dead zone — and the pre-flight's own
+  // catch swallows everything that is not /^NOT queued:/, so a ReferenceError there does
+  // not surface as an error at all: it silently disables the whole missing-node
+  // pre-flight. Ordering is the only thing that stops that.
+  const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
+  const runAt = src.indexOf("async graph_run({ batch_count, to_node_id }) {");
+  assert.ok(runAt > 0, "graph_run must still be recognisable");
+  const declared = src.indexOf("let partialTargets;", runAt);
+  const assigned = src.indexOf("partialTargets = [res.execId];", runAt);
+  const read = src.indexOf("unrunnableNodeIdsInScope(built, partialTargets)", runAt);
+  assert.ok(declared > runAt, "partialTargets must be declared inside graph_run");
+  assert.ok(assigned > declared, "the resolved target must be assigned to it");
+  assert.ok(read > assigned, "the pre-flight must read it AFTER it is resolved, never before");
 });
 
 test("#1460 WIRING: it runs BEFORE the prompt is queued", () => {

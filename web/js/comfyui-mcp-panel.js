@@ -375,7 +375,7 @@ import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import { withoutFrontendVirtualTypes } from "./lib/frontend-virtual-nodes.js";
 import { collectFrontendVirtualTypes } from "./lib/virtual-registry.js";
 import {
-  unrunnableNodeIds,
+  unrunnableNodeIdsInScope,
   describeUnrunnable,
   missingNodeRunRefusal,
   graphToPromptUnusable,
@@ -15578,6 +15578,69 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof app.queuePrompt !== "function") {
       throw new Error("app.queuePrompt is unavailable on this frontend");
     }
+    // "Run to node" = ComfyUI partial execution. The server keeps an OUTPUT node
+    // (SaveImage/PreviewImage/SaveVideo/…) as an execution root only when its id
+    // is in partial_execution_targets, then walks back through that node's
+    // dependencies — so only that branch renders. A non-output node can't be a
+    // root (the prompt would have "no outputs"). An output node nested in a
+    // subgraph is targeted by a PATH-style NodeExecutionId — the colon-joined
+    // chain of subgraph-instance ids from root down to the node ("10:15:359"),
+    // exactly what ComfyUI's own flattened prompt uses (#411). We resolve the id
+    // in the CURRENT viewing scope first (the reporter added the output node
+    // INSIDE the subgraph they were viewing), then root, then any nested subgraph.
+    // Stays undefined for a normal full run (byte-identical to the prior behaviour;
+    // a root-level target yields String(id), the same value as before).
+    //
+    // RESOLVED BEFORE THE PRE-FLIGHT (comfyui-mcp#1871). The pre-flight below refuses a
+    // run for nodes the server cannot execute, and a scoped run must only be refused for
+    // nodes that are IN its scope — which cannot be known before the target is resolved.
+    // Resolution is read-only, so moving it ahead changes nothing it does; it only changes
+    // which refusal answers first, and "node N was not found" is the better answer to a
+    // request naming node N than a report about some other node's pack.
+    let partialTargets;
+    // #699 — carried out of the resolve block so the queue-rejection summary can
+    // explain a `prompt_no_outputs` refusal of a target the panel already verified
+    // advertises output_node:true. Null for a full run.
+    let runToNodeInfo = null;
+    if (to_node_id != null) {
+      // Resolve the run-to-node target in the CURRENT viewing scope first (the reporter
+      // added / is targeting the output node INSIDE the subgraph they are viewing —
+      // active first-level #438/#439, nested #411). resolveRunToNodeTarget encapsulates
+      // the SAME find→output-eligibility→colon-path resolution the tests drive.
+      const viewing = graph !== rootGraph ? graph : null;
+      const res = resolveRunToNodeTarget(rootGraph, viewing, to_node_id);
+      if (!res.ok) {
+        if (res.code === "not_found") {
+          return {
+            queued: false,
+            error:
+              `node ${to_node_id} was not found on the root graph or in any subgraph — ` +
+              `run-to-node targets an output node in the current workflow (check the id in panel_query_graph)`,
+          };
+        }
+        // isOutputNode mirrors ComfyUI's util: node.constructor.nodeData.output_node.
+        if (res.code === "not_output") {
+          return {
+            queued: false,
+            error:
+              `node ${to_node_id} (${res.node.type}) is not an output node — "run to node" can ` +
+              `only target an output node such as SaveImage, PreviewImage, or SaveVideo. Pick the ` +
+              `output node at the end of the branch you want to render (is_output:true in panel_query_graph).`,
+          };
+        }
+        // "unreachable": the owning subgraph isn't reachable from the live root (stale view).
+        return {
+          queued: false,
+          error:
+            `node ${to_node_id} is inside a subgraph that isn't reachable from the current ` +
+            `workflow root (stale view) — re-open the workflow and try again`,
+        };
+      }
+      // Colon path for a nested node ("10:15:359") / first-level ("76:34"), or
+      // String(id) at root.
+      partialTargets = [res.execId];
+      runToNodeInfo = { nodeId: to_node_id, nodeType: res.node?.type };
+    }
     // comfyui-mcp#1460 — PRE-FLIGHT the node types. An unregistered type still draws
     // on the canvas and is still included by ComfyUI's own graphToPrompt, with
     // `class_type: undefined` — so the server answers "has no class_type" for ONE
@@ -15628,7 +15691,13 @@ const GRAPH_TOOL_EXECUTORS = {
           ),
         );
       }
-      const badIds = unrunnableNodeIds(built);
+      // comfyui-mcp#1871 — SCOPED to the requested branch. The refusal's own premise ("a
+      // run carrying an unregistered type cannot succeed") holds for a full run and stopped
+      // holding for a run-to-node once #1511 let ComfyUI's refusal of an excluded branch be
+      // retried without it: such a run CAN succeed, and this check was the only thing left
+      // preventing it. Full runs and every case the closure cannot be computed for get the
+      // unscoped answer, so nothing that refuses today stops refusing.
+      const badIds = unrunnableNodeIdsInScope(built, partialTargets);
       if (badIds.length) {
         const liveNodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
         // comfyui-mcp#1648 — hand the refusal THIS PAGE's litegraph registry so it can
@@ -15667,63 +15736,6 @@ const GRAPH_TOOL_EXECUTORS = {
     const batch = Number.isFinite(requestedBatch)
       ? Math.min(Math.max(requestedBatch, 1), MAX_BATCH)
       : 1;
-
-    // "Run to node" = ComfyUI partial execution. The server keeps an OUTPUT node
-    // (SaveImage/PreviewImage/SaveVideo/…) as an execution root only when its id
-    // is in partial_execution_targets, then walks back through that node's
-    // dependencies — so only that branch renders. A non-output node can't be a
-    // root (the prompt would have "no outputs"). An output node nested in a
-    // subgraph is targeted by a PATH-style NodeExecutionId — the colon-joined
-    // chain of subgraph-instance ids from root down to the node ("10:15:359"),
-    // exactly what ComfyUI's own flattened prompt uses (#411). We resolve the id
-    // in the CURRENT viewing scope first (the reporter added the output node
-    // INSIDE the subgraph they were viewing), then root, then any nested subgraph.
-    // Stays undefined for a normal full run (byte-identical to the prior behaviour;
-    // a root-level target yields String(id), the same value as before).
-    let partialTargets;
-    // #699 — carried out of the resolve block so the queue-rejection summary can
-    // explain a `prompt_no_outputs` refusal of a target the panel already verified
-    // advertises output_node:true. Null for a full run.
-    let runToNodeInfo = null;
-    if (to_node_id != null) {
-      // Resolve the run-to-node target in the CURRENT viewing scope first (the reporter
-      // added / is targeting the output node INSIDE the subgraph they are viewing —
-      // active first-level #438/#439, nested #411). resolveRunToNodeTarget encapsulates
-      // the SAME find→output-eligibility→colon-path resolution the tests drive.
-      const viewing = graph !== rootGraph ? graph : null;
-      const res = resolveRunToNodeTarget(rootGraph, viewing, to_node_id);
-      if (!res.ok) {
-        if (res.code === "not_found") {
-          return {
-            queued: false,
-            error:
-              `node ${to_node_id} was not found on the root graph or in any subgraph — ` +
-              `run-to-node targets an output node in the current workflow (check the id in panel_query_graph)`,
-          };
-        }
-        // isOutputNode mirrors ComfyUI's util: node.constructor.nodeData.output_node.
-        if (res.code === "not_output") {
-          return {
-            queued: false,
-            error:
-              `node ${to_node_id} (${res.node.type}) is not an output node — "run to node" can ` +
-              `only target an output node such as SaveImage, PreviewImage, or SaveVideo. Pick the ` +
-              `output node at the end of the branch you want to render (is_output:true in panel_query_graph).`,
-          };
-        }
-        // "unreachable": the owning subgraph isn't reachable from the live root (stale view).
-        return {
-          queued: false,
-          error:
-            `node ${to_node_id} is inside a subgraph that isn't reachable from the current ` +
-            `workflow root (stale view) — re-open the workflow and try again`,
-        };
-      }
-      // Colon path for a nested node ("10:15:359") / first-level ("76:34"), or
-      // String(id) at root.
-      partialTargets = [res.execId];
-      runToNodeInfo = { nodeId: to_node_id, nodeType: res.node?.type };
-    }
 
     // app.queuePrompt(number, batchCount, queueNodeIds | QueuePromptOptions) —
     // the 3rd arg becomes the request's partial_execution_targets, but its SHAPE

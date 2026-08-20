@@ -293,7 +293,7 @@ test("#1648 CALL SITE 3: the bounded list still says how many were withheld", ()
 });
 
 test("#1648 CALL SITE 3 WIRING: graph_run hands the refusal this page's registry", () => {
-  const at = PANEL.indexOf("const badIds = unrunnableNodeIds(built);");
+  const at = PANEL.indexOf("const badIds = unrunnableNodeIdsInScope(built, partialTargets);");
   assert.ok(at > 0, "the pre-flight must still be recognisable");
   const end = PANEL.indexOf("} catch (err) {", at);
   assert.ok(end > at, "the pre-flight's try block must still be recognisable");
@@ -305,10 +305,10 @@ test("#1648 CALL SITE 3 WIRING: graph_run hands the refusal this page's registry
 });
 
 test("#1648 CALL SITE 3 WIRING: the registry is diagnosis only — the refusal is still the prompt", () => {
-  const at = PANEL.indexOf("const badIds = unrunnableNodeIds(built);");
+  const at = PANEL.indexOf("const badIds = unrunnableNodeIdsInScope(built, partialTargets);");
   const end = PANEL.indexOf("} catch (err) {", at);
   const block = PANEL.slice(at, end);
-  // The go/no-go remains `unrunnableNodeIds(built)`; the registry appears only inside the
+  // The go/no-go remains `unrunnableNodeIdsInScope(built, partialTargets)`; the registry appears only inside the
   // message construction. A guard keyed on the registry would refuse runs that succeed.
   assert.match(block, /if \(badIds\.length\) \{/);
   assert.equal((block.match(/registered_node_types/g) ?? []).length, 1);
