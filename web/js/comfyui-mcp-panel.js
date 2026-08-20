@@ -412,6 +412,7 @@ import { canonicalNodeId, isQualifiedNodeId } from "./lib/node-id.js";
 import { configureAppMode } from "./lib/configure-app-mode.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
+import { reconcileWidgetClaims, supersededNote } from "./lib/manual-change-claims.js";
 import {
   CANVAS_TOOL_DISCLOSURE,
   commandProvesExposure,
@@ -8834,6 +8835,14 @@ let lastAgentGraphKey = null;
 // "100+ nodes removed" notice that the very next live graph read contradicted.
 let lastAgentGraphEpoch = -1;
 let sessionEpoch = 0;
+// #1498 — the widget-value triples the LAST emitted MANUAL CANVAS CHANGES block
+// actually asserted, plus the workflow identity they were read under. A graph read
+// later in the same turn re-checks these against the live graph so a canvas that
+// moved on mid-turn is disclosed as a newer observation rather than surfacing as
+// two panel surfaces silently disagreeing. Emptied whenever the baseline is
+// reseeded, at turn end, and per-widget whenever the PANEL itself writes one.
+let manualChangeClaims = [];
+let manualChangeClaimsKey = null;
 
 // #291 — live-canvas tool exposure.
 //
@@ -8876,12 +8885,20 @@ const modeName = (m) => MODE_NAME[m] ?? `mode${m ?? 0}`;
 // Serialized link = [id, origin_id, origin_slot, target_id, target_slot, type].
 // Compare by ENDPOINTS (link ids churn on every edit), not by id.
 const linkKey = (l) => `${l[1]}:${l[2]}->${l[3]}:${l[4]}`;
-function widgetName(liveGraph, nodeId, i) {
+// The live widget's NAME for a serialized `widgets_values` index, or NULL when it
+// cannot be resolved.
+//
+// #1498 — null rather than the old `#i` fallback, because the two answers are not
+// interchangeable any more. The DISPLAY still falls back to the positional `#i`, at
+// the one line that renders it; a CLAIM must not be recorded without a name at all,
+// since the reconciliation looks the widget back up BY NAME — exactly as the graph
+// readers key it — and `#3` is not a name any reader would find.
+function resolvedWidgetName(liveGraph, nodeId, i) {
   try {
     const w = liveGraph?.getNodeById?.(canonicalNodeId(nodeId))?.widgets?.[i];
-    if (w && w.name) return w.name;
+    if (w && typeof w.name === "string" && w.name) return w.name;
   } catch {}
-  return `#${i}`;
+  return null;
 }
 function shortVal(v) {
   const s = String(typeof v === "string" ? v : (JSON.stringify(v) ?? "")).replace(/\s+/g, " ");
@@ -8891,7 +8908,11 @@ function shortVal(v) {
 // Diff two serialized root graphs (prev → curr) into compact, LLM-readable lines.
 // Reports node add/remove, mode (bypass/mute) changes, widget-value changes, title
 // changes, and connection add/remove. Ignores pure moves/resizes/recolors (noise).
-function diffGraphsForAgent(prev, curr, liveGraph) {
+// `claims` (#1498) is an OUT-parameter: every widget-value line this diff asserts
+// also pushes the { node, widget, value } triple it asserted, so a later graph read
+// can re-check just those triples and disclose the ones the canvas has moved past.
+// Optional — callers that only want the text pass nothing.
+function diffGraphsForAgent(prev, curr, liveGraph, claims = null) {
   if (!prev || !curr) return [];
   const lines = [];
   const P = new Map((prev.nodes || []).map((n) => [n.id, n]));
@@ -8917,7 +8938,11 @@ function diffGraphsForAgent(prev, curr, liveGraph) {
         for (let i = 0; i < Math.max(pv.length, cv.length); i++) {
           if (JSON.stringify(pv[i]) === JSON.stringify(cv[i])) continue;
           if ((cv[i] && typeof cv[i] === "object") || (pv[i] && typeof pv[i] === "object")) continue; // skip nested preview blobs
-          lines.push(`• ${label(c)}: ${widgetName(liveGraph, id, i)} ${shortVal(pv[i])} → ${shortVal(cv[i])}`);
+          const wname = resolvedWidgetName(liveGraph, id, i);
+          lines.push(`• ${label(c)}: ${wname ?? `#${i}`} ${shortVal(pv[i])} → ${shortVal(cv[i])}`);
+          // #1498 — record the CLAIM, not the rendered line: the reconciliation needs
+          // the raw value to compare, and `shortVal` has already clipped it.
+          if (wname && claims) claims.push({ node_id: id, node_type: c.type, widget: wname, reported: cv[i] });
         }
       } else {
         lines.push(`• ${label(c)}: widgets changed`);
@@ -9080,6 +9105,11 @@ function manualChangeBanner() {
     lastAgentGraph = curr;
     lastAgentGraphKey = currKey;
     lastAgentGraphEpoch = sessionEpoch;
+    // #1498 — claims belong to the block that made them. Drop them with the baseline
+    // they were taken against, so a read can never reconcile against a stale turn's
+    // assertions; the diff path below re-arms them for the block it is about to emit.
+    manualChangeClaims = [];
+    manualChangeClaimsKey = null;
   };
   const decision = classifyManualChangeBaseline({
     hasBaseline: true,
@@ -9106,9 +9136,15 @@ function manualChangeBanner() {
       `node ids may not apply. Re-read with panel_graph_outline before editing.\n\n`
     );
   }
-  const lines = diffGraphsForAgent(lastAgentGraph, curr, live);
+  const claims = [];
+  const lines = diffGraphsForAgent(lastAgentGraph, curr, live, claims);
   reseed();
   if (!lines.length) return "";
+  // #1498 — arm the reconciliation for THIS block only (reseed above cleared the
+  // previous one). Keyed to the workflow the reading was taken from, so a tab switch
+  // mid-turn cannot make a read compare node ids across two different graphs.
+  manualChangeClaims = claims;
+  manualChangeClaimsKey = currKey;
   const MAX = 40;
   const shown = lines.slice(0, MAX);
   const more = lines.length > MAX ? `\n  …and ${lines.length - MAX} more change(s)` : "";
@@ -9116,8 +9152,67 @@ function manualChangeBanner() {
     `⟳ MANUAL CANVAS CHANGES since your last turn — the user edited the graph directly:\n  ` +
     shown.join("\n  ") +
     more +
-    `\nTreat the canvas as being in THIS state now (it overrides what you remember); ` +
-    `re-read with panel_graph_outline if the changes are substantial.\n\n`
+    // #1498 — STATE THE AS-OF, and the precedence that follows from it. This block is
+    // one reading, taken when the message was sent; the user is sitting in ComfyUI and
+    // can keep editing while the turn runs, and a node's own callback can normalize a
+    // value straight back. Claiming the present tense outright ("the canvas IS in this
+    // state") made a later, CORRECT live read look like a broken panel surface.
+    `\nThis is the canvas AS OF THE MOMENT THIS MESSAGE WAS SENT. It overrides what you ` +
+    `remember — but NOT a live read taken after it: if panel_graph_outline or ` +
+    `panel_query_graph reports a different value, that read is NEWER and it wins. ` +
+    `Re-read with panel_graph_outline if the changes are substantial.\n\n`
+  );
+}
+
+/**
+ * #1498 — the reply rider that dates the two readings against each other.
+ *
+ * Called by the graph READS, which are the surface that observes the disagreement.
+ * Re-checks only the widget triples the current turn's MANUAL CANVAS CHANGES block
+ * asserted, against the live root graph, and returns the ones it no longer holds.
+ * Returns `{}` — no fields at all — when there is nothing to say, so an unaffected
+ * read is byte-identical to before and costs nothing against `max_chars`.
+ *
+ * Refuses to reconcile across a WORKFLOW SWITCH: node ids are per-graph, so
+ * comparing a claim taken on workflow A against workflow B's node of the same id is
+ * exactly the wrong-target claim panel#348/#198 removed from the diff itself. An
+ * unreadable identity on either side is the same refusal — never inferred.
+ */
+function manualChangeSupersededRider(rootGraph) {
+  if (!manualChangeClaims.length || !rootGraph) return {};
+  let key = null;
+  try {
+    key = workflowStableUuid();
+  } catch {
+    key = null;
+  }
+  if (key == null || manualChangeClaimsKey == null || key !== manualChangeClaimsKey) return {};
+  let result;
+  try {
+    result = reconcileWidgetClaims(manualChangeClaims, (nodeId) =>
+      rootGraph.getNodeById?.(canonicalNodeId(nodeId)) ?? null,
+    );
+  } catch {
+    // A read must never fail over its own explanatory rider.
+    return {};
+  }
+  if (!result.rows.length) return {};
+  return {
+    manual_changes_superseded: result.rows,
+    manual_changes_superseded_note: supersededNote(result),
+  };
+}
+
+/** #1498 — the PANEL just wrote this widget, so a later difference on it is the
+ *  model's own edit, not the user's. Drop the claim rather than let the rider
+ *  report the agent's write back to it as the canvas moving on. Matching is by
+ *  node id + widget name, the pair the claim is keyed on; ids are compared as
+ *  strings because a serialized id is a number and a live one is a string. */
+function dropManualChangeClaim(nodeId, widget) {
+  if (!manualChangeClaims.length || nodeId == null || typeof widget !== "string") return;
+  const id = String(nodeId);
+  manualChangeClaims = manualChangeClaims.filter(
+    (c) => !(String(c.node_id) === id && c.widget === widget),
   );
 }
 
@@ -11787,6 +11882,12 @@ const GRAPH_TOOL_EXECUTORS = {
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
         : {}),
+      // #1498 — name any widget this turn's MANUAL CANVAS CHANGES block announced that
+      // the canvas has already moved past. Rides OUTSIDE `outline`, so it cannot be shed
+      // by the detail ladder: the whole point is that this read is the newer reading, and
+      // a degraded rung is exactly when the reader most needs to be told which one dates
+      // from when. Bounded to 8 rows by the lib.
+      ...manualChangeSupersededRider(rootGraph),
     };
   },
 
@@ -11947,6 +12048,11 @@ const GRAPH_TOOL_EXECUTORS = {
       ...groupsCut,
       ...(groups.length ? { groups } : {}),
       ...(inSubgraph ? { rails: describeRails(graph) } : {}),
+      // #1498 — same rider as graph_outline, on `meta` so it reaches BOTH of this
+      // command's return paths (rows and the group_by aggregate). Resolved against the
+      // ROOT graph, never `graph`: the block diffs the root, so a claim must be checked
+      // where it was made even when the caller is reading inside a subgraph.
+      ...manualChangeSupersededRider(rootGraph),
     };
 
     // 3) Aggregate?
@@ -14387,6 +14493,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // The creation and its rollback both live inside this call now, at the synchronous write
     // boundary — see `prepareWriteTarget` above. There is nothing to undo out here.
     const result = await runSetWidget(node, widget, value, setWidgetOpts);
+    // #1498 — the PANEL owns this widget's value from here on, so the turn's
+    // MANUAL CANVAS CHANGES claim about it is spent: leaving it armed would make the
+    // next graph read report the model's OWN write back to it as the user editing
+    // again. Placed after runSetWidget, which throws on every refusal, so only a write
+    // that actually ran retires the claim.
+    dropManualChangeClaim(node?.id ?? node_id, widget);
 
     // #418: LiteGraph's `has_errors` red flag is STICKY — repointing a widget from a
     // missing asset (or an invalid value) to a valid one drops the missing-asset
@@ -33094,6 +33206,11 @@ function buildPanel() {
         liveTurnThreadId = null;
         hideThinking(); // authoritative terminal frame — clears the action label too
         ssSet(MID_TASK_KEY, null); // turn finished cleanly — nothing to resume
+        // #1498 — the turn that owned these claims is over. Retire them BEFORE the
+        // snapshot below (which can throw), so a failed serialize cannot leave a
+        // finished turn's assertions armed for the next one's reads.
+        manualChangeClaims = [];
+        manualChangeClaimsKey = null;
         // Snapshot the graph the agent is leaving behind; the next user turn diffs
         // the live graph against this to surface MANUAL edits made between turns.
         try {

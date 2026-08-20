@@ -227,6 +227,9 @@ const EXECUTOR_DEPS = [
   // out of the eval harness throws ReferenceError, the catch returns false, fetchApi
   // never runs, and #1418's hung-probe assertion reads as "skipped" instead of bounded.
   "inputAssetViewQuery",
+  // #1498 — the handler retires the turn's manual-change claim for the widget it just
+  // wrote. Panel module state, so the harness supplies a no-op double.
+  "dropManualChangeClaim",
 ];
 
 function deferred() {
@@ -354,6 +357,7 @@ function realGraphSetWidget({
     // refreshCombos reads before it calls the coalescer.
     nodeDefRefreshInFlight: inFlight,
     inputAssetViewQuery,
+    dropManualChangeClaim: () => {},
   };
   const factory = new Function(
     ...EXECUTOR_DEPS,
