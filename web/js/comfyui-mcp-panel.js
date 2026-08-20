@@ -530,6 +530,7 @@ import {
   boundsAroundNodes,
   groupMemberNodes,
   classifyRequestedMembership,
+  describeGroupMembershipGap,
   refreshNodeArea,
   syncNodeArea,
   syncGraphNodeAreas,
@@ -19769,6 +19770,8 @@ const GRAPH_TOOL_EXECUTORS = {
     syncGraphNodeAreas(graph);
     let bbox;
     let requestedIds = null;
+    let resolvedIds = new Set();
+    let unsyncedIds = new Set();
     if (Array.isArray(node_ids) && node_ids.length) {
       // Record EVERY requested id (including ids that don't resolve) so the
       // honesty report below can list nonexistent ones as missing (#297).
@@ -19779,7 +19782,16 @@ const GRAPH_TOOL_EXECUTORS = {
       // collapsed — so it is a geometric member of the box we build around it. The
       // sync-all above skips collapsed nodes (to avoid overstating unrelated ones),
       // but a requested collapsed node with a stale rect must still be included (#391).
-      ns.forEach((n) => syncNodeArea(n, /* forceCollapsed */ true));
+      // Keep the VERDICT, not just the attempt. syncNodeArea returns false when a
+      // node's cached rect would not accept the resync (a frozen/derived rect on
+      // some frontend builds), and that node is then judged on geometry the panel
+      // could not make live — the one way a requested node can still be missing
+      // once the box and the rect share a footprint model (mcp#1877). Discarding
+      // the verdict is what left the report blaming a dense layout for it.
+      unsyncedIds = new Set(
+        ns.filter((n) => !syncNodeArea(n, /* forceCollapsed */ true)).map((n) => String(n.id)),
+      );
+      resolvedIds = new Set(ns.map((n) => String(n.id)));
       // Tight box around exactly the requested nodes that exist (title height + padding).
       bbox = boundsAroundNodes(ns);
     } else if (Array.isArray(bounds) && bounds.length === 4) {
@@ -19800,24 +19812,20 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     graph.setDirtyCanvas(true, true);
     const summary = summarizeGroup(graph, group);
-    // Honesty for dense layouts (#297): group membership is purely GEOMETRIC, so
-    // any unrelated node whose CENTRE falls within the computed rectangle is now a
-    // member (LiteGraph's containsCentre rule, #497) — LiteGraph has no per-node
-    // ownership to exclude it. When the live members
-    // differ from what was requested, surface both sets and a warning instead of
-    // silently reporting a misleading success.
+    // Honesty when the live members differ from what was requested: group
+    // membership is purely GEOMETRIC, so any unrelated node whose CENTRE falls
+    // within the computed rectangle is now a member (LiteGraph's containsCentre
+    // rule, #497) and LiteGraph has no per-node ownership to exclude it (#297).
+    // Surface both sets rather than reporting a misleading success — and name the
+    // cause that actually applies, since a MISSING requested node is a different
+    // failure from a captured bystander and used to be reported as one (mcp#1877).
     if (requestedIds) {
       const { extra, missing } = classifyRequestedMembership(requestedIds, summary.node_ids);
       summary.requested_node_ids = requestedIds;
       if (extra.length || missing.length) {
         summary.extra_node_ids = extra;
         summary.missing_node_ids = missing;
-        summary.warning =
-          "group membership is geometric: the box that wraps the requested nodes " +
-          `also captures ${extra.length} unrelated node(s) (their centre falls inside)` +
-          (missing.length ? ` and misses ${missing.length} requested node(s)` : "") +
-          ". Move the intended nodes into a contiguous region (panel_edit_node / " +
-          "panel_auto_layout) before grouping, or edit the group bounds, to get an exact set.";
+        summary.warning = describeGroupMembershipGap(extra, missing, resolvedIds, unsyncedIds);
       }
     }
     return { group: summary };

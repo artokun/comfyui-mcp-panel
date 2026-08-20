@@ -15,6 +15,8 @@ import assert from "node:assert/strict";
 import {
   nodeFocusBounds,
   boundsAroundNodes,
+  nodeExtents,
+  describeGroupMembershipGap,
   groupBoundsOf,
   groupMemberNodes,
   classifyRequestedMembership,
@@ -991,4 +993,100 @@ test("#1306 holdGraphItemPositions never throws on a hostile walk", () => {
     hold = holdGraphItemPositions(graph, null);
   });
   assert.doesNotThrow(() => hold.restore());
+});
+
+// ---------------------------------------------------------------------------
+// mcp#1877 — panel_create_group excluded a requested COLLAPSED node from a box
+// whose bounds visibly covered it.
+// ---------------------------------------------------------------------------
+
+test("mcp#1877 a requested node reporting a ZERO extent is a member of its own box", () => {
+  // Numbers straight from the report: collapsed VAEDecode 81 at [9750, 5410],
+  // which the frontend presents with a collapsed pill width and a ZERO body
+  // height. graph_create_group syncs the requested node's cached rect (forced to
+  // the FULL footprint) and then builds the box with boundsAroundNodes.
+  //
+  // FAIL-BEFORE: the two disagreed about a zero extent. boundsAroundNodes read
+  // `size[1] ?? 100` — `??` passes 0 through — so the box was [9720, 5340, 285,
+  // 100]; wantedNodeArea rejected the 0 and wrote a rect 130 tall. The rect's
+  // centre landed at y 5445, five pixels below the box's bottom edge at 5440, and
+  // the tool reported node_count 0 / missing_node_ids [81].
+  const n = {
+    id: 81,
+    type: "VAEDecode",
+    flags: { collapsed: true },
+    pos: [9750, 5410],
+    size: [225, 0],
+    boundingRect: [0, 0, 0, 0], // stale, as after a graph load
+  };
+  syncNodeArea(n, /* forceCollapsed */ true);
+  const bbox = boundsAroundNodes([n]);
+  assert.deepEqual(
+    groupMemberNodes(graphOf(n), groupBox(bbox)).map((x) => x.id),
+    [81],
+    "the node the box was built around must be one of its members",
+  );
+});
+
+test("mcp#1877 boundsAroundNodes and wantedNodeArea share ONE extent model", () => {
+  // The invariant behind the fix, stated directly on the degenerate extents that
+  // broke it: whatever width/height the box builder uses for a node, the cached
+  // rect writer must use the same. Testing membership (above) alone would not
+  // catch the two drifting apart again in a way that happens to stay inside the
+  // padding.
+  for (const size of [[225, 0], [0, 120], [0, 0], [225, -40], [225, NaN], [Infinity, 120]]) {
+    const n = { id: 1, pos: [100, 100], size };
+    syncNodeArea(n, true); // no cached rect ⇒ read the model through nodeFocusBounds
+    const [, , focusW, focusH] = nodeFocusBounds(n);
+    assert.deepEqual(
+      nodeExtents(n),
+      [focusW, focusH - 30],
+      `size ${JSON.stringify(size)}: box extents must match the rect extents`,
+    );
+  }
+});
+
+test("mcp#1877 a non-finite position never yields a NaN group box", () => {
+  // A NaN extent or a NaN *y* never touched minX, and minX was the only
+  // accumulator checked — so the box escaped as [x, NaN, w, NaN] and
+  // setGroupBounds wrote it to the user's graph.
+  const good = node(1, 100, 100);
+  const badY = { id: 2, pos: [100, Number.NaN], size: [300, 120] };
+  const badSize = { id: 3, pos: [400, 100], size: [300, Number.NaN] };
+  for (const bbox of [
+    boundsAroundNodes([good, badY]),
+    boundsAroundNodes([good, badSize]),
+    boundsAroundNodes([badY]),
+  ]) {
+    assert.ok(
+      bbox.every((v) => Number.isFinite(v)),
+      `every component of ${JSON.stringify(bbox)} must be finite`,
+    );
+  }
+});
+
+test("mcp#1877 a MISSING requested node is not reported as a dense-layout capture", () => {
+  // The old warning was one sentence that always began "also captures N unrelated
+  // node(s)" — with N printed as 0 — and always prescribed spreading the nodes
+  // out. For a single requested node that is exactly backwards.
+  const resolved = new Set(["81"]);
+  const w = describeGroupMembershipGap([], [81], resolved, new Set());
+  assert.ok(!/captures 0 unrelated/.test(w), `must not claim a 0-node capture: ${w}`);
+  assert.ok(!/contiguous region/.test(w), `must not prescribe a layout change: ${w}`);
+  assert.match(w, /81/, "names the node that is missing");
+  assert.match(w, /CENTRE/, "names the rule that actually excluded it");
+
+  // A rect that refused the resync is named as such, not blamed on the layout.
+  const stuck = describeGroupMembershipGap([], [81], resolved, new Set(["81"]));
+  assert.match(stuck, /could not be reconciled/, `names the stuck rect: ${stuck}`);
+  assert.ok(!/CENTRE of their footprint falls outside/.test(stuck), "one cause, not both");
+
+  // An id that resolves to nothing is its own cause (#297's nonexistent-id case).
+  const unknown = describeGroupMembershipGap([], [99], new Set(), new Set());
+  assert.match(unknown, /do not exist in this graph/, `names the unknown id: ${unknown}`);
+
+  // The dense-layout sentence still fires when something extra WAS captured.
+  const dense = describeGroupMembershipGap([7, 8], [], resolved, new Set());
+  assert.match(dense, /also captures 2 unrelated node\(s\)/);
+  assert.match(dense, /contiguous region/);
 });
