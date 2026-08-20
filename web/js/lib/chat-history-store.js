@@ -941,8 +941,27 @@ function mergeThreadMessages(older, newer) {
   const oldMessages = Array.isArray(older?.msgs) ? older.msgs : [];
   const newMessages = Array.isArray(newer?.msgs) ? newer.msgs : [];
   const byId = new Map();
+  // The TIEBREAK, and it is the whole of #1516. A pre-v3 transcript carries no
+  // per-message timestamp, so normalizeMessage floors every one of its messages
+  // at createdAt:1 — which makes the timestamp comparison below a dead heat for
+  // the ENTIRE thread. The old tiebreak was the message id, and a pre-v3
+  // message's id is `legacy-<hash of its own content>`: sorting on it dealt the
+  // user's conversation back in content-hash order. Measured on a six-message
+  // legacy thread crossing the 0.7.x -> 0.15.x boundary the reporter hit:
+  //
+  //     stored   u1, a1, u2, a2, u3, a3
+  //     painted  a2, u3, a3, a1, u2, u1
+  //
+  // The user's first two prompts land after the agent's LAST reply, which is
+  // what "refreshing the page repeated my initial messages" looks like from the
+  // chat pane. Position in the source arrays is the order those records were
+  // actually written in, so rank by that instead. Timestamped messages are
+  // untouched: their comparison resolves before this ever runs, so cross-tab
+  // causal interleaving keeps deciding by time.
+  const rank = new Map();
   for (const message of [...oldMessages, ...newMessages]) {
     const previous = byId.get(message.id);
+    if (!rank.has(message.id)) rank.set(message.id, rank.size);
     if (!previous || compareRevisions(message.revision || message, previous.revision || previous) > 0) {
       byId.set(message.id, message);
     }
@@ -950,6 +969,7 @@ function mergeThreadMessages(older, newer) {
   return [...byId.values()].sort(
     (a, b) =>
       finiteTs(a.createdAt || a.ts) - finiteTs(b.createdAt || b.ts) ||
+      (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0) ||
       String(a.id).localeCompare(String(b.id)),
   );
 }
