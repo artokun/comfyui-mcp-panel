@@ -1346,9 +1346,18 @@ test("#1848: a widen that could not answer is reported as UNKNOWN, not as absenc
 
   // And the remedy has to change with the cause: reloading the tab re-registers widgets,
   // which does nothing for an /object_info read that ran out of time.
-  assert.match(unknown, /RETRY this add/);
-  assert.match(unknown, /Reloading the tab does NOT help/);
-  assert.doesNotMatch(unknown, /Reload the ComfyUI browser tab so node packs/);
+  // ADDITIVE. Every entry here reached the report because no widget constructor
+  // appeared after the full poll, so the missing widget is PROVEN and its remedy must
+  // survive. The unfinished schema read adds a second possible cause, it does not
+  // retract the first — and since the widen's bound is fixed, telling a user to retry
+  // INSTEAD of reloading would loop forever on a large enough /object_info.
+  assert.match(unknown, /Reload the ComfyUI browser tab/, "the proven cause keeps its remedy");
+  assert.match(unknown, /ALSO worth a RETRY/, "and the unresolved one is added, not substituted");
+  assert.doesNotMatch(
+    unknown,
+    /not a frontend widget|does NOT help/,
+    "never denies the one cause that is actually proven",
+  );
 });
 
 test("#1848: a COMPLETE proof still asserts absence, and keeps its own remedy", () => {
@@ -1359,7 +1368,7 @@ test("#1848: a COMPLETE proof still asserts absence, and keeps its own remedy", 
   assert.match(complete, /no installed node outputs "ZIPN_STYLE_GALLERY"/);
   assert.match(complete, /Reload the ComfyUI browser tab/);
   assert.doesNotMatch(complete, /UNKNOWN/);
-  assert.doesNotMatch(complete, /RETRY this add/);
+  assert.doesNotMatch(complete, /ALSO worth a RETRY/);
 
   // Default-true: every existing caller that passes three arguments keeps the old text.
   assert.equal(unavailableRequiredWidgetMessage(report, "ZipnStyler", 5000), complete);
@@ -1380,7 +1389,7 @@ test("#1848: link-proven inputs are unaffected by the schema-proof state", () =>
     // works for it. linkProven comes from SAFE_SOCKET_TYPES / core 3D types / this
     // class's own outputs, none of which a widen can change.
     assert.match(m, /Reload the ComfyUI browser tab/, "keeps the remedy that fits its cause");
-    assert.doesNotMatch(m, /RETRY this add/);
+    assert.doesNotMatch(m, /ALSO worth a RETRY/);
   }
 });
 
@@ -1396,7 +1405,7 @@ test("#1848: a MIXED report gives both remedies, because it has both causes", ()
     5000,
     false,
   );
-  assert.match(message, /RETRY this add/, "for the input whose producer question went unanswered");
+  assert.match(message, /ALSO worth a RETRY/, "for the input whose producer question went unanswered");
   assert.match(message, /Reload the ComfyUI browser tab/, "for the input waiting on a widget");
 });
 

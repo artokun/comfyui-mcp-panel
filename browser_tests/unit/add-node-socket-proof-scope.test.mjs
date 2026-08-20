@@ -570,7 +570,8 @@ for (const [label, bad] of [
       "a broken whole-schema read is not evidence that nothing produces the type",
     );
     assert.match(err.message, /whether any installed node outputs it is UNKNOWN/);
-    assert.match(err.message, /RETRY this add/, "the remedy follows the real cause");
+    assert.match(err.message, /ALSO worth a RETRY/, "the unresolved producer question is surfaced");
+    assert.match(err.message, /Reload the ComfyUI browser tab/, "and the proven cause keeps its remedy");
     assert.doesNotMatch(
       err.message,
       /SEEDVR2_DIT/,
