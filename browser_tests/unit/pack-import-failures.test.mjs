@@ -535,9 +535,9 @@ test("#1544 POSITIVE evidence only — a map that omits the pack never drops it"
 test("#1544 packsProvidingType reads the class list, and claims nothing else", () => {
   assert.deepEqual(
     [...packsProvidingType(NODE_MAP, "PreviewVideo")].sort(),
-    ["llmtoolkit", "vertexaicomfyuinodes"],
+    ["llm-toolkit", "vertex-ai-comfyui-nodes"],
   );
-  assert.deepEqual([...packsProvidingType(NODE_MAP, "LTXVAddGuide")], ["comfyuiltxvideo"]);
+  assert.deepEqual([...packsProvidingType(NODE_MAP, "LTXVAddGuide")], ["comfyui-ltxvideo"]);
   // Nothing to go on ⇒ no owners, which is the branch that handles not knowing.
   assert.equal(packsProvidingType(NODE_MAP, "NoSuchType").size, 0);
   assert.equal(packsProvidingType(null, "PreviewVideo").size, 0);
@@ -670,4 +670,58 @@ test("#1544 nodeMapPackCount counts what is checkable, not what is present", () 
   assert.equal(nodeMapPackCount(null), 0);
   assert.equal(nodeMapPackCount("<html>"), 0);
   assert.equal(nodeMapPackCount([["A"]]), 0, "an array payload carries no class list we can read");
+});
+
+test("#1544 two DIFFERENT packs that normalise alike never prove ownership", () => {
+  // Real collision from the live catalogue: ComfyUI-OmniSVG (A043-studios) and
+  // ComfyUI_OmniSVG (smthemex) are separate projects by separate authors. Under the
+  // #1447 `packKey` normalisation — which strips every non-alphanumeric — they are
+  // one key, and a failed A043 install would have been named as the proven owner of
+  // a class only smthemex provides. That is #1544's own bug restated with MORE
+  // confidence, which is strictly worse than the hedge it replaced.
+  //
+  // Measured on the live 5583-entry map: `packKey` leaves 79 keys claimed by more
+  // than one entry, 72 of which disagree about class names. Keeping separators takes
+  // that to 3, at no cost to the installed-folder hit rate (59/75 either way).
+  const COLLIDING = {
+    "https://github.com/A043-studios/ComfyUI-OmniSVG": [
+      ["OmniSVG Model Loader"],
+      { title_aux: "ComfyUI-OmniSVG" },
+    ],
+    "https://github.com/smthemex/ComfyUI_OmniSVG": [
+      ["SVG Saver"],
+      { title_aux: "ComfyUI_OmniSVG" },
+    ],
+  };
+  // Each is proven owner of its OWN class, and of nothing else.
+  assert.deepEqual([...packsProvidingType(COLLIDING, "OmniSVG Model Loader")], ["comfyui-omnisvg"]);
+  assert.deepEqual([...packsProvidingType(COLLIDING, "SVG Saver")], ["comfyui_omnisvg"]);
+
+  // The hyphen pack failed; the underscore pack owns the requested class. Nothing
+  // may present the hyphen pack as the cause.
+  const note = importFailureNote(["ComfyUI-OmniSVG"], {
+    forType: "SVG Saver",
+    liveDefs: CORE_ONLY_DEFS,
+    nodeMap: COLLIDING,
+  });
+  assert.match(note, /SEPARATE ISSUE/);
+  assert.doesNotMatch(note, /is provided by/);
+});
+
+test("#1544 entries under ONE key must agree before that key owns a type", () => {
+  // The 3 collisions that survive separator-preserving keys. Aliases of a single
+  // pack list the same classes and still promote; two projects filed under one key
+  // that disagree promote nothing.
+  const ALIASES = {
+    "https://github.com/x/Same-Pack": [["ClassA"], {}],
+    "https://github.com/x/Same-Pack.git": [["ClassA"], {}],
+  };
+  assert.deepEqual([...packsProvidingType(ALIASES, "ClassA")], ["same-pack"], "agreeing aliases promote");
+
+  const DISAGREE = {
+    "https://github.com/one/Dup-Pack": [["ClassA"], {}],
+    "https://github.com/two/Dup-Pack": [["ClassB"], {}],
+  };
+  assert.equal(packsProvidingType(DISAGREE, "ClassA").size, 0, "one entry omits it ⇒ not proven");
+  assert.equal(packsProvidingType(DISAGREE, "ClassB").size, 0);
 });

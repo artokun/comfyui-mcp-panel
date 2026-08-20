@@ -150,7 +150,8 @@ const SUBGRAPH_UUID =
  * (`llm-toolkit`). Manager clones into a folder named after that last segment, which
  * is the SAME segment the `(IMPORT FAILED)` log line prints — so the final path
  * component, `.git` stripped, is what the two sides have in common. Normalised
- * through `packKey` so case and separators do not decide a match.
+ * through `ownerKey` — case-folded, separators KEPT — see there for why the looser
+ * `packKey` merges packs that are genuinely different projects.
  */
 function packKeyFromNodeMapKey(key) {
   const s = String(key || "")
@@ -159,7 +160,29 @@ function packKeyFromNodeMapKey(key) {
     .replace(/\/+$/, "");
   if (!s) return "";
   const seg = s.split(/[/\\]/).filter(Boolean).pop() || s;
-  return packKey(seg.replace(/\.git$/i, ""));
+  return ownerKey(seg.replace(/\.git$/i, ""));
+}
+
+/**
+ * The identity an OWNERSHIP claim is matched on: case-folded, separators KEPT.
+ *
+ * Deliberately stricter than `packKey`, which strips every non-alphanumeric. That
+ * loose form is right for #1447 — it matches a pack folder against ITSELF across
+ * case and separator drift — but it is wrong here, because it merges packs that are
+ * genuinely different projects. `ComfyUI-OmniSVG` (A043-studios) and
+ * `ComfyUI_OmniSVG` (smthemex) are separate repos by separate authors and collapse
+ * to one key; so do `ComfyUI-QwenVL`, `ComfyUI-Qwen-VL` and `ComfyUI_QwenVL`.
+ * Promoting on that would name the WRONG pack as a proven cause — #1544's own bug,
+ * restated with more confidence.
+ *
+ * Measured on the live 5583-entry map: under `packKey`, 79 normalised keys are
+ * claimed by more than one catalogue entry and 72 of those disagree about class
+ * names. Keeping separators takes that to 3, and costs nothing — the installed
+ * folder hit rate is 59/75 either way, because Manager clones into a folder named
+ * after the repo, separators and all.
+ */
+function ownerKey(name) {
+  return String(name || "").trim().toLowerCase();
 }
 
 /**
@@ -194,11 +217,24 @@ export function packsProvidingType(nodeMap, forType) {
   // "no owner", which is the branch that already handles not knowing. So an array
   // simply yields no owners and the caller says ownership was not established.
   if (Array.isArray(nodeMap)) return out;
+  // UNANIMITY among every catalogue entry sharing an owner key. Keeping separators
+  // leaves 3 keys still claimed by entries that disagree about class names, and a
+  // single one of those is enough to name the wrong pack with confidence. So a key
+  // owns the type only when EVERY entry filed under it provides it: aliases of one
+  // pack agree and still promote; two different projects that collide do not.
+  const byKey = new Map();
   for (const [key, val] of Object.entries(nodeMap)) {
     const classes = Array.isArray(val) ? val[0] : null;
-    if (!Array.isArray(classes) || !classes.includes(type)) continue;
+    if (!Array.isArray(classes)) continue;
     const pk = packKeyFromNodeMapKey(key);
-    if (pk) out.add(pk);
+    if (!pk) continue;
+    const seen = byKey.get(pk) || { entries: 0, providing: 0 };
+    seen.entries += 1;
+    if (classes.includes(type)) seen.providing += 1;
+    byKey.set(pk, seen);
+  }
+  for (const [pk, seen] of byKey) {
+    if (seen.providing > 0 && seen.providing === seen.entries) out.add(pk);
   }
   return out;
 }
@@ -285,7 +321,7 @@ export function importFailureNote(failed, opts = {}) {
   // one message that finally has a definite answer. A workflow LOAD still reports
   // every failure (the no-forType branch below).
   const owners = packsProvidingType(o.nodeMap, forType);
-  const owning = owners.size ? relevant.filter((name) => owners.has(packKey(name))) : [];
+  const owning = owners.size ? relevant.filter((name) => owners.has(ownerKey(name))) : [];
   if (owning.length) {
     const many = owning.length > 1;
     return (
