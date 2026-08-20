@@ -725,3 +725,30 @@ test("#1544 entries under ONE key must agree before that key owns a type", () =>
   assert.equal(packsProvidingType(DISAGREE, "ClassA").size, 0, "one entry omits it ⇒ not proven");
   assert.equal(packsProvidingType(DISAGREE, "ClassB").size, 0);
 });
+
+test("#1544 a map HIT promotes through the shipped guard, not just the helper", async () => {
+  // Review gap: the other resolver test asserts SEPARATE ISSUE, which is ALSO the
+  // no-map wording — so discarding the fetched map (`await readNodeMap()` without
+  // assigning it) would still have passed every test here. The cost test proves the
+  // injector is CALLED and the wiring test proves the panel PASSES it; neither
+  // proves the fetched payload reaches importFailureNote. This does: the map owns
+  // the type, so the refusal must carry the causal wording.
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const err = await assertAddNodeResolvableRefreshing({}, "LTXVAddGuide", {
+    getFreshObjectInfo: async () => CORE_ONLY_DEFS,
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => ["ComfyUI-LTXVideo"],
+    readNodeMap: async () => NODE_MAP,
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an absent type must still be refused");
+  assert.match(err.message, /Unknown node type "LTXVAddGuide"/);
+  assert.match(err.message, /BEFORE INSTALLING ANYTHING/);
+  assert.match(err.message, /"LTXVAddGuide" is provided by ComfyUI-LTXVideo/);
+  assert.match(err.message, /Ownership is from ComfyUI-Manager's node map/);
+  assert.doesNotMatch(err.message, /SEPARATE ISSUE/);
+});
