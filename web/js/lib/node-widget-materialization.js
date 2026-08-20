@@ -298,30 +298,55 @@ export function unavailableRequiredWidgetReport(
 
 /**
  * The refusal text for a report that never cleared. Says which INPUT is unsatisfiable
- * (not just its datatype), which of the two situations it is, and what actually fixes
+ * (not just its datatype), which of the situations it is, and what actually fixes
  * each — the previous single-cause message named a remedy ("retry shortly") that cannot
  * work for a datatype no widget will ever back, and named none for the case that does.
+ *
+ * #1848 — there are THREE situations, not two. "No installed node outputs T" is a claim
+ * about the whole install, and it is only true if the whole schema was actually read. The
+ * socket proof may come from a single-class /object_info (#780's optimisation), in which
+ * case it is widened against the full schema on the refusal path (#821) — and that widen
+ * is BOUNDED (#1180/#1192), so on a heavy install it can return nothing. When it does,
+ * the guard rightly keeps failing closed, but the MESSAGE must not upgrade "I could not
+ * find out" into "nothing produces it". That is the same false-cause defect #695 and #700
+ * were about, and it sends the reader to a remedy (reload the tab) that cannot help: the
+ * missing thing is not a frontend widget, it is the answer to a question never asked.
+ *
+ * `schemaProofComplete` is false only when a widen was attempted and could not answer.
  */
-export function unavailableRequiredWidgetMessage(report, classType, waitedMs) {
+export function unavailableRequiredWidgetMessage(report, classType, waitedMs, schemaProofComplete = true) {
   const target = classType ? `"${classType}"` : "this node";
   const lines = report.map((entry) => {
     const inputs = entry.inputs.map((name) => `"${name}"`).join(", ");
     const cause = entry.linkProven
       ? `the backend declares "${entry.type}" as a link datatype, but this input also declares a ` +
         `widget value (default/min/max/options), so it needs a registered widget and none appeared`
-      : `no installed node outputs "${entry.type}" and no frontend widget is registered for it`;
+      : schemaProofComplete
+        ? `no installed node outputs "${entry.type}" and no frontend widget is registered for it`
+        : `no frontend widget is registered for "${entry.type}", and whether any installed node ` +
+          `outputs it is UNKNOWN — the full /object_info read that would answer it did not ` +
+          `complete in time, so this is not evidence that nothing produces it`;
     return `  - input ${inputs} (declared type "${entry.type}"): ${cause}.`;
   });
   const waited = Number.isFinite(waitedMs) ? `${(waitedMs / 1000).toFixed(1)}s` : "the wait window";
+  const remedy = schemaProofComplete
+    ? "Reload the ComfyUI browser tab so node packs can re-register their frontend widgets, then " +
+      "retry. If it fails again the pack's frontend extension is not loading and retrying alone " +
+      "will not fix it. This is NOT a link datatype being misread: an input the backend proves is " +
+      "a socket (MASK, IMAGE, LATENT, a comma-joined union of them) is added immediately, without " +
+      "any wait."
+    : // The schema read is the thing that ran out of time, so a retry is the remedy that can
+      // actually change the answer — unlike reloading the tab, which re-registers widgets and
+      // does nothing about an /object_info read that did not finish.
+      "RETRY this add: the full /object_info read is what ran out of time, and a retry can " +
+      "complete it. Reloading the tab does NOT help here — the missing thing is the schema " +
+      "answer, not a frontend widget. If it keeps timing out, this install's /object_info is " +
+      "large enough that the read needs a longer budget.";
   return (
     `Cannot add ${target}: ${report.length} required input type${report.length === 1 ? "" : "s"} ` +
     `had no widget after ${waited} waiting for node extensions to register.\n` +
     `${lines.join("\n")}\n` +
-    "Reload the ComfyUI browser tab so node packs can re-register their frontend widgets, then " +
-    "retry. If it fails again the pack's frontend extension is not loading and retrying alone " +
-    "will not fix it. This is NOT a link datatype being misread: an input the backend proves is " +
-    "a socket (MASK, IMAGE, LATENT, a comma-joined union of them) is added immediately, without " +
-    "any wait."
+    remedy
   );
 }
 
