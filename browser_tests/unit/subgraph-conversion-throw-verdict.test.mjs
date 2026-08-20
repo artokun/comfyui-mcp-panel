@@ -440,9 +440,13 @@ test("the two conversion tools no longer select for themselves — the runner do
   const fn = runner.slice(0, runner.indexOf("\nfunction "));
   assert.ok(fn.includes("canvas?.selectItems"), "the runner must make the selection");
   assert.ok(fn.includes("canvas?.selectNodes"), "including the deprecated fallback");
+  // `indexOf` alone has no teeth here: deleting the refusal makes it -1, which is
+  // "before" everything. Require it to be PRESENT first.
+  const refusalAt = fn.indexOf("selection API");
+  assert.ok(refusalAt > -1, "a frontend with neither selection API must be refused, not fallen through");
   assert.ok(
-    fn.indexOf("selection API") < fn.indexOf("graph.convertToSubgraph"),
-    "a frontend with no selection API must be refused before the conversion, not after",
+    refusalAt < fn.indexOf("graph.convertToSubgraph"),
+    "and refused before the conversion, not after it",
   );
 });
 
