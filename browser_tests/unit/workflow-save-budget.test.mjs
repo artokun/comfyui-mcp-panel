@@ -326,12 +326,12 @@ test("#1455: a Save-As names the DESTINATION, not the source it was copied from"
     budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
     modified: true,
     persisted: false,
-    filename: "Copy.json",
+    filename: "Copy",
     requested: "Copy.json",
-    previousActive: "Original.json",
+    previousActive: "Original",
   });
-  assert.match(text, /for "Copy\.json"/);
-  assert.doesNotMatch(text, /for "Original\.json"/);
+  assert.match(text, /for "Copy(\.json)?"/);
+  assert.doesNotMatch(text, /Original/);
   assert.match(text, /modified:true/);
 });
 
@@ -340,11 +340,11 @@ test("#1455: a known destination with the canvas elsewhere withholds the foreign
     budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
     modified: false,
     persisted: true,
-    filename: "Something else.json",
+    filename: "Something else",
     requested: "Copy.json",
-    previousActive: "Original.json",
+    previousActive: "Original",
   });
-  assert.match(text, /for "Copy\.json"/);
+  assert.match(text, /for "Copy(\.json)?"/);
   // Those flags belong to another workflow; reporting them here would be a wrong-target
   // claim of exactly the kind this issue is about.
   assert.doesNotMatch(text, /modified:false/);
@@ -358,14 +358,14 @@ test("#1455: an un-named save whose canvas moved says the target is undeterminab
     budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
     modified: false,
     persisted: true,
-    filename: "Real name.json",
+    filename: "Real name",
     previousActive: "Unsaved Workflow (2)",
   });
   assert.match(text, /cannot be determined from here/);
-  assert.match(text, /changed from "Unsaved Workflow \(2\)" to "Real name\.json"/);
+  assert.match(text, /changed from "Unsaved Workflow \(2\)" to "Real name"/);
   // No file is named as the target, because none is known to be.
   assert.doesNotMatch(text, /for "Unsaved Workflow \(2\)"/);
-  assert.doesNotMatch(text, /for "Real name\.json"/);
+  assert.doesNotMatch(text, /for "Real name"/);
 });
 
 test("#1455 WIRING: the requested name reaches the reply as the destination", async () => {
@@ -375,8 +375,8 @@ test("#1455 WIRING: the requested name reaches the reply as the destination", as
   const observeWorkflow = () => {
     call += 1;
     return call === 1
-      ? { modified: true, persisted: true, filename: "Original.json" }
-      : { modified: true, persisted: false, filename: "Copy.json" };
+      ? { modified: true, persisted: true, filename: "Original" }
+      : { modified: true, persisted: false, filename: "Copy" };
   };
   await assert.rejects(
     () =>
@@ -390,8 +390,8 @@ test("#1455 WIRING: the requested name reaches the reply as the destination", as
         observeWorkflow,
       }),
     (err) => {
-      assert.match(err.message, /for "Copy\.json"/, "names the requested destination");
-      assert.doesNotMatch(err.message, /for "Original\.json"/, "never the source");
+      assert.match(err.message, /for "Copy(\.json)?"/, "names the destination, not the source");
+      assert.doesNotMatch(err.message, /for "Original"/, "never the source");
       return true;
     },
   );
@@ -407,4 +407,35 @@ test("#1455 WIRING: BOTH save handlers pass the requested name to the bound save
   const bound = panel.match(/runBoundedWorkflowSave\(/g) ?? [];
   assert.equal(bound.length, 2, "exactly two bounded save call sites (workflow_save, workflow_save_as)");
   assert.equal(passes.length, 2, "both of them pass the destination name");
+});
+
+test("#1455: a requested name and the canvas name are the SAME workflow once normalized", () => {
+  // panel_list_workflows hands back "workflows/Foo.json"; the canvas reports "Foo".
+  // Comparing those raw is a wrong-pair test — it claims the canvas moved off its own
+  // destination and suppresses modified:true, the only one-directional evidence here.
+  for (const requested of ["Foo.json", "workflows/Foo.json", " Foo ", "Foo.app.json"]) {
+    const text = describeWorkflowSaveTimeout({
+      budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+      modified: true,
+      persisted: false,
+      filename: "Foo",
+      requested,
+      previousActive: "Original",
+    });
+    assert.doesNotMatch(text, /not the save's destination/, requested + " is the canvas");
+    assert.match(text, /modified:true/, requested + " keeps the dirty observation");
+    assert.match(text, /has not been acknowledged as landed/);
+  }
+});
+
+test("#1455: with no flags readable the reply does not reason about a flag it never saw", () => {
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    filename: "Foo",
+    requested: "Foo.json",
+  });
+  assert.match(text, /could not be read/);
+  assert.match(text, /UNDETERMINED/);
+  // The modified:false rationale belongs to a reading that did not happen.
+  assert.doesNotMatch(text, /never dirty/);
 });
