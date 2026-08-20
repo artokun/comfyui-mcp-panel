@@ -10710,7 +10710,10 @@ async function awaitRequiredCustomWidgetRegistration(
   // spend the full 5 s on every such add and still reach the same answer. A widen that
   // throws or yields nothing leaves the original proof in place and the guard fails closed
   // exactly as it does today — #580's protection does not depend on this succeeding.
-  if (unavailable.length && typeof widenSocketProof === "function") {
+  // #1848 — a widen that was ATTEMPTED and could not answer leaves the guard failing
+  // closed (correct), but it also means nothing here knows whether a producer exists.
+  // Remember that, so the refusal reports "unknown" instead of "nothing outputs it".
+  let schemaProofComplete = true;  if (unavailable.length && typeof widenSocketProof === "function") {
     let widened = null;
     try {
       // #1192 — the widen's bound is derived from THIS wait's effective deadline, which
@@ -10722,6 +10725,10 @@ async function awaitRequiredCustomWidgetRegistration(
     if (widened && typeof widened.has === "function") {
       socketTypes = widened;
       unavailable = check();
+    } else {
+      // null is this helper's answer for every doubtful payload INCLUDING a call that
+      // never returned in budget — which is exactly "I did not find out".
+      schemaProofComplete = false;
     }
   }
   while (monotonicNow() < deadline) {
@@ -10767,7 +10774,7 @@ async function awaitRequiredCustomWidgetRegistration(
   // of defect as #663 and #852: a refusal naming a remedy that cannot work.
   const cutShort = wait < CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   throw new Error(
-    unavailableRequiredWidgetMessage(unavailable, classType, monotonicNow() - startedAt) +
+    unavailableRequiredWidgetMessage(unavailable, classType, monotonicNow() - startedAt, schemaProofComplete) +
       (cutShort
         ? `\nNOTE: this wait was cut short — it got ${(wait / 1000).toFixed(1)}s of its normal ` +
           `${(CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS / 1000).toFixed(1)}s because THIS COMMAND had ` +

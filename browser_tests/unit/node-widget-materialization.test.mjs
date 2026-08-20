@@ -1020,8 +1020,11 @@ test("#695: graph_add_node consumes the report and message, and names the class"
     src,
     // #1180 — monotonicNow, not Date.now. `startedAt` is read from the monotonic clock, so
     // subtracting a wall-clock reading from it reports an elapsed wait of roughly 1.7e12 ms.
-    /unavailableRequiredWidgetMessage\(unavailable, classType, monotonicNow\(\) - startedAt\)/,
-    "the refusal is built from the report, with the elapsed wait — measured on ONE clock",
+    // #1848 — the fourth argument is the fix: without it the refusal cannot tell
+    // "checked, nothing produces it" from "could not check". Deleting it here is
+    // invisible to every message-level test above, so it is pinned at the source.
+    /unavailableRequiredWidgetMessage\(unavailable, classType, monotonicNow\(\) - startedAt, schemaProofComplete\)/,
+    "the refusal is built from the report, with the elapsed wait — measured on ONE clock — and whether the schema proof completed",
   );
   assert.match(
     src,
@@ -1314,4 +1317,108 @@ test("#636: EVERY input carrying the type must be accounted for, not just one", 
   );
   const both = { type: "X", inputs: [{ name: "video" }, { name: "video_b" }], widgets: [] };
   assert.deepEqual(unavailableEntriesLiveNodeCannotExplain(refused, both), []);
+});
+
+// ---------------------------------------------------------------------------
+// #1848 — "no installed node outputs T" is a claim about the WHOLE install, and it
+// is only true if the whole schema was actually read.
+// ---------------------------------------------------------------------------
+
+test("#1848: a widen that could not answer is reported as UNKNOWN, not as absence", () => {
+  const report = [{ type: "SAM3_MODEL_CONFIG", inputs: ["sam3_model_config"], linkProven: false }];
+
+  // The reporter's case: LoadSAM3Model was added seconds earlier and outputs exactly this
+  // type, /object_info proves it — but the bounded whole-schema read did not finish, so
+  // nothing here had grounds to say anything about producers.
+  const unknown = unavailableRequiredWidgetMessage(report, "SAM3Grounding", 5000, false);
+  assert.doesNotMatch(
+    unknown,
+    /no installed node outputs/,
+    "never asserts absence from a state of not-knowing",
+  );
+  assert.match(unknown, /UNKNOWN/);
+  // Deliberately not "in time": schemaProofComplete=false also covers a rejected
+  // getNodeDefs and an empty payload, so claiming a TIMEOUT would over-specify a
+  // cause the flag cannot distinguish.
+  assert.match(unknown, /did not complete/);
+  assert.doesNotMatch(unknown, /did not complete in time/);
+  assert.match(unknown, /not evidence that nothing produces it/);
+
+  // And the remedy has to change with the cause: reloading the tab re-registers widgets,
+  // which does nothing for an /object_info read that ran out of time.
+  // ADDITIVE. Every entry here reached the report because no widget constructor
+  // appeared after the full poll, so the missing widget is PROVEN and its remedy must
+  // survive. The unfinished schema read adds a second possible cause, it does not
+  // retract the first — and since the widen's bound is fixed, telling a user to retry
+  // INSTEAD of reloading would loop forever on a large enough /object_info.
+  assert.match(unknown, /Reload the ComfyUI browser tab/, "the proven cause keeps its remedy");
+  assert.match(unknown, /ALSO worth a RETRY/, "and the unresolved one is added, not substituted");
+  assert.doesNotMatch(
+    unknown,
+    /not a frontend widget|does NOT help/,
+    "never denies the one cause that is actually proven",
+  );
+});
+
+test("#1848: a COMPLETE proof still asserts absence, and keeps its own remedy", () => {
+  // The fix must not soften the case that is genuinely proven — a type nothing outputs
+  // still fails closed with the message #695 built.
+  const report = [{ type: "ZIPN_STYLE_GALLERY", inputs: ["gallery"], linkProven: false }];
+  const complete = unavailableRequiredWidgetMessage(report, "ZipnStyler", 5000, true);
+  assert.match(complete, /no installed node outputs "ZIPN_STYLE_GALLERY"/);
+  assert.match(complete, /Reload the ComfyUI browser tab/);
+  assert.doesNotMatch(complete, /UNKNOWN/);
+  assert.doesNotMatch(complete, /ALSO worth a RETRY/);
+
+  // Default-true: every existing caller that passes three arguments keeps the old text.
+  assert.equal(unavailableRequiredWidgetMessage(report, "ZipnStyler", 5000), complete);
+});
+
+test("#1848: link-proven inputs are unaffected by the schema-proof state", () => {
+  // linkProven is decided by the backend's own declaration, not by the widen, so an
+  // incomplete proof must not change that branch's text.
+  const report = [{ type: "ACME_VALUE", inputs: ["amount"], linkProven: true }];
+  const a = unavailableRequiredWidgetMessage(report, "AcmeNode", 5000, true);
+  const b = unavailableRequiredWidgetMessage(report, "AcmeNode", 5000, false);
+  for (const m of [a, b]) {
+    assert.match(m, /declares "ACME_VALUE" as a link datatype/);
+    assert.doesNotMatch(m, /no installed node outputs/);
+    // The REMEDY, not just the cause. Checking only the cause line is how the first
+    // version of this fix shipped a report-wide remedy over a per-entry cause: a
+    // link-proven entry got "reloading does NOT help", deleting the only advice that
+    // works for it. linkProven comes from SAFE_SOCKET_TYPES / core 3D types / this
+    // class's own outputs, none of which a widen can change.
+    assert.match(m, /Reload the ComfyUI browser tab/, "keeps the remedy that fits its cause");
+    assert.doesNotMatch(m, /ALSO worth a RETRY/);
+  }
+});
+
+test("#1848: a MIXED report gives both remedies, because it has both causes", () => {
+  // One input waiting on a widget, another on an answer. Emitting only one remedy
+  // strands whichever input it does not address.
+  const message = unavailableRequiredWidgetMessage(
+    [
+      { type: "IMAGE,MASK", inputs: ["canvas"], linkProven: true },
+      { type: "SAM3_MODEL_CONFIG", inputs: ["cfg"], linkProven: false },
+    ],
+    "MixedNode",
+    5000,
+    false,
+  );
+  assert.match(message, /ALSO worth a RETRY/, "for the input whose producer question went unanswered");
+  assert.match(message, /Reload the ComfyUI browser tab/, "for the input waiting on a widget");
+});
+
+test("#1848 WIRING: the widen's failure sets the flag the message reads", () => {
+  // The flag is only correct if it is set on the SAME branch that discards the widen.
+  // A helper-level test cannot see that; assert on the source.
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /let schemaProofComplete = true;/, "declared before the widen");
+  // The else-branch of the widen acceptance test is the only place it may be cleared:
+  // widenSocketProof answers null for every doubtful payload INCLUDING a timeout.
+  assert.match(
+    src,
+    /if \(widened && typeof widened\.has === "function"\) \{[\s\S]{0,200}?\} else \{[\s\S]{0,400}?schemaProofComplete = false;/,
+    "cleared exactly where the widen is rejected, not somewhere else",
+  );
 });

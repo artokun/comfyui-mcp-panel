@@ -298,30 +298,72 @@ export function unavailableRequiredWidgetReport(
 
 /**
  * The refusal text for a report that never cleared. Says which INPUT is unsatisfiable
- * (not just its datatype), which of the two situations it is, and what actually fixes
+ * (not just its datatype), which of the situations it is, and what actually fixes
  * each — the previous single-cause message named a remedy ("retry shortly") that cannot
  * work for a datatype no widget will ever back, and named none for the case that does.
+ *
+ * #1848 — there are THREE situations, not two. "No installed node outputs T" is a claim
+ * about the whole install, and it is only true if the whole schema was actually read. The
+ * socket proof may come from a single-class /object_info (#780's optimisation), in which
+ * case it is widened against the full schema on the refusal path (#821) — and that widen
+ * is BOUNDED (#1180/#1192), so on a heavy install it can return nothing. When it does,
+ * the guard rightly keeps failing closed, but the MESSAGE must not upgrade "I could not
+ * find out" into "nothing produces it". That is the same false-cause defect #695 and #700
+ * were about, and it sends the reader to a remedy (reload the tab) that cannot help: the
+ * missing thing is not a frontend widget, it is the answer to a question never asked.
+ *
+ * `schemaProofComplete` is false only when a widen was attempted and could not answer.
  */
-export function unavailableRequiredWidgetMessage(report, classType, waitedMs) {
+export function unavailableRequiredWidgetMessage(report, classType, waitedMs, schemaProofComplete = true) {
   const target = classType ? `"${classType}"` : "this node";
   const lines = report.map((entry) => {
     const inputs = entry.inputs.map((name) => `"${name}"`).join(", ");
     const cause = entry.linkProven
       ? `the backend declares "${entry.type}" as a link datatype, but this input also declares a ` +
         `widget value (default/min/max/options), so it needs a registered widget and none appeared`
-      : `no installed node outputs "${entry.type}" and no frontend widget is registered for it`;
+      : schemaProofComplete
+        ? `no installed node outputs "${entry.type}" and no frontend widget is registered for it`
+        : `no frontend widget is registered for "${entry.type}", and whether any installed node ` +
+          `outputs it is UNKNOWN — the full /object_info read that would answer it did not ` +
+          `complete, so this is not evidence that nothing produces it`;
     return `  - input ${inputs} (declared type "${entry.type}"): ${cause}.`;
   });
   const waited = Number.isFinite(waitedMs) ? `${(waitedMs / 1000).toFixed(1)}s` : "the wait window";
-  return (
-    `Cannot add ${target}: ${report.length} required input type${report.length === 1 ? "" : "s"} ` +
-    `had no widget after ${waited} waiting for node extensions to register.\n` +
-    `${lines.join("\n")}\n` +
+  // #1848 (gate) — the CAUSE is per entry, so the REMEDY has to be too. `linkProven` is
+  // decided from SAFE_SOCKET_TYPES / core 3D types / this class's own outputs, none of
+  // which a widen can change, so a report made only of link-proven entries is untouched
+  // by the schema question and must keep the remedy that can actually help it. Switching
+  // the whole message on a report-wide flag deleted that advice — the same
+  // remedy-that-cannot-work defect (#695/#700) this change exists to fix.
+  const schemaUnknown = !schemaProofComplete && report.some((e) => !e.linkProven);
+  const reloadRemedy =
     "Reload the ComfyUI browser tab so node packs can re-register their frontend widgets, then " +
     "retry. If it fails again the pack's frontend extension is not loading and retrying alone " +
     "will not fix it. This is NOT a link datatype being misread: an input the backend proves is " +
     "a socket (MASK, IMAGE, LATENT, a comma-joined union of them) is added immediately, without " +
-    "any wait."
+    "any wait.";
+  // ADDITIVE, never substitutive. Every entry in this report reached it because no widget
+  // constructor existed after the full poll, so "no frontend widget is registered" is the
+  // one thing here that is PROVEN. An unfinished schema read adds a second possible cause
+  // (a sibling may output the type); it does not retract the first. Saying "the missing
+  // thing is the schema answer, not a frontend widget" denied the proven half and removed
+  // its remedy — and because the widen's bound is fixed, an install whose /object_info
+  // exceeds it re-fails identically on every retry, so that advice could never resolve.
+  const retryRemedy =
+    "ALSO worth a RETRY: whether any installed node outputs the type(s) above is unresolved — " +
+    "the full /object_info read that would settle it did not complete, and a retry can " +
+    "complete that read. If retries keep hitting the same wall, this install's /object_info " +
+    "may be large enough that the read needs a longer budget.";
+  // The reload advice fits EVERY entry (each one is a widget that did not appear), so it
+  // is always emitted. The retry advice is stacked on top only when a producer question
+  // was left unanswered.
+  const remedy = schemaUnknown ? `${reloadRemedy}
+${retryRemedy}` : reloadRemedy;
+  return (
+    `Cannot add ${target}: ${report.length} required input type${report.length === 1 ? "" : "s"} ` +
+    `had no widget after ${waited} waiting for node extensions to register.\n` +
+    `${lines.join("\n")}\n` +
+    remedy
   );
 }
 
