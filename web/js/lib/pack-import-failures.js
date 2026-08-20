@@ -187,12 +187,15 @@ export function packsProvidingType(nodeMap, forType) {
   const type = String(forType || "").trim();
   const out = new Set();
   if (!type || !nodeMap || typeof nodeMap !== "object") return out;
-  // Both wire shapes, exactly as parseNodeMappings handles them: an ARRAY of pack
-  // objects, or the documented MAP of key → [[classNames…], meta].
-  const entries = Array.isArray(nodeMap)
-    ? nodeMap.map((p) => [p?.id ?? p?.reference ?? p?.title, p?.nodenames ?? p?.nodes])
-    : Object.entries(nodeMap).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v?.nodenames]);
-  for (const [key, classes] of entries) {
+  // ONLY the documented MAP shape, key → [[classNames…], meta]. `parseNodeMappings`
+  // also accepts an ARRAY of pack objects, but it reads ids and titles from those —
+  // it never reads a class list, and no array payload carrying one was observed
+  // here. Inventing a field name for it would be a guess, and a wrong guess reads as
+  // "no owner", which is the branch that already handles not knowing. So an array
+  // simply yields no owners and the caller says ownership was not established.
+  if (Array.isArray(nodeMap)) return out;
+  for (const [key, val] of Object.entries(nodeMap)) {
+    const classes = Array.isArray(val) ? val[0] : null;
     if (!Array.isArray(classes) || !classes.includes(type)) continue;
     const pk = packKeyFromNodeMapKey(key);
     if (pk) out.add(pk);
@@ -303,9 +306,14 @@ export function importFailureNote(failed, opts = {}) {
     `${plural ? "these packs" : "this pack"} FAILED TO IMPORT at startup — ${list}. ` +
     `Nothing ties ${plural ? "them" : "it"} to "${forType}" — ${why} — so do not reinstall ` +
     `${plural ? "them" : "it"} expecting "${forType}" to appear. ` +
+    // #775's advice is still owed to the reader — a failed import is a real fault
+    // whoever hits this should fix, and re-installing is a dead end for it whether
+    // or not it owns the type they asked for. Demoting the CAUSAL claim must not
+    // quietly drop the remedy that made the note worth writing.
     `${plural ? "Those failures are" : "That failure is"} still worth fixing on ${
       plural ? "their" : "its"
-    } own: a pack that fails to import registers NONE of its nodes. ` +
+    } own: a pack that fails to import registers NONE of its nodes, and installing ` +
+    `${plural ? "them" : "it"} again will not help. ` +
     howToReadTheLog(relevant.length)
   );
 }

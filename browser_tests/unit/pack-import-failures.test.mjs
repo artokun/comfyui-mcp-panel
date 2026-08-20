@@ -23,6 +23,7 @@ import {
   importFailureNote,
   readPackImportFailures,
   dropLivePackImportFailures,
+  packsProvidingType,
 } from "../../web/js/lib/pack-import-failures.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -314,8 +315,17 @@ test("#1447 a leftover failure is labelled as not owning the requested type", as
   );
   assert.match(err.message, /ComfyUI-LTXVideo/);
   assert.doesNotMatch(err.message, /comfyui-reactor-node/);
-  assert.match(err.message, /does not prove it provides "VideoToImages"/);
-  assert.match(err.message, /may be unrelated/);
+  // #1544 made this claim stronger and moved it to the FRONT. #1447 shipped it as a
+  // trailing "does not prove it provides X — the failure may be unrelated", and a
+  // reporter read straight past it to the pack name. Same finding, stated where it
+  // is read; the ordering assertion is what stops it drifting back to a footnote.
+  assert.match(err.message, /not the cause of this missing type/);
+  assert.match(err.message, /Nothing ties it to "VideoToImages"/);
+  assert.ok(
+    err.message.indexOf("not the cause of this missing type") <
+      err.message.indexOf("ComfyUI-LTXVideo"),
+    "the qualifier must come before the pack name",
+  );
 });
 
 test("#1447 importFailureNote itself drops a live pack", () => {
@@ -411,4 +421,218 @@ test("#1180: the bound covers the BODY, not just the response head", async () =>
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// --- #1544: a failed pack is the CAUSE only when the node map says it owns the type ---
+//
+// `panel_add_node PreviewVideo` was refused with "coldinfire_fal_privacy FAILED TO
+// IMPORT at startup" attached. Nothing connected them. The note had a trailing
+// hedge, and it did not survive contact with a reader: the sentence that leads
+// with a pack name is the one that gets acted on.
+//
+// The fixture mirrors a real `/customnode/getmappings` payload — BOTH key shapes
+// occur in one response (repo URL and bare registry id), and the three packs below
+// are the three the live 5583-entry map really does list for PreviewVideo.
+const NODE_MAP = {
+  "https://github.com/khanhlvg/vertex-ai-comfyui-nodes": [
+    ["PreviewVideo", "VertexImagen"],
+    { title_aux: "[Unofficial] Vertex AI Custom Nodes for ComfyUI" },
+  ],
+  "llm-toolkit": [["PreviewVideo"], { title_aux: "ComfyUI LLM Toolkit" }],
+  "https://github.com/lightricks/ComfyUI-LTXVideo.git": [
+    ["LTXVAddGuide", "LTXVPreprocess"],
+    { title_aux: "ComfyUI-LTXVideo" },
+  ],
+};
+
+/** A live /object_info with no custom-node pack in common with the failures. */
+const CORE_ONLY_DEFS = { KSampler: { python_module: "nodes" } };
+
+test("#1544 the reported refusal no longer blames an unrelated failed pack", () => {
+  const note = importFailureNote(["coldinfire_fal_privacy"], {
+    forType: "PreviewVideo",
+    liveDefs: CORE_ONLY_DEFS,
+    nodeMap: NODE_MAP,
+  });
+  // The map lists three packs for PreviewVideo and coldinfire_fal_privacy is not
+  // one of them, so nothing may present it as the reason.
+  assert.doesNotMatch(note, /BEFORE INSTALLING ANYTHING/);
+  assert.match(note, /SEPARATE ISSUE, not the cause of this missing type/);
+  assert.match(note, /ComfyUI-Manager's node map does not link it to that type/);
+  assert.match(note, /do not reinstall it expecting "PreviewVideo" to appear/);
+
+  // ORDER is the fix. The pack is still disclosed — a failed import is a real
+  // problem — but the reader meets "not the cause" before they meet the name.
+  // Assert the position, not just the presence: the pre-#1544 note contained the
+  // very same hedge words and still read as an accusation because they came last.
+  assert.match(note, /coldinfire_fal_privacy/);
+  assert.ok(
+    note.indexOf("not the cause of this missing type") < note.indexOf("coldinfire_fal_privacy"),
+    "the disclaimer must precede the pack name, or it is the old bug with more words",
+  );
+});
+
+test("#1544 ownership PROVEN still gets #775's causal note", () => {
+  // The case #775 was filed about: the pack really did fail, and it really is why
+  // the type is missing. That advice must not be watered down by this change.
+  // Doubles as the key-shape test: a `.git`-suffixed repo URL must match the
+  // folder name the IMPORT FAILED log line prints.
+  const note = importFailureNote(["ComfyUI-LTXVideo"], {
+    forType: "LTXVAddGuide",
+    liveDefs: CORE_ONLY_DEFS,
+    nodeMap: NODE_MAP,
+  });
+  assert.match(note, /BEFORE INSTALLING ANYTHING/);
+  assert.match(note, /"LTXVAddGuide" is provided by ComfyUI-LTXVideo/);
+  assert.match(note, /installing it again will not help/);
+  assert.match(note, /Ownership is from ComfyUI-Manager's node map/);
+  assert.doesNotMatch(note, /SEPARATE ISSUE/);
+});
+
+test("#1544 when ownership is proven, ONLY the owner is named", () => {
+  const note = importFailureNote(["coldinfire_fal_privacy", "ComfyUI-LTXVideo"], {
+    forType: "LTXVAddGuide",
+    liveDefs: CORE_ONLY_DEFS,
+    nodeMap: NODE_MAP,
+  });
+  assert.match(note, /provided by ComfyUI-LTXVideo/);
+  // Re-listing the unrelated failure inside the one message that finally has a
+  // definite answer would put the ambiguity straight back.
+  assert.doesNotMatch(note, /coldinfire_fal_privacy/);
+  assert.match(note, /that line/, "one named pack means one log line, not 'those lines'");
+});
+
+test("#1544 no map means ownership was NOT CHECKED, and says so", () => {
+  // Manager disabled, legacy, or unreachable. "We did not check" and "we checked
+  // and found nothing" send the reader to different next steps, so they must not
+  // arrive as the same sentence.
+  const note = importFailureNote(["coldinfire_fal_privacy"], {
+    forType: "PreviewVideo",
+    liveDefs: CORE_ONLY_DEFS,
+  });
+  assert.match(note, /SEPARATE ISSUE, not the cause of this missing type/);
+  assert.match(note, /node map could not be read, so ownership was not checked/);
+  assert.doesNotMatch(note, /does not link it to that type/);
+});
+
+test("#1544 POSITIVE evidence only — a map that omits the pack never drops it", () => {
+  // The tempting next step is "the map knows this pack and its class list omits the
+  // type, so it is not the owner". Measured against a live map, 4 of the 59
+  // installed packs it recognises share NO class with their own /object_info
+  // entries — the catalogue lags a pack's releases. Acting on that would silently
+  // discard real import failures: #775's fault with the sign flipped. The failure
+  // must survive, demoted but disclosed.
+  const note = importFailureNote(["ComfyUI-LTXVideo"], {
+    forType: "PreviewVideo",
+    liveDefs: CORE_ONLY_DEFS,
+    nodeMap: NODE_MAP,
+  });
+  assert.match(note, /ComfyUI-LTXVideo/, "a real failure is never silently dropped");
+  assert.match(note, /SEPARATE ISSUE/);
+});
+
+test("#1544 packsProvidingType reads the class list, and claims nothing else", () => {
+  assert.deepEqual(
+    [...packsProvidingType(NODE_MAP, "PreviewVideo")].sort(),
+    ["llmtoolkit", "vertexaicomfyuinodes"],
+  );
+  assert.deepEqual([...packsProvidingType(NODE_MAP, "LTXVAddGuide")], ["comfyuiltxvideo"]);
+  // Nothing to go on ⇒ no owners, which is the branch that handles not knowing.
+  assert.equal(packsProvidingType(NODE_MAP, "NoSuchType").size, 0);
+  assert.equal(packsProvidingType(null, "PreviewVideo").size, 0);
+  assert.equal(packsProvidingType({}, "PreviewVideo").size, 0);
+  assert.equal(packsProvidingType(NODE_MAP, "").size, 0);
+  // The ARRAY payload shape carries ids and titles, never a class list we have
+  // seen — so it yields no owners rather than a guessed field name.
+  assert.equal(packsProvidingType([{ id: "x", nodenames: ["PreviewVideo"] }], "PreviewVideo").size, 0);
+});
+
+test("#1544 panel_add_node PreviewVideo: the shipped guard, end to end", async () => {
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const err = await assertAddNodeResolvableRefreshing({}, "PreviewVideo", {
+    getFreshObjectInfo: async () => CORE_ONLY_DEFS,
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => ["coldinfire_fal_privacy"],
+    readNodeMap: async () => NODE_MAP,
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an absent type must still be refused");
+  assert.match(err.message, /Unknown node type "PreviewVideo"/);
+  assert.match(err.message, /SEPARATE ISSUE, not the cause of this missing type/);
+  assert.doesNotMatch(err.message, /BEFORE INSTALLING ANYTHING/);
+});
+
+test("#1544 a node-map read that throws leaves the refusal intact", async () => {
+  // Manager unreachable on the refusal path. A diagnostic must never replace the
+  // refusal it exists to explain.
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const err = await assertAddNodeResolvableRefreshing({}, "PreviewVideo", {
+    getFreshObjectInfo: async () => CORE_ONLY_DEFS,
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => ["coldinfire_fal_privacy"],
+    readNodeMap: async () => {
+      throw new Error("Manager is not reachable");
+    },
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.match(err.message, /Unknown node type "PreviewVideo"/);
+  assert.match(err.message, /ownership was not checked/);
+});
+
+test("#1544 the ~1.4MB node map is read ONLY when a failure needs adjudicating", async () => {
+  const { assertAddNodeResolvableRefreshing } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const run = async (type, failures, liveDefs = CORE_ONLY_DEFS) => {
+    let reads = 0;
+    await assertAddNodeResolvableRefreshing({}, type, {
+      getFreshObjectInfo: async () => liveDefs,
+      wasTypeEverDefined: () => false,
+      readImportFailures: async () => failures,
+      readNodeMap: async () => {
+        reads++;
+        return NODE_MAP;
+      },
+    }).catch(() => {});
+    return reads;
+  };
+
+  assert.equal(await run("PreviewVideo", []), 0, "nothing failed: nothing to adjudicate");
+  assert.equal(
+    await run("VideoToImages", ["comfyui-reactor-node"], {
+      ...CORE_ONLY_DEFS,
+      ReActorFaceSwap: { python_module: "custom_nodes.comfyui-reactor-node" },
+    }),
+    0,
+    "#1447 dropped the only failure: the map cannot change the answer",
+  );
+  assert.equal(
+    await run("2fd9c1ea-1f4c-4b1e-9a3e-8f2b7c6d5e40", ["coldinfire_fal_privacy"]),
+    0,
+    "#1523 a subgraph UUID has no pack owner to look up",
+  );
+  assert.equal(await run("PreviewVideo", ["coldinfire_fal_privacy"]), 1, "…and exactly once when it does");
+});
+
+test("#1544 WIRING: the add-node guard is handed the Manager node map", () => {
+  // A one-line injection is invisible to every helper-level test above: the whole
+  // ownership check is inert if the panel never passes `readNodeMap`. Pin the CALL
+  // SITE, in the same options object that wires #775's log reader.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const i = src.indexOf("readImportFailures: () => readPackImportFailures(api),");
+  assert.ok(i > 0, "the #775 add-node wiring must still be there to anchor on");
+  const block = src.slice(i, i + 1200);
+  assert.match(
+    block,
+    /readNodeMap: \(\) => managerGet\("customnode\/getmappings\?mode=cache"\)/,
+    "panel_add_node must fetch the ownership map, or #1544 ships as dead code",
+  );
 });
