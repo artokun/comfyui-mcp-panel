@@ -84,7 +84,7 @@ test("malformed graphs never throw — a diagnostic must not fail", () => {
     assert.doesNotThrow(() => locateNodeAcrossScopes(bad, 1));
     assert.equal(locateNodeAcrossScopes(bad, 1), null);
   }
-  assert.equal(locateNodeAcrossScopes(sub([node(1)]), "not-a-number"), null);
+  assert.equal(locateNodeAcrossScopes(sub([node(1)]), "not-a-number").undetermined, "unparseable");
 });
 
 // ── the message ───────────────────────────────────────────────────────────
@@ -258,6 +258,88 @@ test("#1298 a current graph with no root still names live ids", () => {
 test("#1298 current-id listing never throws", () => {
   const root = { get _nodes() { throw new Error("boom"); } };
   assert.doesNotThrow(() => describeMissingNode(1, root, true));
+});
+
+// ── #1501 null must not mean "could not look" ─────────────────────────────
+//
+// Reporter (filed from the #1495 review): locateNodeAcrossScopes returned
+// null for three different jobs — searched-and-absent, the walk threw, and
+// the id was not a finite number — and describeMissingNode could only spell
+// one of them: "The id may be from a different workflow, or the node was
+// removed." A throw mid-walk, or a subgraph-qualified id (`263:78`) the
+// rest of the system produces on purpose, was therefore reported as a
+// positive statement about the node's absence. Same shape as #1495: a
+// diagnostic that could not look claimed a fact it did not have.
+
+test("#1501 a walk that threw is inconclusive, not a miss", () => {
+  // Flat scan of this graph succeeds; descending into node 2 throws. The
+  // search did not finish, so "not in any other scope" is unsupportable.
+  const root = sub([
+    node(1, { type: "KSampler" }),
+    { id: 2, type: "S", get subgraph() { throw new Error("boom"); } },
+  ]);
+  const hit = locateNodeAcrossScopes(root, 99);
+  assert.equal(hit.undetermined, "threw");
+  assert.ok(!hit.scope, "must not look like a location");
+
+  const msg = describeMissingNode(99, root, true, root);
+  assert.match(msg, /^No node with id 99/);
+  assert.match(msg, /this is not a finding that the node is absent/);
+  assert.match(msg, /threw before it finished/);
+  assert.ok(!/not in any other scope either/.test(msg), "the walk did not finish");
+  assert.ok(!/may be from a different workflow/.test(msg), "must not invent a workflow-identity problem");
+  assert.ok(!/the node was removed/.test(msg), "must not invent a removal");
+  // live ids on the graph that DID scan are still the retarget the caller can use
+  assert.match(msg, /1 \(KSampler\)/);
+});
+
+test("#1501 a qualified id is found by the same identity the writes use", () => {
+  // Unpacking leaves genuine root nodes whose id is `263:78`. Number("263:78")
+  // is NaN, and Number.parseInt is 263 — a different, real node. The locator
+  // used to return null before searching and the miss message called it foreign.
+  const root = sub([
+    node("263:78", { type: "CLIPTextEncode" }),
+    node(263, { type: "KSampler" }),
+  ]);
+  const hit = locateNodeAcrossScopes(root, "263:78");
+  assert.equal(hit.scope, "root");
+  assert.deepEqual(hit.hostPath, []);
+  // The parseInt trap: a graph that only has 263 must NOT report `263:78` as found.
+  assert.equal(locateNodeAcrossScopes(sub([node(263)]), "263:78"), null);
+});
+
+test("#1501 a qualified id on the root while viewing a subgraph says EXIT, not 'different workflow'", () => {
+  const inner = sub([node(10, { type: "InnerA" })]);
+  const root = sub([
+    node("263:78", { type: "SaveImage" }),
+    node(9, { title: "S", subgraph: inner }),
+  ]);
+  const msg = describeMissingNode("263:78", root, false, inner);
+  assert.match(msg, /on the ROOT graph/);
+  assert.match(msg, /panel_exit_subgraph/);
+  assert.ok(!/may be from a different workflow/.test(msg));
+  assert.ok(!/not a local integer or a subgraph-qualified id/.test(msg), "it is a qualified id; we searched");
+});
+
+test("#1501 an unparseable id is inconclusive, not a miss", () => {
+  const root = sub([node(1, { type: "KSampler" })]);
+  const hit = locateNodeAcrossScopes(root, "not-a-number");
+  assert.equal(hit.undetermined, "unparseable");
+
+  const msg = describeMissingNode("not-a-number", root, true, root);
+  assert.match(msg, /^No node with id not-a-number/);
+  assert.match(msg, /this is not a finding that the node is absent/);
+  assert.match(msg, /not a local integer or a subgraph-qualified id/);
+  assert.ok(!/not in any other scope either/.test(msg), "nothing was searched");
+  assert.ok(!/may be from a different workflow/.test(msg));
+});
+
+test("#1501 a genuine miss of a qualified id may still say the id is gone", () => {
+  // Once we actually searched, the old sentence is allowed: the node is not here.
+  const root = sub([node(1, { type: "KSampler" })]);
+  const msg = describeMissingNode("120:104", root, true, root);
+  assert.match(msg, /not in any other scope either/);
+  assert.match(msg, /may be from a different workflow/);
 });
 
 // ── WIRING ────────────────────────────────────────────────────────────────
