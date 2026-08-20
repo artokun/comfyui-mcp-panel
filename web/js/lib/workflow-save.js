@@ -724,10 +724,11 @@ export async function saveActiveWorkflow(
 
   // A safe save requires a RESOLVED, non-empty target path. Without one — e.g. a
   // persisted workflow whose filename is empty/unresolved and no name was given —
-  // the in-place branch must NOT run: the frontend's `saveWorkflow` would
-  // recompute the target from the empty name (→ a bare "…/.json") and RENAME
-  // (move) the source to it, a persisted MOVE with no absent-oracle proof (#226).
-  // Refuse instead — never let an unresolved name relocate a real file.
+  // there is no destination we can stand behind. Refuse rather than write through
+  // saveInPlace with an empty name (#226). (The workflow SERVICE's saveWorkflow
+  // would recompute a bare "…/.json" and rename onto it; the STORE the panel
+  // actually calls writes `this.path`. Either way an unresolved name is not a
+  // destination.)
   if (!finalTargetPath) {
     if (!currentPath) {
       throw new Error("name must not be blank — pass a non-whitespace workflow name");
