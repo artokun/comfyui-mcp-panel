@@ -24,7 +24,7 @@ const APP_JSON_EXT = ".app.json";
 
 /** Strip a trailing workflow extension (.app.json or .json) and surrounding
  *  whitespace. Mirrors how ComfyUI derives a bare filename from a path. */
-function baseName(name) {
+export function baseName(name) {
   const s = String(name || "").trim();
   const lower = s.toLowerCase();
   if (lower.endsWith(APP_JSON_EXT)) return s.slice(0, -APP_JSON_EXT.length).trim();
