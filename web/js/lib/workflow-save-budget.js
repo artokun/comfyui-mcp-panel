@@ -26,6 +26,9 @@ import { makeCommandBudget } from "./command-budget.js";
 // requested name against ComfyUI's derived `filename` is a wrong-pair test: the
 // frontend strips the directory and the .json/.app.json suffix, so "Foo.json" and
 // "Foo" are the same workflow and must not read as a moved canvas.
+// #1459 — it applies to the REQUESTED name only. The frontend's `filename` has
+// already had one trailing extension removed, and stripping it again collapses
+// distinct workflows onto one key (see describeWorkflowSaveTimeout).
 import { baseName } from "./workflow-save.js";
 
 /** Whole-command deadline `workflow_save` / `workflow_save_as` take. */
@@ -97,12 +100,41 @@ export function describeWorkflowSaveTimeout({
   const str = (v) => (typeof v === "string" && v ? v : null);
   // Directory + extension are presentation, not identity: `panel_list_workflows`
   // reports "workflows/Foo.json" and the canvas reports "Foo" for one workflow.
-  const nameKey = (v) => {
+  //
+  // #1459 — but the two sides arrive normalized to DIFFERENT degrees, so one shared
+  // helper cannot key both. `requested` is the caller's raw string and may still carry
+  // a directory and a ".json"/".app.json" suffix — exactly what the save layer strips
+  // with baseName() before it builds the target path. `filename` has already been
+  // stripped by the frontend (UserFile → getPathDetails → getFilenameDetails), so the
+  // directory is the only part of it still safe to drop. Running it through baseName()
+  // too strips it a SECOND time — the same double-strip workflow-save.js:650 documents
+  // as unsafe: a file on disk at "…/Foo.json.json" reports filename "Foo.json", which
+  // stripped again reads "Foo" and matches a requested "Foo". A genuinely different
+  // workflow then passes as the destination, the "not the save's destination"
+  // disclosure is suppressed, and the SOURCE's dirty/persisted flags are printed as
+  // the target's.
+  const dropDir = (v) => {
     const raw = String(v ?? "").trim();
     if (!raw) return "";
     const segments = raw.split(/[\\/]/);
-    return baseName(segments[segments.length - 1] ?? raw);
+    return (segments[segments.length - 1] ?? raw).trim();
   };
+  /** Key a caller-supplied name: both the directory and the extension are presentation. */
+  const requestedKey = (v) => baseName(dropDir(v));
+  // What getFilenameDetails actually does, read off the shipped frontend (1.49.6) rather
+  // than assumed: ONE special case for the compound ".app.json", then a cut at the LAST
+  // dot. So "Foo.app.json" → "Foo", "Foo.json" → "Foo", "Foo.json.json" → "Foo.json",
+  // and "My.Workflow.json" → "My.Workflow". Every one of those is already as bare as the
+  // frontend can make it, which is why activeKey must not cut again.
+  //
+  // KNOWN AND UNCHANGED: it leaves ONE residual mismatch, in the other (safe) direction.
+  // A workflow literally NAMED "Foo.app" persists at "Foo.app.json" and so reports
+  // filename "Foo", while requestedKey keeps the ".app" baseName does not recognise —
+  // the two do not key equal. That is identical before and after this change, and it
+  // errs toward an extra "cannot say which file" disclosure rather than toward a
+  // wrong-target claim, so it is left alone rather than papered over with another guess.
+  /** Key a frontend-derived `filename`: drop the directory and NOTHING else. */
+  const activeKey = (v) => dropDir(v);
   const dest = str(requested);
   const active = str(filename);
   const prior = str(previousActive);
@@ -126,7 +158,8 @@ export function describeWorkflowSaveTimeout({
         `and panel_list_workflows reports that same flag. Treat the outcome as UNDETERMINED. `;
 
   // Case 3 — the target is genuinely unknown. Never dressed up as case 2.
-  if (!dest && prior && active && nameKey(prior) !== nameKey(active)) {
+  // BOTH sides here are frontend-derived `filename`s, so both take activeKey.
+  if (!dest && prior && active && activeKey(prior) !== activeKey(active)) {
     return (
       `workflow_save did not finish within ${seconds}s. ` +
       head +
@@ -139,12 +172,12 @@ export function describeWorkflowSaveTimeout({
   // When the destination and the canvas are the SAME workflow, prefer the name the
   // frontend derived: it is the file as it actually exists. `dest` is only needed to
   // NAME a target the canvas is not showing.
-  const subject = dest && active && nameKey(dest) === nameKey(active) ? active : (dest ?? prior ?? active);
+  const subject = dest && active && requestedKey(dest) === activeKey(active) ? active : (dest ?? prior ?? active);
   const who = subject ? `"${subject}"` : "the active workflow";
 
   // Case 1 with a moved canvas: the destination is known, but the flags on screen
   // belong to some other workflow. Report the target; withhold the foreign flags.
-  if (dest && active && nameKey(active) !== nameKey(dest)) {
+  if (dest && active && activeKey(active) !== requestedKey(dest)) {
     return (
       `workflow_save did not finish within ${seconds}s for ${who}. ` +
       head +
