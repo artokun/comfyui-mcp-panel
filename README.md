@@ -165,7 +165,7 @@ which receives `panel_*` by a different route.
 | `panel_get_subgraph` | Read inside a subgraph node's inner graph |
 | `panel_get_errors` | Read the last execution error + per-node validation errors |
 | `panel_list_workflows` | List open workflow tabs and which is active |
-| `panel_list_nodes` | List installed custom-node packs |
+| `panel_list_nodes` | List installed custom-node packs (optional `search` or `query` filters by pack name) |
 | `panel_list_mcp` | List connected MCP servers |
 | `panel_get_content_mode` | Read the adult-content (NSFW) consent state |
 

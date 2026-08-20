@@ -120,6 +120,7 @@ import {
   taskHistoryBlindNote,
   installGitUrl,
   installedListRoute,
+  listedNodesResult,
   isManagerRouteMissing,
   isManagerUnreachable,
   markManagerUnreachable,
@@ -20942,7 +20943,7 @@ const GRAPH_TOOL_EXECUTORS = {
     return searchNodesVia(managerGet, managerCall, { query, limit, objectInfoGet: fetchObjectInfo });
   },
 
-  async nodes_list() {
+  async nodes_list(args = {}) {
     // #423: route the installed-node list by dialect (managerGet strips /v2 for
     // legacy) with an explicit ?mode=default — matching the live-tested
     // orchestrator. A pip Manager in --enable-manager-legacy-ui mode can answer
@@ -20959,12 +20960,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // the 404/unreachable fallback below never fires and the raw error leaked to
     // the agent. Retry transient transport failures with a short bounded backoff,
     // then reword into an actionable "still reconnecting" status.
+    // #1496 — `search` (reporter) or `query` (panel_search_nodes alias) filters
+    // the installed payload. The MCP schema is still empty `{}` today, so this
+    // is inert until the orchestrator forwards the key.
     return retryDuringReconnect(async () => {
       try {
-        return { installed: await managerGet(route) };
+        return listedNodesResult(await managerGet(route), args);
       } catch (err) {
         if (!isManagerUnreachable(err)) throw err;
-        return { installed: await managerCall(route) };
+        return listedNodesResult(await managerCall(route), args);
       }
     });
   },

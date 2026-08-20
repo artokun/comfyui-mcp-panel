@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `panel_list_nodes` with `search` (or `query`) filters the installed-pack list instead of returning every pack (#1496)
+
 ## [0.15.25] - 2026-08-20
 
 ### Fixed

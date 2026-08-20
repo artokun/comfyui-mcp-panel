@@ -208,6 +208,75 @@ export function parseInstalled(raw) {
 }
 
 /**
+ * #1496 — which filter a `nodes_list` command asked for.
+ * `search` is the reporter's key (and the compact-mode list_tools filter).
+ * `query` is the alias panel_search_nodes / panel_find_nodes already use.
+ * Prefer `search` when both are non-empty.
+ */
+export function installedListQuery(args = {}) {
+  const search = args?.search;
+  const query = args?.query;
+  if (typeof search === "string" && search.trim()) return { key: "search", value: search };
+  if (typeof query === "string" && query.trim()) return { key: "query", value: query };
+  return { key: null, value: "" };
+}
+
+function installedEntryHay(entry, mapKey) {
+  if (typeof entry === "string") return entry.toLowerCase();
+  if (!entry || typeof entry !== "object") return String(mapKey ?? "").toLowerCase();
+  return [mapKey, entry.title, entry.module, entry.cnr_id, entry.aux_id, entry.ver]
+    .filter((v) => typeof v === "string" && v)
+    .join(" ")
+    .toLowerCase();
+}
+
+/** Filter a raw Manager `/customnode/installed` payload, preserving map vs array shape. */
+export function filterInstalledPayload(raw, query) {
+  const terms = queryTerms(query);
+  if (Array.isArray(raw)) {
+    const total = raw.length;
+    if (!terms.length) return { installed: raw, total, count: total };
+    const installed = raw.filter((entry) => matchesAllTerms(installedEntryHay(entry), terms));
+    return { installed, total, count: installed.length };
+  }
+  if (raw && typeof raw === "object") {
+    const entries = Object.entries(raw);
+    const total = entries.length;
+    if (!terms.length) return { installed: raw, total, count: total };
+    const installed = {};
+    for (const [k, v] of entries) {
+      if (matchesAllTerms(installedEntryHay(v, k), terms)) installed[k] = v;
+    }
+    return { installed, total, count: Object.keys(installed).length };
+  }
+  return { installed: raw, total: 0, count: 0 };
+}
+
+/**
+ * #1496 — `panel_list_nodes` result. No filter → `{installed}` as before.
+ * A `search`/`query` filters the payload and discloses count/total so a miss
+ * cannot be read as "nothing is installed".
+ */
+export function listedNodesResult(raw, args = {}) {
+  const { key, value } = installedListQuery(args);
+  if (!key) return { installed: raw };
+  const filtered = filterInstalledPayload(raw, value);
+  const out = {
+    installed: filtered.installed,
+    [key]: value,
+    count: filtered.count,
+    total: filtered.total,
+  };
+  if (filtered.count === 0) {
+    out.note =
+      `0 of ${filtered.total} installed packs matched ${key} "${value}". ` +
+      `This filters ALREADY-INSTALLED packs, not the installable registry — ` +
+      `use panel_search_nodes with query for packs you can install.`;
+  }
+  return out;
+}
+
+/**
  * Does the installed-nodes list contain the pack we just tried to install?
  * `idOrUrl` is the install target — a registry id (author/pack or CNR id) or a
  * git URL. For a git URL we match on the derived repo name. Compares against
