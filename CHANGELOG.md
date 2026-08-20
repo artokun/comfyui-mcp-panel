@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.20] - 2026-08-20
+
+### Fixed
+- a subgraph conversion that THROWS says whether the graph changed (#1466)
+
+### Changed
+- bump @types/node from 22.20.0 to 26.2.0 (#1471)
+
+
 ## [0.15.19] - 2026-08-20
 
 ### Changed
