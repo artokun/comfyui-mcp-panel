@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- `panel_add_node` of a subgraph UUID already loaded in the live workflow no longer rejects it as an unknown backend node or names an unrelated failed pack (#1523)
 - a run ComfyUI accepted while dropping some outputs is reported as queued, with the dropped outputs named, instead of as a refusal (#1504)
 - `panel_list_nodes` with `search` (or `query`) filters the installed-pack list instead of returning every pack (#1496)
 

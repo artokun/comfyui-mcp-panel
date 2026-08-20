@@ -328,6 +328,41 @@ test("#1447 importFailureNote itself drops a live pack", () => {
   assert.equal(note, "");
 });
 
+test("#1523 a subgraph UUID never gets a pack-import note — no pack can own it", () => {
+  // The reporter's type. ReActor failed to import on that canvas; naming it as
+  // the reason a loaded SAM3 subgraph could not be added is the whole issue.
+  const note = importFailureNote(["comfyui-reactor-node"], {
+    forType: "6e7ab3ea-96aa-470f-9b94-3d9d0e01f481",
+  });
+  assert.equal(note, "");
+});
+
+test("#1523 panel_add_node of a subgraph UUID does not name an unrelated failed pack", async () => {
+  const { assertAddNodeResolvableRefreshing, subgraphUuidAddRefusal } = await import(
+    "../../web/js/lib/node-resolve.js"
+  );
+  const uuid = "6e7ab3ea-96aa-470f-9b94-3d9d0e01f481";
+  const err = await assertAddNodeResolvableRefreshing({}, uuid, {
+    getFreshObjectInfo: async () => ({
+      KSampler: { python_module: "nodes" },
+    }),
+    wasTypeEverDefined: () => false,
+    readImportFailures: async () => ["comfyui-reactor-node"],
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an unloaded subgraph UUID must still be refused");
+  assert.equal(err.message, subgraphUuidAddRefusal(uuid, { loaded: false, registered: false }));
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
+  assert.doesNotMatch(err.message, /FAILED TO IMPORT/);
+});
+
+test("#1523 WIRING: the panel supplies the live root graph to the add-node resolver", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.match(src, /getRootGraph: \(\) => capturedContext\?\.rootGraph \?\? capturedContext\?\.graph/);
+});
+
 test("#1180: a hanging log read cannot outlive the refusal it is explaining", async () => {
   // readComfyLogText runs while EXPLAINING a refusal, against the same server whose
   // half-open connection is the reason the refusal is being written. Its catch handles a

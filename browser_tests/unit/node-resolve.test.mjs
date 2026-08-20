@@ -31,6 +31,9 @@ import {
   HISTORY_UNSEEDED,
   HISTORY_PENDING,
   backendHistoryVerdict,
+  isSubgraphUuidType,
+  subgraphTypeIsLoaded,
+  subgraphUuidAddRefusal,
 } from "../../web/js/lib/node-resolve.js";
 import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
@@ -2545,4 +2548,183 @@ test("#1126: the unreadable fallback REFUSES a nested promotion rather than writ
   assert.equal(concreteWidget.value, "", "the concrete widget is untouched");
   assert.equal(midWidget.value, "", "the intermediate projection is untouched");
   assert.equal(outerWidget.value, "", "the outer rail is untouched");
+});
+
+// ---- #1523: panel_add_node of a loaded subgraph UUID is not an unknown backend
+//      node, and must never name an unrelated failed pack. ----------------------
+
+const SAM3_UUID = "6e7ab3ea-96aa-470f-9b94-3d9d0e01f481";
+
+function uuidSubgraphCtor(uuid) {
+  const ctor = function ComfySubgraphNode() {};
+  ctor.nodeData = { input: { required: {} }, name: uuid };
+  ctor.comfyClass = uuid;
+  return ctor;
+}
+
+function addOptsForSubgraph(reg, { rootGraph, readImportFailures } = {}) {
+  return {
+    getFreshObjectInfo: async () => objectInfo(),
+    refresh: async () => {},
+    wasTypeEverDefined: () => false,
+    getRootGraph: () => rootGraph,
+    readImportFailures:
+      readImportFailures ?? (async () => ["comfyui-reactor-node"]),
+  };
+}
+
+test("#1523 isSubgraphUuidType: RFC-4122 only", () => {
+  assert.equal(isSubgraphUuidType(SAM3_UUID), true);
+  assert.equal(isSubgraphUuidType("KSampler"), false);
+  assert.equal(isSubgraphUuidType("SubgraphBlueprint.Image Segmentation (SAM3)"), false);
+  assert.equal(isSubgraphUuidType(""), false);
+  assert.equal(isSubgraphUuidType(null), false);
+});
+
+test("#1523 subgraphTypeIsLoaded: registry Map, nested instance, fail-closed", () => {
+  const sub = { id: SAM3_UUID, _nodes: [] };
+  const root = { subgraphs: new Map([[SAM3_UUID, sub]]), _nodes: [] };
+  assert.equal(subgraphTypeIsLoaded(root, SAM3_UUID), true);
+
+  const nested = {
+    _nodes: [{ type: SAM3_UUID, subgraph: { id: SAM3_UUID, _nodes: [] } }],
+  };
+  assert.equal(subgraphTypeIsLoaded(nested, SAM3_UUID), true);
+
+  assert.equal(subgraphTypeIsLoaded({ _nodes: [] }, SAM3_UUID), false);
+  assert.equal(subgraphTypeIsLoaded(null, SAM3_UUID), false);
+  assert.equal(subgraphTypeIsLoaded(root, "KSampler"), false);
+});
+
+test("#1523 add_node: loaded + registered SAM3 UUID is ADDABLE on a healthy backend that never lists it", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  const rootGraph = {
+    subgraphs: new Map([[SAM3_UUID, { id: SAM3_UUID, _nodes: [] }]]),
+    _nodes: [{ id: 1, type: SAM3_UUID }],
+  };
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, addOptsForSubgraph(reg, { rootGraph })),
+  );
+});
+
+test("#1523 add_node: the same UUID without a live definition is refused as a subgraph, not a missing pack", async () => {
+  const reg = loadedRegistry();
+  const err = await assertAddNodeResolvableRefreshing(
+    () => reg,
+    SAM3_UUID,
+    addOptsForSubgraph(reg, { rootGraph: { _nodes: [] } }),
+  ).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an unloaded subgraph UUID must still be refused");
+  assert.equal(
+    err.message,
+    subgraphUuidAddRefusal(SAM3_UUID, { loaded: false, registered: false }),
+  );
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
+  assert.doesNotMatch(err.message, /FAILED TO IMPORT/);
+  assert.doesNotMatch(err.message, /Unknown node type/);
+  assert.doesNotMatch(err.message, /not installed, its pack was removed/);
+});
+
+test("#1523 add_node: loaded but UNREGISTERED UUID is refused with copy-instance advice, never a pack note", async () => {
+  const reg = loadedRegistry(); // SAM3 class not registered — createNode would mint a placeholder
+  const rootGraph = {
+    subgraphs: new Map([[SAM3_UUID, { id: SAM3_UUID, _nodes: [] }]]),
+    _nodes: [{ id: 1, type: SAM3_UUID }],
+  };
+  const err = await assertAddNodeResolvableRefreshing(
+    () => reg,
+    SAM3_UUID,
+    addOptsForSubgraph(reg, { rootGraph }),
+  ).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, "an unregistered class must still be refused");
+  assert.equal(
+    err.message,
+    subgraphUuidAddRefusal(SAM3_UUID, { loaded: true, registered: false }),
+  );
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
+  assert.doesNotMatch(err.message, /FAILED TO IMPORT/);
+});
+
+test("#1523 add_node: the exemption requires the ever-seen oracle, like the frontend-only one", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  const rootGraph = {
+    subgraphs: new Map([[SAM3_UUID, { id: SAM3_UUID, _nodes: [] }]]),
+    _nodes: [],
+  };
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, {
+        getFreshObjectInfo: async () => objectInfo(),
+        getRootGraph: () => rootGraph,
+        // wasTypeEverDefined deliberately omitted
+      }),
+    (err) => {
+      assert.equal(
+        err.message,
+        subgraphUuidAddRefusal(SAM3_UUID, { loaded: true, registered: true }),
+      );
+      return true;
+    },
+  );
+});
+
+test("#1523 add_node: an EVER-SEEN (removed) UUID still fails closed — the trust root is not bypassed", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  const rootGraph = {
+    subgraphs: new Map([[SAM3_UUID, { id: SAM3_UUID, _nodes: [] }]]),
+    _nodes: [],
+  };
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, {
+        getFreshObjectInfo: async () => objectInfo(),
+        wasTypeEverDefined: (t) => t === SAM3_UUID,
+        getRootGraph: () => rootGraph,
+      }),
+    /defined this node type earlier this session|removed/i,
+  );
+});
+
+test("#1523 add_node: isLoadedSubgraphType override is the positive proof, even without a graph", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, {
+      getFreshObjectInfo: async () => objectInfo(),
+      wasTypeEverDefined: () => false,
+      isLoadedSubgraphType: (t) => t === SAM3_UUID,
+      readImportFailures: async () => ["comfyui-reactor-node"],
+    }),
+  );
+});
+
+test("#1523 add_node: a throwing isLoadedSubgraphType fails closed rather than authorizing", async () => {
+  const reg = loadedRegistry();
+  reg[SAM3_UUID] = uuidSubgraphCtor(SAM3_UUID);
+  const err = await assertAddNodeResolvableRefreshing(() => reg, SAM3_UUID, {
+    getFreshObjectInfo: async () => objectInfo(),
+    wasTypeEverDefined: () => false,
+    isLoadedSubgraphType: () => {
+      throw new Error("graph unreadable");
+    },
+    readImportFailures: async () => ["comfyui-reactor-node"],
+  }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.equal(
+    err.message,
+    subgraphUuidAddRefusal(SAM3_UUID, { loaded: false, registered: true }),
+  );
+  assert.doesNotMatch(err.message, /graph unreadable/);
+  assert.doesNotMatch(err.message, /comfyui-reactor-node/);
 });

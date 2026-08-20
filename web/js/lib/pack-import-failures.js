@@ -34,6 +34,11 @@ import { readComfyLogText } from "./comfy-log.js";
  * `python_module` on /object_info is the proof it did. Drop those before naming
  * them. Remaining failures still do not prove ownership of the requested type,
  * so the note says so in the type's own words.
+ *
+ * #1523 — a subgraph UUID is never provided by a custom-node pack. Naming
+ * whatever pack happened to fail import (ReActor, on a canvas whose missing
+ * type was Image Segmentation (SAM3)) is the same misdiagnosis. No ownership
+ * mapping can link a pack to a UUID type, so the note stays off.
  */
 
 // Built from the code point, never written as a literal escape. The first
@@ -130,9 +135,22 @@ export function dropLivePackImportFailures(failed, liveDefs) {
  *
  * `opts.liveDefs` drops packs that currently provide types (#1447).
  * `opts.forType` names the missing class so a leftover failure is labelled
- * unrelated rather than read as its cause.
+ * unrelated rather than read as its cause. A subgraph UUID forType yields
+ * no note at all (#1523) — ownership mapping cannot link a pack to it.
  */
 export function importFailureNote(failed, opts = {}) {
+  const forType = opts && typeof opts === "object" && typeof opts.forType === "string"
+    ? opts.forType.trim()
+    : "";
+  // #1523 — a UUID class_type is a subgraph definition, not a pack-provided
+  // node. The note would name an unrelated failed pack with no possible
+  // ownership link.
+  if (
+    forType &&
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(forType)
+  ) {
+    return "";
+  }
   const relevant = dropLivePackImportFailures(
     failed,
     opts && typeof opts === "object" ? opts.liveDefs : undefined,
@@ -140,7 +158,6 @@ export function importFailureNote(failed, opts = {}) {
   if (relevant.length === 0) return "";
   const list = relevant.join(", ");
   const plural = relevant.length > 1;
-  const forType = opts && typeof opts.forType === "string" ? opts.forType.trim() : "";
   const ownership = forType
     ? ` This does not prove ${plural ? "they provide" : "it provides"} "${forType}" — ` +
       `the failure may be unrelated.`
