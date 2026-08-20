@@ -1,0 +1,76 @@
+# Dependency and CVE tracking for the sidebar pack.
+#
+# This repo already runs bandit and a YARA-parity pass — in CI and again at
+# publish — but those scan OUR OWN shipped files for malicious patterns. They
+# cannot see a published advisory against a package we already depend on, which
+# is a different question and the one nothing here was asking.
+#
+# It matters for a pack distributed through the Comfy Registry: what ships is a
+# zip of this repo, installed into people's ComfyUI, and the registry's scanner
+# looks for the same inward-facing patterns ours does.
+#
+# WEEKLY AND GROUPED so each PR is actually read rather than rubber-stamped;
+# majors ungrouped so they arrive alone. Bumps are reviewed by a human — the
+# autopilot skips bot-authored PRs by decision.
+version: 2
+updates:
+  # Dev tooling: Playwright, TypeScript, ws, zod. Not shipped to users, but it is
+  # what runs the browser tests that gate this pack.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+    labels:
+      - "dependencies"
+    groups:
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # The one dependency that reaches users: pyproject declares the frontend
+  # package floor the sidebar tab registration relies on.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+    groups:
+      pip-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Publishing to the registry happens from a workflow; a compromised action
+  # there is a compromised pack.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(actions)"
+    labels:
+      - "dependencies"
+    groups:
+      actions-all:
+        patterns:
+          - "*"
