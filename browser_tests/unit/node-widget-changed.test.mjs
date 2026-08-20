@@ -468,6 +468,72 @@ test("#1519: an INSTANCE-SCOPED promoted write announces on the WRAPPER, whose r
   assert.equal(widget, railWidget);
 });
 
+// ---- the hook EVERY node on a real page carries -----------------------------
+
+/**
+ * On a real page this hook is not exotic — the FRONTEND installs one on every node.
+ * `installNodeHooksRecursive` (comfyui-frontend-package 1.48.7, GraphView-*.js) runs
+ * over every node in the graph on attach and again from `onNodeAdded`, wrapping
+ * `onWidgetChanged` to clear widget-related validation errors:
+ *
+ *     e.onWidgetChanged = Mc(e.onWidgetChanged, function (t, n, r, i) {
+ *       if (!Z.rootGraph) return
+ *       let a = is(Z.rootGraph, e); if (!a) return
+ *       let o = { min: i.options?.min, max: i.options?.max }
+ *       let s = wa(Z.rootGraph, e, i)
+ *       s?.sourceExecutionId && ia().clearWidgetRelatedErrors(s.sourceExecutionId, …, n, o)
+ *       ia().clearWidgetRelatedErrors(a, t, i.name, n, o)
+ *     })
+ *
+ * So this change fires on ordinary writes to ordinary nodes, and the argument shape is
+ * load-bearing rather than cosmetic: the wrapper dereferences the FOURTH argument
+ * (`i.options`, `i.name`). Handing it `undefined` there would make every panel write on
+ * a real page throw and newly report `widget_changed_hook_failed`.
+ */
+test("#1519: the frontend's OWN installed hook receives what it dereferences — an ordinary write stays clean", () => {
+  const cleared = [];
+  const node = {
+    id: 30,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20, options: { min: 1, max: 100 } }],
+    // The wrapper's body, transcribed from the bundle above.
+    onWidgetChanged(name, value, prevValue, widget) {
+      const bounds = { min: widget.options?.min, max: widget.options?.max };
+      cleared.push({ executionId: `node:${this.id}`, name, widgetName: widget.name, value, bounds });
+    },
+  };
+
+  const set = applyWidgetWrite(node, "steps", 30, HOOKS);
+
+  assert.equal(set.value, 30);
+  assert.equal(
+    set.widget_changed_hook_failed,
+    undefined,
+    "an ordinary write on an ordinary node must not newly carry a hook failure",
+  );
+  assert.equal(set.widget_changed_slots, undefined, "clearing an error moves no slots");
+  assert.deepEqual(cleared, [
+    { executionId: "node:30", name: "steps", widgetName: "steps", value: 30, bounds: { min: 1, max: 100 } },
+  ]);
+});
+
+test("#1519: a widget with NO options does not break the wrapper's optional reads", () => {
+  const seen = [];
+  const node = {
+    id: 31,
+    type: "N",
+    widgets: [{ name: "text", type: "customtext", value: "a" }],
+    onWidgetChanged(name, value, prevValue, widget) {
+      seen.push({ min: widget.options?.min, widgetName: widget.name });
+    },
+  };
+
+  const set = applyWidgetWrite(node, "text", "b", HOOKS);
+
+  assert.equal(set.widget_changed_hook_failed, undefined);
+  assert.deepEqual(seen, [{ min: undefined, widgetName: "text" }]);
+});
+
 // ---- the helper's own contract ---------------------------------------------
 
 test("#1519: fireNodeWidgetChanged never throws, whatever it is handed", () => {
