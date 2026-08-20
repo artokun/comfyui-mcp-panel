@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.21] - 2026-08-20
+
+### Fixed
+- the video card mounts, reserves its real space, and pauses before it unmounts (#1481)
+- a tab switch no longer leaves graph reads refused on a stale root identity (#1478)
+- a schema read that timed out is UNKNOWN, not proof that nothing outputs the type (#1479)
+
+
 ## [0.15.20] - 2026-08-20
 
 ### Fixed
