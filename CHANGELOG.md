@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.19] - 2026-08-20
+
+### Changed
+- bump the npm-minor-patch group with 2 updates (#1469)
+- bump the actions-all group with 3 updates (#1468)
+
+
 ## [0.15.18] - 2026-08-20
 
 ### Fixed
