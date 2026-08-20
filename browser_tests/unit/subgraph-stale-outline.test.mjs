@@ -14,6 +14,10 @@ import {
   disconnectedBoundaryInputs,
   brokenConversionRefusal,
   brokenConversionWarning,
+  detachedConversionNodes,
+  detachedConversionRefusal,
+  conversionSnapshot,
+  conversionThrowReport,
 } from "../../web/js/lib/subgraph-conversion-integrity.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -73,10 +77,27 @@ const advisoriesMatch = panelSrc.match(
 assert.ok(advisoriesMatch, "could not locate subgraphConversionAdvisories in panel source");
 const subgraphConversionAdvisories = new Function(`return ${advisoriesMatch[0]};`)();
 
+// #1463 — both executors now reach convertToSubgraph through a shared runner that
+// refuses a detached selection up front and reports a throw with a measured
+// mutation verdict. Same treatment again: the REAL runner, wired to the REAL lib
+// helpers, so a regression in it fails here instead of hiding behind a stub.
+const runnerMatch = panelSrc.match(
+  /function convertSelectionToSubgraph\(\{ graph, canvas, nodes, what \}\) \{[\s\S]*?\r?\n\}/,
+);
+assert.ok(runnerMatch, "could not locate convertSelectionToSubgraph in panel source");
+const convertSelectionToSubgraph = new Function(
+  "detachedConversionNodes",
+  "detachedConversionRefusal",
+  "conversionSnapshot",
+  "conversionThrowReport",
+  `return ${runnerMatch[0]};`,
+)(detachedConversionNodes, detachedConversionRefusal, conversionSnapshot, conversionThrowReport);
+
 function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
   return new Function(
     "getGraphCtx",
     "clearStaleRedFlagsAfterSubgraphConversion",
+    "convertSelectionToSubgraph",
     "assertSubgraphNodeLanded",
     "assertSubgraphConversionSerializable",
     "subgraphConversionAdvisories",
@@ -84,6 +105,7 @@ function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
   )(
     getGraphCtx,
     clearStaleRedFlagsAfterSubgraphConversion,
+    convertSelectionToSubgraph,
     assertSubgraphNodeLanded,
     assertSubgraphConversionSerializable,
     subgraphConversionAdvisories,
@@ -103,6 +125,7 @@ function realGroup(
     "syncGraphNodeAreas",
     "groupMemberNodes",
     "clearStaleRedFlagsAfterSubgraphConversion",
+    "convertSelectionToSubgraph",
     "assertSubgraphNodeLanded",
     "assertSubgraphConversionSerializable",
     "subgraphConversionAdvisories",
@@ -113,6 +136,7 @@ function realGroup(
     syncGraphNodeAreas,
     groupMemberNodes,
     clearStaleRedFlagsAfterSubgraphConversion,
+    convertSelectionToSubgraph,
     assertSubgraphNodeLanded,
     assertSubgraphConversionSerializable,
     subgraphConversionAdvisories,

@@ -382,6 +382,10 @@ import {
   disconnectedBoundaryInputs,
   brokenConversionRefusal,
   brokenConversionWarning,
+  detachedConversionNodes,
+  detachedConversionRefusal,
+  conversionSnapshot,
+  conversionThrowReport,
 } from "./lib/subgraph-conversion-integrity.js";
 import {
   classifyWorkflowRefresh,
@@ -9268,11 +9272,60 @@ function clearStaleRedFlag(node, { app, graph, rootGraph }) {
   return false;
 }
 
-/**
- * `convertToSubgraph()` rewires surviving root-graph neighbours to its new
- * wrapper but does not revalidate their sticky red flags. Re-adjudicate only
- * those direct neighbours; never the wrapper or the nodes moved inside it.
- */
+/** Run the frontend's conversion so that a THROW is as informative as a return.
+ *
+ *  #1463 — both tools called `graph.convertToSubgraph()` bare, so the caller got the
+ *  frontend's raw exception and nothing else. That is not enough to act on, because the
+ *  SAME exception lands at different points of the mutation: driven in a browser, a
+ *  detached boundary neighbour throws in the reconnect loop with the selected nodes
+ *  ALREADY REMOVED, while a detached selected node throws at `disconnectInput` with the
+ *  nodes intact but a subgraph definition already registered. #1463's reporter read the
+ *  bare message as "no other side effects" and retried three times.
+ *
+ *  So: refuse up front on the state that provably causes it, and otherwise measure the
+ *  graph either side of the call and report what actually moved. The frontend's own
+ *  message is always quoted verbatim inside the result and kept as `cause`, so nothing
+ *  greppable is lost. What the measurement may and may not conclude — and why a wrapper
+ *  on `convertToSubgraph` withdraws the confident answer — is argued in the lib.
+ *
+ *  The SELECTION is made here rather than at the two call sites, because both had the
+ *  same hole: on a frontend with neither selection API they fell through and converted
+ *  whatever happened to be selected, which is a set the caller never named.
+ *  `graph_select_nodes` already refuses that; now so does this.
+ *
+ *  `beforeChange`/`afterChange` stay paired exactly as before — the report is added
+ *  around them, not in place of them. */
+function convertSelectionToSubgraph({ graph, canvas, nodes, what }) {
+  if (typeof canvas?.selectItems === "function") canvas.selectItems(nodes);
+  else if (typeof canvas?.selectNodes === "function") canvas.selectNodes(nodes);
+  else {
+    throw new Error(
+      `${what} was NOT run and the graph is unchanged — this ComfyUI frontend exposes no ` +
+        `selection API (neither canvas.selectItems nor canvas.selectNodes), and converting ` +
+        `whatever happened to be selected instead would wrap a set you never named.`,
+    );
+  }
+  const detached = detachedConversionNodes(graph, nodes);
+  if (detached.length) throw new Error(detachedConversionRefusal({ what, detached }));
+  const before = conversionSnapshot(graph, nodes);
+  graph.beforeChange?.();
+  try {
+    return graph.convertToSubgraph(canvas.selectedItems);
+  } catch (err) {
+    throw new Error(
+      conversionThrowReport({
+        what,
+        message: err?.message ?? String(err),
+        before,
+        after: conversionSnapshot(graph, nodes),
+      }),
+      { cause: err },
+    );
+  } finally {
+    graph.afterChange?.();
+  }
+}
+
 /** Confirm `convertToSubgraph` actually produced a subgraph NODE on this graph.
  *
  *  Both conversion tools reported `node_id: res?.node?.id ?? null` — so a conversion
@@ -9346,6 +9399,11 @@ function subgraphConversionAdvisories({ disconnected, dangling, warning }) {
   };
 }
 
+/**
+ * `convertToSubgraph()` rewires surviving root-graph neighbours to its new
+ * wrapper but does not revalidate their sticky red flags. Re-adjudicate only
+ * those direct neighbours; never the wrapper or the nodes moved inside it.
+ */
 function clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph }) {
   try {
     for (const id of collectLinkedNeighborNodeIds(res?.node, graph?.links)) {
@@ -18096,15 +18154,14 @@ const GRAPH_TOOL_EXECUTORS = {
       .map((id) => graph.getNodeById(Number(id)))
       .filter(Boolean);
     if (!ns.length) throw new Error("provide node_ids to group into a subgraph");
-    if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
-    else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
-    graph.beforeChange?.();
-    let res;
-    try {
-      res = graph.convertToSubgraph(canvas.selectedItems);
-    } finally {
-      graph.afterChange?.();
-    }
+    // #1463 — selects, refuses a detached selection, and reports a THROW with a
+    // mutation verdict instead of the frontend's bare exception.
+    const res = convertSelectionToSubgraph({
+      graph,
+      canvas,
+      nodes: ns,
+      what: "panel_create_subgraph",
+    });
     clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     graph.setDirtyCanvas?.(true, true);
     // `node_id: null` inside a `subgraph:` payload reads as a success with a missing
@@ -18145,15 +18202,14 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!ns.length) {
       throw new Error(`group "${g.title}" has no nodes inside its box to wrap into a subgraph`);
     }
-    if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
-    else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
-    graph.beforeChange?.();
-    let res;
-    try {
-      res = graph.convertToSubgraph(canvas.selectedItems);
-    } finally {
-      graph.afterChange?.();
-    }
+    // #1463 — same runner as panel_create_subgraph. Both entry points failed
+    // identically in that report, so neither may keep the bare re-throw.
+    const res = convertSelectionToSubgraph({
+      graph,
+      canvas,
+      nodes: ns,
+      what: "panel_subgraph_group",
+    });
     clearStaleRedFlagsAfterSubgraphConversion(res, { app, graph, rootGraph });
     graph.setDirtyCanvas?.(true, true);
     // Same guard as panel_create_subgraph: a conversion that produced no node must
