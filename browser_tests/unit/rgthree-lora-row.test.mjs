@@ -1334,6 +1334,9 @@ const EXECUTOR_DEPS = [
   // The coalescer's live slot. This harness's refreshCombos path is never exercised (the
   // runSetWidget double never calls it), so a fixed null is the truth here.
   "nodeDefRefreshInFlight",
+  // #1498 — the handler retires the turn's manual-change claim for the widget it just
+  // wrote. Panel module state, so the harness supplies a no-op double.
+  "dropManualChangeClaim",
 ];
 
 /**
@@ -1471,6 +1474,7 @@ function executor(node, overrides = {}) {
     // with the shipped numbers, from the shared harness constants.
     ...setWidgetCommandBudgetDeps(),
     nodeDefRefreshInFlight: null,
+    dropManualChangeClaim: () => {},
     ...overrides,
   };
   const factory = new Function(
