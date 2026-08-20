@@ -21,6 +21,8 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 import { mergeHistorySnapshots } from '../../web/js/lib/chat-history-store.js'
 
@@ -92,4 +94,41 @@ test('#1516: timestamped messages still interleave by TIME, not by position', ()
 test('#1516: a single snapshot was already in order and stays that way', () => {
   const only = mergeHistorySnapshots({ threads: [legacyThread(CONVERSATION)], meta: {} })
   assert.deepEqual(textsOf(only), CONVERSATION)
+})
+
+/**
+ * The precondition the tiebreak rests on.
+ *
+ * The rank only ever decides an order when the timestamp comparison ties, and it
+ * can only tie when BOTH messages lack a usable time. `normalizeMessage` floors a
+ * time-less message at createdAt:1, so a live transcript stays timestamp-ordered
+ * exactly as long as the panel keeps stamping every message it records. There is
+ * one writer — `record()` is the only place anything reaches `thread.msgs` — so
+ * this is a one-line invariant, and if a later edit drops it the rank silently
+ * starts re-ordering a MODERN conversation instead of repairing a legacy one.
+ *
+ * Scoped to record()'s own body on purpose: a body-wide scan of the 38k-line panel
+ * would be satisfied by any sibling that happens to mention createdAt.
+ */
+test('#1516: record() stamps createdAt on every entry, which is what keeps live transcripts time-ordered', () => {
+  const panelUrl = new URL('../../web/js/comfyui-mcp-panel.js', import.meta.url)
+  const source = readFileSync(fileURLToPath(panelUrl), 'utf8').replace(/\r\n/g, '\n')
+  const start = source.indexOf('\n  function record(entry) {')
+  assert.notEqual(start, -1, 'could not locate record()')
+  const end = source.indexOf('\n  }\n', source.indexOf('thread.msgs.push(entry);', start))
+  assert.ok(end > start, 'could not locate the end of record()')
+  const body = source.slice(start, end)
+  assert.match(
+    body,
+    /if \(!Number\(entry\.createdAt\)\) entry\.createdAt = now;[\s\S]{0,400}?thread\.msgs\.push\(entry\);/,
+    'record() must stamp createdAt BEFORE the entry reaches thread.msgs'
+  )
+})
+
+test('#1516: record() is still the only path into thread.msgs', () => {
+  const panelUrl = new URL('../../web/js/comfyui-mcp-panel.js', import.meta.url)
+  const source = readFileSync(fileURLToPath(panelUrl), 'utf8').replace(/\r\n/g, '\n')
+  // A second writer would be a second place a message can arrive without a time.
+  const pushes = source.match(/\.msgs\.push\(/g) || []
+  assert.equal(pushes.length, 1, 'a new thread.msgs writer must also stamp createdAt (see #1516)')
 })
