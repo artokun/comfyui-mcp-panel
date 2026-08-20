@@ -6,8 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.16] - 2026-08-20
+
 ### Fixed
 - adding an unknown node type no longer reports an unrelated ReActor import failure when that pack currently provides other live types (#1447)
+- the save-timeout reply no longer claims the canvas is not the save's destination when it is: the requested name and the frontend's derived filename are now compared after the same normalization, so `workflow_save_as({name:"Foo.json"})` keeps reporting `modified:true` instead of withholding it (#1458)
 
 ## [0.15.15] - 2026-08-20
 
