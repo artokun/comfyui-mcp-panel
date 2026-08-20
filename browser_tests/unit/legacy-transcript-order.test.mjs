@@ -24,7 +24,7 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-import { mergeHistorySnapshots } from '../../web/js/lib/chat-history-store.js'
+import { ChatHistoryStore, mergeHistorySnapshots } from '../../web/js/lib/chat-history-store.js'
 
 const THREAD_ID = '11111111-2222-3333-4444-555555555555'
 
@@ -131,4 +131,26 @@ test('#1516: record() is still the only path into thread.msgs', () => {
   // A second writer would be a second place a message can arrive without a time.
   const pushes = source.match(/\.msgs\.push\(/g) || []
   assert.equal(pushes.length, 1, 'a new thread.msgs writer must also stamp createdAt (see #1516)')
+})
+
+/**
+ * The sibling call site. `importPayload` sorted messages with its OWN copy of the
+ * same two-term rule, so a portable archive of a pre-v3 transcript arrived
+ * content-hash scrambled — and an import is a WRITE, so that order would then be
+ * persisted as the conversation's real one. Export runs every message through
+ * normalizeThread, which is what floors a legacy message at createdAt:1, so the
+ * exported archive carries exactly the timestamp-less shape that ties.
+ */
+test('#1516: importing an exported pre-v3 transcript keeps its order', () => {
+  const store = new ChatHistoryStore({
+    storage: { getItem: () => null, setItem: () => {} },
+    indexedDb: null
+  })
+  const archive = store.exportPayload([legacyThread(CONVERSATION)], {})
+  // Nothing local yet: the archive is the only source, so its own order is the
+  // only order there is to keep.
+  const imported = store.importPayload(JSON.stringify(archive), [], {})
+  const thread = imported.threads.find((t) => t.id === THREAD_ID)
+  assert.ok(thread, 'the archived thread should import')
+  assert.deepEqual(thread.msgs.map((m) => m.text), CONVERSATION)
 })

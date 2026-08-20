@@ -937,41 +937,64 @@ export function retainBoundedThreads(threads, limit, protectedThreadIds = []) {
   return ordered.filter((candidate) => keptIds.has(candidate.id));
 }
 
+/**
+ * Where each message already sat, by id — the order those records were actually
+ * written in. Built from the source lists in the order they are handed over, so
+ * the first list defines the baseline and later ones extend it.
+ */
+function messagePositions(...lists) {
+  const rank = new Map();
+  for (const list of lists) {
+    for (const message of Array.isArray(list) ? list : []) {
+      if (message && !rank.has(message.id)) rank.set(message.id, rank.size);
+    }
+  }
+  return rank;
+}
+
+/**
+ * Order messages: by time, and — this is the whole of #1516 — by the position
+ * they already held rather than by their id when the time ties.
+ *
+ * A pre-v3 transcript carries no per-message timestamp, so normalizeMessage
+ * floors every one of its messages at createdAt:1 and the time comparison is a
+ * dead heat for the ENTIRE thread. The old tiebreak was the message id, and a
+ * pre-v3 message's id is `legacy-<hash of its own content>`: sorting on it dealt
+ * the user's conversation back in content-hash order. Measured on a six-message
+ * legacy thread crossing the 0.7.x -> 0.15.x boundary the reporter hit:
+ *
+ *     stored   u1, a1, u2, a2, u3, a3
+ *     painted  a3, u1, u2, a1, a2, u3
+ *
+ * Their first two prompts land after the agent's LAST reply, which is what
+ * "refreshing the page repeated my initial messages" looks like from the chat
+ * pane. Timestamped messages are untouched: their comparison resolves before the
+ * rank is ever consulted, so cross-tab causal interleaving keeps deciding by
+ * time. The id stays as the last resort, so the order is still total.
+ *
+ * ONE comparator for BOTH callers on purpose. The reload merge and the archive
+ * import each carried their own copy of the same two-term rule, so fixing only
+ * the one this issue arrived through would have left an import able to write the
+ * scrambled order straight back into a thread the merge had just repaired.
+ */
+function compareMessageOrder(rank) {
+  return (left, right) =>
+    finiteTs(left.createdAt || left.ts) - finiteTs(right.createdAt || right.ts) ||
+    (rank.get(left.id) ?? 0) - (rank.get(right.id) ?? 0) ||
+    String(left.id).localeCompare(String(right.id));
+}
+
 function mergeThreadMessages(older, newer) {
   const oldMessages = Array.isArray(older?.msgs) ? older.msgs : [];
   const newMessages = Array.isArray(newer?.msgs) ? newer.msgs : [];
   const byId = new Map();
-  // The TIEBREAK, and it is the whole of #1516. A pre-v3 transcript carries no
-  // per-message timestamp, so normalizeMessage floors every one of its messages
-  // at createdAt:1 — which makes the timestamp comparison below a dead heat for
-  // the ENTIRE thread. The old tiebreak was the message id, and a pre-v3
-  // message's id is `legacy-<hash of its own content>`: sorting on it dealt the
-  // user's conversation back in content-hash order. Measured on a six-message
-  // legacy thread crossing the 0.7.x -> 0.15.x boundary the reporter hit:
-  //
-  //     stored   u1, a1, u2, a2, u3, a3
-  //     painted  a2, u3, a3, a1, u2, u1
-  //
-  // The user's first two prompts land after the agent's LAST reply, which is
-  // what "refreshing the page repeated my initial messages" looks like from the
-  // chat pane. Position in the source arrays is the order those records were
-  // actually written in, so rank by that instead. Timestamped messages are
-  // untouched: their comparison resolves before this ever runs, so cross-tab
-  // causal interleaving keeps deciding by time.
-  const rank = new Map();
   for (const message of [...oldMessages, ...newMessages]) {
     const previous = byId.get(message.id);
-    if (!rank.has(message.id)) rank.set(message.id, rank.size);
     if (!previous || compareRevisions(message.revision || message, previous.revision || previous) > 0) {
       byId.set(message.id, message);
     }
   }
-  return [...byId.values()].sort(
-    (a, b) =>
-      finiteTs(a.createdAt || a.ts) - finiteTs(b.createdAt || b.ts) ||
-      (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0) ||
-      String(a.id).localeCompare(String(b.id)),
-  );
+  return [...byId.values()].sort(compareMessageOrder(messagePositions(oldMessages, newMessages)));
 }
 
 /** Merge snapshots by thread id; the newest record wins without dropping fields
@@ -2924,11 +2947,14 @@ export class ChatHistoryStore {
         messages.set(message.id, message);
         thread.updatedAt = Math.max(finiteTs(thread.updatedAt), finiteTs(message.updatedAt));
       }
-      thread.msgs = [...messages.values()].sort(
-        (left, right) =>
-          finiteTs(left.createdAt || left.ts) - finiteTs(right.createdAt || right.ts) ||
-          String(left.id).localeCompare(String(right.id)),
-      );
+      // #1516 — `messages` is already in the right order (the local thread's own
+      // messages, then whatever the archive adds), so its insertion order IS the
+      // rank. Without it an imported pre-v3 transcript arrives content-hash
+      // scrambled, and an import is a WRITE: that order becomes the thread's real
+      // one. Built before the sort, which reorders `collected` in place.
+      const collected = [...messages.values()];
+      const positions = messagePositions(collected);
+      thread.msgs = collected.sort(compareMessageOrder(positions));
       if (existing) {
         const versions = Object.assign(safeMap(), thread.workflowVersions || {});
         let versionState = importedVersionState.get(source.id);
