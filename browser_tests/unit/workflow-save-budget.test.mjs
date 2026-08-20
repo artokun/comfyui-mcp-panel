@@ -155,8 +155,9 @@ test("#1434: the refusal NAMES a live tab and the dirty observation, never 'froz
   assert.match(text, /still live/);
   assert.match(text, /modified:true/);
   assert.match(text, /persisted:true/);
-  assert.match(text, /panel_list_workflows/);
   assert.match(text, /not a backgrounded or frozen tab/);
+  // #1455 — the reply must never resolve landed-ness from the dirty flag.
+  assert.doesNotMatch(text, /if modified is false the write landed/);
   // Same observation the reporter could read after the timeout.
   assert.deepEqual(
     workflowSaveTimeoutObservation({
@@ -280,4 +281,130 @@ test("#1434: BOTH save handlers wrap programmaticSave in the bound — the helpe
     /function observeActiveWorkflowSaveState\(\)/,
     "the timeout path must observe the live dirty flags, not invent them",
   );
+});
+
+// ---------------------------------------------------------------------------
+// #1455 — the reply reports OBSERVATIONS, and is explicit about WHICH workflow
+// they belong to. The save's destination is the requested name, never a guess
+// made from whichever workflow happens to be active.
+// ---------------------------------------------------------------------------
+
+test("#1455: modified:false is reported, never resolved into 'the write landed'", () => {
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: false,
+    persisted: true,
+    filename: "Clean.json",
+  });
+  assert.match(text, /modified:false/);
+  assert.match(text, /persisted:true/);
+  // isModified === false is equally the state of a workflow that was never dirty, and
+  // save() forces past the isPersisted && !isModified early return, so a clean workflow
+  // reaches a hanging PUT with the flag already false.
+  assert.doesNotMatch(text, /the write landed/);
+  assert.match(text, /UNDETERMINED/);
+  assert.doesNotMatch(text, /Check panel_list_workflows before retrying/);
+});
+
+test("#1455: modified:true keeps its one-directional meaning", () => {
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: true,
+    persisted: true,
+    filename: "Dirty.json",
+  });
+  assert.match(text, /has not been acknowledged as landed/);
+  assert.doesNotMatch(text, /UNDETERMINED/);
+});
+
+test("#1455: a Save-As names the DESTINATION, not the source it was copied from", () => {
+  // workflow-save.js:1353 calls openWorkflow(copy) BEFORE saveWorkflow(copy), so by the
+  // time the budget fires the canvas already shows the copy. The source is the one file
+  // this route provably never writes — naming it would send the caller to read the wrong
+  // file and conclude the save was fine.
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: true,
+    persisted: false,
+    filename: "Copy.json",
+    requested: "Copy.json",
+    previousActive: "Original.json",
+  });
+  assert.match(text, /for "Copy\.json"/);
+  assert.doesNotMatch(text, /for "Original\.json"/);
+  assert.match(text, /modified:true/);
+});
+
+test("#1455: a known destination with the canvas elsewhere withholds the foreign flags", () => {
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: false,
+    persisted: true,
+    filename: "Something else.json",
+    requested: "Copy.json",
+    previousActive: "Original.json",
+  });
+  assert.match(text, /for "Copy\.json"/);
+  // Those flags belong to another workflow; reporting them here would be a wrong-target
+  // claim of exactly the kind this issue is about.
+  assert.doesNotMatch(text, /modified:false/);
+  assert.match(text, /do not describe "Copy\.json"/);
+});
+
+test("#1455: an un-named save whose canvas moved says the target is undeterminable", () => {
+  // First-save auto-naming. "I cannot tell which file" must not collapse into the
+  // in-place case, which is the same failure the modified:false half of this issue is.
+  const text = describeWorkflowSaveTimeout({
+    budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    modified: false,
+    persisted: true,
+    filename: "Real name.json",
+    previousActive: "Unsaved Workflow (2)",
+  });
+  assert.match(text, /cannot be determined from here/);
+  assert.match(text, /changed from "Unsaved Workflow \(2\)" to "Real name\.json"/);
+  // No file is named as the target, because none is known to be.
+  assert.doesNotMatch(text, /for "Unsaved Workflow \(2\)"/);
+  assert.doesNotMatch(text, /for "Real name\.json"/);
+});
+
+test("#1455 WIRING: the requested name reaches the reply as the destination", async () => {
+  // Deleting `targetName` at either call site drops the only authoritative signal and
+  // sends the reply back to guessing from the active workflow.
+  let call = 0;
+  const observeWorkflow = () => {
+    call += 1;
+    return call === 1
+      ? { modified: true, persisted: true, filename: "Original.json" }
+      : { modified: true, persisted: false, filename: "Copy.json" };
+  };
+  await assert.rejects(
+    () =>
+      runBoundedWorkflowSave(() => new Promise(() => {}), {
+        budgetMs: 40,
+        targetName: "Copy.json",
+        withTimeout: async (p, ms, onTimeout) => {
+          const t = new Promise((r) => setTimeout(() => r(onTimeout()), ms));
+          return Promise.race([p, t]);
+        },
+        observeWorkflow,
+      }),
+    (err) => {
+      assert.match(err.message, /for "Copy\.json"/, "names the requested destination");
+      assert.doesNotMatch(err.message, /for "Original\.json"/, "never the source");
+      return true;
+    },
+  );
+  assert.ok(call >= 2, "observed before the save and at the budget");
+});
+
+test("#1455 WIRING: BOTH save handlers pass the requested name to the bound save", () => {
+  // A one-line option at a call site is invisible to a helper-level test: deleting
+  // `targetName: name` leaves every assertion above green while the shipped reply
+  // goes back to guessing the destination from whatever is active. Assert on the SOURCE.
+  const panel = PANEL_SRC;
+  const passes = panel.match(/targetName: name,/g) ?? [];
+  const bound = panel.match(/runBoundedWorkflowSave\(/g) ?? [];
+  assert.equal(bound.length, 2, "exactly two bounded save call sites (workflow_save, workflow_save_as)");
+  assert.equal(passes.length, 2, "both of them pass the destination name");
 });
