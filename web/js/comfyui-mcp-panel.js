@@ -246,6 +246,7 @@ import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { installSidebarRenderWatchdog } from "./lib/sidebar-render-watchdog.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { duplicateWidgetRows } from "./lib/widget-rows.js";
+import { pickAdvertisedBridgeUrl } from "./lib/advertised-bridge-url.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "./lib/refresh-coalesce.js";
 import {
@@ -35331,15 +35332,27 @@ function buildPanel() {
   // advertise (or the orchestrator itself coming up after this tab started
   // retrying) self-heals instead of wedging permanently.
   async function reclaimAdvertisedBridgeUrl() {
-    if (location.protocol !== "https:") return;
     const wanted = urlInput.value.trim();
     const manualOverride =
       !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
     if (manualOverride) return; // a user-typed Advanced Bridge URL is never clobbered
-    const secure = await fetchAdvertisedBridgeUrl();
-    if (!secure || secure === client.currentUrl()) return;
-    client.setUrl(secure, { persist: false });
-    lastAutoUrl = secure;
+    // #1486 — the https gate used to sit ABOVE this, so a plain-loopback page never even
+    // read the advertisement. An orchestrator started outside the panel (`npx comfyui-mcp
+    // connect`) POSTs nothing, so neither of the two POST-response adoption sites fires;
+    // status was the only channel left and nothing consulted it. Result: the tab dialled
+    // its compiled default forever while status advertised the port actually bound.
+    const secure = location.protocol === "https:" ? await fetchAdvertisedBridgeUrl() : null;
+    const statusBridgeUrl =
+      location.protocol === "https:" ? null : (await readOrchestratorStatus())?.bridge_url;
+    const next = pickAdvertisedBridgeUrl({
+      protocol: location.protocol,
+      secureUrl: secure,
+      statusBridgeUrl,
+      currentUrl: client.currentUrl(),
+    });
+    if (!next) return;
+    client.setUrl(next, { persist: false });
+    lastAutoUrl = next;
   }
 
   let launcherStartGeneration = 0;
