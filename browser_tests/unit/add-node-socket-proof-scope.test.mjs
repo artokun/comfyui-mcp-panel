@@ -560,7 +560,17 @@ for (const [label, bad] of [
       (e) => e,
     );
     assert.ok(err, "still fails closed — an unproven sibling type is not waived");
-    assert.match(err.message, /no installed node outputs "SEEDVR2_VAE"/);
+    // #1848 — the widen is what would have answered "does anything output SEEDVR2_VAE?",
+    // and in this fixture it could not. Refusing is right; asserting ABSENCE is not, and
+    // that over-claim is the same one #821 was filed about, left behind on the failure
+    // path after #821 fixed the success path.
+    assert.doesNotMatch(
+      err.message,
+      /no installed node outputs "SEEDVR2_VAE"/,
+      "a broken whole-schema read is not evidence that nothing produces the type",
+    );
+    assert.match(err.message, /whether any installed node outputs it is UNKNOWN/);
+    assert.match(err.message, /RETRY this add/, "the remedy follows the real cause");
     assert.doesNotMatch(
       err.message,
       /SEEDVR2_DIT/,
@@ -612,10 +622,18 @@ test("#821: a failed widen leaves the guard exactly as it fails closed today", a
     },
   });
 
-  await assert.rejects(
-    () => graph_add_node({ class_type: "SeedVR2VideoUpscaler" }),
-    /no installed node outputs "SEEDVR2_DIT"/,
+  // #1848 — the guard's behaviour is unchanged (still refused, nothing added); what the
+  // refusal SAYS is not. getNodeDefs throws here, so the whole-schema proof never
+  // happened, and this is the exact sentence #821 was reported for: SeedVR2VideoUpscaler
+  // told "no installed node outputs SEEDVR2_DIT" while SeedVR2LoadDiTModel — which
+  // outputs precisely that — sat on the canvas.
+  const err = await graph_add_node({ class_type: "SeedVR2VideoUpscaler" }).then(
+    () => null,
+    (e) => e,
   );
+  assert.ok(err, "still fails closed on a fetch that did not happen");
+  assert.doesNotMatch(err.message, /no installed node outputs "SEEDVR2_DIT"/);
+  assert.match(err.message, /UNKNOWN/);
   assert.equal(comfy.graph._nodes.length, 0);
 });
 
