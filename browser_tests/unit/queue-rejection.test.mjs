@@ -433,3 +433,36 @@ test("WIRING #1504: graph_run captures the 200 node_errors and hands the ids to 
     "buildQueueAcceptResult must receive the dropped outputs",
   );
 });
+
+test("#1504 gate r1 P1: an accepted batch item must NOT mask a per-node-only refusal of another", () => {
+  // batch=2. Item 1 answered 200 with a prompt id; item 2 was refused with a 400
+  // carrying node_errors and NO top-level error. Reading the id as a blanket
+  // acceptance there reports queued:true for a prompt that was never queued — and
+  // sends the caller to re-run the batch, re-queueing the item that IS rendering.
+  //
+  // The rule is that only the AMBIGUOUS channel yields to a minted id. `rejection`
+  // is captured solely from a non-200 reply, so it is standing proof that some post
+  // was refused, whatever else the run also achieved.
+  const verdict = summarizePromptRejection({
+    rejection: { error: null, node_errors: DROPPED_VAE_DECODES },
+    lastNodeErrors: {},
+    acceptedPromptIds: ["p1"],
+  });
+  assert.ok(verdict, "a captured non-200 rejection is never erased by another post's id");
+  assert.equal(verdict.queued, false);
+  assert.deepEqual(verdict.node_errors, DROPPED_VAE_DECODES, "the refused item errors survive");
+  assert.equal(verdict.prompt_id, "p1", "…and the accepted item id rides along, not lost");
+});
+
+test("#1504 gate r1 P1: an EMPTY captured rejection body does not block an accepted partial run", () => {
+  // `{error:null, node_errors:{}}` names no refusal on either channel, so it is not
+  // evidence of one — the reported #1504 shape (a 200 partial run) must still pass.
+  assert.equal(
+    summarizePromptRejection({
+      rejection: { error: null, node_errors: {} },
+      lastNodeErrors: DROPPED_VAE_DECODES,
+      acceptedPromptIds: [RUNNING_PROMPT_ID],
+    }),
+    null,
+  );
+});

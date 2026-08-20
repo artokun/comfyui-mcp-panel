@@ -33,8 +33,10 @@
  *   (#699) instead of passing the bare backend string through.
  * @param {(string|number)[]} [args.acceptedPromptIds]  Every prompt_id ComfyUI MINTED
  *   during this run, read out of a 200 POST /prompt body (#1504). A minted id is a
- *   receipt of acceptance, not a flag the panel set, so it decides the verdict over
- *   any per-node errors that accompany it.
+ *   receipt of acceptance, not a flag the panel set, so it outranks `lastNodeErrors` —
+ *   the one channel that cannot say which reply it came from. It does NOT outrank
+ *   `rejection`, which is captured only from a non-200 reply: in a batch both can be
+ *   true at once, and the ids are then reported ALONGSIDE the refusal.
  * @returns {null | {queued:false, error?:string, error_type?:string, node_errors?:object,
  *   prompt_id?:string, prompt_ids?:string[]}}
  *   `null` ⇒ accepted (report queued). Otherwise the failure to return verbatim.
@@ -74,11 +76,19 @@ export function summarizePromptRejection({
   // an id present ⇒ work was accepted. #358 does not regress: a pure top-level rejection
   // is a 400 that mints nothing, leaving this list empty.
   //
-  // A top-level error still wins, because the two claims then contradict each other and
-  // this module must not pick a side — it reports BOTH (the ids ride along on the result)
-  // and lets the orchestrator send the caller to the queue to settle it.
+  // ONLY THE AMBIGUOUS CHANNEL IS OVERRIDDEN (codex gate r1, P1). `lastNodeErrors` is
+  // ambiguous because the frontend writes a 200 reply and a rejection into it alike.
+  // `rejection` is NOT: it is captured only from a NON-200 reply, so it is standing
+  // proof that some post was refused, whether or not that body also carried a
+  // top-level `error`. A batch makes the two coexist — item 1 accepted with an id,
+  // item 2 refused — and reading the id as a blanket acceptance there would report
+  // `queued:true` for prompts that were never queued, sending the caller to re-run the
+  // one that IS. So a captured rejection always stands, and the accepted ids ride along
+  // on the result instead of erasing it: the orchestrator turns that pairing into its
+  // "[UNCERTAIN] … a render may already be in flight, do NOT re-run" answer, which is
+  // the honest reading of a reply that says both things at once.
   const acceptedIds = normalizeAcceptedIds(acceptedPromptIds);
-  if (acceptedIds.length && !hasTopError(topError)) return null;
+  if (acceptedIds.length && !hasCapturedRejection(rejection)) return null;
 
   const result = { queued: false };
   if (acceptedIds.length) {
@@ -151,6 +161,17 @@ function noOutputsHint(errorType, runToNode) {
     `is a defect in the node pack and cannot be worked around from here. Either way, running ` +
     `the FULL workflow (omit to_node_id) executes this node normally.`
   );
+}
+
+/**
+ * True when `rejection` is a body captured from a NON-200 /prompt reply that names a
+ * refusal on either channel. Unlike `lastNodeErrors`, this cannot have come from an
+ * accepted prompt — the capture layer only fills it on a non-200 — so it is never
+ * overridden by a prompt id minted by some OTHER post of the same run.
+ */
+function hasCapturedRejection(rejection) {
+  if (!rejection || typeof rejection !== "object") return false;
+  return hasTopError(rejection.error ?? null) || normalizeNodeErrors(rejection.node_errors) != null;
 }
 
 function hasTopError(err) {
