@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.30] - 2026-08-20
+
+### Fixed
+- the default saveWorkflow test double writes the tab's own path (#1542)
+
+
 ## [0.15.29] - 2026-08-20
 
 ### Fixed
