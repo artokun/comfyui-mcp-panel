@@ -318,10 +318,25 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
     giveBack < src.indexOf('phase = "combo";', localStart),
     "…and be handed back BEFORE the combo phase reads what is left",
   );
+  // #608 split the fetch phase between TWO transports, so the one property this used to
+  // pin is now pinned in three: the phase draws its budget from the RUN deadline, the
+  // client route gets a SHARE of that phase (the rest is the reserve the raw /object_info
+  // route is asked with), and the bound actually armed is what is left of the client
+  // route's own deadline. A constant substituted at any of the three fails here.
   assert.match(
     src,
-    /boundedGetNodeDefs\(nodeDefsBudgetLeft\(runDeadline, NODE_DEFS_FETCH_SHARE\)\)/,
-    "the fetch phase must draw its bound from the run deadline",
+    /const fetchPhaseBudgetMs = nodeDefsBudgetLeft\(runDeadline, NODE_DEFS_FETCH_SHARE\);/,
+    "the fetch phase must draw its budget from the run deadline",
+  );
+  assert.match(
+    src,
+    /fetchPhaseStartedAt \+ Math\.max\(1, Math\.floor\(fetchPhaseBudgetMs \* NODE_DEFS_CLIENT_ROUTE_SHARE\)\)/,
+    "the client route takes a share of the phase, so the second transport keeps a reserve",
+  );
+  assert.match(
+    src,
+    /boundedGetNodeDefs\(nodeDefsBudgetLeft\(clientRouteDeadline\)\)/,
+    "…and the bound actually armed is what is left of the client route's deadline",
   );
   // #1193 read the bound into a variable so the refusal can name it. The property this
   // pins is unchanged and now pinned in two halves: the bound is COMPUTED from what the

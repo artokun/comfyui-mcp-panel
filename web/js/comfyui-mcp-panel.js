@@ -1522,8 +1522,8 @@ async function registerComfyNodeDefs(preloadedDefs) {
       //
       // Same question, different route: the WHOLE document, never the per-class
       // `/object_info/<Type>` one — the oracle's header says why that is not
-      // interchangeable, and this path feeds `objectInfoSnapshot.record(..., whole: true)`,
-      // which is exactly the reader a single-class payload would poison.
+      // interchangeable, and this path files what it fetched in the whole-schema snapshot
+      // (#1223), which is exactly the reader a single-class payload would poison.
       //
       // AN EMPTY `{}` IS AN ANSWER, NOT AN ABSENCE, and this mirrors the oracle rather than
       // `objectInfoLooksTransient`, which the two modules genuinely disagree about. A client
