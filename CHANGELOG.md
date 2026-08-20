@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.27] - 2026-08-20
+
+### Fixed
+- the archive import carried the same broken tiebreak (#1531)
+- a timestamp-less transcript keeps the order it was written in (#1530)
+- the slot snapshot is instrumentation, not a precondition for firing the hook
+- a programmatic widget write announces itself to the node, not just to the widget
+
+
 ## [0.15.26] - 2026-08-20
 
 ### Fixed
