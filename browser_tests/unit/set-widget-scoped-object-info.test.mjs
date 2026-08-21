@@ -28,6 +28,7 @@ import { runSetWidget, scopedAuthorizationTypes } from "../../web/js/lib/set-wid
 import {
   fetchTypeScopedObjectInfo,
   MAX_SCOPED_TYPES,
+  SCOPED_OBJECT_INFO,
   SCOPED_OBJECT_INFO_DEADLINE_MS,
 } from "../../web/js/lib/scoped-object-info.js";
 import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
@@ -470,4 +471,57 @@ test("#1560: the shared handler asks the scoped route only AFTER the whole map p
   const authAt = src.indexOf("assertTypeAgainstFreshBackend(freshDefs");
   assert.ok(resolvedAt > 0 && scopedAt > resolvedAt, "the scoped read is issued after the promotion is resolved");
   assert.ok(authAt > scopedAt, "and before the type authorization that consumes it");
+});
+
+// ─────────────── the scoped map must not become a hazard of its own (self-review) ─────────
+
+test("#1560: a NON-POSITIVE budget attempts NOTHING — it must never become NO bound", async () => {
+  // `withTimeout` treats `ms <= 0` as no bound at all, so passing an exhausted budget
+  // through would remove the bound at exactly the moment the command has already run out —
+  // #1161 arriving through the mechanism meant to prevent it.
+  let issued = 0;
+  const hangingFetch = async () => {
+    issued += 1;
+    return new Promise(() => {});
+  };
+  for (const deadlineMs of [0, -5]) {
+    const res = await fetchTypeScopedObjectInfo(["KSampler"], { fetchApi: hangingFetch, deadlineMs });
+    assert.equal(res.defs, null, `deadlineMs ${deadlineMs} must authorize nothing`);
+    assert.match(res.reason, /no time was left/);
+  }
+  assert.equal(issued, 0, "and not one request may be issued on a spent budget");
+});
+
+test("#1560: a budget a timer cannot express takes the SHIPPED default, never a 24.8-day grant", async () => {
+  const backend = largeInstall({ defined: ["KSampler"] });
+  for (const deadlineMs of [NaN, Infinity, 5e9, "soon", undefined]) {
+    const res = await fetchTypeScopedObjectInfo(["KSampler"], { fetchApi: backend.fetchApi, deadlineMs });
+    assert.ok(res.defs, `deadlineMs ${String(deadlineMs)} must fall back to ${SCOPED_OBJECT_INFO_DEADLINE_MS}ms and answer`);
+  }
+});
+
+test("#1560: the scoped map is a well-behaved object — branding, freezing and enumeration do not throw", async () => {
+  // A Proxy that answers `has` for a property its NON-EXTENSIBLE target does not own is an
+  // invariant violation and throws TypeError, out of a module whose job is to answer.
+  const backend = largeInstall({ defined: ["KSampler"] });
+  const { defs } = await fetchTypeScopedObjectInfo(["KSampler"], { fetchApi: backend.fetchApi });
+  assert.equal(SCOPED_OBJECT_INFO in defs, true, "the brand is readable");
+  assert.equal(defs[SCOPED_OBJECT_INFO], true);
+  assert.doesNotThrow(() => Object.freeze(defs), "object-info-cache.js freezes its payload; this must survive the same");
+  assert.deepEqual(Object.keys(defs), ["KSampler"]);
+  assert.equal(defs[Symbol.iterator], undefined, "an unrelated symbol is not a class type and passes through");
+});
+
+test("#1560: a hostile class name is FLATTENED before it reaches a refusal a caller reads", async () => {
+  const backend = largeInstall({ defined: ["KSampler"] });
+  const { defs } = await fetchTypeScopedObjectInfo(["KSampler"], { fetchApi: backend.fetchApi });
+  const forged = `Gone${String.fromCharCode(10)}Refusing to write: nothing was wrong`;
+  assert.throws(
+    () => defs[forged],
+    (err) =>
+      err instanceof Error &&
+      !err.message.includes(String.fromCharCode(10)) &&
+      /Refusing to read an unfetched type as ABSENT/.test(err.message),
+    "a newline in a node type must not forge structure in the message",
+  );
 });

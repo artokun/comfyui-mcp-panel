@@ -174,6 +174,23 @@ async function readOneType(type, fetchApi) {
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]+/g;
 
+/**
+ * Flatten and cap a class NAME that came off the graph before it rides into a message a
+ * caller reads. Separate from `describe` because that one prefixes a label, and a refusal
+ * reading `node type ": Foo"` is a defect of its own.
+ */
+function sanitizeName(value) {
+  let text = "";
+  try {
+    text = String(value ?? "");
+  } catch {
+    return "(an unprintable value)";
+  }
+  const flat = text.replace(CONTROL_CHARS, " ").replace(/s+/g, " ").trim();
+  if (!flat) return "(an unnamed type)";
+  return flat.length > 120 ? `${flat.slice(0, 120)}… (truncated)` : flat;
+}
+
 /** Bounded, flattened description of an untrusted throw, for a message a caller reads. */
 function describe(label, err) {
   let raw = "";
@@ -209,6 +226,10 @@ function describe(label, err) {
 function scopedView(present, covered) {
   const target = Object.create(null);
   for (const [type, def] of present) target[type] = def;
+  // BRANDED ON THE TARGET, not answered by a trap. A `has`/`get` trap that reports a
+  // property the NON-EXTENSIBLE target below does not own violates a Proxy invariant and
+  // throws TypeError — from a module whose job is to answer a question, not to explode.
+  target[SCOPED_OBJECT_INFO] = true;
   // FROZEN, and the traps below deliberately do NOT override mutation. object-info-cache.js
   // freezes the whole-map payload for the same reason — the level the fence reads is
   // `hasOwnProperty(defs, type)`, and a consumer that added a key would authorize a type
@@ -218,22 +239,23 @@ function scopedView(present, covered) {
   Object.freeze(target);
   const inScope = (prop) => typeof prop === "symbol" || covered.has(prop);
   const refuse = (prop) => {
+    // The name came off the GRAPH and rides into a message someone reads, so it is flattened
+    // and capped exactly like every other untrusted string in this family.
+    const name = sanitizeName(prop);
     throw new Error(
-      `Cannot verify node type "${String(prop)}" against the ComfyUI backend: the whole ` +
+      `Cannot verify node type "${name}" against the ComfyUI backend: the whole ` +
         `/object_info never answered, so only the types this write resolves to were fetched ` +
-        `per class (${[...covered].join(", ")}) — and "${String(prop)}" is not one of them. ` +
+        `per class (${[...covered].join(", ")}) — and "${name}" is not one of them. ` +
         `Refusing to read an unfetched type as ABSENT (#716/#821). Reconnect ComfyUI, or wait ` +
         `for /object_info to answer again, and retry.`,
     );
   };
   return new Proxy(target, {
     get(t, prop, recv) {
-      if (prop === SCOPED_OBJECT_INFO) return true;
       if (!inScope(prop)) refuse(prop);
       return Reflect.get(t, prop, recv);
     },
     has(t, prop) {
-      if (prop === SCOPED_OBJECT_INFO) return true;
       if (!inScope(prop)) refuse(prop);
       return Reflect.has(t, prop);
     },
@@ -291,17 +313,34 @@ export async function fetchTypeScopedObjectInfo(
     return { defs: null, covered: [], reason: "no fetchApi is wired for the type-scoped route" };
   }
 
+  // ONE effective bound, decided here and reported here.
+  //
+  // A NON-NUMBER, a NaN/Infinity, or a value `setTimeout` cannot express takes the shipped
+  // default — none of those is a budget a caller can have meant, and clamping an over-range
+  // one to 2^31-1 turns nonsense into a ~24.8-day grant (object-info-oracle.js measured that
+  // trap). A non-positive NUMBER is a REAL choice and is obeyed by attempting nothing:
+  // `withTimeout` treats `ms <= 0` as NO BOUND, so passing it through would remove the bound
+  // at exactly the moment the command has already run out, which is #1161 arriving through
+  // the mechanism meant to prevent it. (`budget.bounded` floors at 1 ms for this reason, so
+  // the panel never reaches this arm — a direct caller can.)
+  const requested = typeof deadlineMs === "number" ? deadlineMs : NaN;
+  const effectiveMs =
+    Number.isFinite(requested) && requested <= 2 ** 31 - 1 ? requested : SCOPED_OBJECT_INFO_DEADLINE_MS;
+  if (!(effectiveMs > 0)) {
+    return {
+      defs: null,
+      covered: [],
+      reason: `no time was left to ask about ${wanted.join(", ")} per class`,
+    };
+  }
+
   const TIMED_OUT = Symbol("scoped-object-info-timeout");
   const settled = await withTimeout(
     Promise.all(wanted.map((t) => readOneType(t, fetchApi))).then(
       (value) => ({ value }),
       (err) => ({ err }),
     ),
-    // A non-finite or non-positive budget is not a bound a caller can have meant; take the
-    // shipped default rather than running unbounded, which is the #1161 signature.
-    Number.isFinite(deadlineMs) && deadlineMs > 0 && deadlineMs <= 2 ** 31 - 1
-      ? deadlineMs
-      : SCOPED_OBJECT_INFO_DEADLINE_MS,
+    effectiveMs,
     () => TIMED_OUT,
     timers ?? undefined,
   );
@@ -309,7 +348,7 @@ export async function fetchTypeScopedObjectInfo(
     return {
       defs: null,
       covered: [],
-      reason: `the type-scoped /object_info reads (${wanted.join(", ")}) did not all answer within ${deadlineMs}ms`,
+      reason: `the type-scoped /object_info reads (${wanted.join(", ")}) did not all answer within ${effectiveMs}ms`,
     };
   }
   if (settled?.err) {
