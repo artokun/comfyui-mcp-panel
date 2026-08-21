@@ -556,3 +556,206 @@ test("#1565 CALL SITE: graph_run takes its budget from RUN_COMMAND_BUDGET_MS on 
     "the pre-flight serialization draws from the command budget, not its own fresh clock",
   );
 });
+
+// ---------------------------------------------------------------------------
+// 5. THE UNSCOPED FULL RUN — `graph_run({})`, no to_node_id.
+//
+// The first cut of #1565 bounded only the scoped path and disclosed the unscoped one as
+// deliberately out of scope, on the argument that abandoning an unbounded queue call
+// risks claiming `queued` with no receipt. A review returned that as a P1. MEASURED
+// against the shipped body, both halves of the argument turned out to be true and only
+// one of them survives:
+//
+//   - the harm is REAL and identical to the scoped one. `graph_run({})` against a
+//     frontend whose queue processor never answers never replied; the caller timed out
+//     at 20,007 ms, retried on the advice of a message blaming a "backgrounded or
+//     frozen" tab, and the retry queued at 20,022 ms while the FIRST run's post landed
+//     at 21,011 ms — TWO full-graph renders from one user intent, on the MORE COMMON
+//     path;
+//   - and the receipt objection is real: `buildQueueAcceptResult` with no ids answers a
+//     bare `{queued: true, batch_count: N}` — a definite positive with nothing behind it.
+//
+// What resolves it is that the honest vocabulary already existed. `queued_unknown` was
+// built for exactly this epistemic state on the scoped path, so the bound routes into it
+// rather than into a `queued` the run cannot back.
+// ---------------------------------------------------------------------------
+
+/**
+ * A frontend for the UNSCOPED path.
+ * @param {"late"|"never"|"silent"|"postThenHang"} mode
+ *   late         posts and settles after drainMs (healthy)
+ *   never        never settles; posts drainMs later (the busy processor)
+ *   silent       never settles, never posts
+ *   postThenHang posts and captures a prompt_id, then never settles (partial batch)
+ */
+function makeUnscopedFrontend({ apiTarget, mode, drainMs = 5 }) {
+  const app = {
+    queueItems: [],
+    graph: { _nodes: [] },
+    graphToPrompt: async () => ({ output: OUR_OUTPUT, workflow: {} }),
+    queuePrompt: async () => {
+      const post = () =>
+        apiTarget.fetchApi("/prompt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: OUR_OUTPUT, client_id: "x" }),
+        });
+      if (mode === "silent") return new Promise(() => {});
+      if (mode === "postThenHang") {
+        await post();
+        return new Promise(() => {});
+      }
+      if (mode === "never") {
+        const t = setTimeout(post, drainMs);
+        if (typeof t.unref === "function") t.unref();
+        return new Promise(() => {});
+      }
+      await post();
+      return true;
+    },
+  };
+  return app;
+}
+
+test("#1565 P1: a full run whose queue call never settles ANSWERS inside its budget — it does not hang to the relay timeout", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "never", drainMs: 60000 });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 600, serializeMs: 400 });
+    const started = Date.now();
+    const answer = await Promise.race([
+      built.graph_run({}).then((r) => ({ replied: r })),
+      new Promise((r) => setTimeout(() => r({ hung: true }), 5000)),
+    ]);
+    assert.ok(
+      !answer.hung,
+      "graph_run({}) never replied — the unbounded queue call is the reported hang, on the " +
+        "MORE COMMON path: the caller then times out and retries, and the late post still lands",
+    );
+    assert.ok(Date.now() - started <= 5000);
+  } finally {
+    stop();
+  }
+});
+
+test("#1565 P1: an abandoned full run NEVER answers a bare queued:true — the receipt objection, honoured", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "silent" });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 600, serializeMs: 400 });
+    const res = await built.graph_run({});
+    // buildQueueAcceptResult with no ids answers {queued:true, batch_count:N}. Routing an
+    // abandoned run through it would assert a render nobody observed.
+    assert.notEqual(res.queued, true, "a run with no receipt must never claim it queued");
+    assert.equal(res.queued_unknown, true, "it takes the honest shape the scoped path already uses");
+    assert.equal("queued" in res, false, "and OMITS `queued` — there is no boolean that means unknown");
+    assert.match(String(res.retry_guidance), /blind retry renders the whole graph twice/);
+  } finally {
+    stop();
+  }
+});
+
+test("#1565 P1: `queued:false` is never earned by an abandoned run — a bounded observation cannot license an unbounded negative", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const server = apiTarget.fetchApi;
+    // Nothing has left the panel when the budget expires — but the queue call is STILL
+    // RUNNING and posts afterwards. Measured on the real body: answered at 1.5 s with
+    // posted === 0, and the post left at 21 s anyway. Telling the caller "nothing was
+    // queued, safe to re-issue" there moves the duplicate render rather than removing it.
+    const app = makeUnscopedFrontend({ apiTarget, mode: "never", drainMs: 400 });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 250, serializeMs: 150 });
+    const res = await built.graph_run({});
+    assert.equal(server.calls.length, 0, "nothing had left the panel at the moment of the reply");
+    assert.notEqual(
+      res.queued,
+      false,
+      "`queued:false` says the run can be re-issued safely; the frontend can still post it",
+    );
+    assert.equal(res.queued_unknown, true);
+    assert.match(String(res.retry_guidance), /STILL RUNNING/);
+    // And the late post does arrive, which is exactly why the negative was not honest.
+    await new Promise((r) => setTimeout(r, 700));
+    assert.equal(server.calls.length, 1, "the abandoned queue call posted after the reply");
+  } finally {
+    stop();
+  }
+});
+
+test("#1565 P1: prompts that DID queue before the budget expired are reported with their real ids", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "postThenHang" });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 600, serializeMs: 400 });
+    const res = await built.graph_run({});
+    // Reporting this as a failure would send the caller to re-run work that is rendering.
+    assert.equal(res.queued, true);
+    assert.equal(res.partially_queued, true);
+    assert.deepEqual(res.queued_prompt_ids, ["srv-1"]);
+    assert.equal(res.complete, false);
+    assert.match(String(res.incomplete_reason), /command budget/);
+  } finally {
+    stop();
+  }
+});
+
+test("#1565 P1: a HEALTHY full run is untouched — same accept result, no budget in sight", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late", drainMs: 5 });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({});
+    assert.deepEqual(res, { queued: true, batch_count: 1, prompt_id: "srv-1" });
+  } finally {
+    stop();
+  }
+});
+
+test("#1565 P1: the run interceptor COUNTS what left the panel, so the reply states it rather than assuming it", async () => {
+  const stop = keepAlive();
+  try {
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const inner = async (route, options) => {
+      await gate;
+      return { status: 200, clone: () => ({ json: async () => ({ prompt_id: "p1" }) }), text: async () => "{}" };
+    };
+    const interceptor = createRunFetchInterceptor({ origFetchApi: inner });
+    assert.deepEqual(interceptor.state, { posted: 0, inFlight: 0 });
+    const post = interceptor("/prompt", { method: "POST", body: JSON.stringify({ prompt: {} }) });
+    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 1 }, "counted BEFORE the request leaves");
+    release();
+    await post;
+    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 0 }, "and settled when it answers");
+    // A non-prompt request is never counted as this run's work.
+    await interceptor("/queue", { method: "GET" });
+    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 0 });
+  } finally {
+    stop();
+  }
+});
+
+test("#1565 P1: an unreadable request cannot stop a fetch that previously went out", async () => {
+  const stop = keepAlive();
+  try {
+    let reached = false;
+    const inner = async () => {
+      reached = true;
+      return { status: 200, clone: () => ({ json: async () => ({}) }), text: async () => "{}" };
+    };
+    const interceptor = createRunFetchInterceptor({ origFetchApi: inner });
+    // Classification moved BEFORE the await, so a throwing `options` must not become a
+    // request that never leaves — this used to run only after the fetch.
+    const hostile = new Proxy({}, { get() { throw new Error("hostile options"); } });
+    await interceptor("/prompt", hostile);
+    assert.equal(reached, true, "the request still went out");
+    assert.equal(interceptor.state.posted, 0, "it simply is not counted");
+  } finally {
+    stop();
+  }
+});

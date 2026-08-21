@@ -1228,6 +1228,15 @@ async function classifyRunResponse(res, { onRejection, onPromptId, onAcceptedNod
  * lands on lastNodeErrors), so the raw non-200 /prompt body is the only place
  * that error exists; and EVERY accepted prompt_id is captured for the recovery
  * ledger. Installed only for the duration of the queuePrompt call.
+ *
+ * #1565 — IT ALSO COUNTS WHAT LEFT. `interceptor.state` is live:
+ *   - `posted`   /prompt requests this run handed to the network, ever;
+ *   - `inFlight` those whose response has not come back yet.
+ * A full run whose `app.queuePrompt` is abandoned at the command budget has to say
+ * whether anything actually left the panel, and "nothing was queued" and "a request
+ * is in flight" are different answers with different retry advice — only one of them
+ * is safe to act on blindly. This is the only place that sees the request leave, so
+ * it is the only place that can answer it from observation rather than assumption.
  */
 export function createRunFetchInterceptor({
   origFetchApi,
@@ -1235,13 +1244,35 @@ export function createRunFetchInterceptor({
   onPromptId = null,
   onAcceptedNodeErrors = null,
 } = {}) {
-  return async function runFetchInterceptor(route, options) {
-    const res = await origFetchApi(route, options);
-    if (isPromptPost(route, options) && res) {
-      await captureRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors });
+  const state = { posted: 0, inFlight: 0 };
+  const interceptor = async function runFetchInterceptor(route, options) {
+    // Classified BEFORE the request leaves, because that is the only moment at which
+    // "this one is ours to count" can still be decided. Guarded: reading `options`
+    // is itself an operation that can throw (a throwing getter, a Proxy), and this
+    // used to run only AFTER the fetch — so a throw here must not be able to stop a
+    // request that previously went out. An unreadable request is simply not counted.
+    let isPost = false;
+    try {
+      isPost = isPromptPost(route, options);
+    } catch {
+      isPost = false;
     }
-    return res;
+    if (isPost) {
+      state.posted++;
+      state.inFlight++;
+    }
+    try {
+      const res = await origFetchApi(route, options);
+      if (isPost && res) {
+        await captureRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors });
+      }
+      return res;
+    } finally {
+      if (isPost) state.inFlight--;
+    }
   };
+  interceptor.state = state;
+  return interceptor;
 }
 
 /**
