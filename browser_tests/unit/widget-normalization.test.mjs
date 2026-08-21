@@ -148,12 +148,21 @@ test("#1130 the float grid is `round`, and NEITHER reading of `step` is it", () 
 });
 
 test("#1130 the float grid is anchored at ZERO, not at min", () => {
-  // NormalizeImages.std: min 0.001, round 0.1. Measured: 0.3381 stores 0.3.
-  // Anchored at min the same arithmetic yields 0.301 — so the anchor is not a
-  // detail, it decides the value.
-  const w = widget({ min: 0.001, max: 1, step: 5, step2: 0.5, round: 0.1, precision: 1 });
-  assert.ok(explainNumericNormalization(0.3381, 0.3, w), "zero-anchored 0.3 is what the widget stored");
-  assert.equal(explainNumericNormalization(0.3381, 0.301, w), null, "the min-anchored answer never happened");
+  // The anchor is usually invisible — `toFixed(precision)` re-rounds onto the
+  // zero grid and hides it — so these are the requests where it is NOT, found by
+  // sweeping the two models against each other and then MEASURED on the rig.
+  // Each pair is (what the widget stored, what a min-anchored model predicts).
+  const std = widget({ min: 0.001, max: 1, step: 5, step2: 0.5, round: 0.1, precision: 1 });
+  assert.ok(explainNumericNormalization(0.0500223, 0.1, std), "measured: 0.0500223 stores 0.1");
+  assert.equal(explainNumericNormalization(0.0500223, 0.001, std), null, "min-anchored says 0.001 — it never happened");
+
+  const duration = widget({ min: 0.01, max: 2048, step: 5, step2: 0.5, round: 0.1, precision: 1 });
+  assert.ok(explainNumericNormalization(0.05137, 0.1, duration), "measured: 0.05137 stores 0.1");
+  assert.equal(explainNumericNormalization(0.05137, 0.01, duration), null, "min-anchored says 0.01");
+
+  const alpha = widget({ min: -10000, max: 10000, step: 1, step2: 0.1, round: 0.01, precision: 1 });
+  assert.ok(explainNumericNormalization(-9999.554863, -9999.6, alpha), "measured: -9999.554863 stores -9999.6");
+  assert.equal(explainNumericNormalization(-9999.554863, -9999.5, alpha), null, "min-anchored says -9999.5");
 });
 
 test("#1130 `toFixed(precision)` is arithmetic, not presentation", () => {

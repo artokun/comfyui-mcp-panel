@@ -51,9 +51,12 @@
  *    declares no step at all, so the frontend fills in `step: 5, step2: 0.5,
  *    round: 0.1, precision: 1`. The grid that quantized 1.12 to 1.1 is `round`
  *    — a value neither `step` (5) nor the 10x reading of it (0.5) produces.
- *  - **The float grid is anchored at ZERO, not at `min`.** `NormalizeImages.std`
- *    (min 0.001, round 0.1) stores 0.3 for a request of 0.3381; anchored at min
- *    the same arithmetic yields 0.301.
+ *  - **The float grid is anchored at ZERO, not at `min`.** Usually invisible —
+ *    `toFixed` re-rounds onto the zero grid and hides the shift — but not always:
+ *    `NormalizeImages.std` (min 0.001, round 0.1) stores 0.1 for a request of
+ *    0.0500223, where anchoring at min yields 0.001. Measured, not reasoned: the
+ *    two models were swept against each other for a disagreement and the
+ *    disagreement was then run on the rig.
  *  - **`toFixed(precision)` is part of the arithmetic, not presentation.** It is
  *    what makes the stored value the exact double `1.1` rather than the
  *    `1.1000000000000000888` that `Math.round(1.12 / 0.1) * 0.1` leaves behind.
