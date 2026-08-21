@@ -15756,8 +15756,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // the catch below already treats as "pre-flight unavailable" and skips — the
       // documented fail-soft contract, unchanged. The dispatch's own bounded serialization
       // then produces the truthful, worded refusal.
+      // `Promise.resolve(...)` because an extension may replace graphToPrompt with a
+      // SYNCHRONOUS function returning the prompt object. `await` accepted that; a bare
+      // `.then` on it throws, and the catch below would silently skip a pre-flight that
+      // used to run — a bound that removes a guard is the failure it exists to prevent.
       const preflightBuild = await withTimeout(
-        app.graphToPrompt().then(
+        Promise.resolve(app.graphToPrompt()).then(
           (value) => ({ value }),
           (error) => ({ error }),
         ),

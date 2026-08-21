@@ -94,6 +94,18 @@ test("#1582 a long type list is bounded", () => {
 //    a few lines inside a 30k-line file that a refactor could drop with every unit test
 //    still green.
 
+test("#1565: a SYNCHRONOUS graphToPrompt still reaches the pre-flight — the bound must not remove a guard", async () => {
+  // An extension may replace graphToPrompt with a plain function returning the prompt
+  // object. `await` accepted that; a bare `.then` on a non-thenable throws, and the
+  // pre-flight's own catch would swallow it and skip a guard that used to run.
+  const msg = await runPreflight({
+    graphToPrompt: () => ({ output: { 1: { class_type: undefined, inputs: {} } }, workflow: {} }),
+    nodes: [{ id: 1, type: "LCKreaSampler", constructor: {} }],
+  });
+  assert.notEqual(msg, "__NO_REFUSAL__", "the pre-flight must still refuse an unrunnable node");
+  assert.match(msg, /^NOT queued:/);
+});
+
 test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async () => {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
