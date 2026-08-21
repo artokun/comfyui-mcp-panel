@@ -268,6 +268,37 @@ export function isAuthorizedFrontendOnlyType(registry, type, node) {
  * BEFORE the frontend-only exemption. `wasTypeEverDefined` is injected by the panel
  * and itself fails closed while the session baseline is unseeded.
  */
+/**
+ * mcp#2000 — THE FRONTEND-ONLY EXEMPTION AS APPLIED ON THE UNAVAILABLE-/object_info PATH,
+ * in ONE place for all three guards that need it. The clauses are identical to the ones
+ * each guard applies when /object_info WAS fetched, and neither reads the fetched defs:
+ * the ever-seen gate reads the session-history oracle (a timeout leaves it intact) and
+ * isAuthorizedFrontendOnlyType reads the live registry. A frontend-only type is absent
+ * from /object_info BY DESIGN, so a fetch that did not answer withheld nothing about it.
+ *
+ * WHY IT SWALLOWS: before mcp#2000 these guards threw their refusal WITHOUT consulting
+ * anything, so nothing on that path could raise. Consulting two predicates first means a
+ * hostile registry (a Proxy whose membership trap throws) or an oracle that raises would
+ * surface a RAW error in place of the worded refusal — the change making something worse
+ * that it did not have to. Measured, not theorised: all three guards leaked
+ * "registry exploded" / "history oracle exploded" before this wrapper existed.
+ * Any doubt returns false, which refuses — the #458 default, and the same idiom this file
+ * already uses for readImportFailures and describeObjectInfoFailure ("a diagnostic that
+ * throws must not replace the refusal it explains").
+ *
+ * One copy, three call sites, deliberately: three inline copies is the #496 drift.
+ */
+function frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined) {
+  try {
+    return (
+      backendHistoryVerdict(type, wasTypeEverDefined) === "never-seen" &&
+      isAuthorizedFrontendOnlyType(registry, type, node)
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function isRemovedBackendType(type, wasTypeEverDefined) {
   return backendHistoryVerdict(type, wasTypeEverDefined) === "removed";
 }
@@ -427,6 +458,11 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
   const id = node?.id ?? "(unknown)";
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
+    // mcp#2000 — same exemption, same terms, same reason as the add guard: neither
+    // clause reads `freshDefs`, and for a frontend-only type a successful fetch would
+    // have said nothing about it anyway. Kept in step with the two sibling guards
+    // deliberately — one copy relaxed alone is the #496 drift all over again.
+    if (frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined)) return;
     throw new Error(
       `Cannot set widget on node ${id}${label}: cannot verify the ${role} node against the ` +
         `ComfyUI backend (object_info is unavailable). Refusing to write rather than trust a ` +
@@ -533,6 +569,12 @@ export function assertAddNodeResolvable(registry, class_type) {
  *      We must NOT fall back to the stale registry: a transient fetch failure would
  *      otherwise authorize a since-removed type (#458/P1-2). Only a caller that
  *      wires NO fresh-oracle at all degrades to the registry-only guard.
+ *      THE ONE EXCEPTION (mcp#2000) is the SAME frontend-only exemption as step 2,
+ *      applied on the same terms: a type absent from the session history oracle
+ *      (which a timeout leaves intact) AND authorized by isAuthorizedFrontendOnlyType
+ *      against the LIVE REGISTRY. Neither clause reads /object_info, and for a
+ *      frontend-only type /object_info is empty by design — so a fetch that did not
+ *      answer withheld nothing, and refusing on it was a false refusal, not a guard.
  *
  *   getRegistry        : () => the LIVE registry object (re-invoked after refresh).
  *   getFreshObjectInfo : optional async () => the CURRENT /object_info map (keyed by
@@ -575,6 +617,38 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       freshDefs = null;
     }
     if (!freshDefs || typeof freshDefs !== "object") {
+      // mcp#2000 — A FETCH THAT DID NOT ANSWER IS NOT EVIDENCE ABOUT A TYPE THE FETCH
+      // COULD NEVER HAVE ANSWERED ABOUT. Failing closed here for EVERY type refused a
+      // MarkdownNote on a healthy live canvas whose /object_info refresh had just timed
+      // out, telling the reporter to "Reconnect ComfyUI" while ComfyUI was answering
+      // fine. object-info-history.js already states this rule for its own latch — "ARM
+      // THIS ONLY ON EVIDENCE, NEVER ON A TIMEOUT… latching on one would turn ordinary
+      // latency into a permanent false refusal of every legitimate add/write" — and this
+      // branch was breaking it.
+      //
+      // The exemption below is EXACTLY the one the fetched-defs path applies a few lines
+      // down, and it is safe here because NOT ONE of its clauses reads `freshDefs`:
+      //   - the #458 ever-seen gate reads the SESSION HISTORY oracle, which survives a
+      //     timeout untouched (recordTypes(null) records nothing, and a timeout must
+      //     never arm loseBaseline) — so the non-forgeable trust root that catches a
+      //     removed pack squatting a reserved name is still fully in force; and
+      //   - isAuthorizedFrontendOnlyType reads the LIVE REGISTRY (membership + reserved
+      //     allowlist + no backend provenance), which is also precisely what
+      //     LG.createNode needs, so an exempted add constructs a REAL node and cannot
+      //     mint the #458 placeholder.
+      // For a genuinely frontend-only type /object_info is empty BY DESIGN, so a
+      // successful fetch would have added no information about it whatsoever. Every
+      // other type — and every doubt, including a pending/unseeded/absent history
+      // oracle — still fails closed on the message below, unchanged.
+      //
+      // Testing `=== "never-seen"` is what makes the ever-seen gate load-bearing here,
+      // and it subsumes the sibling exemption's separate `typeof wasTypeEverDefined ===
+      // "function"` clause: an unwired oracle classifies as "no-oracle", never
+      // "never-seen". Spelling that clause out as well passed every test with it
+      // deleted, so it is left out rather than kept as an untestable reassurance.
+      if (frontendOnlyExemptionApplies(readRegistry(), class_type, undefined, wasTypeEverDefined)) {
+        return;
+      }
       throw new Error(
         `cannot verify node type "${class_type}" against the ComfyUI backend ` +
           `(object_info is unavailable — the backend is unreachable or the fetch failed). ` +
@@ -761,7 +835,9 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * a STALE POSITIVE for an uninstalled pack when the browser tab was never reloaded
  * after a ComfyUI restart. `freshDefs` is the freshly-fetched /object_info map (or
  * null/undefined when the fetch failed). FAILS CLOSED in both directions:
- *   - fetch unavailable (null/non-object) ⇒ "cannot verify against backend"; and
+ *   - fetch unavailable (null/non-object) ⇒ "cannot verify against backend" — except
+ *     for an authorized frontend-only type, which the fetch could not have spoken to
+ *     either way (mcp#2000); and
  *   - type absent from the fresh map ⇒ "backend does not provide" (removed pack).
  * Never authorizes from the stale registry. Pure — no side effects — so the caller
  * can run it on the exact target it is about to mutate, before any mutation.
@@ -774,9 +850,11 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * frontend canvas edit and legitimately has no /object_info entry. This does NOT
  * reopen the #458 hole: a REMOVED backend node (whether it keeps a stale-positive
  * class WITH nodeData, or is left as a DEFLESS husk) is NOT on the allowlist and is
- * still refused; and the exemption applies ONLY when object_info was fetched — a
- * genuinely UNVERIFIABLE type (fetch unavailable, null map) always fails closed below,
- * for every type.
+ * still refused. mcp#2000 — the exemption is NO LONGER scoped to "object_info was
+ * fetched": it is applied on the unavailable path too, on identical terms, because
+ * neither of its clauses reads `freshDefs` and a frontend-only type is absent from
+ * /object_info BY DESIGN, so a fetch that did not answer withheld nothing about it.
+ * Every OTHER type still fails closed on an unavailable map, exactly as before.
  *
  * `opts.registry` is the live LiteGraph registry used to recognize a frontend-only
  * type; `opts.node` is the actual write-target node whose OWN constructor is also
@@ -799,6 +877,12 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     } catch {
       observed = ""; // a diagnostic must never replace the refusal it is describing
     }
+    // mcp#2000 — see assertAddNodeResolvableRefreshing. The exemption is evaluated
+    // BEFORE this refusal on exactly the terms the fetched-defs path below uses, and it
+    // is placed after `describeObjectInfoFailure` deliberately: that oracle only builds
+    // a diagnostic string, so an exempted write costs it nothing that matters and the
+    // refusal it explains still reads identically for every type that is refused.
+    if (frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined)) return;
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: cannot verify the node type against the ` +
         `ComfyUI backend — no usable /object_info schema was obtained.${observed} ` +

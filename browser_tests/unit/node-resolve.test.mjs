@@ -1010,19 +1010,375 @@ test("#496 add_node: the EVER-SEEN gate still wins — an allowlisted name whose
   );
 });
 
-test("#496 add_node: object_info UNAVAILABLE still fails closed, even for a frontend-only type", async () => {
-  // The exemption is scoped to "object_info WAS fetched but lacks the type". An
-  // unverifiable backend must never authorize anything (#458).
+// ---- mcp#2000: object_info UNAVAILABLE no longer refuses a FRONTEND-ONLY type.
+//      Reported against a HEALTHY live canvas: panel_refresh_nodes timed out fetching
+//      /object_info, and the very next panel_add_node "MarkdownNote" was refused with
+//      "Reconnect ComfyUI and retry" — while ComfyUI was answering fine. The
+//      availability guard ran BEFORE the frontend-only exemption, so a fetch that did
+//      not answer vetoed a type the fetch could never have answered about: /object_info
+//      never lists Note/MarkdownNote/Reroute/PrimitiveNode BY DESIGN.
+//
+//      The exemption is applied on the SAME terms as the fetched-defs path, and neither
+//      of its clauses reads freshDefs — the ever-seen gate reads the session history
+//      oracle (which a timeout leaves intact), and isAuthorizedFrontendOnlyType reads
+//      the live registry. So this narrows nothing about #458: the block below pins every
+//      fail-closed direction, and each case is refused for a DIFFERENT clause. --------
+
+const ADD_OPTS_NO_OBJECT_INFO = (wasTypeEverDefined = () => false) => ({
+  getFreshObjectInfo: async () => null, // the bounded fetch timed out / rejected
+  refresh: async () => {},
+  wasTypeEverDefined,
+});
+
+test("mcp#2000 add_node: THE REPORTED CASE — a frontend-only native is ADDABLE when the /object_info fetch did not answer", async () => {
   const reg = registryWithNatives();
+  for (const t of ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+    await assert.doesNotReject(
+      () => assertAddNodeResolvableRefreshing(() => reg, t, ADD_OPTS_NO_OBJECT_INFO()),
+      `mcp#2000: "${t}" is frontend-only — a fetch that did not answer withheld nothing about it`,
+    );
+  }
+  // The rgthree frontend control nodes ride the same shared allowlist.
+  const reg2 = loadedRegistry([], ["Fast Groups Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(
+      () => reg2,
+      "Fast Groups Bypasser (rgthree)",
+      ADD_OPTS_NO_OBJECT_INFO(),
+    ),
+  );
+});
+
+test("mcp#2000 add_node: driven through the REAL history oracle after a timed-out refresh, not a stub", async () => {
+  // Production wiring: the baseline seeded at page load, then a refresh timed out.
+  // recordTypes(null) records nothing and a timeout must NEVER arm loseBaseline, so the
+  // baseline SURVIVES — which is exactly why the ever-seen gate is still trustworthy on
+  // this path. If that ever stops holding, this test is the one that catches it.
+  const history = createObjectInfoHistory();
+  history.recordTypes({ KSampler: {}, VAEDecode: {}, SaveImage: {} });
+  history.markSeeded();
+  history.recordTypes(null); // the timed-out refresh
+  assert.equal(history.seeded, true, "a timeout must not demote the baseline");
+  assert.equal(history.wasTypeEverDefined("MarkdownNote"), false, "verdict must be never-seen");
+
+  const reg = registryWithNatives();
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(
+      () => reg,
+      "MarkdownNote",
+      ADD_OPTS_NO_OBJECT_INFO((t) => history.wasTypeEverDefined(t)),
+    ),
+  );
+  // …and a type the SAME surviving baseline DID report is still refused: the trust root
+  // is doing real work here, it is not merely present.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => loadedRegistry([], ["SaveImage"]),
+        "SaveImage",
+        ADD_OPTS_NO_OBJECT_INFO((t) => history.wasTypeEverDefined(t)),
+      ),
+    /cannot verify|object_info is unavailable/i,
+  );
+});
+
+test("mcp#2000 add_node: object_info UNAVAILABLE still fails closed for everything that is not an authorized frontend-only type", async () => {
+  // Each case below trips a DIFFERENT clause, so a mutation that removes any one of
+  // them shows up here rather than hiding behind a sibling.
+  // (a) not on the allowlist — a genuinely unknown type.
+  const reg = registryWithNatives();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (b) a REAL backend type: /object_info IS load-bearing for it, so an unanswered
+  //     fetch must still veto — this is the #458 case the guard exists for.
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "KSampler", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (c) an allowlisted NAME whose registered class carries backend provenance — a
+  //     removed pack's stale class squatting a reserved name.
+  const regHusk = loadedRegistry(["MarkdownNote"]); // registered WITH nodeData
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => regHusk, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (d) an allowlisted name absent from the LIVE REGISTRY — registry membership is what
+  //     LG.createNode needs, so without it the add could only mint a placeholder.
+  const regBare = loadedRegistry();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => regBare, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (e) THE EVER-SEEN GATE, on the unavailable path too: the backend reported this
+  //     reserved name earlier this session ⇒ its pack was removed ⇒ refuse.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => reg,
+        "MarkdownNote",
+        ADD_OPTS_NO_OBJECT_INFO((t) => t === "MarkdownNote"),
+      ),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (f) history PENDING (the baseline has not arrived) and (g) UNSEEDED (it never
+  //     will) are both TRUTHY sentinels ⇒ not "never-seen" ⇒ refuse.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO(() => HISTORY_PENDING)),
+    /cannot verify|object_info is unavailable/i,
+  );
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO(() => HISTORY_UNSEEDED)),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (h) NO history oracle wired at all: the exemption REQUIRES the non-forgeable trust
+  //     root, so a caller that omits it gets the strict pre-mcp#2000 behaviour.
   await assert.rejects(
     () =>
       assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", {
         getFreshObjectInfo: async () => null,
         refresh: async () => {},
-        wasTypeEverDefined: () => false,
       }),
     /cannot verify|object_info is unavailable/i,
   );
+});
+
+test("mcp#2000 INVARIANT: relaxing the precondition does not change WHICH types are exempt", async () => {
+  // THE load-bearing invariant of the whole change, and the one a reviewer can check
+  // without re-deriving my reasoning: the exempt SET must be identical whether
+  // /object_info answered or not. The change moves a PRECONDITION, it does not widen the
+  // permission set. Exactly one verdict may differ between the two paths — a REAL backend
+  // type, for which the fetch genuinely is load-bearing.
+  //
+  // Iterating FRONTEND_ONLY_NODE_TYPES rather than a hand-written list is deliberate: a
+  // type added to the allowlist later is covered here automatically, on both paths.
+  const addVerdict = async (fresh, type, reg, ever) => {
+    try {
+      await assertAddNodeResolvableRefreshing(() => reg, type, {
+        getFreshObjectInfo: async () => fresh,
+        refresh: async () => {},
+        wasTypeEverDefined: ever,
+      });
+      return "ALLOW";
+    } catch {
+      return "REFUSE";
+    }
+  };
+  const swVerdict = (fresh, type, reg, ever) => {
+    try {
+      assertTypeAgainstFreshBackend(fresh, type, 1, {
+        registry: reg,
+        node: { id: 1, type, constructor: reg[type] },
+        wasTypeEverDefined: ever,
+      });
+      return "ALLOW";
+    } catch {
+      return "REFUSE";
+    }
+  };
+  const healthy = objectInfo(); // a live backend that never lists a frontend-only type
+  const never = () => false;
+
+  const cases = [];
+  for (const t of FRONTEND_ONLY_NODE_TYPES) {
+    cases.push([`${t} (clean, never-seen)`, t, loadedRegistry([], [t]), never, "ALLOW"]);
+  }
+  cases.push(["unknown type", "TotallyMadeUpNode", loadedRegistry(), never, "REFUSE"]);
+  cases.push(["ever-seen ⇒ removed", "MarkdownNote", registryWithNatives(), () => true, "REFUSE"]);
+  cases.push(["provenance husk", "MarkdownNote", loadedRegistry(["MarkdownNote"]), never, "REFUSE"]);
+  cases.push(["not in the live registry", "MarkdownNote", loadedRegistry(), never, "REFUSE"]);
+
+  for (const [label, type, reg, ever, expected] of cases) {
+    const withDefs = await addVerdict(healthy, type, reg, ever);
+    const without = await addVerdict(null, type, reg, ever);
+    assert.equal(withDefs, expected, `add/${label}: unexpected verdict WITH defs`);
+    assert.equal(without, withDefs, `add/${label}: the two paths disagree — the exempt set moved`);
+    const swWith = swVerdict(healthy, type, reg, ever);
+    const swWithout = swVerdict(null, type, reg, ever);
+    assert.equal(swWithout, swWith, `set_widget/${label}: the two paths disagree`);
+  }
+
+  // …and the ONE type whose verdict MUST differ: a real backend node genuinely needs the
+  // fetch, so an unanswered one still refuses. If this ever stops differing, the
+  // relaxation has leaked out of the frontend-only set and into live backend types.
+  const reg = loadedRegistry();
+  assert.equal(await addVerdict(objectInfo(["KSampler"]), "KSampler", reg, never), "ALLOW");
+  assert.equal(await addVerdict(null, "KSampler", reg, never), "REFUSE");
+  assert.equal(swVerdict(objectInfo(["KSampler"]), "KSampler", reg, never), "ALLOW");
+  assert.equal(swVerdict(null, "KSampler", reg, never), "REFUSE");
+});
+
+test("mcp#2000: an exemption that THROWS must not replace the refusal it was checking", async () => {
+  // Found by running the review taxonomy against my OWN diff (class 5: what does the
+  // change make WORSE?). Before mcp#2000 these guards threw their refusal WITHOUT
+  // consulting anything, so nothing on this path could raise. Consulting two predicates
+  // first meant a hostile registry or a raising oracle surfaced a RAW error instead of
+  // the worded refusal — measured leaking "registry exploded" / "history oracle exploded"
+  // from all three guards before the shared helper swallowed it. Any doubt REFUSES.
+  const ctor = function MarkdownNoteNative() {};
+  const reg = registryWithNatives();
+  const node = { id: 1, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  const BOOM = () => {
+    throw new Error("history oracle exploded");
+  };
+  // A registry whose membership probe throws — the realistic shape is a Proxy.
+  const hostileReg = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor() {
+        throw new Error("registry exploded");
+      },
+      has() {
+        throw new Error("registry exploded");
+      },
+      get() {
+        throw new Error("registry exploded");
+      },
+    },
+  );
+  const isWorded = (err) => {
+    assert.match(err.message, /cannot verify|object_info is unavailable|no usable/i);
+    assert.doesNotMatch(err.message, /exploded/, "the raw error must not reach the caller");
+    return true;
+  };
+
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", {
+        getFreshObjectInfo: async () => null,
+        refresh: async () => {},
+        wasTypeEverDefined: BOOM,
+      }),
+    isWorded,
+  );
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => hostileReg, "MarkdownNote", {
+        getFreshObjectInfo: async () => null,
+        refresh: async () => {},
+        wasTypeEverDefined: () => false,
+      }),
+    isWorded,
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(null, "MarkdownNote", 1, { registry: reg, node, wasTypeEverDefined: BOOM }),
+    isWorded,
+  );
+  assert.throws(() => assertMutatedNodeAuthorized(null, reg, node, "target", BOOM), isWorded);
+
+  // CONTROL: swallowing must not have swallowed the exemption itself.
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+  );
+  void ctor;
+});
+
+// ---- mcp#2000 PARITY: the SAME relaxation in the two set_widget guards. All three
+//      /object_info-oracle guards had the identical `!freshDefs` early throw, so fixing
+//      only add_node would have shipped HALF the documented annotation path — the note
+//      appears and its text can never be written. Measured on origin/main before
+//      extending the fix: with the fetch unavailable the write REFUSED, and the control
+//      (same state, fetch answering) WROTE, so the probe was proving the product and not
+//      itself. One copy relaxed alone is the #496 drift again, hence all three. --------
+
+test("mcp#2000 set_widget: assertTypeAgainstFreshBackend exempts an authorized frontend-only type when object_info is unavailable", () => {
+  const reg = registryWithNatives();
+  const node = { id: 7, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  assert.doesNotThrow(() =>
+    assertTypeAgainstFreshBackend(null, "MarkdownNote", 7, {
+      registry: reg,
+      node,
+      wasTypeEverDefined: () => false,
+    }),
+  );
+  // …and every other direction still fails closed on the SAME unavailable map.
+  for (const [why, type, opts] of [
+    ["a real backend type", "KSampler", { registry: reg, wasTypeEverDefined: () => false }],
+    ["a non-allowlisted type", "TotallyMadeUpNode", { registry: reg, wasTypeEverDefined: () => false }],
+    ["an ever-seen (removed) allowlisted name", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => true }],
+    ["a pending baseline", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => HISTORY_PENDING }],
+    ["an unseeded baseline", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => HISTORY_UNSEEDED }],
+    ["no registry wired at all", "MarkdownNote", { node, wasTypeEverDefined: () => false }],
+    ["a provenance-bearing husk", "MarkdownNote", { registry: loadedRegistry(["MarkdownNote"]), wasTypeEverDefined: () => false }],
+  ]) {
+    assert.throws(
+      () => assertTypeAgainstFreshBackend(null, type, 7, opts),
+      /cannot verify|object_info is unavailable|no usable/i,
+      `mcp#2000: ${why} must still fail closed`,
+    );
+  }
+  // A stale backend INSTANCE under a bare native class of the same name is refused by
+  // the instance-provenance clause, which only this guard family has.
+  assert.throws(
+    () =>
+      assertTypeAgainstFreshBackend(null, "MarkdownNote", 7, {
+        registry: reg,
+        node: { id: 7, type: "MarkdownNote", constructor: { comfyClass: "MarkdownNote" } },
+        wasTypeEverDefined: () => false,
+      }),
+    /cannot verify|no usable/i,
+  );
+});
+
+test("mcp#2000 set_widget: assertMutatedNodeAuthorized keeps the same terms on the unavailable path", () => {
+  const reg = registryWithNatives();
+  const node = { id: 9, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  assert.doesNotThrow(() => assertMutatedNodeAuthorized(null, reg, node, "target", () => false));
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, reg, node, "target", () => true),
+    /cannot verify|object_info is unavailable/i,
+    "an ever-seen removal still wins",
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, reg, { id: 9, type: "KSampler" }, "target", () => false),
+    /cannot verify|object_info is unavailable/i,
+    "a real backend type still needs the fetch",
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, undefined, node, "target", () => false),
+    /cannot verify|object_info is unavailable/i,
+    "no registry wired ⇒ no exemption",
+  );
+});
+
+test("mcp#2000 set_widget e2e: the documented annotation path COMPLETES through the production handler when object_info never answers", async () => {
+  // THE WHOLE POINT: add the note, then put the text in it. Driving runSetWidget — the
+  // body graph_set_widget delegates to — not a predicate in isolation.
+  const history = createObjectInfoHistory();
+  history.recordTypes({ KSampler: {}, SaveImage: {} });
+  history.markSeeded();
+  history.recordTypes(null); // the timed-out refresh
+
+  const ctor = function MarkdownNoteNative() {};
+  const reg = loadedRegistry();
+  reg["MarkdownNote"] = ctor;
+  const node = { id: 42, type: "MarkdownNote", widgets: [{ name: "text", type: "text", value: "" }], constructor: ctor };
+  const { set } = await runSetWidget(node, "text", "hello", {
+    registry: reg,
+    getFreshObjectInfo: async () => null, // the fetch never answers
+    wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+    ...HOOKS,
+  });
+  assert.equal(set.value, "hello");
+  assert.equal(node.widgets[0].value, "hello", "the note is fillable, not just addable");
+
+  // CONTROL: a REAL backend node in the identical state still refuses — the relaxation
+  // is scoped to frontend-only types, not to "object_info is down".
+  const ksNode = { id: 43, type: "KSampler", widgets: [{ name: "steps", type: "INT", value: 1 }], constructor: reg["KSampler"] };
+  await assert.rejects(
+    () =>
+      runSetWidget(ksNode, "steps", 20, {
+        registry: reg,
+        getFreshObjectInfo: async () => null,
+        wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+        ...HOOKS,
+      }),
+    /cannot verify|object_info is unavailable|no usable/i,
+  );
+  assert.equal(ksNode.widgets[0].value, 1, "the refused write left the node untouched");
 });
 
 // ---- #1296: an allowlisted FRONTEND-ONLY type that is NOT in the live registry is
