@@ -131,6 +131,7 @@ import {
   parseTaskHistoryItem,
   queueDrained,
   rebootCandidates,
+  resolveInstalledUpdateId,
   searchNodesVia,
   taskFailureReason,
   unlistedGitUrlAdvice,
@@ -7363,6 +7364,31 @@ async function managerGet(route, { signal } = {}) {
     if (!retry || retry === dialect) throw err;
     return retry === "legacy" ? managerCall(route, opts) : managerV2(route, opts);
   }
+}
+
+/** Resolve an update target against the installed-pack metadata before queueing
+ * a mutation. Manager's installed endpoint is keyed by the directory name,
+ * while its update queue expects the registry/aux identity used by active_nodes.
+ * A miss is returned to the caller as a no-queue unmanaged-pack result; a list
+ * read failure is kept distinct so it cannot be mistaken for an unmanaged pack.
+ */
+async function resolveManagerUpdateTarget(requestedId) {
+  const route = installedListRoute();
+  let installed;
+  try {
+    try {
+      installed = await managerGet(route);
+    } catch (err) {
+      if (!isManagerUnreachable(err)) throw err;
+      installed = await managerCall(route);
+    }
+  } catch (err) {
+    throw new Error(
+      `Could not resolve "${requestedId}" against ComfyUI-Manager's installed-pack list; ` +
+        `no update was queued. ${String(err?.message ?? err)}`,
+    );
+  }
+  return resolveInstalledUpdateId(requestedId, installed);
 }
 
 /** #426 — fetch the connected ComfyUI's full `/object_info` map (node CLASS →
@@ -22349,6 +22375,26 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!id) throw new Error("id (installed pack name/dir or registry id) is required");
     const sel = version === "nightly" ? "nightly" : "latest";
     let dialect = await detectManagerDialect();
+    const requestedId = id;
+    const managerId = await resolveManagerUpdateTarget(requestedId);
+    if (!managerId) {
+      return {
+        queued: false,
+        updated: false,
+        verified: false,
+        unmanaged_pack: true,
+        id: requestedId,
+        version: sel,
+        dialect,
+        note:
+          `Could not resolve "${requestedId}" to a ComfyUI-Manager-managed installed pack. ` +
+          "No update was queued. If this is a local Git checkout, pull it on the ComfyUI host; " +
+          "otherwise retry with the pack's registry id or repository URL.",
+      };
+    }
+    // Manager's queue indexes active_nodes by the resolved registry/aux id,
+    // not necessarily by the directory spelling supplied by the caller.
+    id = managerId;
     const ui_id = crypto.randomUUID();
     const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
     // #424: the absolute (no-/v2) legacy self-update route. Updating the
