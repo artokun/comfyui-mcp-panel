@@ -604,8 +604,13 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // successful fetch would have added no information about it whatsoever. Every
       // other type — and every doubt, including a pending/unseeded/absent history
       // oracle — still fails closed on the message below, unchanged.
+      //
+      // Testing `=== "never-seen"` is what makes the ever-seen gate load-bearing here,
+      // and it subsumes the sibling exemption's separate `typeof wasTypeEverDefined ===
+      // "function"` clause: an unwired oracle classifies as "no-oracle", never
+      // "never-seen". Spelling that clause out as well passed every test with it
+      // deleted, so it is left out rather than kept as an untestable reassurance.
       if (
-        typeof wasTypeEverDefined === "function" &&
         backendHistoryVerdict(class_type, wasTypeEverDefined) === "never-seen" &&
         isAuthorizedFrontendOnlyType(readRegistry(), class_type)
       ) {
