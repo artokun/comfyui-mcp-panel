@@ -12,7 +12,16 @@
  * A single-class payload would answer the first question and read the second as absent,
  * refusing a legitimate write. That is #821 exactly: the reply is not wrong, the question
  * asked of it was. So this keeps the whole payload and shortens only how often it is
- * re-fetched.
+ * re-fetched — and it still does; nothing in this file caches anything but a whole map.
+ *
+ * #1560 QUALIFIES THE "BEFORE RESOLVING" HALF of that reason without changing what this file
+ * does. On an install whose whole map never lands inside any budget, the fence now has a
+ * LAST-RESORT type-scoped read (`scoped-object-info.js`) issued BELOW the promotion
+ * resolution, so it can name the outer node, every intermediate AND the concrete target
+ * rather than one of them, and the map it hands back THROWS for anything else instead of
+ * reading it as absent. That read deliberately does NOT come through this cache: a partial
+ * map stored here would be handed to the next caller as if it were whole, which is #821 with
+ * a longer fuse.
  *
  * WHAT THIS DOES NOT WEAKEN. Every caller still receives the SAME whole-schema map, so no
  * question changes scope. What changes is age: a write may be authorized against a map

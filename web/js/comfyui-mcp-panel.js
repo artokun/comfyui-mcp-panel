@@ -280,8 +280,20 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
-import { fetchWholeObjectInfo, objectInfoOracleFailureNote, OBJECT_INFO_DEADLINE_MS } from "./lib/object-info-oracle.js";
-import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
+import {
+  fetchWholeObjectInfo,
+  objectInfoOracleFailureNote,
+  OBJECT_INFO_DEADLINE_MS,
+  // #1562 — the oracle's per-route OUTCOME vocabulary, so the fetch phase can tell an
+  // abandoned-at-the-bound route from a failed one WITHOUT matching its prose (#1223).
+  TRANSPORT_OUTCOME,
+} from "./lib/object-info-oracle.js";
+import {
+  createObjectInfoSnapshot,
+  snapshotAuthorizationNote,
+  noBackendAnswerEstablished,
+} from "./lib/object-info-snapshot.js";
+import { fetchTypeScopedObjectInfo, SCOPED_OBJECT_INFO_DEADLINE_MS } from "./lib/scoped-object-info.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
@@ -1296,7 +1308,7 @@ const OBJECT_INFO_SEED_WAIT_MS = 8000;
 const awaitObjectInfoHistorySeed = (waitMs = OBJECT_INFO_SEED_WAIT_MS) =>
   awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, waitMs);
 
-async function registerComfyNodeDefs(preloadedDefs) {
+async function registerComfyNodeDefs(preloadedDefs, runOpts) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once they have
   // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
   // do that and the trust flag accepts either (#1193): `refreshComboInNodes()` answering,
@@ -1337,7 +1349,24 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // left of it, so the run's cost is this budget rather than the sum of numbers that each
   // looked reasonable alone. Taken here, before any phase starts, so a slow fetch is paid
   // for by the combo phase rather than added to it.
-  let runDeadline = monotonicNow() + NODE_DEFS_RUN_BUDGET_MS;
+  //
+  // #1562 — the ALLOWANCE is the caller's when it states one. `NODE_DEFS_RUN_BUDGET_MS` is
+  // sized for a refresh that runs as a SUB-STEP (see its note); a caller whose whole
+  // command IS the refresh has a different window and says so. Only a positive finite
+  // number is honoured — an `Infinity`/`NaN` computed from an unset budget would restore
+  // the unbounded run this deadline exists to prevent, and a non-positive one would start
+  // a run with no time at all.
+  //
+  // NAMED, not just added to a deadline: the combo phase's refusal quotes "the budget this
+  // refresh had", and it used to quote the DEFAULT constant unconditionally. The moment a
+  // caller could state its own, that sentence became arithmetically impossible — "the
+  // 37500ms this refresh had left of its 9000ms budget" — which is #1161's defect (naming a
+  // number that was never spent) reintroduced by this very change.
+  const runBudgetMs =
+    Number.isFinite(runOpts?.runBudgetMs) && runOpts.runBudgetMs > 0
+      ? runOpts.runBudgetMs
+      : NODE_DEFS_RUN_BUDGET_MS;
+  let runDeadline = monotonicNow() + runBudgetMs;
   // #716 — drop the widget-write burst cache at the START of this run, not after it
   // succeeds (codex). This function runs on exactly the events that change the schema —
   // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
@@ -1362,6 +1391,19 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // tried instead of leaving "check that the ComfyUI server process is still running" to
   // stand on the evidence of one route out of two (#982's own defect, and #954's).
   let fetchRouteFailures = null;
+  // #1562 — did EVERY whole-document route end by being ABANDONED AT ITS BOUND, rather
+  // than by failing? That is a different fact from "the fetch failed", and the remedy is
+  // different too: a route that never answered inside its bound proves nothing about
+  // whether the server is up, so the verdict must not send the reader to check a process
+  // that was answering the whole time (#982's defect, reported again as #1562 — the
+  // reporter's own `GET /object_info` returned 25,104,088 bytes in 20.84 s while this
+  // remedy was telling them the backend might not be running).
+  //
+  // DECIDED FROM TAGS, never from the failure PROSE (#1223): route 1 reports through
+  // `lastAttemptTimedOut`, route 2 through the oracle's `TRANSPORT_OUTCOME.NO_ANSWER`.
+  // Starts null — "no whole-document route was reached at all" — so a run that never
+  // entered the fetch block cannot claim either answer.
+  let fetchAbandonedAtBound = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
   // clean one — misattributing the verdict and, worse, setting the shared
@@ -1539,6 +1581,23 @@ async function registerComfyNodeDefs(preloadedDefs) {
         clientRouteError = err;
         defs = null;
       }
+      // #1562 — record HOW route 1 ended, from the flags the loop already keeps rather than
+      // from the error's text. `lastAttemptTimedOut` is set only where `boundedGetNodeDefs`
+      // returned its sentinel, so it means "abandoned at the bound", never "failed".
+      //
+      // `!sawRealError` is the loop's OWN precedence rule, applied to the classification as
+      // well as to the thrown value. A REAL ERROR OUTRANKS A SYNTHESIZED TIMEOUT (the
+      // `if (sawRealError) throw lastRealError` above), and the same sequence that makes it
+      // outrank there makes it outrank here: attempt 1 rejects for real (`Failed to fetch`
+      // against a port that is not open yet), the retry stalls past its bound, and the loop
+      // ends with BOTH flags set. Without this clause that ending was read as an
+      // abandonment, so a verdict whose own evidence clause said
+      // "api.getNodeDefs() failed: Failed to fetch" was headed "none of them FAILED" — the
+      // report contradicting itself in one paragraph — and the reader of a genuinely
+      // restarting backend was told a plain retry would not help, when a plain retry is
+      // exactly what helps there. The rule is one line, not two: an abandonment is what
+      // ends a route that never failed, ACROSS attempts as well as across routes.
+      fetchAbandonedAtBound = clientRouteThrew && lastAttemptTimedOut === true && !sawRealError;
       // #608 — THE SECOND TRANSPORT, on the terms #982 set and #1161 bounded.
       //
       // Same question, different route: the WHOLE document, never the per-class
@@ -1598,6 +1657,12 @@ async function registerComfyNodeDefs(preloadedDefs) {
           defs = fallbackDefs;
           clientRouteThrew = false;
           clientRouteError = null;
+          // #1562 — and route 2 ANSWERED, so "every route was abandoned" is no longer
+          // true. Cleared HERE rather than left to the fact that no fetch-phase refusal
+          // can be reached from this branch: a stale `true` that happens not to be read
+          // is a latent wrong answer waiting for the next reader, which is the shape this
+          // whole issue is about.
+          fetchAbandonedAtBound = false;
         } else {
           // Neither route produced a payload. Record what each one did so the verdict can
           // say it: the client route's sentence is built HERE because the oracle was handed
@@ -1627,6 +1692,14 @@ async function registerComfyNodeDefs(preloadedDefs) {
               (_, i) => fallbackOutcomes?.[i]?.route === "http",
             ),
           ];
+          // #1562 — and route 2's ending, by its TAG. Both must be abandonments for the
+          // verdict to say so: one route that genuinely FAILED is evidence about the
+          // server, and it outranks the other's silence.
+          fetchAbandonedAtBound =
+            fetchAbandonedAtBound === true &&
+            (Array.isArray(fallbackOutcomes) ? fallbackOutcomes : []).some(
+              (o) => o?.route === "http" && o?.kind === TRANSPORT_OUTCOME.NO_ANSWER,
+            );
         }
       }
       // Rethrown here rather than at the catch, so the phase attribution, the verdict's
@@ -1792,7 +1865,31 @@ async function registerComfyNodeDefs(preloadedDefs) {
       // it, "did not answer in time" is the same sentence for a phase starved down to
       // 3000ms by a slow fetch and for one handed the whole budget that hung anyway, and
       // those two have different causes and different remedies.
-      comboWaitMs = nodeDefsBudgetLeft(runDeadline);
+      //
+      // #1562 — AND NEVER MORE THAN A RUN'S DEFAULT ALLOWANCE, whatever the caller stated.
+      //
+      // The larger budget a caller may now pass exists for the FETCH phase — a whole
+      // `/object_info` that cannot be delivered inside the old 9,000ms. Letting it fall
+      // through to here instead hands this phase up to 37,500ms, and this phase's bound is
+      // the one that decides how long the RUN lives: a `panel_refresh_nodes` whose fetch was
+      // fast and whose `refreshComboInNodes()` merely hangs would then outlive the 25,000ms
+      // JOIN its own command holds. Measured on the shipped executor over the real
+      // coalescer, varying only the combo call's latency:
+      //
+      //     combo latency   before this issue        uncapped 37,500ms run
+      //       15,000 ms     refreshed:true           refreshed:true
+      //       26,000 ms     refreshed:true at 9 s    refreshed:FALSE (refresh_still_running)
+      //       never answers refreshed:true at 9 s    refreshed:FALSE (refresh_still_running)
+      //
+      // That is a case that WORKED being turned into one that does not — and it takes
+      // #1193's `combo_refresh_confirmed:false` disclosure with it, which is unreachable
+      // through this command once the phase can cross the join. The extension must therefore
+      // reach the phase it was measured for and no further, so this phase keeps exactly the
+      // ceiling it has always had. `Math.min` is a NO-OP for every caller that states no
+      // budget: what is left of a 9,000ms run is never more than 9,000ms.
+      const comboBudgetLeft = nodeDefsBudgetLeft(runDeadline);
+      comboWaitMs = Math.min(comboBudgetLeft, NODE_DEFS_RUN_BUDGET_MS);
+      const comboWaitCapped = comboWaitMs < comboBudgetLeft;
       const comboSettled = await withTimeout(
         Promise.resolve()
           .then(() => a.refreshComboInNodes())
@@ -1851,8 +1948,16 @@ async function registerComfyNodeDefs(preloadedDefs) {
         // catch. The `?? ` that used to guard this assignment could never fire.
         thrown = comboAbandoned
           ? new Error(
-              `refreshComboInNodes() did not answer within the ${comboWaitMs}ms this refresh had ` +
-                `left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget, and this run's own combo rebuild ` +
+              // #1562 — WHICH OF THE TWO BOUNDS ACTUALLY BIT, and the run's OWN budget rather
+              // than the default constant. #1193 put the numbers in this sentence so a phase
+              // starved to a sliver by a slow fetch reads differently from one handed the
+              // whole budget that hung anyway; a third case now exists — a phase holding the
+              // ceiling while the run still had time — and it has to be readable too.
+              `refreshComboInNodes() did not answer within the ${comboWaitMs}ms ` +
+                (comboWaitCapped
+                  ? `this phase is capped at (this refresh had ${comboBudgetLeft}ms left of its ${runBudgetMs}ms budget)`
+                  : `this refresh had left of its ${runBudgetMs}ms budget`) +
+                ", and this run's own combo rebuild " +
                 "did not complete either, so the dropdown lists are NOT known to be current",
             )
           : comboSettled.err;
@@ -1927,6 +2032,10 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // #608 — what every transport in the fetch phase did, so a refusal about /object_info
     // names the routes it actually tried.
     fetchRouteFailures,
+    // #1562 — and whether every one of them was ABANDONED AT ITS BOUND rather than failing,
+    // which is what separates "the server did not answer" from "the server answered too
+    // slowly for this command's window".
+    fetchAbandonedAtBound,
   });
   // #1275 — VERIFY the refresh was ADDITIVE over the live graph.
   //
@@ -10878,6 +10987,69 @@ const ADD_NODE_COMMAND_BUDGET_MS = 25000;
 const REFRESH_NODES_COMMAND_BUDGET_MS = 25000;
 
 /**
+ * #1562 — the RUN budget for the refresh THIS command starts, as opposed to the JOIN
+ * budget above.
+ *
+ * THE TWO WERE THE WRONG WAY ROUND, and that is the whole defect. `joinMs` (25,000 ms) is
+ * how long this command is willing to WAIT; `NODE_DEFS_RUN_BUDGET_MS` (9,000 ms) is how
+ * long the run it starts is allowed to SPEND. Because the run's allowance was the smaller
+ * one, the run always died first — so `REFRESH_JOIN_ABANDONED` / `refresh_still_running`,
+ * the retryable verdict #1404 built for exactly "a big install ... without any concurrency
+ * at all", was unreachable on the install it was written for. What the caller got instead
+ * was `object_info_fetch_failed`, which tears the run down, so every retry started another
+ * doomed run and the tool could never succeed on that machine.
+ *
+ * MEASURED, against a REAL 25,000,581-byte `/object_info` served in 20.80 s (the reporter
+ * measured 25,104,088 bytes / 20.84 s), driving the SHIPPED fetch phase — the real
+ * `boundedGetNodeDefs`, the real retry loop, the real oracle:
+ *
+ *     run budget   route 1 bound   whole-document GETs   outcome
+ *      9,000 ms       6,000 ms            2              FAILED at 7.5 s — and the refusal
+ *                                                        is the reported sentence verbatim:
+ *                                                        "GET /object_info did not answer
+ *                                                        within its 1492ms share of the
+ *                                                        2985ms budget"
+ *     25,000 ms      16,666 ms            2              STILL FAILED at 20.9 s
+ *     32,000 ms      21,333 ms            1              obtained 20,020 types at 20.86 s
+ *     37,500 ms      25,000 ms            1              obtained 20,020 types at 20.98 s
+ *
+ * The 25,000 ms row is why this is not simply `REFRESH_NODES_COMMAND_BUDGET_MS`: handing
+ * the run the command's own window leaves its FETCH SHARE two thirds of that, and two
+ * thirds of the window is not the window. So the number is DERIVED from the property that
+ * has to hold rather than picked to fit one install:
+ *
+ *     the fetch phase alone must be able to spend everything the command will wait for
+ *     →  runBudget x NODE_DEFS_FETCH_SHARE  >=  REFRESH_NODES_COMMAND_BUDGET_MS
+ *
+ * which is asserted by test, so raising either input cannot silently break it again.
+ *
+ * WHAT IT COSTS. Nothing at all on a healthy install: every one of these numbers is a
+ * CEILING, and a backend that answers in ~0.5 s (#1180's own measurements on this rig:
+ * 456 ms warm, 1,062 ms cold — quoted, not re-measured here) reaches the identical verdict
+ * in the identical time. That part WAS re-measured: the reproduction was run against a fast
+ * backend under both budgets and the elapsed times and outcomes match (312 ms vs 322 ms,
+ * one request, same payload). What it
+ * does cost is a run that OUTLIVES its command: a `panel_refresh_nodes` against a backend
+ * that never answers now leaves one whole-document download in flight for up to
+ * ~12,500 ms after the reply. That is bounded, it is one run (the coalescer holds a single
+ * slot), and it is exactly the work the retry this reply asks for will join — which is the
+ * trade #1351 already made deliberately for the join.
+ *
+ * A `graph_add_node` arriving inside that window meets a longer-lived run and can refuse
+ * with its (worded, retryable) busy message where it would previously have waited out a
+ * shorter one. On an install this budget changes anything for, that add was failing its
+ * OWN refresh already.
+ *
+ * ONLY THE EXPLICIT COMMAND passes this. Reconnect, install-completed and download
+ * refreshes keep `NODE_DEFS_RUN_BUDGET_MS`, so #1180's composition property — two
+ * serialized runs inside the bridge's read default — is untouched for every caller that
+ * is not this one.
+ */
+const REFRESH_NODES_RUN_BUDGET_MS = Math.ceil(
+  REFRESH_NODES_COMMAND_BUDGET_MS / NODE_DEFS_FETCH_SHARE,
+);
+
+/**
  * #1192 — what an add still has to do AFTER the node-def refresh, held back so the join
  * cannot spend it.
  *
@@ -11239,6 +11411,11 @@ const GRAPH_TOOL_EXECUTORS = {
     const verdict = await refreshComfyNodeDefs(undefined, {
       force: true,
       joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,
+      // #1562 — and the RUN this command starts gets an allowance that outlasts that wait,
+      // so the JOIN is what ends the command. Without this line the run gives up first and
+      // the retryable `refresh_still_running` verdict below is unreachable on exactly the
+      // installs it exists for. See REFRESH_NODES_RUN_BUDGET_MS for the measurement.
+      runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS,
     });
     // #1404 — a NAMED verdict, before the generic branch below can call it "unknown".
     //
@@ -14250,6 +14427,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // its refusal, so the message would name routes another call tried. Declared in the
     // handler's own scope, so each invocation reports what IT observed.
     let oracleFailures = [];
+    // #1560 — may the TYPE-SCOPED last resort be consulted at all?
+    //
+    // Only when no whole-map route ANSWERED. A route that threw, returned a non-gateway
+    // status, or expressed deny-all as `{}` must never be overruled by a broader per-class
+    // read — the one direction object-info-oracle.js's own note forbids.
+    //
+    // CAPTURED WHERE THE SNAPSHOT MAKES THE SAME JUDGEMENT, from the SAME `outcome.outcomes`
+    // in the same statement — never re-read from a variable later. Storing the tag list and
+    // testing it at call time is a second reading of a fact that was established at a
+    // MOMENT, and this handler enters `readObjectInfo` more than once (the #1126 live
+    // re-ask). One verdict, decided beside the snapshot's, cannot disagree with it.
+    // Per-request for exactly the reason `oracleFailures` is.
+    let scopedReadLicensed = false;
     // #1223 — null while the authorization came from a LIVE probe; the oracle's failure
     // note once it came from the last-observed snapshot instead. Per-request for the same
     // reason `oracleFailures` is: a concurrent write must not make THIS reply claim a
@@ -14519,6 +14709,8 @@ const GRAPH_TOOL_EXECUTORS = {
           socketDown: comfyBackendIsDown(),
           outcomes: outcome?.outcomes,
         });
+        // #1560 — the SAME evidence, read ONCE, in the same statement as the snapshot's.
+        scopedReadLicensed = noBackendAnswerEstablished(outcome?.outcomes);
         if (fallback.defs) {
           // Held for the reply. The write is about to be reported as SUCCEEDED and VERIFIED,
           // and it was verified against a schema nobody could re-fetch — an agent that is
@@ -14549,6 +14741,73 @@ const GRAPH_TOOL_EXECUTORS = {
       // that was perfectly valid.
       refetchObjectInfoLive: async () =>
         setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts)),
+      // #1560 — the THIRD route, and the only one that is TYPE-SCOPED.
+      //
+      // On a ~1023-model install neither whole-schema route ever lands inside its share of
+      // the budget while ComfyUI is idle and healthy, so #1223's snapshot is never populated
+      // and EVERY set_widget refuses for the life of the tab. `/object_info/<Type>` answers
+      // that same install in ~2.7KB. This asks it about exactly the types runSetWidget has
+      // already resolved this write to — see scoped-object-info.js for why a map that
+      // THROWS outside that set is not the per-class payload #716/#821 were about.
+      //
+      // TWO GATES, both here rather than in the lib, because only this file holds the facts.
+      //
+      //   1. THE SILENCE LICENCE, decided beside the snapshot's own verdict on the SAME
+      //      `outcome.outcomes` and merely READ here. A client that returned an empty schema
+      //      has expressed deny-all, and a broader per-class read must never overrule it. A
+      //      timeout, a client that returned NOTHING, or a proxy's 504 leave the question
+      //      unanswered — those, and only those, may be asked again by another route. It is
+      //      false until a read establishes it, so an unwired or never-run oracle licenses
+      //      nothing.
+      //   2. WHAT THE COMMAND HAS LEFT. The whole-map attempt has already spent most of the
+      //      budget by the time this runs (measured on the reported shape: 15,015 ms of a 20s
+      //      oracle deadline), so this takes `budget.bounded` like every other step and
+      //      cannot push the reply past the bridge's own timeout.
+      //
+      // NEVER recorded into the #1223 snapshot — object-info-snapshot.js requires an explicit
+      // `whole: true` claim precisely so a per-class payload cannot make every OTHER type read
+      // as a removed pack — and never fed to recordObjectInfoTypes, whose ever-seen history is
+      // the fence's own trust root.
+      fetchScopedObjectInfo: async (types) => {
+        if (!scopedReadLicensed) {
+          // STATE WHAT WAS OBSERVED, not one cause of it. `noBackendAnswerEstablished` is
+          // false for FOUR different things — a route ANSWERED something unusable, a route
+          // THREW, the outcome list was empty, or every route was NOT_ATTEMPTED — and naming
+          // only the first asserts an event that did not happen in the other three. A refusal
+          // that reports a cause it did not establish is #982's own defect, and the reporter
+          // of #1560 went looking at a backend that was answering fine because of exactly
+          // that. (#1223 makes a similar over-specific claim one sentence earlier in the same
+          // refusal; that one is pre-existing and is not touched here.)
+          return {
+            defs: null,
+            covered: [],
+            reason:
+              "no whole-schema route was both CONTACTED and SILENT, and a type-scoped read " +
+              "may only stand in for one that was — it must never overrule what a route did " +
+              "establish, and it is not a substitute for a route nobody ran",
+          };
+        }
+        const scoped = await fetchTypeScopedObjectInfo(types, {
+          fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+          deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
+        });
+        // Stamped for the #1126 blind-write ladder, which must NOT treat this as the server's
+        // whole word: it is the server answering now about a handful of types.
+        //
+        // NOT "held for the reply" — an earlier version of this comment said so and it was
+        // never true. Only the #1223 snapshot path sets `setWidgetSchemaFromSnapshot`, which
+        // is what puts `schema_source` on the result; a scoped-authorized write reports plain
+        // success, deliberately (the authorization really was the server answering live, so
+        // the argument that justifies disclosing a PAST word does not carry over, and a new
+        // reply field is its own reviewable change under the freeze).
+        //
+        // And this stamp alone cannot carry the fact to the ladder: the ladder re-asks for a
+        // live map, which re-enters this same handler and re-stamps on every exit path it
+        // has. `set-widget.js` therefore reads the BRAND on the payload rather than trusting
+        // this variable to survive; see `provenanceOf` there.
+        if (scoped.defs) setWidgetSchemaProvenance = () => "scoped";
+        return scoped;
+      },
       // What the last oracle attempt observed, so a refusal can say which routes were
       // tried and what each one did instead of asserting an unreachable backend — then,
       // separately, why the last-observed schema could not stand in for them either.
