@@ -1146,6 +1146,71 @@ test("mcp#2000 add_node: object_info UNAVAILABLE still fails closed for everythi
   );
 });
 
+test("mcp#2000 INVARIANT: relaxing the precondition does not change WHICH types are exempt", async () => {
+  // THE load-bearing invariant of the whole change, and the one a reviewer can check
+  // without re-deriving my reasoning: the exempt SET must be identical whether
+  // /object_info answered or not. The change moves a PRECONDITION, it does not widen the
+  // permission set. Exactly one verdict may differ between the two paths — a REAL backend
+  // type, for which the fetch genuinely is load-bearing.
+  //
+  // Iterating FRONTEND_ONLY_NODE_TYPES rather than a hand-written list is deliberate: a
+  // type added to the allowlist later is covered here automatically, on both paths.
+  const addVerdict = async (fresh, type, reg, ever) => {
+    try {
+      await assertAddNodeResolvableRefreshing(() => reg, type, {
+        getFreshObjectInfo: async () => fresh,
+        refresh: async () => {},
+        wasTypeEverDefined: ever,
+      });
+      return "ALLOW";
+    } catch {
+      return "REFUSE";
+    }
+  };
+  const swVerdict = (fresh, type, reg, ever) => {
+    try {
+      assertTypeAgainstFreshBackend(fresh, type, 1, {
+        registry: reg,
+        node: { id: 1, type, constructor: reg[type] },
+        wasTypeEverDefined: ever,
+      });
+      return "ALLOW";
+    } catch {
+      return "REFUSE";
+    }
+  };
+  const healthy = objectInfo(); // a live backend that never lists a frontend-only type
+  const never = () => false;
+
+  const cases = [];
+  for (const t of FRONTEND_ONLY_NODE_TYPES) {
+    cases.push([`${t} (clean, never-seen)`, t, loadedRegistry([], [t]), never, "ALLOW"]);
+  }
+  cases.push(["unknown type", "TotallyMadeUpNode", loadedRegistry(), never, "REFUSE"]);
+  cases.push(["ever-seen ⇒ removed", "MarkdownNote", registryWithNatives(), () => true, "REFUSE"]);
+  cases.push(["provenance husk", "MarkdownNote", loadedRegistry(["MarkdownNote"]), never, "REFUSE"]);
+  cases.push(["not in the live registry", "MarkdownNote", loadedRegistry(), never, "REFUSE"]);
+
+  for (const [label, type, reg, ever, expected] of cases) {
+    const withDefs = await addVerdict(healthy, type, reg, ever);
+    const without = await addVerdict(null, type, reg, ever);
+    assert.equal(withDefs, expected, `add/${label}: unexpected verdict WITH defs`);
+    assert.equal(without, withDefs, `add/${label}: the two paths disagree — the exempt set moved`);
+    const swWith = swVerdict(healthy, type, reg, ever);
+    const swWithout = swVerdict(null, type, reg, ever);
+    assert.equal(swWithout, swWith, `set_widget/${label}: the two paths disagree`);
+  }
+
+  // …and the ONE type whose verdict MUST differ: a real backend node genuinely needs the
+  // fetch, so an unanswered one still refuses. If this ever stops differing, the
+  // relaxation has leaked out of the frontend-only set and into live backend types.
+  const reg = loadedRegistry();
+  assert.equal(await addVerdict(objectInfo(["KSampler"]), "KSampler", reg, never), "ALLOW");
+  assert.equal(await addVerdict(null, "KSampler", reg, never), "REFUSE");
+  assert.equal(swVerdict(objectInfo(["KSampler"]), "KSampler", reg, never), "ALLOW");
+  assert.equal(swVerdict(null, "KSampler", reg, never), "REFUSE");
+});
+
 test("mcp#2000: an exemption that THROWS must not replace the refusal it was checking", async () => {
   // Found by running the review taxonomy against my OWN diff (class 5: what does the
   // change make WORSE?). Before mcp#2000 these guards threw their refusal WITHOUT
