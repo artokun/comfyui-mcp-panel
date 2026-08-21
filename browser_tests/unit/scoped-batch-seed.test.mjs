@@ -153,7 +153,15 @@ test("#988 (codex) source guard: the scan runs BEFORE dispatch, not after", () =
   // let the caller cancel — a remedy it could not offer.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const scan = src.indexOf("repeatingControls = findRepeatingControlWidgets(");
-  const dispatch = src.indexOf("await app.queuePrompt(0, batch, undefined)");
+  // #1565 — the unscoped dispatch is BOUNDED by the command budget now, so the literal is
+  // no longer a bare `await`. The anchor follows the call; the ordering property it guards
+  // is unchanged, and the assertion below pins that it is still the bounded call.
+  const dispatch = src.indexOf("app.queuePrompt(0, batch, undefined)");
+  assert.match(
+    src.slice(Math.max(0, dispatch - 200), dispatch + 200),
+    /Promise\.resolve\(app\.queuePrompt\(0, batch, undefined\)\)/,
+    "the unscoped dispatch must stay bounded — an unbounded one hangs past the relay window",
+  );
   const scopedDispatch = src.indexOf("runScopeResult = await dispatchScopedRun({");
   assert.ok(scan > 0, "the pre-dispatch scan must exist");
   assert.ok(scan < dispatch && scan < scopedDispatch, "and precede BOTH dispatch paths");
