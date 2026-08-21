@@ -71,7 +71,12 @@ const SAVE_AS_ROUTES = [
 // `removeWorkflow` is a best-effort orphan-copy cleanup on a failed 1.47 persist
 // (#309) — only called when the store exposes it (else it falls back to closeWorkflow
 // or splicing the open-tabs array), so it is optional, not required.
-const OPTIONAL_METHODS = ['syncWorkflows', 'removeWorkflow']
+// `openWorkflowsInBackground` returns a tab to `openWorkflowPaths` after the store's
+// own `openWorkflow` early-returned on a stale active pointer and skipped that push
+// (#1575). Only called behind a `typeof … === "function"` guard: a frontend without it
+// still gets the loaded canvas, it just cannot have its tab list corrected, which the
+// reply discloses.
+const OPTIONAL_METHODS = ['syncWorkflows', 'removeWorkflow', 'openWorkflowsInBackground']
 
 // Reactive store PROPERTIES the panel reads off the service.
 const STORE_PROPS = ['activeWorkflow', 'workflows', 'openWorkflows']
