@@ -696,6 +696,25 @@ test("#1872 a title-only edit lands on a node whose stored height is zero", () =
   assert.deepEqual(result.edited[0].after.size, [225, 0]);
 });
 
+test("#1583 a move/title/collapse edit accepts a collapsed node whose stored height is zero", () => {
+  const node = makeNode(35, { pos: [1520, 380], size: [225, 0] });
+  node.flags.collapsed = true;
+  // A move/title/collapse request does not own the node's size. A real LiteGraph
+  // node may clamp zero when setSize is called, so prove this path never treats
+  // the inherited zero-height body as an explicit resize.
+  node.setSize = () => { throw new Error("setSize must not run without an explicit size"); };
+  const { fn } = setup([node]);
+
+  const result = fn({ node_id: 35, pos: [360, 80], collapsed: true, title: "VAE Encode" });
+
+  assert.deepEqual(node.pos, [360, 80]);
+  assert.equal(node.flags.collapsed, true);
+  assert.equal(node.title, "VAE Encode");
+  assert.deepEqual(node.size, [225, 0], "an omitted size must not be normalized or validated as a resize");
+  assert.deepEqual(result.edited[0].after.pos, [360, 80]);
+  assert.deepEqual(result.edited[0].after.size, [225, 0]);
+});
+
 test("#1872 a move on a zero-height node restores the shared Rectangle instead of refusing", () => {
   const node = makeRectBackedNode(35, { pos: [1520, 380], size: [225, 0] });
   node.flags.collapsed = true;
