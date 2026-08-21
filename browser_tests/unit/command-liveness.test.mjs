@@ -144,7 +144,7 @@ test("codex R8: a SENSITIVE result is never journaled in the clear (it must not 
       reply: { rid: "r1", ok: true, result: "sk-live-SUPERSECRET" },
       cmd,
       at: 1,
-      url: "ws://127.0.0.1:9180",
+      url: "ws://127.0.0.1:9199",
     });
     assert.equal(entry.redacted, true);
     assert.equal(entry.ok, false, "a redacted entry must not advertise a success it will not deliver");
@@ -161,11 +161,11 @@ test("codex R8: a SENSITIVE result is never journaled in the clear (it must not 
 test("codex R8: a NON-sensitive result is journaled verbatim so it can be replayed as-is", () => {
   const j = createLostReplyJournal();
   const reply = { rid: "r2", ok: true, result: { opened: { path: "x.json" } } };
-  const entry = j.record({ reply, cmd: "workflow_open", at: 1, url: "ws://127.0.0.1:9180" });
+  const entry = j.record({ reply, cmd: "workflow_open", at: 1, url: "ws://127.0.0.1:9199" });
   assert.equal(entry.redacted, false);
   assert.deepEqual(entry.reply, reply);
   assert.equal(entry.ok, true);
-  assert.equal(entry.url, "ws://127.0.0.1:9180", "the owning bridge must be stamped on the entry");
+  assert.equal(entry.url, "ws://127.0.0.1:9199", "the owning bridge must be stamped on the entry");
   assert.equal(redactSensitiveReply(reply, "workflow_open"), reply, "pass-through must be identity");
 });
 
@@ -197,7 +197,7 @@ test("codex R8: replay never crosses a bridge change — entries for another bri
 });
 
 test("codex R10: isReplayable demands the SAME bridge and a recent entry, and fails closed", () => {
-  const URL_A = "ws://127.0.0.1:9180";
+  const URL_A = "ws://127.0.0.1:9199";
   const now = 1_000_000;
   const fresh = { url: URL_A, at: now - 1000 };
   assert.equal(isReplayable(fresh, { now, targetUrl: URL_A }), true);
@@ -217,7 +217,7 @@ test("codex R10: isReplayable demands the SAME bridge and a recent entry, and fa
 });
 
 test("#694: isReplayable demands the SAME session epoch — match replays, mismatch drops, both-absent replays (legacy)", () => {
-  const URL_A = "ws://127.0.0.1:9180";
+  const URL_A = "ws://127.0.0.1:9199";
   const now = 1_000_000;
   const fresh = { url: URL_A, at: now - 1000, epoch: "epoch-1" };
   // Same session (the ordinary reconnect within one orchestrator run) — replays.

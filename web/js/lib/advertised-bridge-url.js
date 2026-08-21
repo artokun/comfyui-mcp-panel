@@ -69,18 +69,25 @@ export function acceptableLoopbackBridgeUrl(url) {
 export function pickAdvertisedBridgeUrl({
   protocol,
   secureUrl,
+  localUrl,
   statusBridgeUrl,
   statusRunning,
   currentUrl,
 } = {}) {
-  const chosen =
-    protocol === "https:"
-      ? typeof secureUrl === "string" && secureUrl.startsWith("wss://")
-        ? secureUrl
-        : null
-      : statusRunning === true
-        ? acceptableLoopbackBridgeUrl(statusBridgeUrl)
-        : null;
+  let chosen;
+  if (protocol === "https:") {
+    chosen =
+      typeof secureUrl === "string" && secureUrl.startsWith("wss://") ? secureUrl : null;
+  } else {
+    // #1596 — the orchestrator's advertised loopback is authoritative. It named
+    // the port it bound; that does not need `running` corroboration (the compiled
+    // probe port may be 9199 while a live session is still on 9180).
+    chosen = acceptableLoopbackBridgeUrl(localUrl);
+    if (!chosen) {
+      chosen =
+        statusRunning === true ? acceptableLoopbackBridgeUrl(statusBridgeUrl) : null;
+    }
+  }
   if (!chosen) return null;
   if (typeof currentUrl === "string" && currentUrl.trim() === chosen) return null;
   return chosen;

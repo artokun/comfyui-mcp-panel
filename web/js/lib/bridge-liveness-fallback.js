@@ -66,14 +66,26 @@ export function sameBridge(a, b) {
  * `attempted` is what this session has already tried, so two dead ports cannot start a
  * loop. The caller records the fallback there before dialing.
  */
-export function bridgeFallbackPlan({ configured, fallback, attempted } = {}) {
-  const to = norm(fallback);
-  if (!to) return null;
-  // Redialing the address that just refused gains nothing and would loop.
-  if (sameBridge(configured, fallback)) return null;
+export function bridgeFallbackPlan({ configured, fallback, fallbacks, attempted } = {}) {
+  const candidates = [];
+  if (Array.isArray(fallbacks) && fallbacks.length) {
+    for (const u of fallbacks) {
+      const key = norm(u);
+      if (key) candidates.push({ url: typeof u === "string" ? u.trim() : u, key });
+    }
+  } else {
+    const to = norm(fallback);
+    if (to) candidates.push({ url: fallback, key: to });
+  }
   const tried = attempted instanceof Set ? attempted : new Set(attempted ?? []);
-  if (tried.has(to)) return null;
-  return { url: fallback, key: to, notice: bridgeFallbackNotice(configured, fallback) };
+  const from = norm(configured);
+  for (const c of candidates) {
+    // Redialing the address that just refused gains nothing and would loop.
+    if (from && c.key === from) continue;
+    if (tried.has(c.key)) continue;
+    return { url: c.url, key: c.key, notice: bridgeFallbackNotice(configured, c.url) };
+  }
+  return null;
 }
 
 /**

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- the pack no longer treats any TCP listener on the bridge port as a running orchestrator (Logitech G HUB's `lghub_agent` sits on 9180); identity is a hello/models handshake, the default is 9199 with 9180 as a legacy fallback, `/status` and Connect try 9180 before spawning a 9199 orchestrator, and a live 9180 session is not stranded across a panel update (#1596 / mcp#2030)
+
 ## [0.15.34] - 2026-08-21
 
 ### Fixed
@@ -29,7 +32,6 @@ All notable changes to this project are documented here. This project adheres to
 - recognise ComfyUI's file_upload flag so Load3D model inputs get upload handling (#1571)
 - panel_refresh_nodes spends the window it holds, and stops blaming a server it never saw fail (#1566)
 - a type-scoped /object_info answers the fence when the whole map never lands (#1561)
-
 
 ## [0.15.32] - 2026-08-21
 

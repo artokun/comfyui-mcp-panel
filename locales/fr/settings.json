@@ -69,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "URL du pont (avancé)",
-    "tooltip": "URL WebSocket du pont de l'orchestrateur du panneau — UN seul pont dessert désormais tous les fournisseurs (par défaut ws://127.0.0.1:9180). Ne la changez que si vous démarrez l'orchestrateur sur un port non standard (COMFYUI_MCP_BRIDGE_PORT). S'applique au prochain Connecter."
+    "tooltip": "URL WebSocket du pont de l'orchestrateur du panneau — UN seul pont dessert désormais tous les fournisseurs (par défaut ws://127.0.0.1:9199). Ne la changez que si vous démarrez l'orchestrateur sur un port non standard (COMFYUI_MCP_BRIDGE_PORT). S'applique au prochain Connecter."
   },
   "comfyui-mcp_zoomToAction": {
     "name": "Zoomer sur les modifications de l'agent",

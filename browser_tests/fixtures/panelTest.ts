@@ -50,7 +50,7 @@ async function applyPanelRouteStubs(
   panelAutostartMcp = false,
   bridgeUrl: string | null = null,
 ) {
-  // Hermetic runs on a dev box with a REAL orchestrator listening on :9180:
+  // Hermetic runs on a dev box with a REAL orchestrator listening on :9199:
   // the panel's mount probe (GET /comfyui_mcp_panel/status → { running: true })
   // would auto-connect it to the live agent before the spec's setBridgeUrl()
   // override applies — the real greeting then pollutes the transcript and the

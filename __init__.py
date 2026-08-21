@@ -28,11 +28,14 @@ may expose one authenticated loopback action that opens the fixed MCP command;
 this pack can proxy that action but never supplies a command or starts a process.
 
 Env knobs:
-- ``COMFYUI_MCP_BRIDGE_PORT`` — panel bridge port to probe (default 9180).
+- ``COMFYUI_MCP_BRIDGE_PORT`` — panel bridge port to probe (default 9199;
+  9180 is a legacy fallback the browser still tries).
 - ``COMFYUI_URL`` — the ComfyUI the agent targets (auto-detected otherwise).
 """
 
+import base64
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -61,17 +64,24 @@ WEB_DIRECTORY = "./web"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
 _BRIDGE_HOST = "127.0.0.1"
-_BRIDGE_PORT = int(environ.get("COMFYUI_MCP_BRIDGE_PORT", "9180"))
+# 9199 is the dedicated bridge default. 9180 collided with Logitech G HUB's
+# lghub_agent; the browser still tries 9180 as a legacy fallback so a live
+# session on the old port is not stranded across a panel update.
+_BRIDGE_PORT = int(environ.get("COMFYUI_MCP_BRIDGE_PORT", "9199"))
+# Previous compiled default. Probed when 9199 is silent so a live session on
+# 9180 is still `running` and Connect does not spawn a second orchestrator.
+_LEGACY_BRIDGE_PORT = 9180
 _LAUNCHER_PROTOCOL = 1
 _LAUNCHER_INSTALL_COMMAND = "npx -y comfyui-mcp@latest launcher install"
 
-# Backend -> bridge port map. "claude" is the default (9180); "codex"/"gemini"
-# have their own ports so an orchestrator per provider can run side by side.
-# (Informational for the panel's picker — this pack never binds or spawns.)
+# ONE bridge serves every provider. The stale per-backend ports (codex 9181,
+# gemini 9182) are gone — provider selection is the hello / set_backend
+# handshake, not a port. Informational for the panel's picker; this pack
+# never binds or spawns.
 _BACKEND_PORTS = {
     "claude": _BRIDGE_PORT,
-    "codex": 9181,
-    "gemini": 9182,
+    "codex": _BRIDGE_PORT,
+    "gemini": _BRIDGE_PORT,
     "antigravity": _BRIDGE_PORT,  # Google Antigravity (agy) — single-port multi-provider
     "pi": _BRIDGE_PORT,  # pi.dev (pi) — single-port multi-provider, same orchestrator (#491)
     "grok": _BRIDGE_PORT,  # single-port multi-provider — same orchestrator
@@ -91,6 +101,10 @@ _DEFAULT_BACKEND = "claude"
 # ws://127.0.0.1 loopback default — required when this page is served over https,
 # where a plain ws:// is blocked by the browser. In-process; last writer wins.
 _ADVERTISED_BRIDGE_URL = None
+# Local ws://127.0.0.1:<port> advertised by the same POST. Authoritative for
+# the browser's first dial; accepted now so an orchestrator that starts
+# sending it (mcp#2030) is followed instead of a compiled default.
+_ADVERTISED_LOCAL_URL = None
 
 
 def _log(msg):
@@ -577,31 +591,276 @@ def _provider_state(provider):
     return {"cli": cli, "auth": auth, "ready": ready}
 
 
-def _port_in_use(host, port):
-    """True if something is listening on (host, port) — i.e. an orchestrator
-    (however the user started it) already owns the bridge."""
+# RFC 6455 §1.3 — SHA-1 is the WebSocket handshake, not a digest of secrets.
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_PROBE_TIMEOUT_S = 1.2
+_PROTOCOL_FRAME_TYPES = ("session_epoch", "backends", "models")
+_LOOPBACK_WS_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _ws_client_frame(payload):
+    """A masked unfragmented text frame. Probe payloads are tiny (<126)."""
+    if len(payload) >= 126:
+        raise ValueError("probe frame unexpectedly large")
+    mask = os.urandom(4)
+    header = bytes((0x81, 0x80 | len(payload))) + mask
+    body = bytes(payload[i] ^ mask[i % 4] for i in range(len(payload)))
+    return header + body
+
+
+def _ws_server_texts(buf):
+    """Decode unmasked server text frames; skip anything else or incomplete."""
+    out = []
+    offset = 0
+    while offset + 2 <= len(buf):
+        first = buf[offset]
+        second = buf[offset + 1]
+        length = second & 0x7F
+        header = 2
+        if length == 126:
+            if offset + 4 > len(buf):
+                break
+            length = int.from_bytes(buf[offset + 2 : offset + 4], "big")
+            header = 4
+        elif length == 127:
+            break
+        masked = (second & 0x80) != 0
+        if masked:
+            header += 4
+        if offset + header + length > len(buf):
+            break
+        if (first & 0x0F) == 1 and not masked:
+            out.append(buf[offset + header : offset + header + length].decode("utf-8"))
+        offset += header + length
+    return out
+
+
+def _probe_bridge(host, port, timeout=_PROBE_TIMEOUT_S):
+    """Identity probe: a TCP listener is not an orchestrator.
+
+    Returns ``{"running": bool, "port_held_by_other_process": bool}``.
+    ``running`` is True only when the peer completes a WebSocket upgrade and
+    answers ``hello`` with a ``models`` / ``session_epoch`` / ``backends``
+    frame (the same exchange as comfyui-mcp ``probePanelOrchestrator``).
+    ``port_held_by_other_process`` is True when the socket opened but the
+    peer did not speak the panel protocol (Logitech G HUB on 9180, etc.).
+    """
+    result = {"running": False, "port_held_by_other_process": False}
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    digest = hashlib.sha1(  # noqa: S324 — RFC 6455 handshake, not a secret digest
+        (key + _WS_GUID).encode("ascii"), usedforsecurity=False
+    ).digest()
+    accept = base64.b64encode(digest).decode("ascii")
+    request = (
+        "GET / HTTP/1.1\r\n"
+        "Host: {0}:{1}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: {2}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n"
+    ).format(host, port, key)
+    hello = _ws_client_frame(
+        json.dumps(
+            {"type": "hello", "tab_id": "pack-probe", "backend": "claude"}
+        ).encode("utf-8")
+    )
     with socket(AF_INET, SOCK_STREAM) as probe:
-        probe.settimeout(0.3)
-        return probe.connect_ex((host, port)) == 0
+        probe.settimeout(timeout)
+        if probe.connect_ex((host, port)) != 0:
+            return result
+        result["port_held_by_other_process"] = True
+        try:
+            probe.sendall(request.encode("ascii"))
+            buf = b""
+            upgraded = False
+            while True:
+                chunk = probe.recv(4096)
+                if not chunk:
+                    return result
+                buf += chunk
+                if not upgraded:
+                    end = buf.find(b"\r\n\r\n")
+                    if end < 0:
+                        continue
+                    header = buf[:end].decode("utf-8", "replace")
+                    if not header.startswith("HTTP/1.1 101") or (
+                        "sec-websocket-accept: " + accept.lower()
+                    ) not in header.lower():
+                        return result
+                    upgraded = True
+                    buf = buf[end + 4 :]
+                    probe.sendall(hello)
+                for text in _ws_server_texts(buf):
+                    try:
+                        frame = json.loads(text)
+                    except ValueError:
+                        continue
+                    if (
+                        isinstance(frame, dict)
+                        and frame.get("type") in _PROTOCOL_FRAME_TYPES
+                    ):
+                        result["running"] = True
+                        result["port_held_by_other_process"] = False
+                        return result
+        except OSError:
+            return result
+    return result
+
+
+def _orchestrator_probe(port=None):
+    return _probe_bridge(_BRIDGE_HOST, port if port is not None else _BRIDGE_PORT)
+
+
+def _port_of_local_url(url):
+    accepted = _acceptable_local_bridge_url(url)
+    if not accepted:
+        return None
+    try:
+        from urllib.parse import urlsplit
+
+        port = urlsplit(accepted).port
+    except Exception:
+        return None
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        return None
+    return port
+
+
+def _status_probe_ports():
+    """Advertised local port, compiled default, then legacy 9180.
+
+    Deduped, first protocol peer wins. 9180 is always tried when 9199 is
+    silent so `/status.running` cannot mean "no orchestrator exists".
+    """
+    ports = []
+    advertised = _port_of_local_url(_ADVERTISED_LOCAL_URL)
+    if advertised:
+        ports.append(advertised)
+    for port in (_BRIDGE_PORT, _LEGACY_BRIDGE_PORT):
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _live_bridge_probe():
+    """First protocol peer on the status probe list, else the compiled default."""
+    default_held = False
+    last = {"running": False, "port_held_by_other_process": False}
+    for port in _status_probe_ports():
+        probe = _probe_bridge(_BRIDGE_HOST, port)
+        if probe["running"]:
+            return probe, port
+        if port == _BRIDGE_PORT:
+            default_held = probe["port_held_by_other_process"]
+        last = probe
+    last["port_held_by_other_process"] = default_held or last["port_held_by_other_process"]
+    return last, _BRIDGE_PORT
 
 
 def _orchestrator_running(port=None):
-    return _port_in_use(_BRIDGE_HOST, port if port is not None else _BRIDGE_PORT)
+    if port is not None:
+        return _orchestrator_probe(port)["running"]
+    probe, _live = _live_bridge_probe()
+    return probe["running"]
 
 
-def _backend_status(backend):
+def _backend_status(backend, running=None):
     """{"backend", "port", "running", "cli", "auth", "ready"} for a backend.
-    "running" is a raw bridge-port probe (covers an orchestrator the user
-    started, regardless of how)."""
+    "running" is a protocol probe (hello → models), not a TCP connect."""
     port = _backend_port(backend)
     state = _provider_state(backend)
+    if running is None:
+        running = _orchestrator_running(port)
     return {
         "backend": backend,
         "port": port,
-        "running": _orchestrator_running(port),
+        "running": running,
         "cli": state["cli"],
         "auth": state["auth"],
         "ready": state["ready"],
+    }
+
+
+def _acceptable_local_bridge_url(url):
+    """A loopback ``ws://`` URL the orchestrator may advertise, or None."""
+    if not isinstance(url, str):
+        return None
+    trimmed = url.strip()
+    if not trimmed.startswith("ws://"):
+        return None
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(trimmed)
+    except Exception:
+        return None
+    host = (parts.hostname or "").lower()
+    if host not in _LOOPBACK_WS_HOSTS:
+        return None
+    return trimmed
+
+
+def _store_advertised_bridge(body):
+    """Apply an advertise_bridge payload. Returns (ok, message, status)."""
+    global _ADVERTISED_BRIDGE_URL, _ADVERTISED_LOCAL_URL
+    if not isinstance(body, dict):
+        return False, "invalid JSON", 400
+    url = body.get("url")
+    local_url = body.get("local_url")
+    stored_tunnel = None
+    stored_local = None
+    if isinstance(url, str) and url.startswith("wss://"):
+        stored_tunnel = url
+    elif isinstance(url, str) and url.startswith("ws://"):
+        stored_local = _acceptable_local_bridge_url(url)
+        if stored_local is None:
+            return False, "url must be a wss:// string or a loopback ws:// URL", 400
+    elif url is not None:
+        return False, "url must be a wss:// string", 400
+    if local_url is not None:
+        stored_local = _acceptable_local_bridge_url(local_url)
+        if stored_local is None:
+            return False, "local_url must be a loopback ws:// URL", 400
+    if stored_tunnel is None and stored_local is None:
+        return False, "url must be a wss:// string", 400
+    if stored_tunnel is not None:
+        _ADVERTISED_BRIDGE_URL = stored_tunnel
+    if stored_local is not None:
+        _ADVERTISED_LOCAL_URL = stored_local
+    return True, None, 200
+
+
+def _advertised_bridge_payload():
+    return {"url": _ADVERTISED_BRIDGE_URL, "local_url": _ADVERTISED_LOCAL_URL}
+
+
+def _status_bridge_url(live_port=None):
+    if live_port is not None:
+        return "ws://{}:{}".format(_BRIDGE_HOST, live_port)
+    if _ADVERTISED_LOCAL_URL:
+        return _ADVERTISED_LOCAL_URL
+    return "ws://{}:{}".format(_BRIDGE_HOST, _BRIDGE_PORT)
+
+
+def _status_body():
+    probe, live_port = _live_bridge_probe()
+    detected = _detect_comfyui_url()
+    return {
+        "running": probe["running"],
+        "port_held_by_other_process": probe["port_held_by_other_process"],
+        "port": live_port,
+        # No in-process auto-start: the orchestrator runs out-of-band.
+        "can_spawn": False,
+        "bridge_url": _status_bridge_url(live_port if probe["running"] else None),
+        "comfyui_url": detected,
+        # #296/#291 — the local ComfyUI workspace path (folder_paths.base_path
+        # of the ComfyUI this pack is embedded in). READ-ONLY/advisory: the
+        # panel advertises it in its session-init hello so an out-of-band
+        # orchestrator can register the live panel_* graph tools + local panel
+        # management even with no CLI workspace config. Never used to spawn.
+        "comfyui_path": _local_comfyui_path(),
+        "start_command": _start_command(detected),
     }
 
 
@@ -918,24 +1177,7 @@ def _register_routes():
 
     @routes.get("/comfyui_mcp_panel/status")
     async def _status(_request):
-        detected = _detect_comfyui_url()
-        return web.json_response(
-            {
-                "running": _orchestrator_running(),
-                "port": _BRIDGE_PORT,
-                # No in-process auto-start: the orchestrator runs out-of-band.
-                "can_spawn": False,
-                "bridge_url": "ws://{}:{}".format(_BRIDGE_HOST, _BRIDGE_PORT),
-                "comfyui_url": detected,
-                # #296/#291 — the local ComfyUI workspace path (folder_paths.base_path
-                # of the ComfyUI this pack is embedded in). READ-ONLY/advisory: the
-                # panel advertises it in its session-init hello so an out-of-band
-                # orchestrator can register the live panel_* graph tools + local panel
-                # management even with no CLI workspace config. Never used to spawn.
-                "comfyui_path": _local_comfyui_path(),
-                "start_command": _start_command(detected),
-            }
-        )
+        return web.json_response(_status_body())
 
     _register_launcher_routes(routes, web)
 
@@ -944,35 +1186,44 @@ def _register_routes():
         # A local orchestrator driving this remote pod (`connect <this-pod>`) POSTs
         # the public wss:// URL of its secure bridge here so the browser panel can
         # fetch and use it — no URL copy/paste. Restricted to wss:// so a stray POST
-        # can't redirect the panel to an arbitrary/insecure endpoint.
-        global _ADVERTISED_BRIDGE_URL
+        # can't redirect the panel to an arbitrary/insecure endpoint. The same call
+        # may also carry the local ws://127.0.0.1:<port> (mcp#2030); that is the
+        # authoritative loopback dial target.
         try:
             body = await _request.json()
         except Exception:
             return web.json_response({"ok": False, "message": "invalid JSON"}, status=400)
-        url = body.get("url") if isinstance(body, dict) else None
-        if not isinstance(url, str) or not url.startswith("wss://"):
-            return web.json_response(
-                {"ok": False, "message": "url must be a wss:// string"}, status=400
-            )
-        _ADVERTISED_BRIDGE_URL = url
-        _log("secure bridge advertised: {}".format(url.split("?")[0]))
+        ok, message, status = _store_advertised_bridge(body if isinstance(body, dict) else None)
+        if not ok:
+            return web.json_response({"ok": False, "message": message}, status=status)
+        advertised = _advertised_bridge_payload()
+        if advertised["url"]:
+            _log("secure bridge advertised: {}".format(advertised["url"].split("?")[0]))
+        if advertised["local_url"]:
+            _log("local bridge advertised: {}".format(advertised["local_url"]))
         return web.json_response({"ok": True})
 
     @routes.get("/comfyui_mcp_panel/bridge_url")
     async def _bridge_url(_request):
-        # The panel calls this on Connect. If a local orchestrator advertised a
-        # secure wss:// bridge, return it (the browser uses it instead of the
-        # ws://127.0.0.1 default — mandatory when this page is https); else null so
-        # the panel keeps its loopback default.
-        return web.json_response({"url": _ADVERTISED_BRIDGE_URL})
+        # The panel calls this on Connect. `url` is a secure wss:// tunnel when a
+        # local orchestrator advertised one (mandatory on an https page); `local_url`
+        # is the orchestrator's loopback ws:// and is the first dial target when
+        # present. Both may be null so the panel falls back to [9199, 9180].
+        return web.json_response(_advertised_bridge_payload())
 
     @routes.get("/comfyui_mcp_panel/backends")
     async def _backends(_request):
         # Discovery for the panel's backend picker: each known backend with its
         # mapped port, whether an orchestrator is running there, and per-provider
         # readiness (cli/auth/ready) so the panel can show an onboarding card.
-        backends = [_backend_status(b) for b in _BACKEND_PORTS]
+        # Probe each distinct port once — every backend shares the single bridge.
+        probe_by_port = {}
+        backends = []
+        for b in _BACKEND_PORTS:
+            port = _backend_port(b)
+            if port not in probe_by_port:
+                probe_by_port[port] = _orchestrator_probe(port)
+            backends.append(_backend_status(b, running=probe_by_port[port]["running"]))
         return web.json_response(
             {
                 "backends": backends,
@@ -1013,14 +1264,16 @@ def _register_routes():
                 status=400,
             )
         port = _backend_port(backend)
-        bridge_url = "ws://{}:{}".format(_BRIDGE_HOST, port)
-        if _orchestrator_running(port):
+        probe, live_port = _live_bridge_probe()
+        bridge_url = _status_bridge_url(live_port if probe["running"] else None)
+        if probe["running"]:
             return web.json_response(
                 {
                     "ok": True,
                     "running": True,
+                    "port_held_by_other_process": False,
                     "backend": backend,
-                    "port": port,
+                    "port": live_port,
                     "bridge_url": bridge_url,
                     "message": "orchestrator already running — connecting",
                 },
@@ -1030,6 +1283,7 @@ def _register_routes():
             {
                 "ok": False,
                 "running": False,
+                "port_held_by_other_process": probe["port_held_by_other_process"],
                 "backend": backend,
                 "port": port,
                 "can_spawn": False,

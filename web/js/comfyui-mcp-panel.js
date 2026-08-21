@@ -254,7 +254,16 @@ import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { installSidebarRenderWatchdog } from "./lib/sidebar-render-watchdog.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { duplicateWidgetRows } from "./lib/widget-rows.js";
-import { pickAdvertisedBridgeUrl } from "./lib/advertised-bridge-url.js";
+import { pickAdvertisedBridgeUrl, acceptableLoopbackBridgeUrl } from "./lib/advertised-bridge-url.js";
+import {
+  DEFAULT_BRIDGE_URL,
+  LEGACY_BRIDGE_URL,
+  LEGACY_9180_BRIDGE_URL,
+  defaultDialOrder,
+  isDefaultBridgeUrl,
+  normalizeBridgeUrl,
+  resolvedDefaultBridgeUrl,
+} from "./lib/bridge-defaults.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "./lib/refresh-coalesce.js";
 import {
@@ -586,7 +595,7 @@ import {
 import { mergeProviderSnapshots } from "./lib/provider-snapshot-merge.js";
 import { providerDiscoveryDecision } from "./lib/provider-autoselect.js";
 import { choiceModal } from "./cmcp-modal.js";
-import { migrateAutostartValue, panelOpenAction } from "./lib/mcp-autostart-policy.js";
+import { migrateAutostartValue, panelOpenAction, connectEntryPlan } from "./lib/mcp-autostart-policy.js";
 import {
   MOVE_CAUSES,
   createActiveWorkflowProvenance,
@@ -2410,7 +2419,7 @@ let cmcpOauthOnBackendsPush = null;
 // token-gated credential API (`GET/POST {consoleUrl}/api/secrets`) — the standalone
 // comfyui-cred-console sidebar tab is retired; credential management lives in the
 // AI backend and is edited here. The fetch is cross-origin (ComfyUI :8188 → console
-// :9182), which the console now allows via CORS on /api/secrets (see
+// :9197), which the console now allows via CORS on /api/secrets (see
 // panel-console-http.ts). The token travels as a query param; values are write-only
 // and never read back (only a masked preview comes down).
 function cmcpApiBase() {
@@ -2906,17 +2915,16 @@ const STORAGE_KEY_BRIDGE = "comfyui-mcp.panel.bridgeUrl";
 // is highlighted in the connection settings. Default "claude" keeps the existing
 // no-pick behavior.
 const STORAGE_KEY_BACKEND = "comfyui-mcp.panel.backend";
-// The panel orchestrator owns a DEDICATED bridge port (9180) — so a stray
-// process in another session can never sit on the panel's port and produce a
-// "connected but no agent" lie.
-const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:9180";
-const LEGACY_BRIDGE_URL = "ws://127.0.0.1:9101"; // old shared default — migrate off it
-// Single-port multi-provider: ONE orchestrator bridge (9180) serves ALL backends —
+// The panel orchestrator owns a DEDICATED bridge port (9199; 9180 is legacy).
+// Identity is a hello/models handshake, not a TCP connect — Logitech G HUB's
+// lghub_agent sits on 9180 and is not an orchestrator (#1596).
+// Single-port multi-provider: ONE orchestrator bridge serves ALL backends —
 // provider selection happens per tab over the hello/set_backend handshake, not by
 // port. This per-backend map survives from the old per-port layout for call-site
-// compatibility; every entry is the same URL. A DEFAULT must NOT count as a
-// "manual override" (so /connect's bridge_url still applies) — only a user-typed
-// NON-default URL overrides (see connectAgent.manualOverride).
+// compatibility; every entry is the same URL. A DEFAULT (including a saved
+// 9180/9101) must NOT count as a "manual override" (so /connect's bridge_url
+// still applies) — only a user-typed NON-default URL overrides (see
+// connectAgent.manualOverride).
 // Single-port multi-provider: ONE orchestrator on ONE bridge serves every
 // provider. The backend is chosen in the hello / set_backend handshake, NOT by
 // port — so all providers resolve to the same default bridge URL. (Kept as a
@@ -2943,10 +2951,11 @@ function defaultBridgeUrlFor(backend) {
 function loadBridgeUrl() {
   // Single-port: the single (advanced) Bridge URL override, else the default. Old
   // per-port localStorage / per-backend values are intentionally ignored so a
-  // stale custom port can't make the initial connect dial a dead bridge.
+  // stale custom port can't make the initial connect dial a dead bridge. A saved
+  // exact 9180/9101 is the old compiled default, not a pin — migrate it.
   try {
     const v = getSetting(SETTING_BRIDGE);
-    if (typeof v === "string" && v.trim()) return v.trim();
+    return resolvedDefaultBridgeUrl(v);
   } catch {
     // settings not ready yet — fall through to the default.
   }
@@ -5392,15 +5401,15 @@ function externalOrchestratorMode() {
   return true;
 }
 // The Bridge URL to dial: the single (advanced) Bridge URL override when set,
-// else the shared single-port default (9180 — same for every backend).
+// else the shared single-port default (9199 — same for every backend). A saved
+// exact 9180 is treated as default and migrated, not as a pin (#1596).
 function configuredBridgeUrlFor(backend) {
   // Single-port multi-provider: ONE bridge for every provider. Honor only the
   // single (advanced) Bridge URL override, else the default — ignore any stale
   // per-backend value from the pre-single-port layout. (backend kept for
   // call-site compatibility.)
   void backend;
-  const v = getSetting(SETTING_BRIDGE);
-  return (typeof v === "string" && v.trim()) || DEFAULT_BRIDGE_URL;
+  return resolvedDefaultBridgeUrl(getSetting(SETTING_BRIDGE));
 }
 // Best-effort ComfyUI URL to put in the "start it locally" hint — the address of
 // the ComfyUI the user is viewing (a remote pod when opened over its proxy URL).
@@ -5640,7 +5649,7 @@ function panelSettingsList() {
     },
   });
   // A per-backend "Bridge URL" settings row — retained from the pre-single-port
-  // layout (ONE bridge on 9180 now serves every backend; configuredBridgeUrlFor
+  // layout (ONE bridge on 9199 now serves every backend; configuredBridgeUrlFor
   // ignores stale per-backend values). The value seeds the URL field shown for
   // that backend; /connect's returned bridge_url still applies. Drives the live panel
   // (a reconnect) only for the ACTIVE backend's group — a non-active group's edit
@@ -6146,7 +6155,7 @@ function panelSettingsList() {
       sortOrder: 141,
       tooltip:
         "WebSocket URL of the panel orchestrator bridge — ONE bridge now serves every provider " +
-        "(default ws://127.0.0.1:9180). Only change this if you start the orchestrator on a " +
+        "(default ws://127.0.0.1:9199; 9180 is a legacy fallback). Only change this if you start the orchestrator on a " +
         "non-default port (COMFYUI_MCP_BRIDGE_PORT). Applies on the next Connect.",
       type: "text",
       defaultValue: DEFAULT_BRIDGE_URL,
@@ -28691,6 +28700,13 @@ function buildPanel() {
       urlInput.value = su;
       saveBridgeUrl(su);
     }
+    // #1596 — a saved exact 9180 (or 9101) is the old compiled default, not a pin.
+    // Rewrite it so Settings shows 9199; the dial order still tries 9180 if 9199
+    // is silent, so a live session on the old port is not stranded.
+    const savedBridge = getSetting(SETTING_BRIDGE);
+    if (typeof savedBridge === "string" && isDefaultBridgeUrl(savedBridge) && savedBridge.trim() !== DEFAULT_BRIDGE_URL) {
+      setSetting(SETTING_BRIDGE, DEFAULT_BRIDGE_URL);
+    }
   }
   seedFromSettings();
   autostartToggle.checked = getSetting(SETTING_AUTOSTART_MCP) !== false;
@@ -36292,9 +36308,14 @@ function buildPanel() {
     // POSTed, so the advertised bridge_url never arrives. Liveness is already known
     // HERE — this runs precisely because the dial failed — so no guess about who
     // chose the URL is needed.
+    const failed = client.currentUrl() || bridge;
+    const failedKey = normalizeBridgeUrl(failed);
+    if (failedKey) bridgeFallbacksTried.add(failedKey);
     const plan = bridgeFallbackPlan({
-      configured: bridge,
-      fallback: defaultBridgeUrlFor(selectedBackend),
+      configured: failed,
+      fallbacks: isDefaultBridgeUrl(bridge) || isDefaultBridgeUrl(failed)
+        ? defaultDialOrder()
+        : [defaultBridgeUrlFor(selectedBackend)],
       attempted: bridgeFallbacksTried,
     });
     if (plan) {
@@ -36592,15 +36613,18 @@ function buildPanel() {
   // the query) here — a plain ws://127.0.0.1 from an https origin is blocked by the
   // browser (mixed-content / Private Network Access). Returns the wss URL or null.
   // No-op on http/localhost pages, where the plain ws:// default works.
-  async function fetchAdvertisedBridgeUrl() {
-    if (location.protocol !== "https:") return null;
+  async function fetchAdvertisedBridge() {
     try {
       const res = await api.fetchApi("/comfyui_mcp_panel/bridge_url");
       const data = await res.json().catch(() => ({}));
       const url = data && data.url;
-      return typeof url === "string" && url.startsWith("wss://") ? url : null;
+      const local = data && (data.local_url || data.localUrl);
+      return {
+        secure: typeof url === "string" && url.startsWith("wss://") ? url : null,
+        local: acceptableLoopbackBridgeUrl(local),
+      };
     } catch {
-      return null;
+      return { secure: null, local: null };
     }
   }
 
@@ -36624,23 +36648,29 @@ function buildPanel() {
   async function reclaimAdvertisedBridgeUrl() {
     const wanted = urlInput.value.trim();
     const manualOverride =
-      !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
+      !!wanted && !isDefaultBridgeUrl(wanted) && wanted !== lastAutoUrl;
     if (manualOverride) return; // a user-typed Advanced Bridge URL is never clobbered
     // #1486 — the https gate used to sit ABOVE this, so a plain-loopback page never even
     // read the advertisement. An orchestrator started outside the panel (`npx comfyui-mcp
     // connect`) POSTs nothing, so neither of the two POST-response adoption sites fires;
     // status was the only channel left and nothing consulted it. Result: the tab dialled
     // its compiled default forever while status advertised the port actually bound.
-    const secure = location.protocol === "https:" ? await fetchAdvertisedBridgeUrl() : null;
+    // #1596 — /bridge_url.local_url is the orchestrator's bound loopback and is
+    // authoritative even when status.running is false (the compiled probe port may
+    // be 9199 while a live session is still on 9180).
+    const advertised = await fetchAdvertisedBridge();
+    const secure = location.protocol === "https:" ? advertised.secure : null;
     // status.bridge_url names the port THIS ComfyUI was configured to probe, not where
     // the orchestrator bound (__init__.py:64/928 — an import-time constant with no
     // mutator). `running` is the corroboration that something actually answered there,
     // and it rides in the same payload; without it an adopt can move a live tab onto a
-    // dead port and never come back.
+    // dead port and never come back. Advertised local_url does not need that
+    // corroboration — the orchestrator told us where it bound.
     const status = location.protocol === "https:" ? null : await readOrchestratorStatus();
     const next = pickAdvertisedBridgeUrl({
       protocol: location.protocol,
       secureUrl: secure,
+      localUrl: advertised.local,
       statusBridgeUrl: status?.bridge_url,
       statusRunning: status?.running,
       currentUrl: client.currentUrl(),
@@ -36680,7 +36710,23 @@ function buildPanel() {
     const generation = ++launcherStartGeneration;
     const initial = await readOrchestratorStatus();
     if (generation !== launcherStartGeneration) return;
-    if (initial?.running) {
+    const advertised = await fetchAdvertisedBridge();
+    if (generation !== launcherStartGeneration) return;
+    const wanted = urlInput.value.trim();
+    // #1596 — advertised local and a live 9180 peer must be connected BEFORE
+    // launcher /start. Spawning 9199 because 9199 is silent strands a session
+    // still on 9180. tryUrls is the handshake list the plan requires first.
+    const plan = connectEntryPlan({
+      pinnedUrl: wanted,
+      advertisedLocalUrl: advertised.local,
+      statusRunning: initial?.running === true,
+      statusBridgeUrl: initial?.bridge_url,
+    });
+    if (!plan.spawn) {
+      if (plan.url && plan.url !== client.currentUrl()) {
+        client.setUrl(plan.url, { persist: false });
+        lastAutoUrl = plan.url;
+      }
       void connectAgent();
       return;
     }
@@ -36720,6 +36766,9 @@ function buildPanel() {
               "Install the companion launcher once to autostart MCP; the command is in Connect settings.",
             ),
       );
+      // Still dial advertised / [9199, 9180]. Returning here is what stranded a
+      // live 9180 session when the companion launcher was not installed.
+      void connectAgent();
       return;
     }
     const deadline = Date.now() + 90_000;
@@ -36791,37 +36840,48 @@ function buildPanel() {
     const wanted = urlInput.value.trim();
     // Only a GENUINELY custom URL counts as a manual override. The backend's DEFAULT
     // bridge URL must NOT — the Settings "Bridge URL" seeds that default (the shared
-    // single-port 9180, same for every backend), and on a sticky/load connect
-    // lastAutoUrl is still empty, so flagging the default as an override would SKIP
-    // the bridge_url from /connect (#25).
+    // single-port 9199, same for every backend; a saved 9180 is treated as default
+    // too), and on a sticky/load connect lastAutoUrl is still empty, so flagging
+    // the default as an override would SKIP the bridge_url from /connect (#25).
     // A chip switch is INCLUDED now (no `!opts.fromChip` guard): connectBackend already
     // seeds urlInput + the client url from SETTING_BRIDGE_URL[id] BEFORE this runs, so a
     // user-CUSTOMIZED non-default per-backend URL must survive the switch and not be
     // overwritten by /connect's default bridge_url. A per-backend DEFAULT url still
     // isn't an override, so a normal switch keeps following /connect's bridge_url.
     const manualOverride =
-      !!wanted && wanted !== defaultBridgeUrlFor(selectedBackend) && wanted !== lastAutoUrl;
+      !!wanted && !isDefaultBridgeUrl(wanted) && wanted !== lastAutoUrl;
     if (manualOverride && wanted !== client.currentUrl()) client.setUrl(wanted);
     // EXTERNAL/LOCAL ORCHESTRATOR MODE: the agent is run by the user on THEIR
     // machine, not spawned by this ComfyUI host — so do NOT POST /connect (this
-    // host may have no Node/agent, e.g. a remote pod). Dial the configured Bridge
-    // URL for the selected backend directly; the bounded WS retry surfaces a clear
-    // "start it locally" hint if nothing is listening yet (showExternalHintOnce).
+    // host may have no Node/agent, e.g. a remote pod). Dial the advertised local
+    // URL first, else the configured Bridge URL; the bounded WS retry surfaces a
+    // clear "start it locally" hint if nothing is listening yet (showExternalHintOnce).
     if (externalOrchestratorMode()) {
       connecting = false;
       if (!manualOverride) {
         // Prefer a secure wss:// bridge advertised by the orchestrator (required on
         // an https pod, where ws://127.0.0.1 is browser-blocked). It's per-session
         // and ephemeral, so connect WITHOUT persisting it as the saved default.
-        const secure = await fetchAdvertisedBridgeUrl();
+        // The local ws:// advertisement is next: the orchestrator named the port
+        // it bound, so dial that before any compiled default (#1596).
+        const advertised = await fetchAdvertisedBridge();
         if (myGen !== connectGen) return;
+        const secure = location.protocol === "https:" ? advertised.secure : null;
         if (secure) {
           if (secure !== client.currentUrl()) client.setUrl(secure, { persist: false });
           lastAutoUrl = secure;
         } else {
-          const target = configuredBridgeUrlFor(selectedBackend);
+          const status = await readOrchestratorStatus();
+          if (myGen !== connectGen) return;
+          const plan = connectEntryPlan({
+            pinnedUrl: wanted,
+            advertisedLocalUrl: advertised.local,
+            statusRunning: status?.running === true,
+            statusBridgeUrl: status?.bridge_url,
+          });
+          const target = plan.url || plan.tryUrls?.[0] || configuredBridgeUrlFor(selectedBackend);
           if (target && target !== client.currentUrl()) {
-            client.setUrl(target);
+            client.setUrl(target, { persist: false });
             urlInput.value = target;
             lastAutoUrl = target;
           }
@@ -37003,7 +37063,7 @@ function buildPanel() {
         client.stop();
         connecting = false;
         // FIX 2 — refresh the bridge URL (and the Advanced URL field) before reconnecting.
-        // Single-port now, so this is normally the same 9180 URL for every backend; it still
+        // Single-port now, so this is normally the same 9199 URL for every backend; it still
         // matters when a custom Bridge URL override is set. /connect's returned bridge_url
         // still applies on top. The client is stopped, so setUrl only updates its `url`
         // here; connectAgent's client.start() opens it.

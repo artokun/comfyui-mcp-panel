@@ -69,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "Köprü adresi (gelişmiş)",
-    "tooltip": "Panel orkestratör köprüsünün WebSocket adresi — artık TEK bir köprü her sağlayıcıya hizmet ediyor (varsayılan ws://127.0.0.1:9180). Bunu yalnızca orkestratörü varsayılan olmayan bir bağlantı noktasında başlatıyorsanız değiştirin (COMFYUI_MCP_BRIDGE_PORT). Bir sonraki Bağlan işleminde geçerli olur."
+    "tooltip": "Panel orkestratör köprüsünün WebSocket adresi — artık TEK bir köprü her sağlayıcıya hizmet ediyor (varsayılan ws://127.0.0.1:9199). Bunu yalnızca orkestratörü varsayılan olmayan bir bağlantı noktasında başlatıyorsanız değiştirin (COMFYUI_MCP_BRIDGE_PORT). Bir sonraki Bağlan işleminde geçerli olur."
   },
   "comfyui-mcp_zoomToAction": {
     "name": "Ajan düzenlemelerine yakınlaş",

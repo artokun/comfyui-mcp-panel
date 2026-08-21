@@ -16,7 +16,7 @@
  * The load-bearing assertion is therefore the OTHER one: clicking the real Connect
  * button reaches a real handshake with the MockBridge at the CONFIGURED url.
  * That one is a true regression test — removing the url write in step (4) turns
- * this red (measured: it dialled the default ws://127.0.0.1:9180 instead).
+ * this red (measured: it dialled the default ws://127.0.0.1:9199 instead).
  */
 import { test, expect } from './fixtures/panelTest'
 
@@ -75,7 +75,7 @@ test('external mode connects to the bridge WITHOUT a host /connect spawn', async
 
   //    …and re-apply it AFTER mount. The pre-mount write above is clobbered when
   //    the panel registers its own settings during mount: reading it back at that
-  //    point returned the DEFAULT `ws://127.0.0.1:9180`, which is exactly what this
+  //    point returned the DEFAULT `ws://127.0.0.1:9199`, which is exactly what this
   //    spec was dialling. Auto-connect was removed in (1), so the panel sits idle
   //    here and this write lands before the only connect attempt.
   await panel.page.evaluate(([id, u]) => {

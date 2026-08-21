@@ -69,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "桥接地址（高级）",
-    "tooltip": "面板编排器桥接的 WebSocket 地址 —— 现在一个桥接服务于所有服务商（默认 ws://127.0.0.1:9180）。只有当你在非默认端口（ COMFYUI_MCP_BRIDGE_PORT ）上启动编排器时才需要修改。下次连接时生效。"
+    "tooltip": "面板编排器桥接的 WebSocket 地址 —— 现在一个桥接服务于所有服务商（默认 ws://127.0.0.1:9199）。只有当你在非默认端口（ COMFYUI_MCP_BRIDGE_PORT ）上启动编排器时才需要修改。下次连接时生效。"
   },
   "comfyui-mcp_zoomToAction": {
     "name": "缩放到智能体的改动",

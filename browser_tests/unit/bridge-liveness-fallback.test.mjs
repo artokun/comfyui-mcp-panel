@@ -98,7 +98,7 @@ test("#1136 WIRING: the fallback runs where liveness is already known", () => {
   );
   const at = src.indexOf("function showExternalHintOnce()");
   assert.ok(at > 0, "showExternalHintOnce must exist");
-  const body = src.slice(at, at + 1800);
+  const body = src.slice(at, at + 2800);
   // It runs precisely because the dial failed — no separate liveness probe needed.
   assert.match(body, /bridgeFallbackPlan\(\{/);
   // The fallback must NOT persist: setUrl saves the URL as the bridge default unless
@@ -114,7 +114,7 @@ test("#1136 WIRING: the 'nobody is listening' hint waits for the fallback to fai
   // the same over-claim class as the bug: reporting a conclusion before it is earned.
   const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
   const at = src.indexOf("function showExternalHintOnce()");
-  const body = src.slice(at, at + 1800);
+  const body = src.slice(at, at + 2800);
   const planAt = body.indexOf("bridgeFallbackPlan({");
   const latchAt = body.indexOf("externalHintShown = true;");
   assert.ok(planAt > -1 && latchAt > -1);
@@ -135,9 +135,10 @@ test("#1136 the notice's promise matches what the code does", () => {
 test("#1136 WIRING: the refuted provenance rule is gone", () => {
   const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
   assert.equal((src.match(/isManualBridgeOverride/g) ?? []).length, 0);
-  // and the original override rule is restored untouched at BOTH sites
+  // A saved 9180 is the old compiled default, not a pin — both override sites
+  // use isDefaultBridgeUrl so it migrates rather than locking the tab to 9180.
   const rule =
-    src.match(/!!wanted && wanted !== defaultBridgeUrlFor\(selectedBackend\) && wanted !== lastAutoUrl/g) ??
+    src.match(/!!wanted && !isDefaultBridgeUrl\(wanted\) && wanted !== lastAutoUrl/g) ??
     [];
-  assert.equal(rule.length, 2, "both override sites keep the original rule");
+  assert.equal(rule.length, 2, "both override sites treat 9180 as default, not a pin");
 });

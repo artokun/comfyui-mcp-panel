@@ -69,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "브리지 URL (고급)",
-    "tooltip": "패널 오케스트레이터 브리지의 WebSocket 주소입니다 — 이제 하나의 브리지가 모든 제공자를 담당합니다(기본값 ws://127.0.0.1:9180). 오케스트레이터를 기본이 아닌 포트(COMFYUI_MCP_BRIDGE_PORT)에서 실행할 때만 바꾸세요. 다음 연결부터 적용됩니다."
+    "tooltip": "패널 오케스트레이터 브리지의 WebSocket 주소입니다 — 이제 하나의 브리지가 모든 제공자를 담당합니다(기본값 ws://127.0.0.1:9199). 오케스트레이터를 기본이 아닌 포트(COMFYUI_MCP_BRIDGE_PORT)에서 실행할 때만 바꾸세요. 다음 연결부터 적용됩니다."
   },
   "comfyui-mcp_zoomToAction": {
     "name": "에이전트 편집에 맞춰 확대",
