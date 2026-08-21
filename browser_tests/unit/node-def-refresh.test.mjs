@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
-import { fetchWholeObjectInfo } from "../../web/js/lib/object-info-oracle.js";
+import { fetchWholeObjectInfo, TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
 
 // #1180 — READ from the panel, never restated. Shared with the other harnesses that
 // rebuild shipped functions, so one copy of a constant cannot drift from another.
@@ -27,6 +27,7 @@ import {
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
   NODE_DEFS_RUN_BUDGET_MS,
+  REFRESH_NODES_RUN_BUDGET_MS,
   REFRESH_NODES_EXECUTOR_DEPS,
   monotonicNow,
   nodeDefsBudgetLeft,
@@ -448,6 +449,10 @@ function buildRegisterComfyNodeDefs({
     // body throws ReferenceError without them.
     "objectInfoSnapshot",
     "backendReconnectEpoch",
+    // #1562 — the oracle's per-route OUTCOME vocabulary. The fetch phase reads route 2's
+    // ending from the TAG rather than from its sentence (#1223), so the extracted body
+    // throws ReferenceError without it.
+    "TRANSPORT_OUTCOME",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
      // gets its own stub without threading a helper through every call.
      const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
@@ -501,6 +506,7 @@ function buildRegisterComfyNodeDefs({
     // re-records only a payload it fetched itself.
     snapshotSpy,
     7,
+    TRANSPORT_OUTCOME,
   );
 }
 
@@ -1790,4 +1796,195 @@ test("#608: the no-payload guard is keyed on defsObtained, not on the phase name
   });
   assert.equal(fetchFailed.reason, "object_info_fetch_failed");
   assert.match(fetchFailed.detail, /Failed to fetch/);
+});
+
+// ---------------------------------------------------------------------------
+// #1562 — an ABANDONED route is not a FAILED one, and the remedy must not confuse them.
+//
+// The reporter's `GET /object_info` returned 25,104,088 bytes in 20.84 s from a ComfyUI
+// that was up throughout, while this verdict told them to "check that the ComfyUI server
+// process is still running". Every route had been abandoned at its bound; not one of them
+// had failed. These drive the SHIPPED run — the real oracle on injected timers — because
+// the distinction is made inside the fetch phase from the oracle's TAGS, and a test of
+// `describeNodeDefRefresh` alone cannot see whether the panel computes the input correctly.
+// ---------------------------------------------------------------------------
+
+/** Run the shipped register with the real oracle on virtual timers, and settle it. */
+async function runWithHangingRoutes(apiValue) {
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue,
+    timers,
+    fetchWholeObjectInfo: (opts) => fetchWholeObjectInfo({ ...opts, timers }),
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks(300);
+  for (let i = 0; i < 8; i += 1) {
+    timers.fireAll();
+    await drainMicrotasks(200);
+  }
+  return orFail(running, "the run never settled");
+}
+
+test("#1562: BOTH whole-document routes abandoned at their bound is not reported as a dead server", async () => {
+  const verdict = await runWithHangingRoutes({
+    getNodeDefs: () => new Promise(() => {}), // bounded → abandoned, never failed
+    fetchApi: () => new Promise(() => {}), // the oracle's NO_ANSWER, same shape
+  });
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.doesNotMatch(
+    verdict.remedy,
+    /check that the ComfyUI server process is still running/,
+    "nothing here established that the server is down — both routes merely ran out of time",
+  );
+  assert.match(verdict.remedy, /ABANDONED AT ITS BOUND/);
+  assert.match(verdict.remedy, /plain retry meets the same bound/);
+  assert.match(verdict.remedy, /Tried 2 routes/, "…and #608's evidence clause survives");
+});
+
+test("#1562: a route that genuinely FAILED outranks the other's silence", async () => {
+  // Route 1 fails for real while route 2 is merely slow. That IS evidence about the
+  // server, so the old remedy is the right one and the new branch must not fire.
+  const verdict = await runWithHangingRoutes({
+    getNodeDefs: async () => {
+      throw new TypeError("Failed to fetch");
+    },
+    fetchApi: () => new Promise(() => {}),
+  });
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(verdict.remedy, /check that the ComfyUI server process is still running/);
+  assert.doesNotMatch(verdict.remedy, /ABANDONED AT ITS BOUND/);
+});
+
+test("#1562: a route that ANSWERED unusably outranks the other's silence too", async () => {
+  // Route 1 is abandoned, route 2 answers 500. A server that answers is a server that is
+  // up, but it did not answer THIS question — and "answered badly" is not "ran out of
+  // time", so the abandonment finding must not be claimed.
+  const verdict = await runWithHangingRoutes({
+    getNodeDefs: () => new Promise(() => {}),
+    fetchApi: async () => ({ ok: false, status: 500, json: async () => ({}) }),
+  });
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.doesNotMatch(verdict.remedy, /ABANDONED AT ITS BOUND/);
+  assert.match(verdict.remedy, /GET \/object_info was not OK \(status 500\)/);
+});
+
+test("#1562: a real failure EARLIER in route 1's retry loop outranks the stall that ended it", async () => {
+  // THE SEQUENCE A POST-RESTART REFRESH ACTUALLY MEETS, and the one the first version of
+  // this branch got wrong. ComfyUI is genuinely down when attempt 1 runs (`Failed to
+  // fetch`, connection refused); by the retry it has bound the port but is still importing
+  // packs, so attempt 2 stalls past its bound and the loop ends with BOTH flags set —
+  // `sawRealError` AND `lastAttemptTimedOut`. The loop already ranks these ("A REAL ERROR
+  // OUTRANKS A SYNTHESIZED TIMEOUT": it rethrows `lastRealError`, not the stall), and the
+  // classification has to rank them the same way. Reading that ending as an abandonment
+  // produced a verdict headed "none of them FAILED" whose own evidence clause read
+  // "api.getNodeDefs() failed: Failed to fetch", and told a reader whose backend was still
+  // booting that a plain retry would not help — which is the one thing that does help there.
+  let attempt = 0;
+  const verdict = await runWithHangingRoutes({
+    getNodeDefs: async () => {
+      attempt += 1;
+      if (attempt === 1) throw new TypeError("Failed to fetch");
+      return new Promise(() => {}); // bounded → NODE_DEFS_NO_ANSWER on the retry
+    },
+    fetchApi: () => new Promise(() => {}), // route 2 merely stalls
+  });
+  assert.ok(attempt >= 2, `the retry loop must have run twice for this to be the case under test (ran ${attempt})`);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(
+    verdict.remedy,
+    /check that the ComfyUI server process is still running/,
+    "route 1 FAILED for real before it stalled, so the remedy that names a possibly-down " +
+      "server is the correct one — and a plain retry is what fixes a booting backend",
+  );
+  assert.doesNotMatch(
+    verdict.remedy,
+    /ABANDONED AT ITS BOUND/,
+    "a route that failed and then stalled did not merely run out of time",
+  );
+  // The self-contradiction this guards: the heading and the evidence clause disagreeing.
+  assert.match(verdict.remedy, /Failed to fetch/, "#608's evidence clause still names what route 1 did");
+});
+
+// ---------------------------------------------------------------------------
+// #1562 round 2 — THE LARGER BUDGET IS THE FETCH PHASE'S, NOT THE WHOLE RUN'S.
+//
+// `panel_refresh_nodes` hands the run 37,500 ms so the whole `/object_info` can land, and
+// this phase's bound is `what is left of the run`. Uncapped, that lets a run whose fetch was
+// FAST and whose `refreshComboInNodes()` merely hangs live for 37.5 s — past the 25 s JOIN
+// its own command holds — so a `panel_refresh_nodes` that used to answer `refreshed:true`
+// (with #1193's `combo_refresh_confirmed:false` disclosure) answers `refresh_still_running`
+// instead. A case that worked, broken by the fix for a case that did not.
+// ---------------------------------------------------------------------------
+
+/** Run with a STATED run budget and a combo call that never answers. */
+async function runWithStatedBudgetAndHangingCombo({ sweep }) {
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: APP_WITH_GRAPH, // its refreshComboInNodes() never settles
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) }, // a FAST fetch
+    timers,
+    reapplyDefsToLiveNodes: sweep,
+  });
+  const running = registerComfyNodeDefs(undefined, { runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS });
+  await drainMicrotasks();
+  timers.fireAll();
+  return orFail(running, "the combo phase never gave up");
+}
+
+test("#1562: a stated run budget does NOT extend the combo phase past a run's default allowance", async () => {
+  const verdict = await runWithStatedBudgetAndHangingCombo({ sweep: sweepThatStopsPartWay() });
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  const bound = Number(verdict.detail.match(/did not answer within the (\d+)ms/)?.[1]);
+  assert.ok(Number.isFinite(bound), `the refusal must still name its bound: ${verdict.detail}`);
+  assert.ok(
+    bound <= NODE_DEFS_RUN_BUDGET_MS,
+    `the combo phase was given ${bound}ms out of a stated ${REFRESH_NODES_RUN_BUDGET_MS}ms run. ` +
+      `It may never exceed ${NODE_DEFS_RUN_BUDGET_MS}ms — the whole allowance a run had before a ` +
+      "caller could state one — because this phase's bound decides how long the RUN lives, and a " +
+      "run that outlives its command's 25s join turns a refreshed:true into refresh_still_running",
+  );
+});
+
+test("#1562: the abandoned-combo refusal names the run's OWN budget, not the default constant", async () => {
+  const verdict = await runWithStatedBudgetAndHangingCombo({ sweep: sweepThatStopsPartWay() });
+  assert.match(
+    verdict.detail,
+    new RegExp(`${REFRESH_NODES_RUN_BUDGET_MS}ms budget`),
+    "the sentence quotes the budget THIS run was given; quoting the default produced an " +
+      "arithmetically impossible refusal — \"the 37500ms this refresh had left of its 9000ms budget\"",
+  );
+  assert.doesNotMatch(
+    verdict.detail,
+    new RegExp(`left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget`),
+    "…and it must not describe a 37,500ms run as a 9,000ms one",
+  );
+  // The three cases stay distinguishable (#1193's requirement): starved by a slow fetch,
+  // handed the whole budget and hung anyway, and — new — holding the phase ceiling while the
+  // run still had time. Only the third says "capped".
+  assert.match(verdict.detail, /capped at \(this refresh had \d+ms left of its \d+ms budget\)/);
+});
+
+test("#1562: a caller that states NO budget keeps the combo phase's wording byte-identical", async () => {
+  // The `Math.min` must be a no-op for every existing caller: what is left of a 9,000ms run
+  // is never more than 9,000ms, so nothing about the default path may read differently.
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: APP_WITH_GRAPH,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    timers,
+    reapplyDefsToLiveNodes: sweepThatStopsPartWay(),
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  timers.fireAll();
+  const verdict = await orFail(running, "the combo phase never gave up");
+  assert.match(
+    verdict.detail,
+    new RegExp(`did not answer within the \\d+ms this refresh had left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget`),
+    "the pre-existing sentence, unchanged — the cap never bites on a default run",
+  );
+  assert.doesNotMatch(verdict.detail, /capped/);
 });

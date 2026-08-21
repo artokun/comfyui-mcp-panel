@@ -82,6 +82,12 @@ function detailSuffix(thrown) {
  *                              // running" was printed on the evidence of one route, and
  *                              // the reported install had a healthy server answering a
  *                              // different transport at that same moment.
+ *   fetchAbandonedAtBound?: boolean|null, // #1562 — EVERY whole-document route ended by
+ *                              // being ABANDONED AT ITS BOUND rather than by failing. The
+ *                              // caller decides this from the oracle's per-route TAGS and
+ *                              // its own timeout flag, never from the failure prose
+ *                              // (#1223). null = no whole-document route was reached, so
+ *                              // neither answer is claimed.
  * }} o
  * @returns {{ refreshed: boolean, reason: string, remedy?: string, detail?: string }}
  */
@@ -97,6 +103,7 @@ export function describeNodeDefRefresh({
   didThrow,
   thrown = null,
   fetchRouteFailures = null,
+  fetchAbandonedAtBound = null,
 } = {}) {
   // Backstop for a caller that predates didThrow: a truthy caught value implies it.
   const failed = didThrow === true || !!thrown;
@@ -177,9 +184,34 @@ export function describeNodeDefRefresh({
     const remedy = noPayload
       ? noPayloadRemedy
       : reason === NODE_DEF_REFRESH_REASONS.OBJECT_INFO_FETCH_FAILED
-        ? "The /object_info fetch failed on every transport this panel has, so nothing was " +
-          "refreshed. The backend may still be restarting — retry once it answers, and if it " +
-          "never does, check that the ComfyUI server process is still running." +
+        ? // #1562 — SAY WHICH OF THE TWO THIS WAS, because their remedies are opposite.
+          //
+          // Every route being ABANDONED AT ITS BOUND is not evidence that the server is
+          // down; it is evidence that nothing arrived in the time this command had. The
+          // reporter's `/object_info` returned 25,104,088 bytes in 20.84 s from a server
+          // that was up the whole time, while this text sent them to check whether the
+          // process was still running — a remedy for a cause that was never established,
+          // which is the same defect #982 recorded and #608 narrowed.
+          //
+          // It also must not promise that a plain retry helps. A document that does not fit
+          // the window will not fit the next one either, so the steps named are the ones
+          // that change the size of the question or the size of the window.
+          //
+          // `=== true` deliberately: `null` means no whole-document route was reached at
+          // all, and an unestablished fact must fall to the wording that claims less about
+          // this particular run rather than to the one that claims more.
+          (fetchAbandonedAtBound === true
+            ? "No /object_info answered inside the time this command had — every transport was " +
+              "ABANDONED AT ITS BOUND and none of them FAILED, so this is NOT evidence that the " +
+              "ComfyUI server is down; it may have been answering the whole time, just not fast " +
+              "enough. Nothing was refreshed. A plain retry meets the same bound unless the " +
+              "backend got faster: on a very large install the whole node-definition document " +
+              "can take longer to deliver than one command may wait. Reload the ComfyUI tab — " +
+              "its page load fetches the schema under no such bound — or reduce the installed " +
+              "pack count."
+            : "The /object_info fetch failed on every transport this panel has, so nothing was " +
+              "refreshed. The backend may still be restarting — retry once it answers, and if it " +
+              "never does, check that the ComfyUI server process is still running.") +
           // #608 — the routes, appended rather than folded into the sentence above: which
           // ones were tried is EVIDENCE, and it is what separates "one client call did not
           // answer" (where the server is usually fine, and was) from "nothing answers".

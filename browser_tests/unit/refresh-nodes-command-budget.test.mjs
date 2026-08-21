@@ -323,9 +323,15 @@ test("#1404: the shipped call site passes the budget — the helper alone cannot
   // whole of #1404 was that this one call site never passed it. A behavioural test drives the
   // extracted body, so it already covers the wiring — this is the same fact asserted where a
   // reviewer reading the diff will look for it, on the SOURCE.
+  // #1562 — the same shape, now with the RUN allowance beside the JOIN. The two are
+  // different quantities and both belong here: `joinMs` is how long this command WAITS,
+  // `runBudgetMs` is how long the run it starts may SPEND, and a run that gives up first
+  // makes the retryable `refresh_still_running` verdict below unreachable. The comment
+  // between them is skipped by `[\s\S]*?`, deliberately — pinning prose is not the point —
+  // but BOTH options are required by name.
   assert.match(
     refreshNodesMatch[0],
-    /refreshComfyNodeDefs\(undefined, \{\s*force: true,\s*joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,\s*\}\)/,
-    "refresh_nodes must bound its own wait on the coalescer",
+    /refreshComfyNodeDefs\(undefined, \{[\s\S]*?force: true,[\s\S]*?joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,[\s\S]*?runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS,\s*\}\)/,
+    "refresh_nodes must bound its own wait on the coalescer AND state the run's allowance",
   );
 });
