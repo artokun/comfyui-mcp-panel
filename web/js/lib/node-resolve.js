@@ -268,6 +268,37 @@ export function isAuthorizedFrontendOnlyType(registry, type, node) {
  * BEFORE the frontend-only exemption. `wasTypeEverDefined` is injected by the panel
  * and itself fails closed while the session baseline is unseeded.
  */
+/**
+ * mcp#2000 — THE FRONTEND-ONLY EXEMPTION AS APPLIED ON THE UNAVAILABLE-/object_info PATH,
+ * in ONE place for all three guards that need it. The clauses are identical to the ones
+ * each guard applies when /object_info WAS fetched, and neither reads the fetched defs:
+ * the ever-seen gate reads the session-history oracle (a timeout leaves it intact) and
+ * isAuthorizedFrontendOnlyType reads the live registry. A frontend-only type is absent
+ * from /object_info BY DESIGN, so a fetch that did not answer withheld nothing about it.
+ *
+ * WHY IT SWALLOWS: before mcp#2000 these guards threw their refusal WITHOUT consulting
+ * anything, so nothing on that path could raise. Consulting two predicates first means a
+ * hostile registry (a Proxy whose membership trap throws) or an oracle that raises would
+ * surface a RAW error in place of the worded refusal — the change making something worse
+ * that it did not have to. Measured, not theorised: all three guards leaked
+ * "registry exploded" / "history oracle exploded" before this wrapper existed.
+ * Any doubt returns false, which refuses — the #458 default, and the same idiom this file
+ * already uses for readImportFailures and describeObjectInfoFailure ("a diagnostic that
+ * throws must not replace the refusal it explains").
+ *
+ * One copy, three call sites, deliberately: three inline copies is the #496 drift.
+ */
+function frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined) {
+  try {
+    return (
+      backendHistoryVerdict(type, wasTypeEverDefined) === "never-seen" &&
+      isAuthorizedFrontendOnlyType(registry, type, node)
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function isRemovedBackendType(type, wasTypeEverDefined) {
   return backendHistoryVerdict(type, wasTypeEverDefined) === "removed";
 }
@@ -431,12 +462,7 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
     // clause reads `freshDefs`, and for a frontend-only type a successful fetch would
     // have said nothing about it anyway. Kept in step with the two sibling guards
     // deliberately — one copy relaxed alone is the #496 drift all over again.
-    if (
-      backendHistoryVerdict(type, wasTypeEverDefined) === "never-seen" &&
-      isAuthorizedFrontendOnlyType(registry, type, node)
-    ) {
-      return;
-    }
+    if (frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined)) return;
     throw new Error(
       `Cannot set widget on node ${id}${label}: cannot verify the ${role} node against the ` +
         `ComfyUI backend (object_info is unavailable). Refusing to write rather than trust a ` +
@@ -620,10 +646,7 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       // "function"` clause: an unwired oracle classifies as "no-oracle", never
       // "never-seen". Spelling that clause out as well passed every test with it
       // deleted, so it is left out rather than kept as an untestable reassurance.
-      if (
-        backendHistoryVerdict(class_type, wasTypeEverDefined) === "never-seen" &&
-        isAuthorizedFrontendOnlyType(readRegistry(), class_type)
-      ) {
+      if (frontendOnlyExemptionApplies(readRegistry(), class_type, undefined, wasTypeEverDefined)) {
         return;
       }
       throw new Error(
@@ -859,12 +882,7 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
     // is placed after `describeObjectInfoFailure` deliberately: that oracle only builds
     // a diagnostic string, so an exempted write costs it nothing that matters and the
     // refusal it explains still reads identically for every type that is refused.
-    if (
-      backendHistoryVerdict(type, wasTypeEverDefined) === "never-seen" &&
-      isAuthorizedFrontendOnlyType(registry, type, node)
-    ) {
-      return;
-    }
+    if (frontendOnlyExemptionApplies(registry, type, node, wasTypeEverDefined)) return;
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: cannot verify the node type against the ` +
         `ComfyUI backend — no usable /object_info schema was obtained.${observed} ` +

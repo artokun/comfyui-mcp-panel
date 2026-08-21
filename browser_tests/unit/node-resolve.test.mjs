@@ -1146,6 +1146,71 @@ test("mcp#2000 add_node: object_info UNAVAILABLE still fails closed for everythi
   );
 });
 
+test("mcp#2000: an exemption that THROWS must not replace the refusal it was checking", async () => {
+  // Found by running the review taxonomy against my OWN diff (class 5: what does the
+  // change make WORSE?). Before mcp#2000 these guards threw their refusal WITHOUT
+  // consulting anything, so nothing on this path could raise. Consulting two predicates
+  // first meant a hostile registry or a raising oracle surfaced a RAW error instead of
+  // the worded refusal — measured leaking "registry exploded" / "history oracle exploded"
+  // from all three guards before the shared helper swallowed it. Any doubt REFUSES.
+  const ctor = function MarkdownNoteNative() {};
+  const reg = registryWithNatives();
+  const node = { id: 1, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  const BOOM = () => {
+    throw new Error("history oracle exploded");
+  };
+  // A registry whose membership probe throws — the realistic shape is a Proxy.
+  const hostileReg = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor() {
+        throw new Error("registry exploded");
+      },
+      has() {
+        throw new Error("registry exploded");
+      },
+      get() {
+        throw new Error("registry exploded");
+      },
+    },
+  );
+  const isWorded = (err) => {
+    assert.match(err.message, /cannot verify|object_info is unavailable|no usable/i);
+    assert.doesNotMatch(err.message, /exploded/, "the raw error must not reach the caller");
+    return true;
+  };
+
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", {
+        getFreshObjectInfo: async () => null,
+        refresh: async () => {},
+        wasTypeEverDefined: BOOM,
+      }),
+    isWorded,
+  );
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => hostileReg, "MarkdownNote", {
+        getFreshObjectInfo: async () => null,
+        refresh: async () => {},
+        wasTypeEverDefined: () => false,
+      }),
+    isWorded,
+  );
+  assert.throws(
+    () => assertTypeAgainstFreshBackend(null, "MarkdownNote", 1, { registry: reg, node, wasTypeEverDefined: BOOM }),
+    isWorded,
+  );
+  assert.throws(() => assertMutatedNodeAuthorized(null, reg, node, "target", BOOM), isWorded);
+
+  // CONTROL: swallowing must not have swallowed the exemption itself.
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+  );
+  void ctor;
+});
+
 // ---- mcp#2000 PARITY: the SAME relaxation in the two set_widget guards. All three
 //      /object_info-oracle guards had the identical `!freshDefs` early throw, so fixing
 //      only add_node would have shipped HALF the documented annotation path — the note
