@@ -221,12 +221,34 @@ const UNENUMERABLE_PREFIX =
  */
 export function comboOffers(options, value) {
   if (!Array.isArray(options)) return false;
-  // Deliberately NOT a coercing compare. See the doc block above: `"10"` and `10`
-  // are different values to the server, and only strict equality reproduces that.
-  // JS `===` already matches Python `==` for the two types that occur in a live
-  // option list (string 2630, number 44 — measured; no booleans exist, so Python's
-  // `True == 1` quirk has nothing to model here).
-  return options.some((o) => o === value);
+  return options.some((o) => serverConsidersEqual(o, value));
+}
+
+/**
+ * Python `==` for the primitive types a combo can carry, because that is the operator
+ * `val not in combo_options` actually runs. Two rules, both measured against this
+ * machine's ComfyUI 0.33.2 interpreter rather than inferred:
+ *
+ *   - a string NEVER equals a number or a boolean — `"10" == 10` is False, and that
+ *     is what makes a stringified value a real defect rather than a spelling (#14641);
+ *   - a BOOLEAN equals a number when it equals it numerically, because `bool` is a
+ *     subclass of `int`: `True == 1` and `False == 0` are both True.
+ *
+ * The second rule is the one that keeps the boolean fix from becoming a false positive:
+ *
+ *     True  in [False]      -> False   (report)      True  in [1, 2]  -> True  (clean)
+ *     False in [False]      -> True    (clean)       False in [1, 2]  -> False (report)
+ *     True  in [True,False] -> True    (clean)       False in [0, 1]  -> True  (clean)
+ *
+ * A bare `===` would call `true` unavailable on options `[1, 2]`, which the server
+ * accepts. JS has one number type, so `10 == 10.0` needs nothing extra.
+ */
+function serverConsidersEqual(option, value) {
+  if (option === value) return true;
+  // bool <-> number only. Never string <-> anything.
+  const a = typeof option === "boolean" ? (option ? 1 : 0) : option;
+  const b = typeof value === "boolean" ? (value ? 1 : 0) : value;
+  return typeof a === "number" && typeof b === "number" && a === b;
 }
 
 export async function scanComboAvailability(
@@ -409,9 +431,18 @@ export async function scanComboAvailability(
       // also teaching it to JUDGE numeric values left the seam open on the far side.
       // A false NEGATIVE on get_errors is the failure this tool exists to prevent.
       //
+      // Gate round 2 (codex P1) extended this to BOOLEANS for the same reason: with
+      // `options: [false]` and a widget holding `true`, the server rejects and the scan
+      // was returning clean. Judging them requires the bool/int rule in `comboOffers` —
+      // without it `true` on options `[1, 2]` would be reported, and the server ACCEPTS
+      // that. No live combo declares boolean options (measured: string 2630, number 44,
+      // boolean 0), so this closes the shape rather than a sighting.
+      //
       // Still skipped: `null`/`undefined`, an empty string, and any object. `0` and
       // `false` are real combo values and must NOT be dropped by a truthiness test.
-      if (typeof value !== "string" && typeof value !== "number") continue;
+      if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+        continue;
+      }
       if (value === "") continue;
       if (comboOffers(options, value)) continue;
       // #1357 — before calling it missing, check whether this combo could have
