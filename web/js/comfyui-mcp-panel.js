@@ -225,6 +225,9 @@ import {
 import {
   findRepeatingControlWidgets,
   scopedBatchSeedNote,
+  driveControlHooksAcrossScopedBatch,
+  nodesInPartialExecutionScope,
+  scopedBatchDriveNote,
   findRgthreeSeedNodes,
   rgthreeFixedSeedNote,
   repeatingRgthreeSeeds,
@@ -16113,6 +16116,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // Resolution is read-only, so moving it ahead changes nothing it does; it only changes
     // which refusal answers first, and "node N was not found" is the better answer to a
     // request naming node N than a report about some other node's pack.
+    // #1998 (gate P1-1) — the pre-flight's serialization, kept so the scope closure can
+    // be computed from the SAME compilation. A second `app.graphToPrompt()` would describe
+    // a graph that may have moved and is not read-only (#985). Null whenever the pre-flight
+    // did not produce one, which the closure treats as "scope unprovable".
+    let preflightPrompt = null;
     let partialTargets;
     // #699 — carried out of the resolve block so the queue-rejection summary can
     // explain a `prompt_no_outputs` refusal of a target the panel already verified
@@ -16203,6 +16211,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // the pre-flight catch as a throw, exactly as the bare await delivered it.
       if ("error" in preflightBuild) throw preflightBuild.error;
       const built = preflightBuild.value;
+      preflightPrompt = built;
       // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
       // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a
       // result that does not exist has no unrunnable entries in it — and the check below
@@ -16393,6 +16402,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // FIXED rgthree seed is submitted verbatim for every item whether the run is scoped or
     // not. Gating it the same way would have kept it invisible for exactly the unscoped
     // batch a user reaches for when they want ten different images.
+    // #1998 - what the driven control widgets ACTUALLY did across a scoped batch.
+    // Null when no scoped batch ran, so the #988 warning stays in charge of that case.
+    let controlDriveObservations = null;
     let rgthreeSeeds = [];
     if (batch > 1) {
       try {
@@ -16465,21 +16477,105 @@ const GRAPH_TOOL_EXECUTORS = {
       // drive (#556). It marks every one of this run's posts with a queue
       // position sentinel and tags the pending queue item, so a scoped run
       // can never be confused with unrelated queue traffic.
-      runScopeResult = await dispatchScopedRun({
-        app,
-        apiTarget: api,
-        execIds: partialTargets,
-        batch,
-        toNodeId: to_node_id,
-        // #1565 — THE WHOLE FIX IS THIS ONE ARGUMENT reaching the dispatch. Without it
-        // dispatchScopedRun keeps its per-attempt clocks (4 × 5,000 ms = the entire
-        // 20,000 ms relay window) and its unbounded `await app.queuePrompt`, so the
-        // command cannot answer OR refuse inside the window its reply is relayed in.
-        budget,
-        onRejection: captureRejection,
-        onPromptId: capturePromptId,
-        onAcceptedNodeErrors: captureAcceptedNodeErrors,
-      });
+      // #1998 - a SCOPED batch of more than one would submit N byte-identical
+      // prompts. ComfyUI refuses to advance control_after_generate on a PARTIAL
+      // execution (ComfyUI_frontend #8774: `if (params.isPartialExecution) return
+      // undefined`), so every item after the first is a cache hit that returns the
+      // FIRST output file - and panel_run reported N successes for one render.
+      //
+      // Separating the dispatches does not help: MEASURED on frontend 1.49.6, four
+      // separate `queuePrompt(0, 1, scope)` calls posted the same seed four times,
+      // exactly like one `queuePrompt(0, 4, scope)`. The refusal keys on the scope,
+      // not on the batch position. So the ONE thing that can vary the value is the
+      // flag, and that is the only thing this changes: the control widgets' OWN
+      // hooks run with `isPartialExecution: false` and ComfyUI computes every value
+      // itself - which is why `fixed` still repeats (its own `mode === "fixed"`
+      // returns undefined) and increment/decrement need no panel arithmetic.
+      //
+      // ONLY for batch > 1. A single scoped preview keeps #8774's behaviour exactly:
+      // the user iterating on one branch does not want their seed churned.
+      //
+      // SCOPED TO THE RUN, not to the workflow (gate P1-1). Arming every node advanced
+      // controls on branches this run never executes — MEASURED: a batch scoped to node 9
+      // walked an unrelated KSampler's seed 808000 -> 808004 and reported it as advanced.
+      // That is a silent wrong-target mutation, and it contradicts the very reason for
+      // overriding #8774: the user asked for N renders OF THE SCOPE THEY NAMED.
+      //
+      // `nodesInPartialExecutionScope` returns null when the scope cannot be PROVEN, and
+      // null arms nothing: the batch then repeats exactly as ComfyUI ships it and #988's
+      // warning stands (see the skip below). Never an approximation of the node set.
+      let controlDrive = null;
+      try {
+        const inScope =
+          batch > 1 ? nodesInPartialExecutionScope(rootGraph, preflightPrompt, partialTargets) : [];
+        // `batchCount` is what lets the drive PROVE the hook calls it observed were its
+        // own: owning the batch means exactly 2 x batchCount invocations. Without it the
+        // drive attributes nothing, which is the fail-closed default (gate r2 P1-A).
+        controlDrive = driveControlHooksAcrossScopedBatch(inScope ?? [], { batchCount: batch });
+      } catch {
+        controlDrive = null; /* the run must survive a failure to arm the drive */
+      }
+      try {
+        runScopeResult = await dispatchScopedRun({
+          app,
+          apiTarget: api,
+          execIds: partialTargets,
+          batch,
+          toNodeId: to_node_id,
+          // #1565 - THE WHOLE FIX IS THIS ONE ARGUMENT reaching the dispatch. Without it
+          // dispatchScopedRun keeps its per-attempt clocks (4 x 5,000 ms = the entire
+          // 20,000 ms relay window) and its unbounded `await app.queuePrompt`, so the
+          // command cannot answer OR refuse inside the window its reply is relayed in.
+          budget,
+          onRejection: captureRejection,
+          onPromptId: capturePromptId,
+          onAcceptedNodeErrors: captureAcceptedNodeErrors,
+        });
+      } finally {
+        // ALWAYS, on every exit including a throw. A hook left wrapped would keep
+        // advancing controls on the user's later single scoped previews.
+        //
+        // #1565 sharpens the deferred-dispatch caveat rather than creating it: the
+        // budget makes dispatchScopedRun RETURN sooner, so a frontend that defers its
+        // post past the budget runs those items with the original hooks and repeats.
+        // That degrades to the pre-#1998 behaviour, and `observe()` reports
+        // `advanced: false` for it - the note then warns instead of claiming a fix.
+        try {
+          controlDrive?.restore();
+        } catch {}
+      }
+      try {
+        controlDriveObservations = controlDrive ? controlDrive.observe() : null;
+      } catch {
+        controlDriveObservations = null;
+      }
+      // #988 x #1998 (gate P1-2, narrowed by gate r2 P1-A) - SUBTRACT ONLY WHAT THE DRIVE
+      // CAN PROVE IT OWNED.
+      //
+      // The suppression first keyed on `controlDriveObservations` being non-null, and an
+      // empty array is non-null: a control the drive could not arm submitted identical
+      // prompts while the reply carried NEITHER the drive note NOR the warning (MEASURED:
+      // four posts of seed 707000 with `repeating_controls_note` absent). Keying it on
+      // "armed" fixed that but was still too generous - an armed control whose hook calls
+      // came from somewhere else was subtracted on the strength of another run's work. So
+      // the skip is now the ATTRIBUTED set: armed AND with exactly this batch's own
+      // invocation count behind it.
+      //
+      // RUN AFTER THE DISPATCH, and that is safe here even though #988's finding is
+      // deliberately a pre-dispatch one: this scan reads control MODES and node identity,
+      // and the drive mutates neither - it moves the GOVERNED value widget. The entries it
+      // produces are therefore the same before and after, which is pinned by a test.
+      try {
+        const attributed = controlDrive?.attributedWidgets?.() ?? null;
+        if (attributed?.size) {
+          repeatingControls = findRepeatingControlWidgets(
+            collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []),
+            { skip: attributed },
+          );
+        }
+      } catch {
+        /* keep the unfiltered scan - over-warning is the safe direction here */
+      }
     }
     // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
     // BEFORE the rejection check. With batch>1, app.queuePrompt breaks its loop on
@@ -16678,7 +16774,20 @@ const GRAPH_TOOL_EXECUTORS = {
       // #1504 — outputs ComfyUI dropped from the prompt it queued.
       droppedOutputs: acceptedNodeErrors,
     });
-    // #988 — attach the PRE-dispatch finding.
+    // #1998 — when the scoped batch was DRIVEN, report what the controls actually did
+    // and do NOT also ship #988's "this batch WILL reuse the same values": that sentence
+    // is what the drive stops being true, and two contradictory statements in one result
+    // is worse than either alone. The #988 note stays in charge whenever the drive did
+    // not run (arming threw, or a frontend with no hooks to wrap).
+    const driveNote = scopedBatchDriveNote(controlDriveObservations, batch);
+    if (driveNote) {
+      accept.batch_controls = controlDriveObservations;
+      accept.batch_controls_note = driveNote;
+    }
+    // #988 — attach the PRE-dispatch finding, now covering exactly the controls the drive
+    // did NOT arm (gate P1-2). The subtraction happens at the arming site, before dispatch,
+    // so this keeps #988's "computed BEFORE dispatch" property; what changed is that an
+    // unarmed control keeps its warning instead of being silenced by an unrelated one.
     const repeatingNote = scopedBatchSeedNote(repeatingControls, batch);
     if (repeatingNote) {
       accept.repeating_controls = repeatingControls;

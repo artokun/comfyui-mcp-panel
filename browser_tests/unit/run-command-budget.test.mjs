@@ -56,6 +56,8 @@ import {
   findRgthreeSeedNodes,
   repeatingRgthreeSeeds,
   scopedBatchSeedNote,
+  driveControlHooksAcrossScopedBatch,
+  scopedBatchDriveNote,
   rgthreeFixedSeedNote,
 } from "../../web/js/lib/scoped-batch-seed.js";
 import { collectVirtualSourceFeeds, virtualSourceNote } from "../../web/js/lib/virtual-source-promotion.js";
@@ -439,6 +441,11 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch }) {
     findRgthreeSeedNodes,
     repeatingRgthreeSeeds,
     scopedBatchSeedNote,
+    // mcp#1998 — graph_run now also drives the frontend's control hooks across a scoped
+    // batch. Every free name in the executor has to be injected here or the eval throws
+    // ReferenceError at RUN time, which is how this harness caught the omission.
+    driveControlHooksAcrossScopedBatch,
+    scopedBatchDriveNote,
     rgthreeFixedSeedNote,
     summarizePromptRejection,
     buildQueueAcceptResult,
