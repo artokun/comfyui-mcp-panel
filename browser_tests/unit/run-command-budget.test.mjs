@@ -311,6 +311,61 @@ test("#1565: NO budget ⇒ no new bound — an existing caller keeps today's beh
   }
 });
 
+test("#1565 P0: a run abandoned at its bound still FENCES its own late post, with another run's guard installed on top", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const server = apiTarget.fetchApi;
+    const raw = apiTarget.fetchApi;
+    // Run A: its queue call never settles, so it is abandoned at the bound. The post it
+    // already handed to the busy processor arrives LATER — after A has been reported.
+    let latePost = null;
+    const appA = {
+      queueItems: [],
+      graphToPrompt: async () => ({ output: OUR_OUTPUT, workflow: {} }),
+      queuePrompt: async (number) => {
+        // The processor will emit this run's post long after queuePrompt is abandoned,
+        // through WHATEVER fetchApi is installed by then — which is another run's guard.
+        latePost = () =>
+          apiTarget.fetchApi("/prompt", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt: OUR_OUTPUT, client_id: "x", number }),
+          });
+        return new Promise(() => {});
+      },
+    };
+    const a = await dispatchScopedRun({
+      app: appA, apiTarget, execIds: ["327"], batch: 1, toNodeId: 327,
+      verifyTimeoutMs: 300, budget: makeCommandBudget(400),
+    });
+    assert.notEqual(a.outcome, "dispatched", "A was abandoned at its bound");
+    assert.notEqual(apiTarget.fetchApi, raw, "and its fence is still in the chain, never restored to raw fetch");
+
+    // Run B starts afterwards and installs ITS guard on top of A's closed one.
+    const appB = makeBusyDroppingFrontend({ apiTarget, drainMs: 5 });
+    const b = await dispatchScopedRun({
+      app: appB, apiTarget, execIds: ["327"], batch: 1, toNodeId: 327,
+      verifyTimeoutMs: 300, budget: makeCommandBudget(2000),
+    });
+    assert.equal(b.outcome, "dispatched", "B is unaffected by A's abandoned fence");
+    const postsAfterB = server.calls.length;
+
+    // NOW A's late post arrives. It must travel B's guard (mark mismatch, passed through)
+    // and meet A's CLOSED guard below it — refused, never forwarded to the server.
+    const res = await latePost();
+    assert.equal(res.status, 400, "A's late post is refused by A's own closed fence");
+    assert.equal(
+      server.calls.length,
+      postsAfterB,
+      "a post from an abandoned run must never reach ComfyUI scopeless — that is the " +
+        "full-graph execution this whole module exists to prevent",
+    );
+  } finally {
+    stop();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 3. THE CALL SITE. The whole fix is one budget reaching the dispatch, and a
 //    library-level test cannot see whether it does. This runs the SHIPPED
