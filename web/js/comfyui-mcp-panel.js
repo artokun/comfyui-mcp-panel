@@ -3724,15 +3724,17 @@ const _savePathGuardRefusalsLogged = new Set();
  *      `prepareForSave` would have resolved a microsecond later.
  *   2. a comparison of the live root against the state about to be written ACTUALLY
  *      HAPPENED (`describeGraphStateDifference(...).comparable === true`) and the
- *      tolerant proof (`graphRootReproducesStateContent`) did not vouch for it. Both
- *      halves are load-bearing: the tolerance stops a frontend that re-measures node
- *      boxes or renumbers subgraph link ids from manufacturing a refusal, and the
- *      comparability stops an ABSENT comparison from doing the same — the proof
- *      answers `proven:false` for "could not compare" exactly as it does for "differs",
- *      so reading it alone made a root that cannot be serialized indistinguishable
- *      from a canvas with lost work. Without conjunct 2 at all, a suppressed capture
- *      on an already-equal canvas — the ordinary state of a clean tab — would block
- *      every save.
+ *      tolerant proof (`graphRootReproducesStateContent`) did not vouch for it — neither
+ *      `proven` nor `presentationOnly`. Both halves are load-bearing: the tolerance
+ *      stops a frontend that re-measures node boxes or renumbers subgraph link ids
+ *      from manufacturing a refusal, and the comparability stops an ABSENT comparison
+ *      from doing the same — the proof answers `proven:false` for "could not compare"
+ *      exactly as it does for "differs", so reading it alone made a root that cannot
+ *      be serialized indistinguishable from a canvas with lost work. Without conjunct
+ *      2 at all, a suppressed capture on an already-equal canvas — the ordinary state
+ *      of a clean tab — would block every save. Reading `proven !== true` alone also
+ *      refused a dragged node: `pos` is presentation-only (nothing AUTHORED is behind
+ *      the canvas) and this guard gates autosave and Ctrl+S (#1580).
  *
  * ACTIVE WORKFLOW ONLY. `app.rootGraph` is the ACTIVE tab's canvas; comparing it with
  * an inactive tab's snapshot would compare two different workflows and refuse a save
@@ -3800,7 +3802,13 @@ function saveWouldPersistStaleSnapshot(wf, state) {
     if (describeGraphStateDifference({ rootGraph: frozen, state })?.comparable !== true) {
       return false;
     }
-    return graphRootReproducesStateContent({ rootGraph: frozen, state })?.proven !== true;
+    const reproduces = graphRootReproducesStateContent({ rootGraph: frozen, state });
+    // #1580 — a difference the panel's own classifier vouches for as presentation-only
+    // means nothing AUTHORED is behind the canvas. Refusing the save there is louder
+    // than the drift, and this guard gates autosave and Ctrl+S as well as
+    // panel_save_workflow. `proven` is the stricter measured-rewrite proof and does
+    // not cover a dragged node (`pos`); reading it alone was the false positive.
+    return reproduces?.proven !== true && reproduces?.presentationOnly !== true;
   } catch {
     return false;
   }
