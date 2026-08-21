@@ -303,3 +303,21 @@ test("#1130 WIRING: a write the widget REFUSED still fails and still rolls back"
   );
   assert.equal(factor.value, 1, "rolled back to the prior value");
 });
+
+test("#1130 the INT callback does NOT clamp on the panel's write path", () => {
+  // applyWidgetWrite assigns `widget.value` and invokes the callback directly,
+  // so `NumberWidget.setValue`'s clamp never runs. Measured on the rig:
+  // EmptyLatentImage.width (min 16, max 16384, step2 8) stores 20000 for 20001
+  // and -32 for -33 — NOT 16384 and 16. A model that clamps here reports both
+  // of those applied writes as refused.
+  const w = widget({ min: 16, max: 16384, step: 80, step2: 8, precision: 0 });
+  assert.ok(explainNumericNormalization(20001, 20000, w), "above max: snapped, not clamped");
+  assert.ok(explainNumericNormalization(-33, -32, w), "below min: snapped, not clamped");
+  // KSampler.steps (step2 1, max 10000), measured: 20001.4 stores 20001.
+  assert.ok(explainNumericNormalization(20001.4, 20001, widget({ min: 1, max: 10000, step: 10, step2: 1, precision: 0 })));
+  // The FLOAT callback is the one that DOES clamp, and it still must.
+  // AdjustContrast.factor, measured: 7.77 stores 2 and -3.33 stores 0.
+  const f = widget(ADJUST_CONTRAST_FACTOR);
+  assert.ok(explainNumericNormalization(7.77, 2, f), "float clamps to max");
+  assert.ok(explainNumericNormalization(-3.33, 0, f), "float clamps to min");
+});

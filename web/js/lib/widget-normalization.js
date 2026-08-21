@@ -129,14 +129,24 @@ function snapFloat(value, { round, precision, min, max }) {
 }
 
 /**
- * `onValueChange` (the INT callback), verbatim, plus the min/max clamp
- * `NumberWidget.setValue` applies around it.
+ * `onValueChange` (the INT callback), verbatim.
  *
  * Note the anchor: `min % step`, not `min`. Both generate the same lattice, but
  * this is the arithmetic the frontend runs, and matching it exactly is the whole
  * contract of this module.
+ *
+ * And note what is NOT here: a clamp. The float callback clamps its own result;
+ * this one does not, and the clamp that would otherwise cover it lives in
+ * `NumberWidget.setValue`, which `applyWidgetWrite` does not go through — it
+ * assigns `widget.value` and invokes the callback directly. Measured on the rig
+ * rather than argued: `EmptyLatentImage.width` (min 16, max 16384, step2 8)
+ * stores **20000** for a request of 20001 and **-32** for -33. Clamping here
+ * would predict 16384 and 16, miss both, and report two applied writes as
+ * refused — the very failure this module exists to prevent, and one the
+ * min-anchored model had too. The standalone `clamp` reading below still covers
+ * the paths that DO clamp.
  */
-function snapInt(value, { step2, min, max }) {
+function snapIntNoClamp(value, { step2, min }) {
   if (!isFiniteNumber(step2) || step2 <= 0) return null;
   let out;
   if (step2 === 1) {
@@ -145,8 +155,7 @@ function snapInt(value, { step2, min, max }) {
     const offset = (min ?? 0) % step2;
     out = Math.round((value - offset) / step2) * step2 + offset;
   }
-  if (!Number.isFinite(out)) return null;
-  return clampTo(out, min, max);
+  return Number.isFinite(out) ? out : null;
 }
 
 /**
@@ -211,7 +220,7 @@ export function explainNumericNormalization(expected, actual, widget) {
     // The frontend's INT path — `onValueChange`.
     const offset = step2 === 1 ? 0 : (min ?? 0) % step2;
     candidates.push({
-      value: () => snapInt(expected, cfg),
+      value: () => snapIntNoClamp(expected, cfg),
       why: step2 === 1 ? "whole numbers (step 1)" : `step ${step2} offset ${offset}`,
       grid: step2,
     });
