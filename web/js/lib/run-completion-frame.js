@@ -634,15 +634,24 @@ async function buildVideoSegment(v, deps) {
       // cost the agent far more than the imprecision does. It is described
       // without a count instead — never with the capacity, which is the claim
       // that was actually false.
-      const sheetDesc =
+      // The head names the sheet; the disclosure is a SEPARATE sentence. Folding
+      // the blank-cell caveat into the head produced "…spread across the video of
+      // the FINAL saved video (file x.mp4…)", because the head is followed by
+      // `of ${videoKind}` — a garbled sentence in the one place this change exists
+      // to make legible (gate non-finding, fixed rather than shipped).
+      const sheetHead =
         frames == null
           ? "storyboard (contact sheet)"
           : frames < cells
-            ? `${cells}-cell storyboard (contact sheet) holding ${frames} sampled ` +
-              `frame${frames === 1 ? "" : "s"} — the other ${cells - frames} could not be captured and are ` +
-              `BLANK, so judge nothing from them, and the frames that did survive may be clustered ` +
-              `rather than spread across the video`
+            ? `${cells}-cell storyboard (contact sheet)`
             : `${frames}-frame storyboard (contact sheet)`;
+      const blanks = frames == null ? 0 : cells - frames;
+      const blankClause =
+        blanks > 0
+          ? `Only ${frames} of its ${cells} cells hold a sampled frame — the other ${blanks} ` +
+            `${blanks === 1 ? "is" : "are"} BLANK, so judge nothing from ${blanks === 1 ? "it" : "them"}, ` +
+            `and the frames that did survive may be CLUSTERED rather than spread across the video. `
+          : "";
       // THE POSTER rides along on the sheet blob (see buildVideoStoryboard), from
       // the same decode. Upload it beside the sheet and hand it back to the card,
       // which has already been painted by the time we get here — the card cannot
@@ -686,10 +695,11 @@ async function buildVideoSegment(v, deps) {
       // variant says so AFFIRMATIVELY (an explicit prohibition is reliable; a
       // merely-absent request is not) — the sheet is still painted for the user
       // above, so only the agent is blind.
-      const header = `📽️ ${sheetDesc} of ${videoKind} — `;
+      const header = `📽️ ${sheetHead} of ${videoKind} — `;
       const note =
         header +
         `frames run top-left→bottom-right = start→end. ` +
+        blankClause +
         `Review motion, sharpness, and temporal consistency.` +
         metaSuffix(sizeStr, frames);
       const noteWhenBlind =

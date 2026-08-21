@@ -126,8 +126,10 @@ test("#1485: the note describes the frames actually PAINTED, not the grid's capa
     !/20-frame storyboard/.test(frame.note),
     `a 3-frame sheet must not be announced as 20 frames\n${frame.note}`,
   );
-  assert.match(frame.note, /3 sampled frames/, "the count that was drawn is the count that is stated");
-  assert.match(frame.note, /17 could not be captured and are BLANK/, "and the blanks are disclosed, not implied");
+  assert.match(frame.note, /Only 3 of its 20 cells hold a sampled frame/, "the count that was drawn is the count that is stated");
+  assert.match(frame.note, /the other 17 are BLANK/, "and the blanks are disclosed, not implied");
+  assert.match(frame.note, /📽️ 20-cell storyboard \(contact sheet\) of the FINAL saved video/,
+    "the head names the sheet and flows into the file — the caveat is its own sentence");
 });
 
 test("#1485: a FULL sheet still reads as a plain N-frame storyboard", async () => {
@@ -152,9 +154,35 @@ test("#1485: exactly ONE sampled frame is described in the singular, with the bl
   const { deps } = makeDeps({ buildVideoStoryboard: async () => sheetBlob({ paintedFrames: 1 }) });
   const frame = await composeRunCompletionFrame(videoPayload(), deps);
 
-  assert.match(frame.note, /holding 1 sampled frame —/, "one frame is one frame, not '1 sampled frames'");
-  assert.match(frame.note, /19 could not be captured and are BLANK/);
+  assert.match(frame.note, /Only 1 of its 20 cells hold/, "one frame is one frame");
+  assert.match(frame.note, /the other 19 are BLANK, so judge nothing from them/);
   assert.ok(!/20-frame storyboard/.test(frame.note), `\n${frame.note}`);
+});
+
+test("#1485: cells-minus-one reads 'is BLANK', not 'are BLANK' (gate non-finding)", async () => {
+  // The boundary the plural rule actually gets wrong: 19 of 20 painted leaves
+  // exactly one blank cell. Caught by the review gate reading the generated
+  // string rather than the branch, which is why it is pinned by the string.
+  const { deps } = makeDeps({ buildVideoStoryboard: async () => sheetBlob({ paintedFrames: 19 }) });
+  const frame = await composeRunCompletionFrame(videoPayload(), deps);
+
+  assert.match(frame.note, /the other 1 is BLANK, so judge nothing from it/, `
+${frame.note}`);
+  assert.ok(!/the other 1 are BLANK/.test(frame.note), "one blank cell is 'is', not 'are'");
+});
+
+test("#1485: a count over capacity is CLAMPED, never announced as more than the grid holds", async () => {
+  // paintedFrames is an expando the builder sets; a caller must not be able to
+  // claim 25 samples from a 20-cell sheet. Clamped to the capacity, which then
+  // reads as a full sheet with no blanks — the honest description of 20 cells
+  // that all hold a frame.
+  const { deps } = makeDeps({ buildVideoStoryboard: async () => sheetBlob({ paintedFrames: 25 }) });
+  const frame = await composeRunCompletionFrame(videoPayload(), deps);
+
+  assert.ok(!/25/.test(frame.note), `a count above the capacity must never be printed
+${frame.note}`);
+  assert.match(frame.note, /📽️ 20-frame storyboard \(contact sheet\)/);
+  assert.ok(!/BLANK/.test(frame.note), "a clamped-full sheet has no blanks to disclose");
 });
 
 test("#1485: an UNKNOWN sampled count claims no count at all — never the capacity, never 'null'", async () => {
