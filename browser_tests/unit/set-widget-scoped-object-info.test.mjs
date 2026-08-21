@@ -423,6 +423,15 @@ test("#1560: fetchTypeScopedObjectInfo refuses an empty set, an unwired fetchApi
   const capped = await fetchTypeScopedObjectInfo(many, { fetchApi: backend.fetchApi });
   assert.equal(capped.defs, null, "a pathological promotion chain is not turned into a request storm");
   assert.deepEqual(backend.perClassCalls(), [], "and nothing was issued");
+  // THE VALUE, not just the existence of a cap. `MAX_SCOPED_TYPES + 1` above is
+  // self-referential — it passes for any number the constant happens to hold, so a change to
+  // 1 (refusing every promoted write) or to 500 (a request storm against a backend that is
+  // already struggling) would sail through it. Pin the number and both sides of the boundary.
+  assert.equal(MAX_SCOPED_TYPES, 8, "the cap is a deliberate number, not whatever it drifted to");
+  const atCap = Array.from({ length: MAX_SCOPED_TYPES }, (_, i) => `Type${i}`);
+  const allowed = await fetchTypeScopedObjectInfo(atCap, { fetchApi: backend.fetchApi });
+  assert.ok(allowed.defs, "exactly MAX_SCOPED_TYPES is still ANSWERED — the cap is off-by-one-safe");
+  assert.equal(backend.perClassCalls().length, MAX_SCOPED_TYPES, "one request per type, no more");
 });
 
 // ───────────────────────────────── the CALL SITE, not just the helper ─────────────────────

@@ -14610,9 +14610,9 @@ const GRAPH_TOOL_EXECUTORS = {
             defs: null,
             covered: [],
             reason:
-              "the whole-schema routes did not go SILENT, and a type-scoped read may only " +
-              "stand in for routes that were contacted and returned nothing — never overrule " +
-              "what they did establish",
+              "no whole-schema route was both CONTACTED and SILENT, and a type-scoped read " +
+              "may only stand in for one that was — it must never overrule what a route did " +
+              "establish, and it is not a substitute for a route nobody ran",
           };
         }
         const scoped = await fetchTypeScopedObjectInfo(types, {
