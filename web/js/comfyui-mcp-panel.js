@@ -281,7 +281,12 @@ import { createSettingsBackendDefault } from "./lib/settings-backend-default.js"
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
 import { fetchWholeObjectInfo, objectInfoOracleFailureNote, OBJECT_INFO_DEADLINE_MS } from "./lib/object-info-oracle.js";
-import { createObjectInfoSnapshot, snapshotAuthorizationNote } from "./lib/object-info-snapshot.js";
+import {
+  createObjectInfoSnapshot,
+  snapshotAuthorizationNote,
+  noBackendAnswerEstablished,
+} from "./lib/object-info-snapshot.js";
+import { fetchTypeScopedObjectInfo, SCOPED_OBJECT_INFO_DEADLINE_MS } from "./lib/scoped-object-info.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
@@ -14250,6 +14255,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // its refusal, so the message would name routes another call tried. Declared in the
     // handler's own scope, so each invocation reports what IT observed.
     let oracleFailures = [];
+    // #1560 — the MACHINE-READABLE half of the same observation (#1223's tags), kept because
+    // the type-scoped last resort below may only be consulted when the whole-map routes went
+    // SILENT. A route that ANSWERED — threw, a non-gateway status, a client expressing
+    // deny-all as `{}` — must never be overruled by a broader per-class read, which is the
+    // one direction object-info-oracle.js's own note forbids. Per-request for exactly the
+    // reason `oracleFailures` is.
+    let oracleOutcomes = [];
     // #1223 — null while the authorization came from a LIVE probe; the oracle's failure
     // note once it came from the last-observed snapshot instead. Per-request for the same
     // reason `oracleFailures` is: a concurrent write must not make THIS reply claim a
@@ -14483,6 +14495,7 @@ const GRAPH_TOOL_EXECUTORS = {
         );
         const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
+        oracleOutcomes = defs ? [] : (outcome?.outcomes ?? []);
         if (defs) {
           // #1126 — ONE fact, from the one component that can establish it. The cache says
           // whether the answer it just handed back is the server speaking NOW ("live") or a
@@ -14549,6 +14562,51 @@ const GRAPH_TOOL_EXECUTORS = {
       // that was perfectly valid.
       refetchObjectInfoLive: async () =>
         setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts)),
+      // #1560 — the THIRD route, and the only one that is TYPE-SCOPED.
+      //
+      // On a ~1023-model install neither whole-schema route ever lands inside its share of
+      // the budget while ComfyUI is idle and healthy, so #1223's snapshot is never populated
+      // and EVERY set_widget refuses for the life of the tab. `/object_info/<Type>` answers
+      // that same install in ~2.7KB. This asks it about exactly the types runSetWidget has
+      // already resolved this write to — see scoped-object-info.js for why a map that
+      // THROWS outside that set is not the per-class payload #716/#821 were about.
+      //
+      // TWO GATES, both here rather than in the lib, because only this file holds the facts.
+      //
+      //   1. THE SILENCE LICENCE. Consulted only when no whole-map route ANSWERED. The SAME
+      //      `noBackendAnswerEstablished` test #1223's snapshot licenses on, for the same
+      //      reason: a client that returned an empty schema has expressed deny-all, and a
+      //      broader per-class read must never overrule it. A timeout, a client that returned
+      //      NOTHING, or a proxy's 504 leave the question unanswered — those, and only those,
+      //      may be asked again by another route.
+      //   2. WHAT THE COMMAND HAS LEFT. The whole-map attempt has already spent most of the
+      //      budget by the time this runs (measured on the reported shape: 15,015 ms of a 20s
+      //      oracle deadline), so this takes `budget.bounded` like every other step and
+      //      cannot push the reply past the bridge's own timeout.
+      //
+      // NEVER recorded into the #1223 snapshot — object-info-snapshot.js requires an explicit
+      // `whole: true` claim precisely so a per-class payload cannot make every OTHER type read
+      // as a removed pack — and never fed to recordObjectInfoTypes, whose ever-seen history is
+      // the fence's own trust root.
+      fetchScopedObjectInfo: async (types) => {
+        if (!noBackendAnswerEstablished(oracleOutcomes)) {
+          return {
+            defs: null,
+            covered: [],
+            reason:
+              "a whole-schema route ANSWERED rather than going silent, so a type-scoped read " +
+              "is not licensed to overrule it",
+          };
+        }
+        const scoped = await fetchTypeScopedObjectInfo(types, {
+          fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+          deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
+        });
+        // Held for the reply and for the #1126 blind-write ladder, which must NOT treat this
+        // as the server's whole word: it is the server answering now about a handful of types.
+        if (scoped.defs) setWidgetSchemaProvenance = () => "scoped";
+        return scoped;
+      },
       // What the last oracle attempt observed, so a refusal can say which routes were
       // tried and what each one did instead of asserting an unreachable backend — then,
       // separately, why the last-observed schema could not stand in for them either.
