@@ -22,6 +22,7 @@ import {
   scanComboAvailability,
   comboInputsOf,
   comboConfigsOf,
+  comboOffers,
   declaresUnrecognizedUploadKind,
   optionsLookLikeFiles,
   comboAvailabilityNote,
@@ -407,4 +408,43 @@ test("#745 recurrence: comboInputsOf reads V1 and V2 alike, and configs come wit
     "the V2 config must travel with the list, or the #1357 upload abstention cannot arm",
   );
   assert.equal(comboInputsOf(LOAD3D, "NoSuchClass"), null, "an absent class is still UNKNOWN");
+});
+
+/** LtxvApiTextToVideo.duration — a V2 combo publishing INTEGERS, live-verified shape. */
+const INT_COMBO = classBody("LtxvApiTextToVideo", {
+  duration: ["COMBO", { multiselect: false, options: [6, 8, 10] }],
+});
+
+test("#745 recurrence: an INTEGER option list is never collapsed to 'nothing installed'", async () => {
+  // Measured: 15 inputs publish pure-int lists and ALL FIFTEEN are V2, so filtering
+  // non-strings out of the stored list would turn every one into `option_count: 0`
+  // — which this module reads as "the server enumerates nothing" — and label a
+  // perfectly good graph `missing_asset`. Introduced by reading V2, by nothing else.
+  const r = await scanComboAvailability(
+    [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: "99" }])],
+    async () => INT_COMBO,
+  );
+  assert.equal(r.unavailable.length, 1, "a genuinely off-list value is still reported");
+  assert.equal(r.unavailable[0].option_count, 3, "the list is NOT empty and must not say it is");
+  assert.equal(r.unavailable[0].kind, "invalid_value", "an int list names modes, not files on disk");
+});
+
+test("#745 recurrence: a STRINGIFIED int the server offers is not called missing", async () => {
+  // A workflow round-trip and panel_set_widget both hand back "10" for an option
+  // published as the number 10. Judging that by identity accuses a graph that runs.
+  const r = await scanComboAvailability(
+    [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: "10" }])],
+    async () => INT_COMBO,
+  );
+  assert.deepEqual(r.unavailable, [], "the server DOES offer this duration");
+  assert.deepEqual(r.unknown, []);
+});
+
+test("#745 recurrence: comboOffers coerces primitives only, never structures", () => {
+  assert.equal(comboOffers([6, 10], "10"), true);
+  assert.equal(comboOffers([6, 10], "7"), false);
+  assert.equal(comboOffers(["a.safetensors"], "a.safetensors"), true);
+  assert.equal(comboOffers([true], "true"), true);
+  assert.equal(comboOffers([{ key: "a" }], "[object Object]"), false, "no structure may be flattened into a match");
+  assert.equal(comboOffers(null, "x"), false);
 });

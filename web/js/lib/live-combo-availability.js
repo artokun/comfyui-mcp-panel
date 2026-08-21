@@ -120,10 +120,18 @@ function parseClassCombos(body, className) {
       // for a REMOTE V2 (1 input) and a dynamic V3 (123 inputs) because those lists are
       // genuinely unread, so an unread list is never mistaken for an empty one. Those
       // stay unjudged, exactly as they are today.
+      //
+      // The list is stored AS DECLARED. Dropping non-strings — which the V1-era read
+      // did, harmlessly, because every V1 list on the live server is all-strings —
+      // would collapse an INTEGER list to `[]`, and `[]` means "the server enumerates
+      // nothing, so every value is unavailable". Measured: 15 inputs publish pure-int
+      // lists (`LtxvApiTextToVideo.duration [6,8,…]`, `MinimaxHailuoVideoNode.duration
+      // [6,10]`, …) and ALL FIFTEEN are V2, so every one of them would have been a
+      // false `missing_asset` introduced by this change and by nothing else.
       if (!Array.isArray(def)) continue;
       const values = authoritativeComboValues(def);
       if (Array.isArray(values)) {
-        options.set(name, values.filter((v) => typeof v === "string"));
+        options.set(name, values);
         configs.set(name, def[1] && typeof def[1] === "object" ? def[1] : {});
       }
     }
@@ -182,6 +190,29 @@ export function linkDrivenWidgetNames(node) {
  * server could not be asked about. Kept in one place so "I could not check this"
  * never drifts into reading like "I checked and it is fine".
  */
+const UNENUMERABLE_PREFIX =
+  "not checked: this value names a file below the input root (or under an " +
+  "[output]/[temp]/[input] annotation), which /object_info's combo list cannot enumerate";
+
+/**
+ * #745 — TRUE when the server's list OFFERS `value`, comparing by VALUE rather than
+ * by identity.
+ *
+ * A combo may publish NUMBERS (`duration: [6, 10]`), while a widget value that has been
+ * through a workflow round-trip or a `panel_set_widget` write is the string `"10"`.
+ * A bare `includes()` calls that a value the server does not offer, which is a false
+ * accusation about a graph that runs. Only primitives are coerced — never an object —
+ * so nothing structural is flattened into a string that happens to match.
+ */
+export function comboOffers(options, value) {
+  if (!Array.isArray(options)) return false;
+  return options.some(
+    (o) =>
+      o === value ||
+      ((typeof o === "number" || typeof o === "boolean") && String(o) === value),
+  );
+}
+
 /**
  * #745 — TRUE when this input config announces itself as an UPLOAD input via a
  * `*_upload` flag that `uploadConfigOf` does NOT recognise (ComfyUI's own
@@ -202,10 +233,6 @@ export function declaresUnrecognizedUploadKind(config) {
     return false;
   }
 }
-
-const UNENUMERABLE_PREFIX =
-  "not checked: this value names a file below the input root (or under an " +
-  "[output]/[temp]/[input] annotation), which /object_info's combo list cannot enumerate";
 
 export async function scanComboAvailability(
   nodes,
@@ -399,7 +426,7 @@ export async function scanComboAvailability(
       if (!options) continue; // not a combo input — nothing to judge it against
       const value = widget.value;
       if (typeof value !== "string" || value === "") continue;
-      if (options.includes(value)) continue;
+      if (comboOffers(options, value)) continue;
       // #1357 — before calling it missing, check whether this combo could have
       // listed it at all.
       const asset = await adjudicateUnenumerableAsset(entry.configs?.get(name), value);
