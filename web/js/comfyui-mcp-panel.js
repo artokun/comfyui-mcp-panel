@@ -1356,11 +1356,17 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts) {
   // number is honoured — an `Infinity`/`NaN` computed from an unset budget would restore
   // the unbounded run this deadline exists to prevent, and a non-positive one would start
   // a run with no time at all.
-  let runDeadline =
-    monotonicNow() +
-    (Number.isFinite(runOpts?.runBudgetMs) && runOpts.runBudgetMs > 0
+  //
+  // NAMED, not just added to a deadline: the combo phase's refusal quotes "the budget this
+  // refresh had", and it used to quote the DEFAULT constant unconditionally. The moment a
+  // caller could state its own, that sentence became arithmetically impossible — "the
+  // 37500ms this refresh had left of its 9000ms budget" — which is #1161's defect (naming a
+  // number that was never spent) reintroduced by this very change.
+  const runBudgetMs =
+    Number.isFinite(runOpts?.runBudgetMs) && runOpts.runBudgetMs > 0
       ? runOpts.runBudgetMs
-      : NODE_DEFS_RUN_BUDGET_MS);
+      : NODE_DEFS_RUN_BUDGET_MS;
+  let runDeadline = monotonicNow() + runBudgetMs;
   // #716 — drop the widget-write burst cache at the START of this run, not after it
   // succeeds (codex). This function runs on exactly the events that change the schema —
   // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
@@ -1859,7 +1865,31 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts) {
       // it, "did not answer in time" is the same sentence for a phase starved down to
       // 3000ms by a slow fetch and for one handed the whole budget that hung anyway, and
       // those two have different causes and different remedies.
-      comboWaitMs = nodeDefsBudgetLeft(runDeadline);
+      //
+      // #1562 — AND NEVER MORE THAN A RUN'S DEFAULT ALLOWANCE, whatever the caller stated.
+      //
+      // The larger budget a caller may now pass exists for the FETCH phase — a whole
+      // `/object_info` that cannot be delivered inside the old 9,000ms. Letting it fall
+      // through to here instead hands this phase up to 37,500ms, and this phase's bound is
+      // the one that decides how long the RUN lives: a `panel_refresh_nodes` whose fetch was
+      // fast and whose `refreshComboInNodes()` merely hangs would then outlive the 25,000ms
+      // JOIN its own command holds. Measured on the shipped executor over the real
+      // coalescer, varying only the combo call's latency:
+      //
+      //     combo latency   before this issue        uncapped 37,500ms run
+      //       15,000 ms     refreshed:true           refreshed:true
+      //       26,000 ms     refreshed:true at 9 s    refreshed:FALSE (refresh_still_running)
+      //       never answers refreshed:true at 9 s    refreshed:FALSE (refresh_still_running)
+      //
+      // That is a case that WORKED being turned into one that does not — and it takes
+      // #1193's `combo_refresh_confirmed:false` disclosure with it, which is unreachable
+      // through this command once the phase can cross the join. The extension must therefore
+      // reach the phase it was measured for and no further, so this phase keeps exactly the
+      // ceiling it has always had. `Math.min` is a NO-OP for every caller that states no
+      // budget: what is left of a 9,000ms run is never more than 9,000ms.
+      const comboBudgetLeft = nodeDefsBudgetLeft(runDeadline);
+      comboWaitMs = Math.min(comboBudgetLeft, NODE_DEFS_RUN_BUDGET_MS);
+      const comboWaitCapped = comboWaitMs < comboBudgetLeft;
       const comboSettled = await withTimeout(
         Promise.resolve()
           .then(() => a.refreshComboInNodes())
@@ -1918,8 +1948,16 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts) {
         // catch. The `?? ` that used to guard this assignment could never fire.
         thrown = comboAbandoned
           ? new Error(
-              `refreshComboInNodes() did not answer within the ${comboWaitMs}ms this refresh had ` +
-                `left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget, and this run's own combo rebuild ` +
+              // #1562 — WHICH OF THE TWO BOUNDS ACTUALLY BIT, and the run's OWN budget rather
+              // than the default constant. #1193 put the numbers in this sentence so a phase
+              // starved to a sliver by a slow fetch reads differently from one handed the
+              // whole budget that hung anyway; a third case now exists — a phase holding the
+              // ceiling while the run still had time — and it has to be readable too.
+              `refreshComboInNodes() did not answer within the ${comboWaitMs}ms ` +
+                (comboWaitCapped
+                  ? `this phase is capped at (this refresh had ${comboBudgetLeft}ms left of its ${runBudgetMs}ms budget)`
+                  : `this refresh had left of its ${runBudgetMs}ms budget`) +
+                ", and this run's own combo rebuild " +
                 "did not complete either, so the dropdown lists are NOT known to be current",
             )
           : comboSettled.err;

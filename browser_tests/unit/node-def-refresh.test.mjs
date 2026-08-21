@@ -27,6 +27,7 @@ import {
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
   NODE_DEFS_RUN_BUDGET_MS,
+  REFRESH_NODES_RUN_BUDGET_MS,
   REFRESH_NODES_EXECUTOR_DEPS,
   monotonicNow,
   nodeDefsBudgetLeft,
@@ -1905,4 +1906,85 @@ test("#1562: a real failure EARLIER in route 1's retry loop outranks the stall t
   );
   // The self-contradiction this guards: the heading and the evidence clause disagreeing.
   assert.match(verdict.remedy, /Failed to fetch/, "#608's evidence clause still names what route 1 did");
+});
+
+// ---------------------------------------------------------------------------
+// #1562 round 2 — THE LARGER BUDGET IS THE FETCH PHASE'S, NOT THE WHOLE RUN'S.
+//
+// `panel_refresh_nodes` hands the run 37,500 ms so the whole `/object_info` can land, and
+// this phase's bound is `what is left of the run`. Uncapped, that lets a run whose fetch was
+// FAST and whose `refreshComboInNodes()` merely hangs live for 37.5 s — past the 25 s JOIN
+// its own command holds — so a `panel_refresh_nodes` that used to answer `refreshed:true`
+// (with #1193's `combo_refresh_confirmed:false` disclosure) answers `refresh_still_running`
+// instead. A case that worked, broken by the fix for a case that did not.
+// ---------------------------------------------------------------------------
+
+/** Run with a STATED run budget and a combo call that never answers. */
+async function runWithStatedBudgetAndHangingCombo({ sweep }) {
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: APP_WITH_GRAPH, // its refreshComboInNodes() never settles
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) }, // a FAST fetch
+    timers,
+    reapplyDefsToLiveNodes: sweep,
+  });
+  const running = registerComfyNodeDefs(undefined, { runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS });
+  await drainMicrotasks();
+  timers.fireAll();
+  return orFail(running, "the combo phase never gave up");
+}
+
+test("#1562: a stated run budget does NOT extend the combo phase past a run's default allowance", async () => {
+  const verdict = await runWithStatedBudgetAndHangingCombo({ sweep: sweepThatStopsPartWay() });
+  assert.equal(verdict.reason, "combo_refresh_failed");
+  const bound = Number(verdict.detail.match(/did not answer within the (\d+)ms/)?.[1]);
+  assert.ok(Number.isFinite(bound), `the refusal must still name its bound: ${verdict.detail}`);
+  assert.ok(
+    bound <= NODE_DEFS_RUN_BUDGET_MS,
+    `the combo phase was given ${bound}ms out of a stated ${REFRESH_NODES_RUN_BUDGET_MS}ms run. ` +
+      `It may never exceed ${NODE_DEFS_RUN_BUDGET_MS}ms — the whole allowance a run had before a ` +
+      "caller could state one — because this phase's bound decides how long the RUN lives, and a " +
+      "run that outlives its command's 25s join turns a refreshed:true into refresh_still_running",
+  );
+});
+
+test("#1562: the abandoned-combo refusal names the run's OWN budget, not the default constant", async () => {
+  const verdict = await runWithStatedBudgetAndHangingCombo({ sweep: sweepThatStopsPartWay() });
+  assert.match(
+    verdict.detail,
+    new RegExp(`${REFRESH_NODES_RUN_BUDGET_MS}ms budget`),
+    "the sentence quotes the budget THIS run was given; quoting the default produced an " +
+      "arithmetically impossible refusal — \"the 37500ms this refresh had left of its 9000ms budget\"",
+  );
+  assert.doesNotMatch(
+    verdict.detail,
+    new RegExp(`left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget`),
+    "…and it must not describe a 37,500ms run as a 9,000ms one",
+  );
+  // The three cases stay distinguishable (#1193's requirement): starved by a slow fetch,
+  // handed the whole budget and hung anyway, and — new — holding the phase ceiling while the
+  // run still had time. Only the third says "capped".
+  assert.match(verdict.detail, /capped at \(this refresh had \d+ms left of its \d+ms budget\)/);
+});
+
+test("#1562: a caller that states NO budget keeps the combo phase's wording byte-identical", async () => {
+  // The `Math.min` must be a no-op for every existing caller: what is left of a 9,000ms run
+  // is never more than 9,000ms, so nothing about the default path may read differently.
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: APP_WITH_GRAPH,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    timers,
+    reapplyDefsToLiveNodes: sweepThatStopsPartWay(),
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks();
+  timers.fireAll();
+  const verdict = await orFail(running, "the combo phase never gave up");
+  assert.match(
+    verdict.detail,
+    new RegExp(`did not answer within the \\d+ms this refresh had left of its ${NODE_DEFS_RUN_BUDGET_MS}ms budget`),
+    "the pre-existing sentence, unchanged — the cap never bites on a default run",
+  );
+  assert.doesNotMatch(verdict.detail, /capped/);
 });

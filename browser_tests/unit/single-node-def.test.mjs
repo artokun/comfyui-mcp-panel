@@ -292,10 +292,18 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
     1,
     "the run must take a deadline once — a second one would be a phase carrying its own number",
   );
+  // The allowance is NAMED before it becomes a deadline (#1562 round 2): the combo phase's
+  // refusal has to be able to quote the budget THIS run was given, and quoting the default
+  // constant instead produced "the 37500ms this refresh had left of its 9000ms budget".
   assert.match(
     src,
-    /let runDeadline =\s*monotonicNow\(\) \+\s*\(Number\.isFinite\(runOpts\?\.runBudgetMs\) && runOpts\.runBudgetMs > 0\s*\? runOpts\.runBudgetMs\s*: NODE_DEFS_RUN_BUDGET_MS\);/,
-    "the run must take a deadline once, before any phase starts, defaulting to the run budget",
+    /const runBudgetMs =\s*Number\.isFinite\(runOpts\?\.runBudgetMs\) && runOpts\.runBudgetMs > 0\s*\? runOpts\.runBudgetMs\s*: NODE_DEFS_RUN_BUDGET_MS;/,
+    "the run's allowance is the caller's when it states a usable one, and the default otherwise",
+  );
+  assert.match(
+    src,
+    /let runDeadline = monotonicNow\(\) \+ runBudgetMs;/,
+    "the run must take a deadline once, before any phase starts, from that one allowance",
   );
   // …and give back what the UNBOUNDED local work took, or that work spends the deadline
   // rather than merely escaping it. Without this, a slow install (#610 measured the whole
@@ -348,10 +356,21 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
   // pins is unchanged and now pinned in two halves: the bound is COMPUTED from what the
   // fetch phase left, and that computed value is the one actually ARMED — a constant
   // substituted at either end fails here.
+  //
+  // #1562 round 2 — and it is CAPPED at a run's default allowance. The larger budget a
+  // caller may now state exists for the FETCH phase; letting it fall through to here lets a
+  // run whose fetch was fast and whose combo call merely hangs outlive the 25s join its own
+  // command holds, turning a refreshed:true into refresh_still_running. `Math.min` is a
+  // no-op for every caller that states nothing: what is left of a 9,000ms run is never more.
   assert.match(
     src,
-    /comboWaitMs = nodeDefsBudgetLeft\(runDeadline\);/,
+    /const comboBudgetLeft = nodeDefsBudgetLeft\(runDeadline\);/,
     "the combo phase must draw from what the fetch phase left, not from a constant",
+  );
+  assert.match(
+    src,
+    /comboWaitMs = Math\.min\(comboBudgetLeft, NODE_DEFS_RUN_BUDGET_MS\);/,
+    "…and a stated run budget must not extend this phase past a run's default allowance",
   );
   assert.match(
     src,

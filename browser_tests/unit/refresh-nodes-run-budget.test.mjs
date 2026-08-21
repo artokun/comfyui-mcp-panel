@@ -215,13 +215,17 @@ test("#1562: a caller that states NO run budget still gets undefined, not a fabr
 /**
  * The panel's own runDeadline expression, lifted rather than restated.
  *
+ * #1562 round 2 — the allowance is NAMED (`runBudgetMs`) before it becomes a deadline,
+ * because the combo phase's refusal has to quote it; the deadline is then
+ * `monotonicNow() + runBudgetMs`, and this pattern asserts that too.
+ *
  * Built INSIDE the test, not at module scope: a mutation that removes the expression must
  * fail a test BY NAME, and a throw during import fails the whole FILE instead — which
  * counts as a kill and names nothing a reader can act on.
  */
 function runDeadlineExpr() {
   const m = PANEL_SRC.match(
-    /let runDeadline =\r?\n\s*monotonicNow\(\) \+\r?\n\s*\(([\s\S]*?)\);\r?\n/,
+    /const runBudgetMs =\r?\n\s*([\s\S]*?);\r?\n\s*let runDeadline = monotonicNow\(\) \+ runBudgetMs;/,
   );
   assert.ok(m, "the run deadline is no longer derived where this harness looks");
   // eslint-disable-next-line no-new-func
