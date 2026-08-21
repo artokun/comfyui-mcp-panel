@@ -785,9 +785,15 @@ test("#1998 CALL SITE: the drive is installed on the SCOPED path, and restored i
   // hooks wrapped would keep advancing controls on the user's later single previews.
   const tail = src.slice(scopedDispatch, scopedDispatch + 2500);
   assert.match(tail, /\}\s*finally\s*\{[\s\S]{0,400}?controlDrive\?\.restore\(\)/, "restore must run in a finally around the dispatch");
-  // Gated on batch > 1: a scoped run of one keeps upstream #8774 behaviour.
-  const head = src.slice(Math.max(0, install - 600), install + 300);
-  assert.match(head, /batch > 1/, "the override must be gated on batch > 1");
+  // Gated on batch > 1: a scoped run of one keeps upstream #8774 behaviour. Assert on
+  // the ARGUMENT EXPRESSION, not on a window of surrounding source - a window matched
+  // the word "batch > 1" in the comment above the call and let a dropped gate survive.
+  const call = src.slice(install, src.indexOf(");", install) + 2);
+  assert.match(
+    call,
+    /batch > 1\s*\?/,
+    `the override must be gated on batch > 1, got: ${call}`,
+  );
 });
 
 test("#1998 CALL SITE: a driven batch does not also ship #988's contradictory warning", () => {
