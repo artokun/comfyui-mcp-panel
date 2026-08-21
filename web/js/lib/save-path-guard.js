@@ -38,6 +38,36 @@
 // refused. That refusal is recoverable (the message names the re-bind that heals it);
 // the overwrite it exists to prevent is not.
 //
+// panel#1563/#1564 — the SECOND way this same funnel loses a graph, and it needs no
+// crossed identity at all: the state it serializes can simply be BEHIND the canvas.
+//
+// `ComfyWorkflow.save()` writes `JSON.stringify(this.activeState)` — the ChangeTracker
+// snapshot, never the live root — and `workflowService.saveWorkflow` refreshes that
+// snapshot first by calling `changeTracker.prepareForSave()` → `captureCanvasState()`.
+// That capture returns EARLY AND SILENTLY while a graph is loading, while an undo is
+// restoring, or inside an open change transaction. When it does, the save proceeds on
+// the stale snapshot and the file loses whatever the canvas gained since.
+//
+// MEASURED on the live rig (ComfyUI 0.33.2, comfyui-frontend 1.49.6, one suppression
+// window held open): panel_create_group added group 2 to the canvas, the following
+// panel_graph_outline was refused `[root-shape-mismatch] ... both the workflow and the
+// live canvas report 6 node(s), but the canvas does not reproduce the workflow's own
+// state`, panel_save_workflow answered `{"saved": true}`, and the file on disk came
+// back with ONE group. Reported success, work gone — the same shape as #1667, reached
+// without any identity crossing.
+//
+// So the guard also refuses a write whose state is PROVABLY stale, on two conjuncts,
+// both required:
+//
+//   * upstream POSITIVELY says the pre-save capture was skipped (its own
+//     `changeCount` / `_restoringState` / `isLoadingGraph` conditions), and
+//   * the live root does not reproduce the state about to be written.
+//
+// Neither alone: a suppressed capture on a canvas that already equals the snapshot
+// loses nothing, and a content difference alone cannot be told from ordinary tracker
+// lag on a frontend whose fields this panel does not recognise. Requiring both keeps
+// an unknown frontend on today's behaviour instead of refusing every save on it.
+//
 // Dependency-light: path normalization is imported; the store reads stay in the caller.
 // Unit-testable with plain fixtures.
 
@@ -45,6 +75,7 @@ import { normalizedWorkflowPath } from "./workflow-chat-identity.js";
 
 export const SAVE_PATH_GUARD_REASON = Object.freeze({
   STAMPED_PATH_FOREIGN: "stamped_path_foreign",
+  STALE_SNAPSHOT: "stale_snapshot",
 });
 
 /**
@@ -60,14 +91,30 @@ export const SAVE_PATH_GUARD_REASON = Object.freeze({
  *   state about to be serialized, or null when absent/unreadable.
  * @param {boolean} [input.stampedPathOwnedByOther] true when the workflow store still
  *   has a record at `stampedPath` that is NOT the workflow being saved.
- * @returns {{allow: true} | {allow: false, reason: string, destinationPath: string, stampedPath: string}}
+ * @param {boolean} [input.snapshotIsStale] panel#1563 — true only when the caller has
+ *   BOTH observations: upstream positively reports the pre-save capture was skipped,
+ *   AND the live root of this (active) workflow does not reproduce the state about to
+ *   be serialized. Absent/false → allow, exactly as before.
+ * @returns {{allow: true} | {allow: false, reason: string, destinationPath: string, stampedPath?: string}}
  */
 export function decideWorkflowSaveVerdict({
   destinationPath,
   destinationPersisted = false,
   stampedPath = null,
   stampedPathOwnedByOther = false,
+  snapshotIsStale = false,
 } = {}) {
+  // panel#1563 — ordered FIRST, and deliberately NOT gated on `destinationPersisted`.
+  // Overwriting an existing file with a stale snapshot destroys the old content, but a
+  // FIRST save that writes a stale snapshot is the same lost work reported as success:
+  // the user is told their canvas is on disk when part of it is not. Both refuse.
+  if (snapshotIsStale) {
+    return {
+      allow: false,
+      reason: SAVE_PATH_GUARD_REASON.STALE_SNAPSHOT,
+      destinationPath,
+    };
+  }
   if (!destinationPersisted) return { allow: true };
   const dest = normalizedWorkflowPath(destinationPath);
   const stamped = normalizedWorkflowPath(stampedPath);
@@ -91,6 +138,20 @@ export function workflowSaveRefusalError(verdict) {
   const dest = typeof verdict?.destinationPath === "string" && verdict.destinationPath
     ? verdict.destinationPath
     : "this workflow's file";
+  if (verdict?.reason === SAVE_PATH_GUARD_REASON.STALE_SNAPSHOT) {
+    return new Error(
+      `REFUSED to save: the state this save would write to "${dest}" is BEHIND the live ` +
+        `canvas, so the file would be missing changes the canvas already has. ComfyUI saves ` +
+        `the ChangeTracker snapshot rather than the graph on screen, and it refreshes that ` +
+        `snapshot first — but that refresh is skipped while a workflow is loading, while an ` +
+        `undo is restoring, or inside an open change transaction, and one of those is true ` +
+        `right now. NOTHING was written; the canvas is intact. This clears by itself once the ` +
+        `load/undo/transaction finishes — wait a moment and save again. If it persists, ` +
+        `reload the ComfyUI tab (panel_reload) and re-open the workflow ` +
+        `(panel_open_workflow); do NOT close the tab first, closing discards the canvas that ` +
+        `holds the only copy of those changes (panel#1563).`,
+    );
+  }
   const stamped = typeof verdict?.stampedPath === "string" && verdict.stampedPath
     ? verdict.stampedPath
     : "a different workflow";
