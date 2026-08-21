@@ -47,8 +47,16 @@
  * them. Every one of those types is fetched, and the returned map REFUSES to answer for any
  * type outside that set: an out-of-scope read THROWS rather than reading as absent. So the
  * #716/#821 failure mode is removed BY CONSTRUCTION rather than by remembering not to trip
- * it — and the same trap doubles as the guard for the await this adds, since a promotion
- * that is relinked mid-fetch resolves to a type the map was never asked to cover.
+ * it.
+ *
+ * WHAT THAT TRAP DOES **NOT** COVER, corrected here because the first version of this note
+ * claimed it covered the whole of the await `set-widget.js` adds, and it does not. A
+ * promotion relinked mid-fetch that resolves deeper to a concrete node of a DIFFERENT type
+ * asks about a type this map was never given, so it throws and the write refuses. A relink
+ * to a node of the SAME type asks a question this map CAN answer, and nothing throws — which
+ * is correct, since the authorization is still true of the node actually driven. The full
+ * accounting of that window, including what genuinely does get older and why it is a
+ * stale-TARGET hazard rather than a fail-open of the #458 fence, is at the call site.
  *
  * FAIL-CLOSED IS UNCHANGED, IN BOTH DIRECTIONS.
  *
