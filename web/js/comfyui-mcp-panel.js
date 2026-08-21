@@ -16500,28 +16500,12 @@ const GRAPH_TOOL_EXECUTORS = {
       try {
         const inScope =
           batch > 1 ? nodesInPartialExecutionScope(rootGraph, preflightPrompt, partialTargets) : [];
-        controlDrive = driveControlHooksAcrossScopedBatch(inScope ?? []);
+        // `batchCount` is what lets the drive PROVE the hook calls it observed were its
+        // own: owning the batch means exactly 2 x batchCount invocations. Without it the
+        // drive attributes nothing, which is the fail-closed default (gate r2 P1-A).
+        controlDrive = driveControlHooksAcrossScopedBatch(inScope ?? [], { batchCount: batch });
       } catch {
         controlDrive = null; /* the run must survive a failure to arm the drive */
-      }
-      // #988 x #1998 (gate P1-2) — SUBTRACT ONLY WHAT WAS ACTUALLY ARMED. The suppression
-      // used to key on `controlDriveObservations` being non-null, and an empty array is
-      // non-null: a control the drive could not arm (one queue hook, an older frontend's
-      // widget shape, a node outside the scope) submitted identical prompts while the
-      // reply carried NEITHER the drive note NOR the repetition warning. MEASURED: with a
-      // single-hook control on the in-scope KSampler, the four posts carried seed 707000
-      // four times and `repeating_controls_note` was absent. Absence of evidence read as
-      // evidence of success — and the empty-array check would not even have caught it,
-      // because an off-scope control had filled the array.
-      if (controlDrive?.armedWidgets?.size) {
-        try {
-          repeatingControls = findRepeatingControlWidgets(
-            collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []),
-            { skip: controlDrive.armedWidgets },
-          );
-        } catch {
-          /* keep the unfiltered scan — over-warning is the safe direction here */
-        }
       }
       try {
         runScopeResult = await dispatchScopedRun({
@@ -16556,6 +16540,33 @@ const GRAPH_TOOL_EXECUTORS = {
         controlDriveObservations = controlDrive ? controlDrive.observe() : null;
       } catch {
         controlDriveObservations = null;
+      }
+      // #988 x #1998 (gate P1-2, narrowed by gate r2 P1-A) - SUBTRACT ONLY WHAT THE DRIVE
+      // CAN PROVE IT OWNED.
+      //
+      // The suppression first keyed on `controlDriveObservations` being non-null, and an
+      // empty array is non-null: a control the drive could not arm submitted identical
+      // prompts while the reply carried NEITHER the drive note NOR the warning (MEASURED:
+      // four posts of seed 707000 with `repeating_controls_note` absent). Keying it on
+      // "armed" fixed that but was still too generous - an armed control whose hook calls
+      // came from somewhere else was subtracted on the strength of another run's work. So
+      // the skip is now the ATTRIBUTED set: armed AND with exactly this batch's own
+      // invocation count behind it.
+      //
+      // RUN AFTER THE DISPATCH, and that is safe here even though #988's finding is
+      // deliberately a pre-dispatch one: this scan reads control MODES and node identity,
+      // and the drive mutates neither - it moves the GOVERNED value widget. The entries it
+      // produces are therefore the same before and after, which is pinned by a test.
+      try {
+        const attributed = controlDrive?.attributedWidgets?.() ?? null;
+        if (attributed?.size) {
+          repeatingControls = findRepeatingControlWidgets(
+            collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []),
+            { skip: attributed },
+          );
+        }
+      } catch {
+        /* keep the unfiltered scan - over-warning is the safe direction here */
       }
     }
     // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —

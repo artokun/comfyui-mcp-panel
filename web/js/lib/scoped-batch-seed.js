@@ -600,7 +600,15 @@ export function rgthreeFixedSeedNote(seeds, batchCount) {
  * Returns `{ armed, restore, observe }`. Fully defensive, like the rest of this module:
  * an unreadable node costs its own entry, never the run.
  */
-export function driveControlHooksAcrossScopedBatch(nodes) {
+
+export function driveControlHooksAcrossScopedBatch(nodes, { batchCount = null } = {}) {
+  // EXPECTED INVOCATIONS. ComfyUI fires beforeQueued and afterQueued once each per batch
+  // item, so a drive that owns the whole batch sees exactly `2 * batchCount` calls. Any
+  // other number means something we did not dispatch also ran through these hooks (or a
+  // rejected item cut the loop short), and `observe()` then refuses to claim anything —
+  // see the attribution note there. Absent batchCount attributes NOTHING, deliberately:
+  // a lenient default is how the previous version came to believe another run's work.
+  const expected = Number.isFinite(batchCount) && batchCount > 0 ? 2 * batchCount : null;
   const armed = [];
   const armedWidgets = new Set();
   const restores = [];
@@ -643,29 +651,82 @@ export function driveControlHooksAcrossScopedBatch(nodes) {
           // for. The FIRST sample is the value the first prompt was built from.
           const forced = (orig) =>
             function (opts) {
+              // NOT OUR RUN — forward it untouched and record nothing (gate r2 P1-A).
+              //
+              // Two cases, and both used to be swallowed. A retired wrapper is one this
+              // drive has already stood down from; and an invocation whose incoming flag is
+              // not `true` is not a partial execution at all, so it is provably not the run
+              // this override exists for — an unscoped queue that happened to land inside
+              // our window. EXECUTED against this module before the fix: an unrelated
+              // unscoped batch of 3 during an armed drive produced
+              // `observed: true, advanced: true, from 12345 to 12348` for a scoped batch
+              // that had not run a single item.
+              if (state.retired || opts?.isPartialExecution !== true) return orig.call(this, opts);
+              // COUNTED PER CALL, not per sample: `record()` fires on both sides of the
+              // original, so counting samples would have meant "4 per item" while the
+              // attribution check said 2. Counting the invocation itself is what the
+              // expectation below is actually about.
+              state.calls += 1;
               record();
               try {
-                return orig.call(this, { ...(opts ?? {}), isPartialExecution: false });
+                return orig.call(this, { ...opts, isPartialExecution: false });
               } finally {
                 record();
               }
             };
-          w.beforeQueued = forced(before);
-          w.afterQueued = forced(after);
+          const state = { retired: false, calls: 0 };
+          const wrappedBefore = forced(before);
+          const wrappedAfter = forced(after);
+          w.beforeQueued = wrappedBefore;
+          w.afterQueued = wrappedAfter;
           armedWidgets.add(w);
           restores.push(() => {
-            w.beforeQueued = before;
-            w.afterQueued = after;
+            // RETIRE, NEVER CLOBBER — and this pair of lines is the whole of gate r2 P1-B.
+            //
+            // Overlapping drives each captured whatever was installed when THEY armed, so
+            // the second's restore wrote the FIRST's wrapper back onto the widget and left
+            // it there, live. EXECUTED against this module before the fix:
+            //
+            //   d1 = drive(nodes); d2 = drive(nodes); d1.restore(); d2.restore();
+            //   queueBatch(nodes, { batchCount: 3, isPartialExecution: true })
+            //     -> 12345, 12346, 12347     a SCOPED run advancing: #8774 broken for good
+            //
+            // Retiring FIRST and unconditionally makes this wrapper transparent however it
+            // is later reached, so a copy left installed by someone else's restore is inert
+            // rather than live. Unhooking only when OURS is still what is installed stops us
+            // clobbering a third party who wrapped on top of us between arming and now.
+            // Together they make nesting SAFE instead of forbidden — no exclusivity latch,
+            // and therefore no way for one missed restore to disable the feature for the
+            // life of the page. (The same rule run-scope-guard.js learned for its fetch
+            // guards: a superseded guard is retired, never unhooked.) After the fix the
+            // sequence above yields 12345, 12345, 12345.
+            state.retired = true;
+            if (w.beforeQueued === wrappedBefore) w.beforeQueued = before;
+            if (w.afterQueued === wrappedAfter) w.afterQueued = after;
           });
-          armed.push({ entry, seen });
+          armed.push({ entry, seen, widget: w, state });
         }
       } catch {
         /* one unreadable node costs its own entry, never the whole dispatch */
       }
     }
   }
+  // ONE predicate. `observe()` and `attributedWidgets()` answer the same question - "are
+  // these samples this drive's own?" - and two copies of it is two chances to disagree
+  // about whether a control may be subtracted from #988's warning.
+  const isAttributable = (a) => expected != null && a.state?.calls === expected;
   return {
     armed: armed.map((a) => ({ ...a.entry })),
+    /**
+     * The armed widgets whose samples this drive can PROVE are its own — the only ones
+     * the caller may subtract from #988's scan (gate r2 P1-A). An armed but unattributed
+     * control keeps its repetition warning, because we do not know what it did.
+     */
+    attributedWidgets() {
+      const out = new Set();
+      for (const a of armed) if (isAttributable(a)) out.add(a.widget);
+      return out;
+    },
     /**
      * The control widget OBJECTS this drive wrapped — the exact set #988's scan must
      * skip, so a control the drive could not reach keeps its repetition warning
@@ -688,15 +749,32 @@ export function driveControlHooksAcrossScopedBatch(nodes) {
         }
       }
     },
-    /** What each governed widget ACTUALLY did across the batch. */
+    /**
+     * What each governed widget ACTUALLY did across the batch — and only when this drive
+     * can PROVE the samples are its own (gate r2 P1-A).
+     *
+     * ATTRIBUTION IS CHECKED, NOT ASSUMED. `2 * batchCount` invocations is exactly what
+     * owning the whole batch looks like; any other count means either something we did not
+     * dispatch ran through these hooks, or a rejected item cut ComfyUI's loop short. In
+     * both cases this reports `attributable: false` and claims NOTHING — no advancement,
+     * no repetition verdict — and the caller then leaves #988's warning in place for that
+     * control. Saying "I cannot tell" is the whole point: the previous version said
+     * "advanced" on another run's work.
+     */
     observe() {
-      return armed.map(({ entry, seen }) => {
+      return armed.map((entryRef) => {
+        const { entry, seen } = entryRef;
+        const attributable = isAttributable(entryRef);
+        if (!attributable) {
+          return { ...entry, attributable: false, observed: false, distinct_values: 0, advanced: false };
+        }
         const keys = seen.map((v) =>
           typeof v === "object" && v !== null ? JSON.stringify(v) : `${typeof v}:${String(v)}`,
         );
         const distinct = new Set(keys).size;
         return {
           ...entry,
+          attributable: true,
           observed: seen.length > 0,
           distinct_values: distinct,
           advanced: distinct > 1,
@@ -720,7 +798,12 @@ export function driveControlHooksAcrossScopedBatch(nodes) {
  */
 export function scopedBatchDriveNote(observations, batchCount) {
   if (!Array.isArray(observations) || !(Number(batchCount) > 1)) return "";
-  const advancingMode = observations.filter((o) => o && ADVANCING.has(o.mode));
+  // An UNATTRIBUTED control is described by neither half of this note: we do not know what
+  // it did, so we neither announce an advance nor warn about a repeat. #988's warning keeps
+  // it instead, because the caller does not subtract it from that scan (gate r2 P1-A).
+  const advancingMode = observations.filter(
+    (o) => o && ADVANCING.has(o.mode) && o.attributable !== false,
+  );
   if (!advancingMode.length) return "";
   const moved = advancingMode.filter((o) => o.advanced);
   const stuck = advancingMode.filter((o) => !o.advanced);

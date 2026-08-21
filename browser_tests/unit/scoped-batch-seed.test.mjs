@@ -741,7 +741,7 @@ test("#1998 a control detected by OPTION SHAPE is driven even when it is renamed
 
 test("#1998 observe() reports what the widget DID, not what the drive asked for", () => {
   const nodes = [controlledSeedNode(42, "randomize"), controlledSeedNode(43, "randomize", { linkFed: true })];
-  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 3 });
   queueBatch(nodes, { batchCount: 3, isPartialExecution: true });
   const seen = drive.observe();
   drive.restore();
@@ -755,7 +755,7 @@ test("#1998 observe() reports what the widget DID, not what the drive asked for"
 
 test("#1998 the note names what advanced and warns about what did not", () => {
   const nodes = [controlledSeedNode(42, "randomize"), controlledSeedNode(43, "increment", { linkFed: true })];
-  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 4 });
   queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
   const note = scopedBatchDriveNote(drive.observe(), 4);
   drive.restore();
@@ -828,9 +828,10 @@ test("#1998 a control the drive ARMED is described once, by the drive - never al
   // invariant it was reaching for is behavioural and is now asserted as such - a control
   // gets EXACTLY ONE description, and which one depends on whether it was armed.
   const armed = [controlledSeedNode(42, "randomize")];
-  const drive = driveControlHooksAcrossScopedBatch(armed);
+  const drive = driveControlHooksAcrossScopedBatch(armed, { batchCount: 4 });
   queueBatch(armed, { batchCount: 4, isPartialExecution: true });
-  const uncovered = findRepeatingControlWidgets(armed, { skip: drive.armedWidgets });
+  // The caller subtracts the ATTRIBUTED set, not merely the armed one (gate r2 P1-A).
+  const uncovered = findRepeatingControlWidgets(armed, { skip: drive.attributedWidgets() });
   const driveNote = scopedBatchDriveNote(drive.observe(), 4);
   drive.restore();
   assert.deepEqual(uncovered, [], "an armed control must not also be named by #988");
@@ -993,7 +994,7 @@ test("#1998 P1-1 CALL SITE: the drive is armed over the SCOPE, and null arms not
   );
 });
 
-test("#1998 P1-2 CALL SITE: the #988 warning is subtracted by ARMED WIDGETS, not suppressed wholesale", () => {
+test("#1998 P1-2 CALL SITE: the #988 warning is subtracted by ATTRIBUTED widgets, not suppressed wholesale", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const sites = [...src.matchAll(/const repeatingNote = ([^\n;]+)/g)].map((m) => m[1].trim());
   assert.equal(sites.length, 1);
@@ -1002,9 +1003,162 @@ test("#1998 P1-2 CALL SITE: the #988 warning is subtracted by ARMED WIDGETS, not
     "scopedBatchSeedNote(repeatingControls, batch)",
     `the note must not be gated on the observation array existing, got: ${sites[0]}`,
   );
+  // ARMED is not enough (gate r2 P1-A): a control whose hook calls came from another run
+  // was being subtracted on the strength of that run's work. Only the ATTRIBUTED set may
+  // silence #988's warning.
   assert.match(
     src,
-    /skip: controlDrive\.armedWidgets/,
-    "the subtraction must come from what was actually armed",
+    /const attributed = controlDrive\?\.attributedWidgets\?\.\(\) \?\? null;/,
+    "the subtraction must come from what the drive can PROVE it owned",
   );
+  assert.match(src, /\{ skip: attributed \}/, "and that set is what the scan skips");
+  assert.doesNotMatch(
+    src,
+    /skip: controlDrive\.armedWidgets/,
+    "subtracting the merely-armed set is gate r2 P1-A",
+  );
+  assert.match(
+    src,
+    /driveControlHooksAcrossScopedBatch\(inScope \?\? \[\], \{ batchCount: batch \}\)/,
+    "the drive cannot attribute anything without the batch size",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #1998 gate r2 — the wrapper was unscoped in TIME, the way it had been unscoped
+// in SPACE. Both reproduced by EXECUTING this module before either was fixed.
+// ---------------------------------------------------------------------------
+
+test("#1998 r2 P1-A an UNSCOPED queue inside our window is not ours: nothing is claimed", () => {
+  // BEFORE: an unrelated unscoped batch of 3 during an armed drive produced
+  //   observed:true advanced:true from 12345 to 12348 distinct:4
+  // for a scoped batch that had not run a single item.
+  const nodes = [controlledSeedNode(42, "increment")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 4 });
+  const foreign = queueBatch(nodes, { batchCount: 3, isPartialExecution: false });
+  drive.restore();
+  const o = drive.observe()[0];
+  assert.deepEqual(foreign, [12345, 12346, 12347], "the other run is left completely alone");
+  assert.equal(o.attributable, false, "its calls are not evidence about our batch");
+  assert.equal(o.advanced, false, "so we claim no advancement");
+  assert.equal(o.observed, false);
+  assert.equal(scopedBatchDriveNote(drive.observe(), 4), "", "and the note says nothing about it");
+});
+
+test("#1998 r2 P1-A an unattributed control keeps #988's warning", () => {
+  const nodes = [controlledSeedNode(42, "increment")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 4 });
+  queueBatch(nodes, { batchCount: 3, isPartialExecution: false }); // not ours
+  drive.restore();
+  assert.equal(drive.attributedWidgets().size, 0, "nothing may be subtracted");
+  const uncovered = findRepeatingControlWidgets(nodes, { skip: drive.attributedWidgets() });
+  assert.equal(uncovered.length, 1);
+  assert.match(scopedBatchSeedNote(uncovered, 4), /node 42/);
+});
+
+test("#1998 r2 P1-A attribution is EXACT: one call too few or too many is not our batch", () => {
+  for (const actual of [3, 5]) {
+    const nodes = [controlledSeedNode(42, "increment")];
+    const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 4 });
+    queueBatch(nodes, { batchCount: actual, isPartialExecution: true });
+    drive.restore();
+    assert.equal(drive.observe()[0].attributable, false, `batch of ${actual} against an expected 4`);
+  }
+  // …and the exact count does attribute.
+  const nodes = [controlledSeedNode(42, "increment")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 4 });
+  queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  const o = drive.observe()[0];
+  assert.equal(o.attributable, true);
+  assert.equal(o.advanced, true);
+  assert.equal(o.from, 12345);
+  assert.equal(o.to, 12349);
+});
+
+test("#1998 r2 P1-A without a batch size the drive attributes NOTHING (fail closed)", () => {
+  const nodes = [controlledSeedNode(42, "increment")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  assert.equal(drive.observe()[0].attributable, false, "a lenient default is how this bug happened");
+  assert.equal(drive.attributedWidgets().size, 0);
+});
+
+test("#1998 r2 P1-B overlapping drives must not resurrect a stale wrapper", () => {
+  // BEFORE: d2's restore wrote d1's wrapper back onto the widget and left it LIVE, so a
+  // later single scoped preview advanced despite isPartialExecution:true —
+  //   queueBatch(..., isPartialExecution: true) -> 12345, 12346, 12347
+  const nodes = [controlledSeedNode(42, "increment")];
+  const d1 = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 2 });
+  const d2 = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 2 });
+  d1.restore();
+  d2.restore();
+  const seeds = queueBatch(nodes, { batchCount: 3, isPartialExecution: true });
+  assert.deepEqual(seeds, [12345, 12345, 12345], "a scoped run must NOT advance once every drive is done");
+});
+
+test("#1998 r2 P1-B restoring out of order is safe in either direction", () => {
+  for (const reverse of [false, true]) {
+    const nodes = [controlledSeedNode(42, "increment")];
+    const a = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 2 });
+    const b = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 2 });
+    const order = reverse ? [b, a] : [a, b];
+    for (const d of order) d.restore();
+    assert.deepEqual(
+      queueBatch(nodes, { batchCount: 2, isPartialExecution: true }),
+      [12345, 12345],
+      `restore order ${reverse ? "b,a" : "a,b"}`,
+    );
+  }
+});
+
+test("#1998 r2 P1-B a third party wrapping on top of us is never clobbered", () => {
+  const nodes = [controlledSeedNode(42, "increment")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 2 });
+  const control = nodes[0].widgets[1];
+  // Someone else wraps AFTER us and expects to stay in the chain.
+  let foreignSaw = 0;
+  const ours = control.afterQueued;
+  control.afterQueued = function (opts) {
+    foreignSaw += 1;
+    return ours.call(this, opts);
+  };
+  const theirs = control.afterQueued;
+  drive.restore();
+  assert.equal(control.afterQueued, theirs, "our restore must not remove their wrapper");
+  queueBatch(nodes, { batchCount: 2, isPartialExecution: true });
+  assert.ok(foreignSaw > 0, "and theirs must still run");
+  assert.equal(
+    nodes[0].widgets[0].value,
+    12345,
+    "while ours, being retired, no longer advances a scoped run",
+  );
+});
+
+test("#1998 r2 the #988 scan is invariant to the drive having run — so filtering it AFTER dispatch is safe", () => {
+  // The caller subtracts post-dispatch. That is only legitimate because this scan reads
+  // control MODES and node identity, and the drive moves the GOVERNED value widget.
+  const nodes = [controlledSeedNode(42, "increment"), ksampler(7, "randomize")];
+  const before = findRepeatingControlWidgets(nodes);
+  const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 3 });
+  queueBatch(nodes, { batchCount: 3, isPartialExecution: true });
+  drive.restore();
+  assert.deepEqual(findRepeatingControlWidgets(nodes), before, "same entries before and after");
+});
+
+test("#1998 r2 P1-A the passthrough is what ignores a foreign run — not merely the call count", () => {
+  // ISOLATION. The attribution check alone was masking this: a foreign batch of a
+  // DIFFERENT size already fails the count, so removing the "is this a partial execution"
+  // passthrough changed nothing observable. Give the foreign run EXACTLY the size this
+  // drive expects, and only the passthrough can still tell the two apart.
+  const nodes = [controlledSeedNode(42, "increment")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes, { batchCount: 4 });
+  const foreign = queueBatch(nodes, { batchCount: 4, isPartialExecution: false });
+  drive.restore();
+  const o = drive.observe()[0];
+  assert.deepEqual(foreign, [12345, 12346, 12347, 12348], "the unscoped run advances on its own");
+  assert.equal(o.attributable, false, "an unscoped queue is provably not the run we override");
+  assert.equal(o.advanced, false);
+  assert.equal(drive.attributedWidgets().size, 0, "and it may not silence #988's warning");
 });
