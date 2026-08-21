@@ -197,6 +197,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
+import { withWorkflowUuid } from "./lib/graph-view-identity.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
@@ -8766,25 +8767,38 @@ function refreshPromotedParents(parents, canvas) {
  *  lockstep (#220/#308). */
 function describeActiveGraph(graph) {
   const root = app?.graph;
-  if (!root || !graph || graph === root) return { scope: "root" };
+  // Reads may pass the #995 stale-tag bypass without rewriting root.extra. Use
+  // the live workflow object's canonical identity for replies, never a possibly
+  // historical root tag. If the active workflow cannot be read, omit identity.
+  let workflowUuid = null;
+  try {
+    const workflow = activeWorkflowRef();
+    if (workflow) workflowUuid = workflowObjectUuid(workflow) || workflowStableUuid(workflow);
+  } catch {
+    workflowUuid = null;
+  }
+  const withLiveIdentity = (viewing) => withWorkflowUuid(viewing, root, workflowUuid);
+  if (!root || !graph || graph === root) return withLiveIdentity({ scope: "root" });
   const owner = findSubgraphOwner(root, graph);
   if (owner) {
-    return {
+    return withLiveIdentity({
       scope: "subgraph",
       owner_node_id: owner.id ?? null,
       title: owner.title ?? graph?.name ?? "subgraph",
-    };
+    });
   }
   // Ownerless but authoritatively part of the root via its subgraphs registry — a
   // valid registry-owned subgraph, exactly what resolveScope keeps (NOT stale). Must
   // report "subgraph" here too, else `viewing` would say root while reads/edits act
   // on the subgraph — reintroducing the #308/#220 divergence.
   if (isSubgraphInRoot(root, graph)) {
-    return { scope: "subgraph", owner_node_id: null, title: graph?.name ?? "subgraph" };
+    return withLiveIdentity(
+      { scope: "subgraph", owner_node_id: null, title: graph?.name ?? "subgraph" },
+    );
   }
   // Neither owned nor registered — a stale reference; report root to match
   // getGraphCtx()'s reconciliation (read + edit stay in lockstep).
-  return { scope: "root" };
+  return withLiveIdentity({ scope: "root" });
 }
 
 // ---- per-turn graph snapshots (rollback foundation, #44) -------------------
@@ -12551,12 +12565,12 @@ const GRAPH_TOOL_EXECUTORS = {
     };
     if (upstream_of != null) {
       const seed = String(upstream_of);
-      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `upstream_of node ${clipDiag(seed)} not found (${total} nodes in view).` };
+      if (!byId.has(seed)) return { viewing: describeActiveGraph(graph), total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `upstream_of node ${clipDiag(seed)} not found (${total} nodes in view).` };
       scope = closure(up, seed, maxDepth);
     }
     if (downstream_of != null) {
       const seed = String(downstream_of);
-      if (!byId.has(seed)) return { total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `downstream_of node ${clipDiag(seed)} not found (${total} nodes in view).` };
+      if (!byId.has(seed)) return { viewing: describeActiveGraph(graph), total, candidates: 0, matched: 0, shown: 0, truncated: false, text: `downstream_of node ${clipDiag(seed)} not found (${total} nodes in view).` };
       const d = closure(down, seed, maxDepth);
       scope = scope ? new Set([...scope].filter((x) => d.has(x))) : d;
     }
@@ -13241,6 +13255,7 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!sub) throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
     const inner = [...(sub._nodes ?? sub.nodes ?? [])];
     return {
+      viewing: describeActiveGraph(graph),
       subgraph_of: { node_id: node.id, title: node.title },
       // #636 — the inner nodes below are the DEFINITION's; the parent instance's
       // promoted widgets can override them. Carry both, labelled, so a legitimate
@@ -21595,7 +21610,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // only exists inside the skipped parent and navigated nowhere useful (#412).
   async graph_exit_subgraph() {
     const { app: comfyApp, graph, canvas, rootGraph } = getGraphCtx();
-    if (graph === rootGraph) return { viewing: { scope: "root" }, note: tr("panel.already_at_root", "already at root") };
+    if (graph === rootGraph) return { viewing: describeActiveGraph(graph), note: tr("panel.already_at_root", "already at root") };
     if (typeof canvas.setGraph !== "function") {
       throw new Error("subgraph navigation unavailable on this frontend");
     }
