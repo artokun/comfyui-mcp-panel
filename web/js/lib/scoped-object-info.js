@@ -86,6 +86,35 @@
  * against `GET /object_info/KSampler` 3,246 bytes / 1.2 ms on a 63-pack install; the #1560
  * reporter measured `/object_info/SmartResolution` at ~2.7 KB / 200 on an install where the
  * whole dump misses a 5,000 ms share. A promoted write asks for at most a handful of these.
+ *
+ * AND RE-MEASURED HERE, ON THE REPORTER'S VERSION FAMILY, because everything above rests on
+ * a route contract #767 established on ComfyUI 0.30.2 and this ships against 0.33.x. A
+ * comment that asserts a premise nobody re-checked is how a dormant fix reads as correct, so
+ * a live ComfyUI **0.33.2** was stood up and asked directly:
+ *
+ *     GET /object_info/KSampler                 200   2,994 bytes   0.21 s   {"KSampler": {…}}
+ *     GET /object_info/DefinitelyNotARealClass  200       2 bytes   0.21 s   {}
+ *     GET /object_info                          200   1,540,926 bytes        853 types
+ *
+ * Three things that matter, and the second is the one this module's safety actually rests on:
+ *
+ *   1. ABSENCE IS STILL `{}`/200, not a 404, on 0.33.x — the contract `readOneType` treats as
+ *      a definitive absence, now confirmed on the version the reporter runs rather than
+ *      inherited from a measurement three minor versions old.
+ *   2. THE PER-CLASS DEF IS BYTE-IDENTICAL to the whole map's entry for the same class:
+ *      `JSON.stringify(perClass.KSampler) === JSON.stringify(whole.KSampler)` is `true`. So
+ *      for the types it covers this is not a narrower or differently-shaped payload that
+ *      merely happens to answer membership — it is the same object the whole map would have
+ *      handed over, which is what makes the per-type readers downstream (`uploadInputConfig`,
+ *      `refreshCombos`, `serverDeclaresEmptyComboOptions`) correct on it and not merely safe.
+ *   3. That whole map is 1.5 MB with ZERO custom packs installed. The reporter has hundreds.
+ *
+ * WHAT THIS STILL DOES NOT ESTABLISH, stated rather than glossed: a PROXY answering 200 with
+ * a non-schema JSON object would read as a definitive absence and refuse a type the backend
+ * does define. That direction is fail-closed — a refusal, never a wrongful write — and a
+ * proxy answering 200 with HTML fails the parse and disqualifies the whole scoped map
+ * instead. Anyone who finds a shape that fails the OTHER way should treat this paragraph as
+ * the thing that was wrong.
  */
 
 import { withTimeout } from "./bounded-step.js";
