@@ -36,6 +36,7 @@ import {
   classifyOpenOutcome,
 } from "../../web/js/lib/open-outcome.js";
 import { savedWorkflowHandle } from "../../web/js/lib/bridge-route.js";
+import { rawWorkflowObject, sameWorkflowObject } from "../../web/js/lib/workflow-chat-identity.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -122,6 +123,26 @@ function namedFunctionSource(src, name) {
     if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1);
   }
   return null;
+}
+
+/** Prelude so extracted `activeWorkflowUuidForOpenReply` can call the shipped
+ *  proxy-safe identity helper instead of a sandbox `===`. */
+const SAME_WORKFLOW_PRELUDE = `${rawWorkflowObject.toString()}\n${sameWorkflowObject.toString()}\n`;
+
+function compileActiveWorkflowUuidForOpenReply(paramNames, ...paramValues) {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const pathSource = namedFunctionSource(src, "savedWorkflowPath");
+  const canonicalUuidSource = namedFunctionSource(src, "isCanonicalWorkflowInstanceUuid");
+  const identitySource = namedFunctionSource(src, "establishedWorkflowReplyIdentity");
+  const helperSource = namedFunctionSource(src, "activeWorkflowUuidForOpenReply");
+  assert.ok(
+    pathSource && canonicalUuidSource && identitySource && helperSource,
+    "the reply identity check must live in the shipped panel source",
+  );
+  return new Function(
+    ...paramNames,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+  )(...paramValues);
 }
 
 const receiptFor = (requested, extra = {}) =>
@@ -993,6 +1014,12 @@ test("#716 wiring: post-open and active workflow responses carry the live instan
     /activeWorkflowRef\s*\(/,
     "the helper must not take a second live read of the active workflow",
   );
+  // #1581 — the identity gate is the proxy-safe helper, never a raw `!==`.
+  // `target` comes from openWorkflows (Vue proxies) and the snapshot from
+  // activeWorkflowRef() (often the raw object). `!==` withholds workflow_uuid
+  // from a successful open of an already-open saved tab.
+  assert.match(helperCode, /sameWorkflowObject\s*\(\s*active,\s*target\s*\)/);
+  assert.doesNotMatch(helperCode, /active\s*!==\s*target/);
 });
 
 test("#716 P1: service rebind during workflow_open omits the former target UUID", () => {
@@ -1017,7 +1044,7 @@ test("#716 P1: service rebind during workflow_open omits the former target UUID"
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => currentService.activeWorkflow,
     (wf) => workflowUuids.get(wf),
@@ -1076,7 +1103,7 @@ test("#1014: open-reply uuid is decided against the shared snapshot, not a secon
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => {
       liveReads += 1;
@@ -1106,6 +1133,62 @@ test("#1014: open-reply uuid is decided against the shared snapshot, not a secon
   // succeed here by re-reading.
   assert.equal(replyUuid(openedTarget), null, "a missing snapshot omits rather than guessing from a second live read");
   assert.equal(liveReads, 0, "the helper must not consult the live binding at all");
+});
+
+test("#1581: opening an already-open saved tab still publishes its fence uuid across a Vue proxy", () => {
+  // The reporter opened a previously saved workflow that was already a tab, then
+  // the next panel_graph_outline was refused: command stamped for the OLD
+  // instance, canvas reporting the NEW one. The open itself succeeded.
+  //
+  // Root cause: activeWorkflowUuidForOpenReply compared target and the live
+  // snapshot with `!==`. ComfyUI's workflow service hands out Vue proxies from
+  // openWorkflows (how an already-open tab is found) while activeWorkflowRef()
+  // can yield the raw object the uuid WeakMap is keyed on. A successful switch
+  // to that tab then withheld workflow_uuid, so the MCP never refreshed its
+  // command fence. sameWorkflowObject is the comparison the rest of the panel
+  // already uses for this split.
+  const tracker = { id: "shared-tracker" };
+  const raw = { isPersisted: true, isTemporary: false, path: "workflows/saved.json", changeTracker: tracker };
+  const proxy = {
+    __v_raw: raw,
+    isPersisted: true,
+    isTemporary: false,
+    path: "workflows/saved.json",
+    changeTracker: tracker,
+  };
+  const uuid = "115f55be-528e-4d7b-8af9-d732ae2e3bb6";
+  const uuids = new WeakMap([[raw, uuid]]);
+  const replyUuid = compileActiveWorkflowUuidForOpenReply(
+    ["activeWorkflowRef", "workflowObjectUuid", "savedWorkflowHandle"],
+    () => proxy,
+    (wf) => uuids.get(rawWorkflowObject(wf)),
+    savedWorkflowHandle,
+  );
+
+  assert.notEqual(proxy, raw, "the Vue-proxy shape is a different reference");
+  assert.equal(
+    sameWorkflowObject(proxy, raw),
+    true,
+    "the shipped identity helper treats proxy and raw as the same tab",
+  );
+  assert.equal(
+    replyUuid(proxy, raw),
+    uuid,
+    "an already-open saved tab found via openWorkflows still publishes the fence uuid",
+  );
+  assert.equal(
+    replyUuid(raw, proxy),
+    uuid,
+    "the inverse carrier split publishes too — the snapshot may be the proxy",
+  );
+
+  const other = { isPersisted: true, isTemporary: false, path: "workflows/other.json", changeTracker: { id: "other" } };
+  uuids.set(other, "e39a0a22-9ab2-43b8-b9b9-f44e76acacb0");
+  assert.equal(
+    replyUuid(proxy, other),
+    null,
+    "a genuinely different live tab still withholds — the #716 fail-closed is unchanged",
+  );
 });
 
 test("#716 P1: service rebind during workflow_list reports only the current active UUID", () => {
@@ -1159,7 +1242,7 @@ test("#716 P1: a malformed truthy active binding cannot mint reply identity", ()
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => malformedActive,
     (wf) => workflowUuids.get(wf),
@@ -1213,7 +1296,7 @@ test("#760: an unsaved canvas with an ESTABLISHED uuid can refresh the fence", (
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
     (wf) => workflowUuids.get(wf),
@@ -1244,7 +1327,7 @@ test("#760: an unsaved canvas with NO established uuid still publishes nothing (
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => unestablished,
     () => undefined, // never established
@@ -1273,7 +1356,7 @@ test("#760: a non-canonical uuid on an unsaved canvas is still refused", () => {
     "workflowObjectUuid",
     "savedWorkflowHandle",
     "workflowTabId",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => temporaryActive,
     () => "tmp:not-a-uuid", // the ROUTING handle, wrongly offered as the uuid
@@ -1303,7 +1386,7 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
     "activeWorkflowRef",
     "workflowObjectUuid",
     "savedWorkflowHandle",
-    `${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
+    `${SAME_WORKFLOW_PRELUDE}${pathSource}; ${canonicalUuidSource}; ${identitySource}; ${helperSource}; return activeWorkflowUuidForOpenReply;`,
   )(
     () => active,
     (wf) => workflowUuids.get(wf),

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- opening an already-open saved workflow publishes the live fence uuid, so the next graph read is not refused as a stale instance (#1581)
+
 ## [0.15.36] - 2026-08-22
 
 ### Fixed
@@ -28,7 +31,6 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - close wrapped secret and version regressions
 - the proxy attribution needs a body that NAMES a responder
-
 
 ## [0.15.33] - 2026-08-21
 
