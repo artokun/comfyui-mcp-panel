@@ -193,6 +193,14 @@ export function unavailableRequiredWidgetReport(
   for (const type of widgetDeclared) socketDeclared.delete(type);
   for (const type of nonNativeDeclared) nativeWidgetDeclared.delete(type);
 
+  // #1584 — `*` is ComfyUI's wildcard output type, not a literal datatype. A live
+  // wildcard producer such as JsonParseNode can feed a custom input like DICT, so an
+  // exact membership test would still misclassify that socket as a widget waiting for
+  // registration. This only widens the OUTPUT-side proof; the input-level
+  // `socketDeclared` check below remains required so a value-bearing custom widget is
+  // never waived merely because some node emits a wildcard.
+  const wildcardOutputProven = knownSocketTypes?.has?.("*") === true;
+
   const report = [];
   for (const [type, inputs] of inputsByType) {
     // The registry is keyed by the DECLARED type exactly as written — including
@@ -217,7 +225,8 @@ export function unavailableRequiredWidgetReport(
       (member) =>
         SAFE_SOCKET_TYPES.has(member) ||
         isCore3dFileType(member) ||
-        knownSocketTypes?.has?.(member) === true,
+        knownSocketTypes?.has?.(member) === true ||
+        wildcardOutputProven,
     );
     // A SINGLE built-in connection datatype is waived on the type alone. Unchanged from
     // before this fix, and sound for the same reason it was then: ComfyUI registers no
