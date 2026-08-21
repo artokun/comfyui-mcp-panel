@@ -177,7 +177,12 @@ test("a line-wrapped credential does not leak its continuation", () => {
   const viaBody = httpBodyPrefix(`<html><body>invalid request: ${wrapped}</body></html>`);
   assert.doesNotMatch(viaBody, /bbbbbbbbbbbbbbbbbbbb/);
   // Ordinary prose after a labelled value keeps its words.
-  assert.match(scrubSecretShapedText("token: abc contact support"), /contact support/);
+  // An ADDRESS label is not a secret and stays bounded, so the page's own footer
+  // survives next to it.
+  assert.match(
+    scrubSecretShapedText("Your IP: 203.0.113.42 Performance & security by Cloudflare"),
+    /Performance & security by Cloudflare/,
+  );
 });
 
 test("a short all-letter wrapped fragment is consumed too", () => {
@@ -189,8 +194,30 @@ test("a short all-letter wrapped fragment is consumed too", () => {
   assert.doesNotMatch(scrubbed, /abcdefghijklmnopqrst/);
   assert.doesNotMatch(scrubbed, /uvwx/, "the short wrapped fragment leaked");
   assert.doesNotMatch(httpBodyPrefix(`<html><body>${wrapped}</body></html>`), /uvwx/);
-  // …and the space case still keeps prose.
-  assert.match(scrubSecretShapedText("api_key: abc12345 please retry"), /please retry/);
+});
+
+// codex gate: shape cannot bound a secret's VALUE at all — a password contains
+// characters no credential alphabet lists, and can contain spaces. A SECRET
+// label therefore takes the rest of its line, and the wrapped continuation too.
+test("a secret label fails closed to the end of its line", () => {
+  for (const [input, mustNotContain] of [
+    ["password:p@ssword", "p@ss"],
+    ["password: my secret", "my secret"],
+    ["Set-Cookie: session=abc123; Path=/; HttpOnly", "abc123"],
+    ["api_key: sk!live!8fbc 21aa 77de", "77de"],
+  ]) {
+    const out = scrubSecretShapedText(input);
+    assert.doesNotMatch(out, new RegExp(mustNotContain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), input);
+    assert.match(out, /«redacted»/, input);
+  }
+  // A label WITHOUT a delimiter is prose and is left completely alone — that is
+  // what keeps the prefix worth printing.
+  assert.equal(scrubSecretShapedText("Authorization required"), "Authorization required");
+  assert.equal(scrubSecretShapedText("auth failed for user"), "auth failed for user");
+  assert.equal(scrubSecretShapedText("Bearer token required"), "Bearer token required");
+  // …and so is an nginx upstream line, the most useful token on such a page.
+  const upstream = "connect() failed while connecting to upstream: http://127.0.0.1:8188/free";
+  assert.equal(scrubSecretShapedText(upstream), upstream);
 });
 
 test("the body prefix is cut on code points, never inside a surrogate pair", () => {

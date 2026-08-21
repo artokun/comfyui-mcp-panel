@@ -97,63 +97,65 @@ const REDACTED = "«redacted»";
  *     length of the identifiers an error page legitimately prints (a Cloudflare
  *     Ray ID is 16–20) so a useful diagnostic is not redacted into uselessness.
  *
- * The label list also covers the CDN convention of printing the VIEWER'S OWN
- * ADDRESS on an error page ("Your IP: …", which the reported Cloudflare 502
- * carries). That is not a credential, but this text is what a user pastes into a
- * public bug report, so the labelled form goes. A BARE address is deliberately
- * left alone: an nginx 502 body's `upstream: http://127.0.0.1:8188` is often the
- * single most useful token on the page, and redacting by shape here would remove
- * the diagnosis along with the PII.
- *
- * A DELIMITER (`:` or `=`) is required for the labelled rule. Allowing a bare
+ * A DELIMITER (`:` or `=`) is required for every labelled rule. Allowing a bare
  * space would turn "Authorization required" into "Authorization: «redacted»" and
  * "auth failed" into "auth: «redacted»" — destroying the diagnosis in the name of
  * protecting it. The one unlabelled-but-unambiguous form, `Bearer <token>`, gets
- * its own rule; the scheme is consumed as part of the labelled value so a
- * `Authorization: Bearer sk-…` redacts the TOKEN and not just the word "Bearer".
+ * its own rule.
  *
  * `/` is excluded from the opaque-run alphabet so an ordinary URL on the page
  * survives: with it in, `//www.cloudflare.com/5xx-error-landing` is a 38-char run
  * and collapses to a redaction marker. Real credentials still have a 32+ run of
  * the remaining alphabet between any slashes.
+ *
+ * ## Why a SECRET label takes the whole line
+ *
+ * Shape cannot bound a secret's value, and three gate rounds proved it one
+ * character at a time: `Bearer aaaa…\nbbbb…` wrapped past the first whitespace,
+ * `…mnopqrst\nuvwx` ended in four letters that no shape rule separates from a
+ * word, and `password:p@ssword` contains a character no credential alphabet
+ * includes. Each fix bought one case. So a SECRET label stops trying: everything
+ * after the delimiter to the end of the line goes, plus any wrapped continuation
+ * on the lines below (a wrap has no space before the break, so a following run of
+ * credential characters is the same token).
+ *
+ * That is json-guard's rule too — fail closed, VISIBLY. The reader still sees
+ * `password: «redacted»` and knows exactly what was withheld and where, which is
+ * why an over-broad redaction here costs far less than one leaked credential in
+ * text a user pastes into a public issue. The price is real and accepted:
+ * `Authorization: this endpoint requires a key` loses its sentence.
+ *
+ * ADDRESS labels are NOT secrets and keep the bounded form. They exist for the
+ * CDN convention of printing the viewer's own address ("Your IP: …", which the
+ * reported Cloudflare 502 carries) — PII in text destined for a bug report, but
+ * not a credential, so taking the rest of the line would eat the page's own
+ * footer for nothing. A BARE address is left alone entirely: an nginx body's
+ * `upstream: http://127.0.0.1:8188` is often the most useful token on the page.
  */
-const CRED_LABELS =
+const SECRET_LABELS =
   "authorization|auth|bearer|token|access[-_]?token|api[-_]?key|apikey|secret|password|passwd|pwd" +
-  "|session[-_]?id|sessionid|cookie|your ip|client ip|remote ip|remote addr|x-forwarded-for";
+  "|session[-_]?id|sessionid|set-cookie|cookie";
+const ADDRESS_LABELS = "your ip|client ip|remote ip|remote addr|x-forwarded-for";
 /** One run of credential-alphabet characters. */
 const CRED = "[A-Za-z0-9._\\-+/=]";
-/**
- * The CONTINUATION of a value that arrived line-wrapped.
- *
- * `Authorization: Bearer aaaa…\nbbbb…` redacted only as far as the first
- * whitespace and handed the second half to the caller. The fix has to separate a
- * WRAP from a word break, and the separator itself is the evidence:
- *
- *   - across a NEWLINE, any run of credential characters is consumed, whatever
- *     it looks like. A hard line break immediately after a credential value is a
- *     wrap of that value; shape cannot help here, because the tail of a token can
- *     be four letters (`…mnopqrst\nuvwx`) and so can a word. Fail closed, and pay
- *     for it with at most one eaten word after a hard newline.
- *   - across a SPACE, only tokens that still look like credential material — they
- *     contain a digit, or run 16+ characters. A space is a word separator, so
- *     ordinary prose after a labelled value ("token: abc contact support") keeps
- *     its words, which is what makes the prefix worth printing at all.
- *
- * This runs BEFORE whitespace is collapsed (see `httpBodyPrefix`), which is what
- * keeps the two cases distinguishable.
- */
-const CRED_CONT = `(?:[\\r\\n]+[ \\t]*${CRED}+|[ \\t]+(?:${CRED}*\\d${CRED}*|${CRED}{16,}))*`;
+/** A value that arrived LINE-WRAPPED continues on the next line with no space
+ *  before the break, so a following run of credential characters is the same
+ *  token. Applied after a to-end-of-line secret redaction. */
+const WRAP_CONT = `(?:[\\r\\n]+[ \\t]*${CRED}+)*`;
 
 export function scrubSecretShapedText(text) {
-  const labelled = new RegExp(
-    `\\b(${CRED_LABELS})\\b\\s*[:=]\\s*(?:bearer\\s+|basic\\s+|token\\s+)?` +
-      `(?:"[^"]*"|'[^']*'|${CRED}+${CRED_CONT})`,
+  // To END OF LINE — see the docblock. `[^\r\n]*` deliberately admits every
+  // character, including the `@`, `!` and spaces a real password contains.
+  const secret = new RegExp(`\\b(${SECRET_LABELS})\\b\\s*[:=][^\\r\\n]*${WRAP_CONT}`, "gi");
+  const scheme = new RegExp(`\\b(bearer|basic)\\s+\\S{8,}[^\\r\\n]*${WRAP_CONT}`, "gi");
+  const address = new RegExp(
+    `\\b(${ADDRESS_LABELS})\\b\\s*[:=]\\s*(?:"[^"]*"|'[^']*'|\\S+)`,
     "gi",
   );
-  const scheme = new RegExp(`\\b(bearer|basic)\\s+${CRED}{8,}${CRED_CONT}`, "gi");
   return String(text ?? "")
-    .replace(labelled, (_m, label) => `${label}: ${REDACTED}`)
+    .replace(secret, (_m, label) => `${label}: ${REDACTED}`)
     .replace(scheme, (_m, s) => `${s} ${REDACTED}`)
+    .replace(address, (_m, label) => `${label}: ${REDACTED}`)
     .replace(/[A-Za-z0-9_\-+=.]{32,}/g, REDACTED);
 }
 
