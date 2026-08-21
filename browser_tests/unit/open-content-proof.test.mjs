@@ -104,6 +104,10 @@ test("#1001 a byte-identical repaint is still reported as exact", () => {
     // consult would misattribute the proof.
     normalizedOnly: false,
     normalizedFields: [],
+    // panel#1283 (the 2026-08-21 recurrence) — nor the DEFINITIONS arm of that ground.
+    // Same rule: an account the proof never consulted must not be reported as one it
+    // used, or the reply discloses a subgraph difference that did not decide anything.
+    definitionsNormalized: false,
   });
 });
 
@@ -244,6 +248,7 @@ test("#1001 an unreadable root proves nothing — absence of comparison is not e
       // unreadable root would prove an open off a comparison that never happened.
       normalizedOnly: false,
       normalizedFields: [],
+      definitionsNormalized: false,
     });
   }
   assert.equal(graphRootReproducesStateContent({ rootGraph: rootOf(state), state: null }).proven, false);
