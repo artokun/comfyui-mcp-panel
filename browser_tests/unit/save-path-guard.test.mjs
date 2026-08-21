@@ -362,6 +362,13 @@ function staleFixture({ suppressed = true, live = "extra-group", active = true }
       this.saved.push(wf.path);
     },
   };
+  // panel#1563 r4 — the COPY point. `workflowStore.saveAs` seeds the new record from
+  // `existingWorkflow.activeState`, so a stale source snapshot becomes a stale file.
+  store.copies = [];
+  store.saveAs = function (sourceWf, path) {
+    this.copies.push({ from: sourceWf?.path, to: path });
+    return { path, isTemporary: false };
+  };
   return {
     store,
     wfA,
@@ -496,4 +503,72 @@ test("#1563 WIRING: the wrapper passes its own observation, not a constant", () 
     /snapshotIsStale: saveWouldPersistStaleSnapshot\(wf, state\)/,
     "the stale-snapshot evidence must be computed from the SAME state the write serializes",
   );
+});
+
+// ---------------------------------------------------------------------------
+// 4. panel#1563 r4 — the Save-As COPY point, where the evidence still exists.
+// ---------------------------------------------------------------------------
+
+test("#1563 r4 WRAPPER: a Save-As is refused BEFORE the stale snapshot is copied", () => {
+  // The gate's P1: the `saveWorkflow` wrapper cannot catch this. `saveAs` seeds the copy
+  // from the SOURCE's snapshot, `openWorkflow` then loads that stale state onto the
+  // canvas, and the fresh target tracker captures it — so by the time the save reaches
+  // the other wrapper the tracker is unsuppressed AND the canvas agrees with the
+  // snapshot. Every piece of evidence is gone. It has to be caught here.
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture();
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  assert.throws(() => fx.store.saveAs(fx.wfA, "workflows/Copy.json"), /BEHIND the live canvas/);
+  assert.deepEqual(fx.store.copies, [], "no copy may be created from a stale snapshot");
+  assert.deepEqual(fx.store.saved, [], "and nothing may be written");
+});
+
+test("#1563 r4 WRAPPER: a healthy Save-As still copies", () => {
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture({ suppressed: false });
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  const made = fx.store.saveAs(fx.wfA, "workflows/Copy.json");
+  assert.equal(made.path, "workflows/Copy.json");
+  assert.deepEqual(fx.store.copies, [{ from: "workflows/A.json", to: "workflows/Copy.json" }]);
+});
+
+test("#1563 r4 WRAPPER: a Save-As of an INACTIVE source is not judged against this canvas", () => {
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture({ active: false });
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  fx.store.saveAs(fx.wfA, "workflows/Copy.json");
+  assert.equal(fx.store.copies.length, 1);
+});
+
+test("#1563 r4 WRAPPER: a frontend with no saveAs is DISCLOSED, not silently unguarded", () => {
+  const { buildInstaller: build, warnings } = buildInstaller();
+  const fx = staleFixture();
+  delete fx.store.saveAs;
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /saveAs is unavailable/);
+});
+
+test("#1563 r4 WIRING: the guard is installed on the COPY point, from the source's own state", () => {
+  const source = PANEL_SRC();
+  const at = source.indexOf("svc.saveAs = function (sourceWf, destPath, ...rest) {");
+  assert.ok(at > 0, "the save funnel must wrap workflowStore.saveAs");
+  const body = source.slice(at, at + 1400);
+  assert.match(
+    body,
+    /sourceWf\?\.changeTracker\?\.activeState \?\? sourceWf\?\.activeState/,
+    "the evidence must come from the SOURCE snapshot the copy is built from",
+  );
+  assert.match(
+    body,
+    /snapshotIsStale: saveWouldPersistStaleSnapshot\(sourceWf, sourceState\)/,
+    "and it must be the same predicate, not a re-derived one",
+  );
+  const throwAt = body.indexOf("throw workflowSaveRefusalError(verdict);");
+  const callAt = body.indexOf("return origSaveAs(");
+  assert.ok(throwAt > 0 && callAt > throwAt, "the refusal must precede the copy");
 });

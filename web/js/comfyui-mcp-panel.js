@@ -3852,6 +3852,60 @@ function installSavePathGuard(appRef) {
       }
       return orig(wf, ...rest);
     };
+    // panel#1563 r4 — THE SAVE-AS COPY POINT, which the `saveWorkflow` wrapper above
+    // cannot see.
+    //
+    // MEASURED in comfyui-frontend 1.49.6. `workflowStore.saveAs` seeds the new record
+    // from the SOURCE's tracker snapshot and nothing else:
+    //
+    //     const state = JSON.parse(JSON.stringify(existingWorkflow.activeState))
+    //     workflow.originalContent = workflow.content = JSON.stringify(state)
+    //
+    // and `workflowService.saveWorkflowAs` calls `prepareForSave()` only on the TARGET,
+    // after the copy. So when the source's capture is suppressed, its snapshot is copied
+    // stale; `openWorkflow(target)` then loads that stale state onto the canvas — taking
+    // the unsaved edits off the screen too — and the fresh target tracker captures the
+    // now-stale canvas. By the time `saveWorkflow(target)` reaches the wrapper above,
+    // all three suppression flags are false and the canvas AGREES with the snapshot:
+    // every piece of evidence the guard reads has been destroyed, and it correctly
+    // allows a write that is missing the user's work.
+    //
+    // The evidence exists only HERE, before the copy. Same predicate, same refusal,
+    // asked of the SOURCE — and it throws before `saveAs` returns a record, so no file
+    // is created and the canvas is left exactly as the user has it.
+    if (typeof svc.saveAs === "function") {
+      const origSaveAs = svc.saveAs.bind(svc);
+      svc.saveAs = function (sourceWf, destPath, ...rest) {
+        let verdict = { allow: true };
+        try {
+          // The state the copy will be built from — read the SAME way `saveAs` reads it.
+          const sourceState = sourceWf?.changeTracker?.activeState ?? sourceWf?.activeState ?? null;
+          verdict = decideWorkflowSaveVerdict({
+            destinationPath: typeof destPath === "string" ? destPath : null,
+            snapshotIsStale: saveWouldPersistStaleSnapshot(sourceWf, sourceState),
+          });
+        } catch {
+          verdict = { allow: true }; // a guard that cannot read its evidence never invents a refusal
+        }
+        if (!verdict.allow) {
+          const key = `saveAs:${verdict.destinationPath}`;
+          if (!_savePathGuardRefusalsLogged.has(key)) {
+            _savePathGuardRefusalsLogged.add(key);
+            try {
+              console.warn(`[comfyui-mcp] ${workflowSaveRefusalError(verdict).message}`);
+            } catch {}
+          }
+          throw workflowSaveRefusalError(verdict);
+        }
+        return origSaveAs(sourceWf, destPath, ...rest);
+      };
+    } else {
+      // Disclosed, never silent — the same rule the missing-store branch above follows.
+      console.warn(
+        "[comfyui-mcp] save-path guard: workflowStore.saveAs is unavailable on this frontend — " +
+          "a Save-As copy is NOT checked against a stale tracker snapshot (panel#1563).",
+      );
+    }
     _savePathGuardInstalled = true;
   } catch (err) {
     _savePathGuardInstalled = false;
