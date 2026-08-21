@@ -365,6 +365,13 @@ test("percent-encoded authorization material is scrubbed as one credential", () 
   assert.match(scrubbed, /Authorization: «redacted»/);
 });
 
+test("wrapped secret material with punctuation is scrubbed through the continuation", () => {
+  const scrubbed = scrubSecretShapedText("password:p@ssword\\nanother@secret");
+  assert.doesNotMatch(scrubbed, /p@ssword/);
+  assert.doesNotMatch(scrubbed, /another@secret/);
+  assert.equal(scrubbed, "password: «redacted»");
+});
+
 test("a standard reason phrase is dropped, a custom one is kept", () => {
   assert.equal(describeHttpStatus(502, "Bad Gateway"), "502");
   assert.equal(describeHttpStatus(503, "Origin warming up"), "503 Origin warming up");

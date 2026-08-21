@@ -136,12 +136,10 @@ const SECRET_LABELS =
   "authorization|auth|bearer|token|access[-_]?token|api[-_]?key|apikey|secret|password|passwd|pwd" +
   "|session[-_]?id|sessionid|set-cookie|cookie";
 const ADDRESS_LABELS = "your ip|client ip|remote ip|remote addr|x-forwarded-for";
-/** One run of credential-alphabet characters. */
-const CRED = "[A-Za-z0-9._\\-+/=]";
 /** A value that arrived LINE-WRAPPED continues on the next line with no space
- *  before the break, so a following run of credential characters is the same
- *  token. Applied after a to-end-of-line secret redaction. */
-const WRAP_CONT = `(?:[\\r\\n]+[ \\t]*${CRED}+)*`;
+ *  before the break, so the continuation line is the same token. Applied after
+ *  a to-end-of-line secret redaction. */
+const WRAP_CONT = `(?:[\\r\\n]+[ \\t]*[^\\r\\n]+)*`;
 
 export function scrubSecretShapedText(text) {
   // To END OF LINE — see the docblock. `[^\r\n]*` deliberately admits every
