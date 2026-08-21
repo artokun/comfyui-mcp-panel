@@ -18625,6 +18625,15 @@ const GRAPH_TOOL_EXECUTORS = {
               if (contentProof.normalizedOnly && !contentProof.presentationOnly) {
                 openContentNormalized = contentProof.normalizedFields;
               }
+              // panel#1283 (the 2026-08-21 recurrence) — the completed-load ground carried
+              // this open over a `definitions` difference as well as a `nodes` one, so the
+              // reply says so. `content_normalized` names ROOT node fields and would leave
+              // the subgraph difference unmentioned; #1477's key already exists for exactly
+              // that sentence, and its note points at the same recovery. A reply that
+              // succeeded partly on the subgraph account must not be silent about it.
+              if (contentProof.definitionsNormalized) {
+                openDefinitionsUnverified = true;
+              }
               const verdict = resolveOpenRebindVerdict({
                 instanceStillTarget,
                 markerMatches,

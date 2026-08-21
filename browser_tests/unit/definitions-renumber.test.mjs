@@ -123,7 +123,14 @@ test("#886 WIRING: the content proof consults it for a definitions surface", () 
   // The predicate is inert unless the proof calls it, and the behavioural tests
   // above cannot see the call site.
   const src = readFileSync(join(ROOT, "web/js/lib/graph-binding.js"), "utf8");
-  assert.match(src, /import \{ definitionsDifferOnlyByRenumber \} from "\.\/definitions-renumber\.js";/);
+  // panel#1283 (the 2026-08-21 recurrence) added a SECOND import from this module, so the
+  // statement became a braced multi-line one. Pin what the assertion is FOR — that
+  // graph-binding pulls THIS symbol from THAT module — rather than one spelling of the
+  // statement, which a formatter or a sibling import re-breaks while the wiring is fine.
+  assert.match(
+    src,
+    /import\s*\{[^}]*\bdefinitionsDifferOnlyByRenumber\b[^}]*\}\s*from\s*"\.\/definitions-renumber\.js";/,
+  );
   // comfyui-mcp#1706 — BOTH call sites must pass the payload's ROOT nodes. The node-id
   // account is granted only to a caller that supplies them (a call without the argument
   // answers the pre-#1706 question and refuses), so a call site that dropped it would

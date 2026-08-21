@@ -1,4 +1,7 @@
-import { definitionsDifferOnlyByRenumber } from "./definitions-renumber.js";
+import {
+  definitionsDifferOnlyByCompletedLoadNormalization,
+  definitionsDifferOnlyByRenumber,
+} from "./definitions-renumber.js";
 import { nodeInputsDifferOnlyByDefinitionRebuild } from "./node-inputs-rebuild.js";
 import {
   isEmptyBaselineMismatch,
@@ -1104,6 +1107,7 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     presentationOnly: false,
     normalizedOnly: false,
     normalizedFields: [],
+    definitionsNormalized: false,
   };
   try {
     // ONE SNAPSHOT, and every check below reads it (codex r3). Serializing separately
@@ -1122,6 +1126,7 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
         presentationOnly: false,
         normalizedOnly: false,
         normalizedFields: [],
+        definitionsNormalized: false,
       };
     }
     const diff = describeGraphStateDifference({ rootGraph: frozen, state });
@@ -1182,9 +1187,35 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     // refusal rests on did not happen here. Weaker than `presentationOnly` about the
     // fields (it names them rather than vouching for them) and stronger about the LOAD
     // (it is an observation of this restore, not a judgement about a field name).
+    //
+    // panel#1283 (the 2026-08-21 recurrence) — AND THE SAME GROUND ONE LEVEL DOWN.
+    //
+    // `definitions` is subtracted from `unexplainedSurfaces` above only by
+    // `definitionsDifferOnlyByRenumber`, which is FIELD-LEVEL: it enumerates what a
+    // renumbering may touch and requires every other field to be deep-equal. Measured in
+    // a real browser on v0.15.32 / ComfyUI 0.33.2 / frontend 1.49.6, an installed pack
+    // stamps a key into every node's `properties` during `configure`. On the ROOT nodes
+    // that is already accounted for — by the completed-load ground immediately below,
+    // which admits any NAMED per-node difference once the panel has watched the restore
+    // run to completion. The identical rewrite, on the same nodes, inside a subgraph
+    // definition had no account at all, so a faithful open of any subgraph workflow on
+    // that machine was refused on `nodes, definitions`, published no `workflow_uuid`, and
+    // sent the caller through the multi-call recovery this whole cluster is about.
+    //
+    // So the completed-load ground reads the surface list with that account applied too.
+    // Deliberately NOT applied to `presentationOnly`: that ground claims "nothing
+    // AUTHORED was lost", and this admits an arbitrary per-node field inside a definition
+    // — a claim only the weaker, observation-licensed ground may make.
+    const definitionsNormalized =
+      unexplainedSurfaces.includes("definitions") &&
+      definitionsDifferOnlyByCompletedLoadNormalization(state?.definitions, actualState?.definitions, {
+        loadRanToCompletion,
+      });
     const normalizedOnly = openContentDifferenceIsCompletedLoadNormalization({
       comparable: true,
-      surfaces: unexplainedSurfaces,
+      surfaces: definitionsNormalized
+        ? unexplainedSurfaces.filter((surface) => surface !== "definitions")
+        : unexplainedSurfaces,
       nodeDifference: diff.nodeDifference,
       loadRanToCompletion,
     });
@@ -1203,6 +1234,11 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
       // the strict proof, so a fix that only populated this on the success path would be
       // wired into a branch its own bug reports cannot reach.
       normalizedFields: normalizedOnly && Array.isArray(diff.nodeDifference?.fields) ? diff.nodeDifference.fields : [],
+      // Only when it actually CARRIED the verdict. The caller turns this into the
+      // `definitions_unverified` disclosure, and a reply may not announce a subgraph
+      // difference the verdict never rested on — this is an account that was USED, not
+      // one that would have applied had some other refusal not fired first.
+      definitionsNormalized: normalizedOnly && definitionsNormalized,
     };
     const surfaces = Array.isArray(diff.surfaces) ? diff.surfaces : [];
     // ONE surface, and it must be `nodes`. A group or a link that disagrees is
@@ -1251,7 +1287,15 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     // A definitions-only difference is fully accounted for once the renumber check
     // passes: there is no node difference to classify.
     if (!unique.includes("nodes")) {
-      return { proven: true, exact: false, fields: [], presentationOnly: false, normalizedOnly: false, normalizedFields: [] };
+      return {
+        proven: true,
+        exact: false,
+        fields: [],
+        presentationOnly: false,
+        normalizedOnly: false,
+        normalizedFields: [],
+        definitionsNormalized: false,
+      };
     }
     const nodes = diff.nodeDifference;
     // THE NEXT TWO CHECKS DELIBERATELY OVERLAP, and neither can be killed alone by
@@ -1297,7 +1341,15 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     // nobody can point at is exactly the fabricated all-clear to avoid.
     if (!fields.length) return notProven;
     if (!fields.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return notProven;
-    return { proven: true, exact: false, fields, presentationOnly: false, normalizedOnly: false, normalizedFields: [] };
+    return {
+      proven: true,
+      exact: false,
+      fields,
+      presentationOnly: false,
+      normalizedOnly: false,
+      normalizedFields: [],
+      definitionsNormalized: false,
+    };
   } catch {
     return NOT_PROVEN;
   }
