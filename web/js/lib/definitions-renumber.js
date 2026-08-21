@@ -133,8 +133,31 @@ function deepEqual(a, b, seen = new Set(), depth = 0) {
       if (a.length !== b.length) return false;
       return a.every((v, i) => deepEqual(v, b[i], seen, depth + 1));
     }
-    const ka = Object.keys(a);
-    const kb = Object.keys(b);
+    // A KEY WHOSE VALUE IS `undefined` IS ABSENT — the repo's own rule (#1001, stated and
+    // measured on `classifyNodeDifference`), applied here because this comparison has the
+    // same two sides: a JSON payload against a LIVE `serialize()`.
+    //
+    // MEASURED on ComfyUI 0.33.2 / frontend 1.49.6, reopening a subgraph workflow, payload
+    // vs live, for one `New Subgraph` definition:
+    //
+    //   inputNode / outputNode   live carries `pinned: undefined`
+    //   inputs[]                 live carries `localized_name`, `label`, `dir`, `shape`,
+    //                            `color_off`, `color_on` — every one of them `undefined`
+    //
+    // `JSON.stringify` drops such a key, so no saved workflow and no `JSON.parse(JSON
+    // .stringify(...))` payload can ever carry one. Counting them made three definition
+    // fields "differ" whose JSON is byte-identical, which refused the whole `definitions`
+    // account — i.e. #886's and #1706's renumber grounds were INERT on that frontend, and
+    // a faithful open of any subgraph workflow was reported unverified. That is the bug
+    // panel#1283 keeps being reported for.
+    //
+    // `null` STAYS SIGNIFICANT, deliberately: JSON carries null, so present-as-null and
+    // absent are genuinely different states of a saved file. Only `undefined` is dropped,
+    // and only on OBJECT keys — an array element is left alone, because a hole and a
+    // shorter array are a length difference, which is the safe direction.
+    const definedKeys = (o) => Object.keys(o).filter((k) => o[k] !== undefined);
+    const ka = definedKeys(a);
+    const kb = definedKeys(b);
     if (ka.length !== kb.length) return false;
     return ka.every(
       (k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual(a[k], b[k], seen, depth + 1),
@@ -594,4 +617,127 @@ function compareDefinitions(a, b, options) {
   }
   if (!anyRelabel) return true;
   return !rootNodesReferenceRemappedId(options?.rootNodes, remappedFrom);
+}
+
+/**
+ * panel#1283 (the 2026-08-21 recurrence) — the THIRD thing a load does to this surface,
+ * and the first one no field-level account can name.
+ *
+ * ## What was measured
+ *
+ * Reproduced in a real browser on ComfyUI 0.33.2 / frontend 1.49.6 (v0.15.32, the current
+ * release): `workflow_open` on an already-open unsaved `tmp:` tab whose graph contains a
+ * subgraph. The open bound correctly, every root node came back with the same id and
+ * type, nothing extra appeared — and it was refused, `no workflow_uuid`, because the
+ * surfaces that differed were `nodes, definitions`. The whole `definitions` difference,
+ * byte for byte, was one key appearing inside a definition node's `properties`:
+ *
+ *     payload:  "ue_properties": { "widget_ue_connectable": {}, "input_ue_unconnectable": {} }
+ *     live:     "ue_properties": { "widget_ue_connectable": {}, "input_ue_unconnectable": {},
+ *                                  "version": "7.8" }
+ *
+ * i.e. an installed pack (cg-use-everywhere) stamping its version onto every node it sees
+ * during `configure`. It does the same to the ROOT nodes — and there it is already
+ * accounted for: `openContentDifferenceIsCompletedLoadNormalization` admits ANY named
+ * per-node difference once the panel has WATCHED the restore run to completion. The same
+ * rewrite, on the same nodes, one level down, had no account at all.
+ *
+ * ## Why a renumber account cannot reach it
+ *
+ * `definitionsDifferOnlyByRenumber` is field-level by construction: it enumerates which
+ * fields a renumbering may touch and requires every other one to be deep-equal. A pack
+ * that writes a key nobody has enumerated is exactly the case that enumeration cannot
+ * answer, and adding `properties` to it would license a renumber to rewrite arbitrary
+ * node content. That is the treadmill #1358's own header describes — the next pack
+ * invents the next field.
+ *
+ * ## So this asks the question at the level #1358 moved it to
+ *
+ * The refusal exists for ONE hypothesis: a restore that stopped part-way leaves a
+ * complete node set over nodes that lost their values. `loadRanToCompletion === true`
+ * refutes that hypothesis BY OBSERVATION for this load — and the observation covers the
+ * definitions, not just the root: `installNodeConfigureIsolation` wraps
+ * `LGraphNode.prototype.configure`, which is what a definition's nodes resolve
+ * `configure` through, and `installGraphConfigureWatch` wraps `LGraph.prototype.configure`,
+ * which `Subgraph` extends.
+ *
+ * ## What it therefore requires, and every one of these fails closed
+ *
+ *  - `loadRanToCompletion === true`. STRICTLY. `null` is "nobody watched" and `false` is
+ *    "something threw"; both refuse. This is the whole licence, so it is checked first.
+ *  - The two blocks pair: same container shape, same count, same keys, and every
+ *    top-level key other than `subgraphs` deep-equal.
+ *  - Inside each definition, EVERY field but `nodes` deep-equal — `links`, `state`,
+ *    `widgets`, `inputs`, `outputs`, `groups`, `config`, `inputNode`, `outputNode`,
+ *    `name`, `id`, `extra`. So no re-wiring, no promoted-widget change, no counter
+ *    movement, and no definition added, dropped or renamed rides in on this.
+ *  - Inside `nodes`, the same array length, and at each position the SAME `id` and the
+ *    SAME `type`. Nothing was added, dropped, retyped or reordered.
+ *
+ * That last requirement also closes #1706's cross-surface hazard structurally rather
+ * than by a guard: a definition node id here can never move, so `patchProxyWidgets`
+ * cannot have run, so a root node's `properties.proxyWidgets` cannot be pointing at a
+ * node this account relabeled. `rootNodesReferenceRemappedId` has nothing to refuse
+ * because no remapping is admitted in the first place.
+ *
+ * ## What it does NOT claim
+ *
+ * Not that the values inside the definitions are the file's values — the same limit
+ * `content_normalized` states for the root. The caller is told the definitions differ
+ * (`definitions_unverified`) and pointed at `panel_graph_outline`.
+ */
+export function definitionsDifferOnlyByCompletedLoadNormalization(a, b, options) {
+  // Same boundary guard as its sibling, for the same reason: nothing in here may throw,
+  // because an exception on this path takes out the verdict rather than answering "not
+  // proven". A throwing `ownKeys` trap on a Proxy is the measured shape.
+  try {
+    if (options?.loadRanToCompletion !== true) return false;
+    return compareDefinitionsUnderCompletedLoad(a, b);
+  } catch {
+    return false;
+  }
+}
+
+/** Same id and same type, at the same position — the node SET and its order, pinned. */
+function definitionNodesAreTheSameSet(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const na = a[i];
+    const nb = b[i];
+    if (!isObj(na) || !isObj(nb)) return false;
+    // Stringified, because a serialized id legitimately arrives as a number on one side
+    // and a numeric string on the other across frontend versions — and a `!==` on the raw
+    // values would refuse a faithful load for a dialect difference. `String` on a value
+    // with a throwing `toString` is caught by the boundary guard above.
+    if (String(na.id) !== String(nb.id)) return false;
+    if (String(na.type) !== String(nb.type)) return false;
+  }
+  return true;
+}
+
+function compareDefinitionsUnderCompletedLoad(a, b) {
+  // Shape FIRST, and no `a === b` shortcut before it: two sides we cannot read must fail
+  // closed rather than compare equal (the same order its sibling takes, for that reason).
+  if (!isObj(a) || !isObj(b)) return false;
+  if (a === b) return true;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  let pairs = [];
+  for (const k of keys) {
+    if (k !== "subgraphs") {
+      if (!deepEqual(a[k], b[k])) return false;
+      continue;
+    }
+    const paired = pairDefinitions(a.subgraphs, b.subgraphs);
+    if (paired === null) return false;
+    pairs = paired;
+  }
+  for (const [defA, defB] of pairs) {
+    if (!isObj(defA) || !isObj(defB)) return false;
+    // Everything EXCEPT the node array must be identical. `differsOnlyIn` also pins the
+    // key sets, so a definition that gained or lost a field is refused here.
+    if (!differsOnlyIn(defA, defB, new Set(["nodes"]))) return false;
+    if (!definitionNodesAreTheSameSet(defA.nodes ?? [], defB.nodes ?? [])) return false;
+  }
+  return true;
 }
