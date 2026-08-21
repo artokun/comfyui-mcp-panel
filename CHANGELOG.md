@@ -7,7 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-- the pack no longer treats any TCP listener on the bridge port as a running orchestrator (Logitech G HUB's `lghub_agent` sits on 9180); identity is a hello/models handshake, the default is 9199 with 9180 as a legacy fallback, and a live 9180 session is not stranded across a panel update (#1596 / mcp#2030)
+- the pack no longer treats any TCP listener on the bridge port as a running orchestrator (Logitech G HUB's `lghub_agent` sits on 9180); identity is a hello/models handshake, the default is 9199 with 9180 as a legacy fallback, `/status` and Connect try 9180 before spawning a 9199 orchestrator, and a live 9180 session is not stranded across a panel update (#1596 / mcp#2030)
 
 ## [0.15.34] - 2026-08-21
 

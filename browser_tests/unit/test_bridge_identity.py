@@ -194,12 +194,21 @@ class ProbeIdentity(unittest.TestCase):
         self.assertEqual(result["running"], True)
         self.assertEqual(result["port_held_by_other_process"], False)
 
+    def _isolate_ports(self, default_port, legacy_port=None):
+        old_default = mod._BRIDGE_PORT
+        old_legacy = mod._LEGACY_BRIDGE_PORT
+        old_advertised = mod._ADVERTISED_LOCAL_URL
+        self.addCleanup(lambda: setattr(mod, "_BRIDGE_PORT", old_default))
+        self.addCleanup(lambda: setattr(mod, "_LEGACY_BRIDGE_PORT", old_legacy))
+        self.addCleanup(lambda: setattr(mod, "_ADVERTISED_LOCAL_URL", old_advertised))
+        mod._BRIDGE_PORT = default_port
+        mod._LEGACY_BRIDGE_PORT = legacy_port if legacy_port is not None else _free_port()
+        mod._ADVERTISED_LOCAL_URL = None
+
     def test_status_body_reports_the_probe_fields(self):
         server = _TcpListener(_silent_handler).start()
         self.addCleanup(server.close)
-        old_port = mod._BRIDGE_PORT
-        self.addCleanup(lambda: setattr(mod, "_BRIDGE_PORT", old_port))
-        mod._BRIDGE_PORT = server.port
+        self._isolate_ports(server.port)
         body = mod._status_body()
         self.assertEqual(body["running"], False)
         self.assertEqual(body["port_held_by_other_process"], True)
@@ -208,12 +217,26 @@ class ProbeIdentity(unittest.TestCase):
     def test_status_body_running_true_for_a_protocol_peer(self):
         server = _TcpListener(_protocol_handler("backends")).start()
         self.addCleanup(server.close)
-        old_port = mod._BRIDGE_PORT
-        self.addCleanup(lambda: setattr(mod, "_BRIDGE_PORT", old_port))
-        mod._BRIDGE_PORT = server.port
+        self._isolate_ports(server.port)
         body = mod._status_body()
         self.assertEqual(body["running"], True)
         self.assertEqual(body["port_held_by_other_process"], False)
+
+    def test_status_legacy_protocol_peer_is_running_when_default_is_silent(self):
+        live = _TcpListener(_protocol_handler("models")).start()
+        self.addCleanup(live.close)
+        self._isolate_ports(_free_port(), live.port)
+        body = mod._status_body()
+        self.assertEqual(body["running"], True)
+        self.assertEqual(body["port_held_by_other_process"], False)
+        self.assertEqual(body["port"], live.port)
+        self.assertEqual(body["bridge_url"], "ws://127.0.0.1:{}".format(live.port))
+
+    def test_status_probe_ports_include_legacy_9180(self):
+        ports = mod._status_probe_ports()
+        self.assertIn(mod._BRIDGE_PORT, ports)
+        self.assertIn(mod._LEGACY_BRIDGE_PORT, ports)
+        self.assertEqual(mod._LEGACY_BRIDGE_PORT, 9180)
 
 
 class AdvertiseLocalUrl(unittest.TestCase):

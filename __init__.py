@@ -68,6 +68,9 @@ _BRIDGE_HOST = "127.0.0.1"
 # lghub_agent; the browser still tries 9180 as a legacy fallback so a live
 # session on the old port is not stranded across a panel update.
 _BRIDGE_PORT = int(environ.get("COMFYUI_MCP_BRIDGE_PORT", "9199"))
+# Previous compiled default. Probed when 9199 is silent so a live session on
+# 9180 is still `running` and Connect does not spawn a second orchestrator.
+_LEGACY_BRIDGE_PORT = 9180
 _LAUNCHER_PROTOCOL = 1
 _LAUNCHER_INSTALL_COMMAND = "npx -y comfyui-mcp@latest launcher install"
 
@@ -709,8 +712,57 @@ def _orchestrator_probe(port=None):
     return _probe_bridge(_BRIDGE_HOST, port if port is not None else _BRIDGE_PORT)
 
 
+def _port_of_local_url(url):
+    accepted = _acceptable_local_bridge_url(url)
+    if not accepted:
+        return None
+    try:
+        from urllib.parse import urlsplit
+
+        port = urlsplit(accepted).port
+    except Exception:
+        return None
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        return None
+    return port
+
+
+def _status_probe_ports():
+    """Advertised local port, compiled default, then legacy 9180.
+
+    Deduped, first protocol peer wins. 9180 is always tried when 9199 is
+    silent so `/status.running` cannot mean "no orchestrator exists".
+    """
+    ports = []
+    advertised = _port_of_local_url(_ADVERTISED_LOCAL_URL)
+    if advertised:
+        ports.append(advertised)
+    for port in (_BRIDGE_PORT, _LEGACY_BRIDGE_PORT):
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _live_bridge_probe():
+    """First protocol peer on the status probe list, else the compiled default."""
+    default_held = False
+    last = {"running": False, "port_held_by_other_process": False}
+    for port in _status_probe_ports():
+        probe = _probe_bridge(_BRIDGE_HOST, port)
+        if probe["running"]:
+            return probe, port
+        if port == _BRIDGE_PORT:
+            default_held = probe["port_held_by_other_process"]
+        last = probe
+    last["port_held_by_other_process"] = default_held or last["port_held_by_other_process"]
+    return last, _BRIDGE_PORT
+
+
 def _orchestrator_running(port=None):
-    return _orchestrator_probe(port)["running"]
+    if port is not None:
+        return _orchestrator_probe(port)["running"]
+    probe, _live = _live_bridge_probe()
+    return probe["running"]
 
 
 def _backend_status(backend, running=None):
@@ -783,22 +835,24 @@ def _advertised_bridge_payload():
     return {"url": _ADVERTISED_BRIDGE_URL, "local_url": _ADVERTISED_LOCAL_URL}
 
 
-def _status_bridge_url():
+def _status_bridge_url(live_port=None):
+    if live_port is not None:
+        return "ws://{}:{}".format(_BRIDGE_HOST, live_port)
     if _ADVERTISED_LOCAL_URL:
         return _ADVERTISED_LOCAL_URL
     return "ws://{}:{}".format(_BRIDGE_HOST, _BRIDGE_PORT)
 
 
 def _status_body():
-    probe = _orchestrator_probe()
+    probe, live_port = _live_bridge_probe()
     detected = _detect_comfyui_url()
     return {
         "running": probe["running"],
         "port_held_by_other_process": probe["port_held_by_other_process"],
-        "port": _BRIDGE_PORT,
+        "port": live_port,
         # No in-process auto-start: the orchestrator runs out-of-band.
         "can_spawn": False,
-        "bridge_url": _status_bridge_url(),
+        "bridge_url": _status_bridge_url(live_port if probe["running"] else None),
         "comfyui_url": detected,
         # #296/#291 — the local ComfyUI workspace path (folder_paths.base_path
         # of the ComfyUI this pack is embedded in). READ-ONLY/advisory: the
@@ -1210,8 +1264,8 @@ def _register_routes():
                 status=400,
             )
         port = _backend_port(backend)
-        bridge_url = _status_bridge_url() if port == _BRIDGE_PORT else "ws://{}:{}".format(_BRIDGE_HOST, port)
-        probe = _orchestrator_probe(port)
+        probe, live_port = _live_bridge_probe()
+        bridge_url = _status_bridge_url(live_port if probe["running"] else None)
         if probe["running"]:
             return web.json_response(
                 {
@@ -1219,7 +1273,7 @@ def _register_routes():
                     "running": True,
                     "port_held_by_other_process": False,
                     "backend": backend,
-                    "port": port,
+                    "port": live_port,
                     "bridge_url": bridge_url,
                     "message": "orchestrator already running — connecting",
                 },

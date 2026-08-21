@@ -594,7 +594,7 @@ import {
 import { mergeProviderSnapshots } from "./lib/provider-snapshot-merge.js";
 import { providerDiscoveryDecision } from "./lib/provider-autoselect.js";
 import { choiceModal } from "./cmcp-modal.js";
-import { migrateAutostartValue, panelOpenAction } from "./lib/mcp-autostart-policy.js";
+import { migrateAutostartValue, panelOpenAction, connectEntryPlan } from "./lib/mcp-autostart-policy.js";
 import {
   MOVE_CAUSES,
   createActiveWorkflowProvenance,
@@ -36665,7 +36665,23 @@ function buildPanel() {
     const generation = ++launcherStartGeneration;
     const initial = await readOrchestratorStatus();
     if (generation !== launcherStartGeneration) return;
-    if (initial?.running) {
+    const advertised = await fetchAdvertisedBridge();
+    if (generation !== launcherStartGeneration) return;
+    const wanted = urlInput.value.trim();
+    // #1596 — advertised local and a live 9180 peer must be connected BEFORE
+    // launcher /start. Spawning 9199 because 9199 is silent strands a session
+    // still on 9180. tryUrls is the handshake list the plan requires first.
+    const plan = connectEntryPlan({
+      pinnedUrl: wanted,
+      advertisedLocalUrl: advertised.local,
+      statusRunning: initial?.running === true,
+      statusBridgeUrl: initial?.bridge_url,
+    });
+    if (!plan.spawn) {
+      if (plan.url && plan.url !== client.currentUrl()) {
+        client.setUrl(plan.url, { persist: false });
+        lastAutoUrl = plan.url;
+      }
       void connectAgent();
       return;
     }
@@ -36705,6 +36721,9 @@ function buildPanel() {
               "Install the companion launcher once to autostart MCP; the command is in Connect settings.",
             ),
       );
+      // Still dial advertised / [9199, 9180]. Returning here is what stranded a
+      // live 9180 session when the companion launcher was not installed.
+      void connectAgent();
       return;
     }
     const deadline = Date.now() + 90_000;
@@ -36806,24 +36825,18 @@ function buildPanel() {
         if (secure) {
           if (secure !== client.currentUrl()) client.setUrl(secure, { persist: false });
           lastAutoUrl = secure;
-        } else if (advertised.local) {
-          if (advertised.local !== client.currentUrl()) {
-            client.setUrl(advertised.local, { persist: false });
-            urlInput.value = advertised.local;
-            lastAutoUrl = advertised.local;
-          }
         } else {
           const status = await readOrchestratorStatus();
           if (myGen !== connectGen) return;
-          // If the compiled default is occupied by a non-orchestrator, skip it
-          // and start on the legacy 9180 so a live session there is not dropped
-          // behind a 20s handshake with Logitech G HUB (or similar).
-          const target =
-            status?.port_held_by_other_process === true
-              ? LEGACY_9180_BRIDGE_URL
-              : configuredBridgeUrlFor(selectedBackend);
+          const plan = connectEntryPlan({
+            pinnedUrl: wanted,
+            advertisedLocalUrl: advertised.local,
+            statusRunning: status?.running === true,
+            statusBridgeUrl: status?.bridge_url,
+          });
+          const target = plan.url || plan.tryUrls?.[0] || configuredBridgeUrlFor(selectedBackend);
           if (target && target !== client.currentUrl()) {
-            client.setUrl(target);
+            client.setUrl(target, { persist: false });
             urlInput.value = target;
             lastAutoUrl = target;
           }
