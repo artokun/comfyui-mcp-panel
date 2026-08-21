@@ -191,6 +191,13 @@ test("#1563 upstream's three suppression conditions are read; an unknown tracker
   assert.equal(trackerCaptureSuppressed({}), false);
   assert.equal(trackerCaptureSuppressed(null), false);
   assert.equal(trackerCaptureSuppressed({ changeCount: 0, _restoringState: false }), false);
+  // TRUTHY, not `=== true`. `captureWasSuppressed` (#882, the destructive close path)
+  // delegates here and read these flags as truthy before the refactor; a strict identity
+  // check would silently narrow that fail-closed guard.
+  assert.equal(trackerCaptureSuppressed({ _restoringState: 1 }), true);
+  class LoadingTruthy {}
+  LoadingTruthy.isLoadingGraph = 1;
+  assert.equal(trackerCaptureSuppressed(new LoadingTruthy()), true);
 });
 
 test("#1563 a SWALLOWED deferred capture is retried until upstream stops skipping it", () => {

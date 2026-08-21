@@ -69,9 +69,16 @@ let pendingSnapshot = null;
  */
 export function trackerCaptureSuppressed(tracker) {
   try {
-    if (tracker?._restoringState === true) return true; // an undo/redo is restoring
+    // TRUTHINESS, not `=== true`. Upstream declares both flags `boolean`, but
+    // `captureWasSuppressed` (which delegates here) is a fail-closed guard on a
+    // DESTRUCTIVE path, and it read them as truthy before this refactor. Tightening
+    // to a strict identity check would let a truthy non-boolean — the exact drift a
+    // defensive guard exists for — slip past it. Optional chaining still gives the
+    // positive-evidence default this function needs: an absent field is `undefined`,
+    // which is falsy, so an unreadable tracker answers "not suppressed" here.
+    if (tracker?._restoringState) return true; // an undo/redo is restoring
     if (Number(tracker?.changeCount) > 0) return true; // inside a change transaction
-    if (tracker?.constructor?.isLoadingGraph === true) return true; // a graph is loading
+    if (tracker?.constructor?.isLoadingGraph) return true; // a graph is loading
     return false;
   } catch {
     return false;
