@@ -168,11 +168,18 @@ test("#1562: the coalescer forwards runBudgetMs on the NOTHING-IN-FLIGHT path", 
 });
 
 test("#1562: the coalescer forwards runBudgetMs on the PAYLOAD path", async () => {
+  // The payload branch is only reached while a run is ALREADY IN FLIGHT — a payload call
+  // that arrives with the slot empty takes the nothing-in-flight branch instead. Written
+  // the other way first, and the mutation harness caught it: dropping the forward on this
+  // exact branch killed nothing, because the test was never on it.
   const { refresh, seen, release } = coalescerRecorder();
   const first = refresh(undefined, { force: true, joinMs: 5000, runBudgetMs: 1 });
+  const withPayload = refresh({ SomeNode: {} }, { joinMs: 5000, runBudgetMs: 4243 });
   release();
   await first;
-  await refresh({ SomeNode: {} }, { joinMs: 5000, runBudgetMs: 4243 });
+  await withPayload;
+  assert.equal(seen.length, 2, "the payload must run AFTER the in-flight run, not join it");
+  assert.equal(seen.at(-1)?.preloadedDefs?.SomeNode !== undefined, true, "…on the payload branch");
   assert.equal(seen.at(-1)?.runOpts?.runBudgetMs, 4243);
 });
 
@@ -205,28 +212,35 @@ test("#1562: a caller that states NO run budget still gets undefined, not a fabr
 // 4. THE RUN HONOURS IT — the deadline arithmetic, as the panel writes it
 // ---------------------------------------------------------------------------
 
-/** The panel's own runDeadline expression, lifted rather than restated. */
-const runDeadlineExpr = (() => {
+/**
+ * The panel's own runDeadline expression, lifted rather than restated.
+ *
+ * Built INSIDE the test, not at module scope: a mutation that removes the expression must
+ * fail a test BY NAME, and a throw during import fails the whole FILE instead — which
+ * counts as a kill and names nothing a reader can act on.
+ */
+function runDeadlineExpr() {
   const m = PANEL_SRC.match(
     /let runDeadline =\r?\n\s*monotonicNow\(\) \+\r?\n\s*\(([\s\S]*?)\);\r?\n/,
   );
-  if (!m) throw new Error("the run deadline is no longer derived where this harness looks");
+  assert.ok(m, "the run deadline is no longer derived where this harness looks");
   // eslint-disable-next-line no-new-func
   return new Function("runOpts", "NODE_DEFS_RUN_BUDGET_MS", `return (${m[1]});`);
-})();
+}
 
 test("#1562: a stated run budget is used; anything unusable falls back to the default", () => {
-  assert.equal(runDeadlineExpr({ runBudgetMs: 37500 }, NODE_DEFS_RUN_BUDGET_MS), 37500);
+  const deadline = runDeadlineExpr();
+  assert.equal(deadline({ runBudgetMs: 37500 }, NODE_DEFS_RUN_BUDGET_MS), 37500);
   for (const bad of [undefined, null, 0, -1, NaN, Infinity, "37500", {}]) {
     assert.equal(
-      runDeadlineExpr({ runBudgetMs: bad }, NODE_DEFS_RUN_BUDGET_MS),
+      deadline({ runBudgetMs: bad }, NODE_DEFS_RUN_BUDGET_MS),
       NODE_DEFS_RUN_BUDGET_MS,
       `runBudgetMs=${String(bad)} must not become the run's allowance — Infinity/NaN would ` +
         "restore the unbounded run this deadline exists to prevent, and a non-positive one " +
         "would start a run with no time at all",
     );
   }
-  assert.equal(runDeadlineExpr(undefined, NODE_DEFS_RUN_BUDGET_MS), NODE_DEFS_RUN_BUDGET_MS);
+  assert.equal(deadline(undefined, NODE_DEFS_RUN_BUDGET_MS), NODE_DEFS_RUN_BUDGET_MS);
 });
 
 // ---------------------------------------------------------------------------
