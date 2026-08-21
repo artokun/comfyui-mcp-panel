@@ -183,6 +183,13 @@ export function authoritativeComboValues(spec) {
   // V1 — the first element IS the option array.
   if (Array.isArray(spec[0])) return spec[0];
   // V2 — a "COMBO" type string, options under the config object.
+  //
+  // A REMOTE list is unread by definition: it arrives from a separate fetch and the
+  // frontend shows "Loading…" until it lands. Measured remote V2 specs carry no `options`
+  // array at all, so this is defense in depth rather than a live shape — but the whole
+  // safety argument for reading V2 is that UNREAD never becomes EMPTY, and a spec carrying
+  // `remote` alongside an empty `options` would be exactly the case that breaks it.
+  if (spec[0] === "COMBO" && spec[1]?.remote) return null;
   if (spec[0] === "COMBO" && Array.isArray(spec[1]?.options)) return spec[1].options;
   return null;
 }

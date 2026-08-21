@@ -850,13 +850,23 @@ function mergedInputsFor(def, cache, type) {
 /**
  * Is this input spec a combo whose authoritative option list came back EMPTY?
  *
- * A combo's spec is `[[opt, ...], config?]`. An empty first element is the backend saying
- * "this widget has no valid values" — which is a real answer (#507/#1133: a server with zero
- * checkpoints), not a panel failure. It is worth DISCLOSING and never worth refusing over.
+ * An empty published list is the backend saying "this widget has no valid values" — a real
+ * answer (#507/#1133: a server with zero checkpoints), not a panel failure. It is worth
+ * DISCLOSING and never worth refusing over.
+ *
+ * mcp#1940 — read through `authoritativeComboValues`, never off `spec[0]`. This tested
+ * `Array.isArray(spec[0])`, which holds only for the V1 shape `[[opt, ...], config?]`; a V2
+ * `["COMBO", { options: [] }]` leaves the type string "COMBO" at `spec[0]` and was silently
+ * skipped, so a graph carrying one (CustomCombo, HypernetworkLoader, …) disclosed nothing.
+ * That is the same per-call-site adoption gap this reader was introduced to close in the
+ * WRITE path — found here by review of that fix, one module away from it.
+ *
+ * Unread still never counts as empty: a remote V2 whose list has not landed, and a dynamic
+ * V3, both yield null and are not disclosed.
  */
 function isEmptyComboSpec(spec) {
-  const first = Array.isArray(spec) ? spec[0] : undefined;
-  return Array.isArray(first) && first.length === 0;
+  const values = authoritativeComboValues(spec);
+  return Array.isArray(values) && values.length === 0;
 }
 
 /**

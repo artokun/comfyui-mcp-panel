@@ -1611,3 +1611,39 @@ test("#1172 WIRING: the disclosure survives the `refreshed: true` branch (#981's
   // verdict what #1133 deliberately permits via the write path.
   assert.doesNotMatch(code, /empty_combo_lists[\s\S]{0,200}?refreshed = false/, "disclosure, not failure");
 });
+
+test("mcp#1940 review: emptyComboListsOnGraph discloses V2 empties, and still never discloses an UNREAD list", () => {
+  // The sibling of the write-path bug, found by review of its fix. isEmptyComboSpec tested
+  // Array.isArray(spec[0]), true only for V1, so a graph carrying a V2 empty combo
+  // disclosed nothing at all.
+  const defsByType = {
+    CustomCombo: { input: { required: { choice: ["COMBO", { multiselect: false, options: [] }] } } },
+    LegacyEmpty: { input: { required: { pick: [[], {}] } } },
+    V2Full: { input: { required: { pick: ["COMBO", { options: ["a", "b"] }] } } },
+    V2Remote: { input: { required: { pick: ["COMBO", { remote: { route: "/internal/files/output" } }] } } },
+    V3Dyn: { input: { required: { pick: ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "png" }] }] } } },
+  };
+  const rootGraph = {
+    _nodes: [
+      { type: "CustomCombo" },
+      { type: "LegacyEmpty" },
+      { type: "V2Full" },
+      { type: "V2Remote" },
+      { type: "V3Dyn" },
+    ],
+  };
+  const found = emptyComboListsOnGraph(rootGraph, defsByType);
+  assert.deepEqual(found, [
+    { type: "CustomCombo", widget: "choice" },
+    { type: "LegacyEmpty", widget: "pick" },
+  ]);
+});
+
+test("mcp#1940 review: a REMOTE V2 is unread even when it also carries an empty options array", () => {
+  // The invariant the whole change rests on: unread must never read as empty. A remote
+  // list arrives from a separate fetch, so options:[] alongside it is "not here yet".
+  assert.equal(authoritativeComboValues(["COMBO", { remote: { route: "/r" }, options: [] }]), null);
+  assert.equal(authoritativeComboValues(["COMBO", { remote: { route: "/r" } }]), null);
+  // Without a remote marker an empty list is still a real, server-published answer.
+  assert.deepEqual(authoritativeComboValues(["COMBO", { options: [] }]), []);
+});
