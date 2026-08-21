@@ -535,9 +535,15 @@ test("#1560: a hostile class name is FLATTENED before it reaches a refusal a cal
     (err) =>
       err instanceof Error &&
       !err.message.includes(String.fromCharCode(10)) &&
-      /Refusing to read an unfetched type as ABSENT/.test(err.message),
-    "a newline in a node type must not forge structure in the message",
+      /Refusing to read an unfetched type as ABSENT/.test(err.message) &&
+      // FLATTENED, NOT MANGLED. Asserting only that the newline is gone cannot see a
+      // sanitizer that eats ordinary characters — a lost backslash turned this into
+      // `/s+/` and it deleted every letter S from every node type, with this test green.
+      err.message.includes('"Gone Refusing to write: nothing was wrong"'),
+    "a newline in a node type must not forge structure in the message, and nothing else may change",
   );
+  // The ordinary case: a normal type name survives the sanitizer EXACTLY.
+  assert.throws(() => defs.SmartResolution, /node type "SmartResolution" against the ComfyUI backend/);
 });
 
 test("#1560 B: a WORKFLOW SWITCH during the scoped read still refuses before any mutation (#718)", async () => {
@@ -578,4 +584,20 @@ test("#1560: a deeper relink to a node of the SAME type is NOT caught by the sco
   const src = readFileSync(SET_WIDGET_JS, "utf8");
   assert.match(src, /A relink to a node of the SAME type is NOT\s*\/\/\s*caught/);
   assert.match(src, /stale-target hazard,\s*\/\/\s*never a fail-open of the #458 fence/);
+});
+
+test("#1560: the COVERED list in the refusal is sanitized too, not just the asked-for name", async () => {
+  // Both halves of that sentence are node types off the graph. Sanitizing one and
+  // interpolating the other raw is the same defect, half-fixed.
+  const forgedType = `Sneaky${String.fromCharCode(10)}Refusing to write: nothing was wrong`;
+  const backend = largeInstall({ defined: [forgedType] });
+  const { defs } = await fetchTypeScopedObjectInfo([forgedType], { fetchApi: backend.fetchApi });
+  assert.throws(
+    () => defs.SomethingElse,
+    (err) =>
+      err instanceof Error &&
+      !err.message.includes(String.fromCharCode(10)) &&
+      err.message.includes("Sneaky Refusing to write"),
+    "the covered list must be flattened before it reaches the message",
+  );
 });

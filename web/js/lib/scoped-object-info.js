@@ -186,7 +186,11 @@ function sanitizeName(value) {
   } catch {
     return "(an unprintable value)";
   }
-  const flat = text.replace(CONTROL_CHARS, " ").replace(/s+/g, " ").trim();
+  // `/\s+/`, NOT `/s+/`. A backslash lost in transit made this delete every LETTER S from
+  // every node type in a refusal — "SmartResolution" reading back as "SmartRe olution" — and
+  // the test that was supposed to cover it only asserted that a NEWLINE was gone, so it
+  // passed. The assertions below now pin the name itself, not just the absence of a newline.
+  const flat = text.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim();
   if (!flat) return "(an unnamed type)";
   return flat.length > 120 ? `${flat.slice(0, 120)}… (truncated)` : flat;
 }
@@ -234,9 +238,12 @@ function scopedView(present, covered) {
   // freezes the whole-map payload for the same reason — the level the fence reads is
   // `hasOwnProperty(defs, type)`, and a consumer that added a key would authorize a type
   // nobody installed. Freezing the TARGET rather than trapping writes also keeps
-  // `Object.freeze(defs)` working on the proxy, which a hand-written `defineProperty: false`
-  // turns into a TypeError from a module whose job is to answer, not to explode.
+  // `Object.freeze(defs)` working on the proxy; a hand-written `defineProperty: false` makes
+  // that a TypeError instead.
   Object.freeze(target);
+  // Built ONCE, and sanitized: every one of these names came off the graph too, and a
+  // newline inside one would forge structure in the refusal just as the asked-for name would.
+  const coveredNames = [...covered].map((t) => sanitizeName(t)).join(", ");
   const inScope = (prop) => typeof prop === "symbol" || covered.has(prop);
   const refuse = (prop) => {
     // The name came off the GRAPH and rides into a message someone reads, so it is flattened
@@ -245,7 +252,7 @@ function scopedView(present, covered) {
     throw new Error(
       `Cannot verify node type "${name}" against the ComfyUI backend: the whole ` +
         `/object_info never answered, so only the types this write resolves to were fetched ` +
-        `per class (${[...covered].join(", ")}) — and "${name}" is not one of them. ` +
+        `per class (${coveredNames}) — and "${name}" is not one of them. ` +
         `Refusing to read an unfetched type as ABSENT (#716/#821). Reconnect ComfyUI, or wait ` +
         `for /object_info to answer again, and retry.`,
     );
