@@ -66,7 +66,8 @@ export function optionsLookLikeFiles(options) {
  *
  * @param {unknown} body the parsed response — `{ [class]: { input: { required, optional } } }`
  * @param {string} className
- * @returns {Map<string, string[]>|null} widget name -> allowed values, or null when
+ * @returns {Map<string, Array<string|number|boolean>>|null} widget name -> the allowed
+ *   values AS DECLARED (a combo may publish numbers — see `comboOffers`), or null when
  *   the class is absent (an `{}` body). null means UNKNOWN, never "no combos".
  */
 export function comboInputsOf(body, className) {
