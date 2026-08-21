@@ -19,7 +19,44 @@
  * `add_node` uses is NOT interchangeable here: `set_widget` authorizes two types for a
  * promoted write and fetches BEFORE resolving which target it writes to, so a
  * single-class payload answers one question and reads the other as absent (#716/#821).
- * The fallback changes the TRANSPORT, never the question.
+ * The fallback changes the TRANSPORT, never the question. Both routes THIS module offers
+ * are still whole-schema, and nothing below has been relaxed.
+ *
+ * #1560 RE-EXAMINED THAT PARAGRAPH AND FOUND HALF OF IT LOAD-BEARING AND HALF OF IT AN
+ * ARTEFACT OF WHERE THE FETCH SITS. Recorded here because this comment is what a later
+ * reader will trust, and it foreclosed the fix for a real P2 for as long as it stood alone.
+ *
+ * The report: on ~1023 models and hundreds of packs BOTH routes above time out — the client
+ * on its 10s share, the raw GET on its 5s share — while ComfyUI is idle, `/system_stats`
+ * answers 200 and `/object_info/SmartResolution` answers 200 in ~2.7KB. No whole map ever
+ * lands, so #1223's snapshot is never populated, so EVERY `set_widget` refuses for the life
+ * of the tab. Reproduced by execution against this module, the real burst cache, the real
+ * snapshot and the real `runSetWidget`: zero per-class requests ever issued, the widget never
+ * written, the identical refusal 15,015 ms later on the second call.
+ *
+ * WHAT IS TRUE: a BARE single-class payload cannot serve this fence. "Two types" is real, and
+ * a map that answers one of them and reads the other as absent is #821 exactly.
+ *
+ * WHAT WAS AN ARTEFACT: "fetches BEFORE resolving which target it writes to" describes THIS
+ * fetch, and this fetch is the one that does not need to know. MEASURED — driving
+ * `resolvePromotedInnerTarget` → `followPromotionToConcrete` → `collectPromotionIntermediates`
+ * with NO schema at all on a nested A→B→KSampler write yields the COMPLETE type set
+ * (SubgraphA, SubgraphB, KSampler) from the graph, with nothing fetched. So a type-scoped
+ * read issued BELOW the resolution can name every type the fence will ask about.
+ *
+ * `scoped-object-info.js` is that read, and it is NOT this module's third transport: it is a
+ * LAST RESORT the fence itself reaches for, only after this oracle has returned nothing AND
+ * the #1223 snapshot has refused, and only when no route here ANSWERED — a client expressing
+ * deny-all as `{}` is still never overruled. The map it returns THROWS for any type it was
+ * not asked to cover, so "reads the other as absent" is impossible by construction rather
+ * than by this paragraph being obeyed.
+ *
+ * WHAT REMAINS A TRADE, stated rather than glossed. That map is genuinely PARTIAL: it can
+ * authorize a node type and it cannot answer anything that ranges over the install
+ * (`registeredSocketTypes` is #821's own example), which is why it never reaches the #1223
+ * snapshot, never reaches the ever-seen history, and does not license the #1126 blind write.
+ * `panel_refresh_nodes` is unhelped for the same reason and still refuses on such a backend.
+ * The honest fix for all of that is still a whole `/object_info` that lands.
  *
  * FAIL-CLOSED IS UNCHANGED. Only a usable, non-empty payload authorizes anything; every
  * failure path returns `defs: null`, which the fence already refuses on.

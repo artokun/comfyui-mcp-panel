@@ -19,8 +19,25 @@
 
 // Upload-input config flags ComfyUI attaches to an input SPEC's config object. Any
 // truthy one marks the input as one the user uploads a file into (image / video /
-// audio / 3d), whose valid values live on DISK, not only in the combo snapshot.
-const UPLOAD_CONFIG_FLAGS = ["image_upload", "video_upload", "audio_upload", "model_upload"];
+// audio / 3d model), whose valid values live on DISK, not only in the combo snapshot.
+//
+// #1569 — the 3D kind serializes as `file_upload`, NOT `model_upload`. ComfyUI's own
+// `UploadType` enum (comfy_api/latest/_io.py) is image="image_upload",
+// audio="audio_upload", video="video_upload", model="file_upload", and the V1 spelling
+// that predates it was already `{"file_upload": True}` (ComfyUI bdf39379, Dec 2024, the
+// commit that added Load3D). MEASURED on a live 0.33.2 /object_info (853 types): four
+// `image_upload`, one `audio_upload`, one `video_upload`, TWO `file_upload`
+// (Load3D.model_file, Load3DAdvanced.model_file) — and ZERO `model_upload`.
+//
+// `model_upload` is kept anyway, and that is a decision rather than an oversight. It has
+// never been a ComfyUI flag in any release — `git log -S model_upload -- '*.py'` over the
+// whole ComfyUI history returns no commit that introduces it as an input config key — so
+// it cannot be legacy for an older supported server. It is kept because a third-party pack
+// is free to invent it for a checkpoint-upload widget, dropping it could only ever REFUSE
+// a write that is accepted today, and recognising it costs nothing: `uploadInputAccepts`
+// admits a value only when the config carries the flag AND the extension matches THAT
+// flag's own kind, so an unused flag can never widen anything.
+const UPLOAD_CONFIG_FLAGS = ["image_upload", "video_upload", "audio_upload", "model_upload", "file_upload"];
 
 // Extension allowlist PER upload kind. A successful `/view?type=input` probe proves a
 // file EXISTS, not that it is a LOADABLE asset of the RIGHT kind — `/view` serves any
@@ -43,6 +60,22 @@ const UPLOAD_KIND_EXTENSIONS = {
   ]),
   model_upload: new Set([
     "safetensors", "ckpt", "pt", "pth", "bin", "gguf", "sft", "onnx",
+  ]),
+  // #1569 — the 3D-asset kind (`file_upload`), and it is NOT the weight-file kind above.
+  // These are exactly the suffixes `Load3D.define_schema` itself enumerates when it builds
+  // the combo (comfy_extras/nodes_load_3d.py: `file_path.suffix.lower() in {...}`), so a
+  // value the panel admits here is one ComfyUI's own listing would have offered had the
+  // file been under `input/3d/`. Deliberately NOT widened to `.usdz` — Preview3D declares a
+  // USDZ socket type, but Load3D's listing does not include it, and #240 says refuse where
+  // the server's own enumeration would not offer.
+  //
+  // Sharing the weight-file set would have been the wrong reuse: ComfyUI runs NO extension
+  // check of its own on this input (`Load3D.validate_inputs` only asks
+  // `exists_annotated_filepath`), so this list is the ONLY thing standing between a
+  // server-confirmed `3d/notes.txt` and a Load3D combo — measured: `/view` serves that file
+  // 206 and ComfyUI's own /prompt validation ACCEPTS it.
+  file_upload: new Set([
+    "gltf", "glb", "obj", "fbx", "stl", "spz", "splat", "ply", "ksplat",
   ]),
 };
 

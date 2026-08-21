@@ -512,6 +512,11 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     "objectInfoOracleFailureNote",
     "OBJECT_INFO_DEADLINE_MS",
     "makeCommandBudget",
+    // #1560 — the shipped body decides the type-scoped route's silence licence beside the
+    // snapshot's own verdict, so this sandbox has to supply the same predicate. A name the
+    // body closes over and the harness does not provide is a harness that models a panel
+    // which does not exist.
+    "noBackendAnswerEstablished",
     // `backendReconnectEpoch` MUST be a live mutable binding in the same scope as the
     // extracted body, because the panel's is module state the body re-reads. An earlier
     // version passed it as a frozen value, which made `observedAtEpoch` and the record-time
@@ -520,6 +525,7 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     `let backendReconnectEpoch = initialEpoch;
      let oracleFailures = [];
      let snapshotIneligibility = "";
+     let scopedReadLicensed = false;
      let setWidgetSchemaFromSnapshot = null;
      const comfyBackendIsDown = () => comfyBackendSocketDown;
      const historyRecorded = [];
@@ -548,6 +554,7 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
        readNote: () => setWidgetSchemaFromSnapshot,
        readIneligibility: () => snapshotIneligibility,
        readFailures: () => oracleFailures,
+       readScopedLicence: () => scopedReadLicensed,
        readHistory: () => historyRecorded,
      };`,
   );
@@ -563,6 +570,7 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     objectInfoOracleFailureNote,
     OBJECT_INFO_DEADLINE_MS,
     makeCommandBudget,
+    noBackendAnswerEstablished,
   );
 }
 
@@ -991,4 +999,51 @@ test("#1223 no comment cites a symbol that does not exist", () => {
   for (const [name, src] of [["panel", PANEL_SRC], ["snapshot module", snapshotSrc]]) {
     assert.ok(!/recordsWholeSchemaOnly/.test(src), `${name} still cites a phantom symbol`);
   }
+});
+
+// ───────────── #1560: the SHIPPED body's licence for the type-scoped last resort ──────────
+
+test("#1560 SHIPPED: hung probes LICENSE the type-scoped read; the snapshot and the licence agree", async () => {
+  // Both whole-map routes went silent — the #1560 install. That is the one condition under
+  // which a per-class read may be asked at all, and it is the SAME evidence #1223's snapshot
+  // is licensed on, read once, in the same statement.
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({ api: hungApi, snapshot, epoch: 5 });
+  assert.equal(await o.getFreshObjectInfo(), null, "nothing usable came back");
+  assert.equal(o.readScopedLicence(), true, "silence licenses the type-scoped route");
+});
+
+test("#1560 SHIPPED: a client ANSWERING deny-all `{}` licenses NOTHING — it is never overruled", async () => {
+  // An empty schema is a client expressing deny-all. Consulting a broader per-class read
+  // there is the one direction object-info-oracle.js's note forbids, and the licence is what
+  // stops it. If this ever reads true, the fence can be widened past a deliberate refusal.
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({ api: { getNodeDefs: async () => ({}) }, snapshot, epoch: 5 });
+  assert.equal(await o.getFreshObjectInfo(), null, "an empty schema authorizes nothing, as before");
+  assert.equal(o.readScopedLicence(), false, "and it may not be re-asked by another route");
+});
+
+test("#1560 SHIPPED: a route that THREW licenses nothing either — something answered", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: async () => {
+        throw new Error("connection refused");
+      },
+      fetchApi: async () => {
+        throw new Error("connection refused");
+      },
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.getFreshObjectInfo(), null);
+  assert.equal(o.readScopedLicence(), false, "a refused connection is a process that is GONE, not one that is busy");
+});
+
+test("#1560 SHIPPED: a LIVE answer leaves the licence false — there is nothing to license", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({ api: { getNodeDefs: async () => SCHEMA }, snapshot, epoch: 5 });
+  assert.equal(await o.getFreshObjectInfo(), SCHEMA);
+  assert.equal(o.readScopedLicence(), false);
 });
