@@ -1638,6 +1638,12 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts) {
           defs = fallbackDefs;
           clientRouteThrew = false;
           clientRouteError = null;
+          // #1562 — and route 2 ANSWERED, so "every route was abandoned" is no longer
+          // true. Cleared HERE rather than left to the fact that no fetch-phase refusal
+          // can be reached from this branch: a stale `true` that happens not to be read
+          // is a latent wrong answer waiting for the next reader, which is the shape this
+          // whole issue is about.
+          fetchAbandonedAtBound = false;
         } else {
           // Neither route produced a payload. Record what each one did so the verdict can
           // say it: the client route's sentence is built HERE because the oracle was handed

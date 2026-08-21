@@ -323,4 +323,15 @@ test("#1562: the fetch phase classifies route endings by TAG, not by message tex
     /fetchAbandonedAtBound\s*=[^;]*\.(includes|match|test)\(/,
     "no branch may decide this by reading the failure prose",
   );
+  // A SOURCE assertion, and said to be one. When route 2 ANSWERS, "every route was
+  // abandoned" stops being true — but the run then succeeds, so no fetch-phase refusal is
+  // reachable and no verdict can observe the value. There is nothing to assert
+  // behaviourally; what there is to protect is that the clear does not get dropped, since
+  // a stale `true` left for the next reader is exactly the shape this issue is about.
+  const answered = block.slice(block.indexOf("if (fallbackDefs) {"));
+  assert.match(
+    answered.slice(0, answered.indexOf("} else {")),
+    /fetchAbandonedAtBound = false;/,
+    "a fallback that ANSWERED must clear the abandonment finding rather than leave it set",
+  );
 });
