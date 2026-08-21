@@ -21,6 +21,8 @@ import test from "node:test";
 import {
   scanComboAvailability,
   comboInputsOf,
+  comboConfigsOf,
+  declaresUnrecognizedUploadKind,
   optionsLookLikeFiles,
   comboAvailabilityNote,
   linkDrivenWidgetNames,
@@ -299,4 +301,110 @@ test("#984 linkDrivenWidgetNames reports only CONNECTED inputs", () => {
   );
   assert.deepEqual([...linkDrivenWidgetNames(null)], []);
   assert.deepEqual([...linkDrivenWidgetNames({ inputs: {} })], []);
+});
+
+// ---------------------------------------------------------------------------
+// panel#745 RECURRENCE (reopened 2026-08-21, panel 0.15.19) — the scan omitted
+// every combo declared in the V2/V3 wire shape.
+//
+// A V3-schema node (`IO.Combo.Input` under `@comfytype(io_type="COMBO")`) puts the
+// literal string "COMBO" at spec[0] and the list under the config, so the old
+// `Array.isArray(def[0])` read filed it as "not a combo" and the widget was skipped
+// ENTIRELY — no finding AND no unchecked_nodes entry.
+//
+// Every fixture below is VERBATIM from this machine's live ComfyUI 0.33.2
+// /api/object_info (853 types, 652 combo inputs). The def[0] read recognised 61 of
+// them, all V1; reading through `authoritativeComboValues` recognises 528.
+// ---------------------------------------------------------------------------
+
+/** Load3D.model_file, copied verbatim from GET /api/object_info/Load3D. */
+const LOAD3D = classBody("Load3D", {
+  model_file: ["COMBO", { multiselect: false, options: ["none"], file_upload: true }],
+  image: ["LOAD_3D", {}],
+  width: ["INT", { default: 1024, min: 1, max: 4096, step: 1 }],
+});
+
+/** LoadAudio.audio — a V2 combo the server declares EMPTY, live-verified shape. */
+const LOAD_AUDIO = classBody("LoadAudio", {
+  audio: ["COMBO", { multiselect: false, options: [], audio_upload: true }],
+});
+
+test("#745 recurrence: the reporter's case — a V2 combo value the server does not offer IS reported", async () => {
+  const r = await scanComboAvailability(
+    [node(12, "Load3D", [{ name: "model_file", value: "3d/absent.glb" }])],
+    async () => LOAD3D,
+  );
+  assert.equal(r.unavailable.length, 1, "a V2 combo must be judged, not skipped");
+  assert.equal(r.unavailable[0].widget, "model_file");
+  assert.equal(r.unavailable[0].value, "3d/absent.glb");
+  assert.deepEqual(r.unknown, [], "it is a DETERMINED answer, not an unchecked one");
+});
+
+test("#745 recurrence: a V2 value the server DOES offer produces no finding", async () => {
+  const r = await scanComboAvailability(
+    [node(12, "Load3D", [{ name: "model_file", value: "none" }])],
+    async () => LOAD3D,
+  );
+  assert.deepEqual(r.unavailable, [], "must not report a value the server itself lists");
+  assert.deepEqual(r.unknown, []);
+});
+
+test("#745 recurrence: a server-declared-EMPTY V2 list is a real answer, like its V1 twin", async () => {
+  const r = await scanComboAvailability(
+    [node(3, "LoadAudio", [{ name: "audio", value: "song.mp3" }])],
+    async () => LOAD_AUDIO,
+  );
+  assert.equal(r.unavailable.length, 1, "zero options installed means the value is unavailable");
+  assert.equal(r.unavailable[0].option_count, 0);
+});
+
+test("#745 recurrence: an UNREAD V2 list is never mistaken for an empty one", async () => {
+  // A remote list arrives from a separate fetch, and a dynamic V3's keys select
+  // SUB-INPUTS rather than values. Both must stay unjudged — reading either as []
+  // would report every value on them as missing, the mass-false-positive failure
+  // #774 refused to risk.
+  for (const spec of [
+    ["COMBO", { remote: { route: "/api/models" } }],
+    ["COMBO", { remote: { route: "/api/models" }, options: [] }],
+    ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "a", inputs: [] }] }],
+  ]) {
+    const body = classBody("Remote", { pick: spec });
+    const r = await scanComboAvailability(
+      [node(1, "Remote", [{ name: "pick", value: "anything_at_all" }])],
+      async () => body,
+    );
+    assert.deepEqual(r.unavailable, [], `must not judge against an unread list: ${JSON.stringify(spec)}`);
+  }
+});
+
+test("#745 recurrence: an ANNOTATED value on an unrecognized upload kind abstains, never accuses", async () => {
+  // `Load3D.model_file` declares `file_upload`, which is NOT in UPLOAD_CONFIG_FLAGS,
+  // so the #1357 abstention did not arm for it. `chair.glb [output]` resolves through
+  // exists_annotated_filepath and runs fine, and NO option list on the live server
+  // carries an annotation (measured: 0 of 652), so non-membership says nothing.
+  const r = await scanComboAvailability(
+    [node(99, "Load3D", [{ name: "model_file", value: "chair.glb [output]" }])],
+    async () => LOAD3D,
+  );
+  assert.deepEqual(r.unavailable, [], "an annotated value must not be reported as missing");
+  assert.equal(r.unknown.length, 1, "and must not be silently dropped either");
+  assert.match(r.unknown[0].reason, /upload kind/);
+});
+
+test("#745 recurrence: declaresUnrecognizedUploadKind abstains ONLY for an unknown upload flag", () => {
+  assert.equal(declaresUnrecognizedUploadKind({ file_upload: true }), true);
+  assert.equal(declaresUnrecognizedUploadKind({ image_upload: true }), false, "already handled");
+  assert.equal(declaresUnrecognizedUploadKind({ options: [], multiselect: false }), false);
+  assert.equal(declaresUnrecognizedUploadKind({ file_upload: false }), false);
+  assert.equal(declaresUnrecognizedUploadKind(null), false);
+});
+
+test("#745 recurrence: comboInputsOf reads V1 and V2 alike, and configs come with them", () => {
+  assert.deepEqual([...comboInputsOf(LOAD3D, "Load3D").entries()], [["model_file", ["none"]]]);
+  assert.deepEqual(
+    comboConfigsOf(LOAD3D, "Load3D").get("model_file"),
+    { multiselect: false, options: ["none"], file_upload: true },
+    "the V2 config must travel with the list, or the #1357 upload abstention cannot arm",
+  );
+  assert.equal(comboInputsOf(LOAD3D, "NoSuchClass"), null, "an absent class is still UNKNOWN");
 });

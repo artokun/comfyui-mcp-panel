@@ -37,6 +37,7 @@
 
 import { isFrontendVirtualNode } from "./frontend-virtual-nodes.js";
 import {
+  authoritativeComboValues,
   parseAnnotatedFilepath,
   splitInputAssetRef,
   uploadConfigOf,
@@ -98,10 +99,31 @@ function parseClassCombos(body, className) {
     const entries = input[group];
     if (!entries || typeof entries !== "object") continue;
     for (const [name, def] of Object.entries(entries)) {
-      // A combo is declared as `[[...allowed], {opts}]`; a typed input as
-      // `["MODEL", {...}]`. Only the first form enumerates values.
-      if (Array.isArray(def) && Array.isArray(def[0])) {
-        options.set(name, def[0].filter((v) => typeof v === "string"));
+      // #745 (recurrence) — the option list is read through the ONE canonical
+      // reader, not off `def[0]`.
+      //
+      // `def[0]` is the option array only in the V1 shape `[[...allowed], {opts}]`.
+      // A V3-schema node (`IO.Combo.Input`, `@comfytype(io_type="COMBO")`) serializes
+      // as `["COMBO", { multiselect, options: [...] }]` — the literal type string sits
+      // at `def[0]` and the list lives under the config — so `Array.isArray(def[0])`
+      // filed every one of them under "not a combo" and the scan skipped the widget
+      // ENTIRELY: no finding, and no `unchecked_nodes` entry either, which is the
+      // silent drop this module exists to prevent.
+      //
+      // MEASURED against this machine's live ComfyUI 0.33.2 /object_info (853 types,
+      // 652 combo inputs): the `def[0]` read recognised 61 — every one of them V1.
+      // `authoritativeComboValues` recognises 528 (61 V1 + 467 V2), of which 27 are
+      // server-declared EMPTY, i.e. exactly the reporter's class of case. The scan was
+      // blind to 91% of the combos on the canvas it was asked to judge.
+      //
+      // Strictness is unchanged in the direction that matters: the reader yields null
+      // for a REMOTE V2 (1 input) and a dynamic V3 (123 inputs) because those lists are
+      // genuinely unread, so an unread list is never mistaken for an empty one. Those
+      // stay unjudged, exactly as they are today.
+      if (!Array.isArray(def)) continue;
+      const values = authoritativeComboValues(def);
+      if (Array.isArray(values)) {
+        options.set(name, values.filter((v) => typeof v === "string"));
         configs.set(name, def[1] && typeof def[1] === "object" ? def[1] : {});
       }
     }
@@ -160,6 +182,27 @@ export function linkDrivenWidgetNames(node) {
  * server could not be asked about. Kept in one place so "I could not check this"
  * never drifts into reading like "I checked and it is fine".
  */
+/**
+ * #745 — TRUE when this input config announces itself as an UPLOAD input via a
+ * `*_upload` flag that `uploadConfigOf` does NOT recognise (ComfyUI's own
+ * `UploadType.model` serializes as `file_upload`, which is not in the panel's list).
+ *
+ * Used ONLY to abstain, never to report: an unrecognised upload kind means the panel
+ * cannot say what this list can enumerate, and "I could not check this" must not be
+ * written as "this is missing". False for a config with no upload flag at all, and
+ * false for one `uploadConfigOf` already handles, so it changes nothing for the
+ * inputs that were already judged.
+ */
+export function declaresUnrecognizedUploadKind(config) {
+  try {
+    if (!config || typeof config !== "object") return false;
+    if (uploadConfigOf(config)) return false;
+    return Object.keys(config).some((k) => /_upload$/.test(k) && config[k]);
+  } catch {
+    return false;
+  }
+}
+
 const UNENUMERABLE_PREFIX =
   "not checked: this value names a file below the input root (or under an " +
   "[output]/[temp]/[input] annotation), which /object_info's combo list cannot enumerate";
@@ -252,8 +295,29 @@ export async function scanComboAvailability(
   let assetProbeLimitHit = false;
   const adjudicateUnenumerableAsset = async (config, value) => {
     const cfg = uploadConfigOf(config);
-    if (!cfg) return null;
     const { name: bare, type: root, annotated } = parseAnnotatedFilepath(value);
+    // #745 (recurrence) — reading V2 combos brought UPLOAD inputs whose kind this
+    // panel does not recognise into scope for the first time, and an ANNOTATED value
+    // on one of them would be a NEW false positive.
+    //
+    // Measured on live 0.33.2: exactly two inputs declare an upload flag outside
+    // `UPLOAD_CONFIG_FLAGS` — `Load3D.model_file` and `Load3DAdvanced.model_file`, both
+    // `file_upload`, both V2. That is the very node class this recurrence was reported
+    // against. `uploadConfigOf` answers null for them, so the abstention below never
+    // armed and `chair.glb [output]` — which Load3D resolves through
+    // `exists_annotated_filepath` and runs fine — would be reported `missing_asset`.
+    //
+    // Abstaining on the ANNOTATED value costs no coverage: measured across all 652
+    // combo inputs, ZERO option strings carry an `[output]`/`[input]`/`[temp]`
+    // annotation, so such a value can never be a member of any list and non-membership
+    // was never evidence about it. A subfolder-only value stays JUDGED, so the
+    // reporter's own `3d/absent.glb` case is still reported.
+    if (!cfg) {
+      if (annotated && declaresUnrecognizedUploadKind(config)) {
+        return { reason: `${UNENUMERABLE_PREFIX}, and this input's upload kind is one this panel cannot adjudicate` };
+      }
+      return null;
+    }
     const { subfolder, filename } = splitInputAssetRef(bare, { backslashIsSeparator });
     if (!filename) return null;
     if (!annotated && !subfolder) return null;
