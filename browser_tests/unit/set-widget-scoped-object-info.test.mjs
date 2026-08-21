@@ -539,3 +539,43 @@ test("#1560: a hostile class name is FLATTENED before it reaches a refusal a cal
     "a newline in a node type must not forge structure in the message",
   );
 });
+
+test("#1560 B: a WORKFLOW SWITCH during the scoped read still refuses before any mutation (#718)", async () => {
+  // The scoped read adds an await between the promotion resolution and the write. The
+  // workflow fence is what covers that window — it is re-checked synchronously inside
+  // `write`, with no await after it — and the scope trap does NOT cover this shape.
+  const reg = loadedRegistry(["SmartResolution"]);
+  const node = regNode(1976, "SmartResolution", [{ name: "value", type: "INT", value: 512 }]);
+  const backend = largeInstall({ defined: ["SmartResolution"] });
+  let switched = false;
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "value", 768, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => null,
+        fetchScopedObjectInfo: async (types) => {
+          const scoped = await fetchTypeScopedObjectInfo(types, { fetchApi: backend.fetchApi });
+          switched = true; // the user changed the active canvas while this request was in flight
+          return scoped;
+        },
+        assertTargetStillCurrent: () => {
+          if (switched) throw new Error("workflow instance mismatch");
+        },
+        wasTypeEverDefined: () => false,
+        ...HOOKS,
+      }),
+    /workflow instance mismatch/,
+  );
+  assert.equal(node.widgets[0].value, 512, "the stale command must not mutate the new workflow");
+});
+
+test("#1560: a deeper relink to a node of the SAME type is NOT caught by the scope trap — and says so", () => {
+  // The header states this explicitly rather than implying the trap covers every shape: a
+  // relink that lands on a node whose type IS covered asks a question the map can answer, so
+  // nothing throws. That is correct — the authorization is still true of the node driven —
+  // but a comment claiming otherwise is how a false guarantee outlives its author.
+  const src = readFileSync(SET_WIDGET_JS, "utf8");
+  assert.match(src, /A relink to a node of the SAME type is NOT\s*\/\/\s*caught/);
+  assert.match(src, /stale-target hazard,\s*\/\/\s*never a fail-open of the #458 fence/);
+});

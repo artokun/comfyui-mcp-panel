@@ -400,11 +400,28 @@ export async function runSetWidget(
   // passes the whole unit suite, but it would make the resolution older by up to a full
   // budget on every healthy call to buy something only this path needs.
   //
-  // THE AWAIT THIS ADDS IS GUARDED BY THE SAME TRAP. It sits between the resolution and the
-  // write, so a promotion relinked mid-fetch could resolve deeper to a different concrete
-  // node — and that node's type is one the scoped map was never asked to cover, so it throws
-  // and the write refuses. The workflow fence (`assertTargetStillCurrent`, re-checked
-  // synchronously inside `write`) already covers a workflow switch across the same window.
+  // WHAT THE AWAIT THIS ADDS DOES AND DOES NOT COST — stated exactly, because the first
+  // version of this note claimed the scope trap guarded all of it, and it does not.
+  //
+  // The trap catches ONE of the two shapes: a promotion relinked mid-fetch that resolves
+  // deeper to a concrete node of a DIFFERENT type asks the map about a type it was never
+  // given, so it throws and the write refuses. A relink to a node of the SAME type is NOT
+  // caught, and does not need to be — the type authorization is still true of the node
+  // actually driven.
+  //
+  // What is genuinely older is `promotedResolution`, captured just above: `authTarget` and
+  // every guard below are still computed AFTER this await, exactly as they are after the
+  // whole-map fetch today, but the IMMEDIATE write target now predates one more await. So a
+  // caller who re-promotes a widget during this window can have the write land on the node
+  // the promotion pointed at when the command was resolved. That is a stale-target hazard,
+  // never a fail-open of the #458 fence: whatever is written is still registry-checked
+  // (`assertResolvedTargetRegistered`), still type-authorized against a live backend, and
+  // still fenced to the active workflow (`assertTargetStillCurrent`, re-checked synchronously
+  // inside `write` with no await after it).
+  //
+  // The window is this read alone — measured at 1.2 ms per class on this repo's own rig
+  // (#767), 15 ms in the reproduction — on a path where the alternative is a refusal that
+  // never succeeds. That is the trade, and it is taken deliberately.
   //
   // Skipped entirely for a promoted-but-unresolvable write: nothing consults freshDefs on
   // that path, so a request would only add latency to a refusal that is already decided.
