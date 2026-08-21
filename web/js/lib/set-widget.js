@@ -37,6 +37,7 @@ import {
   freshBackendDefinesType,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
+import { isTypeScopedObjectInfo } from "./scoped-object-info.js";
 import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
 import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
 import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
@@ -131,6 +132,51 @@ function staleComboRefreshRefusalMessage(refreshStillRunning) {
   );
 }
 
+/**
+ * #1560 — the COMPLETE set of class types this write is about to be authorized against,
+ * derived from the GRAPH with no schema and no I/O.
+ *
+ * This is what makes a type-scoped `/object_info` read answer the RIGHT question. The three
+ * guards below ask about exactly these:
+ *
+ *   - `assertTypeAgainstFreshBackend` on the ULTIMATE CONCRETE target's type;
+ *   - `assertMutatedNodeAuthorized` on the OUTER subgraph node's type;
+ *   - `assertMutatedNodeAuthorized` on EVERY intermediate container's type;
+ *   - and the #612 not-promoted diagnosis, on the outer node's type again.
+ *
+ * MEASURED, not reasoned: driving the real helpers on the nested A→B→KSampler shape the #458
+ * suite uses returns SubgraphA / SubgraphB / KSampler with nothing fetched. That is the
+ * "TWO types for a promoted write" the oracle's header warns about, named up front instead of
+ * discovered after the fetch.
+ *
+ * A SUPERSET IS SAFE; A SUBSET IS A REFUSAL, NEVER A WRONG ANSWER. An extra type costs one
+ * ~3KB request. A missing one is a type the returned map was not asked to cover, and reading
+ * it throws rather than reporting it absent — which is the #716/#821 failure this exists to
+ * make impossible.
+ */
+export function scopedAuthorizationTypes(node, promotedResolution, isResolvedPromotion, resolveSource) {
+  const types = [];
+  const push = (t) => {
+    if (typeof t === "string" && t !== "" && !types.includes(t)) types.push(t);
+  };
+  push(node?.type);
+  if (isResolvedPromotion) {
+    // Both helpers walk injected, caller-supplied link data and can throw on a malformed or
+    // cyclic promotion. An incomplete list must never be returned as though it were the whole
+    // set, so a throw yields NOTHING and the scoped read is simply not attempted — the write
+    // then refuses on the unchanged path below.
+    try {
+      push(followPromotionToConcrete(promotedResolution.target, resolveSource)?.node?.type);
+      for (const intermediate of collectPromotionIntermediates(promotedResolution.target, resolveSource)) {
+        push(intermediate?.type);
+      }
+    } catch {
+      return [];
+    }
+  }
+  return types;
+}
+
 export async function runSetWidget(
   node,
   widgetName,
@@ -175,6 +221,10 @@ export async function runSetWidget(
     //                  silent. NOTE it is a detached map of TYPE NAMES ONLY — see the
     //                  fallback below for why that makes it unable to answer this question
     //                  at all, rather than merely answering it staleley
+    //   "scoped"       #1560's TYPE-SCOPED read stood in while both whole-map probes were
+    //                  silent. It is the server answering NOW, but only about the handful of
+    //                  types this write resolves to — so it can authorize a type and it
+    //                  cannot answer anything that ranges over the install
     //   "none"         nothing was established
     //
     // The first four are ONE answer from object-info-cache.js, which owns the generation
@@ -206,6 +256,24 @@ export async function runSetWidget(
     // OUTCOME the ladder needs — a fresh answer — and leaves the cache to decide how to get
     // one without disturbing anybody else.
     refetchObjectInfoLive,
+    // #1560 — the LAST-RESORT, TYPE-SCOPED route: `(types) => { defs, covered, reason }`,
+    // asking the backend about EXACTLY the class types this write is about to be authorized
+    // against, one `/object_info/<Type>` request each.
+    //
+    // Consulted ONLY when the whole-map oracle AND #1223's snapshot have both produced
+    // nothing — on a ~1023-model install the whole dump never lands inside any budget, so
+    // the snapshot is never populated and every write refuses for the LIFE OF THE TAB.
+    //
+    // It is wired here rather than inside `getFreshObjectInfo` for a reason the oracle's own
+    // header names: a per-class payload "answers one question and reads the other as absent
+    // (#716/#821)", and the set of questions is only known once the promotion has been
+    // resolved — which happens BELOW the fetch. By the time this is called the outer node,
+    // every intermediate and the ultimate concrete target are all known, so the map can be
+    // asked to cover all of them and to THROW for anything else (see scoped-object-info.js).
+    //
+    // The panel gates it on the SAME `noBackendAnswerEstablished` licence #1223's snapshot
+    // uses, so a client that ANSWERED deny-all is never overruled by a broader per-class read.
+    fetchScopedObjectInfo,
     // #757 — SYNCHRONOUS target preparation. Some write targets do not exist until
     // something creates them (an rgthree Power Lora Loader `lora_N` row is minted only by
     // the node's own method), and the creation is a graph MUTATION. Injected here, rather
@@ -228,6 +296,7 @@ export async function runSetWidget(
         p === "reconnected" ||
         p === "retired" ||
         p === "snapshot" ||
+        p === "scoped" ||
         p === "none"
         ? p
         : "unknown";
@@ -235,6 +304,30 @@ export async function runSetWidget(
       return "unknown";
     }
   };
+  /**
+   * The provenance of THE MAP THIS DECISION IS ABOUT — asked of the PAYLOAD first, and only
+   * then of the stamp.
+   *
+   * `readSchemaProvenance` deliberately holds the QUESTION rather than an answer, because a
+   * verdict computed before an await can be superseded during it (#1126). That is right for
+   * the whole-map routes and WRONG for #1560's type-scoped one, because the ladder below
+   * re-asks the panel for a live map: the re-ask re-enters the panel's shared
+   * `readObjectInfo`, which re-stamps the provenance on EVERY exit path it has. So a FAILED
+   * re-ask — the normal case on an install whose whole map never lands — overwrites "scoped"
+   * with "none" while `authDefs` is still the scoped map. The branch keyed on "scoped" then
+   * never fires, and what fires instead tells the caller the provenance could not be
+   * established AT ALL and to reconnect: false twice over, since a type-scoped read did
+   * answer, live, moments earlier, and reconnecting cannot help a backend whose whole map
+   * never arrives. That is the misattribution class #982/#1223 exist to stop, committed by
+   * the change written to extend them.
+   *
+   * #1223's OWN snapshot branch was dead code for the same reason once — `node-resolve.js`'s
+   * suite records it — so this is that defect one field over, and the reason the answer is
+   * not simply a second stamp captured earlier: a brand belongs to the very object being
+   * ruled on, so when the re-ask DOES replace `authDefs` with a whole live map this answers
+   * for the NEW payload with no flag anyone has to remember to clear.
+   */
+  const provenanceOf = (defs) => (isTypeScopedObjectInfo(defs) ? "scoped" : readSchemaProvenance());
   const liveRegistry = () => (typeof getRegistry === "function" ? getRegistry() : registry);
 
   // (0) FRESH-BACKEND TYPE AUTHORIZATION (#458 set_widget gap, found in review of
@@ -310,6 +403,81 @@ export async function runSetWidget(
   // into applyWidgetWrite so the write never re-resolves.
   const resolvedTargetNode = isResolvedPromotion ? promotedResolution.target.node : node;
   const promotedButUnresolvable = !!(promotedResolution && promotedResolution.promoted && !promotedResolution.target);
+
+  // #1560 — LAST RESORT: ask the backend about EXACTLY the types this write needs.
+  //
+  // Reached only when the whole-map oracle returned nothing AND #1223's snapshot could not
+  // stand in — on the reported install that is EVERY call, forever, because the whole dump
+  // never lands and so the snapshot is never populated. Reproduced by execution before this
+  // was written: two hung whole-map routes, zero per-class requests ever issued, the widget
+  // never written, the identical refusal 15,015 ms later on the second call.
+  //
+  // PLACED HERE, BELOW THE RESOLUTION, WHICH IS THE WHOLE POINT. The oracle's header rejects
+  // the per-class route for this fence because "set_widget authorizes two types for a
+  // promoted write and fetches BEFORE resolving which target it writes to, so a single-class
+  // payload answers one question and reads the other as absent (#716/#821)". By this line the
+  // promotion HAS been resolved — purely, with no schema and no I/O (measured: the real
+  // resolution helpers produce SubgraphA / SubgraphB / KSampler for a nested A→B→KSampler
+  // write with nothing fetched at all) — so the request can name all of them and the map it
+  // returns THROWS for any type outside that set instead of reading it as absent.
+  //
+  // The primary fetch above deliberately did NOT move. Resolving before it was tried and
+  // passes the whole unit suite, but it would make the resolution older by up to a full
+  // budget on every healthy call to buy something only this path needs.
+  //
+  // WHAT THE AWAIT THIS ADDS DOES AND DOES NOT COST — stated exactly, because the first
+  // version of this note claimed the scope trap guarded all of it, and it does not.
+  //
+  // The trap catches ONE of the two shapes: a promotion relinked mid-fetch that resolves
+  // deeper to a concrete node of a DIFFERENT type asks the map about a type it was never
+  // given, so it throws and the write refuses. A relink to a node of the SAME type is NOT
+  // caught, and does not need to be — the type authorization is still true of the node
+  // actually driven.
+  //
+  // What is genuinely older is `promotedResolution`, captured just above: `authTarget` and
+  // every guard below are still computed AFTER this await, exactly as they are after the
+  // whole-map fetch today, but the IMMEDIATE write target now predates one more await. So a
+  // caller who re-promotes a widget during this window can have the write land on the node
+  // the promotion pointed at when the command was resolved. That is a stale-target hazard,
+  // never a fail-open of the #458 fence: whatever is written is still registry-checked
+  // (`assertResolvedTargetRegistered`), still type-authorized against a live backend, and
+  // still fenced to the active workflow (`assertTargetStillCurrent`, re-checked synchronously
+  // inside `write` with no await after it).
+  //
+  // The window is this read alone — measured at 1.2 ms per class on this repo's own rig
+  // (#767), 15 ms in the reproduction — on a path where the alternative is a refusal that
+  // never succeeds. That is the trade, and it is taken deliberately.
+  //
+  // Skipped entirely for a promoted-but-unresolvable write: nothing consults freshDefs on
+  // that path, so a request would only add latency to a refusal that is already decided.
+  let scopedIneligibility = "";
+  if (!freshDefs && !promotedButUnresolvable && typeof fetchScopedObjectInfo === "function") {
+    let scoped = null;
+    try {
+      scoped = await fetchScopedObjectInfo(
+        scopedAuthorizationTypes(node, promotedResolution, isResolvedPromotion, resolveSource),
+      );
+    } catch {
+      // A last-resort route must never replace the refusal it was trying to avoid.
+      scoped = null;
+    }
+    if (scoped && scoped.defs) freshDefs = scoped.defs;
+    else if (scoped && typeof scoped.reason === "string" && scoped.reason) scopedIneligibility = scoped.reason;
+  }
+  // The refusal has to be able to say a THIRD route was tried and what it did. Kept OUT of
+  // the transport list `objectInfoOracleFailureNote` renders — that array is what the two
+  // whole-map routes reported, and splicing a non-route entry into it makes a two-transport
+  // failure claim three routes tried, which is #982's own defect.
+  const describeObjectInfoFailureWithScope = () => {
+    let base = "";
+    try {
+      base = typeof describeObjectInfoFailure === "function" ? describeObjectInfoFailure() || "" : "";
+    } catch {
+      base = ""; // a diagnostic must never replace the refusal it is describing
+    }
+    if (!scopedIneligibility) return base;
+    return `${base} A type-scoped /object_info read was tried too — ${scopedIneligibility}.`;
+  };
   // The node whose TYPE to fresh-authorize. For a promoted write, follow the promotion
   // chain through any NESTED SubgraphNodes to the ULTIMATE CONCRETE backend node and
   // authorize THAT type (a virtual intermediate subgraph type is never in /object_info
@@ -433,7 +601,7 @@ export async function runSetWidget(
       // but absent from the current /object_info is a REMOVED backend node — refuse
       // (the non-forgeable trust root; client shape/name/markers cannot prove this).
       wasTypeEverDefined,
-      describeObjectInfoFailure,
+      describeObjectInfoFailure: describeObjectInfoFailureWithScope,
     });
   }
 
@@ -1072,7 +1240,7 @@ export async function runSetWidget(
       // upload probe were awaited, and both of those can supersede it — a refresh, an install,
       // a download completing, a reconnect. A verdict is a statement about a moment, so it is
       // asked at the moment it is used, on the near side of every await that could expire it.
-      let provenance = readSchemaProvenance();
+      let provenance = provenanceOf(freshDefs ?? undefined);
       let authDefs = freshDefs ?? undefined;
       // What the STALE evidence claimed, captured before it is replaced — the difference
       // between "the server publishes a list, as it always did" and "the stale schema said
@@ -1090,7 +1258,49 @@ export async function runSetWidget(
         } catch {
           /* the re-ask failed; provenance stays non-live and the refusals below fire */
         }
-        provenance = readSchemaProvenance();
+        provenance = provenanceOf(authDefs);
+      }
+      // #1560 — a TYPE-SCOPED map is the server answering NOW, but only about the handful of
+      // types this write resolves to. It can authorize the node type; it even holds this
+      // input's own option list. It still may not license the blind write: the whole-schema
+      // probes went silent, so nothing establishes that the panel is looking at the CURRENT
+      // install rather than at one class of it, and widening a last-resort unvalidated write
+      // on a partial view of the schema is the one thing this route was built not to do.
+      //
+      // DECIDED HERE, ABOVE the empty-list shape test, and that placement is the fix rather
+      // than a tidy-up. Below it this branch is unreachable in BOTH directions: when the
+      // scoped map declares the list EMPTY the shape test fires first and refuses with a
+      // message about a provenance that "could not be established at all" — false, a
+      // type-scoped read answered — and when it declares a NON-empty list the ladder falls
+      // through to the generic end-of-ladder refusal, which sends the caller to look at their
+      // value while the actual cause is a backend whose whole map never lands. Verified by
+      // execution, not by reading: with this branch deleted the whole suite stayed green,
+      // which is what dead code looks like from inside a passing test run.
+      // NARROWER THAN IT FIRST READ, deliberately. An earlier wording said a scoped map is
+      // "not enough to license an unvalidated write, whether or not it shows this input's
+      // list as empty" — and that over-claims, because #507's branch above DOES accept one.
+      // The two cases are not the same observation and the asymmetry is correct:
+      //
+      //   - #507: the widget's OWN list read as EMPTY and the schema says empty too. Two
+      //     agreeing observations, and the per-class def is the live server answer for this
+      //     class — byte-identical to the whole map's entry for it (measured on 0.33.2). That
+      //     branch already accepts `cache`/`reconnected`/`retired` whole maps, all of them
+      //     older than this one.
+      //   - HERE: the widget's own list could not be READ AT ALL, so the schema is the only
+      //     witness there is. Standing in for the sole witness is a stronger claim than
+      //     agreeing with a second one, and a partial view of the install may not make it.
+      if (provenance === "scoped") {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `${latest.message} The panel could have written it unvalidated if a WHOLE ` +
+            `/object_info declared this input's option list empty — but both whole-schema ` +
+            `probes went silent, so the only schema available is a TYPE-SCOPED read (#1560) ` +
+            `covering just the node types this write resolves to. That is enough to authorize ` +
+            `the node type. It is not enough to stand in for a list the panel could not read ` +
+            `at all, which is the one thing that would license THIS write. This is NOT a ` +
+            `stale or unreadable schema and reconnecting need not help: wait for /object_info ` +
+            `to answer as a whole again, then retry.`,
+        );
       }
       if (serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput)) {
         // Fails closed: no live declaration, no blind write. The user is told WHICH fact is
