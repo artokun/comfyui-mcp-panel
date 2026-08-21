@@ -96,7 +96,9 @@ const guardSrc = () =>
 
 test("#1571 the fingerprint catch BINDS what was thrown", () => {
   const s = guardSrc();
-  const at = s.indexOf("contentCanon = canonicalizePrompt((await app.graphToPrompt())?.output");
+  // #1565 — the fingerprint serialization is bounded by the command budget now, so the
+  // canonicalize reads the bounded step's value. Same block, same binding requirement.
+  const at = s.indexOf("contentCanon = canonicalizePrompt(built.value?.output");
   assert.ok(at > 0, "the fingerprint call must still be recognisable");
   // Bounded by the refusal it feeds, not by a byte count (#1472/#1460/#1582: fixed windows
   // in this repo have reported missing wiring that was present three separate times).

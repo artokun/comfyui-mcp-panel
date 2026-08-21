@@ -16,6 +16,10 @@
 // `unrunnableNodeIds(undefined)` answers `[]` — no offenders — because a result that does not
 // exist has no unrunnable entries in it. Absence of evidence, read as evidence of absence.
 import test from "node:test";
+// #1565 — the pre-flight serialization is bounded by graph_run's command budget now;
+// the harness below drives the SHIPPED block, so it needs the same two collaborators.
+import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import assert from "node:assert/strict";
 
 import {
@@ -93,8 +97,16 @@ test("#1582 a long type list is bounded", () => {
 test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async () => {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
-  const at = src.indexOf("const built = await app.graphToPrompt();");
+  // #1565 — the call is bounded by the command budget now, so the recognisable line is the
+  // bounded step rather than a bare await. Same block, same assertions below it, plus a
+  // check that it is still graphToPrompt being bounded.
+  const at = src.indexOf("const preflightBuild = await withTimeout(");
   assert.ok(at > 0, "the pre-flight's graphToPrompt call must still be recognisable");
+  assert.match(
+    src.slice(at, src.indexOf("const built = preflightBuild.value;", at)),
+    /app\.graphToPrompt\(\)/,
+    "and it must still be the pre-flight that serializes the prompt",
+  );
   // Bounded by the pre-flight's OWN catch, not a byte count. A fixed 1800 truncated
   // `unrunnableNodeIds(built)` the moment the guard's comment grew — which is the third
   // time today a fixed window in this repo reported missing wiring that was present
@@ -162,6 +174,14 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     // without this the extracted body throws a ReferenceError that the pre-flight catch
     // swallows, and the test sees no refusal at all.
     "window",
+    // #1565 — the serialization is BOUNDED by graph_run's command budget now. All three
+    // names are consts in graph_run, so leaving any of them out makes the extracted body
+    // throw a ReferenceError the pre-flight catch swallows — the test would then read "no
+    // refusal" from a pre-flight that never ran, which is the silent failure this file
+    // exists to stop, one layer down.
+    "withTimeout",
+    "budget",
+    "RUN_SERIALIZE_TIMEOUT_MS",
     `return async function preflight() {\n${body}\n};`,
   );
   // The VIEWED graph is deliberately a DIFFERENT object from the root when the caller
@@ -181,6 +201,11 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     { _nodes: nodes },
     mod.unresolvedNodeTypes,
     { LiteGraph: { registered_node_types: registry } },
+    withTimeout,
+    // A REAL budget with room to spare: this file is about what the pre-flight REFUSES,
+    // and an already-spent budget would answer every case with a skipped pre-flight.
+    makeCommandBudget(30000),
+    8000,
   );
 }
 
