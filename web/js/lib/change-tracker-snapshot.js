@@ -134,10 +134,49 @@ function armCapture(record, delayMs) {
   record.timer = schedule(() => runAttempt(record), delayMs);
 }
 
+/**
+ * May this record still capture? (panel#1563 r2)
+ *
+ * A capture serializes the GLOBAL live canvas into THIS tracker's `activeState`, so a
+ * chain that outlives its workflow does not merely waste a timer — it stamps whatever
+ * canvas is on screen now into the snapshot of the workflow that armed it, and a later
+ * save of that workflow writes the wrong graph over its file. The retry window is
+ * exactly where that is reachable: the chain's own stop condition, `isLoadingGraph`, is
+ * a CLASS STATIC, so an orphaned record reads "suppressed" for the whole of the next
+ * workflow's load and then fires the moment that load completes — when the canvas
+ * belongs to someone else.
+ *
+ * The flush path has always refused on this hazard (its doc names it); the retry path
+ * had no equivalent, so it gets the same question, asked positively. `stillOwnsCanvas`
+ * is supplied by the caller because ownership lives in the workflow store and this
+ * module is deliberately dependency-light. Only a POSITIVE `false` stops the chain: a
+ * caller that supplies no predicate behaves exactly as it did before.
+ */
+function recordMayCapture(record) {
+  try {
+    return record.stillOwnsCanvas ? record.stillOwnsCanvas(record.tracker) !== false : true;
+  } catch {
+    return false; // an ownership question that throws is not a licence to write.
+  }
+}
+
+function dropRecord(record) {
+  record.cancelTimer();
+  if (pendingSnapshot === record) pendingSnapshot = null;
+}
+
 function runAttempt(record) {
   // A flush (or a newer defer) may have consumed the record already; the
   // capture is diff-based and idempotent, so firing anyway is harmless — only
   // the pending marker must not be cleared from under a NEWER record.
+  //
+  // panel#1563 r2 — but "harmless" holds only while this tracker still owns the
+  // canvas. Once it does not, the capture is a WRITE of someone else's graph into
+  // this tracker's state; the chain ends here rather than asking again.
+  if (!recordMayCapture(record)) {
+    dropRecord(record);
+    return;
+  }
   const outcome = captureNow(record.tracker);
   if (!outcome.suppressed || record.attempt >= SUPPRESSED_CAPTURE_RETRY_MS.length) {
     if (pendingSnapshot === record) pendingSnapshot = null;
@@ -154,14 +193,28 @@ function runAttempt(record) {
  * reply. Returns whether a snapshot was queued. `schedule` is injectable for the
  * no-DOM unit test; production uses the browser timer.
  */
-export function deferChangeTrackerSnapshot(changeTracker, schedule = setTimeout, cancel = clearTimeout) {
+export function deferChangeTrackerSnapshot(
+  changeTracker,
+  schedule = setTimeout,
+  cancel = clearTimeout,
+  stillOwnsCanvas = null,
+) {
   if (
     typeof changeTracker?.captureCanvasState !== "function" &&
     typeof changeTracker?.checkState !== "function"
   ) {
     return false;
   }
-  const record = { tracker: changeTracker, schedule, attempt: 0 };
+  // panel#1563 r2 — the record being REPLACED keeps its armed timer otherwise, and an
+  // orphan chain is the one that captures into a tracker that no longer owns the
+  // canvas. Replacing the marker was never enough to stop it.
+  pendingSnapshot?.cancelTimer?.();
+  const record = {
+    tracker: changeTracker,
+    schedule,
+    attempt: 0,
+    stillOwnsCanvas: typeof stillOwnsCanvas === "function" ? stillOwnsCanvas : null,
+  };
   record.cancelTimer = () => cancel(record.timer);
   pendingSnapshot = record;
   armCapture(record, 0);
@@ -183,7 +236,16 @@ export function deferChangeTrackerSnapshot(changeTracker, schedule = setTimeout,
  */
 export function flushPendingChangeTrackerSnapshot(changeTracker) {
   const record = pendingSnapshot;
-  if (!record || !changeTracker || record.tracker !== changeTracker) return false;
+  if (!record) return false;
+  if (!changeTracker || record.tracker !== changeTracker) {
+    // panel#1563 r2 — this flush is called with the ACTIVE tracker, so a pending record
+    // for a DIFFERENT one is stranded: the workflow that armed it no longer owns the
+    // canvas, and every remaining retry would capture this tab's graph into that
+    // workflow's snapshot. Refusing to flush it was always right; leaving its timer
+    // armed was not.
+    if (changeTracker) dropRecord(record);
+    return false;
+  }
   pendingSnapshot = null;
   record.cancelTimer();
   const outcome = captureNow(changeTracker);

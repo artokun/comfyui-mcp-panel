@@ -40,7 +40,10 @@ import {
 } from "../../web/js/lib/save-path-guard.js";
 import { sameWorkflowObject } from "../../web/js/lib/workflow-chat-identity.js";
 import { trackerCaptureSuppressed } from "../../web/js/lib/change-tracker-snapshot.js";
-import { graphRootReproducesStateContent } from "../../web/js/lib/graph-binding.js";
+import {
+  describeGraphStateDifference,
+  graphRootReproducesStateContent,
+} from "../../web/js/lib/graph-binding.js";
 
 // ---------------------------------------------------------------------------
 // 1. The pure verdict.
@@ -183,6 +186,7 @@ function buildInstaller() {
     "workflowSaveRefusalError",
     "activeWorkflowRef",
     "trackerCaptureSuppressed",
+    "describeGraphStateDifference",
     "graphRootReproducesStateContent",
     "window",
     "app",
@@ -200,6 +204,7 @@ function buildInstaller() {
         workflowSaveRefusalError,
         () => activeWorkflow,
         trackerCaptureSuppressed,
+        describeGraphStateDifference,
         graphRootReproducesStateContent,
         {},
         { rootGraph },
@@ -415,6 +420,70 @@ test("#1563 WRAPPER: with no live root readable the guard invents nothing", asyn
   install(fx.appRef);
   await fx.store.saveWorkflow(fx.wfA);
   assert.deepEqual(fx.store.saved, ["workflows/A.json"]);
+});
+
+// ---------------------------------------------------------------------------
+// panel#1563 r2 — AN ABSENT COMPARISON IS NOT EVIDENCE.
+//
+// `graphRootReproducesStateContent` answers the same `proven: false` for "the canvas
+// provably differs" and for "no comparison was possible", and its own contract says
+// `comparable:false` is not evidence either way. Reading `proven !== true` alone turned
+// every unreadable root into a REFUSAL of ComfyUI's whole save funnel — autosave and
+// Ctrl+S included — and told the user their file was missing changes on no evidence.
+// A serialization hook is exactly where a broken or hostile custom node sits.
+// ---------------------------------------------------------------------------
+
+test("#1563 r2 WRAPPER: a root whose serialize() THROWS never manufactures a refusal", async () => {
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture();
+  const install = build({
+    activeWorkflow: fx.activeWorkflow,
+    rootGraph: {
+      serialize() {
+        throw new Error("custom node exploded in a serialization hook");
+      },
+    },
+  });
+  install(fx.appRef);
+  await fx.store.saveWorkflow(fx.wfA);
+  assert.deepEqual(fx.store.saved, ["workflows/A.json"], "an unreadable canvas must not block the save");
+});
+
+test("#1563 r2 WRAPPER: a root that answers null never manufactures a refusal", async () => {
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture();
+  const install = build({
+    activeWorkflow: fx.activeWorkflow,
+    rootGraph: { serialize: () => null },
+  });
+  install(fx.appRef);
+  await fx.store.saveWorkflow(fx.wfA);
+  assert.deepEqual(fx.store.saved, ["workflows/A.json"]);
+});
+
+test("#1563 r2 WRAPPER: a root the comparison cannot read is not a stale snapshot", async () => {
+  // No `nodes` array ⇒ `describeGraphStateDifference` reports `comparable:false`. The
+  // state may be perfectly current; nothing has been established either way.
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture();
+  const install = build({
+    activeWorkflow: fx.activeWorkflow,
+    rootGraph: { serialize: () => ({ groups: [{ id: 1 }] }) },
+  });
+  install(fx.appRef);
+  await fx.store.saveWorkflow(fx.wfA);
+  assert.deepEqual(fx.store.saved, ["workflows/A.json"]);
+});
+
+test("#1563 r2 WRAPPER: the reported case still refuses — comparability is a floor, not a bypass", async () => {
+  // The guard must not have been softened into inertness by the two tests above: a
+  // readable canvas that genuinely holds the new group is still refused.
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture();
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  await assert.rejects(() => fx.store.saveWorkflow(fx.wfA), /BEHIND the live canvas/);
+  assert.deepEqual(fx.store.saved, []);
 });
 
 test("#1563 WIRING: the wrapper passes its own observation, not a constant", () => {

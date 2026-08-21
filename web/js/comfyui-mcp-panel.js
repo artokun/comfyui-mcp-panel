@@ -3706,11 +3706,17 @@ const _savePathGuardRefusalsLogged = new Set();
  *   1. `trackerCaptureSuppressed` — upstream POSITIVELY reports it skipped the
  *      capture. Without this a save could be refused for ordinary tracker lag, which
  *      `prepareForSave` would have resolved a microsecond later.
- *   2. the live root does not reproduce the state about to be written — the tolerant
- *      comparison (`graphRootReproducesStateContent`), so a frontend that re-measures
- *      node boxes or renumbers subgraph link ids on load does not manufacture a
- *      refusal. Without this, a suppressed capture on an already-equal canvas — the
- *      ordinary state of a clean tab — would block every save.
+ *   2. a comparison of the live root against the state about to be written ACTUALLY
+ *      HAPPENED (`describeGraphStateDifference(...).comparable === true`) and the
+ *      tolerant proof (`graphRootReproducesStateContent`) did not vouch for it. Both
+ *      halves are load-bearing: the tolerance stops a frontend that re-measures node
+ *      boxes or renumbers subgraph link ids from manufacturing a refusal, and the
+ *      comparability stops an ABSENT comparison from doing the same — the proof
+ *      answers `proven:false` for "could not compare" exactly as it does for "differs",
+ *      so reading it alone made a root that cannot be serialized indistinguishable
+ *      from a canvas with lost work. Without conjunct 2 at all, a suppressed capture
+ *      on an already-equal canvas — the ordinary state of a clean tab — would block
+ *      every save.
  *
  * ACTIVE WORKFLOW ONLY. `app.rootGraph` is the ACTIVE tab's canvas; comparing it with
  * an inactive tab's snapshot would compare two different workflows and refuse a save
@@ -3727,7 +3733,35 @@ function saveWouldPersistStaleSnapshot(wf, state) {
     const appRef = window.comfyAPI?.app?.app ?? (typeof app !== "undefined" ? app : null);
     const rootGraph = appRef?.rootGraph ?? appRef?.graph ?? null;
     if (typeof rootGraph?.serialize !== "function") return false;
-    return graphRootReproducesStateContent({ rootGraph, state })?.proven !== true;
+    // panel#1563 r2 — SERIALIZE ONCE, and require a comparison that actually happened.
+    //
+    // `graphRootReproducesStateContent` answers the SAME `proven: false` for "the canvas
+    // provably differs" and for "no comparison was possible" — a `serialize()` that
+    // throws or answers null, a difference its classifier cannot account for. Reading
+    // `proven !== true` alone therefore turned every unreadable root into a REFUSAL: a
+    // broken or hostile custom node with a serialization hook could block Ctrl+S and
+    // autosave outright, and the message would tell the user their file is missing
+    // changes the canvas has, on no evidence at all. That inverts this function's own
+    // rule (a guard that cannot read its evidence must never invent a refusal) and the
+    // contract of the comparison itself, which states `comparable:false` is not evidence
+    // either way.
+    //
+    // The single frozen snapshot is the same discipline `graphRootReproducesStateContent`
+    // documents internally: asking two questions off two serializations lets a
+    // synchronous hook show one answer to the comparability check and another to the
+    // proof, so the refusal would rest on content no single comparison ever saw.
+    let liveState;
+    try {
+      liveState = rootGraph.serialize();
+    } catch {
+      return false; // a root that cannot be read is not proof that the snapshot is stale
+    }
+    if (liveState == null) return false;
+    const frozen = { serialize: () => liveState };
+    if (describeGraphStateDifference({ rootGraph: frozen, state })?.comparable !== true) {
+      return false;
+    }
+    return graphRootReproducesStateContent({ rootGraph: frozen, state })?.proven !== true;
   } catch {
     return false;
   }
@@ -23578,7 +23612,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // becomes a claim about what the caller received — only `applied` is that.
           markOpenReceiptReplySent(openReceipts, msg.rid);
         }
-        deferChangeTrackerSnapshot(changeTrackerToSnapshot);
+        // panel#1563 r2 — ownership, re-read on every attempt (see `stillOwnsCanvas`):
+        // the retry chain can still be armed when another workflow opens, and a capture
+        // writes the LIVE canvas into this tracker's state. Unreadable store ⇒ `true`.
+        deferChangeTrackerSnapshot(changeTrackerToSnapshot, undefined, undefined, (tracker) => {
+          const active = activeWorkflowRef();
+          if (!active) return true;
+          return active.changeTracker === tracker;
+        });
         if (superseded) return;
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
