@@ -2835,3 +2835,60 @@ test("mcp#1940: serverDeclaresEmptyComboOptions reads the V2 shape, and still re
   assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v1full"), false);
   assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "notacombo"), false);
 });
+
+// The REPORTED shape end-to-end: a subgraph instance promoting a V2 empty COMBO.
+// mcp#1940 was filed as a promoted-widget bug — "cannot set ANY promoted COMBO on a
+// subgraph node" — so a fix for the combo SHAPE has to be shown to clear the actual
+// reported scenario, not just a bare node. The promotion resolves to the concrete
+// inner CustomCombo (`followPromotionToConcrete`), which is the type whose def the
+// empty-list gate reads; before the fix that read said "not a combo" and the write
+// was refused with a stale-list message no refresh could clear.
+function promotedCustomComboFixture() {
+  const inner = {
+    id: 795,
+    type: "CustomCombo",
+    // Empty live list — nothing for the parent rail to project either.
+    widgets: [{ name: "choice", type: "combo", options: { values: [] }, value: "" }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "795" ? inner : null) };
+  const railWidget = { name: "mode", type: "combo", options: { values: [] }, value: "" };
+  const parent = {
+    id: 816,
+    // The synthetic subgraph UUID from the report — never in /object_info, and never
+    // looked up: the promotion is traversed to the inner type instead.
+    type: "6c697765-ebd7-4e1e-8af0-d84d620be471",
+    subgraph,
+    inputs: [{ name: "mode", _widget: railWidget, _subgraphSlot: { name: "mode" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "mode" ? { sourceNodeId: "795", sourceWidgetName: "choice" } : null;
+  return { parent, inner, resolveSource };
+}
+
+test("mcp#1940 e2e: a PROMOTED V2 empty combo on a subgraph instance is settable from the parent", async () => {
+  const reg = loadedRegistry(["CustomCombo"]);
+  reg["6c697765-ebd7-4e1e-8af0-d84d620be471"] = reg["SubgraphNode"] ?? function SubgraphNode() {};
+  const { parent, inner, resolveSource } = promotedCustomComboFixture();
+  const fresh = objectInfo(["CustomCombo"]);
+  fresh["CustomCombo"] = { input: { required: { choice: ["COMBO", { multiselect: false, options: [] }] } } };
+  const res = await runSetWidget(parent, "mode", "Default", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => fresh,
+    // The UUID was NEVER a backend type — it is a subgraph. Answering `true` here
+    // would claim its absence from /object_info means an uninstalled pack (#458).
+    wasTypeEverDefined: (t) => t === "CustomCombo",
+    refreshCombos: refreshFromServer,
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "Default");
+  assert.equal(res.set.promoted_from.inner_node_id, 795, "resolved through the promotion, not the UUID");
+  assert.equal(
+    inner.widgets.find((w) => w.name === "choice").value,
+    "Default",
+    "the value reached the inner widget the rail projects",
+  );
+});
