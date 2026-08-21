@@ -167,7 +167,7 @@ test("#1418 a never-started recovery says NOTHING IS RUNNING — never 'still ru
 // shipped body with the real coalescer answers that.
 
 const SET_WIDGET_SRC = (() => {
-  const m = PANEL_SRC.match(/ {2}async graph_set_widget\(\{ node_id, widget, value, workflow_uuid \}\) \{[\s\S]*?\n {2}\},/);
+  const m = PANEL_SRC.match(/ {2}async graph_set_widget\(\{ node_id, widget, value, workflow_uuid, builder_state \}\) \{[\s\S]*?\n {2}\},/);
   assert.ok(m, "could not locate graph_set_widget in the panel source");
   return m[0];
 })();
@@ -186,6 +186,8 @@ const EXECUTOR_DEPS = [
   "rgthreeFastGroupsRefusal",
   "classifyIdeogram4PromptBuilderWrite",
   "ideogram4PromptBuilderRefusal",
+  "classifyMiniMaxH3PromptBuilderWrite",
+  "applyMiniMaxH3PromptBuilderWrite",
   "awaitObjectInfoHistorySeed",
   "isRgthreeLoraRowCreation",
   "createRgthreeLoraRow",
@@ -321,6 +323,7 @@ function realGraphSetWidget({
     classifyPromptRelayTimelineWrite: () => null,
     classifyRgthreeFastGroupsWrite: () => null,
     classifyIdeogram4PromptBuilderWrite: () => null,
+    classifyMiniMaxH3PromptBuilderWrite: () => null,
     // #1418 — honors the cap it is handed, the way the shipped one does: it waits at most
     // waitMs, and a slow seed simply spends it.
     awaitObjectInfoHistorySeed: (waitMs) =>

@@ -444,6 +444,10 @@ import {
   ideogram4PromptBuilderRefusal,
 } from "./lib/ideogram4-prompt-builder.js";
 import {
+  classifyMiniMaxH3PromptBuilderWrite,
+  applyMiniMaxH3PromptBuilderWrite,
+} from "./lib/minimax-h3-prompt-builder.js";
+import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
@@ -14232,7 +14236,7 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  async graph_set_widget({ node_id, widget, value, workflow_uuid }) {
+  async graph_set_widget({ node_id, widget, value, workflow_uuid, builder_state }) {
     // #1413 — ONE deadline for the whole command, taken BEFORE anything awaits, so the
     // bounded steps inside it compose instead of adding (#1192, #671). The step this
     // exists for is the stale-combo recovery's refresh join below: reached only after
@@ -14332,6 +14336,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // which has no serializer of its own, is deliberately still writable.
     if (classifyIdeogram4PromptBuilderWrite(node, widget) === "derived") {
       throw new Error(ideogram4PromptBuilderRefusal(widget, node.id));
+    }
+    // #1549: MiniMaxH3PromptBuilder's editor Save writes prompt_text and builder_state
+    // together. Two panel_set_widget calls have no transaction boundary, so a render
+    // that starts in the gap fences the second write and leaves the queued prompt and
+    // the saved editor disagreeing. This route assigns both widgets in one undo
+    // envelope, matching the pack's Save, with no await between them.
+    if (classifyMiniMaxH3PromptBuilderWrite(node, widget)) {
+      return applyMiniMaxH3PromptBuilderWrite(node, widget, value, {
+        builder_state,
+        beforeChange: () => graph.beforeChange(),
+        afterChange: () => graph.afterChange(),
+        setDirty: () => graph.setDirtyCanvas(true, true),
+      });
     }
     // #458: WAIT for the startup baseline history seed to land before authorizing, so a
     // write can never decide "never seen" against an un-seeded history — a pack present
