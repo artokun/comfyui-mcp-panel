@@ -38,6 +38,8 @@
  * preventing it.
  */
 
+import { isControlAfterGenerateWidget } from "./control-after-generate.js";
+
 /**
  * Values of `control_after_generate` that mean "change this between runs".
  *
@@ -47,6 +49,34 @@
  * is the only one that legitimately repeats.
  */
 const ADVANCING = new Set(["randomize", "increment", "decrement", "increment-wrap"]);
+
+/**
+ * The value widget a control governs, resolved the way `findRepeatingControlWidgets`
+ * resolves it — LINK first, adjacency as a labelled fallback.
+ *
+ * ONE resolver, two callers (the #988 warning and the #1998 drive), because they must
+ * never disagree about which widget a control governs: the warning names it and the
+ * drive OBSERVES it, so a divergence would report movement on one widget while
+ * describing another. Returns `{ widget, source }`, or `{ widget: null, source: null }`
+ * when neither signal identifies one — blaming the wrong value widget is worse than
+ * naming none.
+ *
+ * The link points VALUE -> CONTROL, not the other way round: ComfyUI attaches the
+ * control to the VALUE widget's `linkedWidgets`.
+ */
+function governedValueWidget(widgets, control, index) {
+  const owner = widgets.find((cand) => {
+    try {
+      return Array.isArray(cand?.linkedWidgets) && cand.linkedWidgets.includes(control);
+    } catch {
+      return false;
+    }
+  });
+  if (owner && typeof owner.name === "string") return { widget: owner, source: "linked" };
+  const prev = index > 0 ? widgets[index - 1] : null;
+  if (prev && typeof prev.name === "string") return { widget: prev, source: "adjacent" };
+  return { widget: null, source: null };
+}
 
 /**
  * Widgets whose value an unscoped batch would have advanced between items, and which
@@ -84,27 +114,11 @@ export function findRepeatingControlWidgets(nodes) {
         // attaches the control to the VALUE widget's `linkedWidgets`. Reading it off
         // the control found nothing in the ordinary core case and fell through to
         // adjacency, so the authoritative signal was never actually being used.
-        let pairedName = null;
-        let pairedSource = null;
-        const owner = widgets.find((cand) => {
-          try {
-            return Array.isArray(cand?.linkedWidgets) && cand.linkedWidgets.includes(w);
-          } catch {
-            return false;
-          }
-        });
-        const ownerName = typeof owner?.name === "string" ? owner.name : null;
-        if (ownerName) {
-          pairedName = ownerName;
-          pairedSource = "linked";
-        } else {
-          const prev = i > 0 ? widgets[i - 1] : null;
-          const adjacent = typeof prev?.name === "string" ? prev.name : null;
-          if (adjacent) {
-            pairedName = adjacent;
-            pairedSource = "adjacent";
-          }
-        }
+        // ONE resolver, shared with the #1998 drive so the widget this warning NAMES is
+        // the widget that drive OBSERVES (governedValueWidget, above).
+        const paired = governedValueWidget(widgets, w, i);
+        const pairedName = paired.widget ? paired.widget.name : null;
+        const pairedSource = paired.source;
         found.push({
           node_id: node?.id != null ? String(node.id) : null,
           node_type: node?.type ?? null,
@@ -508,4 +522,223 @@ export function rgthreeFixedSeedNote(seeds, batchCount) {
     (anyDegenerate ? `randomMin/randomMax in its node properties` : "") +
     `. This is reported, not repaired — the panel does not rewrite your seeds.`
   );
+}
+
+/**
+ * #1998 - DRIVE ComfyUI's own control hooks across the items of a SCOPED batch.
+ *
+ * THE MECHANISM, read out of the pinned frontend's own source (comfyui_frontend_package
+ * ships sourcemaps with sourcesContent, so this is the real TypeScript, not a guess).
+ * ComfyUI runs its batch loop INSIDE one `app.queuePrompt(number, batchCount, scope)`
+ * call and fires the queue-time widget hooks once per item (src/scripts/app.ts):
+ *
+ *     const isPartialExecution = !!queueNodeIds?.length
+ *     for (let i = 0; i < batchCount; i++) {
+ *       forEachNode(this.rootGraph, (node) => {
+ *         for (const widget of node.widgets ?? []) widget.beforeQueued?.({ isPartialExecution })
+ *         applyPromotedWidgetControl(node, 'beforeQueued', { isPartialExecution })
+ *       })
+ *       const p = await this.graphToPrompt(this.rootGraph)          // the body that is POSTed
+ *       const res = await api.queuePrompt(number, p, { partialExecutionTargets: queueNodeIds })
+ *       executeWidgetsCallback(queuedNodes, 'afterQueued', { isPartialExecution })
+ *     }
+ *
+ * ...and src/scripts/valueControl.ts refuses to advance anything when that flag is set:
+ *
+ *     export function nextValueForLinkedTarget(params) {
+ *       if (params.isPartialExecution) return undefined
+ *
+ * That refusal is deliberate upstream behaviour - ComfyUI_frontend PR #8774, "disable
+ * control after generate during partial execution", merged 2026-02-11, so that queueing
+ * selected output nodes while iterating does not churn the user's seed.
+ *
+ * MEASURED on ComfyUI 0.33.2 / frontend 1.49.6 by capturing the outgoing /prompt bodies
+ * behind an interceptor that answered them locally - nothing queued, no GPU time:
+ *
+ *     unscoped  queuePrompt(0, 4, undefined)   randomize -> 4 distinct seeds
+ *     unscoped  queuePrompt(0, 4, undefined)   increment -> 12345, 12346, 12347, 12348
+ *     scoped    queuePrompt(0, 4, ["9"])       randomize -> 12345, 12345, 12345, 12345
+ *     scoped    queuePrompt(0, 4, ["9"])       increment -> 12345, 12345, 12345, 12345
+ *     scoped    4x queuePrompt(0, 1, ["9"])    randomize -> 12345, 12345, 12345, 12345
+ *
+ * THE LAST LINE IS THE ONE THAT DECIDES THE FIX. "Do what the Queue button does, N
+ * times" does NOT work here: the refusal is keyed on the scope, not on the batch
+ * position, so separating the dispatches changes nothing. (That is also why the #988
+ * reporter's own loop-with-batch:1 patch failed after 114 green tests.) The only thing
+ * that can make the value vary is the flag itself.
+ *
+ * SO WE PASS THE FLAG, AND NOTHING ELSE. This wraps each control widget's OWN
+ * `beforeQueued`/`afterQueued` so they receive `isPartialExecution: false`, and the
+ * frontend then does every remaining thing: `computeNextControlledValue` picks the next
+ * value for randomize / increment / decrement / increment-wrap, honours min/max/step and
+ * a combo's filter list, and - the case that breaks a naive fix - returns `undefined`
+ * for `fixed`, so a fixed control still submits N identical prompts. There is no seed
+ * arithmetic in this module and no mode table: `fixed` is protected by ComfyUI's own
+ * `if (mode === 'fixed') return undefined`, not by a panel branch.
+ *
+ * SCOPE OF THE OVERRIDE. The caller installs this ONLY for a scoped run with
+ * `batch_count > 1` - the one case where upstream's refusal turns "give me N renders"
+ * into N byte-identical prompts that ComfyUI answers from cache while the tool reports N
+ * successes. A scoped run of ONE is left exactly as #8774 made it.
+ *
+ * WHAT IT CANNOT REACH, stated so the note can never over-claim. `app.queuePrompt` also
+ * calls `applyPromotedWidgetControl(node, phase, { isPartialExecution })` directly for a
+ * subgraph host's PROMOTED widgets - a module function, not a widget property, so there
+ * is nothing here to wrap and those still repeat. So do controls whose governed input is
+ * fed by a LINK, which the frontend skips on every path. Neither is guessed at:
+ * `observe()` reports what each governed widget ACTUALLY did across the batch, and
+ * `scopedBatchDriveNote` warns about every advancing control that did not move.
+ *
+ * Returns `{ armed, restore, observe }`. Fully defensive, like the rest of this module:
+ * an unreadable node costs its own entry, never the run.
+ */
+export function driveControlHooksAcrossScopedBatch(nodes) {
+  const armed = [];
+  const restores = [];
+  if (Array.isArray(nodes)) {
+    for (const node of nodes) {
+      try {
+        const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+        for (let i = 0; i < widgets.length; i++) {
+          const w = widgets[i];
+          // DETECTED BY OPTION SHAPE, not by name (control-after-generate.js): a node def
+          // may name its control widget anything, and a name test silently drops those.
+          // BOTH hooks must be present - that is the frontend's own `isValueControlWidget`
+          // test, and it keeps this away from third-party `beforeQueued` hooks which are
+          // not controls and never asked for our flag.
+          if (!isControlAfterGenerateWidget(w)) continue;
+          if (typeof w.beforeQueued !== "function") continue;
+          if (typeof w.afterQueued !== "function") continue;
+          const paired = governedValueWidget(widgets, w, i);
+          const target = paired.widget ?? null;
+          const entry = {
+            node_id: node?.id != null ? String(node.id) : null,
+            node_type: node?.type ?? null,
+            control: typeof w.name === "string" ? w.name : null,
+            mode: typeof w.value === "string" ? w.value : null,
+            ...(target ? { governed: target.name, governed_source: paired.source } : {}),
+          };
+          const seen = [];
+          const record = () => {
+            if (!target) return;
+            try {
+              seen.push(target.value);
+            } catch {
+              /* an unreadable value costs one sample, never the run */
+            }
+          };
+          const before = w.beforeQueued;
+          const after = w.afterQueued;
+          // Sample the governed value on BOTH sides of every hook call, so `observe()`
+          // reports the value this run actually carried rather than the change we asked
+          // for. The FIRST sample is the value the first prompt was built from.
+          const forced = (orig) =>
+            function (opts) {
+              record();
+              try {
+                return orig.call(this, { ...(opts ?? {}), isPartialExecution: false });
+              } finally {
+                record();
+              }
+            };
+          w.beforeQueued = forced(before);
+          w.afterQueued = forced(after);
+          restores.push(() => {
+            w.beforeQueued = before;
+            w.afterQueued = after;
+          });
+          armed.push({ entry, seen });
+        }
+      } catch {
+        /* one unreadable node costs its own entry, never the whole dispatch */
+      }
+    }
+  }
+  return {
+    armed: armed.map((a) => ({ ...a.entry })),
+    /**
+     * Put every hook back. Called from the caller's `finally`, so the override lasts
+     * exactly the dispatch - a control left wrapped would keep advancing on the user's
+     * own single scoped previews, which is the behaviour #8774 exists to prevent.
+     * Idempotent: the queue drains the list, so a second call restores nothing.
+     */
+    restore() {
+      for (const r of restores.splice(0).reverse()) {
+        try {
+          r();
+        } catch {
+          /* a widget that vanished with its graph needs no restoring */
+        }
+      }
+    },
+    /** What each governed widget ACTUALLY did across the batch. */
+    observe() {
+      return armed.map(({ entry, seen }) => {
+        const keys = seen.map((v) =>
+          typeof v === "object" && v !== null ? JSON.stringify(v) : `${typeof v}:${String(v)}`,
+        );
+        const distinct = new Set(keys).size;
+        return {
+          ...entry,
+          observed: seen.length > 0,
+          distinct_values: distinct,
+          advanced: distinct > 1,
+          ...(seen.length ? { from: seen[0], to: seen[seen.length - 1] } : {}),
+        };
+      });
+    },
+  };
+}
+
+/**
+ * The disclosure for a scoped batch the panel DROVE (#1998).
+ *
+ * REPLACES `scopedBatchSeedNote` on that path rather than sitting beside it: that note
+ * says the batch WILL reuse the same values, which is exactly what this drive stops
+ * being true, and shipping both would put two contradictory sentences in one result.
+ *
+ * Silent for a batch of one, and silent when no advancing control was armed - a graph
+ * carrying nothing but `fixed` controls has no surprise to report, and saying something
+ * anyway is the noise that trains people to skip the useful case.
+ */
+export function scopedBatchDriveNote(observations, batchCount) {
+  if (!Array.isArray(observations) || !(Number(batchCount) > 1)) return "";
+  const advancingMode = observations.filter((o) => o && ADVANCING.has(o.mode));
+  if (!advancingMode.length) return "";
+  const moved = advancingMode.filter((o) => o.advanced);
+  const stuck = advancingMode.filter((o) => !o.advanced);
+  const describe = (o) =>
+    `node ${o.node_id}${o.node_type ? ` (${o.node_type})` : ""} ${o.governed ?? o.control}=${o.mode}`;
+  const list = (xs) => {
+    const head = xs.slice(0, 5).map(describe).join("; ");
+    return xs.length > 5 ? `${head}, and ${xs.length - 5} more` : head;
+  };
+  const parts = [];
+  if (moved.length) {
+    parts.push(
+      `A run scoped with to_node_id is a PARTIAL execution, and ComfyUI does not advance ` +
+        `control_after_generate between the items of one (ComfyUI_frontend #8774) - so a scoped ` +
+        `batch would otherwise submit ${batchCount} byte-identical prompts and answer all but the ` +
+        `first from cache, returning the SAME output file for every one. For this batch the panel ` +
+        `ran ComfyUI's OWN control hooks once per item with the partial-execution flag cleared, ` +
+        `and these advanced exactly as they would on an unscoped run: ${list(moved)}. The values ` +
+        `are ComfyUI's: the panel does not compute seeds, it only passes the flag, so ` +
+        `increment/decrement/increment-wrap and a combo's filter list behave as they do on the ` +
+        `Queue button, and a control set to fixed still repeats on purpose (#1998).`,
+    );
+  }
+  if (stuck.length) {
+    parts.push(
+      `${moved.length ? "" : `This scoped batch was driven with ComfyUI's own control hooks (#1998), but `}` +
+        `these advancing controls did NOT move across the batch, so anything depending on them is ` +
+        `identical for every item and can come back as a cache hit on the first output: ` +
+        `${list(stuck)}. OBSERVED, not inferred - the panel read each governed widget on both ` +
+        `sides of every hook call. The usual causes are a governed input fed by a LINK (ComfyUI ` +
+        `skips the control on every path when the value comes from the link rather than the ` +
+        `widget) and a widget PROMOTED to a subgraph host, which ComfyUI advances through a ` +
+        `module function the panel cannot wrap. Set those values yourself between runs, or run ` +
+        `the branch unscoped.`,
+    );
+  }
+  return parts.join(" ");
 }

@@ -225,6 +225,8 @@ import {
 import {
   findRepeatingControlWidgets,
   scopedBatchSeedNote,
+  driveControlHooksAcrossScopedBatch,
+  scopedBatchDriveNote,
   findRgthreeSeedNodes,
   rgthreeFixedSeedNote,
   repeatingRgthreeSeeds,
@@ -16152,6 +16154,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // FIXED rgthree seed is submitted verbatim for every item whether the run is scoped or
     // not. Gating it the same way would have kept it invisible for exactly the unscoped
     // batch a user reaches for when they want ten different images.
+    // #1998 - what the driven control widgets ACTUALLY did across a scoped batch.
+    // Null when no scoped batch ran, so the #988 warning stays in charge of that case.
+    let controlDriveObservations = null;
     let rgthreeSeeds = [];
     if (batch > 1) {
       try {
@@ -16188,16 +16193,54 @@ const GRAPH_TOOL_EXECUTORS = {
       // drive (#556). It marks every one of this run's posts with a queue
       // position sentinel and tags the pending queue item, so a scoped run
       // can never be confused with unrelated queue traffic.
-      runScopeResult = await dispatchScopedRun({
-        app,
-        apiTarget: api,
-        execIds: partialTargets,
-        batch,
-        toNodeId: to_node_id,
-        onRejection: captureRejection,
-        onPromptId: capturePromptId,
-        onAcceptedNodeErrors: captureAcceptedNodeErrors,
-      });
+      // #1998 - a SCOPED batch of more than one would submit N byte-identical
+      // prompts. ComfyUI refuses to advance control_after_generate on a PARTIAL
+      // execution (ComfyUI_frontend #8774: `if (params.isPartialExecution) return
+      // undefined`), so every item after the first is a cache hit that returns the
+      // FIRST output file - and panel_run reported N successes for one render.
+      //
+      // Separating the dispatches does not help: MEASURED on frontend 1.49.6, four
+      // separate `queuePrompt(0, 1, scope)` calls posted the same seed four times,
+      // exactly like one `queuePrompt(0, 4, scope)`. The refusal keys on the scope,
+      // not on the batch position. So the ONE thing that can vary the value is the
+      // flag, and that is the only thing this changes: the control widgets' OWN
+      // hooks run with `isPartialExecution: false` and ComfyUI computes every value
+      // itself - which is why `fixed` still repeats (its own `mode === "fixed"`
+      // returns undefined) and increment/decrement need no panel arithmetic.
+      //
+      // ONLY for batch > 1. A single scoped preview keeps #8774's behaviour exactly:
+      // the user iterating on one branch does not want their seed churned.
+      let controlDrive = null;
+      try {
+        controlDrive = driveControlHooksAcrossScopedBatch(
+          batch > 1 ? collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []) : [],
+        );
+      } catch {
+        controlDrive = null; /* the run must survive a failure to arm the drive */
+      }
+      try {
+        runScopeResult = await dispatchScopedRun({
+          app,
+          apiTarget: api,
+          execIds: partialTargets,
+          batch,
+          toNodeId: to_node_id,
+          onRejection: captureRejection,
+          onPromptId: capturePromptId,
+          onAcceptedNodeErrors: captureAcceptedNodeErrors,
+        });
+      } finally {
+        // ALWAYS, on every exit including a throw. A hook left wrapped would keep
+        // advancing controls on the user's later single scoped previews.
+        try {
+          controlDrive?.restore();
+        } catch {}
+      }
+      try {
+        controlDriveObservations = controlDrive ? controlDrive.observe() : null;
+      } catch {
+        controlDriveObservations = null;
+      }
     }
     // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
     // BEFORE the rejection check. With batch>1, app.queuePrompt breaks its loop on
@@ -16316,8 +16359,18 @@ const GRAPH_TOOL_EXECUTORS = {
       // #1504 — outputs ComfyUI dropped from the prompt it queued.
       droppedOutputs: acceptedNodeErrors,
     });
+    // #1998 — when the scoped batch was DRIVEN, report what the controls actually did
+    // and do NOT also ship #988's "this batch WILL reuse the same values": that sentence
+    // is what the drive stops being true, and two contradictory statements in one result
+    // is worse than either alone. The #988 note stays in charge whenever the drive did
+    // not run (arming threw, or a frontend with no hooks to wrap).
+    const driveNote = scopedBatchDriveNote(controlDriveObservations, batch);
+    if (driveNote) {
+      accept.batch_controls = controlDriveObservations;
+      accept.batch_controls_note = driveNote;
+    }
     // #988 — attach the PRE-dispatch finding.
-    const repeatingNote = scopedBatchSeedNote(repeatingControls, batch);
+    const repeatingNote = controlDriveObservations ? "" : scopedBatchSeedNote(repeatingControls, batch);
     if (repeatingNote) {
       accept.repeating_controls = repeatingControls;
       accept.repeating_controls_note = repeatingNote;

@@ -19,6 +19,8 @@ import { readFileSync } from "node:fs";
 import {
   findRepeatingControlWidgets,
   scopedBatchSeedNote,
+  driveControlHooksAcrossScopedBatch,
+  scopedBatchDriveNote,
   findRgthreeSeedNodes,
   rgthreeFixedSeedNote,
   repeatingRgthreeSeeds,
@@ -519,4 +521,283 @@ test("#1339 r2 source guard: the CALL SITE uses the shared predicate, not its ow
   // It has to be imported to be callable — a bare reference would be a ReferenceError
   // that only a live panel would surface.
   assert.match(src, /import \{[^}]*\brepeatingRgthreeSeeds\b[^}]*\} from "\.\/lib\/scoped-batch-seed\.js"/s);
+});
+
+
+// ---------------------------------------------------------------------------
+// #1998 - the panel DRIVES ComfyUI's own control hooks across a scoped batch.
+//
+// THE DOUBLE BELOW IS A PORT, NOT AN INVENTION. Every branch is taken from the
+// pinned frontend's own TypeScript, recovered from the sourcemaps that ship inside
+// comfyui_frontend_package 1.49.6:
+//
+//   src/scripts/widgets.ts       valueControl.beforeQueued/afterQueued, the
+//                                Comfy.WidgetControlMode split, HAS_EXECUTED
+//   src/scripts/valueControl.ts  `if (params.isPartialExecution) return undefined`
+//                                `if (mode === 'fixed') return undefined`
+//                                computeNextNumberValue: += step / -= step / random
+//   src/scripts/app.ts           the batch loop: beforeQueued -> graphToPrompt ->
+//                                POST -> afterQueued, once per item
+//
+// It is checked against the LIVE rig: driving the real frontend through the real
+// app.queuePrompt with the outgoing /prompt bodies captured behind an interceptor
+// (ComfyUI 0.33.2 / frontend 1.49.6) produced
+//
+//   scoped   randomize -> 12345, 12345, 12345, 12345
+//   scoped   increment -> 12345, 12345, 12345, 12345
+//   unscoped increment -> 12345, 12346, 12347, 12348
+//   scoped   increment + this drive -> 12345, 12346, 12347, 12348
+//
+// which is exactly what the assertions below say.
+// ---------------------------------------------------------------------------
+
+/** A value widget plus its frontend-shaped control combo, wired the way ComfyUI wires them. */
+function controlledSeedNode(id, mode, { runBefore = false, startAt = 12345, linkFed = false } = {}) {
+  const seed = { name: "seed", value: startAt, type: "number", options: { min: 0, max: 1e15, step2: 1 } };
+  const control = {
+    name: "control_after_generate",
+    value: mode,
+    // The AUTHORITATIVE frontend shape: serialize:false + canvasOnly:true + the mode
+    // option list. isControlAfterGenerateWidget keys on exactly this.
+    options: {
+      serialize: false,
+      canvasOnly: true,
+      values: ["fixed", "increment", "decrement", "randomize"],
+    },
+  };
+  seed.linkedWidgets = [control];
+  let hasExecuted = false;
+  const applyWidgetControl = (isPartialExecution) => {
+    // widgets.ts applyWidgetControl: a governed input fed by a LINK is skipped on
+    // EVERY path - the value that executes comes from the link, not the widget.
+    if (linkFed) return;
+    // valueControl.ts nextValueForLinkedTarget - ComfyUI_frontend #8774.
+    if (isPartialExecution) return;
+    // valueControl.ts computeNextControlledValue.
+    if (control.value === "fixed") return;
+    if (control.value === "increment" || control.value === "increment-wrap") seed.value += 1;
+    else if (control.value === "decrement") seed.value -= 1;
+    else if (control.value === "randomize") seed.value = Math.floor(Math.random() * 1e15);
+  };
+  control.beforeQueued = ({ isPartialExecution } = {}) => {
+    if (runBefore) {
+      if (hasExecuted) applyWidgetControl(isPartialExecution);
+      hasExecuted = true;
+    }
+  };
+  control.afterQueued = ({ isPartialExecution } = {}) => {
+    if (!runBefore) applyWidgetControl(isPartialExecution);
+  };
+  return { id, type: "KSampler", widgets: [seed, control, { name: "steps", value: 20 }] };
+}
+
+/** app.ts's batch loop, reduced to the part that decides what each prompt carries. */
+function queueBatch(nodes, { batchCount, isPartialExecution }) {
+  const posted = [];
+  for (let i = 0; i < batchCount; i++) {
+    for (const n of nodes) for (const w of n.widgets ?? []) w.beforeQueued?.({ isPartialExecution });
+    posted.push(nodes.map((n) => (n.widgets ?? []).find((w) => w.name === "seed")?.value));
+    for (const n of nodes) for (const w of n.widgets ?? []) w.afterQueued?.({ isPartialExecution });
+  }
+  return posted.map((row) => row[0]);
+}
+
+test("#1998 the double reproduces the bug: a scoped batch posts one seed four times", () => {
+  const nodes = [controlledSeedNode(42, "randomize")];
+  assert.deepEqual(queueBatch(nodes, { batchCount: 4, isPartialExecution: true }), [12345, 12345, 12345, 12345]);
+});
+
+test("#1998 the double reproduces the WORKING case: an unscoped batch advances", () => {
+  const nodes = [controlledSeedNode(42, "increment")];
+  assert.deepEqual(queueBatch(nodes, { batchCount: 4, isPartialExecution: false }), [12345, 12346, 12347, 12348]);
+});
+
+test("#1998 DRIVEN, a scoped randomize batch posts four different seeds", () => {
+  const nodes = [controlledSeedNode(42, "randomize")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  const seeds = queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  assert.equal(new Set(seeds).size, 4, `expected four distinct seeds, got ${JSON.stringify(seeds)}`);
+  assert.equal(seeds[0], 12345, "the FIRST item still carries the seed the user can see");
+});
+
+test("#1998 DRIVEN, a scoped increment batch matches the unscoped sequence exactly", () => {
+  const scoped = [controlledSeedNode(42, "increment")];
+  const drive = driveControlHooksAcrossScopedBatch(scoped);
+  const driven = queueBatch(scoped, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  const unscoped = queueBatch([controlledSeedNode(42, "increment")], { batchCount: 4, isPartialExecution: false });
+  assert.deepEqual(driven, unscoped);
+  assert.deepEqual(driven, [12345, 12346, 12347, 12348]);
+});
+
+test("#1998 DRIVEN, decrement runs backwards - the panel does no seed arithmetic of its own", () => {
+  const nodes = [controlledSeedNode(42, "decrement")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  const seeds = queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  assert.deepEqual(seeds, [12345, 12344, 12343, 12342]);
+});
+
+test("#1998 `fixed` still repeats - and it is ComfyUI that refuses, not a panel branch", () => {
+  const nodes = [controlledSeedNode(42, "fixed")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  // The control IS armed. If the panel skipped `fixed` itself, this would be empty and
+  // the identical seeds below would prove nothing about who decided.
+  assert.equal(drive.armed.length, 1, "the fixed control must still be driven");
+  assert.equal(drive.armed[0].mode, "fixed");
+  const seeds = queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  assert.deepEqual(seeds, [12345, 12345, 12345, 12345], "a fixed control must submit N identical prompts");
+  assert.equal(scopedBatchDriveNote(drive.observe(), 4), "", "and nothing is said about it");
+});
+
+test("#1998 `fixed` repeats in Comfy.WidgetControlMode 'before' too", () => {
+  const nodes = [controlledSeedNode(42, "fixed", { runBefore: true })];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  const seeds = queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  assert.deepEqual(seeds, [12345, 12345, 12345, 12345]);
+});
+
+test("#1998 the drive works in Comfy.WidgetControlMode 'before' as well as 'after'", () => {
+  const nodes = [controlledSeedNode(42, "increment", { runBefore: true })];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  const seeds = queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  // 'before' skips the first execution (HAS_EXECUTED), so the advance starts on item 2 -
+  // identical to what an unscoped 'before' run does.
+  assert.deepEqual(seeds, [12345, 12346, 12347, 12348]);
+});
+
+test("#1998 restore() puts #8774 back - a later scoped run repeats again", () => {
+  const nodes = [controlledSeedNode(42, "randomize")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  const driven = queueBatch(nodes, { batchCount: 2, isPartialExecution: true });
+  drive.restore();
+  assert.equal(new Set(driven).size, 2);
+  const after = queueBatch(nodes, { batchCount: 3, isPartialExecution: true });
+  assert.equal(new Set(after).size, 1, "an UNDRIVEN scoped run must behave exactly as ComfyUI ships it");
+});
+
+test("#1998 restore() is idempotent and survives a widget whose graph vanished", () => {
+  const nodes = [controlledSeedNode(42, "randomize")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  drive.restore();
+  assert.doesNotThrow(() => drive.restore());
+});
+
+test("#1998 a third-party beforeQueued hook that is NOT a control is left alone", () => {
+  let calls = [];
+  const node = {
+    id: 7,
+    type: "SomePack",
+    widgets: [
+      {
+        name: "populated_text",
+        value: "x",
+        options: { serialize: true },
+        beforeQueued: (o) => calls.push(o),
+        afterQueued: (o) => calls.push(o),
+      },
+    ],
+  };
+  const drive = driveControlHooksAcrossScopedBatch([node]);
+  assert.deepEqual(drive.armed, [], "only value-control combos are driven");
+  queueBatch([node], { batchCount: 2, isPartialExecution: true });
+  drive.restore();
+  assert.ok(
+    calls.every((o) => o.isPartialExecution === true),
+    "a foreign hook must still be told the truth about the run it is in",
+  );
+});
+
+test("#1998 a control detected by OPTION SHAPE is driven even when it is renamed", () => {
+  const nodes = [controlledSeedNode(42, "increment")];
+  nodes[0].widgets[1].name = "seed_behavior";
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  assert.equal(drive.armed.length, 1, "a name test would have dropped this one");
+  const seeds = queueBatch(nodes, { batchCount: 3, isPartialExecution: true });
+  drive.restore();
+  assert.deepEqual(seeds, [12345, 12346, 12347]);
+});
+
+test("#1998 observe() reports what the widget DID, not what the drive asked for", () => {
+  const nodes = [controlledSeedNode(42, "randomize"), controlledSeedNode(43, "randomize", { linkFed: true })];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  queueBatch(nodes, { batchCount: 3, isPartialExecution: true });
+  const seen = drive.observe();
+  drive.restore();
+  const byNode = Object.fromEntries(seen.map((o) => [o.node_id, o]));
+  assert.equal(byNode["42"].advanced, true);
+  assert.equal(byNode["42"].governed, "seed");
+  assert.equal(byNode["42"].governed_source, "linked");
+  assert.equal(byNode["43"].advanced, false, "a link-fed target is skipped by ComfyUI on every path");
+  assert.equal(byNode["43"].observed, true, "and we DID watch it - `observed` is not `advanced`");
+});
+
+test("#1998 the note names what advanced and warns about what did not", () => {
+  const nodes = [controlledSeedNode(42, "randomize"), controlledSeedNode(43, "increment", { linkFed: true })];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  const note = scopedBatchDriveNote(drive.observe(), 4);
+  drive.restore();
+  assert.match(note, /node 42 \(KSampler\) seed=randomize/);
+  assert.match(note, /did NOT move/);
+  assert.match(note, /node 43 \(KSampler\) seed=increment/);
+  assert.match(note, /#8774/, "the note must name the upstream behaviour it is working around");
+});
+
+test("#1998 the note is silent for a batch of one and for a graph of only fixed controls", () => {
+  const nodes = [controlledSeedNode(42, "randomize")];
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  queueBatch(nodes, { batchCount: 1, isPartialExecution: true });
+  assert.equal(scopedBatchDriveNote(drive.observe(), 1), "");
+  drive.restore();
+  assert.equal(scopedBatchDriveNote([{ mode: "fixed", advanced: false, node_id: "1" }], 4), "");
+});
+
+test("#1998 the drive never throws on a malformed graph", () => {
+  assert.doesNotThrow(() => driveControlHooksAcrossScopedBatch(null));
+  assert.doesNotThrow(() => driveControlHooksAcrossScopedBatch([null, {}, { widgets: null }, { widgets: [null] }]));
+  assert.deepEqual(driveControlHooksAcrossScopedBatch(undefined).armed, []);
+});
+
+test("#1998 CALL SITE: the drive is installed on the SCOPED path, and restored in a finally", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  // It has to be imported to be callable - a bare reference is a ReferenceError that
+  // only a live panel would surface.
+  assert.match(
+    src,
+    /import \{[^}]*\bdriveControlHooksAcrossScopedBatch\b[^}]*\} from "\.\/lib\/scoped-batch-seed\.js"/s,
+    "driveControlHooksAcrossScopedBatch must be imported",
+  );
+  const install = src.indexOf("driveControlHooksAcrossScopedBatch(");
+  const scopedDispatch = src.indexOf("runScopeResult = await dispatchScopedRun({");
+  const unscopedDispatch = src.indexOf("await app.queuePrompt(0, batch, undefined)");
+  assert.ok(install > 0, "the drive is never installed - the fix is not wired in");
+  assert.ok(install < scopedDispatch, "it must be armed BEFORE the scoped dispatch it wraps");
+  assert.ok(
+    install > unscopedDispatch,
+    "it must sit in the SCOPED branch: the unscoped path already advances and must not be touched",
+  );
+  // The restore has to be unconditional. A throw out of dispatchScopedRun that left the
+  // hooks wrapped would keep advancing controls on the user's later single previews.
+  const tail = src.slice(scopedDispatch, scopedDispatch + 2500);
+  assert.match(tail, /\}\s*finally\s*\{[\s\S]{0,400}?controlDrive\?\.restore\(\)/, "restore must run in a finally around the dispatch");
+  // Gated on batch > 1: a scoped run of one keeps upstream #8774 behaviour.
+  const head = src.slice(Math.max(0, install - 600), install + 300);
+  assert.match(head, /batch > 1/, "the override must be gated on batch > 1");
+});
+
+test("#1998 CALL SITE: a driven batch does not also ship #988's contradictory warning", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const sites = [...src.matchAll(/const repeatingNote = ([^\n;]+)/g)].map((m) => m[1].trim());
+  assert.equal(sites.length, 1, "the #988 note is computed somewhere unexpected - re-check this gate");
+  assert.match(
+    sites[0],
+    /controlDriveObservations \?\s*""\s*:\s*scopedBatchSeedNote\(/,
+    `the "this batch WILL reuse the same values" note must be suppressed once the drive ran, got: ${sites[0]}`,
+  );
+  assert.match(src, /accept\.batch_controls_note = driveNote/, "the driven result must carry its own note");
 });
