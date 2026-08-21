@@ -307,9 +307,35 @@ function scopedView(present, covered) {
       if (!inScope(prop)) refuse(prop);
       return Reflect.getOwnPropertyDescriptor(t, prop);
     },
-    // Only the types actually PRESENT are enumerated, so anything that ranges over the map
-    // (`Object.keys(defs).length`, a serializer) sees a small, honest object rather than a
-    // throw. It still cannot see the install, which is why the scope trap above exists.
+    // Only the types actually PRESENT are enumerated, so ENUMERATING the map sees a small,
+    // honest object rather than a throw. It still cannot see the install, which is why the
+    // scope trap above exists.
+    //
+    // MEASURED against this module as merged (#1561, `a1844f68`) on node v24.16.0, driving a
+    // two-type scoped map: `Object.keys` → 2 names, `Object.getOwnPropertyNames`,
+    // `Object.entries`, `for…in` and spread `{...defs}` all succeed, and `Reflect.ownKeys`
+    // returns 3 (the two types plus the brand symbol).
+    //
+    // A SERIALIZER IS NOT COVERED, and an earlier version of this note said it was. That was
+    // never true and is corrected here rather than reworded (#1573): `JSON.stringify(defs)`
+    // looks up `toJSON` and `String(defs)` looks up `toString`, neither is a class type in
+    // `covered`, so the `get` trap above REFUSES both and each THROWS — with a message that
+    // reads as though `toJSON` were a node type. Measured on the same run.
+    //
+    // It is a documented edge and not a fault today: nothing reads this map by serializing
+    // it. Checked, not assumed — every consumer of the map `set-widget.js` holds
+    // (`freshBackendDefinesType`, `assertTypeAgainstFreshBackend`, `serverDeclaresEmptyComboOptions`,
+    // `uploadInputConfig`, `refreshCombos`, `isTypeScopedObjectInfo`) reads it by KEY, and a
+    // search of `web/js` finds no `JSON.stringify` of, and no string coercion of, an
+    // `/object_info` defs map. The scope of that check is the whole scope there is: this map
+    // is built here and consumed inside the panel, it never crosses the bridge, so no
+    // orchestrator reader can reach it to serialize. The direction is fail-closed anyway — a
+    // throw refuses a write, it cannot forge one — but do not ADD a reader that serializes
+    // this map without reading the paragraph below first.
+    //
+    // Whether `toJSON`/`toString`/`Symbol.toPrimitive` should simply be IN SCOPE — none of
+    // them is a class type, and symbols already pass through — is a real question and it is
+    // a BEHAVIOUR change, so it is deliberately NOT decided here. #1573 left it open.
     ownKeys(t) {
       return Reflect.ownKeys(t);
     },
