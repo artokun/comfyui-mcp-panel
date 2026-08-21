@@ -216,6 +216,18 @@ export function explainNumericNormalization(expected, actual, widget) {
       why: `round ${round}${Number.isInteger(digits) ? ` at ${digits} dp` : ""}`,
       grid: round,
     });
+  } else if (step2 !== null && precision > 0) {
+    // A widget carrying `step2` and a NON-ZERO precision but no `round` is a
+    // FLOAT whose rounding is switched off (`Comfy.DisableFloatRounding`), not an
+    // integer. `onFloatValueChange` then stores the value UNCHANGED — so no grid
+    // explains a change here, and only the clamp reading below may speak.
+    //
+    // Deliberately NO fall-through to the `step` readings: an else-if chain hands
+    // a blocked tier to the NEXT tier, and that is worse than the int reading it
+    // replaced. Simulated over the corpus with `round` stripped, counting genuine
+    // drifts wrongly explained: origin/main 58, int reading 40, falling through to
+    // `step` 58, this branch **1**. Measuring the obvious guard is the only reason
+    // this is not the obvious guard.
   } else if (step2 !== null) {
     // The frontend's INT path — `onValueChange`.
     const offset = step2 === 1 ? 0 : (min ?? 0) % step2;

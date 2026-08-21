@@ -321,3 +321,24 @@ test("#1130 the INT callback does NOT clamp on the panel's write path", () => {
   assert.ok(explainNumericNormalization(7.77, 2, f), "float clamps to max");
   assert.ok(explainNumericNormalization(-3.33, 0, f), "float clamps to min");
 });
+
+test("#1130 a FLOAT widget with rounding DISABLED is not mistaken for an integer", () => {
+  // grok's residual on PR #1550. With `Comfy.DisableFloatRounding` the frontend
+  // leaves `round` unset; `onFloatValueChange` then stores the value UNCHANGED,
+  // so the explainer is only ever reached when something else moved it — a
+  // genuine drift. The config that remains is shape-identical to an integer's,
+  // and the int grid would happily "explain" that drift.
+  //
+  // AdjustContrast.factor's measured options, minus `round`.
+  const w = widget({ min: 0, max: 2, step: 5, step2: 0.5, precision: 1 });
+  assert.equal(explainNumericNormalization(1.12, 1, w), null, "1.0 is the step2 0.5 grid — but that grid never ran");
+  assert.equal(explainNumericNormalization(1.12, 1.5, w), null);
+  assert.equal(explainNumericNormalization(1.12, 0, w), null, "and it must not fall through to the `step` readings either");
+  // Clamping still applies — it is the one thing that happens regardless.
+  assert.ok(explainNumericNormalization(7.77, 2, w), "above max still clamps");
+  assert.ok(explainNumericNormalization(-3.33, 0, w), "below min still clamps");
+  // A real INT widget (precision 0) is untouched by the guard.
+  assert.ok(explainNumericNormalization(1281, 1280, widget({ min: 16, max: 16384, step: 80, step2: 8, precision: 0 })));
+  // …and so is a widget with no precision at all (older builds, injected steps).
+  assert.ok(explainNumericNormalization(1281, 1280, widget({ min: 16, max: 16384, step2: 8 })));
+});
