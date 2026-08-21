@@ -277,6 +277,23 @@ test("#1223 the reported case: silent probes on an unbroken connection authorize
   assert.ok(Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "and the reported node type is in it");
 });
 
+test("#1582 a same-connection snapshot can shorten the live probe budget", () => {
+  const snap = createObjectInfoSnapshot();
+  assert.equal(stored(snap, SCHEMA, 3), true);
+  assert.equal(snap.isReusable({ epoch: 3, socketDown: false }), true);
+});
+
+test("#1582 snapshot budget shortening keeps the reconnect and socket-down fences", () => {
+  const empty = createObjectInfoSnapshot();
+  assert.equal(empty.isReusable({ epoch: 3, socketDown: false }), false, "nothing observed cannot shorten a probe");
+
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  assert.equal(snap.isReusable({ epoch: 3, socketDown: true }), false, "a down socket may be restarting");
+  assert.equal(snap.isReusable({ epoch: 4, socketDown: false }), false, "a new epoch may define different types");
+  assert.equal(snap.isReusable({ epoch: 3, socketDown: false }), true, "the original connection is reusable");
+});
+
 test("#1223 what is stored is DETACHED — registration hooks mutate defs in place", () => {
   // `registerNodesFromDefs` runs `beforeRegisterNodeDef` hooks that mutate the definitions
   // in place (Comfy's own upload hook adds an input the backend never declared). Retaining
@@ -463,9 +480,9 @@ const PANEL_SRC = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", impo
 function extractSetWidgetOracle() {
   const anchor = PANEL_SRC.indexOf("// #716 — READ THROUGH THE BURST CACHE.");
   assert.notEqual(anchor, -1, "the set_widget oracle's marker comment moved");
-  const start = PANEL_SRC.lastIndexOf("readObjectInfo: async (readThroughCache) => {", anchor);
+  const start = PANEL_SRC.lastIndexOf("readObjectInfo: async (readThroughCache, { reuseSnapshot = true } = {}) => {", anchor);
   assert.notEqual(start, -1, "readObjectInfo not found above its own marker");
-  const open = PANEL_SRC.indexOf("{", start);
+  const open = PANEL_SRC.indexOf("=> {", start) + 3;
   let depth = 0;
   for (let i = open; i < PANEL_SRC.length; i += 1) {
     const ch = PANEL_SRC[i];
@@ -498,7 +515,7 @@ function extractSetWidgetOracle() {
  * `epochDuringFetch` lets a test move the connection epoch WHILE the read is in flight —
  * the reconnect-mid-fetch hazard, which cannot be exercised any other way.
  */
-function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epochDuringFetch = null }) {
+function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epochDuringFetch = null, onFetch = null }) {
   const body = extractSetWidgetOracle();
   const factory = new Function(
     "api",
@@ -511,7 +528,9 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     "comfyBackendSocketDown",
     "objectInfoOracleFailureNote",
     "OBJECT_INFO_DEADLINE_MS",
+    "OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS",
     "makeCommandBudget",
+    "onFetch",
     // #1560 — the shipped body decides the type-scoped route's silence licence beside the
     // snapshot's own verdict, so this sandbox has to supply the same predicate. A name the
     // body closes over and the harness does not provide is a harness that models a panel
@@ -538,6 +557,7 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
      // Declared HERE so it closes over the mutable epoch above and can move it the moment
      // the read is issued — the panel's real hazard is a reconnect landing mid-fetch.
      const fetchWholeObjectInfo = (opts) => {
+       onFetch?.(opts);
        const pending = realFetchWholeObjectInfo({ ...opts, deadlineMs: 20 });
        if (epochDuringFetch !== null) backendReconnectEpoch = epochDuringFetch;
        return pending;
@@ -545,11 +565,14 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
      // The shipped body now takes the cache entry point, so the ordinary read and the
      // last-resort forced reread share it. Driving it the way graph_set_widget's own
      // getFreshObjectInfo does keeps this exercising production wiring, not a paraphrase.
-     const readObjectInfo = async (readThroughCache) => ${body};
+     const readObjectInfo = async (readThroughCache, { reuseSnapshot = true } = {}) => ${body};
      const getFreshObjectInfo = async () =>
        readObjectInfo((loader, opts) => objectInfoCache.readWithProvenance(loader, opts));
+     const refetchObjectInfoLive = async () =>
+       readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts), { reuseSnapshot: false });
      return {
        getFreshObjectInfo,
+       refetchObjectInfoLive,
        setEpoch: (n) => { backendReconnectEpoch = n; },
        readNote: () => setWidgetSchemaFromSnapshot,
        readIneligibility: () => snapshotIneligibility,
@@ -569,7 +592,9 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     socketDown,
     objectInfoOracleFailureNote,
     OBJECT_INFO_DEADLINE_MS,
+    2000,
     makeCommandBudget,
+    onFetch,
     noBackendAnswerEstablished,
   );
 }
@@ -622,13 +647,54 @@ test("#1223 SHIPPED: a CACHE HIT is never filed as evidence — it can predate a
   );
 });
 
-test("#1223 SHIPPED: the reported case — hung probes fall back and disclose", async () => {
+test("#1582 SHIPPED: the reported case — a held snapshot shortens hung probes", async () => {
   const snapshot = createObjectInfoSnapshot();
   stored(snapshot, SCHEMA, 5);
-  const o = buildShippedOracle({ api: hungApi, snapshot, epoch: 5, socketDown: false });
+  let clientCalls = 0;
+  let httpCalls = 0;
+  const deadlines = [];
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: () => {
+        clientCalls += 1;
+        return new Promise(() => {});
+      },
+      fetchApi: () => {
+        httpCalls += 1;
+        return new Promise(() => {});
+      },
+    },
+    snapshot,
+    epoch: 5,
+    socketDown: false,
+    onFetch: (opts) => deadlines.push(opts.deadlineMs),
+  });
   const defs = await o.getFreshObjectInfo();
   assert.ok(defs && Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "the edit is no longer refused");
-  assert.match(o.readNote(), /did not answer/, "and the reply can say which routes went silent");
+  assert.equal(clientCalls, 1, "the client route is still probed so an answered error can refuse");
+  assert.equal(httpCalls, 1, "the raw route is still probed so the fallback transport can answer");
+  assert.deepEqual(deadlines, [2000], "the reusable snapshot caps the serial oracle before the 15s stall");
+  assert.match(o.readNote(), /did not answer/);
+  assert.equal(o.readFailures().length, 2, "the fallback still discloses both silent routes");
+});
+
+test("#1582 the forced live reread does not take the snapshot shortcut", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  let clientCalls = 0;
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: async () => {
+        clientCalls += 1;
+        return SCHEMA;
+      },
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.refetchObjectInfoLive(), SCHEMA);
+  assert.equal(clientCalls, 1, "the blind-write recovery still forces a live schema read");
+  assert.equal(o.readNote(), null, "a live reread does not disclose snapshot authorization");
 });
 
 test("#1223 SHIPPED: a snapshot re-read is NOT recorded as a new backend observation", async () => {

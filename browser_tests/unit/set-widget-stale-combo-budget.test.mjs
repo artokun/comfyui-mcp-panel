@@ -562,7 +562,7 @@ test("#1418 the seed wait and the oracle read are capped by the command budget",
   );
   assert.match(
     body,
-    /deadlineMs: budget\.bounded\(OBJECT_INFO_DEADLINE_MS\)/,
+    /deadlineMs:\s*budget\.bounded\([\s\S]{0,260}OBJECT_INFO_DEADLINE_MS/,
     "the flat 20000ms oracle deadline is capped by what the command has left",
   );
   assert.match(

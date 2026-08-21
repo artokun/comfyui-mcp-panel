@@ -244,6 +244,23 @@ export function createObjectInfoSnapshot() {
       return { defs, reason: "" };
     },
 
+    /**
+     * Is this snapshot current enough to shorten the next probe budget?
+     *
+     * This does not authorize anything and does not expose the names-only map. The actual
+     * `authorize` call still requires the transport outcome to establish silence, preserving
+     * the distinction between a busy backend and one that answered with an unusable schema.
+     * The same socket/epoch fence is used so a reconnect cannot inherit the shorter budget.
+     */
+    isReusable({ epoch: currentEpoch, socketDown } = {}) {
+      return (
+        defs !== null &&
+        !socketDown &&
+        Number.isFinite(currentEpoch) &&
+        currentEpoch === epoch
+      );
+    },
+
     /** Drop it — for anything that knows, or merely suspects, the schema moved. */
     clear() {
       defs = null;
