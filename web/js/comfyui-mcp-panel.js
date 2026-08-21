@@ -479,6 +479,7 @@ import {
   findLandedRailLink,
   isRailLinkPersisted,
   landedAfterThrowWarning,
+  readStoredLink,
 } from "./lib/connect-verify.js";
 import {
   snapshotGraphState,
@@ -10494,11 +10495,16 @@ function summarizeNode(node) {
   // renames invisible, so the agent told the user their renames had not stuck when the
   // canvas showed them. `label` rides ALONGSIDE `name` and is emitted ONLY when one is
   // actually carried AND differs — never inferred, never replacing the addressable name.
-  const inputs = (node.inputs ?? []).map((inp, i) => {
+  const inputs = (node.inputs ?? []).map((inp) => {
     let from = null;
     if (inp.link != null) {
-      const link = node.graph?.links?.[inp.link];
-      if (link) from = { node_id: link.origin_id, output_slot: link.origin_slot };
+      const link = readStoredLink(node.graph, inp.link);
+      if (link) {
+        from = {
+          node_id: link.origin_id ?? link[1],
+          output_slot: link.origin_slot ?? link[2],
+        };
+      }
     }
     const label = boundaryInputLabel(inp);
     return {
@@ -12280,19 +12286,31 @@ const GRAPH_TOOL_EXECUTORS = {
         const ins = (n.inputs ?? [])
           .map((inp) => {
             if (inp.link == null) return null;
-            const l = links[inp.link];
+            const l = readStoredLink(graph, inp.link);
             if (!l) return null;
-            const src = byId.get(l.origin_id);
-            return `${l.origin_id}.${src?.outputs?.[l.origin_slot]?.name ?? l.origin_slot}`;
+            const originId = l.origin_id ?? l[1];
+            const originSlot = l.origin_slot ?? l[2];
+            const src = byId.get(originId);
+            return `${originId}.${src?.outputs?.[originSlot]?.name ?? originSlot}`;
           })
           .filter(Boolean);
         if (ins.length) out.push(`     ← ${ins.join(", ")}`);
         const outs = [];
-        for (const out2 of n.outputs ?? []) {
+        for (let outIdx = 0; outIdx < (n.outputs ?? []).length; outIdx++) {
+          const out2 = n.outputs[outIdx];
           for (const lid of out2.links ?? []) {
-            const l = links[lid];
+            const l = readStoredLink(graph, lid);
             if (!l) continue;
-            const tgt = byId.get(l.target_id);
+            const originId = l.origin_id ?? l[1];
+            const originSlot = l.origin_slot ?? l[2];
+            // #1590: outputs[].links is a cached backlink and can retain a link id
+            // after that id was reused/rebound to another source. Without this check
+            // the outline attributed node 4/6's link records to node 17, while detail
+            // and downstream traversal correctly followed the stored origin.
+            if (String(originId) !== String(n.id) || Number(originSlot) !== outIdx) continue;
+            const targetId = l.target_id ?? l[3];
+            const targetSlot = l.target_slot ?? l[4];
+            const tgt = byId.get(targetId);
             // #342: resolve the LIVE target slot through the target's own
             // inputs[].link backlink. The link record's target_slot goes stale
             // when the target's inputs are compacted (dynamic-combo rebuild,
@@ -12305,12 +12323,12 @@ const GRAPH_TOOL_EXECUTORS = {
             // not in this graph's node set (a dangling id the outline does not even
             // list, so a reader can see it is dead) or it carries no inputs array.
             if (!tgt || !Array.isArray(tgt.inputs)) {
-              outs.push(`${l.target_id}.${tgt?.inputs?.[l.target_slot]?.name ?? l.target_slot}`);
+              outs.push(`${targetId}.${tgt?.inputs?.[targetSlot]?.name ?? targetSlot}`);
               continue;
             }
             const live = liveLinkTargetInput(tgt, lid);
             if (!live) continue;
-            outs.push(`${l.target_id}.${live.name ?? live.index}`);
+            outs.push(`${targetId}.${live.name ?? live.index}`);
           }
         }
         if (outs.length) out.push(`     → ${outs.join(", ")}`);
@@ -12489,7 +12507,6 @@ const GRAPH_TOOL_EXECUTORS = {
     // recomputes geometric membership (summarizeGroup), so it never reports stale ids.
     syncGraphNodeAreas(graph);
     const nodes = graph._nodes ?? [];
-    const links = graph.links ?? {};
     const byId = new Map(nodes.map((n) => [String(n.id), n]));
     const total = nodes.length;
     const lim = Math.min(Math.max(Number(limit) || 40, 1), 200);
@@ -12502,9 +12519,9 @@ const GRAPH_TOOL_EXECUTORS = {
       const id = String(n.id);
       for (const inp of n.inputs ?? []) {
         if (inp.link == null) continue;
-        const l = links[inp.link];
+        const l = readStoredLink(graph, inp.link);
         if (!l) continue;
-        const src = String(l.origin_id);
+        const src = String(l.origin_id ?? l[1]);
         if (!up.has(id)) up.set(id, new Set());
         up.get(id).add(src);
         if (!down.has(src)) down.set(src, new Set());
