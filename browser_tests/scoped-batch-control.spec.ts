@@ -26,6 +26,10 @@ import { routeWorktreeSource } from './fixtures/worktreeSource'
 const WORKFLOW = JSON.parse(
   readFileSync(resolve('browser_tests/fixtures/scoped-batch-workflow.json'), 'utf8')
 )
+/** Same graph plus a SECOND, independent branch: KSampler 13 -> VAEDecode 18 -> SaveImage 19. */
+const TWO_BRANCH = JSON.parse(
+  readFileSync(resolve('browser_tests/fixtures/scoped-batch-two-branch.json'), 'utf8')
+)
 /** ids inside that fixture. */
 const KSAMPLER_ID = '3'
 const SAVE_IMAGE_ID = 9
@@ -176,4 +180,77 @@ test('mcp#1998 a scoped batch of ONE leaves ComfyUI_frontend #8774 alone', async
     return ks?.widgets.find((w: any) => w.name === 'seed')?.value
   }, KSAMPLER_ID)
   expect(after).toBe(START_SEED)
+})
+
+test('mcp#1998 the drive stops at the scope — an OFF-SCOPE control is not touched', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  // GATE P1-1. Arming every node in the workflow advanced controls on branches the run
+  // never executes — a silent rewrite of the user's graph, and the opposite of the reason
+  // for overriding ComfyUI_frontend #8774 (they asked for N renders of the scope they
+  // NAMED). Measured on the rig before the fix: a batch scoped to node 9 walked the
+  // unrelated KSampler 13's seed from 808000 to 808004.
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+
+  await page.evaluate(
+    async ({ wf }) => {
+      const app = (window as any).app
+      await app.loadGraphData(wf, true, true, 'cmcp-1998-two-branch')
+      await new Promise((r) => setTimeout(r, 1500))
+      const find = (id: string) => app.rootGraph._nodes.find((n: any) => String(n.id) === id)
+      for (const [id, seed] of [['3', 707000], ['13', 808000]] as [string, number][]) {
+        const n = find(id)
+        if (!n) throw new Error(`two-branch fixture did not load: no node ${id}`)
+        n.widgets.find((w: any) => w.name === 'control_after_generate').value = 'increment'
+        n.widgets.find((w: any) => w.name === 'seed').value = seed
+      }
+    },
+    { wf: TWO_BRANCH }
+  )
+  await interceptPrompts(page)
+
+  const reply = await mockBridge.command(
+    'graph_run',
+    { batch_count: 4, to_node_id: SAVE_IMAGE_ID },
+    45_000
+  )
+  expect(reply.ok, JSON.stringify(reply)).toBeTruthy()
+
+  const seen = await page.evaluate(() => {
+    const posted = (window as any).__posted1998 ?? []
+    ;(window as any).__restore1998?.()
+    const app = (window as any).app
+    const widget = (id: string) =>
+      app.rootGraph._nodes
+        .find((n: any) => String(n.id) === id)
+        ?.widgets.find((w: any) => w.name === 'seed')?.value
+    return {
+      inScope: posted.map((b: any) => b?.prompt?.['3']?.inputs?.seed),
+      offScope: posted.map((b: any) => b?.prompt?.['13']?.inputs?.seed),
+      offScopeWidget: widget('13')
+    }
+  })
+
+  expect(seen.inScope, 'the branch that RUNS still advances').toEqual([
+    707000, 707001, 707002, 707003
+  ])
+  expect(
+    new Set(seen.offScope).size,
+    `a branch outside the scope must be submitted unchanged, got ${JSON.stringify(seen.offScope)}`
+  ).toBe(1)
+  expect(seen.offScopeWidget, 'and its widget must not have been mutated at all').toBe(808000)
+
+  // GATE P1-2, from the same run: node 13 was never armed, so #988's repetition warning
+  // must still describe it rather than being silenced by the drive having run at all.
+  const named = JSON.stringify(reply?.result?.repeating_controls ?? [])
+  expect(named, 'an unarmed control keeps its warning').toContain('"node_id":"13"')
+  expect(
+    JSON.stringify(reply?.result?.batch_controls ?? []),
+    'and the drive must not claim it'
+  ).not.toContain('"node_id":"13"')
 })

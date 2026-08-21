@@ -20,6 +20,7 @@ import {
   findRepeatingControlWidgets,
   scopedBatchSeedNote,
   driveControlHooksAcrossScopedBatch,
+  nodesInPartialExecutionScope,
   scopedBatchDriveNote,
   findRgthreeSeedNodes,
   rgthreeFixedSeedNote,
@@ -599,15 +600,23 @@ function controlledSeedNode(id, mode, { runBefore = false, startAt = 12345, link
   return { id, type: "KSampler", widgets: [seed, control, { name: "steps", value: 20 }] };
 }
 
-/** app.ts's batch loop, reduced to the part that decides what each prompt carries. */
-function queueBatch(nodes, { batchCount, isPartialExecution }) {
+/** app.ts's batch loop, reduced to the part that decides what each prompt carries.
+ *  `readNodeId` names which node's seed to report — defaulting to the first node is
+ *  fine for a one-branch fixture and silently reports `undefined` for a graph whose
+ *  first node is a loader, which is how two of these tests first went green-looking. */
+function queueBatch(nodes, { batchCount, isPartialExecution, readNodeId = null }) {
+  const seedOf = (n) => (n.widgets ?? []).find((w) => w.name === "seed")?.value;
+  const pick = () =>
+    readNodeId == null
+      ? seedOf(nodes[0])
+      : seedOf(nodes.find((n) => String(n.id) === String(readNodeId)) ?? { widgets: [] });
   const posted = [];
   for (let i = 0; i < batchCount; i++) {
     for (const n of nodes) for (const w of n.widgets ?? []) w.beforeQueued?.({ isPartialExecution });
-    posted.push(nodes.map((n) => (n.widgets ?? []).find((w) => w.name === "seed")?.value));
+    posted.push(pick());
     for (const n of nodes) for (const w of n.widgets ?? []) w.afterQueued?.({ isPartialExecution });
   }
-  return posted.map((row) => row[0]);
+  return posted;
 }
 
 test("#1998 the double reproduces the bug: a scoped batch posts one seed four times", () => {
@@ -801,22 +810,201 @@ test("#1998 CALL SITE: the drive is installed on the SCOPED path, and restored i
   // Gated on batch > 1: a scoped run of one keeps upstream #8774 behaviour. Assert on
   // the ARGUMENT EXPRESSION, not on a window of surrounding source - a window matched
   // the word "batch > 1" in the comment above the call and let a dropped gate survive.
-  const call = src.slice(install, src.indexOf(");", install) + 2);
+  // Since gate P1-1 the gate rides on the SCOPE RESOLUTION that feeds the drive, so the
+  // expression to read is that assignment, not the drive call itself.
+  const scopeAssign = src.slice(src.indexOf("const inScope =", install - 600));
+  const scopeExpr = scopeAssign.slice(0, scopeAssign.indexOf(";") + 1);
   assert.match(
-    call,
+    scopeExpr,
     /batch > 1\s*\?/,
-    `the override must be gated on batch > 1, got: ${call}`,
+    `the override must be gated on batch > 1, got: ${scopeExpr}`,
   );
 });
 
-test("#1998 CALL SITE: a driven batch does not also ship #988's contradictory warning", () => {
+test("#1998 a control the drive ARMED is described once, by the drive - never also by #988", () => {
+  // This used to assert a source-level ternary that suppressed #988's note whenever the
+  // observation array existed. Gate P1-2 showed that was the defect, not the invariant:
+  // an empty (or off-scope-only) array silenced a control that really did repeat. The
+  // invariant it was reaching for is behavioural and is now asserted as such - a control
+  // gets EXACTLY ONE description, and which one depends on whether it was armed.
+  const armed = [controlledSeedNode(42, "randomize")];
+  const drive = driveControlHooksAcrossScopedBatch(armed);
+  queueBatch(armed, { batchCount: 4, isPartialExecution: true });
+  const uncovered = findRepeatingControlWidgets(armed, { skip: drive.armedWidgets });
+  const driveNote = scopedBatchDriveNote(drive.observe(), 4);
+  drive.restore();
+  assert.deepEqual(uncovered, [], "an armed control must not also be named by #988");
+  assert.equal(scopedBatchSeedNote(uncovered, 4), "", "so #988 has nothing to say about it");
+  assert.match(driveNote, /node 42/, "and the drive note is the one that describes it");
+});
+// ---------------------------------------------------------------------------
+// #1998 gate P1-1 - the drive must be confined to the partial-execution scope.
+//
+// REPRODUCED ON THE RIG before it was fixed, with a two-branch graph and
+// `graph_run { batch_count: 4, to_node_id: 9 }` (posts captured, nothing queued):
+//
+//   partial_execution_targets  ["9"] on all four posts
+//   node 3  (in scope)   seed widget 707000 -> 707004
+//   node 13 (OFF scope)  seed widget 808000 -> 808004     <-- never executed
+//
+// and after the fix, same run:
+//
+//   node 3   posted 707000,707001,707002,707003   widget -> 707004
+//   node 13  posted 808000,808000,808000,808000   widget  = 808000 (untouched)
+// ---------------------------------------------------------------------------
+
+/** A two-branch prompt map: 3 -> 9 and 13 -> 19, sharing loader 4. */
+const twoBranchPrompt = {
+  "4": { class_type: "CheckpointLoaderSimple", inputs: {} },
+  "3": { class_type: "KSampler", inputs: { model: ["4", 0] } },
+  "9": { class_type: "SaveImage", inputs: { images: ["3", 0] } },
+  "13": { class_type: "KSampler", inputs: { model: ["4", 0] } },
+  "19": { class_type: "SaveImage", inputs: { images: ["13", 0] } },
+};
+
+const twoBranchGraph = () => ({
+  _nodes: [
+    { id: 4, type: "CheckpointLoaderSimple", widgets: [] },
+    controlledSeedNode(3, "increment", { startAt: 707000 }),
+    { id: 9, type: "SaveImage", widgets: [] },
+    controlledSeedNode(13, "increment", { startAt: 808000 }),
+    { id: 19, type: "SaveImage", widgets: [] },
+  ],
+});
+
+test("#1998 P1-1 the scope is the upstream closure of the target, nothing else", () => {
+  const g = twoBranchGraph();
+  const ids = nodesInPartialExecutionScope(g, twoBranchPrompt, ["9"])
+    .map((n) => String(n.id))
+    .sort();
+  assert.deepEqual(ids, ["3", "4", "9"], "node 13 and node 19 are not in this run");
+});
+
+test("#1998 P1-1 an OFF-SCOPE control is never armed, and its widget is untouched", () => {
+  const g = twoBranchGraph();
+  const inScope = nodesInPartialExecutionScope(g, twoBranchPrompt, ["9"]);
+  const drive = driveControlHooksAcrossScopedBatch(inScope);
+  const seeds = queueBatch(g._nodes, { batchCount: 4, isPartialExecution: true, readNodeId: 3 });
+  drive.restore();
+  const seedOf = (id) => g._nodes.find((n) => n.id === id).widgets.find((w) => w.name === "seed").value;
+  assert.deepEqual(seeds, [707000, 707001, 707002, 707003], "the IN-scope control still advances");
+  assert.equal(seedOf(13), 808000, "the OFF-scope control must not be mutated at all");
+  assert.deepEqual(
+    drive.observe().map((o) => o.node_id),
+    ["3"],
+    "and it must not be reported as advanced either",
+  );
+});
+
+test("#1998 P1-1 FAIL-CLOSED: an unprovable scope yields null, and null arms nothing", () => {
+  const g = twoBranchGraph();
+  // A root that is not a key of the prompt map: the closure cannot be computed.
+  assert.equal(nodesInPartialExecutionScope(g, twoBranchPrompt, ["404"]), null);
+  assert.equal(nodesInPartialExecutionScope(g, null, ["9"]), null, "no prompt map means unprovable");
+  assert.equal(nodesInPartialExecutionScope(g, twoBranchPrompt, []), null, "no roots means unprovable");
+  assert.equal(nodesInPartialExecutionScope(null, twoBranchPrompt, ["9"]), null);
+  // ...and arming with the caller's `?? []` fallback touches nothing.
+  const drive = driveControlHooksAcrossScopedBatch(nodesInPartialExecutionScope(g, null, ["9"]) ?? []);
+  assert.deepEqual(drive.armed, []);
+  const seeds = queueBatch(g._nodes, { batchCount: 3, isPartialExecution: true, readNodeId: 3 });
+  drive.restore();
+  assert.deepEqual(seeds, [707000, 707000, 707000], "unprovable scope keeps ComfyUI's shipped behaviour");
+});
+
+test("#1998 P1-1 a full run (no targets) is not something this function narrows", () => {
+  const g = twoBranchGraph();
+  assert.equal(nodesInPartialExecutionScope(g, twoBranchPrompt, null), null);
+});
+
+test("#1998 P1-1 the prompt RESULT shape is accepted as well as its output map", () => {
+  const g = twoBranchGraph();
+  const ids = nodesInPartialExecutionScope(g, { output: twoBranchPrompt }, ["9"]).map((n) => String(n.id));
+  assert.deepEqual(ids.sort(), ["3", "4", "9"]);
+});
+
+test("#1998 P1-1 nodesInPartialExecutionScope never throws on a malformed graph", () => {
+  assert.doesNotThrow(() => nodesInPartialExecutionScope({ _nodes: [null, {}] }, twoBranchPrompt, ["9"]));
+  assert.doesNotThrow(() => nodesInPartialExecutionScope({ _nodes: null }, twoBranchPrompt, ["9"]));
+});
+
+// ---------------------------------------------------------------------------
+// #1998 gate P1-2 — an unarmed control keeps its repetition warning.
+//
+// REPRODUCED ON THE RIG: with the IN-SCOPE control carrying only `beforeQueued`,
+// the four posts carried seed 707000 four times and `repeating_controls_note` was
+// ABSENT — the reply reported neither the fix nor the warning. The observation
+// array was NOT empty (an off-scope control had filled it), so an "is it empty"
+// check would not have caught this. Coverage is per-WIDGET, not per-array.
+//
+// After the fix, same run: posts still 707000 x4 (a single-hook control cannot be
+// driven), `batch_controls` absent (no false claim), `repeating_controls_note` present.
+// ---------------------------------------------------------------------------
+
+test("#1998 P1-2 a control with only ONE queue hook is not armed, and keeps its warning", () => {
+  const nodes = [controlledSeedNode(42, "increment")];
+  delete nodes[0].widgets[1].afterQueued;
+  const drive = driveControlHooksAcrossScopedBatch(nodes);
+  assert.deepEqual(drive.armed, [], "both hooks are required - that is the frontend's own test");
+  assert.equal(drive.armedWidgets.size, 0);
+  const seeds = queueBatch(nodes, { batchCount: 4, isPartialExecution: true });
+  drive.restore();
+  assert.deepEqual(seeds, [12345, 12345, 12345, 12345], "so it still repeats...");
+  const uncovered = findRepeatingControlWidgets(nodes, { skip: drive.armedWidgets });
+  assert.equal(uncovered.length, 1, "an unarmed control keeps its repetition warning");
+  assert.match(scopedBatchSeedNote(uncovered, 4), /node 42/);
+});
+
+test("#1998 P1-2 skip subtracts exactly the ARMED widgets, by identity not by id", () => {
+  // Two nodes deliberately sharing an id, as a root node and a subgraph node can.
+  const armedNode = controlledSeedNode(7, "randomize");
+  const otherNode = controlledSeedNode(7, "randomize");
+  const drive = driveControlHooksAcrossScopedBatch([armedNode]);
+  const uncovered = findRepeatingControlWidgets([armedNode, otherNode], { skip: drive.armedWidgets });
+  drive.restore();
+  assert.equal(uncovered.length, 1, "matching on node_id would have silenced BOTH");
+});
+
+test("#1998 P1-2 no skip, or an empty one, leaves the shipped #988 scan untouched", () => {
+  const nodes = [ksampler(42, "randomize")];
+  const plain = findRepeatingControlWidgets(nodes);
+  assert.deepEqual(findRepeatingControlWidgets(nodes, {}), plain);
+  assert.deepEqual(findRepeatingControlWidgets(nodes, { skip: new Set() }), plain);
+  assert.deepEqual(findRepeatingControlWidgets(nodes, { skip: null }), plain);
+});
+
+test("#1998 P1-1 CALL SITE: the drive is armed over the SCOPE, and null arms nothing", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(
+    src,
+    /import \{[^}]*\bnodesInPartialExecutionScope\b[^}]*\} from "\.\/lib\/scoped-batch-seed\.js"/s,
+  );
+  const install = src.indexOf("driveControlHooksAcrossScopedBatch(");
+  const call = src.slice(Math.max(0, install - 400), install + 200);
+  assert.match(
+    call,
+    /nodesInPartialExecutionScope\(rootGraph, preflightPrompt, partialTargets\)/,
+    "the drive must be handed the partial-execution scope, not the whole workflow",
+  );
+  assert.match(call, /inScope \?\? \[\]/, "an unprovable scope must arm NOTHING, never the whole graph");
+  assert.doesNotMatch(
+    src.slice(install, install + 200),
+    /collectAllGraphs/,
+    "arming over every graph is gate P1-1",
+  );
+});
+
+test("#1998 P1-2 CALL SITE: the #988 warning is subtracted by ARMED WIDGETS, not suppressed wholesale", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const sites = [...src.matchAll(/const repeatingNote = ([^\n;]+)/g)].map((m) => m[1].trim());
-  assert.equal(sites.length, 1, "the #988 note is computed somewhere unexpected - re-check this gate");
-  assert.match(
+  assert.equal(sites.length, 1);
+  assert.equal(
     sites[0],
-    /controlDriveObservations \?\s*""\s*:\s*scopedBatchSeedNote\(/,
-    `the "this batch WILL reuse the same values" note must be suppressed once the drive ran, got: ${sites[0]}`,
+    "scopedBatchSeedNote(repeatingControls, batch)",
+    `the note must not be gated on the observation array existing, got: ${sites[0]}`,
   );
-  assert.match(src, /accept\.batch_controls_note = driveNote/, "the driven result must carry its own note");
+  assert.match(
+    src,
+    /skip: controlDrive\.armedWidgets/,
+    "the subtraction must come from what was actually armed",
+  );
 });

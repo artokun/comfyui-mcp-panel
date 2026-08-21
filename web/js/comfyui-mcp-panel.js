@@ -226,6 +226,7 @@ import {
   findRepeatingControlWidgets,
   scopedBatchSeedNote,
   driveControlHooksAcrossScopedBatch,
+  nodesInPartialExecutionScope,
   scopedBatchDriveNote,
   findRgthreeSeedNodes,
   rgthreeFixedSeedNote,
@@ -15944,6 +15945,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // Resolution is read-only, so moving it ahead changes nothing it does; it only changes
     // which refusal answers first, and "node N was not found" is the better answer to a
     // request naming node N than a report about some other node's pack.
+    // #1998 (gate P1-1) — the pre-flight's serialization, kept so the scope closure can
+    // be computed from the SAME compilation. A second `app.graphToPrompt()` would describe
+    // a graph that may have moved and is not read-only (#985). Null whenever the pre-flight
+    // did not produce one, which the closure treats as "scope unprovable".
+    let preflightPrompt = null;
     let partialTargets;
     // #699 — carried out of the resolve block so the queue-rejection summary can
     // explain a `prompt_no_outputs` refusal of a target the panel already verified
@@ -16034,6 +16040,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // the pre-flight catch as a throw, exactly as the bare await delivered it.
       if ("error" in preflightBuild) throw preflightBuild.error;
       const built = preflightBuild.value;
+      preflightPrompt = built;
       // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
       // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a
       // result that does not exist has no unrunnable entries in it — and the check below
@@ -16316,13 +16323,42 @@ const GRAPH_TOOL_EXECUTORS = {
       //
       // ONLY for batch > 1. A single scoped preview keeps #8774's behaviour exactly:
       // the user iterating on one branch does not want their seed churned.
+      //
+      // SCOPED TO THE RUN, not to the workflow (gate P1-1). Arming every node advanced
+      // controls on branches this run never executes — MEASURED: a batch scoped to node 9
+      // walked an unrelated KSampler's seed 808000 -> 808004 and reported it as advanced.
+      // That is a silent wrong-target mutation, and it contradicts the very reason for
+      // overriding #8774: the user asked for N renders OF THE SCOPE THEY NAMED.
+      //
+      // `nodesInPartialExecutionScope` returns null when the scope cannot be PROVEN, and
+      // null arms nothing: the batch then repeats exactly as ComfyUI ships it and #988's
+      // warning stands (see the skip below). Never an approximation of the node set.
       let controlDrive = null;
       try {
-        controlDrive = driveControlHooksAcrossScopedBatch(
-          batch > 1 ? collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []) : [],
-        );
+        const inScope =
+          batch > 1 ? nodesInPartialExecutionScope(rootGraph, preflightPrompt, partialTargets) : [];
+        controlDrive = driveControlHooksAcrossScopedBatch(inScope ?? []);
       } catch {
         controlDrive = null; /* the run must survive a failure to arm the drive */
+      }
+      // #988 x #1998 (gate P1-2) — SUBTRACT ONLY WHAT WAS ACTUALLY ARMED. The suppression
+      // used to key on `controlDriveObservations` being non-null, and an empty array is
+      // non-null: a control the drive could not arm (one queue hook, an older frontend's
+      // widget shape, a node outside the scope) submitted identical prompts while the
+      // reply carried NEITHER the drive note NOR the repetition warning. MEASURED: with a
+      // single-hook control on the in-scope KSampler, the four posts carried seed 707000
+      // four times and `repeating_controls_note` was absent. Absence of evidence read as
+      // evidence of success — and the empty-array check would not even have caught it,
+      // because an off-scope control had filled the array.
+      if (controlDrive?.armedWidgets?.size) {
+        try {
+          repeatingControls = findRepeatingControlWidgets(
+            collectAllGraphs(rootGraph).flatMap((g) => g?._nodes ?? []),
+            { skip: controlDrive.armedWidgets },
+          );
+        } catch {
+          /* keep the unfiltered scan — over-warning is the safe direction here */
+        }
       }
       try {
         runScopeResult = await dispatchScopedRun({
@@ -16566,8 +16602,11 @@ const GRAPH_TOOL_EXECUTORS = {
       accept.batch_controls = controlDriveObservations;
       accept.batch_controls_note = driveNote;
     }
-    // #988 — attach the PRE-dispatch finding.
-    const repeatingNote = controlDriveObservations ? "" : scopedBatchSeedNote(repeatingControls, batch);
+    // #988 — attach the PRE-dispatch finding, now covering exactly the controls the drive
+    // did NOT arm (gate P1-2). The subtraction happens at the arming site, before dispatch,
+    // so this keeps #988's "computed BEFORE dispatch" property; what changed is that an
+    // unarmed control keeps its warning instead of being silenced by an unrelated one.
+    const repeatingNote = scopedBatchSeedNote(repeatingControls, batch);
     if (repeatingNote) {
       accept.repeating_controls = repeatingControls;
       accept.repeating_controls_note = repeatingNote;

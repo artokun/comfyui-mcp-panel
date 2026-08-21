@@ -39,6 +39,8 @@
  */
 
 import { isControlAfterGenerateWidget } from "./control-after-generate.js";
+import { upstreamClosure } from "./partial-run-prune.js";
+import { buildNodeExecutionId } from "./subgraph-scope.js";
 
 /**
  * Values of `control_after_generate` that mean "change this between runs".
@@ -90,7 +92,7 @@ function governedValueWidget(widgets, control, index) {
  * Fully defensive — a malformed node or a throwing accessor reduces what is found,
  * never throws. A warning must not be able to take down the run it is about.
  */
-export function findRepeatingControlWidgets(nodes) {
+export function findRepeatingControlWidgets(nodes, { skip = null } = {}) {
   const found = [];
   if (!Array.isArray(nodes)) return found;
   for (const node of nodes) {
@@ -100,6 +102,12 @@ export function findRepeatingControlWidgets(nodes) {
         const w = widgets[i];
         const name = typeof w?.name === "string" ? w.name : null;
         if (name !== "control_after_generate") continue;
+        // #1998 — a control the DRIVE armed is already accounted for by the drive's own
+        // observation note, and warning "this batch WILL reuse it" beside that would be
+        // the contradiction this option exists to prevent. Identity, not id: two nodes in
+        // different subgraphs can share `node.id`, so matching on ids would silence the
+        // wrong widget. Absent/empty skip ⇒ byte-identical to the shipped behaviour.
+        if (skip && skip.has(w)) continue;
         const mode = typeof w.value === "string" ? w.value : null;
         // `fixed` is the one setting that WANTS the same value every time, so a scoped
         // batch repeating it is correct and must not be warned about.
@@ -594,6 +602,7 @@ export function rgthreeFixedSeedNote(seeds, batchCount) {
  */
 export function driveControlHooksAcrossScopedBatch(nodes) {
   const armed = [];
+  const armedWidgets = new Set();
   const restores = [];
   if (Array.isArray(nodes)) {
     for (const node of nodes) {
@@ -643,6 +652,7 @@ export function driveControlHooksAcrossScopedBatch(nodes) {
             };
           w.beforeQueued = forced(before);
           w.afterQueued = forced(after);
+          armedWidgets.add(w);
           restores.push(() => {
             w.beforeQueued = before;
             w.afterQueued = after;
@@ -656,6 +666,13 @@ export function driveControlHooksAcrossScopedBatch(nodes) {
   }
   return {
     armed: armed.map((a) => ({ ...a.entry })),
+    /**
+     * The control widget OBJECTS this drive wrapped — the exact set #988's scan must
+     * skip, so a control the drive could not reach keeps its repetition warning
+     * (#1998 gate P1-2). Identity rather than ids: `node.id` is not unique across
+     * subgraphs, and silencing the wrong widget is the failure being fixed.
+     */
+    armedWidgets,
     /**
      * Put every hook back. Called from the caller's `finally`, so the override lasts
      * exactly the dispatch - a control left wrapped would keep advancing on the user's
@@ -742,4 +759,79 @@ export function scopedBatchDriveNote(observations, batchCount) {
     );
   }
   return parts.join(" ");
+}
+
+/**
+ * #1998 (gate P1-1) — the nodes a PARTIAL execution actually runs, or null when that
+ * cannot be established.
+ *
+ * WHY THIS EXISTS. The drive was armed over `collectAllGraphs(rootGraph)` — every node
+ * in the workflow. MEASURED on the rig with a two-branch graph (KSampler 3 -> SaveImage
+ * 9, KSampler 13 -> SaveImage 19, both `increment`), running
+ * `graph_run { batch_count: 4, to_node_id: 9 }`:
+ *
+ *     partial_execution_targets   ["9"] on all four posts
+ *     node 3  (in scope)  seed widget 707000 -> 707004
+ *     node 13 (OFF scope) seed widget 808000 -> 808004      <-- never executed
+ *
+ * Node 13 is not in the run. Advancing it silently rewrites a branch the user did not
+ * run, and the drive then REPORTED it as `advanced: true`. That is a wrong-target
+ * mutation of someone's workflow, and it is worse than the cache-hit this whole change
+ * exists to fix, because the cache-hit was visible in the outputs and this is not. It
+ * also inverts the justification for overriding ComfyUI_frontend #8774 in the first
+ * place: that the user asked for N distinct renders OF THE SCOPE THEY NAMED.
+ *
+ * ONE CLOSURE, NOT A SECOND OPINION. The backward walk that decides what a run-to-node
+ * executes already lives in `partial-run-prune.js` (#1511) and is what the #1871
+ * pre-flight narrows on. This imports that verdict rather than restating it — two
+ * answers to one question is two chances to disagree, and here disagreement means
+ * either mutating an off-scope node or failing to advance an in-scope one.
+ *
+ * IT WORKS ON THE PROMPT MAP, so the caller must hand over the SAME serialization the
+ * pre-flight already produced. Building a fresh one here would be a second compilation
+ * of a graph that may have moved, and `graphToPrompt` is not read-only (#985).
+ *
+ * FAIL-CLOSED, DELIBERATELY. Null is returned — and the caller then arms NOTHING —
+ * whenever the scope cannot be proven: no prompt map, roots that are not keys of it, or
+ * a node whose execution id cannot be built (a stale/ghost subgraph). Arming nothing
+ * degrades to ComfyUI's shipped behaviour (the batch repeats) AND leaves #988's warning
+ * standing, so the caller is told the truth. Arming everything is the defect above.
+ *
+ * KNOWN LIMIT, stated rather than papered over: a node that carries a control but has no
+ * entry in the prompt map — a frontend-only `PrimitiveNode` feeding a seed, a Reroute —
+ * is not in the closure and is therefore NOT armed. Its control keeps #988's repetition
+ * warning instead, which is the honest outcome; extending the closure to virtual nodes
+ * would mean a second link-walk over litegraph, which is exactly the duplicate verdict
+ * this function refuses to create.
+ */
+export function nodesInPartialExecutionScope(rootGraph, promptResult, targetIds) {
+  try {
+    if (!rootGraph) return null;
+    const map =
+      promptResult?.output && typeof promptResult.output === "object" ? promptResult.output : promptResult;
+    const closure = upstreamClosure(map, targetIds);
+    if (!closure) return null;
+    const out = [];
+    const seen = new Set();
+    const stack = [rootGraph];
+    while (stack.length) {
+      const graph = stack.pop();
+      if (!graph || seen.has(graph)) continue;
+      seen.add(graph);
+      for (const node of graph._nodes ?? []) {
+        if (!node) continue;
+        if (node.subgraph) stack.push(node.subgraph);
+        if (node.id == null) continue;
+        // The colon path ComfyUI itself keys a flattened prompt by, so `closure` (which
+        // holds prompt keys) and this are the same namespace. A node that cannot be
+        // placed makes the whole answer unprovable — see FAIL-CLOSED above.
+        const execId = buildNodeExecutionId(rootGraph, graph, node.id);
+        if (execId == null) return null;
+        if (closure.has(execId)) out.push(node);
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  }
 }
