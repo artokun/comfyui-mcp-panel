@@ -660,7 +660,7 @@ export function driveControlHooksAcrossScopedBatch(nodes) {
      * Put every hook back. Called from the caller's `finally`, so the override lasts
      * exactly the dispatch - a control left wrapped would keep advancing on the user's
      * own single scoped previews, which is the behaviour #8774 exists to prevent.
-     * Idempotent: the queue drains the list, so a second call restores nothing.
+     * Idempotent: the first call drains the list, so a second restores nothing.
      */
     restore() {
       for (const r of restores.splice(0).reverse()) {
@@ -735,9 +735,10 @@ export function scopedBatchDriveNote(observations, batchCount) {
         `${list(stuck)}. OBSERVED, not inferred - the panel read each governed widget on both ` +
         `sides of every hook call. The usual causes are a governed input fed by a LINK (ComfyUI ` +
         `skips the control on every path when the value comes from the link rather than the ` +
-        `widget) and a widget PROMOTED to a subgraph host, which ComfyUI advances through a ` +
-        `module function the panel cannot wrap. Set those values yourself between runs, or run ` +
-        `the branch unscoped.`,
+        `widget) and a widget PROMOTED to a subgraph host, which ComfyUI drives through ` +
+        `applyPromotedWidgetControl - a module function rather than a widget property, so the ` +
+        `cleared flag never reaches it. Set those values yourself between runs, or run the ` +
+        `branch unscoped.`,
     );
   }
   return parts.join(" ");
