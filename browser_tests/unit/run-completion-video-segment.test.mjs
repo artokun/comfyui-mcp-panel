@@ -145,6 +145,46 @@ test("#1485: a FULL sheet still reads as a plain N-frame storyboard", async () =
   );
 });
 
+test("#1485: exactly ONE sampled frame is described in the singular, with the blanks named", async () => {
+  // The reported shape of a barely-decodable video: the builder paints one cell
+  // and leaves nineteen blank. This is the case the capacity claim was worst
+  // for, so the wording is pinned rather than assumed to fall out of the plural.
+  const { deps } = makeDeps({ buildVideoStoryboard: async () => sheetBlob({ paintedFrames: 1 }) });
+  const frame = await composeRunCompletionFrame(videoPayload(), deps);
+
+  assert.match(frame.note, /holding 1 sampled frame —/, "one frame is one frame, not '1 sampled frames'");
+  assert.match(frame.note, /19 could not be captured and are BLANK/);
+  assert.ok(!/20-frame storyboard/.test(frame.note), `\n${frame.note}`);
+});
+
+test("#1485: an UNKNOWN sampled count claims no count at all — never the capacity, never 'null'", async () => {
+  // `paintedFrames` is best-effort: buildVideoStoryboard sets it on the blob and
+  // its own comment allows a Blob implementation that refuses extra properties,
+  // "which callers must treat as unknown — never as the capacity". Unlike
+  // show_media's produceSheet, this path does NOT withhold the sheet for an
+  // unknown count — it is the run's ONE completion and the sheet is the only
+  // thing that shows the agent the video — so it must describe it without one.
+  //
+  // The second half is the trap: `metaSuffix`'s storyboard clause is a plain
+  // truthiness guard, so passing an unknown count through as a number-shaped
+  // nothing would print "null-frame storyboard" on the metadata line.
+  const { deps, calls } = makeDeps({ buildVideoStoryboard: async () => sheetBlob({}) });
+  const frame = await composeRunCompletionFrame(videoPayload(), deps);
+
+  assert.equal(frame.images.length, 1, "the sheet still ships — an unknown count is not a reason to withhold it");
+  assert.match(frame.note, /📽️ storyboard \(contact sheet\)/, "described, but not counted");
+  assert.ok(!/20-frame|20-cell/.test(frame.note), `the capacity must not stand in for the count\n${frame.note}`);
+  assert.ok(
+    !/null|undefined|NaN/.test(frame.note),
+    `an unknown count must never reach the note as a value\n${frame.note}`,
+  );
+  assert.deepEqual(
+    calls.painted.map((p) => p.caption),
+    ["Storyboard"],
+    "and the user's caption drops the count too, rather than inventing one",
+  );
+});
+
 test("#1485: the completion frame does not wait for the card's poster", async () => {
   // THE LATENCY FIX. The poster decorates the USER's video card; the agent never
   // receives it and no part of the note depends on it. It used to be awaited —
