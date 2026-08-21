@@ -484,6 +484,7 @@ import {
 import {
   deferChangeTrackerSnapshot,
   flushPendingChangeTrackerSnapshot,
+  trackerCaptureSuppressed,
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
@@ -3260,9 +3261,13 @@ function captureWasSuppressed(tracker) {
     if (typeof tracker?._restoringState === "undefined") return true;
     if (typeof tracker?.changeCount === "undefined") return true;
     if (typeof tracker?.constructor?.isLoadingGraph === "undefined") return true;
-    if (tracker._restoringState) return true; // an undo/redo is restoring
-    if (Number(tracker.changeCount) > 0) return true; // inside a change transaction
-    if (tracker.constructor.isLoadingGraph) return true; // a graph is loading
+    // The three conditions themselves live in ONE place (panel#1563), so this
+    // question and the retry's question can never disagree about what upstream's
+    // early return reads. Only the DEFAULT for an unreadable tracker differs, and
+    // that difference is the shape-first block above: here an unknown tracker is
+    // suppressed (a close must not discard a canvas on an unproven flag), there it
+    // is not (a retry must not spin on a frontend it cannot read).
+    if (trackerCaptureSuppressed(tracker)) return true;
     const graph =
       window.comfyAPI?.app?.app?.graph ?? (typeof app !== "undefined" ? app?.graph : null);
     return !graph;
@@ -3686,6 +3691,105 @@ function installCreateBoundaryFork(appRef) {
 // satisfies the stamp check; a crossed one is refused here too, which is the point.
 let _savePathGuardInstalled = false;
 const _savePathGuardRefusalsLogged = new Set();
+/**
+ * panel#1563/#1564 — would this save persist a snapshot that has fallen BEHIND the
+ * canvas, and so report success for work the file will not contain?
+ *
+ * The write serializes `changeTracker.activeState`, and the refresh that is supposed
+ * to make it current (`prepareForSave()` → `captureCanvasState()`) is a SILENT no-op
+ * inside upstream's own load / undo / change-transaction windows. Measured on the live
+ * rig with one of those windows open: create_group landed on the canvas, the save
+ * answered `saved: true`, and the file came back without the group.
+ *
+ * TWO CONJUNCTS, both required, and the caller supplies neither by inference:
+ *
+ *   1. `trackerCaptureSuppressed` — upstream POSITIVELY reports it skipped the
+ *      capture. Without this a save could be refused for ordinary tracker lag, which
+ *      `prepareForSave` would have resolved a microsecond later.
+ *   2. a comparison of the live root against the state about to be written ACTUALLY
+ *      HAPPENED (`describeGraphStateDifference(...).comparable === true`) and the
+ *      tolerant proof (`graphRootReproducesStateContent`) did not vouch for it. Both
+ *      halves are load-bearing: the tolerance stops a frontend that re-measures node
+ *      boxes or renumbers subgraph link ids from manufacturing a refusal, and the
+ *      comparability stops an ABSENT comparison from doing the same — the proof
+ *      answers `proven:false` for "could not compare" exactly as it does for "differs",
+ *      so reading it alone made a root that cannot be serialized indistinguishable
+ *      from a canvas with lost work. Without conjunct 2 at all, a suppressed capture
+ *      on an already-equal canvas — the ordinary state of a clean tab — would block
+ *      every save.
+ *
+ * ACTIVE WORKFLOW ONLY. `app.rootGraph` is the ACTIVE tab's canvas; comparing it with
+ * an inactive tab's snapshot would compare two different workflows and refuse a save
+ * that loses nothing. An unreadable identity answers false — a guard that cannot read
+ * its evidence must never invent a refusal (the same rule the #1667 guard states).
+ */
+/**
+ * panel#1563 r2 — does this tracker still own the live canvas? (the deferred capture's
+ * licence to write, re-asked on every retry attempt)
+ *
+ * A capture serializes the GLOBAL canvas into THIS tracker's `activeState`, and the retry
+ * chain can stay armed for up to ~1.4s — long enough for another workflow to open. The
+ * chain's own stop condition is upstream's `isLoadingGraph`, a CLASS STATIC, so an
+ * orphaned record reads "suppressed" for the whole of the next workflow's load and then
+ * fires the instant it completes, when the canvas belongs to someone else.
+ *
+ * POSITIVE OWNERSHIP ONLY — an unreadable store is NOT permission. During a tab switch, a
+ * close, or a teardown, `activeWorkflowRef()` answers null while the canvas on screen is
+ * already someone else's; capturing then writes that canvas into this tracker's state, and
+ * a later save of its workflow persists the wrong graph over its own file (#1667's shape).
+ * Being wrong the other way costs a snapshot that stays behind until the next command —
+ * which `saveWouldPersistStaleSnapshot` refuses LOUDLY rather than losing silently. One
+ * side of that trade is recoverable and the other is not.
+ */
+function trackerStillOwnsCanvas(tracker) {
+  const active = activeWorkflowRef(); // already try/catch-guarded; returns null when unreadable
+  return Boolean(active) && active.changeTracker === tracker;
+}
+
+function saveWouldPersistStaleSnapshot(wf, state) {
+  try {
+    if (!wf || !state || !Array.isArray(state.nodes)) return false;
+    const active = activeWorkflowRef();
+    if (!active || !sameWorkflowObject(active, wf)) return false;
+    const tracker = wf.changeTracker ?? null;
+    if (!tracker || !trackerCaptureSuppressed(tracker)) return false;
+    const appRef = window.comfyAPI?.app?.app ?? (typeof app !== "undefined" ? app : null);
+    const rootGraph = appRef?.rootGraph ?? appRef?.graph ?? null;
+    if (typeof rootGraph?.serialize !== "function") return false;
+    // panel#1563 r2 — SERIALIZE ONCE, and require a comparison that actually happened.
+    //
+    // `graphRootReproducesStateContent` answers the SAME `proven: false` for "the canvas
+    // provably differs" and for "no comparison was possible" — a `serialize()` that
+    // throws or answers null, a difference its classifier cannot account for. Reading
+    // `proven !== true` alone therefore turned every unreadable root into a REFUSAL: a
+    // broken or hostile custom node with a serialization hook could block Ctrl+S and
+    // autosave outright, and the message would tell the user their file is missing
+    // changes the canvas has, on no evidence at all. That inverts this function's own
+    // rule (a guard that cannot read its evidence must never invent a refusal) and the
+    // contract of the comparison itself, which states `comparable:false` is not evidence
+    // either way.
+    //
+    // The single frozen snapshot is the same discipline `graphRootReproducesStateContent`
+    // documents internally: asking two questions off two serializations lets a
+    // synchronous hook show one answer to the comparability check and another to the
+    // proof, so the refusal would rest on content no single comparison ever saw.
+    let liveState;
+    try {
+      liveState = rootGraph.serialize();
+    } catch {
+      return false; // a root that cannot be read is not proof that the snapshot is stale
+    }
+    if (liveState == null) return false;
+    const frozen = { serialize: () => liveState };
+    if (describeGraphStateDifference({ rootGraph: frozen, state })?.comparable !== true) {
+      return false;
+    }
+    return graphRootReproducesStateContent({ rootGraph: frozen, state })?.proven !== true;
+  } catch {
+    return false;
+  }
+}
+
 function installSavePathGuard(appRef) {
   try {
     if (_savePathGuardInstalled) return;
@@ -3723,6 +3827,11 @@ function installSavePathGuard(appRef) {
           destinationPersisted: Boolean(destRecord) && destRecord?.isTemporary !== true,
           stampedPath: typeof stampedPath === "string" && stampedPath ? stampedPath : null,
           stampedPathOwnedByOther: Boolean(stampedRecord) && !sameWorkflowObject(stampedRecord, wf),
+          // panel#1563 — the OTHER way this funnel loses a graph: not a foreign
+          // canvas, just a snapshot upstream silently refused to refresh. Read from
+          // the same `state` the write serializes, so the check and the write can
+          // never be looking at different things.
+          snapshotIsStale: saveWouldPersistStaleSnapshot(wf, state),
         });
       } catch {
         verdict = { allow: true }; // a guard that cannot read its evidence must never invent a refusal
@@ -3732,7 +3841,7 @@ function installSavePathGuard(appRef) {
         // The autosave watcher logs a one-line "Auto save failed" for a thrown save;
         // make the refusal itself unmistakable in the console — but once per crossing,
         // not once per autosave retry.
-        const key = `${verdict.destinationPath}<-${verdict.stampedPath}`;
+        const key = `${verdict.reason}:${verdict.destinationPath}<-${verdict.stampedPath ?? ""}`;
         if (!_savePathGuardRefusalsLogged.has(key)) {
           _savePathGuardRefusalsLogged.add(key);
           try {
@@ -3743,6 +3852,60 @@ function installSavePathGuard(appRef) {
       }
       return orig(wf, ...rest);
     };
+    // panel#1563 r4 — THE SAVE-AS COPY POINT, which the `saveWorkflow` wrapper above
+    // cannot see.
+    //
+    // MEASURED in comfyui-frontend 1.49.6. `workflowStore.saveAs` seeds the new record
+    // from the SOURCE's tracker snapshot and nothing else:
+    //
+    //     const state = JSON.parse(JSON.stringify(existingWorkflow.activeState))
+    //     workflow.originalContent = workflow.content = JSON.stringify(state)
+    //
+    // and `workflowService.saveWorkflowAs` calls `prepareForSave()` only on the TARGET,
+    // after the copy. So when the source's capture is suppressed, its snapshot is copied
+    // stale; `openWorkflow(target)` then loads that stale state onto the canvas — taking
+    // the unsaved edits off the screen too — and the fresh target tracker captures the
+    // now-stale canvas. By the time `saveWorkflow(target)` reaches the wrapper above,
+    // all three suppression flags are false and the canvas AGREES with the snapshot:
+    // every piece of evidence the guard reads has been destroyed, and it correctly
+    // allows a write that is missing the user's work.
+    //
+    // The evidence exists only HERE, before the copy. Same predicate, same refusal,
+    // asked of the SOURCE — and it throws before `saveAs` returns a record, so no file
+    // is created and the canvas is left exactly as the user has it.
+    if (typeof svc.saveAs === "function") {
+      const origSaveAs = svc.saveAs.bind(svc);
+      svc.saveAs = function (sourceWf, destPath, ...rest) {
+        let verdict = { allow: true };
+        try {
+          // The state the copy will be built from — read the SAME way `saveAs` reads it.
+          const sourceState = sourceWf?.changeTracker?.activeState ?? sourceWf?.activeState ?? null;
+          verdict = decideWorkflowSaveVerdict({
+            destinationPath: typeof destPath === "string" ? destPath : null,
+            snapshotIsStale: saveWouldPersistStaleSnapshot(sourceWf, sourceState),
+          });
+        } catch {
+          verdict = { allow: true }; // a guard that cannot read its evidence never invents a refusal
+        }
+        if (!verdict.allow) {
+          const key = `saveAs:${verdict.destinationPath}`;
+          if (!_savePathGuardRefusalsLogged.has(key)) {
+            _savePathGuardRefusalsLogged.add(key);
+            try {
+              console.warn(`[comfyui-mcp] ${workflowSaveRefusalError(verdict).message}`);
+            } catch {}
+          }
+          throw workflowSaveRefusalError(verdict);
+        }
+        return origSaveAs(sourceWf, destPath, ...rest);
+      };
+    } else {
+      // Disclosed, never silent — the same rule the missing-store branch above follows.
+      console.warn(
+        "[comfyui-mcp] save-path guard: workflowStore.saveAs is unavailable on this frontend — " +
+          "a Save-As copy is NOT checked against a stale tracker snapshot (panel#1563).",
+      );
+    }
     _savePathGuardInstalled = true;
   } catch (err) {
     _savePathGuardInstalled = false;
@@ -11170,6 +11333,44 @@ function widenSocketProofBudget(deadlineMs) {
 const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
 
 /**
+ * #1565 — `graph_run` was the one mutating command on this list with NO command budget at
+ * all, and the only one relayed in 20,000 ms rather than 30,000.
+ *
+ * What the RUN path awaits that the READ path does not: `app.graphToPrompt()` (serializing
+ * the whole workflow, including every extension's own serializeValue), `app.queuePrompt()`
+ * (the frontend's queue processor — shadowed by an extension's own property on the
+ * reporter's machine), and the scoped-dispatch observation wait, ONCE PER ARGUMENT SHAPE.
+ * `panel_query_graph` takes none of them: it reads live LiteGraph objects. That is the
+ * whole of the reported asymmetry — reads sub-second on the same tab while the run never
+ * answered at all, twice, including an explicit retry.
+ *
+ * Two things were measured on the shipped module rather than reasoned about:
+ *   - a busy queue processor draining at 4,990 ms/item made dispatchScopedRun take
+ *     20,003 ms — four argument shapes × a fresh 5,000 ms wait each — and the prompt
+ *     POSTED at 20,003 ms, i.e. AFTER the caller had been told the tab may be frozen. A
+ *     retry of that "failed" run renders the branch twice.
+ *   - an `app.queuePrompt` that never settles never returned at all, while a read on the
+ *     same objects answered in 0.06 ms.
+ *
+ * 15,000 ms, mirroring the 5,000 ms of slack ADD_NODE_COMMAND_BUDGET_MS and
+ * SET_WIDGET_COMMAND_BUDGET_MS leave against their own 30,000 ms window — for composing
+ * the reply and the websocket hop. Mirrored rather than derived for the same reason: the
+ * relay constant lives in the OTHER repo and a derived copy here could not be kept true.
+ */
+const RUN_COMMAND_BUDGET_MS = 15000;
+
+/**
+ * #1565 — what ONE `app.graphToPrompt()` may take before the panel stops waiting on it.
+ *
+ * The pre-flight and the scoped dispatch each serialize the workflow once, and a 69-node
+ * graph with extension serializers is the reported case, so this is generous rather than
+ * tight: the guarantee that matters is the COMMAND budget above, which caps the sum
+ * whatever this says. Its own job is only to stop ONE serializer that never settles from
+ * being the thing that spends the whole window.
+ */
+const RUN_SERIALIZE_TIMEOUT_MS = 8000;
+
+/**
  * #1413 — what a widget write still has to do AFTER the stale-combo refresh, held back so
  * the join cannot spend it.
  *
@@ -15870,6 +16071,10 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_run({ batch_count, to_node_id }) {
+    // #1565 — taken on the FIRST line, before anything can spend the window. Every bound
+    // below draws from this one deadline, so they compose instead of each starting a fresh
+    // clock; see RUN_COMMAND_BUDGET_MS.
+    const budget = makeCommandBudget(RUN_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, rootGraph } = getGraphCtx();
     // /run invokes this executor directly rather than through bridge dispatch.
     // Queueing a stale root would render the wrong workflow even though no graph
@@ -15966,7 +16171,30 @@ const GRAPH_TOOL_EXECUTORS = {
       // 200, against a snapshot that could drift from what the run actually sent.
       // None of that applies here: no network, no cap, and the bytes inspected are
       // the bytes that would have been POSTed.
-      const built = await app.graphToPrompt();
+      // #1565 — BOUNDED by the command budget. This serialization is the run path's first
+      // await, and it had none: an extension's serializeValue that never settles held the
+      // whole command open and the caller's only possible outcome was the bare "the tab may
+      // be backgrounded or frozen" timeout. A bound that fires throws a plain Error, which
+      // the catch below already treats as "pre-flight unavailable" and skips — the
+      // documented fail-soft contract, unchanged. The dispatch's own bounded serialization
+      // then produces the truthful, worded refusal.
+      // `Promise.resolve(...)` because an extension may replace graphToPrompt with a
+      // SYNCHRONOUS function returning the prompt object. `await` accepted that; a bare
+      // `.then` on it throws, and the catch below would silently skip a pre-flight that
+      // used to run — a bound that removes a guard is the failure it exists to prevent.
+      const preflightBuild = await withTimeout(
+        Promise.resolve(app.graphToPrompt()).then(
+          (value) => ({ value }),
+          (error) => ({ error }),
+        ),
+        budget.bounded(RUN_SERIALIZE_TIMEOUT_MS),
+        () => null,
+      );
+      if (preflightBuild == null) throw new Error("graph_run pre-flight: graphToPrompt did not answer in time");
+      // `"error" in` rather than a truthiness test: a falsy thrown value must still reach
+      // the pre-flight catch as a throw, exactly as the bare await delivered it.
+      if ("error" in preflightBuild) throw preflightBuild.error;
+      const built = preflightBuild.value;
       // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
       // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a
       // result that does not exist has no unrunnable entries in it — and the check below
@@ -16085,6 +16313,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // around EACH attempt so even a hypothetical nested wrap unwinds cleanly.
     let promptRejection = null;
     let runScopeResult = null;
+    // #1565 — the UNSCOPED run's capture wrap, kept so its live counts (what left the
+    // panel, what is still in flight) can be read after the call, and a flag for the
+    // one exit that needs them: a queue call abandoned at the command budget.
+    let runInterceptor = null;
+    let fullRunAbandoned = false;
     const queuedPromptIds = [];
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
@@ -16166,7 +16399,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
       if (origFetchApi) {
-        api.fetchApi = createRunFetchInterceptor({
+        runInterceptor = createRunFetchInterceptor({
           origFetchApi,
           onRejection: captureRejection,
           onPromptId: capturePromptId,
@@ -16175,9 +16408,45 @@ const GRAPH_TOOL_EXECUTORS = {
           // afterwards with a second app.graphToPrompt() would describe a different
           // compilation than the one ComfyUI accepted, and that call is not read-only.
         });
+        api.fetchApi = runInterceptor;
       }
       try {
-        await app.queuePrompt(0, batch, undefined);
+        // #1565 — BOUNDED, on the SAME command budget the scoped path draws from, so
+        // there is ONE rule for the run path rather than two.
+        //
+        // This was left unbounded in the first cut of #1565 on the argument that
+        // abandoning it risks claiming `queued` with no receipt. MEASURED, both halves
+        // of that argument are true and only one of them survives:
+        //
+        //   - the harm is real and IDENTICAL to the scoped one. `graph_run({})` against
+        //     a frontend whose queue processor never answers never replied; the caller
+        //     timed out at 20,007 ms, retried on the advice of a message blaming a
+        //     "backgrounded or frozen" tab, and the retry queued at 20,022 ms while the
+        //     FIRST run's post landed at 21,011 ms — TWO renders of the full graph from
+        //     one user intent. The more common path, the same duplicate.
+        //   - and the receipt objection is real: `buildQueueAcceptResult` with no ids
+        //     answers a bare `{queued: true, batch_count: N}` — a definite positive with
+        //     nothing behind it.
+        //
+        // What resolves it is that the honest vocabulary ALREADY EXISTS. `queued_unknown`
+        // (with `indeterminate_count` and retry guidance) was built for exactly this
+        // epistemic state on the scoped path; the reply below routes into it rather than
+        // into a `queued` this run cannot back. Nothing is claimed that was not observed:
+        // the interceptor COUNTS what left the panel.
+        //
+        // The whole remainder of the budget, not a slice: unlike the scoped path there is
+        // one queue call here, so nothing is owed to a later attempt.
+        const queued = await withTimeout(
+          Promise.resolve(app.queuePrompt(0, batch, undefined)).then(
+            (value) => ({ value }),
+            (error) => ({ error }),
+          ),
+          budget.bounded(),
+          () => null,
+        );
+        if (queued == null) fullRunAbandoned = true;
+        // `"error" in` rather than a truthiness test — a falsy thrown value still throws.
+        else if ("error" in queued) throw queued.error;
       } finally {
         if (origFetchApi) api.fetchApi = prevFetchApi;
       }
@@ -16194,6 +16463,11 @@ const GRAPH_TOOL_EXECUTORS = {
         execIds: partialTargets,
         batch,
         toNodeId: to_node_id,
+        // #1565 — THE WHOLE FIX IS THIS ONE ARGUMENT reaching the dispatch. Without it
+        // dispatchScopedRun keeps its per-attempt clocks (4 × 5,000 ms = the entire
+        // 20,000 ms relay window) and its unbounded `await app.queuePrompt`, so the
+        // command cannot answer OR refuse inside the window its reply is relayed in.
+        budget,
         onRejection: captureRejection,
         onPromptId: capturePromptId,
         onAcceptedNodeErrors: captureAcceptedNodeErrors,
@@ -16293,6 +16567,86 @@ const GRAPH_TOOL_EXECUTORS = {
         };
       }
       return { queued: false, error: runScopeResult.error };
+    }
+    // #1565 — THE FULL RUN WAS ABANDONED AT THE COMMAND BUDGET. Everything below this
+    // point builds a reply out of what the interceptor captured, and every one of those
+    // shapes asserts something this run cannot back: `buildQueueAcceptResult` with no
+    // ids answers a bare `{queued: true, batch_count: N}` — a definite positive with
+    // nothing behind it — and `queued: false` would be a definite negative about a
+    // request that may already be executing. Neither is honest, so neither is used.
+    //
+    // The vocabulary here is the SCOPED path's, unchanged: a partial batch reports the
+    // prompts that really did queue, an unobserved dispatch that LEFT the panel omits
+    // `queued` entirely and says why, and only a run where nothing left gets the
+    // definite `queued: false`. One rule for the run path, not two.
+    //
+    // The counts are the interceptor's own observations, never an inference: `posted`
+    // is what this run handed to the network, `inFlight` is what had not answered when
+    // the budget expired.
+    if (fullRunAbandoned) {
+      const posted = Number(runInterceptor?.state?.posted) || 0;
+      const inFlight = Number(runInterceptor?.state?.inFlight) || 0;
+      const budgetSeconds = Math.round(RUN_COMMAND_BUDGET_MS / 1000);
+      const why =
+        `the frontend's queue call did not answer within this run's ${budgetSeconds}s command ` +
+        `budget — the panel stopped waiting ON PURPOSE, inside the window its reply is relayed ` +
+        `in, rather than let the call run the window out and leave you with a timeout that ` +
+        `blames a tab which is answering reads normally (#1565). The ComfyUI queue is the ` +
+        `authority on what actually ran.`;
+      if (queuedPromptIds.length) {
+        // Some prompts WERE accepted before the budget expired — they are queued and
+        // rendering, and are already registered for reconnect reconciliation above.
+        // Reporting this as a failure would send the caller to re-run work that is
+        // running; between the two misreadings that is the destructive one.
+        return {
+          queued: true,
+          complete: false,
+          partially_queued: true,
+          queued_count: queuedPromptIds.length,
+          queued_prompt_ids: queuedPromptIds.slice(),
+          incomplete_reason: why,
+          retry_guidance:
+            `${queuedPromptIds.length} of ${batch} prompt(s) ARE queued (prompt_ids above) and ` +
+            `are rendering. The rest were never confirmed. Check the ComfyUI queue before ` +
+            `re-running anything: re-running the whole batch would queue the already-running ` +
+            `prompt(s) again.`,
+        };
+      }
+      // NOTHING CONFIRMED. `queued` is OMITTED rather than set false, and that holds even
+      // when NOTHING has left the panel yet — which is the one thing this branch got wrong
+      // when it was first written, caught by measuring it rather than reading it.
+      //
+      // `posted === 0` is an observation about the instant the budget expired. "Nothing was
+      // queued, safe to re-issue" is a claim about the FUTURE, and `app.queuePrompt` is
+      // still running: on the measured 21 s-drain frontend the panel answered at 1.5 s with
+      // posted === 0, and the post left at 21 s anyway. A caller told it was safe to
+      // re-issue re-issues, and the late post still lands — the duplicate render, moved
+      // rather than removed. A bounded observation cannot license an unbounded negative.
+      //
+      // `queued: false` on this path is therefore only ever reachable when app.queuePrompt
+      // actually SETTLED, which is not this branch.
+      //
+      // WHY THE PENDING ITEM IS NOT CANCELLED, unlike the scoped path: cancellation there
+      // is licensed by an ownership tag plus this run's unique queue mark. An unscoped full
+      // run's pending item carries `number: 0` and no scope — byte-identical to the item a
+      // user's own Queue press leaves. Removing it could cancel THEIR render, so it is left
+      // alone and disclosed instead.
+      return {
+        queued_unknown: true,
+        indeterminate_count: posted,
+        error: `The full-graph run could not be confirmed: ${why}`,
+        retry_guidance:
+          (posted > 0
+            ? `No prompt was CONFIRMED queued, but ${posted} /prompt request(s) DID leave the ` +
+              `panel${inFlight > 0 ? ` (${inFlight} still awaiting a response)` : ""} — ComfyUI ` +
+              `may have accepted them. `
+            : `Nothing had left the panel when the budget expired, but the frontend's queue ` +
+              `call is STILL RUNNING and can post this run whenever its processor resumes — ` +
+              `so this is not a report that nothing will be queued. `) +
+          `Check the queue (or get_history) before retrying rather than assuming nothing ran; ` +
+          `a blind retry renders the whole graph twice. This result deliberately omits ` +
+          `"queued" because neither true nor false is honest here.`,
+      };
     }
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
     // per-node errors the frontend stashed. null ⇒ genuinely accepted.
@@ -23526,7 +23880,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // becomes a claim about what the caller received — only `applied` is that.
           markOpenReceiptReplySent(openReceipts, msg.rid);
         }
-        deferChangeTrackerSnapshot(changeTrackerToSnapshot);
+        // panel#1563 r2 — ownership, re-read on every attempt: the retry chain can still
+        // be armed when another workflow opens, and a capture writes the LIVE canvas into
+        // this tracker's state. See `trackerStillOwnsCanvas`.
+        deferChangeTrackerSnapshot(changeTrackerToSnapshot, undefined, undefined, trackerStillOwnsCanvas);
         if (superseded) return;
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card

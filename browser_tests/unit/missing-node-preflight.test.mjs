@@ -121,8 +121,10 @@ test("#1460 a long list is bounded but says how many were withheld", () => {
 test("#1460 WIRING: the preflight reads the SERIALIZED prompt, not the canvas", () => {
   const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
   assert.match(src, /import \{[\s\S]*?unrunnableNodeIdsInScope,[\s\S]*?\} from "\.\/lib\/missing-node-preflight\.js";/);
-  const at = src.indexOf("const built = await app.graphToPrompt();");
+  // #1565 — bounded by graph_run's command budget now; the block is the same one.
+  const at = src.indexOf("const preflightBuild = await withTimeout(");
   assert.ok(at > 0, "the preflight must serialize the prompt itself");
+  assert.match(src.slice(at, at + 400), /app\.graphToPrompt\(\)/, "and it is graphToPrompt it bounds");
   // Bounded by the pre-flight's OWN catch rather than a byte count. A fixed 600 excluded
   // `unrunnableNodeIds(built)` as soon as #1582 added a guard above it — reporting missing
   // wiring while the wiring was fine. The window exists to keep this assertion scoped to
@@ -212,7 +214,7 @@ test("#1871 WIRING: the run-to-node target is RESOLVED before the pre-flight rea
 
 test("#1460 WIRING: it runs BEFORE the prompt is queued", () => {
   const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
-  const check = src.indexOf("const built = await app.graphToPrompt();");
+  const check = src.indexOf("const preflightBuild = await withTimeout(");
   const queue = src.indexOf("app.queuePrompt", check);
   assert.ok(check > 0 && queue > check, "the check must precede queuePrompt");
 });

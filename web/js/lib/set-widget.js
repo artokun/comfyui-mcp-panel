@@ -464,10 +464,23 @@ export async function runSetWidget(
     if (scoped && scoped.defs) freshDefs = scoped.defs;
     else if (scoped && typeof scoped.reason === "string" && scoped.reason) scopedIneligibility = scoped.reason;
   }
-  // The refusal has to be able to say a THIRD route was tried and what it did. Kept OUT of
-  // the transport list `objectInfoOracleFailureNote` renders — that array is what the two
-  // whole-map routes reported, and splicing a non-route entry into it makes a two-transport
-  // failure claim three routes tried, which is #982's own defect.
+  // The refusal has to be able to say what the THIRD route did. Kept OUT of the transport
+  // list `objectInfoOracleFailureNote` renders — that array is what the two whole-map routes
+  // reported, and splicing a non-route entry into it makes a two-transport failure claim
+  // three routes tried, which is #982's own defect.
+  //
+  // SAYS WHAT THIS SITE KNOWS, WHICH IS NOT WHETHER A REQUEST WAS ISSUED (#1573). All this
+  // line has is a non-empty `reason`, meaning the type-scoped route produced no usable map;
+  // the reason itself says why, and only SOME of the reasons involve a request. An earlier
+  // wording led with "A type-scoped /object_info read was tried too", which asserted an
+  // attempt on every one of them — REPRODUCED BY EXECUTION against the merged head: with the
+  // panel's own unlicensed reason ("no whole-schema route was both CONTACTED and SILENT…")
+  // the refusal claimed a read "was tried" while `perClassCalls()` was EMPTY, not one request
+  // issued. That is the #982 shape — the clause after the dash self-corrects, but a reader
+  // stops at the lead-in and goes looking for a request that never left. So the lead-in
+  // reports the OUTCOME (it did not stand in) and lets the reason report the cause.
+  //
+  // The condition below is byte-for-byte what it was; nothing about WHEN this fires changed.
   const describeObjectInfoFailureWithScope = () => {
     let base = "";
     try {
@@ -476,7 +489,7 @@ export async function runSetWidget(
       base = ""; // a diagnostic must never replace the refusal it is describing
     }
     if (!scopedIneligibility) return base;
-    return `${base} A type-scoped /object_info read was tried too — ${scopedIneligibility}.`;
+    return `${base} A type-scoped /object_info read did not stand in for the whole-schema routes either — ${scopedIneligibility}.`;
   };
   // The node whose TYPE to fresh-authorize. For a promoted write, follow the promotion
   // chain through any NESTED SubgraphNodes to the ULTIMATE CONCRETE backend node and
@@ -1242,11 +1255,22 @@ export async function runSetWidget(
       // asked at the moment it is used, on the near side of every await that could expire it.
       let provenance = provenanceOf(freshDefs ?? undefined);
       let authDefs = freshDefs ?? undefined;
-      // What the STALE evidence claimed, captured before it is replaced — the difference
-      // between "the server publishes a list, as it always did" and "the stale schema said
-      // empty and the live one disagrees" is the whole point of re-asking, and it cannot be
+      // What the PRIOR evidence claimed, captured before it is replaced — the difference
+      // between "the server publishes a list, as it always did" and "the schema in hand said
+      // empty and the re-read disagrees" is the whole point of re-asking, and it cannot be
       // recovered after `authDefs` is overwritten.
-      const staleDeclaredEmpty = serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput);
+      //
+      // "PRIOR", NOT "STALE" (#1573). This used to be called `staleDeclaredEmpty`, and the
+      // refusal it feeds told the caller the schema "was not fetched live". That premise
+      // predates #1560: the gate above is `provenance !== "live"`, and "scoped" is not
+      // "live" — but a type-scoped map WAS fetched live, per class, moments earlier. It is
+      // about fewer types, never about older ones. REPRODUCED BY EXECUTION on the merged
+      // head: a scoped map declaring this input's list empty, a whole-map re-ask that
+      // publishes a real list, and the refusal below asserting the scoped read "was not
+      // fetched live" while `/object_info/<Type>` sat in the issued-request list. All this
+      // line establishes is WHICH schema said empty — the one held before the re-ask — so
+      // that is all the name and the message may claim.
+      const priorDeclaredEmpty = serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput);
       let reAsked = false;
       if (provenance !== "live" && typeof refetchObjectInfoLive === "function") {
         try {
@@ -1438,16 +1462,24 @@ export async function runSetWidget(
             `again) and retry.`,
         );
       }
-      // The stale evidence said EMPTY and the live re-ask disagrees: the server does publish a
-      // list for this input after all. That is exactly the hole the re-ask exists to find, and
-      // it is worth its own message — the generic refusal below would report only that the
-      // widget's own callback failed, sending the caller to look at their value while the
-      // actionable fact is that a real list exists and they can pick from it.
-      if (reAsked && staleDeclaredEmpty) {
+      // The evidence held BEFORE the re-ask said EMPTY and the re-ask disagrees: the server
+      // does publish a list for this input after all. That is exactly the hole the re-ask
+      // exists to find, and it is worth its own message — the generic refusal below would
+      // report only that the widget's own callback failed, sending the caller to look at
+      // their value while the actionable fact is that a real list exists and they can pick
+      // from it.
+      //
+      // WHAT THE LEAD-IN MAY CLAIM (#1573). It used to say that schema "was not fetched
+      // live". Since #1560 that is reachable and FALSE: a type-scoped map is fetched live,
+      // per class, and is exactly the kind of schema that lands here. What this branch
+      // actually establishes is that the schema which said empty has been REPLACED and the
+      // replacement no longer says it — nothing about how the first one was obtained, which
+      // is why the sentence no longer mentions it.
+      if (reAsked && priorDeclaredEmpty) {
         throw new Error(
           `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
             `${latest.message} The schema that appeared to declare this input's option list ` +
-            `empty was not fetched live, and the live re-read NO LONGER declares it empty — ` +
+            `empty has since been REPLACED, and the live re-read NO LONGER declares it empty — ` +
             // What was actually observed is a NEGATIVE: `serverDeclaresEmptyComboOptions`
             // returned false. That is true when the server publishes a real list, and equally
             // true when the re-read does not describe this input (or this type) at all. Saying

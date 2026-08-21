@@ -86,10 +86,15 @@ function largeInstall({ defined = [], perClass } = {}) {
  * The panel's own wiring for the scoped route, reproduced verbatim in shape: the SILENCE
  * LICENCE first, then the bounded type-scoped read, then the "scoped" provenance stamp.
  */
-function panelStyleScopedRoute(fetchApi, outcomes, onScoped) {
+function panelStyleScopedRoute(
+  fetchApi,
+  outcomes,
+  onScoped,
+  unlicensedReason = "a whole-schema route ANSWERED rather than going silent",
+) {
   return async (types) => {
     if (!noBackendAnswerEstablished(outcomes)) {
-      return { defs: null, covered: [], reason: "a whole-schema route ANSWERED rather than going silent" };
+      return { defs: null, covered: [], reason: unlicensedReason };
     }
     const scoped = await fetchTypeScopedObjectInfo(types, { fetchApi, deadlineMs: SCOPED_OBJECT_INFO_DEADLINE_MS });
     if (scoped.defs && typeof onScoped === "function") onScoped(scoped);
@@ -241,7 +246,7 @@ test("#1560 B: an EVER-SEEN type now absent per class is still diagnosed as a RE
   assert.equal(node.widgets[0].value, 20, "no mutation");
 });
 
-test("#1560 B: the per-class route ALSO going silent refuses exactly as today, and SAYS a third route was tried", async () => {
+test("#1560 B: the per-class route ALSO going silent refuses exactly as today, and SAYS what the third route did", async () => {
   const reg = loadedRegistry(["SmartResolution"]);
   const node = regNode(1976, "SmartResolution", [{ name: "value", type: "INT", value: 512 }]);
   const backend = largeInstall({ perClass: () => new Promise(() => {}) }); // never settles
@@ -260,8 +265,67 @@ test("#1560 B: the per-class route ALSO going silent refuses exactly as today, a
     (err) =>
       err instanceof Error &&
       /no usable \/object_info schema was obtained/.test(err.message) &&
-      /A type-scoped \/object_info read was tried too — .*did not all answer within/.test(err.message),
+      // #1573 — the lead-in reports the OUTCOME; the reason reports the cause. On THIS path
+      // requests really were issued, and the reason says so by naming the deadline they
+      // missed. The assertion below pins that the requests happened, so the wording and the
+      // world are checked against each other rather than the wording alone.
+      /A type-scoped \/object_info read did not stand in for the whole-schema routes either — .*did not all answer within/.test(
+        err.message,
+      ),
   );
+  assert.deepEqual(
+    backend.perClassCalls(),
+    ["/object_info/SmartResolution"],
+    "the request the reason blames a deadline for really was issued",
+  );
+  assert.equal(node.widgets[0].value, 512, "no mutation");
+});
+
+test("#1573: an UNLICENSED scoped route issues NOTHING, and the refusal does not claim a read was tried", async () => {
+  // #1561's own fourth gate pass: `describeObjectInfoFailureWithScope` appended "A
+  // type-scoped /object_info read was tried too" for EVERY non-empty reason, including the
+  // ones where the route was never licensed and no request left the panel. The clause after
+  // the dash self-corrected, but the lead-in asserted an attempt that did not happen — the
+  // #982 shape, in the one sentence a stuck caller reads.
+  //
+  // Asserts the OUTPUT, not the absence of a phrase: the exact sentence the caller gets,
+  // paired with the request list that proves what actually happened.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const UNLICENSED_REASON =
+    "no whole-schema route was both CONTACTED and SILENT, and a type-scoped read " +
+    "may only stand in for one that was — it must never overrule what a route did " +
+    "establish, and it is not a substitute for a route nobody ran";
+  assert.ok(
+    src.includes("no whole-schema route was both CONTACTED and SILENT"),
+    "the reason under test is the panel's own, not one invented here",
+  );
+
+  const reg = loadedRegistry(["SmartResolution"]);
+  const node = regNode(1976, "SmartResolution", [{ name: "value", type: "INT", value: 512 }]);
+  const backend = largeInstall({ defined: ["SmartResolution"] });
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "value", 768, {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => null,
+        describeObjectInfoFailure: () => " Tried 2 routes: a; b.",
+        // The panel's unlicensed early return, verbatim: no request is issued at all.
+        fetchScopedObjectInfo: panelStyleScopedRoute(backend.fetchApi, ANSWERED_OUTCOMES, undefined, UNLICENSED_REASON),
+        wasTypeEverDefined: () => false,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.ok(
+        err.message.includes(
+          `A type-scoped /object_info read did not stand in for the whole-schema routes either — ${UNLICENSED_REASON}.`,
+        ),
+        `the refusal must state the outcome and the panel's own reason, verbatim. Got: ${err.message}`,
+      );
+      return true;
+    },
+  );
+  assert.deepEqual(backend.perClassCalls(), [], "not one per-class request was issued — so none may be claimed");
   assert.equal(node.widgets[0].value, 512, "no mutation");
 });
 
@@ -534,6 +598,45 @@ test("#1560: the scoped map is a well-behaved object — branding, freezing and 
   assert.doesNotThrow(() => Object.freeze(defs), "object-info-cache.js freezes its payload; this must survive the same");
   assert.deepEqual(Object.keys(defs), ["KSampler"]);
   assert.equal(defs[Symbol.iterator], undefined, "an unrelated symbol is not a class type and passes through");
+});
+
+test("#1573: ENUMERATION of the scoped map does not throw — a SERIALIZER does, and the header now says so", async () => {
+  // #1561's header claimed that "anything that ranges over the map (`Object.keys(defs).length`,
+  // a serializer) sees a small, honest object rather than a throw". The first half is true;
+  // the serializer half never was. `JSON.stringify` looks up `toJSON` and `String` looks up
+  // `toString` — neither is a class type in `covered`, so the scope trap refuses both.
+  //
+  // This pins the MEASUREMENT the header now records, in both directions, so the header
+  // cannot drift back into a claim nobody re-checked. It is not a change of behaviour: the
+  // traps are untouched and this test passes against the merged head too.
+  const backend = largeInstall({ defined: ["KSampler", "SubgraphA"] });
+  const { defs } = await fetchTypeScopedObjectInfo(["KSampler", "SubgraphA"], { fetchApi: backend.fetchApi });
+
+  assert.deepEqual(Object.keys(defs), ["KSampler", "SubgraphA"]);
+  assert.equal(Object.keys(defs).length, 2, "the example the header names by name");
+  assert.deepEqual(Object.getOwnPropertyNames(defs), ["KSampler", "SubgraphA"]);
+  assert.equal(Object.entries(defs).length, 2);
+  assert.deepEqual(Object.keys({ ...defs }), ["KSampler", "SubgraphA"], "spread copies, it does not refuse");
+  const forIn = [];
+  for (const k in defs) forIn.push(k);
+  assert.deepEqual(forIn, ["KSampler", "SubgraphA"]);
+  assert.equal(Reflect.ownKeys(defs).length, 3, "the two types plus the brand symbol");
+
+  // The other direction, stated rather than glossed. Both are FAIL-CLOSED — a throw refuses
+  // a write, it can never forge one — and no production reader serializes this map.
+  assert.throws(
+    () => JSON.stringify(defs),
+    (err) => err instanceof Error && /Cannot verify node type "toJSON"/.test(err.message),
+    "JSON.stringify looks up toJSON, which is not a covered class type",
+  );
+  assert.throws(
+    () => String(defs),
+    (err) => err instanceof Error && /Cannot verify node type "toString"/.test(err.message),
+    "and a string coercion looks up toString",
+  );
+  // Deliberately coupled to the header rather than to a phrase in it: whoever decides that
+  // `toJSON`/`toString` belong IN SCOPE will fail these two assertions, and the paragraph
+  // that says the question is still open is right above the trap they will be editing.
 });
 
 test("#1560: a hostile class name is FLATTENED before it reaches a refusal a caller reads", async () => {
@@ -818,4 +921,70 @@ test("#1560: a LIVE re-ask that SUCCEEDS is used — the brand follows the paylo
   // read, so the disclosure is the UNREADABLE one. What matters here is that the write landed
   // at all — the live re-ask licensed it, and the scoped refusal did not pre-empt that.
   assert.equal(res.option_list_unreadable, true, "the caller is still told nothing validated the value");
+});
+
+test("#1573: a LIVE type-scoped map that declared the list empty is never reported as 'not fetched live'", async () => {
+  // The third inaccuracy #1561's own gate left behind. The re-ask branch is gated on
+  // `provenance !== "live"`, and "scoped" is not "live" — so a type-scoped map reaches this
+  // refusal, which told the caller the schema "was not fetched live". It WAS: per class,
+  // moments earlier, on the very route this whole change exists to add. A scoped map is
+  // about FEWER types, never about older ones.
+  //
+  // Drives the real ladder to the real refusal and asserts the OUTPUT — plus the request
+  // list, which is what makes "fetched live" a measurement here rather than a reading.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: OPTIONS_THROW }, value: "" };
+  const node = regNode(9, "StarOllamaPromptHelper", [widget]);
+  // The SCOPED map declares this input's option list EMPTY…
+  const backend = largeInstall({
+    defined: ["StarOllamaPromptHelper"],
+    perClass: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ StarOllamaPromptHelper: { input: { required: { model: [[], {}] } } } }),
+    }),
+  });
+  let stamp = () => "none";
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "model", "qwen3-vl:8b", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => null,
+        fetchScopedObjectInfo: panelStyleScopedRoute(backend.fetchApi, SILENT_OUTCOMES, () => {
+          stamp = () => "scoped";
+        }),
+        // …and the whole-map re-ask lands, publishing a REAL list. That disagreement is the
+        // hole the re-ask exists to find, and it routes to this message.
+        refetchObjectInfoLive: async () => {
+          stamp = () => "live";
+          return { StarOllamaPromptHelper: { input: { required: { model: [["qwen3-vl:8b", "llama3"], {}] } } } };
+        },
+        schemaProvenance: () => stamp(),
+        refreshCombos: (fresh, targetNode, defTypeKey, nameMap) =>
+          refreshComboOptionsFromDefs(targetNode, fresh, defTypeKey, nameMap),
+        wasTypeEverDefined: () => true,
+        ...HOOKS,
+      }),
+    (err) => {
+      assert.ok(
+        err.message.includes(
+          "The schema that appeared to declare this input's option list empty has since been " +
+            "REPLACED, and the live re-read NO LONGER declares it empty",
+        ),
+        `the refusal must claim only the replacement it observed. Got: ${err.message}`,
+      );
+      assert.ok(
+        err.message.includes("either it now publishes a real option list for this input, or it no longer describes"),
+        "and it must still name both possibilities rather than choosing one",
+      );
+      return true;
+    },
+  );
+  assert.deepEqual(
+    backend.perClassCalls(),
+    ["/object_info/StarOllamaPromptHelper"],
+    "the schema that said EMPTY was fetched live, per class — which is why the old wording was false",
+  );
+  assert.equal(widget.value, "", "fails closed either way; only the wording changed");
 });
