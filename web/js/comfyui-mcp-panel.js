@@ -11172,6 +11172,44 @@ function widenSocketProofBudget(deadlineMs) {
 const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
 
 /**
+ * #1565 — `graph_run` was the one mutating command on this list with NO command budget at
+ * all, and the only one relayed in 20,000 ms rather than 30,000.
+ *
+ * What the RUN path awaits that the READ path does not: `app.graphToPrompt()` (serializing
+ * the whole workflow, including every extension's own serializeValue), `app.queuePrompt()`
+ * (the frontend's queue processor — shadowed by an extension's own property on the
+ * reporter's machine), and the scoped-dispatch observation wait, ONCE PER ARGUMENT SHAPE.
+ * `panel_query_graph` takes none of them: it reads live LiteGraph objects. That is the
+ * whole of the reported asymmetry — reads sub-second on the same tab while the run never
+ * answered at all, twice, including an explicit retry.
+ *
+ * Two things were measured on the shipped module rather than reasoned about:
+ *   - a busy queue processor draining at 4,990 ms/item made dispatchScopedRun take
+ *     20,003 ms — four argument shapes × a fresh 5,000 ms wait each — and the prompt
+ *     POSTED at 20,003 ms, i.e. AFTER the caller had been told the tab may be frozen. A
+ *     retry of that "failed" run renders the branch twice.
+ *   - an `app.queuePrompt` that never settles never returned at all, while a read on the
+ *     same objects answered in 0.06 ms.
+ *
+ * 15,000 ms, mirroring the 5,000 ms of slack ADD_NODE_COMMAND_BUDGET_MS and
+ * SET_WIDGET_COMMAND_BUDGET_MS leave against their own 30,000 ms window — for composing
+ * the reply and the websocket hop. Mirrored rather than derived for the same reason: the
+ * relay constant lives in the OTHER repo and a derived copy here could not be kept true.
+ */
+const RUN_COMMAND_BUDGET_MS = 15000;
+
+/**
+ * #1565 — what ONE `app.graphToPrompt()` may take before the panel stops waiting on it.
+ *
+ * The pre-flight and the scoped dispatch each serialize the workflow once, and a 69-node
+ * graph with extension serializers is the reported case, so this is generous rather than
+ * tight: the guarantee that matters is the COMMAND budget above, which caps the sum
+ * whatever this says. Its own job is only to stop ONE serializer that never settles from
+ * being the thing that spends the whole window.
+ */
+const RUN_SERIALIZE_TIMEOUT_MS = 8000;
+
+/**
  * #1413 — what a widget write still has to do AFTER the stale-combo refresh, held back so
  * the join cannot spend it.
  *
@@ -15872,6 +15910,10 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_run({ batch_count, to_node_id }) {
+    // #1565 — taken on the FIRST line, before anything can spend the window. Every bound
+    // below draws from this one deadline, so they compose instead of each starting a fresh
+    // clock; see RUN_COMMAND_BUDGET_MS.
+    const budget = makeCommandBudget(RUN_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, rootGraph } = getGraphCtx();
     // /run invokes this executor directly rather than through bridge dispatch.
     // Queueing a stale root would render the wrong workflow even though no graph
@@ -15968,7 +16010,30 @@ const GRAPH_TOOL_EXECUTORS = {
       // 200, against a snapshot that could drift from what the run actually sent.
       // None of that applies here: no network, no cap, and the bytes inspected are
       // the bytes that would have been POSTed.
-      const built = await app.graphToPrompt();
+      // #1565 — BOUNDED by the command budget. This serialization is the run path's first
+      // await, and it had none: an extension's serializeValue that never settles held the
+      // whole command open and the caller's only possible outcome was the bare "the tab may
+      // be backgrounded or frozen" timeout. A bound that fires throws a plain Error, which
+      // the catch below already treats as "pre-flight unavailable" and skips — the
+      // documented fail-soft contract, unchanged. The dispatch's own bounded serialization
+      // then produces the truthful, worded refusal.
+      // `Promise.resolve(...)` because an extension may replace graphToPrompt with a
+      // SYNCHRONOUS function returning the prompt object. `await` accepted that; a bare
+      // `.then` on it throws, and the catch below would silently skip a pre-flight that
+      // used to run — a bound that removes a guard is the failure it exists to prevent.
+      const preflightBuild = await withTimeout(
+        Promise.resolve(app.graphToPrompt()).then(
+          (value) => ({ value }),
+          (error) => ({ error }),
+        ),
+        budget.bounded(RUN_SERIALIZE_TIMEOUT_MS),
+        () => null,
+      );
+      if (preflightBuild == null) throw new Error("graph_run pre-flight: graphToPrompt did not answer in time");
+      // `"error" in` rather than a truthiness test: a falsy thrown value must still reach
+      // the pre-flight catch as a throw, exactly as the bare await delivered it.
+      if ("error" in preflightBuild) throw preflightBuild.error;
+      const built = preflightBuild.value;
       // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
       // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a
       // result that does not exist has no unrunnable entries in it — and the check below
@@ -16087,6 +16152,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // around EACH attempt so even a hypothetical nested wrap unwinds cleanly.
     let promptRejection = null;
     let runScopeResult = null;
+    // #1565 — the UNSCOPED run's capture wrap, kept so its live counts (what left the
+    // panel, what is still in flight) can be read after the call, and a flag for the
+    // one exit that needs them: a queue call abandoned at the command budget.
+    let runInterceptor = null;
+    let fullRunAbandoned = false;
     const queuedPromptIds = [];
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
@@ -16171,7 +16241,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
       if (origFetchApi) {
-        api.fetchApi = createRunFetchInterceptor({
+        runInterceptor = createRunFetchInterceptor({
           origFetchApi,
           onRejection: captureRejection,
           onPromptId: capturePromptId,
@@ -16180,9 +16250,45 @@ const GRAPH_TOOL_EXECUTORS = {
           // afterwards with a second app.graphToPrompt() would describe a different
           // compilation than the one ComfyUI accepted, and that call is not read-only.
         });
+        api.fetchApi = runInterceptor;
       }
       try {
-        await app.queuePrompt(0, batch, undefined);
+        // #1565 — BOUNDED, on the SAME command budget the scoped path draws from, so
+        // there is ONE rule for the run path rather than two.
+        //
+        // This was left unbounded in the first cut of #1565 on the argument that
+        // abandoning it risks claiming `queued` with no receipt. MEASURED, both halves
+        // of that argument are true and only one of them survives:
+        //
+        //   - the harm is real and IDENTICAL to the scoped one. `graph_run({})` against
+        //     a frontend whose queue processor never answers never replied; the caller
+        //     timed out at 20,007 ms, retried on the advice of a message blaming a
+        //     "backgrounded or frozen" tab, and the retry queued at 20,022 ms while the
+        //     FIRST run's post landed at 21,011 ms — TWO renders of the full graph from
+        //     one user intent. The more common path, the same duplicate.
+        //   - and the receipt objection is real: `buildQueueAcceptResult` with no ids
+        //     answers a bare `{queued: true, batch_count: N}` — a definite positive with
+        //     nothing behind it.
+        //
+        // What resolves it is that the honest vocabulary ALREADY EXISTS. `queued_unknown`
+        // (with `indeterminate_count` and retry guidance) was built for exactly this
+        // epistemic state on the scoped path; the reply below routes into it rather than
+        // into a `queued` this run cannot back. Nothing is claimed that was not observed:
+        // the interceptor COUNTS what left the panel.
+        //
+        // The whole remainder of the budget, not a slice: unlike the scoped path there is
+        // one queue call here, so nothing is owed to a later attempt.
+        const queued = await withTimeout(
+          Promise.resolve(app.queuePrompt(0, batch, undefined)).then(
+            (value) => ({ value }),
+            (error) => ({ error }),
+          ),
+          budget.bounded(),
+          () => null,
+        );
+        if (queued == null) fullRunAbandoned = true;
+        // `"error" in` rather than a truthiness test — a falsy thrown value still throws.
+        else if ("error" in queued) throw queued.error;
       } finally {
         if (origFetchApi) api.fetchApi = prevFetchApi;
       }
@@ -16225,6 +16331,11 @@ const GRAPH_TOOL_EXECUTORS = {
           execIds: partialTargets,
           batch,
           toNodeId: to_node_id,
+          // #1565 - THE WHOLE FIX IS THIS ONE ARGUMENT reaching the dispatch. Without it
+          // dispatchScopedRun keeps its per-attempt clocks (4 x 5,000 ms = the entire
+          // 20,000 ms relay window) and its unbounded `await app.queuePrompt`, so the
+          // command cannot answer OR refuse inside the window its reply is relayed in.
+          budget,
           onRejection: captureRejection,
           onPromptId: capturePromptId,
           onAcceptedNodeErrors: captureAcceptedNodeErrors,
@@ -16232,6 +16343,12 @@ const GRAPH_TOOL_EXECUTORS = {
       } finally {
         // ALWAYS, on every exit including a throw. A hook left wrapped would keep
         // advancing controls on the user's later single scoped previews.
+        //
+        // #1565 sharpens the deferred-dispatch caveat rather than creating it: the
+        // budget makes dispatchScopedRun RETURN sooner, so a frontend that defers its
+        // post past the budget runs those items with the original hooks and repeats.
+        // That degrades to the pre-#1998 behaviour, and `observe()` reports
+        // `advanced: false` for it - the note then warns instead of claiming a fix.
         try {
           controlDrive?.restore();
         } catch {}
@@ -16336,6 +16453,86 @@ const GRAPH_TOOL_EXECUTORS = {
         };
       }
       return { queued: false, error: runScopeResult.error };
+    }
+    // #1565 — THE FULL RUN WAS ABANDONED AT THE COMMAND BUDGET. Everything below this
+    // point builds a reply out of what the interceptor captured, and every one of those
+    // shapes asserts something this run cannot back: `buildQueueAcceptResult` with no
+    // ids answers a bare `{queued: true, batch_count: N}` — a definite positive with
+    // nothing behind it — and `queued: false` would be a definite negative about a
+    // request that may already be executing. Neither is honest, so neither is used.
+    //
+    // The vocabulary here is the SCOPED path's, unchanged: a partial batch reports the
+    // prompts that really did queue, an unobserved dispatch that LEFT the panel omits
+    // `queued` entirely and says why, and only a run where nothing left gets the
+    // definite `queued: false`. One rule for the run path, not two.
+    //
+    // The counts are the interceptor's own observations, never an inference: `posted`
+    // is what this run handed to the network, `inFlight` is what had not answered when
+    // the budget expired.
+    if (fullRunAbandoned) {
+      const posted = Number(runInterceptor?.state?.posted) || 0;
+      const inFlight = Number(runInterceptor?.state?.inFlight) || 0;
+      const budgetSeconds = Math.round(RUN_COMMAND_BUDGET_MS / 1000);
+      const why =
+        `the frontend's queue call did not answer within this run's ${budgetSeconds}s command ` +
+        `budget — the panel stopped waiting ON PURPOSE, inside the window its reply is relayed ` +
+        `in, rather than let the call run the window out and leave you with a timeout that ` +
+        `blames a tab which is answering reads normally (#1565). The ComfyUI queue is the ` +
+        `authority on what actually ran.`;
+      if (queuedPromptIds.length) {
+        // Some prompts WERE accepted before the budget expired — they are queued and
+        // rendering, and are already registered for reconnect reconciliation above.
+        // Reporting this as a failure would send the caller to re-run work that is
+        // running; between the two misreadings that is the destructive one.
+        return {
+          queued: true,
+          complete: false,
+          partially_queued: true,
+          queued_count: queuedPromptIds.length,
+          queued_prompt_ids: queuedPromptIds.slice(),
+          incomplete_reason: why,
+          retry_guidance:
+            `${queuedPromptIds.length} of ${batch} prompt(s) ARE queued (prompt_ids above) and ` +
+            `are rendering. The rest were never confirmed. Check the ComfyUI queue before ` +
+            `re-running anything: re-running the whole batch would queue the already-running ` +
+            `prompt(s) again.`,
+        };
+      }
+      // NOTHING CONFIRMED. `queued` is OMITTED rather than set false, and that holds even
+      // when NOTHING has left the panel yet — which is the one thing this branch got wrong
+      // when it was first written, caught by measuring it rather than reading it.
+      //
+      // `posted === 0` is an observation about the instant the budget expired. "Nothing was
+      // queued, safe to re-issue" is a claim about the FUTURE, and `app.queuePrompt` is
+      // still running: on the measured 21 s-drain frontend the panel answered at 1.5 s with
+      // posted === 0, and the post left at 21 s anyway. A caller told it was safe to
+      // re-issue re-issues, and the late post still lands — the duplicate render, moved
+      // rather than removed. A bounded observation cannot license an unbounded negative.
+      //
+      // `queued: false` on this path is therefore only ever reachable when app.queuePrompt
+      // actually SETTLED, which is not this branch.
+      //
+      // WHY THE PENDING ITEM IS NOT CANCELLED, unlike the scoped path: cancellation there
+      // is licensed by an ownership tag plus this run's unique queue mark. An unscoped full
+      // run's pending item carries `number: 0` and no scope — byte-identical to the item a
+      // user's own Queue press leaves. Removing it could cancel THEIR render, so it is left
+      // alone and disclosed instead.
+      return {
+        queued_unknown: true,
+        indeterminate_count: posted,
+        error: `The full-graph run could not be confirmed: ${why}`,
+        retry_guidance:
+          (posted > 0
+            ? `No prompt was CONFIRMED queued, but ${posted} /prompt request(s) DID leave the ` +
+              `panel${inFlight > 0 ? ` (${inFlight} still awaiting a response)` : ""} — ComfyUI ` +
+              `may have accepted them. `
+            : `Nothing had left the panel when the budget expired, but the frontend's queue ` +
+              `call is STILL RUNNING and can post this run whenever its processor resumes — ` +
+              `so this is not a report that nothing will be queued. `) +
+          `Check the queue (or get_history) before retrying rather than assuming nothing ran; ` +
+          `a blind retry renders the whole graph twice. This result deliberately omits ` +
+          `"queued" because neither true nor false is honest here.`,
+      };
     }
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
     // per-node errors the frontend stashed. null ⇒ genuinely accepted.

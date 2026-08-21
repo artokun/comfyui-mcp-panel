@@ -155,7 +155,15 @@ test("#988 (codex) source guard: the scan runs BEFORE dispatch, not after", () =
   // let the caller cancel — a remedy it could not offer.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const scan = src.indexOf("repeatingControls = findRepeatingControlWidgets(");
-  const dispatch = src.indexOf("await app.queuePrompt(0, batch, undefined)");
+  // #1565 — the unscoped dispatch is BOUNDED by the command budget now, so the literal is
+  // no longer a bare `await`. The anchor follows the call; the ordering property it guards
+  // is unchanged, and the assertion below pins that it is still the bounded call.
+  const dispatch = src.indexOf("app.queuePrompt(0, batch, undefined)");
+  assert.match(
+    src.slice(Math.max(0, dispatch - 200), dispatch + 200),
+    /Promise\.resolve\(app\.queuePrompt\(0, batch, undefined\)\)/,
+    "the unscoped dispatch must stay bounded — an unbounded one hangs past the relay window",
+  );
   const scopedDispatch = src.indexOf("runScopeResult = await dispatchScopedRun({");
   assert.ok(scan > 0, "the pre-dispatch scan must exist");
   assert.ok(scan < dispatch && scan < scopedDispatch, "and precede BOTH dispatch paths");
@@ -783,8 +791,13 @@ test("#1998 CALL SITE: the drive is installed on the SCOPED path, and restored i
   );
   // The restore has to be unconditional. A throw out of dispatchScopedRun that left the
   // hooks wrapped would keep advancing controls on the user's later single previews.
-  const tail = src.slice(scopedDispatch, scopedDispatch + 2500);
-  assert.match(tail, /\}\s*finally\s*\{[\s\S]{0,400}?controlDrive\?\.restore\(\)/, "restore must run in a finally around the dispatch");
+  //
+  // The window runs from the INSTALL, not from the dispatch, and is generous: #1565 added
+  // a `budget` argument plus its rationale between the two, and a window measured from the
+  // dispatch stopped reaching the `finally` — a green-to-red that was purely about how much
+  // comment sat in between.
+  const tail = src.slice(install, install + 6000);
+  assert.match(tail, /\}\s*finally\s*\{[\s\S]{0,900}?controlDrive\?\.restore\(\)/, "restore must run in a finally around the dispatch");
   // Gated on batch > 1: a scoped run of one keeps upstream #8774 behaviour. Assert on
   // the ARGUMENT EXPRESSION, not on a window of surrounding source - a window matched
   // the word "batch > 1" in the comment above the call and let a dropped gate survive.
