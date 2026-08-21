@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.32] - 2026-08-21
+
+### Fixed
+- Prompt Builder prompt_text writes keep builder_state in the same step (#1551)
+- serverDeclaresEmptyComboOptions reads the V2 combo shape (#1552)
+- a FLOAT widget's quantization is explained by the grid the frontend actually ran (#1550)
+
+
 ## [0.15.31] - 2026-08-20
 
 ### Fixed
