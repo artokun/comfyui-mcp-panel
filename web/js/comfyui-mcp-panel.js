@@ -10495,7 +10495,7 @@ function summarizeNode(node) {
   // renames invisible, so the agent told the user their renames had not stuck when the
   // canvas showed them. `label` rides ALONGSIDE `name` and is emitted ONLY when one is
   // actually carried AND differs — never inferred, never replacing the addressable name.
-  const inputs = (node.inputs ?? []).map((inp) => {
+  const inputs = (node.inputs ?? []).map((inp, i) => {
     let from = null;
     if (inp.link != null) {
       const link = readStoredLink(node.graph, inp.link);
