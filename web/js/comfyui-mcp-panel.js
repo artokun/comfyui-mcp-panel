@@ -15765,7 +15765,9 @@ const GRAPH_TOOL_EXECUTORS = {
         () => null,
       );
       if (preflightBuild == null) throw new Error("graph_run pre-flight: graphToPrompt did not answer in time");
-      if (preflightBuild.error) throw preflightBuild.error;
+      // `"error" in` rather than a truthiness test: a falsy thrown value must still reach
+      // the pre-flight catch as a throw, exactly as the bare await delivered it.
+      if ("error" in preflightBuild) throw preflightBuild.error;
       const built = preflightBuild.value;
       // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
       // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a

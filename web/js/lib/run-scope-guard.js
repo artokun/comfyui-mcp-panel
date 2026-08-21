@@ -1691,15 +1691,14 @@ export async function dispatchScopedRun({
     return budget.bounded(Math.min(verifyTimeoutMs, share));
   };
   /**
-   * The command budget's total, but ONLY once it is actually spent — that is the one
-   * case where quoting the per-attempt slice would describe a wait nobody made. A
-   * give-up that happens while the command still has room is honestly a per-attempt
-   * give-up and keeps saying so.
+   * The command budget's total, but ONLY when the budget is what SHORTENED this attempt's
+   * wait — i.e. the slice came out below the caller's own `verifyTimeoutMs`. Then the
+   * per-attempt figure describes a wait the budget imposed, and rounding it to seconds can
+   * read as "0s", which is a wait nobody made. A give-up that happens while the command
+   * still had room for a full slice is honestly a per-attempt give-up and keeps saying so.
    */
-  const budgetSpent = () =>
-    hasBudget && typeof budget.exhausted === "function" && budget.exhausted()
-      ? Number(budget.totalMs) || 0
-      : 0;
+  const budgetShortened = (attemptMs) =>
+    hasBudget && attemptMs < verifyTimeoutMs ? Number(budget.totalMs) || 0 : 0;
   // Sentinel for a bounded step that did not settle. A Symbol so it can never collide
   // with a value the bounded promise itself resolves.
   const TIMED_OUT = Symbol("cmcp-run-step-timeout");
@@ -1783,7 +1782,9 @@ export async function dispatchScopedRun({
             `frontend could not serialize the workflow, so nothing was queued`,
         );
       }
-      if (built.error) throw built.error;
+      // `"error" in` rather than a truthiness test: a falsy thrown value (`throw undefined`)
+      // used to propagate out of here, and a bound must not swallow it.
+      if ("error" in built) throw built.error;
       contentCanon = canonicalizePrompt(built.value?.output, volatileInputs);
       contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
     }
@@ -1872,7 +1873,8 @@ export async function dispatchScopedRun({
       // queuePrompt emits later still meets the fence and is refused rather than
       // dispatched scopeless. A throw is re-thrown unchanged (boundedStep keeps it).
       const queued = await boundedStep(app.queuePrompt(mark, batch, scopeArg), boundedBy(attemptMs));
-      if (queued !== TIMED_OUT && queued.error) throw queued.error;
+      // `"error" in` rather than a truthiness test — a falsy thrown value still throws.
+      if (queued !== TIMED_OUT && "error" in queued) throw queued.error;
       if (!guard.verdictReached()) {
         // queuePrompt returned without our dispatch surfacing — the
         // frontend's processor was busy and will serialize/post the item
@@ -1918,7 +1920,7 @@ export async function dispatchScopedRun({
             indeterminate: guard.state.indeterminate,
             inFlight,
             volatileInputs: volatileList,
-            error: scopeUnverifiedError({ toNodeId, timeoutMs: attemptMs, cancelled: true, verified, batch, inFlight, budgetMs: budgetSpent() }),
+            error: scopeUnverifiedError({ toNodeId, timeoutMs: attemptMs, cancelled: true, verified, batch, inFlight, budgetMs: budgetShortened(attemptMs) }),
           };
         }
         return {
@@ -1928,7 +1930,7 @@ export async function dispatchScopedRun({
           indeterminate: guard.state.indeterminate,
           inFlight,
           volatileInputs: volatileList,
-          error: scopeUnverifiedError({ toNodeId, timeoutMs: attemptMs, cancelled: false, verified, batch, inFlight, budgetMs: budgetSpent() }),
+          error: scopeUnverifiedError({ toNodeId, timeoutMs: attemptMs, cancelled: false, verified, batch, inFlight, budgetMs: budgetShortened(attemptMs) }),
         };
       }
       // r6: a dispatch FAILURE with the batch not fully accounted — the

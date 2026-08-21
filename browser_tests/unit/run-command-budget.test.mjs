@@ -290,6 +290,33 @@ test("#1565: a queuePrompt that THROWS still throws — a bound must not relabel
   }
 });
 
+test("#1565: even a FALSY thrown value still throws — the bound settles into {value}/{error}, and `error` may be undefined", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget });
+    // `throw undefined` is legal. A truthiness test on the settled object would read it as
+    // "no error" and continue into the give-up path, reporting a timeout for a frontend
+    // that actually refused. The bare `await` it replaced propagated it.
+    app.queuePrompt = async () => {
+      throw undefined;
+    };
+    let threw = false;
+    try {
+      await dispatchScopedRun({
+        app, apiTarget, execIds: ["327"], batch: 1, toNodeId: 327,
+        verifyTimeoutMs: 500, budget: makeCommandBudget(600),
+      });
+    } catch (err) {
+      threw = true;
+      assert.equal(err, undefined, "and it is the SAME value the frontend threw");
+    }
+    assert.ok(threw, "a falsy throw must still reject, not be relabelled as a timeout");
+  } finally {
+    stop();
+  }
+});
+
 test("#1565: NO budget ⇒ no new bound — an existing caller keeps today's behaviour", async () => {
   const stop = keepAlive();
   try {
