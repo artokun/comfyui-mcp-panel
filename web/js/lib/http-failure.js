@@ -20,7 +20,9 @@
 //
 // It is the panel-side sibling of the orchestrator's `src/comfyui/json-guard.ts`
 // (#1178), deliberately using the SAME classification vocabulary — `proxy-error`,
-// `login`, `not-found`, `html-page`, `not-json` — so the two runtimes name the
+// `login`, `not-found`, `html-page`, `not-json` (plus `json-error`, which json-guard
+// never needs because it only runs after a parse has already failed) — so the two
+// runtimes name the
 // same situation with the same word. It is NOT a second copy for its own sake:
 // json-guard is Node/TypeScript inside the orchestrator process and cannot be
 // reached from a browser executor, which is the only place that ever holds this
@@ -33,13 +35,14 @@
 //      is a diagnostic; the document is a context bomb and a credential risk
 //      (json-guard's `bodyPrefixOf` records a gateway that REFLECTS the request
 //      putting our own ComfyUI credential in the page it answers with).
-//   2. NEVER swallow the failure. An HTML body where JSON was promised is
-//      information: something other than ComfyUI's API answered.
+//   2. NEVER swallow the failure. A body that is not the JSON this route
+//      promises is information, and the status is always reported.
 //   3. NEVER assert a cause the response does not carry. A status alone does not
 //      prove who produced it, and the backend-socket state is stated only when
 //      the caller passes the fact it observed — `undefined` says nothing.
-//   4. NEVER claim the operation did or did not run. A response that did not come
-//      from ComfyUI reports on the proxy, not on the request.
+//   4. NEVER claim the operation did or did not run, and never name a responder the
+//      BODY does not name. ComfyUI runs on aiohttp, whose own error pages are HTML,
+//      so neither a gateway-class status nor bare markup identifies a proxy.
 
 /** Cap on the body prefix carried into a message. Diagnostic, not a document. */
 export const HTTP_FAILURE_BODY_PREFIX_CAP = 200;
@@ -94,33 +97,63 @@ const REDACTED = "«redacted»";
  *     length of the identifiers an error page legitimately prints (a Cloudflare
  *     Ray ID is 16–20) so a useful diagnostic is not redacted into uselessness.
  *
- * The label list also covers the CDN convention of printing the VIEWER'S OWN
- * ADDRESS on an error page ("Your IP: …", which the reported Cloudflare 502
- * carries). That is not a credential, but this text is what a user pastes into a
- * public bug report, so the labelled form goes. A BARE address is deliberately
- * left alone: an nginx 502 body's `upstream: http://127.0.0.1:8188` is often the
- * single most useful token on the page, and redacting by shape here would remove
- * the diagnosis along with the PII.
- *
- * A DELIMITER (`:` or `=`) is required for the labelled rule. Allowing a bare
+ * A DELIMITER (`:` or `=`) is required for every labelled rule. Allowing a bare
  * space would turn "Authorization required" into "Authorization: «redacted»" and
  * "auth failed" into "auth: «redacted»" — destroying the diagnosis in the name of
  * protecting it. The one unlabelled-but-unambiguous form, `Bearer <token>`, gets
- * its own rule; the scheme is consumed as part of the labelled value so a
- * `Authorization: Bearer sk-…` redacts the TOKEN and not just the word "Bearer".
+ * its own rule.
  *
  * `/` is excluded from the opaque-run alphabet so an ordinary URL on the page
  * survives: with it in, `//www.cloudflare.com/5xx-error-landing` is a 38-char run
  * and collapses to a redaction marker. Real credentials still have a 32+ run of
  * the remaining alphabet between any slashes.
+ *
+ * ## Why a SECRET label takes the whole line
+ *
+ * Shape cannot bound a secret's value, and three gate rounds proved it one
+ * character at a time: `Bearer aaaa…\nbbbb…` wrapped past the first whitespace,
+ * `…mnopqrst\nuvwx` ended in four letters that no shape rule separates from a
+ * word, and `password:p@ssword` contains a character no credential alphabet
+ * includes. Each fix bought one case. So a SECRET label stops trying: everything
+ * after the delimiter to the end of the line goes, plus any wrapped continuation
+ * on the lines below (a wrap has no space before the break, so a following run of
+ * credential characters is the same token).
+ *
+ * That is json-guard's rule too — fail closed, VISIBLY. The reader still sees
+ * `password: «redacted»` and knows exactly what was withheld and where, which is
+ * why an over-broad redaction here costs far less than one leaked credential in
+ * text a user pastes into a public issue. The price is real and accepted:
+ * `Authorization: this endpoint requires a key` loses its sentence.
+ *
+ * ADDRESS labels are NOT secrets and keep the bounded form. They exist for the
+ * CDN convention of printing the viewer's own address ("Your IP: …", which the
+ * reported Cloudflare 502 carries) — PII in text destined for a bug report, but
+ * not a credential, so taking the rest of the line would eat the page's own
+ * footer for nothing. A BARE address is left alone entirely: an nginx body's
+ * `upstream: http://127.0.0.1:8188` is often the most useful token on the page.
  */
+const SECRET_LABELS =
+  "authorization|auth|bearer|token|access[-_]?token|api[-_]?key|apikey|secret|password|passwd|pwd" +
+  "|session[-_]?id|sessionid|set-cookie|cookie";
+const ADDRESS_LABELS = "your ip|client ip|remote ip|remote addr|x-forwarded-for";
+/** A value that arrived LINE-WRAPPED continues on the next line with no space
+ *  before the break, so the continuation line is the same token. Applied after
+ *  a to-end-of-line secret redaction. */
+const WRAP_CONT = `(?:[\\r\\n]+[ \\t]*[^\\r\\n]+)*`;
+
 export function scrubSecretShapedText(text) {
+  // To END OF LINE — see the docblock. `[^\r\n]*` deliberately admits every
+  // character, including the `@`, `!` and spaces a real password contains.
+  const secret = new RegExp(`\\b(${SECRET_LABELS})\\b\\s*[:=][^\\r\\n]*${WRAP_CONT}`, "gi");
+  const scheme = new RegExp(`\\b(bearer|basic)\\s+\\S{8,}[^\\r\\n]*${WRAP_CONT}`, "gi");
+  const address = new RegExp(
+    `\\b(${ADDRESS_LABELS})\\b\\s*[:=]\\s*(?:"[^"]*"|'[^']*'|\\S+)`,
+    "gi",
+  );
   return String(text ?? "")
-    .replace(
-      /\b(authorization|auth|bearer|token|access[-_]?token|api[-_]?key|apikey|secret|password|passwd|pwd|session[-_]?id|sessionid|cookie|your ip|client ip|remote ip|remote addr|x-forwarded-for)\b\s*[:=]\s*(?:bearer\s+|basic\s+|token\s+)?("[^"]*"|'[^']*'|\S+)/gi,
-      (_m, label) => `${label}: ${REDACTED}`,
-    )
-    .replace(/\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}/gi, (_m, scheme) => `${scheme} ${REDACTED}`)
+    .replace(secret, (_m, label) => `${label}: ${REDACTED}`)
+    .replace(scheme, (_m, s) => `${s} ${REDACTED}`)
+    .replace(address, (_m, label) => `${label}: ${REDACTED}`)
     .replace(/[A-Za-z0-9_\-+=.]{32,}/g, REDACTED);
 }
 
@@ -149,15 +182,40 @@ export function httpBodyPrefix(body) {
     .replace(/\s+/g, " ")
     .trim();
   if (text === "") return "(no readable text)";
-  return text.length > HTTP_FAILURE_BODY_PREFIX_CAP
-    ? `${text.slice(0, HTTP_FAILURE_BODY_PREFIX_CAP)}…`
+  // Sliced on CODE POINTS, not code units: a code-unit slice can end on a lone
+  // high surrogate and put a replacement character in the message.
+  const points = [...text];
+  return points.length > HTTP_FAILURE_BODY_PREFIX_CAP
+    ? `${points.slice(0, HTTP_FAILURE_BODY_PREFIX_CAP).join("")}…`
     : text;
 }
 
+/**
+ * Markers that IDENTIFY a responder — vendor and server names only.
+ *
+ * The generic status phrases ("bad gateway", "gateway timeout", "error code
+ * 502") were removed after codex gate round 2: ComfyUI runs on aiohttp, whose
+ * OWN default error page is `<html><head><title>502 Bad Gateway</title>…`, so
+ * matching the phrase attributed ComfyUI's own error document to a proxy that
+ * was not there. A product name in the body is evidence; the English for the
+ * status code is not.
+ */
 const PROXY_MARKERS =
-  /\b(cloudflare|cf-ray|nginx|openresty|traefik|envoy|haproxy|varnish|squid|apache\b|gunicorn|amazon cloudfront|akamai|error code 5\d\d|bad gateway|gateway time-?out)\b/i;
+  /\b(cloudflare|cf-ray|nginx|openresty|traefik|envoy|haproxy|varnish|squid|gunicorn|amazon cloudfront|akamai)\b/i;
+/**
+ * A sign-in page SHAPE. Enough to CLASSIFY the response as an auth gate; not
+ * enough to say who runs it. An operator who put their own auth layer in front
+ * of ComfyUI serves a page matching every one of these — which is exactly what
+ * the `login` cause text already hedges (codex gate).
+ */
 const LOGIN_MARKERS =
-  /(<input[^>]+type=["']?password|name=["']?password|\bsign[ -]?in\b|\blog[ -]?in\b|\bsso\b|cloudflare access|okta|auth0|keycloak)/i;
+  /(<input[^>]+type=["']?password|name=["']?password|\bsign[ -]?in\b|\blog[ -]?in\b|\bsso\b)/i;
+/**
+ * A NAMED identity product — the subset that actually identifies a responder,
+ * and therefore the only login evidence allowed to carry an attribution.
+ */
+const LOGIN_VENDOR_MARKERS =
+  /\b(cloudflare access|okta|auth0|keycloak|onelogin|ping ?identity|entra|azure ad|adfs|oauth2[-_ ]?proxy|authelia|authentik)\b/i;
 
 function looksLikeHtml(body) {
   const head = String(body ?? "").trimStart().slice(0, 512).toLowerCase();
@@ -226,20 +284,24 @@ export function classifyHttpFailure({ status, body = "" } = {}) {
 }
 
 /**
- * True only when the BODY carries evidence that something other than ComfyUI's
- * HTTP API produced this response.
+ * True only when the BODY NAMES a responder that is not ComfyUI.
  *
- * Keyed on the evidence, never on the kind (codex gate, round 1). A status-only
- * `proxy-error` — a bare 502 with an empty body — is equally consistent with
- * ComfyUI crashing mid-response, and a status-only `login` is equally consistent
- * with ComfyUI behind the operator's own auth layer. Those cases still say what
- * they saw; they must not say where it came from.
+ * Keyed on the marker, never on the kind and never on "the body is HTML" (codex
+ * gate, rounds 1 and 2). A bare 502 with an empty body is equally consistent
+ * with ComfyUI crashing mid-response; a bare 403 is equally consistent with
+ * ComfyUI behind the operator's own auth layer; and a generic
+ * `<html><body>error</body></html>` on a 502 is equally consistent with
+ * aiohttp's own default error page, which ComfyUI serves. All of those still say
+ * what was seen — they must not say where it came from.
+ *
+ * A PRODUCT NAME is such a naming — `cloudflare`, `nginx`, `okta`, `authelia`.
+ * A generic sign-in FORM is not (codex gate): an operator's own auth layer in
+ * front of ComfyUI serves a page matching every generic marker, so a password
+ * field cannot carry the sentence either. Only a named product can.
  */
-function answeredBySomethingElse(kind, body) {
-  if (kind === "json-error" || kind === "not-json") return false;
-  const html = looksLikeHtml(body);
-  if (!html) return false; // status-only verdicts assert nothing about the responder
-  return kind === "proxy-error" || kind === "login" || kind === "not-found" || kind === "html-page";
+function answeredBySomethingElse(body) {
+  if (!looksLikeHtml(body)) return false;
+  return PROXY_MARKERS.test(String(body)) || LOGIN_VENDOR_MARKERS.test(String(body));
 }
 
 function causeOf(kind, status, body, contentType = "") {
@@ -260,7 +322,10 @@ function causeOf(kind, status, body, contentType = "") {
         : `a gateway-class status (${status}) came back without a page identifying who sent it. A reverse proxy typically answers this way when ComfyUI has crashed, is restarting, or is otherwise unreachable — but ComfyUI itself can answer a ${status} too, and nothing in this response distinguishes them`;
     case "login":
       return LOGIN_MARKERS.test(String(body ?? ""))
-        ? "an authentication gate answered with a SIGN-IN PAGE rather than letting the request through — typically an identity proxy such as Cloudflare Access or an SSO portal"
+        ? "an authentication gate answered with a SIGN-IN PAGE rather than letting the request through. " +
+          "An identity proxy such as Cloudflare Access or an SSO portal serves exactly this, and so does an " +
+          "auth layer the operator put in front of ComfyUI themselves; the page does not distinguish them" +
+          (LOGIN_VENDOR_MARKERS.test(String(body ?? "")) ? ", though it does name an identity product" : "")
         : `the request was rejected with ${status} and the body is not JSON; that is most often an identity proxy or sign-in gate in front of ComfyUI, though ComfyUI behind your own auth layer can return it too, and this response does not distinguish them`;
     case "not-found":
       return "whatever is answering this host does not serve that route at all — the usual candidates are a reverse proxy that forwards the ComfyUI UI but not its API routes, and a base URL pointing somewhere other than the ComfyUI API root";
@@ -305,7 +370,7 @@ export function describeHttpFailure({
   const parts = [
     `Failed to ${what}: ${route} answered ${describeHttpStatus(status, statusText)} — ${causeOf(kind, status, body, contentType)}.`,
   ];
-  if (answeredBySomethingElse(kind, body)) {
+  if (answeredBySomethingElse(body)) {
     parts.push(
       `This answer did not come from ComfyUI, so it reports on whatever produced it and NOT on the request: ` +
         `whether the request reached ComfyUI at all is not established here.`,

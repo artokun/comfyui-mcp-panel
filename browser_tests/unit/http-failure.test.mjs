@@ -128,6 +128,105 @@ test("a ComfyUI 401 with a JSON body is NOT blamed on an identity proxy", () => 
   assert.match(msg, /Unauthorized/);
 });
 
+// codex gate round 2, P1: ComfyUI runs on aiohttp, whose OWN default error page
+// is `<html><head><title>502 Bad Gateway</title>…`. Neither a gateway-class
+// status nor bare markup identifies a proxy.
+test("aiohttp's own error page is not attributed to a proxy that is not there", () => {
+  for (const body of [
+    "<html><body>error</body></html>",
+    "<html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1></body></html>",
+  ]) {
+    const msg = describeHttpFailure({ what: "free VRAM", route: "POST /free", status: 502, body });
+    assert.doesNotMatch(
+      msg,
+      /did not come from ComfyUI/i,
+      `generic HTML must not name a responder: ${body.slice(0, 40)}`,
+    );
+    assert.match(msg, /\b502\b/);
+  }
+  // A body that NAMES one still does.
+  const nginx = "<html><head><title>502</title></head><body><center>nginx/1.24.0</center></body></html>";
+  assert.match(describeHttpFailure({ what: "free VRAM", route: "POST /free", status: 502, body: nginx }),
+    /did not come from ComfyUI/i);
+});
+
+// codex gate: a generic sign-in page identifies an auth gate, not a RESPONDER.
+// An operator's own auth layer in front of ComfyUI serves exactly such a page.
+test("a generic sign-in page does not name a responder; a product does", () => {
+  const generic =
+    '<html><head><title>Sign in</title></head><body><form action="/login">' +
+    '<input type="password" name="password"></form></body></html>';
+  const msgGeneric = describeHttpFailure({ what: "free VRAM", route: "POST /free", status: 401, body: generic });
+  assert.equal(classifyHttpFailure({ status: 401, body: generic }), "login", "still classified as an auth gate");
+  assert.doesNotMatch(msgGeneric, /did not come from ComfyUI/i);
+  assert.match(msgGeneric, /does not distinguish them/i);
+
+  const named = generic.replace("Sign in", "Sign in with Okta");
+  const msgNamed = describeHttpFailure({ what: "free VRAM", route: "POST /free", status: 401, body: named });
+  assert.match(msgNamed, /did not come from ComfyUI/i);
+  assert.match(msgNamed, /does name an identity product/i);
+});
+
+test("a line-wrapped credential does not leak its continuation", () => {
+  const wrapped =
+    "Authorization: Bearer aaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbb rejected";
+  const scrubbed = scrubSecretShapedText(wrapped);
+  assert.doesNotMatch(scrubbed, /aaaaaaaaaaaaaaaaaaaa/);
+  assert.doesNotMatch(scrubbed, /bbbbbbbbbbbbbbbbbbbb/, "the wrapped continuation leaked");
+  // …and through the body path, where whitespace collapsing happens too.
+  const viaBody = httpBodyPrefix(`<html><body>invalid request: ${wrapped}</body></html>`);
+  assert.doesNotMatch(viaBody, /bbbbbbbbbbbbbbbbbbbb/);
+  // Ordinary prose after a labelled value keeps its words.
+  // An ADDRESS label is not a secret and stays bounded, so the page's own footer
+  // survives next to it.
+  assert.match(
+    scrubSecretShapedText("Your IP: 203.0.113.42 Performance & security by Cloudflare"),
+    /Performance & security by Cloudflare/,
+  );
+});
+
+test("a short all-letter wrapped fragment is consumed too", () => {
+  // codex gate: shape cannot separate the TAIL of a token from a word — both can
+  // be four letters. The SEPARATOR is the evidence: a newline right after a
+  // credential value is a wrap, a space is a word break.
+  const wrapped = "Authorization: Bearer abcdefghijklmnopqrst\nuvwx";
+  const scrubbed = scrubSecretShapedText(wrapped);
+  assert.doesNotMatch(scrubbed, /abcdefghijklmnopqrst/);
+  assert.doesNotMatch(scrubbed, /uvwx/, "the short wrapped fragment leaked");
+  assert.doesNotMatch(httpBodyPrefix(`<html><body>${wrapped}</body></html>`), /uvwx/);
+});
+
+// codex gate: shape cannot bound a secret's VALUE at all — a password contains
+// characters no credential alphabet lists, and can contain spaces. A SECRET
+// label therefore takes the rest of its line, and the wrapped continuation too.
+test("a secret label fails closed to the end of its line", () => {
+  for (const [input, mustNotContain] of [
+    ["password:p@ssword", "p@ss"],
+    ["password: my secret", "my secret"],
+    ["Set-Cookie: session=abc123; Path=/; HttpOnly", "abc123"],
+    ["api_key: sk!live!8fbc 21aa 77de", "77de"],
+  ]) {
+    const out = scrubSecretShapedText(input);
+    assert.doesNotMatch(out, new RegExp(mustNotContain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), input);
+    assert.match(out, /«redacted»/, input);
+  }
+  // A label WITHOUT a delimiter is prose and is left completely alone — that is
+  // what keeps the prefix worth printing.
+  assert.equal(scrubSecretShapedText("Authorization required"), "Authorization required");
+  assert.equal(scrubSecretShapedText("auth failed for user"), "auth failed for user");
+  assert.equal(scrubSecretShapedText("Bearer token required"), "Bearer token required");
+  // …and so is an nginx upstream line, the most useful token on such a page.
+  const upstream = "connect() failed while connecting to upstream: http://127.0.0.1:8188/free";
+  assert.equal(scrubSecretShapedText(upstream), upstream);
+});
+
+test("the body prefix is cut on code points, never inside a surrogate pair", () => {
+  const emoji = "🧪".repeat(HTTP_FAILURE_BODY_PREFIX_CAP + 40);
+  const prefix = httpBodyPrefix(emoji);
+  assert.doesNotMatch(prefix, /�/, "a replacement character means the cut split a pair");
+  assert.equal([...prefix].length, HTTP_FAILURE_BODY_PREFIX_CAP + 1); // + the ellipsis
+});
+
 test("a status-only verdict asserts nothing about WHO answered", () => {
   // A bare 502 with no page is equally consistent with ComfyUI crashing
   // mid-response; a bare 403 with no page is equally consistent with ComfyUI
@@ -256,6 +355,21 @@ test("credential-shaped text in a reflecting gateway's page is scrubbed", () => 
   assert.doesNotMatch(prefix, /Zm9vYmFyYmF6cXV1eGNvcmdlZ3JhdWx0Z2FybHk=/);
   assert.match(prefix, /«redacted»/);
   assert.doesNotMatch(scrubSecretShapedText("api_key=abc123def456"), /abc123def456/);
+});
+
+test("percent-encoded authorization material is scrubbed as one credential", () => {
+  const reflected = "Authorization: Bearer abc%2Fdef%3Dghi";
+  const scrubbed = scrubSecretShapedText(reflected);
+  assert.doesNotMatch(scrubbed, /abc%2Fdef%3Dghi/);
+  assert.doesNotMatch(scrubbed, /%2Fdef%3Dghi/);
+  assert.match(scrubbed, /Authorization: «redacted»/);
+});
+
+test("wrapped secret material with punctuation is scrubbed through the continuation", () => {
+  const scrubbed = scrubSecretShapedText("password:p@ssword\\nanother@secret");
+  assert.doesNotMatch(scrubbed, /p@ssword/);
+  assert.doesNotMatch(scrubbed, /another@secret/);
+  assert.equal(scrubbed, "password: «redacted»");
 });
 
 test("a standard reason phrase is dropped, a custom one is kept", () => {
