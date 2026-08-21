@@ -485,7 +485,11 @@ test("#1560: the shared handler asks the scoped route only AFTER the whole map p
 
 // ─────────────── the scoped map must not become a hazard of its own (self-review) ─────────
 
-test("#1560: a NON-POSITIVE budget attempts NOTHING — it must never become NO bound", async () => {
+// AN EXPLICIT TIMEOUT, because the failure mode this pins is a HANG. Delete the guard and
+// `withTimeout` treats the 0 as NO bound, so the hanging fetch below never settles and
+// `node --test` waits forever — a mutation that hangs the runner is indistinguishable from
+// one that survived. With a bound it fails, loudly and by name.
+test("#1560: a NON-POSITIVE budget attempts NOTHING — it must never become NO bound", { timeout: 15000 }, async () => {
   // `withTimeout` treats `ms <= 0` as no bound at all, so passing an exhausted budget
   // through would remove the bound at exactly the moment the command has already run out —
   // #1161 arriving through the mechanism meant to prevent it.
