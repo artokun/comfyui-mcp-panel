@@ -171,6 +171,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
   // pending. Coalesces any number of forced calls arriving during one in-flight run.
   let trailing = null;
   const startRun = (preloadedDefs, runOpts, abandonBeforeLocalWork) => {
+    let yieldBeforeLocalWork = !!abandonBeforeLocalWork;
     let announceBeforeLocalWork;
     const beforeLocalWork = new Promise((resolve) => {
       announceBeforeLocalWork = resolve;
@@ -186,7 +187,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
         // next synchronous registration call could block the tab before that reaction runs.
         // The production run awaits this one macrotask when a caller asked for the early
         // verdict, giving the caller's structured reply a chance to compose first.
-        return abandonBeforeLocalWork
+        return yieldBeforeLocalWork
           ? new Promise((resolve) => setTimeout(resolve, 0))
           : undefined;
       },
@@ -200,8 +201,17 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
         if (getInFlight() === p) setInFlight(null);
       }
     })();
+    // A bounded refresh_nodes caller can arrive after this run was created by
+    // an unbounded force-trigger (download/reconnect). Keep the handoff
+    // upgradeable until the run reaches it; once local synchronous work starts,
+    // no later caller can safely interrupt that JavaScript turn.
+    const requestEarlyYield = () => {
+      yieldBeforeLocalWork = true;
+    };
+    p.beforeLocalWork = beforeLocalWork;
+    p.requestEarlyYield = requestEarlyYield;
     setInFlight(p);
-    return { promise: p, beforeLocalWork };
+    return { promise: p, beforeLocalWork, requestEarlyYield };
   };
   return async function refresh(preloadedDefs, opts) {
     const force = !!(opts && opts.force);
@@ -254,7 +264,15 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       // asymmetry is deliberate: the run is #396's guarantee to whoever else is waiting.
       // The queued promise already includes the trailing `startRun`, so this one bound
       // covers join AND run — the shape #1351 brings to the payload path as well.
+      // #1562 — a bounded refresh_nodes call may arrive after an unbounded force caller
+      // already started the current run or queued the shared trailing run. Upgrade both
+      // handles before waiting so either run yields at the explicit pre-local-work handoff.
+      if (abandonBeforeLocalWork) {
+        current.requestEarlyYield?.();
+        trailing?.requestEarlyYield?.();
+      }
       if (!trailing) {
+        let earlyYieldRequested = abandonBeforeLocalWork;
         const queued = (async () => {
           try {
             await current;
@@ -262,11 +280,14 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
             /* the in-flight refresh failed — run our own anyway */
           }
           trailing = null;
-          return startRun(undefined, runOpts, abandonBeforeLocalWork);
+          return startRun(undefined, runOpts, earlyYieldRequested);
         })();
         trailing = {
           promise: queued.then((handle) => handle.promise),
           beforeLocalWork: queued.then((handle) => handle.beforeLocalWork),
+          requestEarlyYield: () => {
+            earlyYieldRequested = true;
+          },
         };
       }
       return waitForRun(trailing, joinMs, withTimeout, abandonBeforeLocalWork);

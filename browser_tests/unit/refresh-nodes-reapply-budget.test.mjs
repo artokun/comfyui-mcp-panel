@@ -117,6 +117,12 @@ function busyBlock(ms) {
   while (performance.now() < end) {}
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
 test("#1562: refresh_nodes answers before synchronous reapply and keeps registration single-flight", async () => {
   // Scaled 10:1 from the report: fetch finishes inside the caller's wait, but fetch plus
   // synchronous registration exceeds the relay. A retry is issued before the first run's
@@ -182,4 +188,45 @@ test("#1562: refresh_nodes answers before synchronous reapply and keeps registra
   }
   assert.equal(registrationCalls, 2, "the retry joined/queued behind the first run, then refreshed once");
   assert.equal(maxConcurrentRegistrations, 1, "registration passes must remain single-flight");
+});
+
+test("#1562: a later bounded caller upgrades an already-queued trailing run", async () => {
+  const hold = deferred();
+  let runNumber = 0;
+  let localWorkStarted = 0;
+  let inFlight = null;
+  const coalescer = makeRefreshCoalescer({
+    getInFlight: () => inFlight,
+    setInFlight: (p) => { inFlight = p; },
+    runRegister: async (_defs, _opts, control) => {
+      const number = ++runNumber;
+      if (number === 1) await hold.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await control.beforeLocalWork?.();
+      if (number === 2) localWorkStarted += 1;
+      busyBlock(100);
+    },
+    withTimeout,
+  });
+
+  const first = coalescer(undefined, { force: true });
+  // The unbounded download/reconnect-style force caller queues the shared
+  // trailing run without asking it to yield.
+  const unboundedTrailing = coalescer(undefined, { force: true });
+  // refresh_nodes arrives while that trailing run is still queued and upgrades
+  // it before its fetch/local-work handoff begins.
+  const bounded = coalescer(undefined, {
+    force: true,
+    joinMs: 1000,
+    abandonBeforeLocalWork: true,
+  });
+
+  hold.resolve();
+  const outcome = await bounded;
+  assert.equal(outcome, REFRESH_JOIN_ABANDONED);
+  assert.equal(localWorkStarted, 0, "the bounded caller must return before trailing local work");
+
+  await first;
+  await unboundedTrailing;
+  assert.equal(localWorkStarted, 1, "the upgraded trailing run still completes its registration");
 });
