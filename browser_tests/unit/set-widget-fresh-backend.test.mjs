@@ -430,6 +430,30 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
   );
 });
 
+test("#1582 wiring: a reusable snapshot shortens only the ordinary schema probe", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const start = src.search(/async graph_set_widget\(\{[^}]*\}\)/);
+  const end = src.indexOf("\n  async graph_remove_widget(", start);
+  assert.notEqual(start, -1, "graph_set_widget executor must exist");
+  assert.notEqual(end, -1, "graph_set_widget executor boundary must exist");
+  const body = src.slice(start, end);
+  assert.match(
+    body,
+    /readObjectInfo: async \(readThroughCache, \{ reuseSnapshot = true \} = \{\}\)/,
+    "the shared oracle must know whether the caller is an ordinary read or a forced reread",
+  );
+  assert.match(
+    body,
+    /reuseSnapshot &&[\s\S]{0,260}objectInfoSnapshot\.isReusable\([\s\S]{0,180}OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS/,
+    "a current-connection snapshot must cap the ordinary serial probe",
+  );
+  assert.match(
+    body,
+    /objectInfoCache\.readFresh\([\s\S]{0,120}\{ reuseSnapshot: false \}/,
+    "the forced live recovery must bypass that cap",
+  );
+});
+
 test("#458 set_widget: REMOVED type (stale registry positive, absent from fresh object_info) ⇒ FAIL CLOSED, no mutation", async () => {
   // GoneNode's pack was uninstalled + ComfyUI restarted WITHOUT a tab reload: the
   // registry still holds it (with a def) AND the instance is genuinely-resolved, so
@@ -554,6 +578,35 @@ test("#458 set_widget: LIVE VALID type (in fresh object_info + registry) ⇒ sti
   assert.equal(res.set.value, 30);
   assert.equal(node.widgets[0].value, 30);
   assert.equal(objectInfoFetches, 1, "hot path fetches fresh object_info exactly once");
+});
+
+test("#1582 set_widget: snapshot authorization still validates a combo value", async () => {
+  const reg = loadedRegistry(["UNETLoader"]);
+  const widget = {
+    name: "unet_name",
+    type: "combo",
+    options: { values: ["model.safetensors"] },
+    value: "old.safetensors",
+  };
+  const node = regNode("UNETLoader", [widget]);
+  const snapshotDefs = { UNETLoader: {} }; // #1223's detached, membership-only shape
+  const opts = {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => snapshotDefs,
+    schemaProvenance: () => "snapshot",
+    ...HOOKS,
+  };
+
+  const accepted = await runSetWidget(node, "unet_name", "model.safetensors", opts);
+  assert.equal(accepted.set.value, "model.safetensors", "a current combo option still writes");
+
+  await assert.rejects(
+    () => runSetWidget(node, "unet_name", "not-listed.safetensors", opts),
+    /not a valid option/i,
+    "the snapshot must not turn a combo write into an unchecked write",
+  );
+  assert.equal(widget.value, "model.safetensors", "an off-list value is still refused without mutation");
 });
 
 test("#458 set_widget: stale-combo refresh retry STILL works with the fresh oracle wired (#338)", async () => {

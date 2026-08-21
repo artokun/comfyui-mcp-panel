@@ -1030,6 +1030,15 @@ function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
 const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 
 /**
+ * #1582 — when a same-connection whole-schema snapshot is already held, do not spend the
+ * full serial 10s client share plus 5s raw-route share proving that both routes are silent.
+ * Two seconds still leaves roughly four times the measured warm whole-schema read while
+ * keeping the existing fail-closed outcome distinction: an answered bad response refuses,
+ * and only actual silence licenses the last-observed snapshot.
+ */
+const OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS = 2000;
+
+/**
  * #1180 — ONE budget for a whole `registerComfyNodeDefs` run, shared by its phases.
  *
  * PER-PHASE BOUNDS DO NOT COMPOSE, and three review rounds on this issue were spent
@@ -14827,7 +14836,13 @@ const GRAPH_TOOL_EXECUTORS = {
       // path. Sharing the body is what keeps the snapshot fallback, the failure-route
       // bookkeeping and the provenance handling identical between them — a second hand-rolled
       // copy of this for the recovery path is how the two would drift.
-      readObjectInfo: async (readThroughCache) => {
+      readObjectInfo: async (readThroughCache, { reuseSnapshot = true } = {}) => {
+        // #1582 — a whole schema observed on this SAME backend connection makes silence
+        // recoverable, but it must not suppress a route that answers with an unusable schema.
+        // When that snapshot is reusable, shorten the serial oracle budget so the panel spends
+        // at most two seconds discovering silence before the existing snapshot authorization.
+        // A forced reread keeps the normal budget: its purpose is to obtain a live answer for
+        // the blind-write recovery and it must not be shortened by the old snapshot.
         // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
         // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
         // Still the WHOLE payload, so no question this fence asks changes scope —
@@ -14879,7 +14894,16 @@ const GRAPH_TOOL_EXECUTORS = {
             return fetchWholeObjectInfo({
               getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
               fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
-              deadlineMs: budget.bounded(OBJECT_INFO_DEADLINE_MS),
+              deadlineMs: budget.bounded(
+                reuseSnapshot &&
+                  typeof objectInfoSnapshot.isReusable === "function" &&
+                  objectInfoSnapshot.isReusable({
+                    epoch: backendReconnectEpoch,
+                    socketDown: comfyBackendIsDown(),
+                  })
+                  ? OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS
+                  : OBJECT_INFO_DEADLINE_MS,
+              ),
             });
           },
           { stamp: () => backendReconnectEpoch },
@@ -14953,7 +14977,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // invalidating — which used to retire the other's just-issued request and refuse a write
       // that was perfectly valid.
       refetchObjectInfoLive: async () =>
-        setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts)),
+        setWidgetOpts.readObjectInfo((loader, opts) => objectInfoCache.readFresh(loader, opts), { reuseSnapshot: false }),
       // #1560 — the THIRD route, and the only one that is TYPE-SCOPED.
       //
       // On a ~1023-model install neither whole-schema route ever lands inside its share of
@@ -15106,7 +15130,13 @@ const GRAPH_TOOL_EXECUTORS = {
         // always the target's own type — which is how a payload can be present and
         // still be the wrong one.
         const keyType = concreteType ?? target?.type ?? target?.comfyClass;
-        if (defs && keyType && Object.prototype.hasOwnProperty.call(defs, keyType)) {
+        // #1582/#1223 — a snapshot deliberately carries TYPE NAMES ONLY. Treating its
+        // empty placeholder as a usable definition would make this callback silently skip
+        // the authoritative refresh and then validate a newly-downloaded combo against the
+        // stale live list. Reuse is safe for membership, not for option lists.
+        const snapshotOnlySchema =
+          typeof setWidgetSchemaProvenance === "function" && setWidgetSchemaProvenance() === "snapshot";
+        if (!snapshotOnlySchema && defs && keyType && Object.prototype.hasOwnProperty.call(defs, keyType)) {
           // Key the combo options on the ULTIMATE CONCRETE type (resolved through the
           // promotion chain), not the intermediate virtual node's type, and bridge a
           // RENAMED nested promotion via nameMap, so a nested promoted combo is refreshed
