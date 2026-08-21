@@ -3723,6 +3723,29 @@ const _savePathGuardRefusalsLogged = new Set();
  * that loses nothing. An unreadable identity answers false — a guard that cannot read
  * its evidence must never invent a refusal (the same rule the #1667 guard states).
  */
+/**
+ * panel#1563 r2 — does this tracker still own the live canvas? (the deferred capture's
+ * licence to write, re-asked on every retry attempt)
+ *
+ * A capture serializes the GLOBAL canvas into THIS tracker's `activeState`, and the retry
+ * chain can stay armed for up to ~1.4s — long enough for another workflow to open. The
+ * chain's own stop condition is upstream's `isLoadingGraph`, a CLASS STATIC, so an
+ * orphaned record reads "suppressed" for the whole of the next workflow's load and then
+ * fires the instant it completes, when the canvas belongs to someone else.
+ *
+ * POSITIVE OWNERSHIP ONLY — an unreadable store is NOT permission. During a tab switch, a
+ * close, or a teardown, `activeWorkflowRef()` answers null while the canvas on screen is
+ * already someone else's; capturing then writes that canvas into this tracker's state, and
+ * a later save of its workflow persists the wrong graph over its own file (#1667's shape).
+ * Being wrong the other way costs a snapshot that stays behind until the next command —
+ * which `saveWouldPersistStaleSnapshot` refuses LOUDLY rather than losing silently. One
+ * side of that trade is recoverable and the other is not.
+ */
+function trackerStillOwnsCanvas(tracker) {
+  const active = activeWorkflowRef(); // already try/catch-guarded; returns null when unreadable
+  return Boolean(active) && active.changeTracker === tracker;
+}
+
 function saveWouldPersistStaleSnapshot(wf, state) {
   try {
     if (!wf || !state || !Array.isArray(state.nodes)) return false;
@@ -23612,14 +23635,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // becomes a claim about what the caller received — only `applied` is that.
           markOpenReceiptReplySent(openReceipts, msg.rid);
         }
-        // panel#1563 r2 — ownership, re-read on every attempt (see `stillOwnsCanvas`):
-        // the retry chain can still be armed when another workflow opens, and a capture
-        // writes the LIVE canvas into this tracker's state. Unreadable store ⇒ `true`.
-        deferChangeTrackerSnapshot(changeTrackerToSnapshot, undefined, undefined, (tracker) => {
-          const active = activeWorkflowRef();
-          if (!active) return true;
-          return active.changeTracker === tracker;
-        });
+        // panel#1563 r2 — ownership, re-read on every attempt: the retry chain can still
+        // be armed when another workflow opens, and a capture writes the LIVE canvas into
+        // this tracker's state. See `trackerStillOwnsCanvas`.
+        deferChangeTrackerSnapshot(changeTrackerToSnapshot, undefined, undefined, trackerStillOwnsCanvas);
         if (superseded) return;
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card

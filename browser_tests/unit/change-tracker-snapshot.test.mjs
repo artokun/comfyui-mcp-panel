@@ -285,30 +285,39 @@ test("#1563 a NO-CHANGE capture is not retried — an unchanged snapshot is the 
 // whole of the NEXT workflow's load and then fires the moment that load completes.
 // ---------------------------------------------------------------------------
 
-test("#1563 r2 WIRING: the dispatch path SUPPLIES the ownership predicate, and it reads the store live", () => {
+test("#1563 r2 WIRING: the dispatch path supplies trackerStillOwnsCanvas, and it demands POSITIVE ownership", () => {
   // The helper tests above inject a predicate by hand, so they stay green even if
-  // production stops passing one — the argument is a one-line wiring change and this is
-  // the only thing that can see it go missing.
+  // production stops passing one — the argument is a one-line wiring change, and this is
+  // the only thing that can see it go missing. The predicate itself is sliced from the
+  // panel source and DRIVEN, so its answer is pinned rather than its spelling.
   const here = dirname(fileURLToPath(import.meta.url));
   const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
   const at = source.indexOf("deferChangeTrackerSnapshot(changeTrackerToSnapshot");
   assert.ok(at > 0, "the dispatch path defers the tracker snapshot");
-  const call = source.slice(at, at + 400);
   assert.match(
-    call,
-    /deferChangeTrackerSnapshot\(\s*changeTrackerToSnapshot\s*,[^)]*\(tracker\)\s*=>/,
-    "the defer must carry an ownership predicate, or an orphaned retry chain can capture another workflow's canvas",
+    source.slice(at, at + 200),
+    /deferChangeTrackerSnapshot\(\s*changeTrackerToSnapshot\s*,[^)]*trackerStillOwnsCanvas/,
+    "the defer must carry the ownership predicate, or an orphaned retry chain can capture another workflow's canvas",
   );
-  assert.match(
-    call,
-    /activeWorkflowRef\(\)/,
-    "ownership must be re-read from the store when the timer fires, not captured at defer time",
-  );
-  assert.match(
-    call,
-    /active\.changeTracker === tracker/,
-    "ownership is tracker identity against the ACTIVE workflow",
-  );
+
+  const fnAt = source.indexOf("function trackerStillOwnsCanvas(tracker) {");
+  assert.ok(fnAt > 0, "the predicate must be a named function, not an inline closure");
+  const fnEnd = source.indexOf("\n}", fnAt);
+  const slice = source.slice(fnAt, fnEnd + 2);
+  const build = (activeWorkflow) =>
+    new Function("activeWorkflowRef", `${slice}\nreturn trackerStillOwnsCanvas;`)(() => activeWorkflow);
+
+  const tracker = { captureCanvasState() {} };
+  const other = { captureCanvasState() {} };
+  assert.equal(build({ changeTracker: tracker })(tracker), true, "the owning tracker keeps its licence");
+  assert.equal(build({ changeTracker: other })(tracker), false, "another workflow's tracker has none");
+  // THE POINT: an unreadable store is NOT permission. During a tab switch or a close the
+  // store answers null while the canvas on screen is already someone else's, and a
+  // capture then writes that canvas into this tracker's state — which a later save
+  // persists over its own file.
+  assert.equal(build(null)(tracker), false, "a null active workflow must never license a capture");
+  assert.equal(build(undefined)(tracker), false);
+  assert.equal(build({})(tracker), false, "an active workflow with no tracker proves nothing");
 });
 
 test("#1563 r2 the retry chain STOPS once its tracker no longer owns the canvas", () => {
