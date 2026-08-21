@@ -1276,6 +1276,19 @@ export async function runSetWidget(
       // value while the actual cause is a backend whose whole map never lands. Verified by
       // execution, not by reading: with this branch deleted the whole suite stayed green,
       // which is what dead code looks like from inside a passing test run.
+      // NARROWER THAN IT FIRST READ, deliberately. An earlier wording said a scoped map is
+      // "not enough to license an unvalidated write, whether or not it shows this input's
+      // list as empty" — and that over-claims, because #507's branch above DOES accept one.
+      // The two cases are not the same observation and the asymmetry is correct:
+      //
+      //   - #507: the widget's OWN list read as EMPTY and the schema says empty too. Two
+      //     agreeing observations, and the per-class def is the live server answer for this
+      //     class — byte-identical to the whole map's entry for it (measured on 0.33.2). That
+      //     branch already accepts `cache`/`reconnected`/`retired` whole maps, all of them
+      //     older than this one.
+      //   - HERE: the widget's own list could not be READ AT ALL, so the schema is the only
+      //     witness there is. Standing in for the sole witness is a stronger claim than
+      //     agreeing with a second one, and a partial view of the install may not make it.
       if (provenance === "scoped") {
         throw new Error(
           `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
@@ -1283,10 +1296,10 @@ export async function runSetWidget(
             `/object_info declared this input's option list empty — but both whole-schema ` +
             `probes went silent, so the only schema available is a TYPE-SCOPED read (#1560) ` +
             `covering just the node types this write resolves to. That is enough to authorize ` +
-            `the node type and not enough to license an unvalidated write, whether or not it ` +
-            `shows this input's list as empty. This is NOT a stale or unreadable schema and ` +
-            `reconnecting need not help: wait for /object_info to answer as a whole again, ` +
-            `then retry.`,
+            `the node type. It is not enough to stand in for a list the panel could not read ` +
+            `at all, which is the one thing that would license THIS write. This is NOT a ` +
+            `stale or unreadable schema and reconnecting need not help: wait for /object_info ` +
+            `to answer as a whole again, then retry.`,
         );
       }
       if (serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput)) {

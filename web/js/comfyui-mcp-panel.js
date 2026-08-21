@@ -14598,12 +14598,21 @@ const GRAPH_TOOL_EXECUTORS = {
       // the fence's own trust root.
       fetchScopedObjectInfo: async (types) => {
         if (!scopedReadLicensed) {
+          // STATE WHAT WAS OBSERVED, not one cause of it. `noBackendAnswerEstablished` is
+          // false for FOUR different things — a route ANSWERED something unusable, a route
+          // THREW, the outcome list was empty, or every route was NOT_ATTEMPTED — and naming
+          // only the first asserts an event that did not happen in the other three. A refusal
+          // that reports a cause it did not establish is #982's own defect, and the reporter
+          // of #1560 went looking at a backend that was answering fine because of exactly
+          // that. (#1223 makes a similar over-specific claim one sentence earlier in the same
+          // refusal; that one is pre-existing and is not touched here.)
           return {
             defs: null,
             covered: [],
             reason:
-              "a whole-schema route ANSWERED rather than going silent, so a type-scoped read " +
-              "is not licensed to overrule it",
+              "the whole-schema routes did not go SILENT, and a type-scoped read may only " +
+              "stand in for routes that were contacted and returned nothing — never overrule " +
+              "what they did establish",
           };
         }
         const scoped = await fetchTypeScopedObjectInfo(types, {
