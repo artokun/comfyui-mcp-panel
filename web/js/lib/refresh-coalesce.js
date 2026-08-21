@@ -58,7 +58,8 @@
  *
  * A distinct value rather than `undefined`, because `undefined` is already what a
  * successful plain join resolves to and the two demand opposite handling — one means "the
- * defs you wanted are registered", the other means "nobody registered anything for you".
+ * defs you wanted are registered", the other means "the caller stopped waiting while the
+ * run was still responsible for registering them".
  */
 export const REFRESH_JOIN_ABANDONED = Symbol("refresh-join-abandoned");
 
@@ -105,21 +106,31 @@ async function joinBounded(current, joinMs, withTimeout) {
  *
  * A rejecting run still rejects: #608 reads the verdict a forced refresh resolves, and a
  * bound on the wait must not quietly turn that into a success. Only the abandonment is new.
+ * `abandonBeforeLocalWork` also lets a caller stop at the explicit handoff immediately
+ * before a run begins synchronous schema work; the run itself is not cancelled.
  */
-async function waitForRun(run, ms, withTimeout) {
+async function waitForRun(runHandle, ms, withTimeout, abandonBeforeLocalWork = false) {
+  const run = runHandle.promise;
   if (ms === null) return run;
   // An abandoned wait is not a reason to turn the run's failure into an unhandled rejection.
   run.catch(() => {});
   if (!(ms > 0)) return REFRESH_JOIN_ABANDONED;
+  const runOutcome = Promise.resolve(run).then(
+    (value) => ({ value }),
+    (err) => ({ err }),
+  );
   const settled = await withTimeout(
-    Promise.resolve(run).then(
-      (value) => ({ value }),
-      (err) => ({ err }),
-    ),
+    abandonBeforeLocalWork
+      ? Promise.race([
+          runOutcome,
+          runHandle.beforeLocalWork.then(() => ({ beforeLocalWork: true })),
+        ])
+      : runOutcome,
     ms,
     () => null,
   );
   if (settled === null) return REFRESH_JOIN_ABANDONED;
+  if (settled?.beforeLocalWork === true) return REFRESH_JOIN_ABANDONED;
   if ("err" in settled) throw settled.err;
   return settled.value;
 }
@@ -144,10 +155,11 @@ async function waitForRun(run, ms, withTimeout) {
 //
 //   getInFlight / setInFlight : accessors for the shared single-flight promise slot
 //                               (module-level in the panel).
-//   runRegister(preloadedDefs, runOpts) : performs the actual (idempotent) registration;
-//                                its own cleanup must NOT clear the slot — the coalescer
-//                                owns the slot lifecycle. `runOpts` is the caller's
-//                                `{ runBudgetMs }`, forwarded verbatim.
+//   runRegister(preloadedDefs, runOpts, runControl) : performs the actual (idempotent)
+//                                registration; its own cleanup must NOT clear the slot —
+//                                the coalescer owns the slot lifecycle. `runOpts` is the
+//                                caller's `{ runBudgetMs }`, forwarded verbatim. `runControl`
+//                                carries the pre-local-work handoff used by a bounded caller.
 //   withTimeout                : the repo's ONE bounding primitive (bounded-step.js),
 //                                injected rather than imported so this module stays a
 //                                pure coordinator and a test can drive the clock. Omit it
@@ -158,18 +170,48 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
   // The single queued trailing (forced, no-payload) run, or null when none is
   // pending. Coalesces any number of forced calls arriving during one in-flight run.
   let trailing = null;
-  const startRun = (preloadedDefs, runOpts) => {
+  const startRun = (preloadedDefs, runOpts, abandonBeforeLocalWork) => {
+    let yieldBeforeLocalWork = !!abandonBeforeLocalWork;
+    let announceBeforeLocalWork;
+    const beforeLocalWork = new Promise((resolve) => {
+      announceBeforeLocalWork = resolve;
+    });
+    let announced = false;
+    const runControl = {
+      beforeLocalWork: () => {
+        if (!announced) {
+          announced = true;
+          announceBeforeLocalWork();
+        }
+        // Resolving the signal alone is not enough: its reaction is a microtask, and the
+        // next synchronous registration call could block the tab before that reaction runs.
+        // The production run awaits this one macrotask when a caller asked for the early
+        // verdict, giving the caller's structured reply a chance to compose first.
+        return yieldBeforeLocalWork
+          ? new Promise((resolve) => setTimeout(resolve, 0))
+          : undefined;
+      },
+    };
     const p = (async () => {
       try {
-        return await runRegister(preloadedDefs, runOpts);
+        return await runRegister(preloadedDefs, runOpts, runControl);
       } finally {
         // Clear the slot only if it still points at THIS run (a later run may have
         // already replaced it).
         if (getInFlight() === p) setInFlight(null);
       }
     })();
+    // A bounded refresh_nodes caller can arrive after this run was created by
+    // an unbounded force-trigger (download/reconnect). Keep the handoff
+    // upgradeable until the run reaches it; once local synchronous work starts,
+    // no later caller can safely interrupt that JavaScript turn.
+    const requestEarlyYield = () => {
+      yieldBeforeLocalWork = true;
+    };
+    p.beforeLocalWork = beforeLocalWork;
+    p.requestEarlyYield = requestEarlyYield;
     setInFlight(p);
-    return p;
+    return { promise: p, beforeLocalWork, requestEarlyYield };
   };
   return async function refresh(preloadedDefs, opts) {
     const force = !!(opts && opts.force);
@@ -187,6 +229,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     // #1562 — the caller's RUN allowance, forwarded to every `startRun` below. Built here,
     // once, so no branch can start a run under a different budget than its siblings.
     const runOpts = opts && Number.isFinite(opts.runBudgetMs) ? { runBudgetMs: opts.runBudgetMs } : undefined;
+    const abandonBeforeLocalWork = !!(opts && opts.abandonBeforeLocalWork);
     const remaining = () => (joinMs === null ? null : joinMs - (Date.now() - startedAt));
     const current = getInFlight();
     if (current) {
@@ -205,7 +248,12 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
         // #1351 — the join settled, so starting our own run is not a stampede. What remains
         // of `joinMs` bounds the wait on THAT run. Wrapping join+run as one promise and
         // bounding it once would start the run after an abandoned join — the stampede.
-        return waitForRun(startRun(preloadedDefs, runOpts), remaining(), withTimeout);
+        return waitForRun(
+          startRun(preloadedDefs, runOpts, abandonBeforeLocalWork),
+          remaining(),
+          withTimeout,
+          abandonBeforeLocalWork,
+        );
       }
       // Forced, no payload ⇒ guarantee a fresh fetch AFTER the current run
       // settles; coalesce concurrent forced calls into ONE trailing run (#396).
@@ -216,24 +264,44 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       // asymmetry is deliberate: the run is #396's guarantee to whoever else is waiting.
       // The queued promise already includes the trailing `startRun`, so this one bound
       // covers join AND run — the shape #1351 brings to the payload path as well.
+      // #1562 — a bounded refresh_nodes call may arrive after an unbounded force caller
+      // already started the current run or queued the shared trailing run. Upgrade both
+      // handles before waiting so either run yields at the explicit pre-local-work handoff.
+      if (abandonBeforeLocalWork) {
+        current.requestEarlyYield?.();
+        trailing?.requestEarlyYield?.();
+      }
       if (!trailing) {
-        trailing = (async () => {
+        let earlyYieldRequested = abandonBeforeLocalWork;
+        const queued = (async () => {
           try {
             await current;
           } catch {
             /* the in-flight refresh failed — run our own anyway */
           }
           trailing = null;
-          return startRun(undefined, runOpts);
+          return startRun(undefined, runOpts, earlyYieldRequested);
         })();
+        trailing = {
+          promise: queued.then((handle) => handle.promise),
+          beforeLocalWork: queued.then((handle) => handle.beforeLocalWork),
+          requestEarlyYield: () => {
+            earlyYieldRequested = true;
+          },
+        };
       }
-      return waitForRun(trailing, joinMs, withTimeout);
+      return waitForRun(trailing, joinMs, withTimeout, abandonBeforeLocalWork);
     }
     // #1351 — nothing in flight, so `joinMs` has no join to bound. It still bounds THIS
     // run: the 8.0× measurement was a 2,251 ms own run against a 280 ms bound with the
     // join landing (or never starting) inside it. A bound already spent starts nothing —
     // the same as an abandoned join, and for the same `withTimeout` trap.
     if (joinMs !== null && !(joinMs > 0)) return REFRESH_JOIN_ABANDONED;
-    return waitForRun(startRun(preloadedDefs, runOpts), joinMs, withTimeout);
+    return waitForRun(
+      startRun(preloadedDefs, runOpts, abandonBeforeLocalWork),
+      joinMs,
+      withTimeout,
+      abandonBeforeLocalWork,
+    );
   };
 }

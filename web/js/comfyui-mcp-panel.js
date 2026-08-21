@@ -1313,7 +1313,7 @@ const OBJECT_INFO_SEED_WAIT_MS = 8000;
 const awaitObjectInfoHistorySeed = (waitMs = OBJECT_INFO_SEED_WAIT_MS) =>
   awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, waitMs);
 
-async function registerComfyNodeDefs(preloadedDefs, runOpts) {
+async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once they have
   // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
   // do that and the trust flag accepts either (#1193): `refreshComboInNodes()` answering,
@@ -1710,6 +1710,18 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts) {
       // Rethrown here rather than at the catch, so the phase attribution, the verdict's
       // reason and its detail are untouched for the case where both routes failed.
       if (clientRouteThrew) throw clientRouteError;
+    }
+    // #1562 — hand a bounded `refresh_nodes` caller its retryable verdict before any local
+    // schema work can block the main thread. Resolving a promise is not enough here: its
+    // reaction is a microtask, while `recordObjectInfoTypes`, graph serialization,
+    // `registerNodesFromDefs` and the reapply sweep can all run synchronously before the
+    // event loop gets another turn. The coalescer therefore asks this run to announce the
+    // handoff and, for that caller only, awaits one macrotask after the announcement. The
+    // run remains in the single-flight slot throughout, so a retry joins or queues behind
+    // it and can never overlap another registration pass.
+    if (defs && typeof runControl?.beforeLocalWork === "function") {
+      const localWorkGate = runControl.beforeLocalWork();
+      if (localWorkGate) await localWorkGate;
     }
     // Record observed backend history (#458 trust root) — covers reconnect, the forced
     // refresh_nodes path, add_node payloads, and download-triggered refreshes.
@@ -11624,6 +11636,10 @@ const GRAPH_TOOL_EXECUTORS = {
     const verdict = await refreshComfyNodeDefs(undefined, {
       force: true,
       joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,
+      // #1562 — the run announces this handoff after /object_info and yields one turn
+      // before registration, so this caller can return its structured retryable verdict
+      // before synchronous schema work blocks the relay timer.
+      abandonBeforeLocalWork: true,
       // #1562 — and the RUN this command starts gets an allowance that outlasts that wait,
       // so the JOIN is what ends the command. Without this line the run gives up first and
       // the retryable `refresh_still_running` verdict below is unreachable on exactly the
@@ -11655,8 +11671,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // the second case — and it is the case a big install hits without any concurrency at
         // all. `graph_add_node`'s refusal names both for the same reason.
         detail:
-          `A node-def refresh was still running when this command's ` +
-          `${Math.round(REFRESH_NODES_COMMAND_BUDGET_MS / 1000)}s budget ran out waiting for ` +
+          `A node-def refresh was still running when this command stopped waiting for ` +
           `it — either one something else started (a ComfyUI reconnect, a finished install or ` +
           `download, this panel's own missing-asset check after an upload) or this command's ` +
           `own registration. Nothing failed and nothing was changed.`,
