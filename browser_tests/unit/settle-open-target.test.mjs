@@ -151,8 +151,16 @@ function settleArgs(store, target, wasOpen, overrides = {}) {
     openWorkflows: store.openWorkflows,
     sameWorkflowObject,
     matchesSelector,
+    // The collaborators are built EXACTLY as workflow_open builds them — capability
+    // ternaries and all. An earlier version of these tests injected `undefined` or a
+    // throwing stub for `reopenTabInBackground`, two shapes the call site can never
+    // produce, and that blindness let a false `reopened:true` ship (review P1).
+    readOpenWorkflows: () => store.openWorkflows,
     loadWorkflowContent: (wf) => (typeof wf.load === "function" ? wf.load() : undefined),
-    reopenTabInBackground: (p) => store.openWorkflowsInBackground({ right: [p] }),
+    reopenTabInBackground: (p) =>
+      typeof store.openWorkflowsInBackground === "function"
+        ? store.openWorkflowsInBackground({ right: [p] })
+        : undefined,
     ...overrides,
   };
 }
@@ -383,26 +391,53 @@ test("#1575: a load that produces no state is reported, not claimed as repaired"
   assert.equal(result.loaded, false);
 });
 
-test("#1575: a frontend without openWorkflowsInBackground still gets the loaded canvas", async () => {
+test("#1575: a store with NO openWorkflowsInBackground reports reopened:false — through the REAL lambda", async () => {
+  // review P1. The call site always passes a FUNCTION; on a frontend lacking the store
+  // method that function returns `undefined` without throwing. Inferring success from
+  // "it did not throw" made this claim the tab was restored while the open list was
+  // untouched — and suppressed the disclosure that says otherwise.
   const { store, target, wasOpen } = await strandedByCloseThenOpen();
-  const result = await settleOpenedWorkflowTarget(
-    settleArgs(store, target, wasOpen, { reopenTabInBackground: undefined }),
-  );
+  store.openWorkflowsInBackground = undefined; // the frontend simply does not have it
+  const result = await settleOpenedWorkflowTarget(settleArgs(store, target, wasOpen));
+
   assert.equal(result.loaded, true, "the load is what unblocks the repaint");
-  assert.equal(result.reopened, false, "and the un-fixed tab list is disclosed, not hidden");
+  assert.equal(result.reopened, false, "an un-restored tab must NOT be reported as restored");
+  assert.equal(
+    store.openWorkflows.some((w) => w?.path === target.path),
+    false,
+    "ground truth: the tab really is still absent from the open list",
+  );
 });
 
-test("#1575: a throwing openWorkflowsInBackground still yields a loaded target", async () => {
+test("#1575: a store whose openWorkflowsInBackground SILENTLY does nothing reports reopened:false", async () => {
+  // The other shape of the same class: the method exists, accepts the call, and the tab
+  // still does not appear. Only an observation of the list can tell these apart.
   const { store, target, wasOpen } = await strandedByCloseThenOpen();
-  const result = await settleOpenedWorkflowTarget(
-    settleArgs(store, target, wasOpen, {
-      reopenTabInBackground: () => {
-        throw new Error("store refused");
-      },
-    }),
-  );
+  store.openWorkflowsInBackground = () => {}; // accepts, does nothing
+  const result = await settleOpenedWorkflowTarget(settleArgs(store, target, wasOpen));
+  assert.equal(result.loaded, true);
+  assert.equal(result.reopened, false, "reopened must be READ from the open list, not assumed");
+});
+
+test("#1575: a throwing openWorkflowsInBackground still yields a loaded target, reopened:false", async () => {
+  const { store, target, wasOpen } = await strandedByCloseThenOpen();
+  store.openWorkflowsInBackground = () => {
+    throw new Error("store refused");
+  };
+  const result = await settleOpenedWorkflowTarget(settleArgs(store, target, wasOpen));
   assert.equal(result.loaded, true);
   assert.equal(result.reopened, false);
+});
+
+test("#1575: reopened:true is only ever claimed when the tab is OBSERVED in the open list", async () => {
+  const { store, target, wasOpen } = await strandedByCloseThenOpen();
+  const result = await settleOpenedWorkflowTarget(settleArgs(store, target, wasOpen));
+  assert.equal(result.reopened, true);
+  assert.equal(
+    store.openWorkflows.some((w) => w?.path === target.path),
+    true,
+    "the claim and the store must agree",
+  );
 });
 
 test("#1575: a frontend without load() degrades to today's refusal", async () => {
@@ -461,6 +496,35 @@ test("#1575: workflow_open settles the target AFTER openWorkflow and BEFORE it r
   assert.match(call, /loadWorkflowContent:/, "the load the store's early return skipped");
   assert.match(call, /openWorkflowsInBackground/, "and the tab-list half of it");
   assert.match(call, /wasOpen,/, "an already-open tab must be excluded");
+  // review P1 — a READER, so `reopened` can be re-read after the call. A snapshot array
+  // cannot show whether the store did anything.
+  assert.match(
+    call,
+    /readOpenWorkflows:\s*\(\)\s*=>\s*s\.openWorkflows/,
+    "the open list must be re-readable, not captured once",
+  );
+  assert.doesNotMatch(call, /openWorkflows:\s*s\.openWorkflows/, "a snapshot cannot observe an effect");
+});
+
+test("#1575: the settle's await is held INSIDE a reload step, or the fence ages out mid-load", () => {
+  // review P1 — `target.load()` is an unbounded /userdata fetch. Between steps the guard
+  // sits at pending === 0, where activeWorkflowReloadGuard() expires it after
+  // WORKFLOW_RELOAD_GUARD_MAX_MS; a stalled read would drop the fence, let a concurrent
+  // graph_* command through, and the repaint would then overwrite it from disk.
+  const settleAt = SRC.indexOf("openSettled = await settleOpenedWorkflowTarget({");
+  assert.notEqual(settleAt, -1);
+  const before = SRC.slice(Math.max(0, settleAt - 900), settleAt);
+  const after = SRC.slice(settleAt, settleAt + 2200);
+  assert.match(
+    before,
+    /beginWorkflowReloadStep\(reloadGuardToken\);\s*\r?\n\s*try \{\s*\r?\n\s*$/,
+    "the settle must open a reload step immediately before it",
+  );
+  assert.match(
+    after,
+    /\} finally \{\s*\r?\n\s*endWorkflowReloadStep\(reloadGuardToken\);/,
+    "and release it in a finally, so a throwing settle cannot hold the fence forever",
+  );
 });
 
 test("#1575: the repaired target REPLACES the local one, or every later step reads the stale object", () => {

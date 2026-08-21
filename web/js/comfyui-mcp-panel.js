@@ -18120,25 +18120,39 @@ const GRAPH_TOOL_EXECUTORS = {
         // stamp, the proof, the fence, the reply — reads the object that actually holds
         // the workflow. Returns untouched (`reason: "loaded"`) whenever the open produced
         // a usable state, which is every open that works today.
-        openSettled = await settleOpenedWorkflowTarget({
-          wasOpen,
-          target,
-          selector: path,
-          activeAfterOpen: activeWorkflowRef(),
-          openWorkflows: s.openWorkflows,
-          sameWorkflowObject,
-          matchesSelector: workflowRecordMatchesSelector,
-          // The exact call the store's own `openWorkflow` skipped. Guarded, so a
-          // frontend without it degrades to today's refusal rather than throwing.
-          loadWorkflowContent: (wf) => (typeof wf.load === "function" ? wf.load() : undefined),
-          // The store's own "add paths without loading them or changing the active
-          // workflow" entry point — the missing half of the early-returned open, and
-          // what clears the active-but-not-open state the report also named.
-          reopenTabInBackground: (p) =>
-            typeof s.openWorkflowsInBackground === "function"
-              ? s.openWorkflowsInBackground({ right: [p] })
-              : undefined,
-        });
+        // INSIDE a reload STEP (review P1). `target.load()` is a `/userdata` fetch with
+        // no deadline of its own, and between steps the guard sits at `pending === 0`,
+        // where `activeWorkflowReloadGuard()` expires it after WORKFLOW_RELOAD_GUARD_MAX_MS.
+        // A stalled read would therefore drop the fence mid-load, let a concurrent
+        // graph_* command through and acknowledge it, and the repaint below would then
+        // overwrite it from the disk state — the data-loss shape the guard exists to
+        // prevent. A step keeps `pending > 0`, which is never expired.
+        beginWorkflowReloadStep(reloadGuardToken);
+        try {
+          openSettled = await settleOpenedWorkflowTarget({
+            wasOpen,
+            target,
+            selector: path,
+            activeAfterOpen: activeWorkflowRef(),
+            // A READER, not a snapshot: the helper re-reads it after the re-list to
+            // report what the store DID rather than that the call returned (review P1).
+            readOpenWorkflows: () => s.openWorkflows,
+            sameWorkflowObject,
+            matchesSelector: workflowRecordMatchesSelector,
+            // The exact call the store's own `openWorkflow` skipped. Guarded, so a
+            // frontend without it degrades to today's refusal rather than throwing.
+            loadWorkflowContent: (wf) => (typeof wf.load === "function" ? wf.load() : undefined),
+            // The store's own "add paths without loading them or changing the active
+            // workflow" entry point — the missing half of the early-returned open, and
+            // what clears the active-but-not-open state the report also named.
+            reopenTabInBackground: (p) =>
+              typeof s.openWorkflowsInBackground === "function"
+                ? s.openWorkflowsInBackground({ right: [p] })
+                : undefined,
+          });
+        } finally {
+          endWorkflowReloadStep(reloadGuardToken);
+        }
         if (openSettled.target && openSettled.target !== target) target = openSettled.target;
       // We deliberately do NOT auto-reload the canvas from disk here: switching to an
       // already-open tab must not silently discard the user's in-memory graph, and a

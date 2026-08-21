@@ -116,7 +116,7 @@ function frontendConsidersActive(active, target, sameWorkflowObject) {
  *   target?: object | null,
  *   selector?: string,
  *   activeAfterOpen?: object | null,
- *   openWorkflows?: unknown,
+ *   readOpenWorkflows?: () => unknown[],
  *   sameWorkflowObject?: (a: unknown, b: unknown) => boolean,
  *   matchesSelector?: (wf: object, sel: string) => boolean,
  *   loadWorkflowContent?: (wf: object) => unknown,
@@ -130,7 +130,7 @@ export async function settleOpenedWorkflowTarget({
   target,
   selector,
   activeAfterOpen,
-  openWorkflows,
+  readOpenWorkflows,
   sameWorkflowObject,
   matchesSelector,
   loadWorkflowContent,
@@ -209,13 +209,29 @@ export async function settleOpenedWorkflowTarget({
     // The other half of the early-returned open: the tab itself. Best-effort, and
     // strictly after the load, so a failure here leaves a loaded tab rather than
     // an empty one.
-    let reopened = false;
+    //
+    // `reopened` is an OBSERVATION of the open list, never "the call did not throw"
+    // (review, P1). The call site reaches `openWorkflowsInBackground` through a
+    // capability-guarded lambda, so on a frontend that lacks it the call returns
+    // `undefined` silently — and inferring success from the absence of an exception
+    // made "this store has no such API" and "the tab was restored" the same value.
+    // The reply then asserted it had restored the tab AND suppressed the disclosure
+    // saying it could not, which is the inconsistent active/open state this fix
+    // exists to repair being reported as repaired while untouched.
     const path = typeof target.path === "string" ? target.path : "";
-    const alreadyListed = Array.isArray(openWorkflows) && openWorkflows.some((w) => w?.path === path);
+    const listedNow = () => {
+      if (typeof readOpenWorkflows !== "function" || !path) return false;
+      try {
+        const list = readOpenWorkflows();
+        return Array.isArray(list) && list.some((w) => w?.path === path);
+      } catch {
+        return false;
+      }
+    };
+    const alreadyListed = listedNow();
     if (path && !alreadyListed && typeof reopenTabInBackground === "function") {
       try {
         reopenTabInBackground(path);
-        reopened = true;
       } catch {
         // A tab that is active but absent from the open list is recoverable, and is
         // disclosed on the reply; failing the whole open over it would not be.
@@ -225,7 +241,8 @@ export async function settleOpenedWorkflowTarget({
       target,
       adopted: false,
       loaded: true,
-      reopened: reopened || alreadyListed,
+      // Re-read, so this reports what the store DID, not what it was asked to do.
+      reopened: alreadyListed || listedNow(),
       reason: "loaded-after-noop-open",
     };
   } catch (err) {
