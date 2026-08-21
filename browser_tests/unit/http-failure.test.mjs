@@ -357,6 +357,14 @@ test("credential-shaped text in a reflecting gateway's page is scrubbed", () => 
   assert.doesNotMatch(scrubSecretShapedText("api_key=abc123def456"), /abc123def456/);
 });
 
+test("percent-encoded authorization material is scrubbed as one credential", () => {
+  const reflected = "Authorization: Bearer abc%2Fdef%3Dghi";
+  const scrubbed = scrubSecretShapedText(reflected);
+  assert.doesNotMatch(scrubbed, /abc%2Fdef%3Dghi/);
+  assert.doesNotMatch(scrubbed, /%2Fdef%3Dghi/);
+  assert.match(scrubbed, /Authorization: «redacted»/);
+});
+
 test("a standard reason phrase is dropped, a custom one is kept", () => {
   assert.equal(describeHttpStatus(502, "Bad Gateway"), "502");
   assert.equal(describeHttpStatus(503, "Origin warming up"), "503 Origin warming up");
