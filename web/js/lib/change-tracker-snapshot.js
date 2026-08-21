@@ -51,6 +51,20 @@ const SUPPRESSED_CAPTURE_RETRY_MS = Object.freeze([16, 50, 150, 400, 800]);
 
 let pendingSnapshot = null;
 
+let _warnedMissingOwnership = false;
+function warnMissingOwnershipOnce() {
+  if (_warnedMissingOwnership) return;
+  _warnedMissingOwnership = true;
+  try {
+    console.warn(
+      "[comfyui-mcp] deferChangeTrackerSnapshot called without an ownership predicate — " +
+        "the tracker snapshot cannot be proven to still own the canvas, so it will NOT be " +
+        "captured (panel#1563). Undo integration and the back-to-back fence flush stay " +
+        "disabled until the caller supplies one.",
+    );
+  } catch { /* a logger that throws must not also eat the refusal */ }
+}
+
 /**
  * Did upstream POSITIVELY tell us this capture was a no-op? (panel#1563)
  *
@@ -147,14 +161,31 @@ function armCapture(record, delayMs) {
  * belongs to someone else.
  *
  * The flush path has always refused on this hazard (its doc names it); the retry path
- * had no equivalent, so it gets the same question, asked positively. `stillOwnsCanvas`
- * is supplied by the caller because ownership lives in the workflow store and this
- * module is deliberately dependency-light. Only a POSITIVE `false` stops the chain: a
- * caller that supplies no predicate behaves exactly as it did before.
+ * had no equivalent, so it gets the same question. `stillOwnsCanvas` is supplied by the
+ * caller because ownership lives in the workflow store and this module is deliberately
+ * dependency-light.
+ *
+ * ASKED POSITIVELY, AT THIS LAYER TOO. The call-site predicate was corrected to require
+ * a readable active workflow, but this function still granted on "only a POSITIVE
+ * `false` stops the chain, and no predicate behaves as before" — the same
+ * unknown-as-permission reading, one layer down, in the function the review flagged.
+ * Three unknowns reached `true` through it: no predicate supplied, a predicate
+ * answering `undefined`/`null`, and any non-boolean answer. Latent today (the one
+ * production caller supplies a strict boolean), which is exactly when it is cheap to
+ * close: a default-permit API hands the NEXT caller an authorisation nobody decided to
+ * give it, which is the reasoning `graphCommandBindingBar` already applies to
+ * `staleTagReadBypass`.
+ *
+ * So the answer must be a POSITIVE `true`. Everything else — including an unanswerable
+ * question and an absent one — abandons the chain. Abandoning costs a snapshot that
+ * stays behind the canvas, which the next command's flush can still repair and which
+ * `saveWouldPersistStaleSnapshot` refuses loudly rather than losing silently;
+ * proceeding costs a wrong-graph write nothing downstream can tell from the user's
+ * own work.
  */
 function recordMayCapture(record) {
   try {
-    return record.stillOwnsCanvas ? record.stillOwnsCanvas(record.tracker) !== false : true;
+    return record.stillOwnsCanvas?.(record.tracker) === true;
   } catch {
     return false; // an ownership question that throws is not a licence to write.
   }
@@ -209,6 +240,13 @@ export function deferChangeTrackerSnapshot(
   // orphan chain is the one that captures into a tracker that no longer owns the
   // canvas. Replacing the marker was never enough to stop it.
   pendingSnapshot?.cancelTimer?.();
+  if (typeof stillOwnsCanvas !== "function") {
+    // Failing closed must never be SILENT. With no ownership question this module
+    // cannot establish that the tracker still owns the canvas, so it captures nothing —
+    // say so once, rather than let undo integration and the #1723 flush disappear the
+    // way #1667's missing store guard did.
+    warnMissingOwnershipOnce();
+  }
   const record = {
     tracker: changeTracker,
     schedule,

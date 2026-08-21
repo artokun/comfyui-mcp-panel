@@ -25,7 +25,7 @@ test("#581 defers the captured tracker snapshot and preserves its receiver", () 
     deferChangeTrackerSnapshot(tracker, (callback, ms) => {
       queued = callback;
       delay = ms;
-    }),
+    }, () => {}, owns(tracker)),
     true,
   );
   assert.equal(calls, 0, "the expensive serialization cannot run before the reply path returns");
@@ -155,7 +155,7 @@ test("#1723 defers and flushes on a tracker that only has captureCanvasState", (
   const tracker = { captureCanvasState() { calls += 1; } };
   let queued = null;
   assert.equal(
-    deferChangeTrackerSnapshot(tracker, (callback) => { queued = callback; }),
+    deferChangeTrackerSnapshot(tracker, (callback) => { queued = callback; }, () => {}, owns(tracker)),
     true,
     "a current-frontend tracker must still queue — checkState-only support leaves the fingerprint stale forever",
   );
@@ -186,6 +186,9 @@ test("#1723 wires the flush BEFORE the graph-binding fence in the dispatch path"
 /** Upstream's own shape, reduced to what decides this: `captureCanvasState()` returns
  *  early — no throw, no value — while a suppression window is open, and only replaces
  *  `activeState` when it actually runs and the canvas moved. */
+/** A POSITIVE ownership answer: the store names THIS tracker as the active one. */
+const owns = (tracker) => (candidate) => candidate === tracker;
+
 function upstreamTracker({ suppressed = false } = {}) {
   return {
     activeState: { nodes: [], generation: 0 },
@@ -227,7 +230,7 @@ test("#1563 a SWALLOWED deferred capture is retried until upstream stops skippin
   deferChangeTrackerSnapshot(tracker, (cb, ms) => {
     queue.push({ cb, ms });
     return queue.length;
-  }, () => {});
+  }, () => {}, owns(tracker));
 
   queue.shift().cb(); // first attempt: swallowed
   assert.equal(tracker.activeState.generation, 0, "upstream skipped it");
@@ -249,7 +252,7 @@ test("#1563 the retry chain is BOUNDED — a window that never closes cannot spi
   deferChangeTrackerSnapshot(tracker, (cb) => {
     queue.push(cb);
     return queue.length;
-  }, () => {});
+  }, () => {}, owns(tracker));
   let fired = 0;
   while (queue.length && fired < 50) {
     queue.shift()();
@@ -269,7 +272,7 @@ test("#1563 a NO-CHANGE capture is not retried — an unchanged snapshot is the 
   deferChangeTrackerSnapshot(tracker, (cb) => {
     queue.push(cb);
     return queue.length;
-  }, () => {});
+  }, () => {}, owns(tracker));
   queue.shift()();
   assert.equal(tracker.calls, 1);
   assert.equal(queue.length, 0, "an unchanged snapshot on a readable, unsuppressed tracker is not a swallowed call");
@@ -371,20 +374,62 @@ test("#1563 r2 an ownership question that THROWS is not a licence to write", () 
   assert.equal(queue.length, 0);
 });
 
-test("#1563 r2 a caller that supplies NO ownership predicate is unchanged", () => {
-  // The predicate only ever withdraws a licence it can positively see is gone; absent
-  // one, the chain behaves exactly as it did before r2.
+test("#1563 r3 a caller that supplies NO ownership predicate captures NOTHING, and says so", async () => {
+  // r2 asserted the opposite — "no predicate ⇒ behaves as before" — and that assertion
+  // WAS the P1: with no way to establish ownership the module cannot know whose canvas
+  // it is about to serialize, and "as before" was the unguarded write. Fail closed.
+  // A FRESH module instance: the disclosure is deliberately once-per-session, so
+  // asserting it against the shared import would pass or fail on test ORDER.
+  const fresh = await import(`../../web/js/lib/change-tracker-snapshot.js?r3=${Date.now()}`);
+  const tracker = upstreamTracker();
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const queue = [];
+    fresh.deferChangeTrackerSnapshot(tracker, (cb) => {
+      queue.push(cb);
+      return queue.length;
+    }, () => {});
+    queue.shift()();
+    assert.equal(tracker.calls, 0, "an unestablished owner may not authorise a capture");
+    assert.equal(queue.length, 0, "and the chain does not keep asking");
+  } finally {
+    console.warn = realWarn;
+  }
+  // Failing closed silently is how a missing guard survives a release (#1667).
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /without an ownership predicate/);
+});
+
+test("#1563 r3 an UNANSWERABLE ownership question abandons the chain", () => {
+  // The shape codex caught at the call site: `activeWorkflowRef()` answers null both
+  // when nothing is active and when the lookup failed. Neither is "still yours".
+  for (const answer of [null, undefined, 0, "", NaN]) {
+    const tracker = upstreamTracker({ suppressed: true });
+    const queue = [];
+    deferChangeTrackerSnapshot(tracker, (cb) => {
+      queue.push(cb);
+      return queue.length;
+    }, () => {}, () => answer);
+    queue.shift()();
+    assert.equal(tracker.calls, 0, `answer ${String(answer)} must not authorise a capture`);
+    assert.equal(queue.length, 0, `answer ${String(answer)} must not leave a chain armed`);
+  }
+});
+
+test("#1563 r3 a TRUTHY-but-not-true answer is still not permission", () => {
+  // `=== true` deliberately, not truthiness: a predicate returning an object (a
+  // workflow record, say) is answering a different question than the one asked.
   const tracker = upstreamTracker({ suppressed: true });
   const queue = [];
   deferChangeTrackerSnapshot(tracker, (cb) => {
     queue.push(cb);
     return queue.length;
-  }, () => {});
+  }, () => {}, () => ({ changeTracker: tracker }));
   queue.shift()();
-  assert.ok(queue.length > 0, "no predicate ⇒ the retry chain is armed as before");
-  tracker.changeCount = 0;
-  queue.shift()();
-  assert.equal(tracker.activeState.generation, 1, "and it still catches the snapshot up");
+  assert.equal(tracker.calls, 0);
+  assert.equal(queue.length, 0);
 });
 
 test("#1563 r2 a NEW defer cancels the previous record's armed chain", () => {
