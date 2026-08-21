@@ -89,6 +89,12 @@ export const REFRESH_NODES_EXECUTOR_DEPS = Object.freeze({
   REFRESH_JOIN_ABANDONED,
   NODE_DEF_REFRESH_REASONS,
   REFRESH_NODES_COMMAND_BUDGET_MS,
+  // #1562 — the RUN allowance the executor now hands the coalescer. Adding it here is what
+  // keeps the three harnesses that rebuild `refresh_nodes` working; leaving it out throws
+  // ReferenceError in all three at once, which is the signal this collection exists for.
+  get REFRESH_NODES_RUN_BUDGET_MS() {
+    return REFRESH_NODES_RUN_BUDGET_MS;
+  },
 });
 
 /** #1413 — the whole-command deadline `graph_set_widget` takes on its first line. */
@@ -118,6 +124,34 @@ export const NODE_DEFS_FETCH_SHARE = (() => {
   const m = PANEL_SRC.match(/const NODE_DEFS_FETCH_SHARE = (\d+) \/ (\d+);/);
   if (!m) throw new Error("the panel no longer states NODE_DEFS_FETCH_SHARE as a ratio");
   return Number(m[1]) / Number(m[2]);
+})();
+
+/**
+ * #1562 — the run budget `refresh_nodes` derives, EVALUATED FROM THE PANEL'S OWN
+ * EXPRESSION.
+ *
+ * Not `readPanelNumber`: the panel does not state a literal, it states a derivation
+ * (`REFRESH_NODES_COMMAND_BUDGET_MS / NODE_DEFS_FETCH_SHARE`), and the property the tests
+ * assert is about that derivation. Restating it here would make the harness agree with
+ * itself — the exact trap this file's header records — so the expression is lifted out of
+ * the source and evaluated against the two inputs, both of which are themselves read from
+ * the panel.
+ */
+export const REFRESH_NODES_RUN_BUDGET_MS = (() => {
+  const m = PANEL_SRC.match(/const REFRESH_NODES_RUN_BUDGET_MS = ([^;]*);/);
+  if (!m) {
+    throw new Error("REFRESH_NODES_RUN_BUDGET_MS is no longer findable in the panel source");
+  }
+  // eslint-disable-next-line no-new-func
+  const value = new Function(
+    "REFRESH_NODES_COMMAND_BUDGET_MS",
+    "NODE_DEFS_FETCH_SHARE",
+    `return ${m[1]};`,
+  )(REFRESH_NODES_COMMAND_BUDGET_MS, NODE_DEFS_FETCH_SHARE);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`the panel's REFRESH_NODES_RUN_BUDGET_MS expression evaluated to ${value}`);
+  }
+  return value;
 })();
 
 /**

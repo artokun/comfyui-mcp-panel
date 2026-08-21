@@ -280,7 +280,14 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
-import { fetchWholeObjectInfo, objectInfoOracleFailureNote, OBJECT_INFO_DEADLINE_MS } from "./lib/object-info-oracle.js";
+import {
+  fetchWholeObjectInfo,
+  objectInfoOracleFailureNote,
+  OBJECT_INFO_DEADLINE_MS,
+  // #1562 — the oracle's per-route OUTCOME vocabulary, so the fetch phase can tell an
+  // abandoned-at-the-bound route from a failed one WITHOUT matching its prose (#1223).
+  TRANSPORT_OUTCOME,
+} from "./lib/object-info-oracle.js";
 import {
   createObjectInfoSnapshot,
   snapshotAuthorizationNote,
@@ -1301,7 +1308,7 @@ const OBJECT_INFO_SEED_WAIT_MS = 8000;
 const awaitObjectInfoHistorySeed = (waitMs = OBJECT_INFO_SEED_WAIT_MS) =>
   awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, waitMs);
 
-async function registerComfyNodeDefs(preloadedDefs) {
+async function registerComfyNodeDefs(preloadedDefs, runOpts) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once they have
   // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
   // do that and the trust flag accepts either (#1193): `refreshComboInNodes()` answering,
@@ -1342,7 +1349,18 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // left of it, so the run's cost is this budget rather than the sum of numbers that each
   // looked reasonable alone. Taken here, before any phase starts, so a slow fetch is paid
   // for by the combo phase rather than added to it.
-  let runDeadline = monotonicNow() + NODE_DEFS_RUN_BUDGET_MS;
+  //
+  // #1562 — the ALLOWANCE is the caller's when it states one. `NODE_DEFS_RUN_BUDGET_MS` is
+  // sized for a refresh that runs as a SUB-STEP (see its note); a caller whose whole
+  // command IS the refresh has a different window and says so. Only a positive finite
+  // number is honoured — an `Infinity`/`NaN` computed from an unset budget would restore
+  // the unbounded run this deadline exists to prevent, and a non-positive one would start
+  // a run with no time at all.
+  let runDeadline =
+    monotonicNow() +
+    (Number.isFinite(runOpts?.runBudgetMs) && runOpts.runBudgetMs > 0
+      ? runOpts.runBudgetMs
+      : NODE_DEFS_RUN_BUDGET_MS);
   // #716 — drop the widget-write burst cache at the START of this run, not after it
   // succeeds (codex). This function runs on exactly the events that change the schema —
   // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
@@ -1367,6 +1385,19 @@ async function registerComfyNodeDefs(preloadedDefs) {
   // tried instead of leaving "check that the ComfyUI server process is still running" to
   // stand on the evidence of one route out of two (#982's own defect, and #954's).
   let fetchRouteFailures = null;
+  // #1562 — did EVERY whole-document route end by being ABANDONED AT ITS BOUND, rather
+  // than by failing? That is a different fact from "the fetch failed", and the remedy is
+  // different too: a route that never answered inside its bound proves nothing about
+  // whether the server is up, so the verdict must not send the reader to check a process
+  // that was answering the whole time (#982's defect, reported again as #1562 — the
+  // reporter's own `GET /object_info` returned 25,104,088 bytes in 20.84 s while this
+  // remedy was telling them the backend might not be running).
+  //
+  // DECIDED FROM TAGS, never from the failure PROSE (#1223): route 1 reports through
+  // `lastAttemptTimedOut`, route 2 through the oracle's `TRANSPORT_OUTCOME.NO_ANSWER`.
+  // Starts null — "no whole-document route was reached at all" — so a run that never
+  // entered the fetch block cannot claim either answer.
+  let fetchAbandonedAtBound = null;
   // Tracked separately from the caught VALUE: a library can throw a FALSY value
   // (throw null / 0 / "") and `if (thrown)` would then read a failed run as a
   // clean one — misattributing the verdict and, worse, setting the shared
@@ -1544,6 +1575,10 @@ async function registerComfyNodeDefs(preloadedDefs) {
         clientRouteError = err;
         defs = null;
       }
+      // #1562 — record HOW route 1 ended, from the flag the loop already keeps rather than
+      // from the error's text. `lastAttemptTimedOut` is set only where `boundedGetNodeDefs`
+      // returned its sentinel, so this is "abandoned at the bound", never "failed".
+      fetchAbandonedAtBound = clientRouteThrew && lastAttemptTimedOut === true;
       // #608 — THE SECOND TRANSPORT, on the terms #982 set and #1161 bounded.
       //
       // Same question, different route: the WHOLE document, never the per-class
@@ -1632,6 +1667,14 @@ async function registerComfyNodeDefs(preloadedDefs) {
               (_, i) => fallbackOutcomes?.[i]?.route === "http",
             ),
           ];
+          // #1562 — and route 2's ending, by its TAG. Both must be abandonments for the
+          // verdict to say so: one route that genuinely FAILED is evidence about the
+          // server, and it outranks the other's silence.
+          fetchAbandonedAtBound =
+            fetchAbandonedAtBound === true &&
+            (Array.isArray(fallbackOutcomes) ? fallbackOutcomes : []).some(
+              (o) => o?.route === "http" && o?.kind === TRANSPORT_OUTCOME.NO_ANSWER,
+            );
         }
       }
       // Rethrown here rather than at the catch, so the phase attribution, the verdict's
@@ -1932,6 +1975,10 @@ async function registerComfyNodeDefs(preloadedDefs) {
     // #608 — what every transport in the fetch phase did, so a refusal about /object_info
     // names the routes it actually tried.
     fetchRouteFailures,
+    // #1562 — and whether every one of them was ABANDONED AT ITS BOUND rather than failing,
+    // which is what separates "the server did not answer" from "the server answered too
+    // slowly for this command's window".
+    fetchAbandonedAtBound,
   });
   // #1275 — VERIFY the refresh was ADDITIVE over the live graph.
   //
@@ -10883,6 +10930,67 @@ const ADD_NODE_COMMAND_BUDGET_MS = 25000;
 const REFRESH_NODES_COMMAND_BUDGET_MS = 25000;
 
 /**
+ * #1562 — the RUN budget for the refresh THIS command starts, as opposed to the JOIN
+ * budget above.
+ *
+ * THE TWO WERE THE WRONG WAY ROUND, and that is the whole defect. `joinMs` (25,000 ms) is
+ * how long this command is willing to WAIT; `NODE_DEFS_RUN_BUDGET_MS` (9,000 ms) is how
+ * long the run it starts is allowed to SPEND. Because the run's allowance was the smaller
+ * one, the run always died first — so `REFRESH_JOIN_ABANDONED` / `refresh_still_running`,
+ * the retryable verdict #1404 built for exactly "a big install ... without any concurrency
+ * at all", was unreachable on the install it was written for. What the caller got instead
+ * was `object_info_fetch_failed`, which tears the run down, so every retry started another
+ * doomed run and the tool could never succeed on that machine.
+ *
+ * MEASURED, against a REAL 25,000,581-byte `/object_info` served in 20.80 s (the reporter
+ * measured 25,104,088 bytes / 20.84 s), driving the SHIPPED fetch phase — the real
+ * `boundedGetNodeDefs`, the real retry loop, the real oracle:
+ *
+ *     run budget   route 1 bound   whole-document GETs   outcome
+ *      9,000 ms       6,000 ms            2              FAILED at 7.5 s — and the refusal
+ *                                                        is the reported sentence verbatim:
+ *                                                        "GET /object_info did not answer
+ *                                                        within its 1492ms share of the
+ *                                                        2985ms budget"
+ *     25,000 ms      16,666 ms            2              STILL FAILED at 20.9 s
+ *     32,000 ms      21,333 ms            1              obtained 20,020 types at 20.86 s
+ *     37,500 ms      25,000 ms            1              obtained 20,020 types at 20.98 s
+ *
+ * The 25,000 ms row is why this is not simply `REFRESH_NODES_COMMAND_BUDGET_MS`: handing
+ * the run the command's own window leaves its FETCH SHARE two thirds of that, and two
+ * thirds of the window is not the window. So the number is DERIVED from the property that
+ * has to hold rather than picked to fit one install:
+ *
+ *     the fetch phase alone must be able to spend everything the command will wait for
+ *     →  runBudget x NODE_DEFS_FETCH_SHARE  >=  REFRESH_NODES_COMMAND_BUDGET_MS
+ *
+ * which is asserted by test, so raising either input cannot silently break it again.
+ *
+ * WHAT IT COSTS. Nothing at all on a healthy install: every one of these numbers is a
+ * CEILING, and a backend that answers in ~0.5 s (measured: 456 ms warm / 1,062 ms cold on
+ * this rig) reaches the identical verdict in the identical time — the reproduction was run
+ * with a fast backend under both budgets and the elapsed times and outcomes match. What it
+ * does cost is a run that OUTLIVES its command: a `panel_refresh_nodes` against a backend
+ * that never answers now leaves one whole-document download in flight for up to
+ * ~12,500 ms after the reply. That is bounded, it is one run (the coalescer holds a single
+ * slot), and it is exactly the work the retry this reply asks for will join — which is the
+ * trade #1351 already made deliberately for the join.
+ *
+ * A `graph_add_node` arriving inside that window meets a longer-lived run and can refuse
+ * with its (worded, retryable) busy message where it would previously have waited out a
+ * shorter one. On an install this budget changes anything for, that add was failing its
+ * OWN refresh already.
+ *
+ * ONLY THE EXPLICIT COMMAND passes this. Reconnect, install-completed and download
+ * refreshes keep `NODE_DEFS_RUN_BUDGET_MS`, so #1180's composition property — two
+ * serialized runs inside the bridge's read default — is untouched for every caller that
+ * is not this one.
+ */
+const REFRESH_NODES_RUN_BUDGET_MS = Math.ceil(
+  REFRESH_NODES_COMMAND_BUDGET_MS / NODE_DEFS_FETCH_SHARE,
+);
+
+/**
  * #1192 — what an add still has to do AFTER the node-def refresh, held back so the join
  * cannot spend it.
  *
@@ -11244,6 +11352,11 @@ const GRAPH_TOOL_EXECUTORS = {
     const verdict = await refreshComfyNodeDefs(undefined, {
       force: true,
       joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,
+      // #1562 — and the RUN this command starts gets an allowance that outlasts that wait,
+      // so the JOIN is what ends the command. Without this line the run gives up first and
+      // the retryable `refresh_still_running` verdict below is unreachable on exactly the
+      // installs it exists for. See REFRESH_NODES_RUN_BUDGET_MS for the measurement.
+      runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS,
     });
     // #1404 — a NAMED verdict, before the generic branch below can call it "unknown".
     //

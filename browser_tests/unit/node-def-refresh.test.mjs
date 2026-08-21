@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
-import { fetchWholeObjectInfo } from "../../web/js/lib/object-info-oracle.js";
+import { fetchWholeObjectInfo, TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
 
 // #1180 — READ from the panel, never restated. Shared with the other harnesses that
 // rebuild shipped functions, so one copy of a constant cannot drift from another.
@@ -448,6 +448,10 @@ function buildRegisterComfyNodeDefs({
     // body throws ReferenceError without them.
     "objectInfoSnapshot",
     "backendReconnectEpoch",
+    // #1562 — the oracle's per-route OUTCOME vocabulary. The fetch phase reads route 2's
+    // ending from the TAG rather than from its sentence (#1223), so the extracted body
+    // throws ReferenceError without it.
+    "TRANSPORT_OUTCOME",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
      // gets its own stub without threading a helper through every call.
      const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
@@ -501,6 +505,7 @@ function buildRegisterComfyNodeDefs({
     // re-records only a payload it fetched itself.
     snapshotSpy,
     7,
+    TRANSPORT_OUTCOME,
   );
 }
 
@@ -1790,4 +1795,77 @@ test("#608: the no-payload guard is keyed on defsObtained, not on the phase name
   });
   assert.equal(fetchFailed.reason, "object_info_fetch_failed");
   assert.match(fetchFailed.detail, /Failed to fetch/);
+});
+
+// ---------------------------------------------------------------------------
+// #1562 — an ABANDONED route is not a FAILED one, and the remedy must not confuse them.
+//
+// The reporter's `GET /object_info` returned 25,104,088 bytes in 20.84 s from a ComfyUI
+// that was up throughout, while this verdict told them to "check that the ComfyUI server
+// process is still running". Every route had been abandoned at its bound; not one of them
+// had failed. These drive the SHIPPED run — the real oracle on injected timers — because
+// the distinction is made inside the fetch phase from the oracle's TAGS, and a test of
+// `describeNodeDefRefresh` alone cannot see whether the panel computes the input correctly.
+// ---------------------------------------------------------------------------
+
+/** Run the shipped register with the real oracle on virtual timers, and settle it. */
+async function runWithHangingRoutes(apiValue) {
+  const timers = virtualTimers();
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue,
+    timers,
+    fetchWholeObjectInfo: (opts) => fetchWholeObjectInfo({ ...opts, timers }),
+  });
+  const running = registerComfyNodeDefs(undefined);
+  await drainMicrotasks(300);
+  for (let i = 0; i < 8; i += 1) {
+    timers.fireAll();
+    await drainMicrotasks(200);
+  }
+  return orFail(running, "the run never settled");
+}
+
+test("#1562: BOTH whole-document routes abandoned at their bound is not reported as a dead server", async () => {
+  const verdict = await runWithHangingRoutes({
+    getNodeDefs: () => new Promise(() => {}), // bounded → abandoned, never failed
+    fetchApi: () => new Promise(() => {}), // the oracle's NO_ANSWER, same shape
+  });
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.doesNotMatch(
+    verdict.remedy,
+    /check that the ComfyUI server process is still running/,
+    "nothing here established that the server is down — both routes merely ran out of time",
+  );
+  assert.match(verdict.remedy, /ABANDONED AT ITS BOUND/);
+  assert.match(verdict.remedy, /plain retry meets the same bound/);
+  assert.match(verdict.remedy, /Tried 2 routes/, "…and #608's evidence clause survives");
+});
+
+test("#1562: a route that genuinely FAILED outranks the other's silence", async () => {
+  // Route 1 fails for real while route 2 is merely slow. That IS evidence about the
+  // server, so the old remedy is the right one and the new branch must not fire.
+  const verdict = await runWithHangingRoutes({
+    getNodeDefs: async () => {
+      throw new TypeError("Failed to fetch");
+    },
+    fetchApi: () => new Promise(() => {}),
+  });
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(verdict.remedy, /check that the ComfyUI server process is still running/);
+  assert.doesNotMatch(verdict.remedy, /ABANDONED AT ITS BOUND/);
+});
+
+test("#1562: a route that ANSWERED unusably outranks the other's silence too", async () => {
+  // Route 1 is abandoned, route 2 answers 500. A server that answers is a server that is
+  // up, but it did not answer THIS question — and "answered badly" is not "ran out of
+  // time", so the abandonment finding must not be claimed.
+  const verdict = await runWithHangingRoutes({
+    getNodeDefs: () => new Promise(() => {}),
+    fetchApi: async () => ({ ok: false, status: 500, json: async () => ({}) }),
+  });
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.doesNotMatch(verdict.remedy, /ABANDONED AT ITS BOUND/);
+  assert.match(verdict.remedy, /GET \/object_info was not OK \(status 500\)/);
 });

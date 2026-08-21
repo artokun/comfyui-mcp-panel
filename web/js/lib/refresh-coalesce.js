@@ -124,11 +124,30 @@ async function waitForRun(run, ms, withTimeout) {
   return settled.value;
 }
 
+// #1562 — A CALLER MAY ALSO STATE THE RUN'S OWN ALLOWANCE (`opts.runBudgetMs`), which is a
+// different quantity from `joinMs` and was missing.
+//
+// `joinMs` bounds how long THIS caller WAITS. It says nothing about how long the run it
+// starts may SPEND, and the run's own default is sized for a refresh that happens as a
+// sub-step of something else. When the wait is the longer of the two the run always dies
+// first, and `REFRESH_JOIN_ABANDONED` — the retryable "it is still going, join it" verdict
+// this coordinator exists to be able to give — becomes unreachable for the slow installs it
+// was built for. Passing the value through changes nothing for a caller that omits it.
+//
+// FORWARDED, NEVER INTERPRETED: this stays a pure coordinator, so the value is handed to
+// `runRegister` as-is and every check of it belongs there.
+//
+// THE TRAILING RUN IS SHARED, so it keeps the allowance of the caller that QUEUED it — the
+// same asymmetry `joinMs` already documents one paragraph up, and for the same reason: the
+// run is #396's guarantee to whoever else is waiting, and a later caller cannot retroactively
+// re-budget work that has started.
+//
 //   getInFlight / setInFlight : accessors for the shared single-flight promise slot
 //                               (module-level in the panel).
-//   runRegister(preloadedDefs) : performs the actual (idempotent) registration; its
-//                                own cleanup must NOT clear the slot — the coalescer
-//                                owns the slot lifecycle.
+//   runRegister(preloadedDefs, runOpts) : performs the actual (idempotent) registration;
+//                                its own cleanup must NOT clear the slot — the coalescer
+//                                owns the slot lifecycle. `runOpts` is the caller's
+//                                `{ runBudgetMs }`, forwarded verbatim.
 //   withTimeout                : the repo's ONE bounding primitive (bounded-step.js),
 //                                injected rather than imported so this module stays a
 //                                pure coordinator and a test can drive the clock. Omit it
@@ -139,10 +158,10 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
   // The single queued trailing (forced, no-payload) run, or null when none is
   // pending. Coalesces any number of forced calls arriving during one in-flight run.
   let trailing = null;
-  const startRun = (preloadedDefs) => {
+  const startRun = (preloadedDefs, runOpts) => {
     const p = (async () => {
       try {
-        return await runRegister(preloadedDefs);
+        return await runRegister(preloadedDefs, runOpts);
       } finally {
         // Clear the slot only if it still points at THIS run (a later run may have
         // already replaced it).
@@ -165,6 +184,9 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     // #1351 — `joinMs` is a deadline for THIS invocation, taken once, so the join and the
     // run that follows it COMPOSE rather than add. Wall clock, matching `withTimeout`.
     const startedAt = joinMs === null ? 0 : Date.now();
+    // #1562 — the caller's RUN allowance, forwarded to every `startRun` below. Built here,
+    // once, so no branch can start a run under a different budget than its siblings.
+    const runOpts = opts && Number.isFinite(opts.runBudgetMs) ? { runBudgetMs: opts.runBudgetMs } : undefined;
     const remaining = () => (joinMs === null ? null : joinMs - (Date.now() - startedAt));
     const current = getInFlight();
     if (current) {
@@ -183,7 +205,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
         // #1351 — the join settled, so starting our own run is not a stampede. What remains
         // of `joinMs` bounds the wait on THAT run. Wrapping join+run as one promise and
         // bounding it once would start the run after an abandoned join — the stampede.
-        return waitForRun(startRun(preloadedDefs), remaining(), withTimeout);
+        return waitForRun(startRun(preloadedDefs, runOpts), remaining(), withTimeout);
       }
       // Forced, no payload ⇒ guarantee a fresh fetch AFTER the current run
       // settles; coalesce concurrent forced calls into ONE trailing run (#396).
@@ -202,7 +224,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
             /* the in-flight refresh failed — run our own anyway */
           }
           trailing = null;
-          return startRun(undefined);
+          return startRun(undefined, runOpts);
         })();
       }
       return waitForRun(trailing, joinMs, withTimeout);
@@ -212,6 +234,6 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     // join landing (or never starting) inside it. A bound already spent starts nothing —
     // the same as an abandoned join, and for the same `withTimeout` trap.
     if (joinMs !== null && !(joinMs > 0)) return REFRESH_JOIN_ABANDONED;
-    return waitForRun(startRun(preloadedDefs), joinMs, withTimeout);
+    return waitForRun(startRun(preloadedDefs, runOpts), joinMs, withTimeout);
   };
 }

@@ -282,10 +282,20 @@ test("#1180: a whole refresh RUN, not each phase, is what fits the budget", () =
   );
 
   // Every bounded phase must draw from that ONE deadline rather than carry its own number.
+  //
+  // #1562 — the deadline is now taken from the CALLER'S allowance when it states one, and
+  // from NODE_DEFS_RUN_BUDGET_MS otherwise. The property this assertion exists for is
+  // unchanged and is asserted in both halves: it is taken ONCE, before any phase starts,
+  // and the default is still the constant this test sizes above.
+  assert.equal(
+    (src.match(/let runDeadline =/g) || []).length,
+    1,
+    "the run must take a deadline once — a second one would be a phase carrying its own number",
+  );
   assert.match(
     src,
-    /let runDeadline = monotonicNow\(\) \+ NODE_DEFS_RUN_BUDGET_MS;/,
-    "the run must take a deadline once, before any phase starts",
+    /let runDeadline =\s*monotonicNow\(\) \+\s*\(Number\.isFinite\(runOpts\?\.runBudgetMs\) && runOpts\.runBudgetMs > 0\s*\? runOpts\.runBudgetMs\s*: NODE_DEFS_RUN_BUDGET_MS\);/,
+    "the run must take a deadline once, before any phase starts, defaulting to the run budget",
   );
   // …and give back what the UNBOUNDED local work took, or that work spends the deadline
   // rather than merely escaping it. Without this, a slow install (#610 measured the whole
