@@ -197,6 +197,7 @@ import {
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeDef } from "./lib/single-node-def.js";
+import { withWorkflowUuid } from "./lib/graph-view-identity.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
@@ -8757,25 +8758,28 @@ function refreshPromotedParents(parents, canvas) {
  *  lockstep (#220/#308). */
 function describeActiveGraph(graph) {
   const root = app?.graph;
-  if (!root || !graph || graph === root) return { scope: "root" };
+  if (!root || !graph || graph === root) return withWorkflowUuid({ scope: "root" }, root);
   const owner = findSubgraphOwner(root, graph);
   if (owner) {
-    return {
+    return withWorkflowUuid({
       scope: "subgraph",
       owner_node_id: owner.id ?? null,
       title: owner.title ?? graph?.name ?? "subgraph",
-    };
+    }, root);
   }
   // Ownerless but authoritatively part of the root via its subgraphs registry — a
   // valid registry-owned subgraph, exactly what resolveScope keeps (NOT stale). Must
   // report "subgraph" here too, else `viewing` would say root while reads/edits act
   // on the subgraph — reintroducing the #308/#220 divergence.
   if (isSubgraphInRoot(root, graph)) {
-    return { scope: "subgraph", owner_node_id: null, title: graph?.name ?? "subgraph" };
+    return withWorkflowUuid(
+      { scope: "subgraph", owner_node_id: null, title: graph?.name ?? "subgraph" },
+      root,
+    );
   }
   // Neither owned nor registered — a stale reference; report root to match
   // getGraphCtx()'s reconciliation (read + edit stay in lockstep).
-  return { scope: "root" };
+  return withWorkflowUuid({ scope: "root" }, root);
 }
 
 // ---- per-turn graph snapshots (rollback foundation, #44) -------------------
