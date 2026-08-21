@@ -37,6 +37,7 @@
 
 import { isFrontendVirtualNode } from "./frontend-virtual-nodes.js";
 import {
+  authoritativeComboValues,
   parseAnnotatedFilepath,
   splitInputAssetRef,
   uploadConfigOf,
@@ -65,7 +66,8 @@ export function optionsLookLikeFiles(options) {
  *
  * @param {unknown} body the parsed response — `{ [class]: { input: { required, optional } } }`
  * @param {string} className
- * @returns {Map<string, string[]>|null} widget name -> allowed values, or null when
+ * @returns {Map<string, Array<string|number|boolean>>|null} widget name -> the allowed
+ *   values AS DECLARED (a combo may publish numbers — see `comboOffers`), or null when
  *   the class is absent (an `{}` body). null means UNKNOWN, never "no combos".
  */
 export function comboInputsOf(body, className) {
@@ -98,10 +100,39 @@ function parseClassCombos(body, className) {
     const entries = input[group];
     if (!entries || typeof entries !== "object") continue;
     for (const [name, def] of Object.entries(entries)) {
-      // A combo is declared as `[[...allowed], {opts}]`; a typed input as
-      // `["MODEL", {...}]`. Only the first form enumerates values.
-      if (Array.isArray(def) && Array.isArray(def[0])) {
-        options.set(name, def[0].filter((v) => typeof v === "string"));
+      // #745 (recurrence) — the option list is read through the ONE canonical
+      // reader, not off `def[0]`.
+      //
+      // `def[0]` is the option array only in the V1 shape `[[...allowed], {opts}]`.
+      // A V3-schema node (`IO.Combo.Input`, `@comfytype(io_type="COMBO")`) serializes
+      // as `["COMBO", { multiselect, options: [...] }]` — the literal type string sits
+      // at `def[0]` and the list lives under the config — so `Array.isArray(def[0])`
+      // filed every one of them under "not a combo" and the scan skipped the widget
+      // ENTIRELY: no finding, and no `unchecked_nodes` entry either, which is the
+      // silent drop this module exists to prevent.
+      //
+      // MEASURED against this machine's live ComfyUI 0.33.2 /object_info (853 types,
+      // 652 combo inputs): the `def[0]` read recognised 61 — every one of them V1.
+      // `authoritativeComboValues` recognises 528 (61 V1 + 467 V2), of which 27 are
+      // server-declared EMPTY, i.e. exactly the reporter's class of case. The scan was
+      // blind to 91% of the combos on the canvas it was asked to judge.
+      //
+      // Strictness is unchanged in the direction that matters: the reader yields null
+      // for a REMOTE V2 (1 input) and a dynamic V3 (123 inputs) because those lists are
+      // genuinely unread, so an unread list is never mistaken for an empty one. Those
+      // stay unjudged, exactly as they are today.
+      //
+      // The list is stored AS DECLARED. Dropping non-strings — which the V1-era read
+      // did, harmlessly, because every V1 list on the live server is all-strings —
+      // would collapse an INTEGER list to `[]`, and `[]` means "the server enumerates
+      // nothing, so every value is unavailable". Measured: 15 inputs publish pure-int
+      // lists (`LtxvApiTextToVideo.duration [6,8,…]`, `MinimaxHailuoVideoNode.duration
+      // [6,10]`, …) and ALL FIFTEEN are V2, so every one of them would have been a
+      // false `missing_asset` introduced by this change and by nothing else.
+      if (!Array.isArray(def)) continue;
+      const values = authoritativeComboValues(def);
+      if (Array.isArray(values)) {
+        options.set(name, values);
         configs.set(name, def[1] && typeof def[1] === "object" ? def[1] : {});
       }
     }
@@ -163,6 +194,62 @@ export function linkDrivenWidgetNames(node) {
 const UNENUMERABLE_PREFIX =
   "not checked: this value names a file below the input root (or under an " +
   "[output]/[temp]/[input] annotation), which /object_info's combo list cannot enumerate";
+
+/**
+ * #745 — TRUE when the server's list OFFERS `value`, compared the way the SERVER
+ * compares it. Type-faithful on purpose: `"10"` is NOT offered by `[6, 8, 10]`.
+ *
+ * An earlier revision of this fix coerced numeric options to strings so that a widget
+ * holding `"10"` matched an option `10`. Review (codex, P1) called that a false
+ * negative, and the SERVER settles it. `execution.py` validates a combo with
+ *
+ *     invalid_vals = [val] if val not in combo_options else []
+ *
+ * and Python's `in` is `==`, under which `"10" == 10` is **False**. Verified by
+ * execution against this machine's ComfyUI 0.33.2 interpreter:
+ *
+ *     10 in [6,8,10]      -> True     (accepted)
+ *     "10" in [6,8,10]    -> False    (rejected: value_not_in_list)
+ *     10.0 in [6,8,10]    -> True     (accepted — JS has one number type, so `===`
+ *                                      reproduces this for free)
+ *
+ * So a stringified numeric value is a REAL defect in the graph, not a harmless
+ * spelling of a good one, and the coercion was hiding it. The ComfyUI frontend
+ * stringifying combo values on queue (Comfy-Org/ComfyUI_frontend#14641) is exactly
+ * how a canvas acquires one — which makes reporting it the useful behaviour, since
+ * the queue would fail with `Value not in list` and nothing else would have warned.
+ */
+export function comboOffers(options, value) {
+  if (!Array.isArray(options)) return false;
+  return options.some((o) => serverConsidersEqual(o, value));
+}
+
+/**
+ * Python `==` for the primitive types a combo can carry, because that is the operator
+ * `val not in combo_options` actually runs. Two rules, both measured against this
+ * machine's ComfyUI 0.33.2 interpreter rather than inferred:
+ *
+ *   - a string NEVER equals a number or a boolean — `"10" == 10` is False, and that
+ *     is what makes a stringified value a real defect rather than a spelling (#14641);
+ *   - a BOOLEAN equals a number when it equals it numerically, because `bool` is a
+ *     subclass of `int`: `True == 1` and `False == 0` are both True.
+ *
+ * The second rule is the one that keeps the boolean fix from becoming a false positive:
+ *
+ *     True  in [False]      -> False   (report)      True  in [1, 2]  -> True  (clean)
+ *     False in [False]      -> True    (clean)       False in [1, 2]  -> False (report)
+ *     True  in [True,False] -> True    (clean)       False in [0, 1]  -> True  (clean)
+ *
+ * A bare `===` would call `true` unavailable on options `[1, 2]`, which the server
+ * accepts. JS has one number type, so `10 == 10.0` needs nothing extra.
+ */
+function serverConsidersEqual(option, value) {
+  if (option === value) return true;
+  // bool <-> number only. Never string <-> anything.
+  const a = typeof option === "boolean" ? (option ? 1 : 0) : option;
+  const b = typeof value === "boolean" ? (value ? 1 : 0) : value;
+  return typeof a === "number" && typeof b === "number" && a === b;
+}
 
 export async function scanComboAvailability(
   nodes,
@@ -334,11 +421,37 @@ export async function scanComboAvailability(
       const options = combos.get(name);
       if (!options) continue; // not a combo input — nothing to judge it against
       const value = widget.value;
-      if (typeof value !== "string" || value === "") continue;
-      if (options.includes(value)) continue;
+      // #745 (codex P1) — a NUMERIC value is judged, not skipped.
+      //
+      // This read was `typeof value !== "string"`, which silently passed every numeric
+      // combo as clean: `duration: 99` against options `[6, 8, 10]` produced NO finding,
+      // while the server rejects it with `value_not_in_list`. Before this branch that
+      // was unreachable — all 44 numeric options on the live server sit on V2 combos the
+      // scan could not read at all — so teaching the scan to READ numeric lists without
+      // also teaching it to JUDGE numeric values left the seam open on the far side.
+      // A false NEGATIVE on get_errors is the failure this tool exists to prevent.
+      //
+      // Gate round 2 (codex P1) extended this to BOOLEANS for the same reason: with
+      // `options: [false]` and a widget holding `true`, the server rejects and the scan
+      // was returning clean. Judging them requires the bool/int rule in `comboOffers` —
+      // without it `true` on options `[1, 2]` would be reported, and the server ACCEPTS
+      // that. No live combo declares boolean options (measured: string 2630, number 44,
+      // boolean 0), so this closes the shape rather than a sighting.
+      //
+      // Still skipped: `null`/`undefined`, an empty string, and any object. `0` and
+      // `false` are real combo values and must NOT be dropped by a truthiness test.
+      if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+        continue;
+      }
+      if (value === "") continue;
+      if (comboOffers(options, value)) continue;
       // #1357 — before calling it missing, check whether this combo could have
-      // listed it at all.
-      const asset = await adjudicateUnenumerableAsset(entry.configs?.get(name), value);
+      // listed it at all. Only a STRING can name a file, so a numeric value skips
+      // straight to the verdict rather than through the annotated-filepath parser.
+      const asset =
+        typeof value === "string"
+          ? await adjudicateUnenumerableAsset(entry.configs?.get(name), value)
+          : null;
       if (asset?.present) continue;
       if (asset?.reason) {
         unknown.push({ id: node.id, type: className, widget: name, value, reason: asset.reason });

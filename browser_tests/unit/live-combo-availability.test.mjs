@@ -21,6 +21,8 @@ import test from "node:test";
 import {
   scanComboAvailability,
   comboInputsOf,
+  comboConfigsOf,
+  comboOffers,
   optionsLookLikeFiles,
   comboAvailabilityNote,
   linkDrivenWidgetNames,
@@ -299,4 +301,273 @@ test("#984 linkDrivenWidgetNames reports only CONNECTED inputs", () => {
   );
   assert.deepEqual([...linkDrivenWidgetNames(null)], []);
   assert.deepEqual([...linkDrivenWidgetNames({ inputs: {} })], []);
+});
+
+// ---------------------------------------------------------------------------
+// panel#745 RECURRENCE (reopened 2026-08-21, panel 0.15.19) — the scan omitted
+// every combo declared in the V2/V3 wire shape.
+//
+// A V3-schema node (`IO.Combo.Input` under `@comfytype(io_type="COMBO")`) puts the
+// literal string "COMBO" at spec[0] and the list under the config, so the old
+// `Array.isArray(def[0])` read filed it as "not a combo" and the widget was skipped
+// ENTIRELY — no finding AND no unchecked_nodes entry.
+//
+// Every fixture below is VERBATIM from this machine's live ComfyUI 0.33.2
+// /api/object_info (853 types, 652 combo inputs). The def[0] read recognised 61 of
+// them, all V1; reading through `authoritativeComboValues` recognises 528.
+// ---------------------------------------------------------------------------
+
+/** Load3D.model_file, copied verbatim from GET /api/object_info/Load3D. */
+const LOAD3D = classBody("Load3D", {
+  model_file: ["COMBO", { multiselect: false, options: ["none"], file_upload: true }],
+  image: ["LOAD_3D", {}],
+  width: ["INT", { default: 1024, min: 1, max: 4096, step: 1 }],
+});
+
+/** LoadAudio.audio — a V2 combo the server declares EMPTY, live-verified shape. */
+const LOAD_AUDIO = classBody("LoadAudio", {
+  audio: ["COMBO", { multiselect: false, options: [], audio_upload: true }],
+});
+
+test("#745 recurrence: the reporter's case — a V2 combo value the server does not offer IS reported", async () => {
+  // #1571 taught the panel that `file_upload` IS an upload kind, so `3d/absent.glb`
+  // (a SUBFOLDER value) now routes through #1357's abstention and the server's own
+  // /view probe decides it. Production always injects that probe, so the fixture must
+  // too — without it this asserts against a shape production never has.
+  const r = await scanComboAvailability(
+    [node(12, "Load3D", [{ name: "model_file", value: "3d/absent.glb" }])],
+    async () => LOAD3D,
+    { confirmServerAsset: () => false }, // the server answered: not on disk
+  );
+  assert.equal(r.unavailable.length, 1, "a V2 combo must be judged, not skipped");
+  assert.equal(r.unavailable[0].widget, "model_file");
+  assert.equal(r.unavailable[0].value, "3d/absent.glb");
+  assert.deepEqual(r.unknown, [], "it is a DETERMINED answer, not an unchecked one");
+});
+
+test("#745 recurrence: a V2 value the server DOES offer produces no finding", async () => {
+  const r = await scanComboAvailability(
+    [node(12, "Load3D", [{ name: "model_file", value: "none" }])],
+    async () => LOAD3D,
+  );
+  assert.deepEqual(r.unavailable, [], "must not report a value the server itself lists");
+  assert.deepEqual(r.unknown, []);
+});
+
+test("#745 recurrence: a server-declared-EMPTY V2 list is a real answer, like its V1 twin", async () => {
+  const r = await scanComboAvailability(
+    [node(3, "LoadAudio", [{ name: "audio", value: "song.mp3" }])],
+    async () => LOAD_AUDIO,
+  );
+  assert.equal(r.unavailable.length, 1, "zero options installed means the value is unavailable");
+  assert.equal(r.unavailable[0].option_count, 0);
+});
+
+test("#745 recurrence: an UNREAD V2 list is never mistaken for an empty one", async () => {
+  // A remote list arrives from a separate fetch, and a dynamic V3's keys select
+  // SUB-INPUTS rather than values. Both must stay unjudged — reading either as []
+  // would report every value on them as missing, the mass-false-positive failure
+  // #774 refused to risk.
+  for (const spec of [
+    ["COMBO", { remote: { route: "/api/models" } }],
+    ["COMBO", { remote: { route: "/api/models" }, options: [] }],
+    ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "a", inputs: [] }] }],
+  ]) {
+    const body = classBody("Remote", { pick: spec });
+    const r = await scanComboAvailability(
+      [node(1, "Remote", [{ name: "pick", value: "anything_at_all" }])],
+      async () => body,
+    );
+    assert.deepEqual(r.unavailable, [], `must not judge against an unread list: ${JSON.stringify(spec)}`);
+  }
+});
+
+test("#745 recurrence: an ANNOTATED value on an upload combo abstains, never accuses", async () => {
+  // `chair.glb [output]` resolves through exists_annotated_filepath and runs fine, and
+  // NO option list on the live server carries an annotation (measured: 0 of 652), so
+  // non-membership says nothing about it. Since #1571 this is the canonical #1357 path
+  // — `file_upload` is a recognised upload kind — rather than the local workaround an
+  // earlier revision of this branch carried.
+  const r = await scanComboAvailability(
+    [node(99, "Load3D", [{ name: "model_file", value: "chair.glb [output]" }])],
+    async () => LOAD3D,
+  );
+  assert.deepEqual(r.unavailable, [], "an annotated value must not be reported as missing");
+  assert.equal(r.unknown.length, 1, "and must not be silently dropped either");
+  assert.match(r.unknown[0].reason, /cannot enumerate/);
+});
+
+
+test("#745 recurrence: comboInputsOf reads V1 and V2 alike, and configs come with them", () => {
+  assert.deepEqual([...comboInputsOf(LOAD3D, "Load3D").entries()], [["model_file", ["none"]]]);
+  assert.deepEqual(
+    comboConfigsOf(LOAD3D, "Load3D").get("model_file"),
+    { multiselect: false, options: ["none"], file_upload: true },
+    "the V2 config must travel with the list, or the #1357 upload abstention cannot arm",
+  );
+  assert.equal(comboInputsOf(LOAD3D, "NoSuchClass"), null, "an absent class is still UNKNOWN");
+});
+
+/** LtxvApiTextToVideo.duration — a V2 combo publishing INTEGERS, live-verified shape. */
+const INT_COMBO = classBody("LtxvApiTextToVideo", {
+  duration: ["COMBO", { multiselect: false, options: [6, 8, 10] }],
+});
+
+test("#745 recurrence: an INTEGER option list is never collapsed to 'nothing installed'", async () => {
+  // Measured: 15 inputs publish pure-int lists and ALL FIFTEEN are V2, so filtering
+  // non-strings out of the stored list would turn every one into `option_count: 0`
+  // — which this module reads as "the server enumerates nothing" — and label a
+  // perfectly good graph `missing_asset`. Introduced by reading V2, by nothing else.
+  const r = await scanComboAvailability(
+    [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: "99" }])],
+    async () => INT_COMBO,
+  );
+  assert.equal(r.unavailable.length, 1, "a genuinely off-list value is still reported");
+  assert.equal(r.unavailable[0].option_count, 3, "the list is NOT empty and must not say it is");
+  assert.equal(r.unavailable[0].kind, "invalid_value", "an int list names modes, not files on disk");
+});
+
+test("#745 codex P1: a STRINGIFIED numeric value is REPORTED — the server rejects it", async () => {
+  // This test previously asserted the OPPOSITE, and that assertion was the defect.
+  // ComfyUI validates a combo with `val not in combo_options`, and Python's `in` is
+  // `==`, under which `"10" == 10` is False — verified against this machine's 0.33.2
+  // interpreter. So `"10"` on `[6, 8, 10]` fails the queue with `value_not_in_list`,
+  // and calling it clean was a false negative. The frontend stringifying combo values
+  // on queue (Comfy-Org/ComfyUI_frontend#14641) is how a canvas acquires one, which is
+  // exactly why it is worth reporting rather than papering over.
+  const r = await scanComboAvailability(
+    [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: "10" }])],
+    async () => INT_COMBO,
+  );
+  assert.equal(r.unavailable.length, 1, "the server would reject this value");
+  assert.equal(r.unavailable[0].value, "10");
+});
+
+test("#745 codex P1: a NUMERIC value the server does not offer is REPORTED, not skipped", async () => {
+  // The value guard read `typeof value !== "string"`, so every numeric combo passed as
+  // clean. `duration: 99` against `[6, 8, 10]` returned {unavailable:[],unknown:[]} in
+  // execution while the server rejects it. Unreachable before this branch — all 44
+  // numeric options on the live server sit on V2 combos the scan could not read.
+  const r = await scanComboAvailability(
+    [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: 99 }])],
+    async () => INT_COMBO,
+  );
+  assert.equal(r.unavailable.length, 1, "a numeric value must be judged, not skipped");
+  assert.equal(r.unavailable[0].value, 99);
+  assert.equal(r.unavailable[0].option_count, 3);
+});
+
+test("#745 codex P1: a NUMERIC value the server DOES offer stays clean", async () => {
+  // Must be clean because it MATCHED, not because it was skipped — the direction the
+  // old guard got right by accident and would have kept getting right while wrong.
+  const r = await scanComboAvailability(
+    [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: 10 }])],
+    async () => INT_COMBO,
+  );
+  assert.deepEqual(r.unavailable, [], "the server offers 10");
+  assert.deepEqual(r.unknown, []);
+});
+
+test("#745 codex P1: 0 is a real combo value and is never dropped as falsy", async () => {
+  const ZERO = classBody("Z", { pick: ["COMBO", { options: [0, 1, 2] }] });
+  const ok = await scanComboAvailability([node(1, "Z", [{ name: "pick", value: 0 }])], async () => ZERO);
+  assert.deepEqual(ok.unavailable, [], "0 is offered");
+  const bad = await scanComboAvailability([node(1, "Z", [{ name: "pick", value: 7 }])], async () => ZERO);
+  assert.equal(bad.unavailable.length, 1, "7 is not offered and must be reported");
+});
+
+test("#745 codex P1: comboOffers is TYPE-FAITHFUL — it reproduces the server's own compare", () => {
+  assert.equal(comboOffers([6, 10], 10), true, "int matches int");
+  assert.equal(comboOffers([6, 10], "10"), false, 'Python: "10" == 10 is False');
+  assert.equal(comboOffers([6, 10], 7), false);
+  assert.equal(comboOffers(["10"], 10), false, "and not in the other direction either");
+  assert.equal(comboOffers(["a.safetensors"], "a.safetensors"), true);
+  assert.equal(comboOffers([{ key: "a" }], "[object Object]"), false, "no structure may be flattened into a match");
+  assert.equal(comboOffers(null, "x"), false);
+});
+
+test("#745 a non-primitive or absent widget value is still skipped", async () => {
+  for (const v of [null, undefined, {}, [], ""]) {
+    const r = await scanComboAvailability(
+      [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: v }])],
+      async () => INT_COMBO,
+    );
+    assert.deepEqual(r.unavailable, [], `must not judge ${JSON.stringify(v) ?? "undefined"}`);
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// Gate round 2 (codex P1) — BOOLEAN combo values were skipped, so `options: [false]`
+// with a widget holding `true` returned clean while the server rejects it.
+//
+// The naive fix (judge booleans with `===`) introduces a FALSE POSITIVE, because
+// Python's `bool` is a subclass of `int`: `True in [1, 2]` is True, i.e. the server
+// ACCEPTS it. Every expectation below is the real ComfyUI 0.33.2 interpreter's answer
+// for `value in options`, not a guess about what it ought to be.
+// ---------------------------------------------------------------------------
+
+test("#745 gate-r2: a BOOLEAN value the server does not offer is REPORTED, not skipped", async () => {
+  const BOOL = classBody("B", { flag: ["COMBO", { options: [false] }] });
+  const r = await scanComboAvailability(
+    [node(1, "B", [{ name: "flag", value: true }])],
+    async () => BOOL,
+  );
+  assert.equal(r.unavailable.length, 1, "True in [False] is False — the server rejects it");
+  assert.equal(r.unavailable[0].value, true);
+});
+
+test("#745 gate-r2: a BOOLEAN value the server DOES offer stays clean", async () => {
+  const BOOL = classBody("B", { flag: ["COMBO", { options: [true, false] }] });
+  for (const v of [true, false]) {
+    const r = await scanComboAvailability(
+      [node(1, "B", [{ name: "flag", value: v }])],
+      async () => BOOL,
+    );
+    assert.deepEqual(r.unavailable, [], `${v} is offered by [true, false]`);
+  }
+});
+
+test("#745 gate-r2: bool/int equivalence — true on [1,2] is ACCEPTED, so it must not be reported", async () => {
+  // The false positive the naive boolean fix would have created. Python: bool is a
+  // subclass of int, so `True == 1`. A bare `===` calls this unavailable; the server
+  // runs it fine.
+  const INT = classBody("I", { pick: ["COMBO", { options: [1, 2] }] });
+  const clean = await scanComboAvailability([node(1, "I", [{ name: "pick", value: true }])], async () => INT);
+  assert.deepEqual(clean.unavailable, [], "True in [1, 2] is True — the server accepts it");
+  const reported = await scanComboAvailability([node(1, "I", [{ name: "pick", value: false }])], async () => INT);
+  assert.equal(reported.unavailable.length, 1, "False in [1, 2] is False — rejected");
+});
+
+test("#745 gate-r2: comboOffers reproduces the interpreter EXACTLY over a measured truth table", () => {
+  // Generated by running `value in options` in this machine's ComfyUI 0.33.2 Python and
+  // transported over JSON — the same collapse the /object_info wire performs, so this
+  // is the comparison that actually governs. The full generated table is 132 rows and
+  // agrees 132/132; these are the rows that discriminate between candidate rules.
+  const TABLE = [
+    { options: [false], value: true, accepts: false },
+    { options: [false], value: false, accepts: true },
+    { options: [false], value: 0, accepts: true },
+    { options: [false], value: 1, accepts: false },
+    { options: [true, false], value: 1, accepts: true },
+    { options: [true, false], value: "true", accepts: false },
+    { options: [0, 1], value: true, accepts: true },
+    { options: [0, 1], value: false, accepts: true },
+    { options: [1, 2], value: true, accepts: true },
+    { options: [1, 2], value: false, accepts: false },
+    { options: [6, 8, 10], value: 10, accepts: true },
+    { options: [6, 8, 10], value: "10", accepts: false },
+    { options: [6, 8, 10], value: 10.0, accepts: true },
+    { options: ["10"], value: 10, accepts: false },
+    { options: ["10"], value: "10", accepts: true },
+    { options: ["0"], value: 0, accepts: false },
+    { options: [], value: "a", accepts: false },
+  ];
+  for (const { options, value, accepts } of TABLE) {
+    assert.equal(
+      comboOffers(options, value),
+      accepts,
+      `python: ${JSON.stringify(value)} in ${JSON.stringify(options)} === ${accepts}`,
+    );
+  }
 });
