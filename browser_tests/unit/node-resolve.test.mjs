@@ -1146,6 +1146,111 @@ test("mcp#2000 add_node: object_info UNAVAILABLE still fails closed for everythi
   );
 });
 
+// ---- mcp#2000 PARITY: the SAME relaxation in the two set_widget guards. All three
+//      /object_info-oracle guards had the identical `!freshDefs` early throw, so fixing
+//      only add_node would have shipped HALF the documented annotation path — the note
+//      appears and its text can never be written. Measured on origin/main before
+//      extending the fix: with the fetch unavailable the write REFUSED, and the control
+//      (same state, fetch answering) WROTE, so the probe was proving the product and not
+//      itself. One copy relaxed alone is the #496 drift again, hence all three. --------
+
+test("mcp#2000 set_widget: assertTypeAgainstFreshBackend exempts an authorized frontend-only type when object_info is unavailable", () => {
+  const reg = registryWithNatives();
+  const node = { id: 7, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  assert.doesNotThrow(() =>
+    assertTypeAgainstFreshBackend(null, "MarkdownNote", 7, {
+      registry: reg,
+      node,
+      wasTypeEverDefined: () => false,
+    }),
+  );
+  // …and every other direction still fails closed on the SAME unavailable map.
+  for (const [why, type, opts] of [
+    ["a real backend type", "KSampler", { registry: reg, wasTypeEverDefined: () => false }],
+    ["a non-allowlisted type", "TotallyMadeUpNode", { registry: reg, wasTypeEverDefined: () => false }],
+    ["an ever-seen (removed) allowlisted name", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => true }],
+    ["a pending baseline", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => HISTORY_PENDING }],
+    ["an unseeded baseline", "MarkdownNote", { registry: reg, node, wasTypeEverDefined: () => HISTORY_UNSEEDED }],
+    ["no registry wired at all", "MarkdownNote", { node, wasTypeEverDefined: () => false }],
+    ["a provenance-bearing husk", "MarkdownNote", { registry: loadedRegistry(["MarkdownNote"]), wasTypeEverDefined: () => false }],
+  ]) {
+    assert.throws(
+      () => assertTypeAgainstFreshBackend(null, type, 7, opts),
+      /cannot verify|object_info is unavailable|no usable/i,
+      `mcp#2000: ${why} must still fail closed`,
+    );
+  }
+  // A stale backend INSTANCE under a bare native class of the same name is refused by
+  // the instance-provenance clause, which only this guard family has.
+  assert.throws(
+    () =>
+      assertTypeAgainstFreshBackend(null, "MarkdownNote", 7, {
+        registry: reg,
+        node: { id: 7, type: "MarkdownNote", constructor: { comfyClass: "MarkdownNote" } },
+        wasTypeEverDefined: () => false,
+      }),
+    /cannot verify|no usable/i,
+  );
+});
+
+test("mcp#2000 set_widget: assertMutatedNodeAuthorized keeps the same terms on the unavailable path", () => {
+  const reg = registryWithNatives();
+  const node = { id: 9, type: "MarkdownNote", constructor: reg["MarkdownNote"] };
+  assert.doesNotThrow(() => assertMutatedNodeAuthorized(null, reg, node, "target", () => false));
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, reg, node, "target", () => true),
+    /cannot verify|object_info is unavailable/i,
+    "an ever-seen removal still wins",
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, reg, { id: 9, type: "KSampler" }, "target", () => false),
+    /cannot verify|object_info is unavailable/i,
+    "a real backend type still needs the fetch",
+  );
+  assert.throws(
+    () => assertMutatedNodeAuthorized(null, undefined, node, "target", () => false),
+    /cannot verify|object_info is unavailable/i,
+    "no registry wired ⇒ no exemption",
+  );
+});
+
+test("mcp#2000 set_widget e2e: the documented annotation path COMPLETES through the production handler when object_info never answers", async () => {
+  // THE WHOLE POINT: add the note, then put the text in it. Driving runSetWidget — the
+  // body graph_set_widget delegates to — not a predicate in isolation.
+  const history = createObjectInfoHistory();
+  history.recordTypes({ KSampler: {}, SaveImage: {} });
+  history.markSeeded();
+  history.recordTypes(null); // the timed-out refresh
+
+  const ctor = function MarkdownNoteNative() {};
+  const reg = loadedRegistry();
+  reg["MarkdownNote"] = ctor;
+  const node = { id: 42, type: "MarkdownNote", widgets: [{ name: "text", type: "text", value: "" }], constructor: ctor };
+  const { set } = await runSetWidget(node, "text", "hello", {
+    registry: reg,
+    getFreshObjectInfo: async () => null, // the fetch never answers
+    wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+    ...HOOKS,
+  });
+  assert.equal(set.value, "hello");
+  assert.equal(node.widgets[0].value, "hello", "the note is fillable, not just addable");
+
+  // CONTROL: a REAL backend node in the identical state still refuses — the relaxation
+  // is scoped to frontend-only types, not to "object_info is down".
+  const ksNode = { id: 43, type: "KSampler", widgets: [{ name: "steps", type: "INT", value: 1 }], constructor: reg["KSampler"] };
+  await assert.rejects(
+    () =>
+      runSetWidget(ksNode, "steps", 20, {
+        registry: reg,
+        getFreshObjectInfo: async () => null,
+        wasTypeEverDefined: (t) => history.wasTypeEverDefined(t),
+        ...HOOKS,
+      }),
+    /cannot verify|object_info is unavailable|no usable/i,
+  );
+  assert.equal(ksNode.widgets[0].value, 1, "the refused write left the node untouched");
+});
+
 // ---- #1296: an allowlisted FRONTEND-ONLY type that is NOT in the live registry is
 //      still refused (LiteGraph could only mint a placeholder — that part is
 //      correct), but the refusal must stop diagnosing it as "not installed / its

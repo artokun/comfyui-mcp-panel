@@ -427,6 +427,16 @@ export function assertMutatedNodeAuthorized(freshDefs, registry, node, role = "t
   const id = node?.id ?? "(unknown)";
   const label = typeof type === "string" ? ` ("${type}")` : "";
   if (!freshDefs || typeof freshDefs !== "object") {
+    // mcp#2000 — same exemption, same terms, same reason as the add guard: neither
+    // clause reads `freshDefs`, and for a frontend-only type a successful fetch would
+    // have said nothing about it anyway. Kept in step with the two sibling guards
+    // deliberately — one copy relaxed alone is the #496 drift all over again.
+    if (
+      backendHistoryVerdict(type, wasTypeEverDefined) === "never-seen" &&
+      isAuthorizedFrontendOnlyType(registry, type, node)
+    ) {
+      return;
+    }
     throw new Error(
       `Cannot set widget on node ${id}${label}: cannot verify the ${role} node against the ` +
         `ComfyUI backend (object_info is unavailable). Refusing to write rather than trust a ` +
@@ -802,7 +812,9 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * a STALE POSITIVE for an uninstalled pack when the browser tab was never reloaded
  * after a ComfyUI restart. `freshDefs` is the freshly-fetched /object_info map (or
  * null/undefined when the fetch failed). FAILS CLOSED in both directions:
- *   - fetch unavailable (null/non-object) ⇒ "cannot verify against backend"; and
+ *   - fetch unavailable (null/non-object) ⇒ "cannot verify against backend" — except
+ *     for an authorized frontend-only type, which the fetch could not have spoken to
+ *     either way (mcp#2000); and
  *   - type absent from the fresh map ⇒ "backend does not provide" (removed pack).
  * Never authorizes from the stale registry. Pure — no side effects — so the caller
  * can run it on the exact target it is about to mutate, before any mutation.
@@ -815,9 +827,11 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
  * frontend canvas edit and legitimately has no /object_info entry. This does NOT
  * reopen the #458 hole: a REMOVED backend node (whether it keeps a stale-positive
  * class WITH nodeData, or is left as a DEFLESS husk) is NOT on the allowlist and is
- * still refused; and the exemption applies ONLY when object_info was fetched — a
- * genuinely UNVERIFIABLE type (fetch unavailable, null map) always fails closed below,
- * for every type.
+ * still refused. mcp#2000 — the exemption is NO LONGER scoped to "object_info was
+ * fetched": it is applied on the unavailable path too, on identical terms, because
+ * neither of its clauses reads `freshDefs` and a frontend-only type is absent from
+ * /object_info BY DESIGN, so a fetch that did not answer withheld nothing about it.
+ * Every OTHER type still fails closed on an unavailable map, exactly as before.
  *
  * `opts.registry` is the live LiteGraph registry used to recognize a frontend-only
  * type; `opts.node` is the actual write-target node whose OWN constructor is also
@@ -839,6 +853,17 @@ export function assertTypeAgainstFreshBackend(freshDefs, type, nodeId = "(unknow
       observed = typeof describeObjectInfoFailure === "function" ? describeObjectInfoFailure() || "" : "";
     } catch {
       observed = ""; // a diagnostic must never replace the refusal it is describing
+    }
+    // mcp#2000 — see assertAddNodeResolvableRefreshing. The exemption is evaluated
+    // BEFORE this refusal on exactly the terms the fetched-defs path below uses, and it
+    // is placed after `describeObjectInfoFailure` deliberately: that oracle only builds
+    // a diagnostic string, so an exempted write costs it nothing that matters and the
+    // refusal it explains still reads identically for every type that is refused.
+    if (
+      backendHistoryVerdict(type, wasTypeEverDefined) === "never-seen" &&
+      isAuthorizedFrontendOnlyType(registry, type, node)
+    ) {
+      return;
     }
     throw new Error(
       `Cannot set widget on node ${nodeId}${label}: cannot verify the node type against the ` +
