@@ -451,7 +451,17 @@ test("#1560: scopedAuthorizationTypes names EVERY type the fence asks about, fro
 test("#1560: the panel WIRES the scoped route, gated on the silence licence and on the command budget", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   assert.match(src, /fetchScopedObjectInfo:\s*async \(types\) => \{/, "the capability reaches runSetWidget");
-  assert.match(src, /if \(!noBackendAnswerEstablished\(oracleOutcomes\)\)/, "a route that ANSWERED is never overruled");
+  // The licence is DECIDED beside the snapshot's own verdict, on the SAME `outcome.outcomes`,
+  // in the same statement — and merely READ at the gate. A second reading of a fact
+  // established at a moment is how the two could disagree, and this handler enters
+  // `readObjectInfo` more than once (the #1126 live re-ask).
+  assert.match(
+    src,
+    /outcomes: outcome\?\.outcomes,\s*\}\);[\s\S]{0,400}?scopedReadLicensed = noBackendAnswerEstablished\(outcome\?\.outcomes\);/,
+    "decided in the same breath as objectInfoSnapshot.authorize, from the same evidence",
+  );
+  assert.match(src, /if \(!scopedReadLicensed\) \{/, "a route that ANSWERED is never overruled");
+  assert.match(src, /let scopedReadLicensed = false;/, "and it licenses nothing until a read establishes it");
   assert.match(src, /fetchTypeScopedObjectInfo\(types, \{/, "the panel calls the type-scoped reader");
   assert.match(src, /deadlineMs: budget\.bounded\(SCOPED_OBJECT_INFO_DEADLINE_MS\)/, "bounded by what the command has left");
   assert.match(src, /setWidgetSchemaProvenance = \(\) => "scoped"/, "the reply is told which route answered");

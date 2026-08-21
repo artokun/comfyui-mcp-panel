@@ -14255,13 +14255,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // its refusal, so the message would name routes another call tried. Declared in the
     // handler's own scope, so each invocation reports what IT observed.
     let oracleFailures = [];
-    // #1560 — the MACHINE-READABLE half of the same observation (#1223's tags), kept because
-    // the type-scoped last resort below may only be consulted when the whole-map routes went
-    // SILENT. A route that ANSWERED — threw, a non-gateway status, a client expressing
-    // deny-all as `{}` — must never be overruled by a broader per-class read, which is the
-    // one direction object-info-oracle.js's own note forbids. Per-request for exactly the
-    // reason `oracleFailures` is.
-    let oracleOutcomes = [];
+    // #1560 — may the TYPE-SCOPED last resort be consulted at all?
+    //
+    // Only when no whole-map route ANSWERED. A route that threw, returned a non-gateway
+    // status, or expressed deny-all as `{}` must never be overruled by a broader per-class
+    // read — the one direction object-info-oracle.js's own note forbids.
+    //
+    // CAPTURED WHERE THE SNAPSHOT MAKES THE SAME JUDGEMENT, from the SAME `outcome.outcomes`
+    // in the same statement — never re-read from a variable later. Storing the tag list and
+    // testing it at call time is a second reading of a fact that was established at a
+    // MOMENT, and this handler enters `readObjectInfo` more than once (the #1126 live
+    // re-ask). One verdict, decided beside the snapshot's, cannot disagree with it.
+    // Per-request for exactly the reason `oracleFailures` is.
+    let scopedReadLicensed = false;
     // #1223 — null while the authorization came from a LIVE probe; the oracle's failure
     // note once it came from the last-observed snapshot instead. Per-request for the same
     // reason `oracleFailures` is: a concurrent write must not make THIS reply claim a
@@ -14495,7 +14501,6 @@ const GRAPH_TOOL_EXECUTORS = {
         );
         const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
-        oracleOutcomes = defs ? [] : (outcome?.outcomes ?? []);
         if (defs) {
           // #1126 — ONE fact, from the one component that can establish it. The cache says
           // whether the answer it just handed back is the server speaking NOW ("live") or a
@@ -14532,6 +14537,8 @@ const GRAPH_TOOL_EXECUTORS = {
           socketDown: comfyBackendIsDown(),
           outcomes: outcome?.outcomes,
         });
+        // #1560 — the SAME evidence, read ONCE, in the same statement as the snapshot's.
+        scopedReadLicensed = noBackendAnswerEstablished(outcome?.outcomes);
         if (fallback.defs) {
           // Held for the reply. The write is about to be reported as SUCCEEDED and VERIFIED,
           // and it was verified against a schema nobody could re-fetch — an agent that is
@@ -14573,12 +14580,13 @@ const GRAPH_TOOL_EXECUTORS = {
       //
       // TWO GATES, both here rather than in the lib, because only this file holds the facts.
       //
-      //   1. THE SILENCE LICENCE. Consulted only when no whole-map route ANSWERED. The SAME
-      //      `noBackendAnswerEstablished` test #1223's snapshot licenses on, for the same
-      //      reason: a client that returned an empty schema has expressed deny-all, and a
-      //      broader per-class read must never overrule it. A timeout, a client that returned
-      //      NOTHING, or a proxy's 504 leave the question unanswered — those, and only those,
-      //      may be asked again by another route.
+      //   1. THE SILENCE LICENCE, decided beside the snapshot's own verdict on the SAME
+      //      `outcome.outcomes` and merely READ here. A client that returned an empty schema
+      //      has expressed deny-all, and a broader per-class read must never overrule it. A
+      //      timeout, a client that returned NOTHING, or a proxy's 504 leave the question
+      //      unanswered — those, and only those, may be asked again by another route. It is
+      //      false until a read establishes it, so an unwired or never-run oracle licenses
+      //      nothing.
       //   2. WHAT THE COMMAND HAS LEFT. The whole-map attempt has already spent most of the
       //      budget by the time this runs (measured on the reported shape: 15,015 ms of a 20s
       //      oracle deadline), so this takes `budget.bounded` like every other step and
@@ -14589,7 +14597,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // as a removed pack — and never fed to recordObjectInfoTypes, whose ever-seen history is
       // the fence's own trust root.
       fetchScopedObjectInfo: async (types) => {
-        if (!noBackendAnswerEstablished(oracleOutcomes)) {
+        if (!scopedReadLicensed) {
           return {
             defs: null,
             covered: [],
