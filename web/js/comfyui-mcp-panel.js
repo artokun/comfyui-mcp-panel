@@ -484,6 +484,7 @@ import {
 import {
   deferChangeTrackerSnapshot,
   flushPendingChangeTrackerSnapshot,
+  trackerCaptureSuppressed,
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
@@ -3260,9 +3261,13 @@ function captureWasSuppressed(tracker) {
     if (typeof tracker?._restoringState === "undefined") return true;
     if (typeof tracker?.changeCount === "undefined") return true;
     if (typeof tracker?.constructor?.isLoadingGraph === "undefined") return true;
-    if (tracker._restoringState) return true; // an undo/redo is restoring
-    if (Number(tracker.changeCount) > 0) return true; // inside a change transaction
-    if (tracker.constructor.isLoadingGraph) return true; // a graph is loading
+    // The three conditions themselves live in ONE place (panel#1563), so this
+    // question and the retry's question can never disagree about what upstream's
+    // early return reads. Only the DEFAULT for an unreadable tracker differs, and
+    // that difference is the shape-first block above: here an unknown tracker is
+    // suppressed (a close must not discard a canvas on an unproven flag), there it
+    // is not (a retry must not spin on a frontend it cannot read).
+    if (trackerCaptureSuppressed(tracker)) return true;
     const graph =
       window.comfyAPI?.app?.app?.graph ?? (typeof app !== "undefined" ? app?.graph : null);
     return !graph;
@@ -3686,6 +3691,48 @@ function installCreateBoundaryFork(appRef) {
 // satisfies the stamp check; a crossed one is refused here too, which is the point.
 let _savePathGuardInstalled = false;
 const _savePathGuardRefusalsLogged = new Set();
+/**
+ * panel#1563/#1564 — would this save persist a snapshot that has fallen BEHIND the
+ * canvas, and so report success for work the file will not contain?
+ *
+ * The write serializes `changeTracker.activeState`, and the refresh that is supposed
+ * to make it current (`prepareForSave()` → `captureCanvasState()`) is a SILENT no-op
+ * inside upstream's own load / undo / change-transaction windows. Measured on the live
+ * rig with one of those windows open: create_group landed on the canvas, the save
+ * answered `saved: true`, and the file came back without the group.
+ *
+ * TWO CONJUNCTS, both required, and the caller supplies neither by inference:
+ *
+ *   1. `trackerCaptureSuppressed` — upstream POSITIVELY reports it skipped the
+ *      capture. Without this a save could be refused for ordinary tracker lag, which
+ *      `prepareForSave` would have resolved a microsecond later.
+ *   2. the live root does not reproduce the state about to be written — the tolerant
+ *      comparison (`graphRootReproducesStateContent`), so a frontend that re-measures
+ *      node boxes or renumbers subgraph link ids on load does not manufacture a
+ *      refusal. Without this, a suppressed capture on an already-equal canvas — the
+ *      ordinary state of a clean tab — would block every save.
+ *
+ * ACTIVE WORKFLOW ONLY. `app.rootGraph` is the ACTIVE tab's canvas; comparing it with
+ * an inactive tab's snapshot would compare two different workflows and refuse a save
+ * that loses nothing. An unreadable identity answers false — a guard that cannot read
+ * its evidence must never invent a refusal (the same rule the #1667 guard states).
+ */
+function saveWouldPersistStaleSnapshot(wf, state) {
+  try {
+    if (!wf || !state || !Array.isArray(state.nodes)) return false;
+    const active = activeWorkflowRef();
+    if (!active || !sameWorkflowObject(active, wf)) return false;
+    const tracker = wf.changeTracker ?? null;
+    if (!tracker || !trackerCaptureSuppressed(tracker)) return false;
+    const appRef = window.comfyAPI?.app?.app ?? (typeof app !== "undefined" ? app : null);
+    const rootGraph = appRef?.rootGraph ?? appRef?.graph ?? null;
+    if (typeof rootGraph?.serialize !== "function") return false;
+    return graphRootReproducesStateContent({ rootGraph, state })?.proven !== true;
+  } catch {
+    return false;
+  }
+}
+
 function installSavePathGuard(appRef) {
   try {
     if (_savePathGuardInstalled) return;
@@ -3723,6 +3770,11 @@ function installSavePathGuard(appRef) {
           destinationPersisted: Boolean(destRecord) && destRecord?.isTemporary !== true,
           stampedPath: typeof stampedPath === "string" && stampedPath ? stampedPath : null,
           stampedPathOwnedByOther: Boolean(stampedRecord) && !sameWorkflowObject(stampedRecord, wf),
+          // panel#1563 — the OTHER way this funnel loses a graph: not a foreign
+          // canvas, just a snapshot upstream silently refused to refresh. Read from
+          // the same `state` the write serializes, so the check and the write can
+          // never be looking at different things.
+          snapshotIsStale: saveWouldPersistStaleSnapshot(wf, state),
         });
       } catch {
         verdict = { allow: true }; // a guard that cannot read its evidence must never invent a refusal
@@ -3732,7 +3784,7 @@ function installSavePathGuard(appRef) {
         // The autosave watcher logs a one-line "Auto save failed" for a thrown save;
         // make the refusal itself unmistakable in the console — but once per crossing,
         // not once per autosave retry.
-        const key = `${verdict.destinationPath}<-${verdict.stampedPath}`;
+        const key = `${verdict.reason}:${verdict.destinationPath}<-${verdict.stampedPath ?? ""}`;
         if (!_savePathGuardRefusalsLogged.has(key)) {
           _savePathGuardRefusalsLogged.add(key);
           try {

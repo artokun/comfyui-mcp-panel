@@ -16,21 +16,130 @@
 // graph command FLUSH the already-committed capture synchronously before its
 // fence runs: the capture was going to happen either way, so flushing changes
 // only WHEN it lands, never WHETHER.
+//
+// panel#1563/#1564 — ASKING FOR A CAPTURE IS NOT GETTING ONE. Measured on the
+// live rig (ComfyUI 0.33.2, frontend 1.49.6): `ChangeTracker.captureCanvasState`
+// opens with
+//
+//     if (!app.graph || this.changeCount > 0 || this._restoringState ||
+//         ChangeTracker.isLoadingGraph) return
+//
+// — a SILENT early return. No throw, no return value, nothing to await. While one
+// of those windows is open the tracker's `activeState` stops following the canvas,
+// and it never catches up on its own: upstream's only self-heal (`squashState`) is
+// scheduled from INSIDE a capture that succeeded, so a suppressed capture schedules
+// nothing, and `isLoadingGraph` suppresses `squashState` as well. Everything
+// downstream then reads a snapshot that is behind the canvas — the binding fence
+// refuses the right canvas with `root-shape-mismatch`, and a save (which serializes
+// `activeState`, not the live graph) writes a file missing whatever the canvas
+// gained.
+//
+// This is exactly why #1563's proposed fix — awaiting a thenable returned by
+// `captureCanvasState` — could not work, and #1564 is the measurement that proved
+// it: the suppressed call returns `undefined` synchronously, so there is nothing to
+// await. The answer is not to wait longer for one call, it is to NOTICE that the
+// call was swallowed and to ask again once the window closes. Every suppression
+// condition upstream is transient by construction (mid-undo, mid-load,
+// mid-transaction), so a bounded retry chain is all a stranded snapshot needs; the
+// durable case is caught instead by the save guard (`decideWorkflowSaveVerdict`),
+// which refuses to persist a snapshot that provably lost the canvas.
+
+/** Bounded retry schedule, in ms, for a capture upstream silently skipped.
+ *  Short and finite: the suppression windows are transient, and a chain that
+ *  never gives up would keep a dead workflow's record alive forever. */
+const SUPPRESSED_CAPTURE_RETRY_MS = Object.freeze([16, 50, 150, 400, 800]);
 
 let pendingSnapshot = null;
 
+/**
+ * Did upstream POSITIVELY tell us this capture was a no-op? (panel#1563)
+ *
+ * Reads the three fields `captureCanvasState`'s own early return reads. It is
+ * deliberately POSITIVE-evidence-only — an unrecognised tracker answers `false`,
+ * not `true` — because the one caller that acts on it here RETRIES, and retrying
+ * forever on a frontend whose fields were renamed would be a busy loop that no
+ * measurement asked for.
+ *
+ * That is the opposite default from the panel's `captureWasSuppressed`, which
+ * answers the different question "may I CLAIM the capture landed" for the
+ * destructive close path (#882) and must fail closed on an unknown shape. The two
+ * are kept in one place — `captureWasSuppressed` delegates the three conditions
+ * here — so the rule itself cannot drift between them; only the default for an
+ * unreadable tracker differs, and each caller states why.
+ */
+export function trackerCaptureSuppressed(tracker) {
+  try {
+    if (tracker?._restoringState === true) return true; // an undo/redo is restoring
+    if (Number(tracker?.changeCount) > 0) return true; // inside a change transaction
+    if (tracker?.constructor?.isLoadingGraph === true) return true; // a graph is loading
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Run the capture and report what actually happened.
+ *
+ *   attempted   a capture function existed and was called (the old return value).
+ *   landed      the tracker replaced its snapshot object — positive proof it captured.
+ *   suppressed  upstream skipped the call silently and the snapshot did not move.
+ *
+ * `landed:false, suppressed:false` is the ordinary NO-CHANGE case: the canvas
+ * already equals the snapshot, so upstream correctly left it alone. Only the
+ * suppressed case is a problem, and only that case is retried.
+ */
 function captureNow(changeTracker) {
   // `checkState` is DEPRECATED upstream — it warns, then delegates to this — so
   // prefer the current name and keep the old one as the fallback for older
   // frontends (mirrors captureCanvasIntoTracker's resolution order).
   const capture = changeTracker?.captureCanvasState ?? changeTracker?.checkState;
-  if (typeof capture !== "function") return false;
+  if (typeof capture !== "function") return { attempted: false, landed: false, suppressed: false };
+  // Read through a guard: `activeState` is a plain field today, but a version that
+  // makes it a throwing accessor must not blow past the deferred timer.
+  const readState = () => {
+    try {
+      return changeTracker.activeState;
+    } catch {
+      return undefined;
+    }
+  };
+  const before = readState();
   try {
     capture.call(changeTracker);
   } catch {
-    // Older frontends and transient workflow teardown keep undo best-effort.
+    // Older frontends and transient workflow teardown keep undo best-effort. A
+    // THROW is not the silent-no-op window this module retries: upstream told us
+    // it failed, and retrying a throwing tracker just repeats the failure.
+    return { attempted: true, landed: false, suppressed: false };
   }
-  return true;
+  const landed = readState() !== before;
+  return { attempted: true, landed, suppressed: !landed && trackerCaptureSuppressed(changeTracker) };
+}
+
+function armCapture(record, delayMs) {
+  // Read the scheduler into a local and call it BARE. `record.schedule(...)` is a
+  // METHOD call, so `this` would be the record — and the browser's `setTimeout`
+  // rejects any receiver that is not the window with "Illegal invocation", which on
+  // the live rig surfaced as the NEXT graph command failing rather than as a timer
+  // problem (caught by browser_tests/stale-snapshot-save-refused.spec.ts).
+  const schedule = record.schedule;
+  record.timer = schedule(() => runAttempt(record), delayMs);
+}
+
+function runAttempt(record) {
+  // A flush (or a newer defer) may have consumed the record already; the
+  // capture is diff-based and idempotent, so firing anyway is harmless — only
+  // the pending marker must not be cleared from under a NEWER record.
+  const outcome = captureNow(record.tracker);
+  if (!outcome.suppressed || record.attempt >= SUPPRESSED_CAPTURE_RETRY_MS.length) {
+    if (pendingSnapshot === record) pendingSnapshot = null;
+    return;
+  }
+  // Upstream swallowed it. Keep the record pending so the next graph command can
+  // still flush it, and ask again after the transient window has had time to close.
+  armCapture(record, SUPPRESSED_CAPTURE_RETRY_MS[record.attempt]);
+  record.attempt += 1;
 }
 
 /**
@@ -45,16 +154,10 @@ export function deferChangeTrackerSnapshot(changeTracker, schedule = setTimeout,
   ) {
     return false;
   }
-  const record = { tracker: changeTracker };
-  const timer = schedule(() => {
-    // A flush (or a newer defer) may have consumed the record already; the
-    // capture is diff-based and idempotent, so firing anyway is harmless — only
-    // the pending marker must not be cleared from under a NEWER record.
-    if (pendingSnapshot === record) pendingSnapshot = null;
-    captureNow(changeTracker);
-  }, 0);
-  record.cancel = () => cancel(timer);
+  const record = { tracker: changeTracker, schedule, attempt: 0 };
+  record.cancelTimer = () => cancel(record.timer);
   pendingSnapshot = record;
+  armCapture(record, 0);
   return true;
 }
 
@@ -65,11 +168,22 @@ export function deferChangeTrackerSnapshot(changeTracker, schedule = setTimeout,
  * it would stamp one workflow's canvas onto another's state. Returns whether a
  * pending snapshot was consumed. The timer is cancelled so the capture runs
  * exactly once.
+ *
+ * panel#1563 — if THIS capture is swallowed too, the record stays pending with its
+ * retry chain re-armed rather than being dropped. Consuming it would leave the
+ * snapshot stranded behind the canvas with nothing left to move it, which is the
+ * state the fence then refuses and the save then persists.
  */
 export function flushPendingChangeTrackerSnapshot(changeTracker) {
   const record = pendingSnapshot;
   if (!record || !changeTracker || record.tracker !== changeTracker) return false;
   pendingSnapshot = null;
-  record.cancel();
-  return captureNow(changeTracker);
+  record.cancelTimer();
+  const outcome = captureNow(changeTracker);
+  if (outcome.suppressed && record.attempt < SUPPRESSED_CAPTURE_RETRY_MS.length) {
+    pendingSnapshot = record;
+    armCapture(record, SUPPRESSED_CAPTURE_RETRY_MS[record.attempt]);
+    record.attempt += 1;
+  }
+  return outcome.attempted;
 }

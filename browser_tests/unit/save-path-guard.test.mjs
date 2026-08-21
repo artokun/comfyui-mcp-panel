@@ -19,6 +19,13 @@
  *   2. The REAL `installSavePathGuard`, extracted from the panel source and driven
  *      over a fake workflow store, proving the wrapper throws BEFORE the original
  *      save is called — nothing is written — and that a healthy save passes through.
+ *
+ * panel#1563/#1564 added a SECOND refusal to the same funnel: the state about to be
+ * written is not foreign, it is simply BEHIND the canvas, because upstream's pre-save
+ * `captureCanvasState()` was silently skipped. Same outcome as #1667 — a save that
+ * reports success and loses the user's work — reached without any identity crossing.
+ * Its cases live at the bottom of this file, pinned on both sides: the refusal, and
+ * every shape that must still save.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -32,6 +39,8 @@ import {
   SAVE_PATH_GUARD_REASON,
 } from "../../web/js/lib/save-path-guard.js";
 import { sameWorkflowObject } from "../../web/js/lib/workflow-chat-identity.js";
+import { trackerCaptureSuppressed } from "../../web/js/lib/change-tracker-snapshot.js";
+import { graphRootReproducesStateContent } from "../../web/js/lib/graph-binding.js";
 
 // ---------------------------------------------------------------------------
 // 1. The pure verdict.
@@ -161,24 +170,39 @@ function buildInstaller() {
   const source = src.slice(start, end);
 
   const warnings = [];
+  // panel#1563 — `saveWouldPersistStaleSnapshot` lives inside this same slice, so the
+  // wrapper's SECOND verdict is exercised as WIRED, not as a helper called by hand.
+  // Its collaborators are the REAL ones (the suppression predicate and the tolerant
+  // content comparison); only `window`/`app` are shadowed, because the slice reads the
+  // live root off the app object and node has no `window`.
   const build = new Function(
     "WORKFLOW_META_NAMESPACE",
     "WORKFLOW_PATH_FIELD",
     "sameWorkflowObject",
     "decideWorkflowSaveVerdict",
     "workflowSaveRefusalError",
+    "activeWorkflowRef",
+    "trackerCaptureSuppressed",
+    "graphRootReproducesStateContent",
+    "window",
+    "app",
     "console",
     `${source}\nreturn { installSavePathGuard };`,
   );
   return {
     warnings,
-    buildInstaller: () =>
+    buildInstaller: ({ activeWorkflow = null, rootGraph = null } = {}) =>
       build(
         "comfyui_mcp",
         "workflow_path",
         sameWorkflowObject,
         decideWorkflowSaveVerdict,
         workflowSaveRefusalError,
+        () => activeWorkflow,
+        trackerCaptureSuppressed,
+        graphRootReproducesStateContent,
+        {},
+        { rootGraph },
         { warn: (...args) => warnings.push(args.join(" ")) },
       ).installSavePathGuard,
   };
@@ -252,4 +276,155 @@ test("#1667 WRAPPER: a missing store is DISCLOSED, not silent — saves proceed 
   install({ extensionManager: {} });
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /save-path guard NOT installed/);
+});
+
+// ---------------------------------------------------------------------------
+// 3. panel#1563 — a snapshot that has fallen BEHIND the canvas.
+// ---------------------------------------------------------------------------
+
+test("#1563 THE REPORTED CASE: a stale snapshot is refused before it can be written", () => {
+  const verdict = decideWorkflowSaveVerdict({
+    destinationPath: "workflows/big.json",
+    destinationPersisted: true,
+    snapshotIsStale: true,
+  });
+  assert.equal(verdict.allow, false);
+  assert.equal(verdict.reason, SAVE_PATH_GUARD_REASON.STALE_SNAPSHOT);
+  assert.match(workflowSaveRefusalError(verdict).message, /BEHIND the live canvas/);
+  assert.match(workflowSaveRefusalError(verdict).message, /NOTHING was written/);
+});
+
+test("#1563 a FIRST save is refused too — lost work reported as success is the same defect", () => {
+  // Not gated on `destinationPersisted`: no existing file is destroyed, but the user is
+  // still told a canvas reached disk when part of it did not.
+  const verdict = decideWorkflowSaveVerdict({
+    destinationPath: "workflows/new.json",
+    destinationPersisted: false,
+    snapshotIsStale: true,
+  });
+  assert.equal(verdict.allow, false);
+  assert.equal(verdict.reason, SAVE_PATH_GUARD_REASON.STALE_SNAPSHOT);
+});
+
+test("#1563 a healthy save is untouched — the new conjunct defaults to allow", () => {
+  assert.deepEqual(
+    decideWorkflowSaveVerdict({ destinationPath: "workflows/A.json", destinationPersisted: true }),
+    { allow: true },
+  );
+  assert.deepEqual(
+    decideWorkflowSaveVerdict({
+      destinationPath: "workflows/A.json",
+      destinationPersisted: true,
+      snapshotIsStale: false,
+    }),
+    { allow: true },
+  );
+});
+
+/** The reported shape: the canvas gained a group the tracker never captured. */
+function staleFixture({ suppressed = true, live = "extra-group", active = true } = {}) {
+  const snapshot = {
+    nodes: [{ id: 1, type: "VAEDecode", pos: [0, 0] }],
+    groups: [{ id: 1, title: "Pre", bounding: [0, 0, 10, 10] }],
+    extra: {},
+  };
+  const liveState =
+    live === "extra-group"
+      ? {
+          nodes: [{ id: 1, type: "VAEDecode", pos: [0, 0] }],
+          groups: [
+            { id: 1, title: "Pre", bounding: [0, 0, 10, 10] },
+            { id: 2, title: "New17", bounding: [20, 0, 10, 10] },
+          ],
+          extra: {},
+        }
+      : JSON.parse(JSON.stringify(snapshot));
+  const wfA = {
+    path: "workflows/A.json",
+    isTemporary: false,
+    // `changeCount > 0` is one of upstream's own three suppression conditions.
+    changeTracker: { activeState: snapshot, changeCount: suppressed ? 1 : 0, _restoringState: false },
+  };
+  const wfB = { path: "workflows/B.json", isTemporary: false };
+  const store = {
+    saved: [],
+    getWorkflowByPath(p) {
+      if (p === "workflows/A.json") return wfA;
+      if (p === "workflows/B.json") return wfB;
+      return null;
+    },
+    async saveWorkflow(wf) {
+      this.saved.push(wf.path);
+    },
+  };
+  return {
+    store,
+    wfA,
+    appRef: { extensionManager: { workflow: store } },
+    activeWorkflow: active ? wfA : wfB,
+    rootGraph: { serialize: () => liveState },
+  };
+}
+
+test("#1563 WRAPPER: the save that loses the group is refused and never reaches the store", async () => {
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture();
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  await assert.rejects(() => fx.store.saveWorkflow(fx.wfA), /BEHIND the live canvas/);
+  assert.deepEqual(fx.store.saved, [], "nothing may be written when the snapshot is stale");
+});
+
+test("#1563 WRAPPER: a suppressed capture on an ALREADY-EQUAL canvas still saves", async () => {
+  // The ordinary state of a clean tab. Refusing here would trade data loss for a
+  // cannot-save bug.
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture({ live: "equal" });
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  await fx.store.saveWorkflow(fx.wfA);
+  assert.deepEqual(fx.store.saved, ["workflows/A.json"]);
+});
+
+test("#1563 WRAPPER: a content difference with NO suppression still saves", async () => {
+  // Ordinary tracker lag, which `prepareForSave()` resolves a microsecond later. Only
+  // upstream's own positive "I skipped it" turns a difference into a refusal.
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture({ suppressed: false });
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  await fx.store.saveWorkflow(fx.wfA);
+  assert.deepEqual(fx.store.saved, ["workflows/A.json"]);
+});
+
+test("#1563 WRAPPER: an INACTIVE workflow is never judged against the active canvas", async () => {
+  // `app.rootGraph` is the ACTIVE tab's canvas. Comparing it with another tab's
+  // snapshot would refuse a save that loses nothing.
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture({ active: false });
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  await fx.store.saveWorkflow(fx.wfA);
+  assert.deepEqual(fx.store.saved, ["workflows/A.json"]);
+});
+
+test("#1563 WRAPPER: with no live root readable the guard invents nothing", async () => {
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture();
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: null });
+  install(fx.appRef);
+  await fx.store.saveWorkflow(fx.wfA);
+  assert.deepEqual(fx.store.saved, ["workflows/A.json"]);
+});
+
+test("#1563 WIRING: the wrapper passes its own observation, not a constant", () => {
+  const source = PANEL_SRC();
+  const decide = source.indexOf("verdict = decideWorkflowSaveVerdict({");
+  assert.ok(decide > 0, "the save funnel decides with decideWorkflowSaveVerdict");
+  const call = source.slice(decide, decide + 1400);
+  assert.match(
+    call,
+    /snapshotIsStale: saveWouldPersistStaleSnapshot\(wf, state\)/,
+    "the stale-snapshot evidence must be computed from the SAME state the write serializes",
+  );
 });

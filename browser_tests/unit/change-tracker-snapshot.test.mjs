@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import {
   deferChangeTrackerSnapshot,
   flushPendingChangeTrackerSnapshot,
+  trackerCaptureSuppressed,
 } from "../../web/js/lib/change-tracker-snapshot.js";
 
 test("#581 defers the captured tracker snapshot and preserves its receiver", () => {
@@ -155,4 +156,113 @@ test("#1723 wires the flush BEFORE the graph-binding fence in the dispatch path"
   const fence = source.indexOf("assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd))");
   assert.ok(flush >= 0, "the dispatch path flushes a pending tracker snapshot");
   assert.ok(fence > flush, "the flush lands before the binding fence reads the tracker");
+});
+
+// ---------------------------------------------------------------------------
+// panel#1563/#1564 — a capture upstream SILENTLY skips.
+// ---------------------------------------------------------------------------
+
+/** Upstream's own shape, reduced to what decides this: `captureCanvasState()` returns
+ *  early — no throw, no value — while a suppression window is open, and only replaces
+ *  `activeState` when it actually runs and the canvas moved. */
+function upstreamTracker({ suppressed = false } = {}) {
+  return {
+    activeState: { nodes: [], generation: 0 },
+    changeCount: suppressed ? 1 : 0,
+    _restoringState: false,
+    calls: 0,
+    captureCanvasState() {
+      this.calls += 1;
+      if (this._restoringState || this.changeCount > 0) return; // the silent early return
+      this.activeState = { nodes: [], generation: this.activeState.generation + 1 };
+    },
+  };
+}
+
+test("#1563 upstream's three suppression conditions are read; an unknown tracker is NOT suppressed", () => {
+  assert.equal(trackerCaptureSuppressed({ changeCount: 1 }), true);
+  assert.equal(trackerCaptureSuppressed({ _restoringState: true }), true);
+  class Loading {}
+  Loading.isLoadingGraph = true;
+  assert.equal(trackerCaptureSuppressed(new Loading()), true);
+  // POSITIVE evidence only: a tracker whose fields this panel cannot read must not put
+  // the retry chain into a spin. (The destructive close path's `captureWasSuppressed`
+  // deliberately answers the other way; see its comment.)
+  assert.equal(trackerCaptureSuppressed({}), false);
+  assert.equal(trackerCaptureSuppressed(null), false);
+  assert.equal(trackerCaptureSuppressed({ changeCount: 0, _restoringState: false }), false);
+});
+
+test("#1563 a SWALLOWED deferred capture is retried until upstream stops skipping it", () => {
+  const tracker = upstreamTracker({ suppressed: true });
+  const queue = [];
+  deferChangeTrackerSnapshot(tracker, (cb, ms) => {
+    queue.push({ cb, ms });
+    return queue.length;
+  }, () => {});
+
+  queue.shift().cb(); // first attempt: swallowed
+  assert.equal(tracker.activeState.generation, 0, "upstream skipped it");
+  assert.ok(queue.length > 0, "a swallowed capture must leave a retry armed — otherwise the snapshot is stranded behind the canvas forever");
+
+  queue.shift().cb(); // still suppressed
+  assert.equal(tracker.activeState.generation, 0);
+  assert.ok(queue.length > 0);
+
+  tracker.changeCount = 0; // the transient window closes
+  queue.shift().cb();
+  assert.equal(tracker.activeState.generation, 1, "the snapshot catches up once upstream allows it");
+  assert.equal(queue.length, 0, "a landed capture arms nothing further");
+});
+
+test("#1563 the retry chain is BOUNDED — a window that never closes cannot spin forever", () => {
+  const tracker = upstreamTracker({ suppressed: true });
+  const queue = [];
+  deferChangeTrackerSnapshot(tracker, (cb) => {
+    queue.push(cb);
+    return queue.length;
+  }, () => {});
+  let fired = 0;
+  while (queue.length && fired < 50) {
+    queue.shift()();
+    fired += 1;
+  }
+  assert.equal(queue.length, 0, "the chain terminates");
+  assert.ok(fired <= 10, `bounded attempts, got ${fired}`);
+  assert.equal(tracker.activeState.generation, 0, "nothing was captured — that is what the save guard then refuses on");
+});
+
+test("#1563 a NO-CHANGE capture is not retried — an unchanged snapshot is the clean-tab case", () => {
+  const tracker = upstreamTracker();
+  tracker.captureCanvasState = function () {
+    this.calls += 1; // ran, saw no difference, left activeState alone
+  };
+  const queue = [];
+  deferChangeTrackerSnapshot(tracker, (cb) => {
+    queue.push(cb);
+    return queue.length;
+  }, () => {});
+  queue.shift()();
+  assert.equal(tracker.calls, 1);
+  assert.equal(queue.length, 0, "an unchanged snapshot on a readable, unsuppressed tracker is not a swallowed call");
+});
+
+test("#1563 a flush upstream swallows keeps the record PENDING for the next command", () => {
+  const tracker = upstreamTracker({ suppressed: true });
+  const queue = [];
+  const schedule = (cb) => {
+    queue.push(cb);
+    return queue.length;
+  };
+  deferChangeTrackerSnapshot(tracker, schedule, () => {});
+  queue.length = 0; // the fence's flush pre-empts the timer
+
+  assert.equal(flushPendingChangeTrackerSnapshot(tracker), true);
+  assert.equal(tracker.activeState.generation, 0, "the flush was swallowed too");
+  assert.ok(queue.length > 0, "the swallowed flush must re-arm rather than consume the record");
+  // The record is still THIS tracker's, so the next command's flush can still take it.
+  tracker.changeCount = 0;
+  assert.equal(flushPendingChangeTrackerSnapshot(tracker), true);
+  assert.equal(tracker.activeState.generation, 1);
+  assert.equal(flushPendingChangeTrackerSnapshot(tracker), false, "a LANDED flush consumes the record");
 });
