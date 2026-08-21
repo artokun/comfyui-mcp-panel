@@ -1277,7 +1277,7 @@ test("#757 the created row is disclosed on its own field, not in `warning`", () 
 // implementation is verified, never a copy of it.
 
 const SET_WIDGET_SRC = (() => {
-  const m = PANEL_SRC.match(/ {2}async graph_set_widget\(\{ node_id, widget, value, workflow_uuid \}\) \{[\s\S]*?\n {2}\},/);
+  const m = PANEL_SRC.match(/ {2}async graph_set_widget\(\{ node_id, widget, value, workflow_uuid, builder_state \}\) \{[\s\S]*?\n {2}\},/);
   assert.ok(m, "could not locate graph_set_widget in the panel source");
   return m[0];
 })();
@@ -1296,6 +1296,8 @@ const EXECUTOR_DEPS = [
   "rgthreeFastGroupsRefusal",
   "classifyIdeogram4PromptBuilderWrite",
   "ideogram4PromptBuilderRefusal",
+  "classifyMiniMaxH3PromptBuilderWrite",
+  "applyMiniMaxH3PromptBuilderWrite",
   "awaitObjectInfoHistorySeed",
   "isRgthreeLoraRowCreation",
   "createRgthreeLoraRow",
@@ -1459,6 +1461,7 @@ function executor(node, overrides = {}) {
     // stand-in is never an Ideogram4PromptBuilderKJ, so it classifies nothing — same as the
     // other pack classifiers above.
     classifyIdeogram4PromptBuilderWrite: () => null,
+    classifyMiniMaxH3PromptBuilderWrite: () => null,
     awaitObjectInfoHistorySeed: async () => {},
     // The REAL classifier and creator: a double here would let the executor pass against a
     // route that never fires, which is precisely the defect under test.
