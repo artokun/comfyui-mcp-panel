@@ -12,7 +12,13 @@
  *      the class def wasn't matched at load, even though the live def names them. (#199)
  */
 
-import { parseAnnotatedFilepath } from "./input-asset.js";
+import { authoritativeComboValues, parseAnnotatedFilepath } from "./input-asset.js";
+
+// mcp#1940 — `authoritativeComboValues` moved to the LEAF module input-asset.js so
+// `serverDeclaresEmptyComboOptions` (which lives there) can share the one canonical
+// reader without this file and that one importing each other. Re-exported here because
+// this is where it was published and callers import it from this path.
+export { authoritativeComboValues };
 
 const UNKNOWN_WIDGET_RE = /^UNKNOWN(_\d+)?$/;
 
@@ -776,35 +782,6 @@ export function collectAllGraphs(rootGraph) {
  * map supplies the concrete-def key to look its options up under (#458×#366). Widgets
  * not in the map fall back to their own name.
  */
-/**
- * The authoritative option list a def spec publishes, or NULL when this spec does not
- * carry one. Never guesses: a caller that gets null has learned that it cannot rebuild
- * this widget, which is a different thing from a widget that is not a combo.
- *
- * MEASURED against a live ComfyUI 0.33 /object_info (848 types), because the V1 shape was
- * the only one this file handled and it is now the MINORITY:
- *
- *     [[opt, ...], config?]                    V1, 61 inputs   — the historical shape
- *     ["COMBO", { options: [opt, ...] }]       V2, 467 inputs  — silently skipped before
- *     ["COMBO", { remote: { route } }]         V2 remote, 1    — the list is a separate
- *                                              fetch; the frontend shows "Loading…" until
- *                                              it lands, so there is nothing to copy
- *     ["COMFY_DYNAMICCOMBO_V3", { options: [{ key, inputs }] }]   120 inputs — the keys
- *                                              select SUB-INPUTS to materialize; copying
- *                                              the keys alone would publish a list this
- *                                              file cannot honour
- *
- * The last two return null on purpose. `refreshComboOptionsFromDefs` counts them as
- * SKIPPED rather than treating "I did not rebuild it" as "there was nothing to rebuild".
- */
-export function authoritativeComboValues(spec) {
-  if (!Array.isArray(spec)) return null;
-  // V1 — the first element IS the option array.
-  if (Array.isArray(spec[0])) return spec[0];
-  // V2 — a "COMBO" type string, options under the config object.
-  if (spec[0] === "COMBO" && Array.isArray(spec[1]?.options)) return spec[1].options;
-  return null;
-}
 
 /**
  * Whether this input is a COMBO whose list this file could not derive — a remote V2, a
@@ -873,13 +850,23 @@ function mergedInputsFor(def, cache, type) {
 /**
  * Is this input spec a combo whose authoritative option list came back EMPTY?
  *
- * A combo's spec is `[[opt, ...], config?]`. An empty first element is the backend saying
- * "this widget has no valid values" — which is a real answer (#507/#1133: a server with zero
- * checkpoints), not a panel failure. It is worth DISCLOSING and never worth refusing over.
+ * An empty published list is the backend saying "this widget has no valid values" — a real
+ * answer (#507/#1133: a server with zero checkpoints), not a panel failure. It is worth
+ * DISCLOSING and never worth refusing over.
+ *
+ * mcp#1940 — read through `authoritativeComboValues`, never off `spec[0]`. This tested
+ * `Array.isArray(spec[0])`, which holds only for the V1 shape `[[opt, ...], config?]`; a V2
+ * `["COMBO", { options: [] }]` leaves the type string "COMBO" at `spec[0]` and was silently
+ * skipped, so a graph carrying one (CustomCombo, HypernetworkLoader, …) disclosed nothing.
+ * That is the same per-call-site adoption gap this reader was introduced to close in the
+ * WRITE path — found here by review of that fix, one module away from it.
+ *
+ * Unread still never counts as empty: a remote V2 whose list has not landed, and a dynamic
+ * V3, both yield null and are not disclosed.
  */
 function isEmptyComboSpec(spec) {
-  const first = Array.isArray(spec) ? spec[0] : undefined;
-  return Array.isArray(first) && first.length === 0;
+  const values = authoritativeComboValues(spec);
+  return Array.isArray(values) && values.length === 0;
 }
 
 /**

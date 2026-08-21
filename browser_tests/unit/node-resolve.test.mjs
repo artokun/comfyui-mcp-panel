@@ -2728,3 +2728,167 @@ test("#1523 add_node: a throwing isLoadedSubgraphType fails closed rather than a
   assert.doesNotMatch(err.message, /graph unreadable/);
   assert.doesNotMatch(err.message, /comfyui-reactor-node/);
 });
+
+// ── mcp#1940 ─────────────────────────────────────────────────────────────────
+// The V2 combo spec. Everything above declares combos in the V1 shape
+// `[[opt, ...], config]`, where the option array IS `spec[0]`. A live ComfyUI 0.33
+// /object_info publishes 676 inputs in the V2 shape instead —
+// `["COMBO", { options: [...] }]` — with the literal type string "COMBO" at
+// `spec[0]` and the list under the config object. `serverDeclaresEmptyComboOptions`
+// tested `Array.isArray(spec[0])`, so every V2 combo was filed as "not a combo" and
+// the #507 accept could never be reached: measured 0 of 11 server-declared-empty V2
+// inputs recognised, against 30 of 30 V1.
+//
+// The reported node is verbatim from that rig:
+//     "choice": ["COMBO", { "multiselect": false, "options": [] }]
+// which made `CustomCombo.choice` permanently unwritable, blamed on a STALE list that
+// no refresh could ever change.
+function customComboFixture(liveOptions = []) {
+  const reg = loadedRegistry(["CustomCombo"]);
+  const widget = { name: "choice", type: "combo", options: { values: liveOptions }, value: "" };
+  const node = { id: 816, type: "CustomCombo", widgets: [widget], constructor: reg["CustomCombo"] };
+  return { reg, node, widget };
+}
+// /object_info in which CustomCombo's `choice` is declared in the V2 shape.
+function customComboObjectInfo(config) {
+  const info = objectInfo(["CustomCombo"]);
+  info["CustomCombo"] = { input: { required: { choice: ["COMBO", config] } } };
+  return info;
+}
+
+test("mcp#1940 e2e: a V2 combo whose SERVER option list is empty becomes writable", async () => {
+  const { reg, node, widget } = customComboFixture([]);
+  const res = await runSetWidget(node, "choice", "Default", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => customComboObjectInfo({ multiselect: false, options: [] }),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "Default");
+  assert.equal(widget.value, "Default", "the write reached the live widget");
+  assert.equal(res.empty_option_list, true, "reported honestly as an unvalidatable empty list");
+});
+
+test("mcp#1940 e2e: a V2 combo with a REAL server list is still validated STRICTLY", async () => {
+  // The fix must not turn "V2" into a blanket accept. A V2 spec that publishes a real
+  // list is refreshed and enforced exactly like V1: a member lands, a non-member is
+  // refused and nothing is written.
+  const config = { multiselect: false, options: ["Quality", "Default", "Turbo"] };
+  const ok = customComboFixture([]);
+  const res = await runSetWidget(ok.node, "choice", "Turbo", {
+    registry: ok.reg,
+    getRegistry: () => ok.reg,
+    getFreshObjectInfo: async () => customComboObjectInfo(config),
+    wasTypeEverDefined: () => true,
+    refreshCombos: refreshFromServer,
+    ...HOOKS,
+  });
+  assert.equal(ok.widget.value, "Turbo");
+  assert.notEqual(res.empty_option_list, true, "a real list is not the empty-list path");
+
+  const bad = customComboFixture([]);
+  await assert.rejects(
+    () =>
+      runSetWidget(bad.node, "choice", "Nonexistent", {
+        registry: bad.reg,
+        getRegistry: () => bad.reg,
+        getFreshObjectInfo: async () => customComboObjectInfo(config),
+        wasTypeEverDefined: () => true,
+        refreshCombos: refreshFromServer,
+        ...HOOKS,
+      }),
+    /not a valid option|refused/i,
+  );
+  assert.equal(bad.widget.value, "", "an off-list value is still refused (#240 intact)");
+});
+
+test("mcp#1940: serverDeclaresEmptyComboOptions reads the V2 shape, and still refuses to guess", () => {
+  const defs = {
+    T: {
+      input: {
+        required: {
+          v2empty: ["COMBO", { multiselect: false, options: [] }],
+          v2full: ["COMBO", { options: ["a", "b"] }],
+          // The list is a SEPARATE fetch that has not landed. Unread is not empty.
+          v2remote: ["COMBO", { remote: { route: "/internal/files/output" } }],
+          // The keys select SUB-INPUTS to materialize; they are not an option list.
+          v3dynamic: ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "png" }] }],
+          v1empty: [[], {}],
+          v1full: [["a"], {}],
+          notacombo: ["STRING", {}],
+        },
+        optional: { v2optEmpty: ["COMBO", { options: [] }] },
+      },
+    },
+  };
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v2empty"), true);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v2optEmpty"), true, "optional inputs count too");
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v2full"), false);
+  // Both of these are "could not read the list", which must fail CLOSED — never be
+  // mistaken for the server declaring the list empty.
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v2remote"), false, "an unlanded remote list is not an empty one");
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v3dynamic"), false, "dynamic V3 keys are not an option list");
+  // V1 and non-combo behaviour is unchanged.
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v1empty"), true);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "v1full"), false);
+  assert.equal(serverDeclaresEmptyComboOptions(defs, "T", "notacombo"), false);
+});
+
+// The REPORTED shape end-to-end: a subgraph instance promoting a V2 empty COMBO.
+// mcp#1940 was filed as a promoted-widget bug — "cannot set ANY promoted COMBO on a
+// subgraph node" — so a fix for the combo SHAPE has to be shown to clear the actual
+// reported scenario, not just a bare node. The promotion resolves to the concrete
+// inner CustomCombo (`followPromotionToConcrete`), which is the type whose def the
+// empty-list gate reads; before the fix that read said "not a combo" and the write
+// was refused with a stale-list message no refresh could clear.
+function promotedCustomComboFixture() {
+  const inner = {
+    id: 795,
+    type: "CustomCombo",
+    // Empty live list — nothing for the parent rail to project either.
+    widgets: [{ name: "choice", type: "combo", options: { values: [] }, value: "" }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "795" ? inner : null) };
+  const railWidget = { name: "mode", type: "combo", options: { values: [] }, value: "" };
+  const parent = {
+    id: 816,
+    // The synthetic subgraph UUID from the report — never in /object_info, and never
+    // looked up: the promotion is traversed to the inner type instead.
+    type: "6c697765-ebd7-4e1e-8af0-d84d620be471",
+    subgraph,
+    inputs: [{ name: "mode", _widget: railWidget, _subgraphSlot: { name: "mode" } }],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "mode" ? { sourceNodeId: "795", sourceWidgetName: "choice" } : null;
+  return { parent, inner, resolveSource };
+}
+
+test("mcp#1940 e2e: a PROMOTED V2 empty combo on a subgraph instance is settable from the parent", async () => {
+  const reg = loadedRegistry(["CustomCombo"]);
+  reg["6c697765-ebd7-4e1e-8af0-d84d620be471"] = reg["SubgraphNode"] ?? function SubgraphNode() {};
+  const { parent, inner, resolveSource } = promotedCustomComboFixture();
+  const fresh = objectInfo(["CustomCombo"]);
+  fresh["CustomCombo"] = { input: { required: { choice: ["COMBO", { multiselect: false, options: [] }] } } };
+  const res = await runSetWidget(parent, "mode", "Default", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => fresh,
+    // The UUID was NEVER a backend type — it is a subgraph. Answering `true` here
+    // would claim its absence from /object_info means an uninstalled pack (#458).
+    wasTypeEverDefined: (t) => t === "CustomCombo",
+    refreshCombos: refreshFromServer,
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "Default");
+  assert.equal(res.set.promoted_from.inner_node_id, 795, "resolved through the promotion, not the UUID");
+  assert.equal(
+    inner.widgets.find((w) => w.name === "choice").value,
+    "Default",
+    "the value reached the inner widget the rail projects",
+  );
+});

@@ -155,6 +155,46 @@ export function uploadInputConfig(defsByType, type, widgetName) {
 }
 
 /**
+ * The authoritative option list a def spec publishes, or NULL when this spec does not
+ * carry one. Never guesses: a caller that gets null has learned that it cannot read
+ * this list, which is a different thing from an input that is not a combo.
+ *
+ * MEASURED against a live ComfyUI 0.33 /object_info, because the V1 shape was the only
+ * one originally handled and it is now the MINORITY:
+ *
+ *     [[opt, ...], config?]                    V1 — the historical shape
+ *     ["COMBO", { options: [opt, ...] }]       V2 — the common shape today
+ *     ["COMBO", { remote: { route } }]         V2 remote — the list is a separate fetch;
+ *                                              nothing to read until it lands
+ *     ["COMFY_DYNAMICCOMBO_V3", { options: [{ key, inputs }] }]
+ *                                              the keys select SUB-INPUTS to materialize;
+ *                                              they are not an option list
+ *
+ * The last two return null on purpose — "I could not read it", never "it is empty".
+ * That distinction is load-bearing for `serverDeclaresEmptyComboOptions` below.
+ *
+ * Lives in this LEAF module (no imports) so both consumers can share one reader:
+ * asset-staleness.js re-exports it, and `serverDeclaresEmptyComboOptions` uses it
+ * directly. It previously lived in asset-staleness.js, which this file must not
+ * import from — that is how the two drifted apart (mcp#1940).
+ */
+export function authoritativeComboValues(spec) {
+  if (!Array.isArray(spec)) return null;
+  // V1 — the first element IS the option array.
+  if (Array.isArray(spec[0])) return spec[0];
+  // V2 — a "COMBO" type string, options under the config object.
+  //
+  // A REMOTE list is unread by definition: it arrives from a separate fetch and the
+  // frontend shows "Loading…" until it lands. Measured remote V2 specs carry no `options`
+  // array at all, so this is defense in depth rather than a live shape — but the whole
+  // safety argument for reading V2 is that UNREAD never becomes EMPTY, and a spec carrying
+  // `remote` alongside an empty `options` would be exactly the case that breaks it.
+  if (spec[0] === "COMBO" && spec[1]?.remote) return null;
+  if (spec[0] === "COMBO" && Array.isArray(spec[1]?.options)) return spec[1].options;
+  return null;
+}
+
+/**
  * TRUE only when the freshly-fetched /object_info AUTHORITATIVELY declares `widgetName`
  * on `type` to be a combo whose option list is EMPTY — i.e. the SERVER itself says there
  * is nothing to validate against (StarNodes' `"model": ((), {...})` ⇒ `[[], {...}]`).
@@ -168,8 +208,22 @@ export function uploadInputConfig(defsByType, type, widgetName) {
  * violating #240. Requiring the SERVER to declare the list empty makes that impossible.
  *
  * Fails CLOSED on every uncertainty: no defs, no def for the type, no such input, a
- * non-combo spec (a type string like "INT"/"STRING"), or a NON-EMPTY declared list all
- * return false, so the value simply stays rejected exactly as before.
+ * spec that publishes no readable option list, or a NON-EMPTY declared list all return
+ * false, so the value simply stays rejected exactly as before.
+ *
+ * mcp#1940 — the emptiness test reads the list through `authoritativeComboValues`, NOT
+ * off `spec[0]`. `spec[0]` is the option array only in the V1 shape; the now-common V2
+ * `["COMBO", { options: [] }]` puts it under the config object and leaves the literal
+ * type string "COMBO" at `spec[0]`. Testing `Array.isArray(spec[0])` therefore filed
+ * every V2 combo under "not a combo" and returned false — measured on a live 0.33
+ * /object_info as 0 of 11 server-declared-empty V2 inputs recognised, against 30 of 30
+ * V1. That made #507's last-resort accept UNREACHABLE for them, so `CustomCombo.choice`
+ * (declared `["COMBO", { multiselect: false, options: [] }]`) was permanently unwritable
+ * and the refusal blamed a STALE list that no refresh could ever change.
+ *
+ * The read stays authoritative in the direction that matters. A remote V2 and a dynamic
+ * V3 both yield null, not [], so neither is mistaken for "the server says empty" — an
+ * unread list must keep failing closed, exactly as a NON-EMPTY one does.
  */
 export function serverDeclaresEmptyComboOptions(defsByType, type, widgetName) {
   try {
@@ -179,8 +233,7 @@ export function serverDeclaresEmptyComboOptions(defsByType, type, widgetName) {
     const spec =
       (input.required && input.required[widgetName]) ??
       (input.optional && input.optional[widgetName]);
-    if (!Array.isArray(spec)) return false;
-    const options = spec[0];
+    const options = authoritativeComboValues(spec);
     return Array.isArray(options) && options.length === 0;
   } catch {
     return false;
