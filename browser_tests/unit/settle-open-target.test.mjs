@@ -308,6 +308,24 @@ test("#1575: a live object that does NOT answer the selector is never adopted", 
   assert.equal(result.adopted, false);
 });
 
+test("#1575: a live object at a DIFFERENT path is not adopted even when the selector matches it", async () => {
+  // A bare filename is a valid selector and two directories can hold the same one.
+  // Adopting on the name alone would repaint and stamp another workflow's tab (#1089).
+  const stale = new FakeWorkflow("workflows/a/shared.json", DISK_STATE);
+  const otherDir = new FakeWorkflow("workflows/b/shared.json", DISK_STATE);
+  await otherDir.load();
+  const store = new FakeWorkflowStore(stale);
+  const result = await settleOpenedWorkflowTarget(
+    settleArgs(store, stale, false, {
+      activeAfterOpen: otherDir,
+      selector: "shared.json",
+      matchesSelector: (w, sel) => w?.filename === sel, // both answer to it
+    }),
+  );
+  assert.equal(result.adopted, false, "same NAME is not same WORKFLOW");
+  assert.notEqual(result.target, otherDir);
+});
+
 test("#1575: a throwing selector oracle refuses the adoption rather than guessing", async () => {
   const stale = new FakeWorkflow("workflows/x.json", DISK_STATE);
   const live = new FakeWorkflow("workflows/x.json", DISK_STATE);

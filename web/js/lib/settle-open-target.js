@@ -170,7 +170,20 @@ export async function settleOpenedWorkflowTarget({
         // and report under someone else's tab.
         selectorOk = false;
       }
-      if (!sameObject && selectorOk) {
+      // …and it must be the SAME WORKFLOW FILE, not merely something the selector
+      // answers to. `workflowRecordMatchesSelector` accepts a bare filename, and two
+      // workflows in different directories can share one — so on a path where the
+      // store's open failed for a reason OTHER than the early return, the active tab
+      // could be a DIFFERENT workflow that answers the same bare name. Adopting it
+      // would repaint it, stamp this command's uuid onto it, and report success under
+      // its identity: the #1089 hazard, manufactured by the repair. This arm exists for
+      // "a different OBJECT for the same workflow", so requiring the path to agree costs
+      // it nothing, and falling through leaves today's refusal rather than a wrong tab.
+      const samePath =
+        typeof activeAfterOpen.path === "string" &&
+        !!activeAfterOpen.path &&
+        activeAfterOpen.path === target.path;
+      if (!sameObject && selectorOk && samePath) {
         return {
           target: activeAfterOpen,
           adopted: true,
