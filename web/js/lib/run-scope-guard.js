@@ -23,6 +23,15 @@ import { ueQueueTimeLinkPairs } from "./use-everywhere-links.js";
 // can also be present by OPTION SHAPE before its beforeQueued hook is re-hung.
 // Both detectors already live in their own modules; this file imports the verdict.
 import { controlAfterGenerateEntries } from "./control-after-generate.js";
+// #1565 — THE RUN PATH HAS TO ANSWER INSIDE THE WINDOW ITS REPLY IS RELAYED IN.
+// `panel_run` relays `graph_run` in 20,000 ms, and every wait below is a wait the
+// READ path (panel_query_graph reads live LiteGraph objects) never takes — which is
+// exactly the asymmetry the reporter measured: reads sub-second on the same tab
+// while the run never answered at all. The bounds here are APPLIED with the shared
+// `withTimeout`; the allowances come from the caller's command budget. A second
+// timeout helper is how this repo keeps producing near-duplicate bugs (bounded-step's
+// own header), so there is not one.
+import { withTimeout } from "./bounded-step.js";
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -1007,14 +1016,31 @@ export function describeFingerprintFailure(cause) {
  *    verified prompts DID queue (scoped); only the unverified remainder is
  *    in doubt.
  */
-export function scopeUnverifiedError({ toNodeId, timeoutMs, cancelled = false, verified = 0, batch = 1, inFlight = 0 }) {
+export function scopeUnverifiedError({
+  toNodeId,
+  timeoutMs,
+  cancelled = false,
+  verified = 0,
+  batch = 1,
+  inFlight = 0,
+  budgetMs = 0,
+}) {
   const count =
     verified > 0
       ? ` (${verified} of ${batch} batch prompts WERE verified and are queued with the scope)`
       : "";
+  // #1565 — SAY WHICH CLOCK RAN OUT. When the command budget is what expired, the
+  // per-attempt figure is whatever slice was left (as little as 1 ms) and quoting it
+  // would describe a wait nobody made. The budget is also the actionable number: it
+  // tells the reader the panel STOPPED WAITING ON PURPOSE, inside the window its reply
+  // is relayed in, rather than that their frontend answered in 0s.
+  const waited =
+    budgetMs > 0
+      ? `within this run's whole ${Math.round(budgetMs / 1000)}s command budget`
+      : `within ${Math.round(timeoutMs / 1000)}s of queueing`;
   const base =
     `run-to-node scope for node ${toNodeId} could not be verified: no scoped ` +
-    `dispatch was observed within ${Math.round(timeoutMs / 1000)}s of queueing ` +
+    `dispatch was observed ${waited} ` +
     `(the frontend deferred or silently dropped the request)${count}. `;
   // IN FLIGHT ≠ NEVER SENT (codex gate r9). A correctly-scoped request that has
   // already left the panel but whose response has not come back yet is neither
@@ -1625,11 +1651,74 @@ export async function dispatchScopedRun({
   toNodeId = null,
   verifyTimeoutMs = 5000,
   queueMark = null,
+  budget = null,
   onRejection = null,
   onPromptId = null,
   onAcceptedNodeErrors = null,
 } = {}) {
   const mark = queueMark ?? newScopedQueueMark();
+  // #1565 — ONE DEADLINE FOR THE WHOLE DISPATCH, so the per-attempt bounds COMPOSE.
+  //
+  // Every wait in this function used to start its own fresh clock: four argument
+  // shapes are tried in sequence, and each one that reached no verdict paid a full
+  // `verifyTimeoutMs`. 4 × 5,000 ms is 20,000 ms — EXACTLY the window `panel_run`
+  // relays `graph_run` in — so on a frontend whose queue processor is busy (the
+  // reporter had user Queue presses interleaved with agent runs) the command could
+  // not answer, or refuse, inside its own reply window. MEASURED on the shipped
+  // module with a busy processor draining at 4,990 ms/item: dispatchScopedRun took
+  // 20,003 ms and the prompt POSTED at 20,003 ms — after the caller had already been
+  // told the tab "may be backgrounded or frozen". A retry then renders twice.
+  //
+  // `budget.bounded(ms)` caps every allowance by what the COMMAND has left, so the
+  // sum can never exceed it. NO BUDGET ⇒ NO BOUND: `withTimeout` treats ms <= 0 as
+  // no bound, so a caller that supplies none keeps today's behaviour byte for byte
+  // (the panel's own call site always supplies one — see graph_run).
+  const hasBudget = !!budget && typeof budget.bounded === "function";
+  /** The bound for one step, capped by what the command has left; 0 (= unbounded) with no budget. */
+  const boundedBy = (ms) => (hasBudget ? budget.bounded(ms) : 0);
+  /**
+   * This attempt's FAIR SHARE of what is left. A fresh `verifyTimeoutMs` per attempt is
+   * what failed to compose; handing the first attempt everything would be the same defect
+   * with a different shape — on the reporter's build the ONLY argument shape that carries
+   * the scope is the LAST one (they reported `scope_applied_by:"request_body_repair"` on
+   * every successful run), so an allocation that starves the later attempts would refuse
+   * the runs that work today. Never MORE than the caller's own `verifyTimeoutMs`.
+   */
+  const shareFor = (attemptsLeft) => {
+    if (!hasBudget) return verifyTimeoutMs;
+    const left = typeof budget.remaining === "function" ? budget.remaining() : 0;
+    const share = Math.floor(left / Math.max(1, attemptsLeft));
+    return budget.bounded(Math.min(verifyTimeoutMs, share));
+  };
+  /**
+   * The command budget's total, but ONLY once it is actually spent — that is the one
+   * case where quoting the per-attempt slice would describe a wait nobody made. A
+   * give-up that happens while the command still has room is honestly a per-attempt
+   * give-up and keeps saying so.
+   */
+  const budgetSpent = () =>
+    hasBudget && typeof budget.exhausted === "function" && budget.exhausted()
+      ? Number(budget.totalMs) || 0
+      : 0;
+  // Sentinel for a bounded step that did not settle. A Symbol so it can never collide
+  // with a value the bounded promise itself resolves.
+  const TIMED_OUT = Symbol("cmcp-run-step-timeout");
+  /**
+   * Await `promise` under `ms`, PRESERVING ITS REJECTION. `withTimeout` folds a
+   * rejection into its timeout fallback, which here would turn a frontend that THREW
+   * (today: propagates out of graph_run and is reported as the error it is) into one
+   * that "timed out" — a different, wrong story. Settling into {value}/{error} first
+   * keeps the two apart; the caller re-throws.
+   */
+  const boundedStep = (promise, ms) =>
+    withTimeout(
+      Promise.resolve(promise).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      ),
+      ms,
+      () => TIMED_OUT,
+    );
   // CHAIN COMPOSITION (codex gate r8). Both the entry-time capture below and
   // the per-attempt restore used to be WRONG in the presence of a concurrent
   // run:
@@ -1682,7 +1771,20 @@ export async function dispatchScopedRun({
       // This panel's live root is app.graph (r8) — app.rootGraph only as a
       // fallback for frontends that expose it instead.
       volatileInputs = collectVolatileInputs(app?.graph ?? app?.rootGraph ?? null);
-      contentCanon = canonicalizePrompt((await app.graphToPrompt())?.output, volatileInputs);
+      // #1565 — BOUNDED. Serializing the whole workflow is the first thing the run path
+      // does that the read path never does, and an extension's serializeValue that never
+      // settles held the command open with no bound at all. A serializer that will not
+      // answer leaves no fingerprint, which is already the fail-closed state below:
+      // `unverifiable`, nothing queued, and the cause named.
+      const built = await boundedStep(app.graphToPrompt(), boundedBy(verifyTimeoutMs));
+      if (built === TIMED_OUT) {
+        throw new Error(
+          `app.graphToPrompt did not answer within this run's command budget — the ` +
+            `frontend could not serialize the workflow, so nothing was queued`,
+        );
+      }
+      if (built.error) throw built.error;
+      contentCanon = canonicalizePrompt(built.value?.output, volatileInputs);
       contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
     }
   } catch (err) {
@@ -1754,14 +1856,29 @@ export async function dispatchScopedRun({
       onAcceptedNodeErrors,
     });
     apiTarget.fetchApi = guard;
+    // #1565 — this attempt's slice of the command budget, taken ONCE so the queue
+    // call and the observation wait are quoted the same number in the refusal.
+    const attemptMs = shareFor(attempts.length - attemptIndex);
     try {
-      await app.queuePrompt(mark, batch, scopeArg);
+      // #1565 — BOUNDED. `await app.queuePrompt(…)` had no bound of any kind, and it is
+      // the single most reachable hang on the run path: the reporter's own machine has
+      // BOTH `app.queuePrompt` and `api.queuePrompt` shadowed by an extension's own
+      // property, and a wrapper that never settles held graph_run open forever while
+      // reads on the same tab answered in 0.06 ms (MEASURED against this module).
+      //
+      // Abandoning the wait is safe HERE and only here: falling through with no verdict
+      // is the state the give-up path below already exists for — it cancels the still-
+      // pending queue item and, either way, CLOSES this guard, so a post the abandoned
+      // queuePrompt emits later still meets the fence and is refused rather than
+      // dispatched scopeless. A throw is re-thrown unchanged (boundedStep keeps it).
+      const queued = await boundedStep(app.queuePrompt(mark, batch, scopeArg), boundedBy(attemptMs));
+      if (queued !== TIMED_OUT && queued.error) throw queued.error;
       if (!guard.verdictReached()) {
         // queuePrompt returned without our dispatch surfacing — the
         // frontend's processor was busy and will serialize/post the item
         // LATER. Keep the guard installed and wait for the WHOLE batch to be
         // accounted (r5: never dispatched on a partial count), or the timeout.
-        await guard.waitForVerdict(verifyTimeoutMs);
+        await guard.waitForVerdict(attemptMs);
       }
       if (!guard.verdictReached()) {
         // GIVE-UP. The guard stays (that is now the default — the finally only
@@ -1801,7 +1918,7 @@ export async function dispatchScopedRun({
             indeterminate: guard.state.indeterminate,
             inFlight,
             volatileInputs: volatileList,
-            error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: true, verified, batch, inFlight }),
+            error: scopeUnverifiedError({ toNodeId, timeoutMs: attemptMs, cancelled: true, verified, batch, inFlight, budgetMs: budgetSpent() }),
           };
         }
         return {
@@ -1811,7 +1928,7 @@ export async function dispatchScopedRun({
           indeterminate: guard.state.indeterminate,
           inFlight,
           volatileInputs: volatileList,
-          error: scopeUnverifiedError({ toNodeId, timeoutMs: verifyTimeoutMs, cancelled: false, verified, batch, inFlight }),
+          error: scopeUnverifiedError({ toNodeId, timeoutMs: attemptMs, cancelled: false, verified, batch, inFlight, budgetMs: budgetSpent() }),
         };
       }
       // r6: a dispatch FAILURE with the batch not fully accounted — the

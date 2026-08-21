@@ -10998,6 +10998,44 @@ function widenSocketProofBudget(deadlineMs) {
 const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
 
 /**
+ * #1565 — `graph_run` was the one mutating command on this list with NO command budget at
+ * all, and the only one relayed in 20,000 ms rather than 30,000.
+ *
+ * What the RUN path awaits that the READ path does not: `app.graphToPrompt()` (serializing
+ * the whole workflow, including every extension's own serializeValue), `app.queuePrompt()`
+ * (the frontend's queue processor — shadowed by an extension's own property on the
+ * reporter's machine), and the scoped-dispatch observation wait, ONCE PER ARGUMENT SHAPE.
+ * `panel_query_graph` takes none of them: it reads live LiteGraph objects. That is the
+ * whole of the reported asymmetry — reads sub-second on the same tab while the run never
+ * answered at all, twice, including an explicit retry.
+ *
+ * Two things were measured on the shipped module rather than reasoned about:
+ *   - a busy queue processor draining at 4,990 ms/item made dispatchScopedRun take
+ *     20,003 ms — four argument shapes × a fresh 5,000 ms wait each — and the prompt
+ *     POSTED at 20,003 ms, i.e. AFTER the caller had been told the tab may be frozen. A
+ *     retry of that "failed" run renders the branch twice.
+ *   - an `app.queuePrompt` that never settles never returned at all, while a read on the
+ *     same objects answered in 0.06 ms.
+ *
+ * 15,000 ms, mirroring the 5,000 ms of slack ADD_NODE_COMMAND_BUDGET_MS and
+ * SET_WIDGET_COMMAND_BUDGET_MS leave against their own 30,000 ms window — for composing
+ * the reply and the websocket hop. Mirrored rather than derived for the same reason: the
+ * relay constant lives in the OTHER repo and a derived copy here could not be kept true.
+ */
+const RUN_COMMAND_BUDGET_MS = 15000;
+
+/**
+ * #1565 — what ONE `app.graphToPrompt()` may take before the panel stops waiting on it.
+ *
+ * The pre-flight and the scoped dispatch each serialize the workflow once, and a 69-node
+ * graph with extension serializers is the reported case, so this is generous rather than
+ * tight: the guarantee that matters is the COMMAND budget above, which caps the sum
+ * whatever this says. Its own job is only to stop ONE serializer that never settles from
+ * being the thing that spends the whole window.
+ */
+const RUN_SERIALIZE_TIMEOUT_MS = 8000;
+
+/**
  * #1413 — what a widget write still has to do AFTER the stale-combo refresh, held back so
  * the join cannot spend it.
  *
@@ -15611,6 +15649,10 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_run({ batch_count, to_node_id }) {
+    // #1565 — taken on the FIRST line, before anything can spend the window. Every bound
+    // below draws from this one deadline, so they compose instead of each starting a fresh
+    // clock; see RUN_COMMAND_BUDGET_MS.
+    const budget = makeCommandBudget(RUN_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, rootGraph } = getGraphCtx();
     // /run invokes this executor directly rather than through bridge dispatch.
     // Queueing a stale root would render the wrong workflow even though no graph
@@ -15707,7 +15749,24 @@ const GRAPH_TOOL_EXECUTORS = {
       // 200, against a snapshot that could drift from what the run actually sent.
       // None of that applies here: no network, no cap, and the bytes inspected are
       // the bytes that would have been POSTed.
-      const built = await app.graphToPrompt();
+      // #1565 — BOUNDED by the command budget. This serialization is the run path's first
+      // await, and it had none: an extension's serializeValue that never settles held the
+      // whole command open and the caller's only possible outcome was the bare "the tab may
+      // be backgrounded or frozen" timeout. A bound that fires throws a plain Error, which
+      // the catch below already treats as "pre-flight unavailable" and skips — the
+      // documented fail-soft contract, unchanged. The dispatch's own bounded serialization
+      // then produces the truthful, worded refusal.
+      const preflightBuild = await withTimeout(
+        app.graphToPrompt().then(
+          (value) => ({ value }),
+          (error) => ({ error }),
+        ),
+        budget.bounded(RUN_SERIALIZE_TIMEOUT_MS),
+        () => null,
+      );
+      if (preflightBuild == null) throw new Error("graph_run pre-flight: graphToPrompt did not answer in time");
+      if (preflightBuild.error) throw preflightBuild.error;
+      const built = preflightBuild.value;
       // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
       // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a
       // result that does not exist has no unrunnable entries in it — and the check below
@@ -15935,6 +15994,11 @@ const GRAPH_TOOL_EXECUTORS = {
         execIds: partialTargets,
         batch,
         toNodeId: to_node_id,
+        // #1565 — THE WHOLE FIX IS THIS ONE ARGUMENT reaching the dispatch. Without it
+        // dispatchScopedRun keeps its per-attempt clocks (4 × 5,000 ms = the entire
+        // 20,000 ms relay window) and its unbounded `await app.queuePrompt`, so the
+        // command cannot answer OR refuse inside the window its reply is relayed in.
+        budget,
         onRejection: captureRejection,
         onPromptId: capturePromptId,
         onAcceptedNodeErrors: captureAcceptedNodeErrors,
