@@ -10973,9 +10973,11 @@ const REFRESH_NODES_COMMAND_BUDGET_MS = 25000;
  * which is asserted by test, so raising either input cannot silently break it again.
  *
  * WHAT IT COSTS. Nothing at all on a healthy install: every one of these numbers is a
- * CEILING, and a backend that answers in ~0.5 s (measured: 456 ms warm / 1,062 ms cold on
- * this rig) reaches the identical verdict in the identical time — the reproduction was run
- * with a fast backend under both budgets and the elapsed times and outcomes match. What it
+ * CEILING, and a backend that answers in ~0.5 s (#1180's own measurements on this rig:
+ * 456 ms warm, 1,062 ms cold — quoted, not re-measured here) reaches the identical verdict
+ * in the identical time. That part WAS re-measured: the reproduction was run against a fast
+ * backend under both budgets and the elapsed times and outcomes match (312 ms vs 322 ms,
+ * one request, same payload). What it
  * does cost is a run that OUTLIVES its command: a `panel_refresh_nodes` against a backend
  * that never answers now leaves one whole-document download in flight for up to
  * ~12,500 ms after the reply. That is bounded, it is one run (the coalescer holds a single
