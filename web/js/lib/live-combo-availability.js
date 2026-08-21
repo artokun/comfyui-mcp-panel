@@ -196,43 +196,37 @@ const UNENUMERABLE_PREFIX =
   "[output]/[temp]/[input] annotation), which /object_info's combo list cannot enumerate";
 
 /**
- * #745 — TRUE when the server's list OFFERS `value`, comparing by VALUE rather than
- * by identity.
+ * #745 — TRUE when the server's list OFFERS `value`, compared the way the SERVER
+ * compares it. Type-faithful on purpose: `"10"` is NOT offered by `[6, 8, 10]`.
  *
- * A combo may publish NUMBERS (`duration: [6, 10]`), while a widget value that has been
- * through a workflow round-trip or a `panel_set_widget` write is the string `"10"`.
- * A bare `includes()` calls that a value the server does not offer, which is a false
- * accusation about a graph that runs. Only primitives are coerced — never an object —
- * so nothing structural is flattened into a string that happens to match.
+ * An earlier revision of this fix coerced numeric options to strings so that a widget
+ * holding `"10"` matched an option `10`. Review (codex, P1) called that a false
+ * negative, and the SERVER settles it. `execution.py` validates a combo with
+ *
+ *     invalid_vals = [val] if val not in combo_options else []
+ *
+ * and Python's `in` is `==`, under which `"10" == 10` is **False**. Verified by
+ * execution against this machine's ComfyUI 0.33.2 interpreter:
+ *
+ *     10 in [6,8,10]      -> True     (accepted)
+ *     "10" in [6,8,10]    -> False    (rejected: value_not_in_list)
+ *     10.0 in [6,8,10]    -> True     (accepted — JS has one number type, so `===`
+ *                                      reproduces this for free)
+ *
+ * So a stringified numeric value is a REAL defect in the graph, not a harmless
+ * spelling of a good one, and the coercion was hiding it. The ComfyUI frontend
+ * stringifying combo values on queue (Comfy-Org/ComfyUI_frontend#14641) is exactly
+ * how a canvas acquires one — which makes reporting it the useful behaviour, since
+ * the queue would fail with `Value not in list` and nothing else would have warned.
  */
 export function comboOffers(options, value) {
   if (!Array.isArray(options)) return false;
-  return options.some(
-    (o) =>
-      o === value ||
-      ((typeof o === "number" || typeof o === "boolean") && String(o) === value),
-  );
-}
-
-/**
- * #745 — TRUE when this input config announces itself as an UPLOAD input via a
- * `*_upload` flag that `uploadConfigOf` does NOT recognise (ComfyUI's own
- * `UploadType.model` serializes as `file_upload`, which is not in the panel's list).
- *
- * Used ONLY to abstain, never to report: an unrecognised upload kind means the panel
- * cannot say what this list can enumerate, and "I could not check this" must not be
- * written as "this is missing". False for a config with no upload flag at all, and
- * false for one `uploadConfigOf` already handles, so it changes nothing for the
- * inputs that were already judged.
- */
-export function declaresUnrecognizedUploadKind(config) {
-  try {
-    if (!config || typeof config !== "object") return false;
-    if (uploadConfigOf(config)) return false;
-    return Object.keys(config).some((k) => /_upload$/.test(k) && config[k]);
-  } catch {
-    return false;
-  }
+  // Deliberately NOT a coercing compare. See the doc block above: `"10"` and `10`
+  // are different values to the server, and only strict equality reproduces that.
+  // JS `===` already matches Python `==` for the two types that occur in a live
+  // option list (string 2630, number 44 — measured; no booleans exist, so Python's
+  // `True == 1` quirk has nothing to model here).
+  return options.some((o) => o === value);
 }
 
 export async function scanComboAvailability(
@@ -323,29 +317,8 @@ export async function scanComboAvailability(
   let assetProbeLimitHit = false;
   const adjudicateUnenumerableAsset = async (config, value) => {
     const cfg = uploadConfigOf(config);
+    if (!cfg) return null;
     const { name: bare, type: root, annotated } = parseAnnotatedFilepath(value);
-    // #745 (recurrence) — reading V2 combos brought UPLOAD inputs whose kind this
-    // panel does not recognise into scope for the first time, and an ANNOTATED value
-    // on one of them would be a NEW false positive.
-    //
-    // Measured on live 0.33.2: exactly two inputs declare an upload flag outside
-    // `UPLOAD_CONFIG_FLAGS` — `Load3D.model_file` and `Load3DAdvanced.model_file`, both
-    // `file_upload`, both V2. That is the very node class this recurrence was reported
-    // against. `uploadConfigOf` answers null for them, so the abstention below never
-    // armed and `chair.glb [output]` — which Load3D resolves through
-    // `exists_annotated_filepath` and runs fine — would be reported `missing_asset`.
-    //
-    // Abstaining on the ANNOTATED value costs no coverage: measured across all 652
-    // combo inputs, ZERO option strings carry an `[output]`/`[input]`/`[temp]`
-    // annotation, so such a value can never be a member of any list and non-membership
-    // was never evidence about it. A subfolder-only value stays JUDGED, so the
-    // reporter's own `3d/absent.glb` case is still reported.
-    if (!cfg) {
-      if (annotated && declaresUnrecognizedUploadKind(config)) {
-        return { reason: `${UNENUMERABLE_PREFIX}, and this input's upload kind is one this panel cannot adjudicate` };
-      }
-      return null;
-    }
     const { subfolder, filename } = splitInputAssetRef(bare, { backslashIsSeparator });
     if (!filename) return null;
     if (!annotated && !subfolder) return null;
@@ -426,11 +399,28 @@ export async function scanComboAvailability(
       const options = combos.get(name);
       if (!options) continue; // not a combo input — nothing to judge it against
       const value = widget.value;
-      if (typeof value !== "string" || value === "") continue;
+      // #745 (codex P1) — a NUMERIC value is judged, not skipped.
+      //
+      // This read was `typeof value !== "string"`, which silently passed every numeric
+      // combo as clean: `duration: 99` against options `[6, 8, 10]` produced NO finding,
+      // while the server rejects it with `value_not_in_list`. Before this branch that
+      // was unreachable — all 44 numeric options on the live server sit on V2 combos the
+      // scan could not read at all — so teaching the scan to READ numeric lists without
+      // also teaching it to JUDGE numeric values left the seam open on the far side.
+      // A false NEGATIVE on get_errors is the failure this tool exists to prevent.
+      //
+      // Still skipped: `null`/`undefined`, an empty string, and any object. `0` and
+      // `false` are real combo values and must NOT be dropped by a truthiness test.
+      if (typeof value !== "string" && typeof value !== "number") continue;
+      if (value === "") continue;
       if (comboOffers(options, value)) continue;
       // #1357 — before calling it missing, check whether this combo could have
-      // listed it at all.
-      const asset = await adjudicateUnenumerableAsset(entry.configs?.get(name), value);
+      // listed it at all. Only a STRING can name a file, so a numeric value skips
+      // straight to the verdict rather than through the annotated-filepath parser.
+      const asset =
+        typeof value === "string"
+          ? await adjudicateUnenumerableAsset(entry.configs?.get(name), value)
+          : null;
       if (asset?.present) continue;
       if (asset?.reason) {
         unknown.push({ id: node.id, type: className, widget: name, value, reason: asset.reason });

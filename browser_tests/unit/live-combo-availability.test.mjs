@@ -23,7 +23,6 @@ import {
   comboInputsOf,
   comboConfigsOf,
   comboOffers,
-  declaresUnrecognizedUploadKind,
   optionsLookLikeFiles,
   comboAvailabilityNote,
   linkDrivenWidgetNames,
@@ -331,9 +330,14 @@ const LOAD_AUDIO = classBody("LoadAudio", {
 });
 
 test("#745 recurrence: the reporter's case — a V2 combo value the server does not offer IS reported", async () => {
+  // #1571 taught the panel that `file_upload` IS an upload kind, so `3d/absent.glb`
+  // (a SUBFOLDER value) now routes through #1357's abstention and the server's own
+  // /view probe decides it. Production always injects that probe, so the fixture must
+  // too — without it this asserts against a shape production never has.
   const r = await scanComboAvailability(
     [node(12, "Load3D", [{ name: "model_file", value: "3d/absent.glb" }])],
     async () => LOAD3D,
+    { confirmServerAsset: () => false }, // the server answered: not on disk
   );
   assert.equal(r.unavailable.length, 1, "a V2 combo must be judged, not skipped");
   assert.equal(r.unavailable[0].widget, "model_file");
@@ -378,27 +382,21 @@ test("#745 recurrence: an UNREAD V2 list is never mistaken for an empty one", as
   }
 });
 
-test("#745 recurrence: an ANNOTATED value on an unrecognized upload kind abstains, never accuses", async () => {
-  // `Load3D.model_file` declares `file_upload`, which is NOT in UPLOAD_CONFIG_FLAGS,
-  // so the #1357 abstention did not arm for it. `chair.glb [output]` resolves through
-  // exists_annotated_filepath and runs fine, and NO option list on the live server
-  // carries an annotation (measured: 0 of 652), so non-membership says nothing.
+test("#745 recurrence: an ANNOTATED value on an upload combo abstains, never accuses", async () => {
+  // `chair.glb [output]` resolves through exists_annotated_filepath and runs fine, and
+  // NO option list on the live server carries an annotation (measured: 0 of 652), so
+  // non-membership says nothing about it. Since #1571 this is the canonical #1357 path
+  // — `file_upload` is a recognised upload kind — rather than the local workaround an
+  // earlier revision of this branch carried.
   const r = await scanComboAvailability(
     [node(99, "Load3D", [{ name: "model_file", value: "chair.glb [output]" }])],
     async () => LOAD3D,
   );
   assert.deepEqual(r.unavailable, [], "an annotated value must not be reported as missing");
   assert.equal(r.unknown.length, 1, "and must not be silently dropped either");
-  assert.match(r.unknown[0].reason, /upload kind/);
+  assert.match(r.unknown[0].reason, /cannot enumerate/);
 });
 
-test("#745 recurrence: declaresUnrecognizedUploadKind abstains ONLY for an unknown upload flag", () => {
-  assert.equal(declaresUnrecognizedUploadKind({ file_upload: true }), true);
-  assert.equal(declaresUnrecognizedUploadKind({ image_upload: true }), false, "already handled");
-  assert.equal(declaresUnrecognizedUploadKind({ options: [], multiselect: false }), false);
-  assert.equal(declaresUnrecognizedUploadKind({ file_upload: false }), false);
-  assert.equal(declaresUnrecognizedUploadKind(null), false);
-});
 
 test("#745 recurrence: comboInputsOf reads V1 and V2 alike, and configs come with them", () => {
   assert.deepEqual([...comboInputsOf(LOAD3D, "Load3D").entries()], [["model_file", ["none"]]]);
@@ -429,22 +427,72 @@ test("#745 recurrence: an INTEGER option list is never collapsed to 'nothing ins
   assert.equal(r.unavailable[0].kind, "invalid_value", "an int list names modes, not files on disk");
 });
 
-test("#745 recurrence: a STRINGIFIED int the server offers is not called missing", async () => {
-  // A workflow round-trip and panel_set_widget both hand back "10" for an option
-  // published as the number 10. Judging that by identity accuses a graph that runs.
+test("#745 codex P1: a STRINGIFIED numeric value is REPORTED — the server rejects it", async () => {
+  // This test previously asserted the OPPOSITE, and that assertion was the defect.
+  // ComfyUI validates a combo with `val not in combo_options`, and Python's `in` is
+  // `==`, under which `"10" == 10` is False — verified against this machine's 0.33.2
+  // interpreter. So `"10"` on `[6, 8, 10]` fails the queue with `value_not_in_list`,
+  // and calling it clean was a false negative. The frontend stringifying combo values
+  // on queue (Comfy-Org/ComfyUI_frontend#14641) is how a canvas acquires one, which is
+  // exactly why it is worth reporting rather than papering over.
   const r = await scanComboAvailability(
     [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: "10" }])],
     async () => INT_COMBO,
   );
-  assert.deepEqual(r.unavailable, [], "the server DOES offer this duration");
+  assert.equal(r.unavailable.length, 1, "the server would reject this value");
+  assert.equal(r.unavailable[0].value, "10");
+});
+
+test("#745 codex P1: a NUMERIC value the server does not offer is REPORTED, not skipped", async () => {
+  // The value guard read `typeof value !== "string"`, so every numeric combo passed as
+  // clean. `duration: 99` against `[6, 8, 10]` returned {unavailable:[],unknown:[]} in
+  // execution while the server rejects it. Unreachable before this branch — all 44
+  // numeric options on the live server sit on V2 combos the scan could not read.
+  const r = await scanComboAvailability(
+    [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: 99 }])],
+    async () => INT_COMBO,
+  );
+  assert.equal(r.unavailable.length, 1, "a numeric value must be judged, not skipped");
+  assert.equal(r.unavailable[0].value, 99);
+  assert.equal(r.unavailable[0].option_count, 3);
+});
+
+test("#745 codex P1: a NUMERIC value the server DOES offer stays clean", async () => {
+  // Must be clean because it MATCHED, not because it was skipped — the direction the
+  // old guard got right by accident and would have kept getting right while wrong.
+  const r = await scanComboAvailability(
+    [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: 10 }])],
+    async () => INT_COMBO,
+  );
+  assert.deepEqual(r.unavailable, [], "the server offers 10");
   assert.deepEqual(r.unknown, []);
 });
 
-test("#745 recurrence: comboOffers coerces primitives only, never structures", () => {
-  assert.equal(comboOffers([6, 10], "10"), true);
-  assert.equal(comboOffers([6, 10], "7"), false);
+test("#745 codex P1: 0 is a real combo value and is never dropped as falsy", async () => {
+  const ZERO = classBody("Z", { pick: ["COMBO", { options: [0, 1, 2] }] });
+  const ok = await scanComboAvailability([node(1, "Z", [{ name: "pick", value: 0 }])], async () => ZERO);
+  assert.deepEqual(ok.unavailable, [], "0 is offered");
+  const bad = await scanComboAvailability([node(1, "Z", [{ name: "pick", value: 7 }])], async () => ZERO);
+  assert.equal(bad.unavailable.length, 1, "7 is not offered and must be reported");
+});
+
+test("#745 codex P1: comboOffers is TYPE-FAITHFUL — it reproduces the server's own compare", () => {
+  assert.equal(comboOffers([6, 10], 10), true, "int matches int");
+  assert.equal(comboOffers([6, 10], "10"), false, 'Python: "10" == 10 is False');
+  assert.equal(comboOffers([6, 10], 7), false);
+  assert.equal(comboOffers(["10"], 10), false, "and not in the other direction either");
   assert.equal(comboOffers(["a.safetensors"], "a.safetensors"), true);
-  assert.equal(comboOffers([true], "true"), true);
   assert.equal(comboOffers([{ key: "a" }], "[object Object]"), false, "no structure may be flattened into a match");
   assert.equal(comboOffers(null, "x"), false);
 });
+
+test("#745 a non-primitive or absent widget value is still skipped", async () => {
+  for (const v of [null, undefined, {}, [], ""]) {
+    const r = await scanComboAvailability(
+      [node(7, "LtxvApiTextToVideo", [{ name: "duration", value: v }])],
+      async () => INT_COMBO,
+    );
+    assert.deepEqual(r.unavailable, [], `must not judge ${JSON.stringify(v) ?? "undefined"}`);
+  }
+});
+
