@@ -539,12 +539,72 @@ async function buildVideoSegment(v, deps) {
   // UNBOUNDED step (uploadBlobToInput does a fetch with no timeout). Bound the
   // whole pipeline: on timeout, degrade to the note-only fallback so a stalled
   // upload can never suppress the run's single completion frame.
+  //
+  // #1485 — AND KEEP THE PIPELINE SHORT, because everything on it is time the
+  // agent spends being told nothing. The run's single completion frame is not
+  // sent until this resolves, and the orchestrator now gives the panel a 5 s
+  // grace before it synthesises a completion of its own from ComfyUI history
+  // (comfyui-mcp `DEFAULT_SYNTHESIS_GRACE_MS`, cut from 45 s on the stated
+  // assumption that "the normal path lands within a second or two"). For a
+  // VIDEO that assumption does not hold: measured on this repo's rig, sampling
+  // alone is ~1–2 s for a 5–20 s 960×544 h264 clip, and the two PNG encodes
+  // stall into the seconds often enough to have been caught in a three-run
+  // sample. When the orchestrator wins that race the notice it synthesises
+  // CANNOT carry the video — an .mp4 is deliberately named-but-not-attached
+  // (comfyui-mcp#1861) — so the storyboard is the only thing that ever shows
+  // the agent this render, and it arrives late or not at all. Hence: nothing
+  // that only the USER's card needs may be awaited here, and every round trip
+  // that can overlap the decode does.
   const produce = async () => {
     try {
-      const blob = await buildVideoStoryboard(imageViewUrl(m));
+      // The video's own byte size is wanted only for the note's metadata line.
+      // Start its HEAD (bounded at 8 s inside fetchImageBytes) BEFORE the
+      // sampling pass so the round trip overlaps the decode instead of being
+      // serialised behind the sheet upload. On a remote target (a pod) that is a
+      // whole network round trip taken off the completion's critical path; the
+      // note is identical either way.
+      // Called directly, not behind a `Promise.resolve().then(…)` hop: the point
+      // is that the request is IN FLIGHT while the decode runs, and a microtask
+      // hop would let the sampling pass start first. The try/catch covers a
+      // helper that throws synchronously; the `.catch` covers a rejection, which
+      // must cost the note its size line and nothing else — inline, the same
+      // rejection fell into the segment's catch and cost the agent the sheet.
+      let sizeBytes;
+      try {
+        sizeBytes = Promise.resolve(fetchImageBytes(imageViewUrl(m))).catch(() => null);
+      } catch {
+        sizeBytes = Promise.resolve(null);
+      }
+      const produced = await buildVideoStoryboard(imageViewUrl(m));
+      // #1493 — the builder hands back `storyboardFailure({reason})` when it
+      // could not sample the video, and that object is TRUTHY: a bare `!blob`
+      // test sails straight past it and hands a plain object to
+      // uploadBlobToInput, which appends it to a FormData as the string
+      // "[object Object]" and uploads THAT as `storyboard_<name>.png`. The agent
+      // is then shown a "20-frame storyboard" that is not an image and asked to
+      // review its motion and sharpness.
+      //
+      // The builder's own comment says "produceSheet is the only consumer and
+      // does exactly that". It was not the only consumer — this is the second
+      // one, and it was the one that did not check, which is why the warning was
+      // worth nothing here. Recognise SUCCESS positively, on the same test
+      // produceSheet uses: a sheet is the thing with a numeric `size`. Anything
+      // else — `{reason}`, `{}`, `[]`, a string — is a failure, and the reason it
+      // carries is said out loud instead of being thrown away for the second
+      // time.
+      const asObject = produced != null && typeof produced === "object" ? produced : null;
+      const named = asObject && typeof asObject.reason === "string" ? asObject.reason : null;
+      const blob = asObject && typeof asObject.size === "number" && !named ? produced : null;
       if (!blob) {
-        warn("[cmcp] storyboard: could not sample frames from", m?.filename);
-        return { ref: null, note: noteOnly("couldn't sample a storyboard from it") };
+        warn("[cmcp] storyboard: could not sample frames from", m?.filename, named ?? "");
+        return {
+          ref: null,
+          note: noteOnly(
+            named
+              ? `couldn't sample a storyboard from it: ${named}`
+              : "couldn't sample a storyboard from it",
+          ),
+        };
       }
       const base = (coerceMessageText(m?.filename) || "video").replace(/\.[^.]+$/, "");
       // #209 — the storyboard contact sheet is a PANEL-GENERATED preview, not a
@@ -557,8 +617,32 @@ async function buildVideoSegment(v, deps) {
         warn("[cmcp] storyboard: upload failed for", m?.filename);
         return { ref: null, note: noteOnly("couldn't upload its storyboard") };
       }
-      const n = storyboardFrameCount();
-      const sizeStr = humanizeBytes(await fetchImageBytes(imageViewUrl(m)));
+      // THE GRID'S CAPACITY, which is NOT the number of frames that were
+      // sampled. #648 put the real count on the blob and said, in the builder,
+      // that "callers that describe the sheet must use THIS" — and then this
+      // caller described the sheet with `storyboardFrameCount()` anyway. A video
+      // whose frames refuse to seek paints fewer and leaves the rest BLANK, so
+      // the agent was told it was looking at 20 samples while it was looking at
+      // one sample and nineteen empty cells, and asked to judge motion and
+      // temporal consistency across them.
+      const cells = storyboardFrameCount();
+      const drawn = Number.isFinite(blob.paintedFrames) ? blob.paintedFrames : null;
+      const frames = drawn != null && drawn > 0 ? Math.min(drawn, cells) : null;
+      // Unlike show_media's produceSheet, an unknown count does NOT withhold the
+      // sheet here: this is the run's ONE completion, and dropping the only
+      // viewable representation of the video to avoid an imprecise sentence would
+      // cost the agent far more than the imprecision does. It is described
+      // without a count instead — never with the capacity, which is the claim
+      // that was actually false.
+      const sheetDesc =
+        frames == null
+          ? "storyboard (contact sheet)"
+          : frames < cells
+            ? `${cells}-cell storyboard (contact sheet) holding ${frames} sampled ` +
+              `frame${frames === 1 ? "" : "s"} — the other ${cells - frames} could not be captured and are ` +
+              `BLANK, so judge nothing from them, and the frames that did survive may be clustered ` +
+              `rather than spread across the video`
+            : `${frames}-frame storyboard (contact sheet)`;
       // THE POSTER rides along on the sheet blob (see buildVideoStoryboard), from
       // the same decode. Upload it beside the sheet and hand it back to the card,
       // which has already been painted by the time we get here — the card cannot
@@ -567,16 +651,32 @@ async function buildVideoSegment(v, deps) {
       // Entirely best-effort: a card with no poster keeps the metadata
       // placeholder and the guessed ratio, which is exactly the behaviour before
       // this existed. Nothing below may fail the storyboard for it.
+      //
+      // #1485 — AND IT IS DETACHED, deliberately. The poster is for the USER's
+      // video card; the agent never receives it and no part of this note depends
+      // on it. Awaiting it put a full-resolution PNG encode and a second
+      // `POST /upload/image` (718 KB on the clip measured here, against the
+      // sheet's own 1.7 MB) between the run finishing and the agent being told
+      // it finished. The card is back-filled BY URL — that is the whole reason
+      // this is a back-fill and not an argument — so it lands exactly as it does
+      // today, just without the completion frame waiting behind it. The catch is
+      // what keeps a detached rejection from surfacing as an unhandled one.
       if (blob.posterBlob && typeof applyVideoPoster === "function") {
-        try {
-          const posterRef = await uploadBlobToInput(blob.posterBlob, `poster_${base}.png`, { type: "temp" });
-          if (posterRef) applyVideoPoster(imageViewUrl(m), imageViewUrl(posterRef));
-        } catch (err) {
-          warn("[cmcp] storyboard: poster upload failed:", err);
-        }
+        void Promise.resolve()
+          .then(async () => {
+            const posterRef = await uploadBlobToInput(blob.posterBlob, `poster_${base}.png`, { type: "temp" });
+            if (posterRef) applyVideoPoster(imageViewUrl(m), imageViewUrl(posterRef));
+          })
+          .catch((err) => {
+            warn("[cmcp] storyboard: poster upload failed:", err);
+          });
       }
+      const sizeStr = humanizeBytes(await sizeBytes);
       // Show the user the contact sheet next to the <video> player.
-      paintImage(imageViewUrl(ref), `Storyboard · ${n} frames`);
+      paintImage(
+        imageViewUrl(ref),
+        frames == null ? "Storyboard" : `Storyboard · ${frames} frames`,
+      );
       // #609 — the review request is lawful ONLY when the storyboard pixels
       // actually reach the agent. Blind mode strips them at the sendFrame gate;
       // asking for a visual verdict on a withheld sheet makes a vision-capable
@@ -586,17 +686,17 @@ async function buildVideoSegment(v, deps) {
       // variant says so AFFIRMATIVELY (an explicit prohibition is reliable; a
       // merely-absent request is not) — the sheet is still painted for the user
       // above, so only the agent is blind.
-      const header = `📽️ ${n}-frame storyboard (contact sheet) of ${videoKind} — `;
+      const header = `📽️ ${sheetDesc} of ${videoKind} — `;
       const note =
         header +
         `frames run top-left→bottom-right = start→end. ` +
         `Review motion, sharpness, and temporal consistency.` +
-        metaSuffix(sizeStr, n);
+        metaSuffix(sizeStr, frames);
       const noteWhenBlind =
         header +
         `Blind mode is ON, so the storyboard was NOT sent to you (it is shown to the user). ` +
         `Do not comment on motion, sharpness, or visual quality — acknowledge completion and the metadata below only.` +
-        metaSuffix(sizeStr, n);
+        metaSuffix(sizeStr, frames);
       return { ref, note, noteWhenBlind };
     } catch (err) {
       warn("[cmcp] storyboard pipeline failed:", err);
