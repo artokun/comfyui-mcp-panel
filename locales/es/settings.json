@@ -69,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "URL del puente (avanzado)",
-    "tooltip": "URL de WebSocket del puente del orquestador del panel: ahora UN solo puente sirve a todos los proveedores (por defecto ws://127.0.0.1:9180). Cámbiala solo si inicias el orquestador en un puerto que no sea el predeterminado (COMFYUI_MCP_BRIDGE_PORT). Se aplica en la siguiente conexión."
+    "tooltip": "URL de WebSocket del puente del orquestador del panel: ahora UN solo puente sirve a todos los proveedores (por defecto ws://127.0.0.1:9199). Cámbiala solo si inicias el orquestador en un puerto que no sea el predeterminado (COMFYUI_MCP_BRIDGE_PORT). Se aplica en la siguiente conexión."
   },
   "comfyui-mcp_zoomToAction": {
     "name": "Acercar a las ediciones del agente",

@@ -69,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "Bridge URL (advanced)",
-    "tooltip": "WebSocket URL of the panel orchestrator bridge — ONE bridge now serves every provider (default ws://127.0.0.1:9180). Only change this if you start the orchestrator on a non-default port (COMFYUI_MCP_BRIDGE_PORT). Applies on the next Connect."
+    "tooltip": "WebSocket URL of the panel orchestrator bridge — ONE bridge now serves every provider (default ws://127.0.0.1:9199; 9180 is a legacy fallback). Only change this if you start the orchestrator on a non-default port (COMFYUI_MCP_BRIDGE_PORT). Applies on the next Connect."
   },
   "comfyui-mcp_zoomToAction": {
     "name": "Zoom to agent edits",

@@ -145,6 +145,33 @@ test("#1486: the https/tunnel path keeps its existing precedence", () => {
   );
 });
 
+test("#1596 an advertised local_url is adopted even when status.running is false", () => {
+  // The orchestrator named the port it bound. That is the fact that keeps a live
+  // 9180 session from being stranded when the compiled default becomes 9199.
+  assert.equal(
+    pickAdvertisedBridgeUrl({
+      protocol: "http:",
+      localUrl: "ws://127.0.0.1:9180",
+      statusBridgeUrl: "ws://127.0.0.1:9199",
+      statusRunning: false,
+      currentUrl: "ws://127.0.0.1:9199",
+    }),
+    "ws://127.0.0.1:9180",
+  );
+});
+
+test("#1596 an advertised local_url does not churn a tab already on it", () => {
+  assert.equal(
+    pickAdvertisedBridgeUrl({
+      protocol: "http:",
+      localUrl: "ws://127.0.0.1:9180",
+      statusRunning: false,
+      currentUrl: "ws://127.0.0.1:9180",
+    }),
+    null,
+  );
+});
+
 test("#1486 WIRING: the non-https path reads status, passes `running`, and keeps the guard first", () => {
   // A helper that decides correctly and is never called fixes nothing; a helper handed
   // only half the payload re-introduces the wedge above.
@@ -162,10 +189,11 @@ test("#1486 WIRING: the non-https path reads status, passes `running`, and keeps
   );
   assert.match(fn, /readOrchestratorStatus\(\)/, "the non-https path reads the advertisement");
   assert.match(fn, /statusRunning: status\?\.running/, "and passes the corroboration with it");
+  assert.match(fn, /localUrl: advertised\.local/, "and the orchestrator's advertised loopback");
   assert.match(fn, /pickAdvertisedBridgeUrl\(/, "routed through the decision helper");
   assert.ok(
     fn.indexOf("if (manualOverride) return;") < fn.indexOf("pickAdvertisedBridgeUrl("),
     "manual override is checked before anything is adopted",
   );
-  assert.match(src, /import \{ pickAdvertisedBridgeUrl \} from "\.\/lib\/advertised-bridge-url\.js";/);
+  assert.match(src, /from "\.\/lib\/advertised-bridge-url\.js"/);
 });

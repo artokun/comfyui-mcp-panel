@@ -48,8 +48,8 @@ is just its window into your graph.
 this panel ⇄ loopback bridge ⇄ comfyui-mcp orchestrator (background, Claude OR ChatGPT — your subscription) ⇄ your graph
 ```
 
-Each provider runs its own orchestrator on its own loopback port (Claude on
-`ws://127.0.0.1:9180`), so you can pick a provider rather than juggle ports.
+Every provider shares one orchestrator on one loopback port (default
+`ws://127.0.0.1:9199`; 9180 is a legacy fallback), so you pick a provider rather than juggle ports.
 
 ## Features
 
@@ -114,10 +114,10 @@ your canvas. **Disconnect** stops the agent; nothing is ever started without
 your click.
 
 Switching providers starts a fresh chat — conversations aren't shared across
-Claude and ChatGPT — and the panel tells you so. Each provider runs its own
-orchestrator on its own loopback port (Claude defaults to `ws://127.0.0.1:9180`,
-overridable via `COMFYUI_MCP_BRIDGE_PORT`), so you pick a provider rather than a
-port. The bridge is loopback-only. To run an orchestrator yourself, set
+Claude and ChatGPT — and the panel tells you so. Every provider shares one
+orchestrator on one loopback port (default `ws://127.0.0.1:9199`, overridable via
+`COMFYUI_MCP_BRIDGE_PORT`; 9180 is a legacy fallback so a live session there is
+not stranded). The bridge is loopback-only. To run an orchestrator yourself, set
 `COMFYUI_MCP_NO_AUTOSPAWN=1`, launch it manually, then click Connect (the Bridge
 URL lives under **Advanced**).
 

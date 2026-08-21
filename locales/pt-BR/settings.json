@@ -69,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "URL da ponte (avançado)",
-    "tooltip": "URL de WebSocket da ponte do orquestrador do painel — UMA ponte agora atende todos os provedores (padrão ws://127.0.0.1:9180). Só mude isto se você iniciar o orquestrador em uma porta diferente da padrão (COMFYUI_MCP_BRIDGE_PORT). Vale no próximo Conectar."
+    "tooltip": "URL de WebSocket da ponte do orquestrador do painel — UMA ponte agora atende todos os provedores (padrão ws://127.0.0.1:9199). Só mude isto se você iniciar o orquestrador em uma porta diferente da padrão (COMFYUI_MCP_BRIDGE_PORT). Vale no próximo Conectar."
   },
   "comfyui-mcp_zoomToAction": {
     "name": "Aproximar nas edições do agente",

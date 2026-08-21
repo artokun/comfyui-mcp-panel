@@ -191,7 +191,7 @@ export class PanelPage {
    * Records the url ONLY — nothing is applied until `connect()` runs, which is
    * the sole consumer of `pendingBridgeUrl`. A spec that sets a url here and then
    * drives the connection some other way (e.g. clicking the real Connect button)
-   * gets NO override: the panel dials its default `ws://127.0.0.1:9180`. On a dev
+   * gets NO override: the panel dials its default `ws://127.0.0.1:9199`. On a dev
    * box with a real orchestrator there that still connects, so the spec passes
    * while talking to the developer's own orchestrator instead of the MockBridge —
    * exactly how external-orchestrator.spec.ts was green until :9180 went quiet

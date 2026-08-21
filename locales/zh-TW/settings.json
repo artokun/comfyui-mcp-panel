@@ -69,7 +69,7 @@
   },
   "comfyui-mcp_bridgeUrl_single": {
     "name": "橋接網址（進階）",
-    "tooltip": "面板協調器橋接的 WebSocket 網址 —— 現在「一條」橋接就服務所有供應商（預設 ws://127.0.0.1:9180）。只有在你用非預設連接埠啟動協調器時才需要更改 (COMFYUI_MCP_BRIDGE_PORT)。下次按「連線」時生效。"
+    "tooltip": "面板協調器橋接的 WebSocket 網址 —— 現在「一條」橋接就服務所有供應商（預設 ws://127.0.0.1:9199）。只有在你用非預設連接埠啟動協調器時才需要更改 (COMFYUI_MCP_BRIDGE_PORT)。下次按「連線」時生效。"
   },
   "comfyui-mcp_zoomToAction": {
     "name": "縮放到代理的修改處",
