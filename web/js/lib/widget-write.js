@@ -296,6 +296,49 @@ function restoreFiniteNumberIfUnstored(widget, expected) {
   }
 }
 
+/**
+ * Does `node.widgets` have a STABLE IDENTITY — is it one array the node keeps, so that
+ * comparing the array OBJECT says something and re-pointing it restores something — or
+ * is it rebuilt on every read?
+ *
+ * Answered by OBSERVATION (two reads), not by the property descriptor, because the
+ * descriptor does not settle it: an accessor that memoises one array is every bit as
+ * identity-stable as a plain data property, and it is only a getter that BUILDS A NEW
+ * ARRAY per read that makes an identity compare meaningless. Classifying by descriptor
+ * kind would relax the check for memoising accessors that never needed relaxing.
+ *
+ * A real ComfyUI SubgraphNode is the rebuilding kind. Read off the installed
+ * comfyui-frontend 1.49.6, its constructor installs
+ *
+ *   Object.defineProperty(this, "widgets", {
+ *     get: () => [...this.inputs.flatMap(i => project(i) ?? []), ...this._extraWidgets],
+ *     set: () => {}, configurable: true, enumerable: true });
+ *
+ * — a fresh array every read, behind a setter that swallows assignment. The MEMBERS are
+ * stable (`_projectPromotedWidget` memoises each proxy onto `input._widget`); only the
+ * containing array is not.
+ *
+ * The one place this matters is #477 P1's rollback read-back, which compared the outer
+ * widget list by ARRAY IDENTITY. On a rebuilt list that compare can only ever fail, so
+ * every failed promoted write on a subgraph node reported a partial state for a
+ * rollback that had been perfect. The caller gets `false` there and compares
+ * MEMBERSHIP/ORDER instead — still by per-widget identity, which is what authenticates
+ * a rail, and which the memoised projection preserves.
+ */
+function widgetsListHasStableIdentity(node) {
+  let first;
+  let second;
+  try {
+    first = node.widgets;
+    second = node.widgets;
+  } catch {
+    // Unreadable: identity can say nothing. Answering the other way would hand the
+    // identity compare a verdict it has no basis for.
+    return false;
+  }
+  return first === second;
+}
+
 export function isBooleanWidget(widget) {
   const t = String(widget?.type ?? "").toLowerCase();
   return t === "toggle" || t === "boolean";
@@ -1664,9 +1707,15 @@ export function applyWidgetWrite(
   // node.widgets (natural cleanup when substituting a live proxy) detaches a captured
   // proxy while leaving a replacement live. Restoring only the host refs would leave
   // node.widgets corrupt yet pass read-back. Snapshot the array REFERENCE + its contents
-  // so rollback re-points and refills it, and read-back verifies membership/order.
+  // so rollback can re-point and refill it — where the node KEEPS one array — and
+  // read-back verifies membership/order either way.
   const prevOuterWidgetsRef = promotedFrom && Array.isArray(node.widgets) ? node.widgets : null;
   const prevOuterWidgets = prevOuterWidgetsRef ? prevOuterWidgetsRef.slice() : null;
+  // Whether that list KEEPS its identity or is rebuilt per read decides how the
+  // rollback restores it and how the read-back verifies it — see the helper. Read
+  // BEFORE the write, so the recheck can also notice the list changing from one kind
+  // to the other mid-write, which would otherwise slip past the identity compare.
+  const prevOuterWidgetsIdentityStable = prevOuterWidgetsRef ? widgetsListHasStableIdentity(node) : false;
 
   // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
   // so a throwing hook can never bypass our verification/rollback and leave a silent
@@ -2156,8 +2205,14 @@ export function applyWidgetWrite(
       // replacement/reorder a callback did, so a detached captured proxy is re-attached
       // and a swapped-in replacement is dropped. ONLY when the original host input is
       // still wired (else a wholesale-replaced promotion is left for partial-state
-      // reporting rather than masked).
-      if (prevOuterWidgetsRef && hostStillWired) {
+      // reporting rather than masked) — and only when the node KEEPS one array.
+      //
+      // On a real SubgraphNode the list is rebuilt per read from `node.inputs`:
+      // refilling the array a read handed out mutates a throwaway, and the assignment
+      // is swallowed by a no-op setter, so this would be theatre. Its members follow
+      // `inputs` / `hostInput.widget` / `hostInput._widget`, which the block above has
+      // already restored; the by-value read-back below judges whether that landed.
+      if (prevOuterWidgetsRef && prevOuterWidgetsIdentityStable && hostStillWired) {
         try {
           prevOuterWidgetsRef.length = 0;
           for (const wd of prevOuterWidgets) prevOuterWidgetsRef.push(wd);
@@ -2273,12 +2328,39 @@ export function applyWidgetWrite(
     // different widgetId — serializes differently). This holds whether or not the gated
     // restore above ran.
     if (promotedFrom) {
+      // Read the list ONCE: a projected `widgets` rebuilds on every access, so four
+      // reads would compare four different arrays.
+      let liveOuterWidgets;
+      let outerWidgetsReadable = true;
+      try {
+        liveOuterWidgets = node.widgets;
+      } catch {
+        // A list we cannot read is a list we cannot clear. Report the partial state —
+        // and, just as importantly, keep the throw from escaping and replacing the
+        // WidgetWriteError that explains why the write failed with a bare TypeError.
+        outerWidgetsReadable = false;
+      }
       const listExact =
         prevOuterWidgets == null ||
-        (node.widgets === prevOuterWidgetsRef &&
-          Array.isArray(node.widgets) &&
-          node.widgets.length === prevOuterWidgets.length &&
-          node.widgets.every((wd, i) => wd === prevOuterWidgets[i]));
+        (outerWidgetsReadable &&
+          // A `widgets` that swapped KIND between snapshot and read-back has been cut
+          // off from what feeds it — a rebuilt list frozen into a plain array no
+          // longer tracks `node.inputs`. That is outer-topology drift in its own
+          // right, and catching it is what stops the relaxed identity rule below from
+          // being a door: a list cannot buy its exemption after the fact.
+          widgetsListHasStableIdentity(node) === prevOuterWidgetsIdentityStable &&
+          Array.isArray(liveOuterWidgets) &&
+          // Array identity is evidence only for a list the node KEEPS. A rebuilt one
+          // hands out a FRESH array per read, so this compare could only ever fail —
+          // which is how a PERFECT rollback on a subgraph node came to be reported as
+          // a partial state. Membership/order below is the real #477 P1 check: a
+          // replaced or reordered list, an added proxy, or a dropped rail all still
+          // fail it, because each member is compared by the same object identity that
+          // authenticates a rail (and the frontend memoises each projected proxy onto
+          // `input._widget`, so those identities are stable across reads).
+          (!prevOuterWidgetsIdentityStable || liveOuterWidgets === prevOuterWidgetsRef) &&
+          liveOuterWidgets.length === prevOuterWidgets.length &&
+          liveOuterWidgets.every((wd, i) => wd === prevOuterWidgets[i]));
       let liveInput = undefined;
       try {
         const live = resolvePromotedInnerTarget(node, widgetName, resolveSource);
