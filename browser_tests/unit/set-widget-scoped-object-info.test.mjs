@@ -601,3 +601,67 @@ test("#1560: the COVERED list in the refusal is sanitized too, not just the aske
     "the covered list must be flattened before it reaches the message",
   );
 });
+
+test("#1560: THREE levels of nesting (A→B→C→KSampler) names and fetches EVERY intermediate", async () => {
+  // The two-level fixture above cannot see an under-cover that collects only the FIRST
+  // intermediate: with one level there is only one. `assertMutatedNodeAuthorized` runs per
+  // intermediate, so a type set that stopped early would ask the scoped map about a type it
+  // was never given — a refusal on a legitimate write, and invisible until someone nests
+  // three deep. ComfyUI supports arbitrary nesting.
+  const reg = loadedRegistry(["KSampler"]);
+  const concrete = regNode(100, "KSampler", [{ name: "steps", type: "INT", value: 20 }]);
+  const c = {
+    id: 90,
+    type: "SubgraphC",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    subgraph: { _nodes: [concrete], getNodeById: (id) => (String(id) === "100" ? concrete : null) },
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+  };
+  const b = {
+    id: 80,
+    type: "SubgraphB",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    subgraph: { _nodes: [c], getNodeById: (id) => (String(id) === "90" ? c : null) },
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+  };
+  const aRail = { name: "steps", type: "INT", value: 20 };
+  const a = {
+    id: 70,
+    type: "SubgraphA",
+    widgets: [{ name: "decoy", type: "INT", value: 999 }, aRail],
+    subgraph: { _nodes: [b], getNodeById: (id) => (String(id) === "80" ? b : null) },
+    inputs: [{ name: "steps", _widget: aRail, widget: { name: "steps" }, _subgraphSlot: { name: "steps" } }],
+  };
+  for (const t of ["SubgraphA", "SubgraphB", "SubgraphC"]) reg[t] = function Virtual() {};
+  const resolveSource = (n, si) => {
+    if (n === a && si?.name === "steps") return { sourceNodeId: "80", sourceWidgetName: "steps" };
+    if (n === b && si?.name === "steps") return { sourceNodeId: "90", sourceWidgetName: "steps" };
+    if (n === c && si?.name === "steps") return { sourceNodeId: "100", sourceWidgetName: "steps" };
+    return null;
+  };
+
+  const resolution = resolvePromotedInnerTarget(a, "steps", resolveSource);
+  assert.deepEqual(
+    scopedAuthorizationTypes(a, resolution, true, resolveSource).sort(),
+    ["KSampler", "SubgraphA", "SubgraphB", "SubgraphC"],
+    "BOTH intermediates are named, not just the first",
+  );
+
+  const backend = largeInstall({ defined: ["KSampler"] });
+  const { set } = await runSetWidget(a, "steps", 30, {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => null,
+    fetchScopedObjectInfo: panelStyleScopedRoute(backend.fetchApi, SILENT_OUTCOMES),
+    wasTypeEverDefined: () => false,
+    resolveSource,
+    ...HOOKS,
+  });
+  assert.equal(set.value, 30);
+  assert.equal(b.widgets[0].value, 30, "the promoted write lands on the immediate inner node");
+  assert.deepEqual(
+    backend.perClassCalls().sort(),
+    ["/object_info/KSampler", "/object_info/SubgraphA", "/object_info/SubgraphB", "/object_info/SubgraphC"],
+    "and every one of the four was actually asked about",
+  );
+});
