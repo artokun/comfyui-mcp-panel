@@ -306,6 +306,7 @@ import {
   classifyBackendStatusEvent,
   describeGraphMutationReadiness,
 } from "./lib/reconnect-recovery.js";
+import { describeHttpFailure } from "./lib/http-failure.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
 import {
@@ -22349,8 +22350,35 @@ const GRAPH_TOOL_EXECUTORS = {
       body: JSON.stringify({ unload_models: true, free_memory: true }),
     });
     if (!res.ok) {
+      // comfyui-mcp#828 — this used to interpolate `await res.text()` RAW, and on
+      // a target behind Cloudflare that pasted the whole 502 error document into
+      // the agent's tool result. `describeHttpFailure` is the one place a panel
+      // executor turns a not-ok Response into agent-visible text; it classifies
+      // what answered and carries a bounded, scrubbed prefix instead of the page.
+      //
+      // `comfyBackendIsDown()` is the SAME live predicate the graph_* dispatcher
+      // branch and `backendSocketReplyFields` consult — the fact that made
+      // panel_graph_outline say backend_socket:"reconnecting" in the very moment
+      // this call leaked HTML. `free_vram` does not start with `graph_`, so it
+      // never enters that branch; reading the predicate here is what closes the
+      // asymmetry. It is passed as an OBSERVED boolean, never inferred from the
+      // status — a 502 on its own says nothing about this tab's socket.
       const text = await res.text().catch(() => "");
-      throw new Error(`Failed to free VRAM: ${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`);
+      throw new Error(
+        describeHttpFailure({
+          what: "free VRAM",
+          route: "POST /free",
+          status: res.status,
+          statusText: res.statusText,
+          contentType: res.headers?.get?.("content-type") ?? "",
+          body: text,
+          // /free is idempotent (the orchestrator's own #1249 direct re-issue
+          // rests on that), so a retry cannot double-apply anything.
+          outcomeUnknownNote:
+            "Nothing in this response shows models were unloaded, and nothing in it shows they were not — the outcome is genuinely UNKNOWN, so the safe working assumption is that the unload did not happen. /free is idempotent, so re-issuing it once ComfyUI answers again cannot double-apply anything and is the right next step.",
+          backendReconnecting: comfyBackendIsDown(),
+        }),
+      );
     }
     return { freed: true, unload_models: true, free_memory: true };
   },
