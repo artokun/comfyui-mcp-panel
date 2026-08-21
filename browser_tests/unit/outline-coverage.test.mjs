@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { liveLinkTargetInput } from "../../web/js/lib/graph-read.js";
+import { readStoredLink } from "../../web/js/lib/connect-verify.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -292,8 +293,39 @@ function renderOutgoing({ node, links, nodes }) {
   assert.equal(body.lastIndexOf("const outs = [];"), start, "one outgoing render block only");
   const block = body.slice(start, end);
   // eslint-disable-next-line no-new-func -- running the real source IS the assertion
-  const run = new Function("n", "links", "byId", "liveLinkTargetInput", block + " return outs;");
-  return run(node, links, new Map(nodes.map((x) => [x.id, x])), liveLinkTargetInput);
+  const run = new Function(
+    "n",
+    "links",
+    "byId",
+    "liveLinkTargetInput",
+    "readStoredLink",
+    "graph",
+    block + " return outs;",
+  );
+  return run(
+    node,
+    links,
+    new Map(nodes.map((x) => [x.id, x])),
+    liveLinkTargetInput,
+    readStoredLink,
+    { links },
+  );
+}
+
+/** The graph_query adjacency block, taken VERBATIM from the handler and run against a
+ * synthetic graph. Keeping this at the production-source boundary covers traversal,
+ * rather than only the outline's formatting branch. */
+function queryAdjacency({ nodes, links }) {
+  const body = handlerBody(readFileSync(PANEL_JS, "utf8"), "graph_query({");
+  assert.ok(body, "graph_query({ … }) handler must exist");
+  const start = body.indexOf("const up = new Map();");
+  const end = body.indexOf("const closure =", start);
+  assert.notEqual(start, -1, "the graph-query adjacency block must be locatable");
+  assert.ok(end > start, "the graph-query adjacency block must terminate at the closure");
+  const block = body.slice(start, end);
+  // eslint-disable-next-line no-new-func -- running the real source IS the assertion
+  const run = new Function("nodes", "graph", "links", "readStoredLink", `${block}\nreturn { up, down };`);
+  return run(nodes, { links }, links, readStoredLink);
 }
 
 test("#342 an ORPHANED outgoing link renders NOTHING, not the slot that took its index", () => {
@@ -363,6 +395,45 @@ test("#342 an ordinary, uncompacted link still renders exactly as before", () =>
     links: { 4: { id: 4, origin_id: 1, origin_slot: 0, target_id: 3, target_slot: 0 } },
   });
   assert.deepEqual(outs, ["3.model"]);
+});
+
+test("#1590 a stale source output backlink cannot fabricate downstream consumers", () => {
+  // The live target backlink and link record say 4 → 8. Node 17's output cache still
+  // carries that link id, which used to make the outline say 17 → 8 while detail and
+  // downstream_of followed the stored origin and said 4 → 8.
+  const target = {
+    id: 8,
+    type: "KSampler",
+    inputs: [{ name: "model", type: "MODEL", link: 40 }],
+  };
+  const staleSource = { id: 17, type: "NC04 LoRA", outputs: [{ name: "MODEL", links: [40] }] };
+  const realSource = { id: 4, type: "CheckpointLoaderSimple", outputs: [{ name: "MODEL", links: [40] }] };
+  const links = { 40: { id: 40, origin_id: 4, origin_slot: 0, target_id: 8, target_slot: 0 } };
+
+  assert.deepEqual(
+    renderOutgoing({ node: staleSource, nodes: [staleSource, realSource, target], links }),
+    [],
+    "the outline must not attribute another source's stored link to node 17",
+  );
+  assert.deepEqual(
+    renderOutgoing({ node: realSource, nodes: [staleSource, realSource, target], links }),
+    ["8.model"],
+    "the stored origin must remain visible from its actual source",
+  );
+});
+
+test("#1590 downstream traversal follows the stored origin, including a Map-backed link store", () => {
+  const target = { id: 8, inputs: [{ name: "model", link: 40 }] };
+  const staleSource = { id: 17, outputs: [{ links: [40] }] };
+  const realSource = { id: 4, outputs: [{ links: [40] }] };
+  const stored = { id: 40, origin_id: 4, origin_slot: 0, target_id: 8, target_slot: 0 };
+  const { down } = queryAdjacency({
+    nodes: [staleSource, realSource, target],
+    links: new Map([[40, stored]]),
+  });
+
+  assert.deepEqual([...down.get("17") ?? []], [], "stale output metadata must not create a consumer");
+  assert.deepEqual([...down.get("4") ?? []], ["8"], "the stored origin must retain its consumer");
 });
 
 test("#342 with no live inputs to verify against, the recorded slot renders as a bare index", () => {
