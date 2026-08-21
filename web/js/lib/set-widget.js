@@ -37,6 +37,7 @@ import {
   freshBackendDefinesType,
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
+import { isTypeScopedObjectInfo } from "./scoped-object-info.js";
 import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
 import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
 import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
@@ -303,6 +304,30 @@ export async function runSetWidget(
       return "unknown";
     }
   };
+  /**
+   * The provenance of THE MAP THIS DECISION IS ABOUT — asked of the PAYLOAD first, and only
+   * then of the stamp.
+   *
+   * `readSchemaProvenance` deliberately holds the QUESTION rather than an answer, because a
+   * verdict computed before an await can be superseded during it (#1126). That is right for
+   * the whole-map routes and WRONG for #1560's type-scoped one, because the ladder below
+   * re-asks the panel for a live map: the re-ask re-enters the panel's shared
+   * `readObjectInfo`, which re-stamps the provenance on EVERY exit path it has. So a FAILED
+   * re-ask — the normal case on an install whose whole map never lands — overwrites "scoped"
+   * with "none" while `authDefs` is still the scoped map. The branch keyed on "scoped" then
+   * never fires, and what fires instead tells the caller the provenance could not be
+   * established AT ALL and to reconnect: false twice over, since a type-scoped read did
+   * answer, live, moments earlier, and reconnecting cannot help a backend whose whole map
+   * never arrives. That is the misattribution class #982/#1223 exist to stop, committed by
+   * the change written to extend them.
+   *
+   * #1223's OWN snapshot branch was dead code for the same reason once — `node-resolve.js`'s
+   * suite records it — so this is that defect one field over, and the reason the answer is
+   * not simply a second stamp captured earlier: a brand belongs to the very object being
+   * ruled on, so when the re-ask DOES replace `authDefs` with a whole live map this answers
+   * for the NEW payload with no flag anyone has to remember to clear.
+   */
+  const provenanceOf = (defs) => (isTypeScopedObjectInfo(defs) ? "scoped" : readSchemaProvenance());
   const liveRegistry = () => (typeof getRegistry === "function" ? getRegistry() : registry);
 
   // (0) FRESH-BACKEND TYPE AUTHORIZATION (#458 set_widget gap, found in review of
@@ -1215,7 +1240,7 @@ export async function runSetWidget(
       // upload probe were awaited, and both of those can supersede it — a refresh, an install,
       // a download completing, a reconnect. A verdict is a statement about a moment, so it is
       // asked at the moment it is used, on the near side of every await that could expire it.
-      let provenance = readSchemaProvenance();
+      let provenance = provenanceOf(freshDefs ?? undefined);
       let authDefs = freshDefs ?? undefined;
       // What the STALE evidence claimed, captured before it is replaced — the difference
       // between "the server publishes a list, as it always did" and "the stale schema said
@@ -1233,7 +1258,36 @@ export async function runSetWidget(
         } catch {
           /* the re-ask failed; provenance stays non-live and the refusals below fire */
         }
-        provenance = readSchemaProvenance();
+        provenance = provenanceOf(authDefs);
+      }
+      // #1560 — a TYPE-SCOPED map is the server answering NOW, but only about the handful of
+      // types this write resolves to. It can authorize the node type; it even holds this
+      // input's own option list. It still may not license the blind write: the whole-schema
+      // probes went silent, so nothing establishes that the panel is looking at the CURRENT
+      // install rather than at one class of it, and widening a last-resort unvalidated write
+      // on a partial view of the schema is the one thing this route was built not to do.
+      //
+      // DECIDED HERE, ABOVE the empty-list shape test, and that placement is the fix rather
+      // than a tidy-up. Below it this branch is unreachable in BOTH directions: when the
+      // scoped map declares the list EMPTY the shape test fires first and refuses with a
+      // message about a provenance that "could not be established at all" — false, a
+      // type-scoped read answered — and when it declares a NON-empty list the ladder falls
+      // through to the generic end-of-ladder refusal, which sends the caller to look at their
+      // value while the actual cause is a backend whose whole map never lands. Verified by
+      // execution, not by reading: with this branch deleted the whole suite stayed green,
+      // which is what dead code looks like from inside a passing test run.
+      if (provenance === "scoped") {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `${latest.message} The panel could have written it unvalidated if a WHOLE ` +
+            `/object_info declared this input's option list empty — but both whole-schema ` +
+            `probes went silent, so the only schema available is a TYPE-SCOPED read (#1560) ` +
+            `covering just the node types this write resolves to. That is enough to authorize ` +
+            `the node type and not enough to license an unvalidated write, whether or not it ` +
+            `shows this input's list as empty. This is NOT a stale or unreadable schema and ` +
+            `reconnecting need not help: wait for /object_info to answer as a whole again, ` +
+            `then retry.`,
+        );
       }
       if (serverDeclaresEmptyComboOptions(authDefs, authTarget?.type, comboDefInput)) {
         // Fails closed: no live declaration, no blind write. The user is told WHICH fact is
@@ -1359,24 +1413,6 @@ export async function runSetWidget(
       // message would tell the caller only that their combo could not be read, sending them to
       // look at their value while the actual cause is a silent backend — the exact
       // misattribution this whole change exists to stop.
-      // #1560 — a TYPE-SCOPED map is the server answering now, but only about the handful of
-      // types this write resolves to. It can authorize the node type; it holds this input's
-      // option list too, and yet it still may not license the blind write: the whole-map probes
-      // went silent, so nothing establishes that the panel is looking at the CURRENT install
-      // rather than at one class of it. Widening a last-resort unvalidated write on a partial
-      // view of the schema is the one thing this route was built not to do, so it refuses —
-      // exactly as it does today, but saying which route did answer and which did not.
-      if (provenance === "scoped") {
-        throw new Error(
-          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
-            `${latest.message} The panel could have written it unvalidated if /object_info ` +
-            `declared this input's option list empty — but both whole-schema probes went ` +
-            `silent, and the only schema available is a TYPE-SCOPED read (#1560) covering just ` +
-            `the node types this write resolves to. That is enough to authorize the node type ` +
-            `and not enough to license an unvalidated write. Wait for /object_info to answer ` +
-            `again (or reconnect to ComfyUI) and retry.`,
-        );
-      }
       if (provenance === "snapshot") {
         throw new Error(
           `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +

@@ -32,6 +32,7 @@ import {
   SCOPED_OBJECT_INFO_DEADLINE_MS,
 } from "../../web/js/lib/scoped-object-info.js";
 import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
+import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
 import { noBackendAnswerEstablished } from "../../web/js/lib/object-info-snapshot.js";
 import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
 import { TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
@@ -664,4 +665,148 @@ test("#1560: THREE levels of nesting (A→B→C→KSampler) names and fetches EV
     ["/object_info/KSampler", "/object_info/SubgraphA", "/object_info/SubgraphB", "/object_info/SubgraphC"],
     "and every one of the four was actually asked about",
   );
+});
+
+// ── The blind-write ladder: the scoped map must not be mistaken for "nothing established" ──
+//
+// Found by an adversarial gate, not by the author, and it is the shape this repo has shipped
+// before: #1223's own snapshot branch was dead code until a test drove the REAL detached map
+// through it. Here the branch keyed on `provenance === "scoped"` could never fire, because
+// the ladder re-asks for a live map and the re-ask re-enters the panel's shared
+// `readObjectInfo`, which re-stamps the provenance on every exit path it has. So the stamp
+// said "none" while the map in hand was the scoped one, and what fired instead told the
+// caller the provenance could not be established AT ALL and to reconnect — false twice over.
+
+/** A combo whose own `options.values` callback THROWS: the valid set is unreadable client-side. */
+const OPTIONS_THROW = () => {
+  throw new Error("the node's own populate() failed");
+};
+
+/**
+ * The panel's provenance stamp, reproduced with the property that made the branch dead: the
+ * shared `readObjectInfo` re-stamps on EVERY exit path, so a FAILED live re-ask overwrites
+ * whatever the scoped read stamped. A test that stubbed a constant `"scoped"` here would
+ * pass against the broken code and prove nothing.
+ */
+function panelStyleStamp() {
+  let stamp = () => "none";
+  return {
+    schemaProvenance: () => stamp(),
+    onScoped: () => {
+      stamp = () => "scoped";
+    },
+    // The panel's own failed-read exit: `setWidgetSchemaProvenance = () => "none"`.
+    refetchObjectInfoLive: async () => {
+      stamp = () => "none";
+      return null;
+    },
+  };
+}
+
+function scopedLadderFixture(serverOptions) {
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: OPTIONS_THROW }, value: "" };
+  const node = regNode(9, "StarOllamaPromptHelper", [widget]);
+  const backend = largeInstall({
+    defined: ["StarOllamaPromptHelper"],
+    perClass: async (type) =>
+      type === "StarOllamaPromptHelper"
+        ? {
+            ok: true,
+            status: 200,
+            json: async () => ({ StarOllamaPromptHelper: { input: { required: { model: [serverOptions, {}] } } } }),
+          }
+        : undefined,
+  });
+  const stamp = panelStyleStamp();
+  return {
+    widget,
+    run: () =>
+      runSetWidget(node, "model", "qwen3-vl:8b", {
+        registry: reg,
+        getRegistry: () => reg,
+        getFreshObjectInfo: async () => null,
+        fetchScopedObjectInfo: panelStyleScopedRoute(backend.fetchApi, SILENT_OUTCOMES, stamp.onScoped),
+        refetchObjectInfoLive: stamp.refetchObjectInfoLive,
+        schemaProvenance: stamp.schemaProvenance,
+        refreshCombos: (fresh, targetNode, defTypeKey, nameMap) =>
+          refreshComboOptionsFromDefs(targetNode, fresh, defTypeKey, nameMap),
+        wasTypeEverDefined: () => true,
+        ...HOOKS,
+      }),
+  };
+}
+
+test("#1560: an unreadable combo on a scoped map refuses by NAMING the scoped read — server publishes a list", async () => {
+  // The server's list is NON-empty, so the empty-list shape test is false and the ladder used
+  // to fall through to the generic end-of-ladder refusal — which reports only that the combo
+  // could not be read, sending the caller to look at their value while the actual cause is a
+  // backend whose whole /object_info never lands.
+  const { widget, run } = scopedLadderFixture(["qwen3-vl:8b", "llama3"]);
+  await assert.rejects(run(), (err) => {
+    assert.match(err.message, /TYPE-SCOPED read \(#1560\)/, "the refusal must name the route that DID answer");
+    assert.doesNotMatch(err.message, /provenance could not be established at all/);
+    return true;
+  });
+  assert.equal(widget.value, "", "fails closed — a partial view of the schema licenses nothing");
+});
+
+test("#1560: …and when the scoped map declares the list EMPTY, it still does not say 'reconnect'", async () => {
+  // The direction that actually shipped a FALSE cause. An empty list makes the shape test
+  // true, so the pre-fix code refused with "the schema provenance could not be established at
+  // all … Reconnect to ComfyUI and retry" — while a type-scoped read had answered, live,
+  // moments earlier, and on this install reconnecting cannot help at all.
+  const { widget, run } = scopedLadderFixture([]);
+  await assert.rejects(run(), (err) => {
+    assert.match(err.message, /TYPE-SCOPED read \(#1560\)/);
+    assert.doesNotMatch(
+      err.message,
+      /provenance could not be established at all/,
+      "a type-scoped read ANSWERED — claiming nothing was established is the #982 misattribution",
+    );
+    assert.match(err.message, /reconnecting need not help/, "and the remedy must be the one that can work");
+    return true;
+  });
+  assert.equal(widget.value, "", "fails closed");
+});
+
+test("#1560: a LIVE re-ask that SUCCEEDS is used — the brand follows the payload, not a flag", async () => {
+  // The other direction of the same fix. A stamp captured when the scoped map was adopted
+  // would still read "scoped" after the re-ask replaced it with a whole live map; the brand
+  // is a property of the payload, so it answers for the NEW one with nothing to reset.
+  const reg = loadedRegistry(["StarOllamaPromptHelper"]);
+  const widget = { name: "model", type: "combo", options: { values: OPTIONS_THROW }, value: "" };
+  const node = regNode(9, "StarOllamaPromptHelper", [widget]);
+  const backend = largeInstall({
+    defined: ["StarOllamaPromptHelper"],
+    perClass: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ StarOllamaPromptHelper: { input: { required: { model: [[], {}] } } } }),
+    }),
+  });
+  let stamp = () => "none";
+  const res = await runSetWidget(node, "model", "qwen3-vl:8b", {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: async () => null,
+    fetchScopedObjectInfo: panelStyleScopedRoute(backend.fetchApi, SILENT_OUTCOMES, () => {
+      stamp = () => "scoped";
+    }),
+    // The whole map lands on the re-ask — a WHOLE payload, so it carries no scoped brand.
+    refetchObjectInfoLive: async () => {
+      stamp = () => "live";
+      return { StarOllamaPromptHelper: { input: { required: { model: [[], {}] } } } };
+    },
+    schemaProvenance: () => stamp(),
+    refreshCombos: (fresh, targetNode, defTypeKey, nameMap) =>
+      refreshComboOptionsFromDefs(targetNode, fresh, defTypeKey, nameMap),
+    wasTypeEverDefined: () => true,
+    ...HOOKS,
+  });
+  assert.equal(res.set.value, "qwen3-vl:8b", "a LIVE whole map declaring the list empty licenses the write");
+  // Which acceptance admitted it is decided at COERCION time: this callback throws on every
+  // read, so the disclosure is the UNREADABLE one. What matters here is that the write landed
+  // at all — the live re-ask licensed it, and the scoped refusal did not pre-empt that.
+  assert.equal(res.option_list_unreadable, true, "the caller is still told nothing validated the value");
 });

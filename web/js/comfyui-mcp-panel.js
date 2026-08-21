@@ -14610,8 +14610,20 @@ const GRAPH_TOOL_EXECUTORS = {
           fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
           deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
         });
-        // Held for the reply and for the #1126 blind-write ladder, which must NOT treat this
-        // as the server's whole word: it is the server answering now about a handful of types.
+        // Stamped for the #1126 blind-write ladder, which must NOT treat this as the server's
+        // whole word: it is the server answering now about a handful of types.
+        //
+        // NOT "held for the reply" — an earlier version of this comment said so and it was
+        // never true. Only the #1223 snapshot path sets `setWidgetSchemaFromSnapshot`, which
+        // is what puts `schema_source` on the result; a scoped-authorized write reports plain
+        // success, deliberately (the authorization really was the server answering live, so
+        // the argument that justifies disclosing a PAST word does not carry over, and a new
+        // reply field is its own reviewable change under the freeze).
+        //
+        // And this stamp alone cannot carry the fact to the ladder: the ladder re-asks for a
+        // live map, which re-enters this same handler and re-stamps on every exit path it
+        // has. `set-widget.js` therefore reads the BRAND on the payload rather than trusting
+        // this variable to survive; see `provenanceOf` there.
         if (scoped.defs) setWidgetSchemaProvenance = () => "scoped";
         return scoped;
       },

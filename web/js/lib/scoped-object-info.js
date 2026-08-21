@@ -412,3 +412,32 @@ export async function fetchTypeScopedObjectInfo(
   }
   return { defs: scopedView(present, new Set(wanted)), covered: wanted, reason: "" };
 }
+
+/**
+ * Is THIS the map `fetchTypeScopedObjectInfo` handed back?
+ *
+ * Asked of the payload itself rather than of a stored stamp, and that is the whole point.
+ * `set-widget.js` re-reads its schema provenance AFTER a live re-ask, and the panel's shared
+ * `readObjectInfo` re-stamps that provenance on every one of its exit paths — so a "the
+ * schema is type-scoped" fact recorded at the moment the map was adopted is overwritten
+ * before the ladder reads it, and the branch keyed on it becomes dead code that never fires
+ * while a message asserting a DIFFERENT, false cause fires in its place. That is not
+ * hypothetical: it is exactly how #1223's own snapshot branch came to be dead
+ * (`node-resolve.test.mjs` records it), and it happened again here one field over.
+ *
+ * A brand carried by the object cannot drift, because it is a property of the very payload
+ * being ruled on: if the re-ask replaces that payload with a whole map, this answers false
+ * for the new one without anybody having to remember to clear a flag.
+ *
+ * A foreign object that THROWS on a symbol read is not this module's map, so false is the
+ * right answer for it — and a throw out of a provenance question would replace a refusal
+ * with a crash.
+ */
+export function isTypeScopedObjectInfo(defs) {
+  if (!defs || typeof defs !== "object") return false;
+  try {
+    return defs[SCOPED_OBJECT_INFO] === true;
+  } catch {
+    return false;
+  }
+}
