@@ -6,24 +6,6 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-## [0.15.33] - 2026-08-21
-
-### Fixed
-- free_vram classifies what answered instead of pasting the proxy's error page (#1591)
-- a frontend-only node stays addable when the object_info fetch does not answer (#1586)
-- a benign load-time rewrite INSIDE a subgraph definition stops refusing the open (#1578)
-- a subgraph node's rebuilt widget list is compared by MEMBERSHIP, not by array identity (#1577)
-- a scoped batch drives ComfyUI's own control hooks, so batch_count means N renders (#1576)
-- the video completion stops waiting on work the agent never sees (#1579)
-- the live availability scan reads V2/V3 combos, not just the V1 shape (#1568)
-- a save whose tracker snapshot is behind the canvas is refused, not reported as success (#1567)
-- three refusal/comment inaccuracies from #1561 now state what the code observed (#1574)
-- graph_run answers inside the window its reply is relayed in (#1570)
-- recognise ComfyUI's file_upload flag so Load3D model inputs get upload handling (#1571)
-- panel_refresh_nodes spends the window it holds, and stops blaming a server it never saw fail (#1566)
-- a type-scoped /object_info answers the fence when the whole map never lands (#1561)
-
-
 ## [0.15.32] - 2026-08-21
 
 ### Fixed
