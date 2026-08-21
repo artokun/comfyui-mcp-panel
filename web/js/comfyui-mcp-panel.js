@@ -1575,10 +1575,23 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts) {
         clientRouteError = err;
         defs = null;
       }
-      // #1562 — record HOW route 1 ended, from the flag the loop already keeps rather than
+      // #1562 — record HOW route 1 ended, from the flags the loop already keeps rather than
       // from the error's text. `lastAttemptTimedOut` is set only where `boundedGetNodeDefs`
-      // returned its sentinel, so this is "abandoned at the bound", never "failed".
-      fetchAbandonedAtBound = clientRouteThrew && lastAttemptTimedOut === true;
+      // returned its sentinel, so it means "abandoned at the bound", never "failed".
+      //
+      // `!sawRealError` is the loop's OWN precedence rule, applied to the classification as
+      // well as to the thrown value. A REAL ERROR OUTRANKS A SYNTHESIZED TIMEOUT (the
+      // `if (sawRealError) throw lastRealError` above), and the same sequence that makes it
+      // outrank there makes it outrank here: attempt 1 rejects for real (`Failed to fetch`
+      // against a port that is not open yet), the retry stalls past its bound, and the loop
+      // ends with BOTH flags set. Without this clause that ending was read as an
+      // abandonment, so a verdict whose own evidence clause said
+      // "api.getNodeDefs() failed: Failed to fetch" was headed "none of them FAILED" — the
+      // report contradicting itself in one paragraph — and the reader of a genuinely
+      // restarting backend was told a plain retry would not help, when a plain retry is
+      // exactly what helps there. The rule is one line, not two: an abandonment is what
+      // ends a route that never failed, ACROSS attempts as well as across routes.
+      fetchAbandonedAtBound = clientRouteThrew && lastAttemptTimedOut === true && !sawRealError;
       // #608 — THE SECOND TRANSPORT, on the terms #982 set and #1161 bounded.
       //
       // Same question, different route: the WHOLE document, never the per-class

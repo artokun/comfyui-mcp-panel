@@ -1869,3 +1869,40 @@ test("#1562: a route that ANSWERED unusably outranks the other's silence too", a
   assert.doesNotMatch(verdict.remedy, /ABANDONED AT ITS BOUND/);
   assert.match(verdict.remedy, /GET \/object_info was not OK \(status 500\)/);
 });
+
+test("#1562: a real failure EARLIER in route 1's retry loop outranks the stall that ended it", async () => {
+  // THE SEQUENCE A POST-RESTART REFRESH ACTUALLY MEETS, and the one the first version of
+  // this branch got wrong. ComfyUI is genuinely down when attempt 1 runs (`Failed to
+  // fetch`, connection refused); by the retry it has bound the port but is still importing
+  // packs, so attempt 2 stalls past its bound and the loop ends with BOTH flags set —
+  // `sawRealError` AND `lastAttemptTimedOut`. The loop already ranks these ("A REAL ERROR
+  // OUTRANKS A SYNTHESIZED TIMEOUT": it rethrows `lastRealError`, not the stall), and the
+  // classification has to rank them the same way. Reading that ending as an abandonment
+  // produced a verdict headed "none of them FAILED" whose own evidence clause read
+  // "api.getNodeDefs() failed: Failed to fetch", and told a reader whose backend was still
+  // booting that a plain retry would not help — which is the one thing that does help there.
+  let attempt = 0;
+  const verdict = await runWithHangingRoutes({
+    getNodeDefs: async () => {
+      attempt += 1;
+      if (attempt === 1) throw new TypeError("Failed to fetch");
+      return new Promise(() => {}); // bounded → NODE_DEFS_NO_ANSWER on the retry
+    },
+    fetchApi: () => new Promise(() => {}), // route 2 merely stalls
+  });
+  assert.ok(attempt >= 2, `the retry loop must have run twice for this to be the case under test (ran ${attempt})`);
+  assert.equal(verdict.reason, "object_info_fetch_failed");
+  assert.match(
+    verdict.remedy,
+    /check that the ComfyUI server process is still running/,
+    "route 1 FAILED for real before it stalled, so the remedy that names a possibly-down " +
+      "server is the correct one — and a plain retry is what fixes a booting backend",
+  );
+  assert.doesNotMatch(
+    verdict.remedy,
+    /ABANDONED AT ITS BOUND/,
+    "a route that failed and then stalled did not merely run out of time",
+  );
+  // The self-contradiction this guards: the heading and the evidence clause disagreeing.
+  assert.match(verdict.remedy, /Failed to fetch/, "#608's evidence clause still names what route 1 did");
+});

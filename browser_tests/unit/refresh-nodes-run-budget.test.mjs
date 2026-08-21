@@ -309,8 +309,11 @@ test("#1562: the fetch phase classifies route endings by TAG, not by message tex
   assert.ok(block.length > 0, "the fetch phase moved — update this harness");
   assert.match(
     block,
-    /fetchAbandonedAtBound = clientRouteThrew && lastAttemptTimedOut === true;/,
-    "route 1's ending must come from the loop's own timeout flag",
+    /fetchAbandonedAtBound = clientRouteThrew && lastAttemptTimedOut === true && !sawRealError;/,
+    "route 1's ending must come from the loop's own flags — the timeout AND the real-error " +
+      "flag it already ranks above it. Dropping `!sawRealError` classifies a route that " +
+      "FAILED and then stalled as an abandonment, which is asserted behaviourally in " +
+      "node-def-refresh.test.mjs; this line is what makes the rule readable in one place.",
   );
   assert.match(
     block,
