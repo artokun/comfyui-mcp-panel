@@ -533,6 +533,12 @@ export function assertAddNodeResolvable(registry, class_type) {
  *      We must NOT fall back to the stale registry: a transient fetch failure would
  *      otherwise authorize a since-removed type (#458/P1-2). Only a caller that
  *      wires NO fresh-oracle at all degrades to the registry-only guard.
+ *      THE ONE EXCEPTION (mcp#2000) is the SAME frontend-only exemption as step 2,
+ *      applied on the same terms: a type absent from the session history oracle
+ *      (which a timeout leaves intact) AND authorized by isAuthorizedFrontendOnlyType
+ *      against the LIVE REGISTRY. Neither clause reads /object_info, and for a
+ *      frontend-only type /object_info is empty by design — so a fetch that did not
+ *      answer withheld nothing, and refusing on it was a false refusal, not a guard.
  *
  *   getRegistry        : () => the LIVE registry object (re-invoked after refresh).
  *   getFreshObjectInfo : optional async () => the CURRENT /object_info map (keyed by
@@ -575,6 +581,36 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
       freshDefs = null;
     }
     if (!freshDefs || typeof freshDefs !== "object") {
+      // mcp#2000 — A FETCH THAT DID NOT ANSWER IS NOT EVIDENCE ABOUT A TYPE THE FETCH
+      // COULD NEVER HAVE ANSWERED ABOUT. Failing closed here for EVERY type refused a
+      // MarkdownNote on a healthy live canvas whose /object_info refresh had just timed
+      // out, telling the reporter to "Reconnect ComfyUI" while ComfyUI was answering
+      // fine. object-info-history.js already states this rule for its own latch — "ARM
+      // THIS ONLY ON EVIDENCE, NEVER ON A TIMEOUT… latching on one would turn ordinary
+      // latency into a permanent false refusal of every legitimate add/write" — and this
+      // branch was breaking it.
+      //
+      // The exemption below is EXACTLY the one the fetched-defs path applies a few lines
+      // down, and it is safe here because NOT ONE of its clauses reads `freshDefs`:
+      //   - the #458 ever-seen gate reads the SESSION HISTORY oracle, which survives a
+      //     timeout untouched (recordTypes(null) records nothing, and a timeout must
+      //     never arm loseBaseline) — so the non-forgeable trust root that catches a
+      //     removed pack squatting a reserved name is still fully in force; and
+      //   - isAuthorizedFrontendOnlyType reads the LIVE REGISTRY (membership + reserved
+      //     allowlist + no backend provenance), which is also precisely what
+      //     LG.createNode needs, so an exempted add constructs a REAL node and cannot
+      //     mint the #458 placeholder.
+      // For a genuinely frontend-only type /object_info is empty BY DESIGN, so a
+      // successful fetch would have added no information about it whatsoever. Every
+      // other type — and every doubt, including a pending/unseeded/absent history
+      // oracle — still fails closed on the message below, unchanged.
+      if (
+        typeof wasTypeEverDefined === "function" &&
+        backendHistoryVerdict(class_type, wasTypeEverDefined) === "never-seen" &&
+        isAuthorizedFrontendOnlyType(readRegistry(), class_type)
+      ) {
+        return;
+      }
       throw new Error(
         `cannot verify node type "${class_type}" against the ComfyUI backend ` +
           `(object_info is unavailable — the backend is unreachable or the fetch failed). ` +

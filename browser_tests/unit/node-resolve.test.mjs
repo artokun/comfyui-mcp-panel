@@ -1010,16 +1010,137 @@ test("#496 add_node: the EVER-SEEN gate still wins — an allowlisted name whose
   );
 });
 
-test("#496 add_node: object_info UNAVAILABLE still fails closed, even for a frontend-only type", async () => {
-  // The exemption is scoped to "object_info WAS fetched but lacks the type". An
-  // unverifiable backend must never authorize anything (#458).
+// ---- mcp#2000: object_info UNAVAILABLE no longer refuses a FRONTEND-ONLY type.
+//      Reported against a HEALTHY live canvas: panel_refresh_nodes timed out fetching
+//      /object_info, and the very next panel_add_node "MarkdownNote" was refused with
+//      "Reconnect ComfyUI and retry" — while ComfyUI was answering fine. The
+//      availability guard ran BEFORE the frontend-only exemption, so a fetch that did
+//      not answer vetoed a type the fetch could never have answered about: /object_info
+//      never lists Note/MarkdownNote/Reroute/PrimitiveNode BY DESIGN.
+//
+//      The exemption is applied on the SAME terms as the fetched-defs path, and neither
+//      of its clauses reads freshDefs — the ever-seen gate reads the session history
+//      oracle (which a timeout leaves intact), and isAuthorizedFrontendOnlyType reads
+//      the live registry. So this narrows nothing about #458: the block below pins every
+//      fail-closed direction, and each case is refused for a DIFFERENT clause. --------
+
+const ADD_OPTS_NO_OBJECT_INFO = (wasTypeEverDefined = () => false) => ({
+  getFreshObjectInfo: async () => null, // the bounded fetch timed out / rejected
+  refresh: async () => {},
+  wasTypeEverDefined,
+});
+
+test("mcp#2000 add_node: THE REPORTED CASE — a frontend-only native is ADDABLE when the /object_info fetch did not answer", async () => {
   const reg = registryWithNatives();
+  for (const t of ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+    await assert.doesNotReject(
+      () => assertAddNodeResolvableRefreshing(() => reg, t, ADD_OPTS_NO_OBJECT_INFO()),
+      `mcp#2000: "${t}" is frontend-only — a fetch that did not answer withheld nothing about it`,
+    );
+  }
+  // The rgthree frontend control nodes ride the same shared allowlist.
+  const reg2 = loadedRegistry([], ["Fast Groups Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(
+      () => reg2,
+      "Fast Groups Bypasser (rgthree)",
+      ADD_OPTS_NO_OBJECT_INFO(),
+    ),
+  );
+});
+
+test("mcp#2000 add_node: driven through the REAL history oracle after a timed-out refresh, not a stub", async () => {
+  // Production wiring: the baseline seeded at page load, then a refresh timed out.
+  // recordTypes(null) records nothing and a timeout must NEVER arm loseBaseline, so the
+  // baseline SURVIVES — which is exactly why the ever-seen gate is still trustworthy on
+  // this path. If that ever stops holding, this test is the one that catches it.
+  const history = createObjectInfoHistory();
+  history.recordTypes({ KSampler: {}, VAEDecode: {}, SaveImage: {} });
+  history.markSeeded();
+  history.recordTypes(null); // the timed-out refresh
+  assert.equal(history.seeded, true, "a timeout must not demote the baseline");
+  assert.equal(history.wasTypeEverDefined("MarkdownNote"), false, "verdict must be never-seen");
+
+  const reg = registryWithNatives();
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(
+      () => reg,
+      "MarkdownNote",
+      ADD_OPTS_NO_OBJECT_INFO((t) => history.wasTypeEverDefined(t)),
+    ),
+  );
+  // …and a type the SAME surviving baseline DID report is still refused: the trust root
+  // is doing real work here, it is not merely present.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => loadedRegistry([], ["SaveImage"]),
+        "SaveImage",
+        ADD_OPTS_NO_OBJECT_INFO((t) => history.wasTypeEverDefined(t)),
+      ),
+    /cannot verify|object_info is unavailable/i,
+  );
+});
+
+test("mcp#2000 add_node: object_info UNAVAILABLE still fails closed for everything that is not an authorized frontend-only type", async () => {
+  // Each case below trips a DIFFERENT clause, so a mutation that removes any one of
+  // them shows up here rather than hiding behind a sibling.
+  // (a) not on the allowlist — a genuinely unknown type.
+  const reg = registryWithNatives();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "TotallyMadeUpNode", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (b) a REAL backend type: /object_info IS load-bearing for it, so an unanswered
+  //     fetch must still veto — this is the #458 case the guard exists for.
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "KSampler", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (c) an allowlisted NAME whose registered class carries backend provenance — a
+  //     removed pack's stale class squatting a reserved name.
+  const regHusk = loadedRegistry(["MarkdownNote"]); // registered WITH nodeData
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => regHusk, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (d) an allowlisted name absent from the LIVE REGISTRY — registry membership is what
+  //     LG.createNode needs, so without it the add could only mint a placeholder.
+  const regBare = loadedRegistry();
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => regBare, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO()),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (e) THE EVER-SEEN GATE, on the unavailable path too: the backend reported this
+  //     reserved name earlier this session ⇒ its pack was removed ⇒ refuse.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(
+        () => reg,
+        "MarkdownNote",
+        ADD_OPTS_NO_OBJECT_INFO((t) => t === "MarkdownNote"),
+      ),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (f) history PENDING (the baseline has not arrived) and (g) UNSEEDED (it never
+  //     will) are both TRUTHY sentinels ⇒ not "never-seen" ⇒ refuse.
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO(() => HISTORY_PENDING)),
+    /cannot verify|object_info is unavailable/i,
+  );
+  await assert.rejects(
+    () =>
+      assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", ADD_OPTS_NO_OBJECT_INFO(() => HISTORY_UNSEEDED)),
+    /cannot verify|object_info is unavailable/i,
+  );
+  // (h) NO history oracle wired at all: the exemption REQUIRES the non-forgeable trust
+  //     root, so a caller that omits it gets the strict pre-mcp#2000 behaviour.
   await assert.rejects(
     () =>
       assertAddNodeResolvableRefreshing(() => reg, "MarkdownNote", {
         getFreshObjectInfo: async () => null,
         refresh: async () => {},
-        wasTypeEverDefined: () => false,
       }),
     /cannot verify|object_info is unavailable/i,
   );
