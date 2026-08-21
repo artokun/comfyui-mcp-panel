@@ -7781,9 +7781,17 @@ function awaitMediaEvent(el, name, timeoutMs) {
  *
  * THIS IS TRUTHY, so a caller must test `.reason` BEFORE treating the result as
  * a sheet — `if (!sheet)` alone would sail past it and try to upload a plain
- * object. `produceSheet` is the only consumer and does exactly that. Said
- * plainly because the tempting summary — "existing checks keep working" — is
- * false, and a wrong reassurance in a comment outlives the person who wrote it.
+ * object. Said plainly because the tempting summary — "existing checks keep
+ * working" — is false, and a wrong reassurance in a comment outlives the person
+ * who wrote it.
+ *
+ * There are TWO consumers, counted rather than remembered (#1485): `produceSheet`
+ * in lib/media-preview.js (show_media) and `buildVideoSegment` in
+ * lib/run-completion-frame.js (the run's completion frame). This comment used to
+ * say produceSheet was the only one — and the second consumer was, for that whole
+ * time, the one testing `!blob` and uploading the failure object as if it were a
+ * PNG. A comment that names its callers has to be re-counted when it is edited,
+ * or it becomes the reason nobody looks.
  *
  * What it DOES preserve is the meaning of `null`: a builder that returns nothing
  * still reports nothing, so a test double of `async () => null` keeps meaning

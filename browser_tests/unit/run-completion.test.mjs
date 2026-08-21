@@ -312,7 +312,15 @@ function makeFrameDeps(overrides = {}) {
     fetchImageBytes: async () => 2048,
     fetchImageDimensions: async () => ({ w: 512, h: 512 }),
     humanizeBytes: (n) => (n == null ? null : `${n} B`),
-    buildVideoStoryboard: async () => ({ fake: "blob" }),
+    // #1485 — this double used to be `{ fake: "blob" }`, and that is the exact
+    // shape the composer must REFUSE: `storyboardFailure({reason})` is a truthy
+    // plain object too, so a double that is truthy-but-not-a-Blob made the old
+    // `if (!blob)` test look correct while production was uploading an
+    // explanation to ComfyUI as `storyboard_<name>.png`. A sheet is the thing
+    // with a numeric `size` (the test every consumer now applies), and
+    // `paintedFrames` is what #648 requires a caller to describe it by — so the
+    // double carries both, and the assertions below are unchanged.
+    buildVideoStoryboard: async () => ({ size: 4096, paintedFrames: 20 }),
     uploadBlobToInput: async (_blob, name, opts) => {
       uploadCalls.push({ name, opts });
       return { filename: name, type: opts?.type || "input" };
@@ -574,7 +582,8 @@ test("#609: ONE decision per frame — parallel segments can never disagree with
     // fast.mp4's storyboard resolves immediately; slow.mp4's takes a real 20ms.
     buildVideoStoryboard: async (url) => {
       if (/slow/.test(url)) await new Promise((r) => setTimeout(r, 20));
-      return { fake: "blob" };
+      return { size: 4096, paintedFrames: 20 }; // #1485 — a Blob-shaped sheet, see makeFrameDeps
+
     },
     // Blind flips ON during slow.mp4's upload — AFTER fast.mp4's whole segment
     // (including its note) was already built.
