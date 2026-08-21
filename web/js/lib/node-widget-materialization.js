@@ -605,7 +605,12 @@ export function registeredSocketTypes(objectInfoDefs) {
     const outputs = def?.output;
     if (!Array.isArray(outputs)) continue;
     for (const out of outputs) {
-      if (typeof out === "string" && out) types.add(out);
+      if (typeof out !== "string" || !out) continue;
+      types.add(out);
+      // ComfyUI's `*` wildcard can be one segment of a comma-joined output type
+      // (for example `*,IMAGE`). Keep the existing whole-output proof, and add the
+      // same wildcard sentinel used by the report's output-side check.
+      if (out.split(",").some((segment) => segment.trim() === "*")) types.add("*");
     }
   }
   return types;

@@ -120,7 +120,7 @@ function wildcardDictObjectInfo() {
     JsonParseNode: {
       name: "JsonParseNode",
       input: { required: {} },
-      output: ["*"],
+      output: ["*,IMAGE"],
     },
     DictGetNode: {
       name: "DictGetNode",

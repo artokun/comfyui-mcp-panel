@@ -353,6 +353,31 @@ test("registeredSocketTypes derives link datatypes from fresh /object_info outpu
   assert.equal(types.size, 5);
 });
 
+test("#1584: registeredSocketTypes recognizes wildcard output segments", () => {
+  for (const output of ["*", "*,IMAGE", "IMAGE,*", " IMAGE , * "]) {
+    const types = registeredSocketTypes({ Producer: { output: [output] } });
+    assert.equal(types.has("*"), true, `${JSON.stringify(output)} proves wildcard output`);
+  }
+
+  for (const output of ["**", "*IMAGE", "IMAGE, MASK"]) {
+    const types = registeredSocketTypes({ Producer: { output: [output] } });
+    assert.equal(types.has("*"), false, `${JSON.stringify(output)} is not a wildcard segment`);
+  }
+});
+
+test("#1584: a wildcard output segment clears a custom socket wait without waiving widgets", () => {
+  const known = registeredSocketTypes({ Producer: { output: ["*,IMAGE"] } });
+  const socket = { input: { required: { value: ["DICT", {}] } } };
+  const widget = { input: { required: { value: ["DICT", { default: {} }] } } };
+
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(socket, {}, known, socket), []);
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(widget, {}, known, widget),
+    ["DICT"],
+    "wildcard output proof must not waive a value-bearing custom widget",
+  );
+});
+
 // ---- #626 P0-1: output-type compatibility is not proof an input is LINK-ONLY -------
 //
 // `knownSocketTypes` waived registration for any input whose type appears as SOME fresh
