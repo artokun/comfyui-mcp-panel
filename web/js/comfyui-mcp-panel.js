@@ -523,6 +523,12 @@ import { ackVisibleCanvasMutation, withVisibleCanvasAck } from "./lib/visible-ca
 import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
 import {
+  installGraphToPromptSnapshotBarrier,
+  reserveGraphToPromptSnapshot,
+  releaseGraphToPromptSnapshot,
+  withoutGraphToPromptSnapshot,
+} from "./lib/run-prompt-snapshot.js";
+import {
   recordCopiedNodes,
   getVerifiedSnapshot,
   parseClipboardNodes,
@@ -16351,7 +16357,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // `.then` on it throws, and the catch below would silently skip a pre-flight that
       // used to run — a bound that removes a guard is the failure it exists to prevent.
       const preflightBuild = await withTimeout(
-        Promise.resolve(app.graphToPrompt()).then(
+        Promise.resolve(withoutGraphToPromptSnapshot(app, () => app.graphToPrompt())).then(
           (value) => ({ value }),
           (error) => ({ error }),
         ),
@@ -16487,6 +16493,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // one exit that needs them: a queue call abandoned at the command budget.
     let runInterceptor = null;
     let fullRunAbandoned = false;
+    let promptSnapshotReservation = null;
     const queuedPromptIds = [];
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
@@ -16525,6 +16532,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // the deferred serialization queuePrompt runs when its processor is already
     // busy) without permanently altering the live workflow.
     installGraphToPromptNullSafety(app);
+    // #1588 — ComfyUI may defer graphToPrompt until its busy queue processor
+    // reaches this item. Keep the prompt captured by this command for the
+    // single-prompt deliberate-sweep path so later widget mutations cannot
+    // rewrite a queued job. Batches retain their queue-time callback semantics.
+    installGraphToPromptSnapshotBarrier(app);
     // #988 — computed BEFORE dispatch (codex). Measuring it afterwards described a
     // run that had already been submitted, while the note claimed it let the caller
     // cancel — a remedy it could not offer. Reading the graph first means the finding
@@ -16570,6 +16582,9 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!partialTargets) {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
+      if (batch === 1 && preflightPrompt != null) {
+        promptSnapshotReservation = reserveGraphToPromptSnapshot(app, preflightPrompt);
+      }
       if (origFetchApi) {
         runInterceptor = createRunFetchInterceptor({
           origFetchApi,
@@ -16619,6 +16634,12 @@ const GRAPH_TOOL_EXECUTORS = {
         if (queued == null) fullRunAbandoned = true;
         // `"error" in` rather than a truthiness test — a falsy thrown value still throws.
         else if ("error" in queued) throw queued.error;
+      } catch (error) {
+        // A busy queue returns before consuming its item, so its reservation
+        // must survive this command's normal `false` result. Release only when
+        // queuePrompt rejected before the item could be processed.
+        releaseGraphToPromptSnapshot(app, promptSnapshotReservation);
+        throw error;
       } finally {
         if (origFetchApi) api.fetchApi = prevFetchApi;
       }

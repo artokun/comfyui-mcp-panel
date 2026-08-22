@@ -50,6 +50,12 @@ import {
 } from "../../web/js/lib/missing-node-preflight.js";
 import { buildQueueAcceptResult, summarizePromptRejection } from "../../web/js/lib/queue-rejection.js";
 import { installGraphToPromptNullSafety } from "../../web/js/lib/widget-null-safety.js";
+import {
+  installGraphToPromptSnapshotBarrier,
+  reserveGraphToPromptSnapshot,
+  releaseGraphToPromptSnapshot,
+  withoutGraphToPromptSnapshot,
+} from "../../web/js/lib/run-prompt-snapshot.js";
 import { collectAllGraphs } from "../../web/js/lib/asset-staleness.js";
 import {
   findRepeatingControlWidgets,
@@ -436,6 +442,10 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch }) {
     missingNodeRunRefusal,
     describeUnrunnable,
     installGraphToPromptNullSafety,
+    installGraphToPromptSnapshotBarrier,
+    reserveGraphToPromptSnapshot,
+    releaseGraphToPromptSnapshot,
+    withoutGraphToPromptSnapshot,
     collectAllGraphs,
     findRepeatingControlWidgets,
     findRgthreeSeedNodes,
@@ -486,6 +496,73 @@ test("#1565 CALL SITE: graph_run hands the dispatch its own command budget", asy
     );
     assert.equal(passed.totalMs, 600, "the budget is the command's own, not one invented inside the dispatch");
     assert.ok(passed.bounded(999999) <= 600, "every allowance is capped by what the COMMAND has left");
+  } finally {
+    stop();
+  }
+});
+
+test("#1588 CALL SITE: a busy queue serializes each deliberate-sweep prompt snapshot", async () => {
+  const stop = keepAlive();
+  try {
+    const promptFor = (label) => {
+      const output = {
+        "1": { class_type: "CLIPTextEncode", inputs: { text: label } },
+      };
+      for (let i = 0; i < 5; i++) {
+        output[String(i + 2)] = {
+          class_type: "SaveImage",
+          inputs: { filename_prefix: `${label}/stage${i}` },
+        };
+      }
+      return { output, workflow: {} };
+    };
+
+    let livePrompt = promptFor("A");
+    const calls = [];
+    const apiTarget = { fetchApi: makeServer() };
+    const app = {
+      graph: { _nodes: [] },
+      // The first item represents the already-running render. New graph_run
+      // calls are accepted into the frontend's pending queue and return false.
+      queueItems: [{ active: true }],
+      processing: true,
+      graphToPrompt: async () => JSON.parse(JSON.stringify(livePrompt)),
+      queuePrompt: async (number, batchCount) => {
+        app.queueItems.push({ number, batchCount });
+        return false;
+      },
+      async drain() {
+        while (app.queueItems.length) {
+          const item = app.queueItems.pop();
+          if (!item.active) calls.push(await app.graphToPrompt(app.graph));
+        }
+        app.processing = false;
+      },
+    };
+
+    const built = realGraphRun({ app, apiTarget, budgetMs: 3000, serializeMs: 500 });
+    await built.graph_run({});
+
+    livePrompt = promptFor("B");
+    await built.graph_run({});
+    livePrompt = promptFor("C");
+    await built.graph_run({});
+
+    await app.drain();
+
+    assert.equal(calls.length, 3, "the three pending graph_run items must serialize");
+    assert.deepEqual(
+      calls.map((prompt) => prompt.output["1"].inputs.text),
+      ["C", "B", "A"],
+      "the frontend queue is LIFO, and each item must retain its own command snapshot",
+    );
+    for (const [index, label] of ["C", "B", "A"].entries()) {
+      assert.deepEqual(
+        Array.from({ length: 5 }, (_, i) => calls[index].output[String(i + 2)].inputs.filename_prefix),
+        Array.from({ length: 5 }, (_, i) => `${label}/stage${i}`),
+        `${label}'s five SaveImage filename_prefix widgets must stay with its prompt`,
+      );
+    }
   } finally {
     stop();
   }

@@ -24,7 +24,7 @@ All notable changes to this project are documented here. This project adheres to
 - report the tab re-list from the open LIST, and hold the fence across the load
 - the adopt arm requires the same workflow FILE, not just a matching selector
 - reopening a closed tab loads the workflow the store's early return skipped
-
+- deliberate-sweep runs retain their prompt and SaveImage filename widgets when the frontend queue is already busy (#1588)
 
 ## [0.15.36] - 2026-08-22
 
