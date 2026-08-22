@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.46] - 2026-08-22
+
+### Fixed
+- first open of the active workflow after restart succeeds (#1643)
+
+
 ## [0.15.45] - 2026-08-22
 
 ### Fixed
