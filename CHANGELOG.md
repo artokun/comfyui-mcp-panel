@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.47] - 2026-08-22
+
+### Changed
+- fix-late-workflow-save-receipts (#1657)
+
+
 ## [0.15.46] - 2026-08-22
 
 ### Fixed
