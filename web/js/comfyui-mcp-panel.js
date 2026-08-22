@@ -341,6 +341,12 @@ import {
   clearAutoLayoutScope,
   layoutScopeFingerprint,
 } from "./lib/auto-layout-scope.js";
+import {
+  applyReconnectScopeFence,
+  noteReconnectScopeFence,
+  pinReconnectScope,
+  releaseReconnectScopePin,
+} from "./lib/reconnect-scope-fence.js";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
 import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
@@ -2352,6 +2358,9 @@ function setupListeners() {
       // The watch runs only the same safe heals a graph command runs lazily;
       // it never repaints the canvas from serialized state (#604).
       kickPostReconnectSettleWatch(backendReconnectEpoch);
+      // #1636: drop the remembered subgraph owner and re-pin viewing/mutation scope.
+      clearAutoLayoutScope();
+      noteReconnectScopeFence();
       // #584: this reconnect can ALSO be a backend restart that swapped the
       // pack on disk (a panel update + panel_restart_comfyui / Manager reboot)
       // under the live tab. The running bundle is then older than the
@@ -8168,7 +8177,7 @@ function getGraphCtx() {
   if (!app || !app.graph || !LG) {
     throw new Error("ComfyUI graph is not available (app.graph / LiteGraph missing)");
   }
-  const scope = resolveScope(app);
+  const scope = applyReconnectScopeFence(resolveScope(app));
   // #604 — CANVAS/ROOT DIVERGENCE. The canvas holds a graph the live root neither
   // owns nor registers, and that graph is NOT provably content-free. Reported after
   // a backend restart with no page reload: `app.graph` was empty while the canvas
@@ -21829,6 +21838,9 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error("subgraph navigation unavailable on this frontend");
     }
     canvas.openSubgraph(sub, node);
+    // Pin BEFORE the receipt's getGraphCtx (assertBound). A root pin still
+    // armed from outline would otherwise hold-root and undo this enter (#1636).
+    pinReconnectScope("subgraph");
     canvas.setDirty?.(true, true);
     const receipt = await confirmCanvasNavigation({
       readCanvasGraph: () => comfyApp?.canvas?.graph ?? null,
@@ -21849,6 +21861,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // — a landing displaced between two polls is invisible to a sampler
       // (codex gate r5). Say what is known (no observation) and make the next
       // step a scope READ, not a blind retry of a possibly-applied navigation.
+      releaseReconnectScopePin();
       throw new Error(
         `panel_enter_subgraph could not confirm that the canvas moved into node ${node.id}'s ` +
           `subgraph: no observation ever saw the canvas inside it. The navigation may not have ` +
@@ -21952,6 +21965,19 @@ const GRAPH_TOOL_EXECUTORS = {
     const parentGraph = findSubgraphOwner(rootGraph, graph)?.parentGraph ?? graph.rootGraph ?? rootGraph;
     canvas.setGraph(parentGraph);
     canvas.setDirty?.(true, true);
+    // #1328 — an explicit exit is the one root observation that MAY drop the
+    // captured subgraph identity. Escape (canvas jumped to root without this
+    // call) must keep it so auto-layout apply can still find the subgraph.
+    // #1636 — pin BEFORE the receipt's getGraphCtx, same as enter: a root pin
+    // still armed from outline would hold-root and undo an exit to a parent
+    // subgraph.
+    if (parentGraph === rootGraph) {
+      clearAutoLayoutScope();
+      pinReconnectScope("root");
+    } else {
+      rememberAutoLayoutScope(layoutScopeFingerprint(parentGraph, rootGraph));
+      pinReconnectScope("subgraph");
+    }
     // #619: same post-navigation receipt as graph_enter_subgraph — a bare setGraph
     // that did not observably land must not report a scope the canvas is not in.
     const receipt = await confirmCanvasNavigation({
@@ -21969,6 +21995,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // — a landing displaced between two polls is invisible to a sampler
       // (codex gate r5). Say what is known (no observation) and make the next
       // step a scope READ, not a blind retry of a possibly-applied navigation.
+      releaseReconnectScopePin();
       throw new Error(
         `panel_exit_subgraph could not confirm that the canvas returned to the parent graph: no ` +
           `observation ever saw the canvas there. The navigation may not have taken effect — or ` +
@@ -21977,11 +22004,6 @@ const GRAPH_TOOL_EXECUTORS = {
           `subgraph, retry, or leave it on the ComfyUI canvas (its breadcrumb, or double-click out).`,
       );
     }
-    // #1328 — an explicit exit is the one root observation that MAY drop the
-    // captured subgraph identity. Escape (canvas jumped to root without this
-    // call) must keep it so auto-layout apply can still find the subgraph.
-    if (parentGraph === rootGraph) clearAutoLayoutScope();
-    else rememberAutoLayoutScope(layoutScopeFingerprint(parentGraph, rootGraph));
     let viewing = null;
     try {
       viewing = describeActiveGraph(getGraphCtx().graph);
