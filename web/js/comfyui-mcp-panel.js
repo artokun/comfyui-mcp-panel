@@ -1057,11 +1057,14 @@ function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
 const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 
 /**
- * #1582 — when a same-connection whole-schema snapshot is already held, do not spend the
- * full serial 10s client share plus 5s raw-route share proving that both routes are silent.
- * Two seconds still leaves roughly four times the measured warm whole-schema read while
- * keeping the existing fail-closed outcome distinction: an answered bad response refuses,
- * and only actual silence licenses the last-observed snapshot.
+ * #1582 — when a same-connection whole-schema snapshot is already held, the FIRST silent
+ * call still has to discover that the live routes will not answer. Do not spend the full
+ * serial 10s client share plus 5s raw-route share on that discovery. Two seconds still
+ * leaves roughly four times the measured warm whole-schema read while keeping the existing
+ * fail-closed outcome distinction: an answered bad response refuses, and only actual
+ * silence licenses the last-observed snapshot. Once that silence is recorded, later
+ * ordinary writes skip the probes entirely (`shouldSkipProbe`) rather than paying this
+ * budget again on every widget edit.
  */
 const OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS = 2000;
 
@@ -15029,10 +15032,35 @@ const GRAPH_TOOL_EXECUTORS = {
       readObjectInfo: async (readThroughCache, { reuseSnapshot = true } = {}) => {
         // #1582 — a whole schema observed on this SAME backend connection makes silence
         // recoverable, but it must not suppress a route that answers with an unusable schema.
-        // When that snapshot is reusable, shorten the serial oracle budget so the panel spends
-        // at most two seconds discovering silence before the existing snapshot authorization.
-        // A forced reread keeps the normal budget: its purpose is to obtain a live answer for
-        // the blind-write recovery and it must not be shortened by the old snapshot.
+        // The FIRST silent call still probes, with the serial oracle capped at two seconds so
+        // the panel spends at most that discovering silence before the existing snapshot
+        // authorization. Once those routes have already gone silent on this connection,
+        // later ordinary writes skip them: repeating the wait is the recurrence (healthy
+        // graph reads, 1s getNodeDefs + 0.5s /object_info on every set_widget). A forced
+        // reread keeps the normal budget and never skips: its purpose is to obtain a live
+        // answer for the blind-write recovery.
+        const snapshotFence = {
+          epoch: backendReconnectEpoch,
+          socketDown: comfyBackendIsDown(),
+        };
+        if (
+          reuseSnapshot &&
+          typeof objectInfoSnapshot.shouldSkipProbe === "function" &&
+          objectInfoSnapshot.shouldSkipProbe(snapshotFence)
+        ) {
+          const held = objectInfoSnapshot.authorize({
+            epoch: snapshotFence.epoch,
+            socketDown: snapshotFence.socketDown,
+            requireSilence: false,
+          });
+          if (held.defs) {
+            setWidgetSchemaFromSnapshot =
+              " This call did not wait on live schema probes again (#1582).";
+            setWidgetSchemaProvenance = () => "snapshot";
+            return held.defs;
+          }
+          snapshotIneligibility = held.reason;
+        }
         // #716 — READ THROUGH THE BURST CACHE. 29 widget writes meant 29 full
         // /object_info downloads (5,413,770 bytes each on a 63-pack install, #767).
         // Still the WHOLE payload, so no question this fence asks changes scope —
@@ -15144,6 +15172,11 @@ const GRAPH_TOOL_EXECUTORS = {
           // not told that cannot tell this apart from a fully live authorization.
           setWidgetSchemaFromSnapshot = objectInfoOracleFailureNote(oracleFailures);
           setWidgetSchemaProvenance = () => "snapshot";
+          // #1582 — remember the silence so the NEXT ordinary write does not re-wait on
+          // the same hung getNodeDefs /object_info pair. A later live `record` clears it.
+          if (typeof objectInfoSnapshot.markProbesSilent === "function") {
+            objectInfoSnapshot.markProbesSilent();
+          }
           // NOT recorded into the ever-seen history: it is not a new observation of the
           // backend, it is the old one being re-read. Recording it would let a snapshot
           // keep its own types "ever seen" after the backend stopped defining them.

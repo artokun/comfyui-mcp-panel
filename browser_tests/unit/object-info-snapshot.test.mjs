@@ -26,6 +26,7 @@ import {
   noBackendAnswerEstablished,
   snapshotAuthorizationNote,
 } from "../../web/js/lib/object-info-snapshot.js";
+import { runSetWidget } from "../../web/js/lib/set-widget.js";
 import {
   TRANSPORT_OUTCOME,
   fetchWholeObjectInfo,
@@ -294,6 +295,49 @@ test("#1582 snapshot budget shortening keeps the reconnect and socket-down fence
   assert.equal(snap.isReusable({ epoch: 3, socketDown: false }), true, "the original connection is reusable");
 });
 
+test("#1582 the first silence does not skip — an answered error must still be able to refuse", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  assert.equal(
+    snap.shouldSkipProbe({ epoch: 3, socketDown: false }),
+    false,
+    "holding a snapshot is not itself evidence the live routes went silent",
+  );
+});
+
+test("#1582 after silence on a held snapshot, later probes may skip", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  snap.markProbesSilent();
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: false }), true);
+  const held = snap.authorize({ epoch: 3, socketDown: false, requireSilence: false });
+  assert.ok(held.defs, "skipping the probe still authorizes from the held map");
+  assert.ok(Object.prototype.hasOwnProperty.call(held.defs, "H3Keyframes"));
+});
+
+test("#1582 a skip still refuses a down socket, a reconnect, and an empty store", () => {
+  const empty = createObjectInfoSnapshot();
+  empty.markProbesSilent();
+  assert.equal(empty.shouldSkipProbe({ epoch: 3, socketDown: false }), false, "silence without a map licenses nothing");
+
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  snap.markProbesSilent();
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: true }), false, "a down socket may be restarting");
+  assert.equal(snap.shouldSkipProbe({ epoch: 4, socketDown: false }), false, "a new epoch may define different types");
+  snap.clear();
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: false }), false, "clearing the snapshot clears the silence latch");
+});
+
+test("#1582 a later live record unlatches silence so the next write prefers a live schema", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 3);
+  snap.markProbesSilent();
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: false }), true);
+  stored(snap, SCHEMA, 3);
+  assert.equal(snap.shouldSkipProbe({ epoch: 3, socketDown: false }), false, "a live map means the routes answered again");
+});
+
 test("#1223 what is stored is DETACHED — registration hooks mutate defs in place", () => {
   // `registerNodesFromDefs` runs `beforeRegisterNodeDef` hooks that mutate the definitions
   // in place (Comfy's own upload hook adds an input the backend never declared). Retaining
@@ -407,6 +451,22 @@ test("#1223 a backend that ANSWERED is told apart from an empty snapshot in the 
   });
   assert.equal(defs, null);
   assert.match(reason, /ANSWERED/);
+});
+
+test("#1582 requireSilence false does not invent silence — it only skips the outcomes check", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 1);
+  const withoutOutcomes = snap.authorize({ epoch: 1, socketDown: false, requireSilence: false });
+  assert.ok(withoutOutcomes.defs, "a held same-connection map authorizes when silence is already known");
+  const answered = snap.authorize({
+    epoch: 1,
+    socketDown: false,
+    outcomes: [{ route: "http", kind: TRANSPORT_OUTCOME.THREW }],
+    requireSilence: false,
+  });
+  assert.ok(answered.defs, "an answered-error list must not veto a skip that already established silence earlier");
+  const reconnect = snap.authorize({ epoch: 2, socketDown: false, requireSilence: false });
+  assert.equal(reconnect.defs, null, "the reconnect fence is still load-bearing");
 });
 
 test("#1223 only a payload that could authorize anything is stored", () => {
@@ -676,6 +736,87 @@ test("#1582 SHIPPED: the reported case — a held snapshot shortens hung probes"
   assert.deepEqual(deadlines, [2000], "the reusable snapshot caps the serial oracle before the 15s stall");
   assert.match(o.readNote(), /did not answer/);
   assert.equal(o.readFailures().length, 2, "the fallback still discloses both silent routes");
+});
+
+test("#1582 SHIPPED: a second ordinary read does not re-wait on probes that already went silent", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  let clientCalls = 0;
+  let httpCalls = 0;
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: () => {
+        clientCalls += 1;
+        return new Promise(() => {});
+      },
+      fetchApi: () => {
+        httpCalls += 1;
+        return new Promise(() => {});
+      },
+    },
+    snapshot,
+    epoch: 5,
+    socketDown: false,
+  });
+  assert.ok(await o.getFreshObjectInfo(), "the first write still discovers silence");
+  assert.equal(clientCalls, 1);
+  assert.equal(httpCalls, 1);
+
+  const started = performance.now();
+  const defs = await o.getFreshObjectInfo();
+  const elapsed = performance.now() - started;
+  assert.ok(defs && Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "the second write is still authorized");
+  assert.equal(clientCalls, 1, "getNodeDefs is not contacted again");
+  assert.equal(httpCalls, 1, "GET /object_info is not contacted again");
+  assert.ok(elapsed < 50, `second read stalled ${elapsed}ms on probes that were already silent`);
+  assert.match(o.readNote(), /#1582/);
+});
+
+test("#1582 SHIPPED set_widget: a second successful write does not re-wait on silent probes", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  let clientCalls = 0;
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: () => {
+        clientCalls += 1;
+        return new Promise(() => {});
+      },
+      fetchApi: () => new Promise(() => {}),
+    },
+    snapshot,
+    epoch: 5,
+  });
+  const ctor = function NodeCtor() {};
+  ctor.nodeData = { input: { required: {} } };
+  const node = {
+    id: 3,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    constructor: ctor,
+  };
+  const reg = { KSampler: ctor };
+  const hooks = { beforeChange() {}, afterChange() {}, setDirty() {} };
+  const opts = {
+    registry: reg,
+    getRegistry: () => reg,
+    getFreshObjectInfo: o.getFreshObjectInfo,
+    schemaProvenance: () => "snapshot",
+    ...hooks,
+  };
+
+  const first = await runSetWidget(node, "steps", 30, opts);
+  assert.equal(first.set.value, 30, "the first write lands");
+  assert.equal(node.widgets[0].value, 30);
+  assert.equal(clientCalls, 1, "the first write still probes");
+
+  const started = performance.now();
+  const second = await runSetWidget(node, "steps", 40, opts);
+  const elapsed = performance.now() - started;
+  assert.equal(second.set.value, 40, "the second write lands");
+  assert.equal(node.widgets[0].value, 40);
+  assert.equal(clientCalls, 1, "the second write must not contact the silent routes again");
+  assert.ok(elapsed < 50, `second set_widget stalled ${elapsed}ms on probes that were already silent`);
 });
 
 test("#1582 the forced live reread does not take the snapshot shortcut", async () => {

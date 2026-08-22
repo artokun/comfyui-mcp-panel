@@ -449,6 +449,16 @@ test("#1582 wiring: a reusable snapshot shortens only the ordinary schema probe"
   );
   assert.match(
     body,
+    /objectInfoSnapshot\.shouldSkipProbe\(/,
+    "a later ordinary write must be able to skip probes that already went silent",
+  );
+  assert.match(
+    body,
+    /objectInfoSnapshot\.markProbesSilent\(/,
+    "the first silent fallback must latch so the next write can skip",
+  );
+  assert.match(
+    body,
     /objectInfoCache\.readFresh\([\s\S]{0,120}\{ reuseSnapshot: false \}/,
     "the forced live recovery must bypass that cap",
   );
