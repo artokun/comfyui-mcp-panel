@@ -314,6 +314,7 @@ import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fi
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import {
   watchPostReconnectSettle,
+  waitForReconnectHandshakeBeforeOpen,
   graphMutationReconnectGate,
   reconnectRefusalError,
   readReconnectRefusal,
@@ -18376,6 +18377,35 @@ const GRAPH_TOOL_EXECUTORS = {
         throw failOpen(new Error(openWorkflowNotFoundMessage({ path, refresh, known, disk })));
       }
     }
+    // #1641 — after a ComfyUI restart the tab can answer this command before the
+    // backend socket, the node-def refresh kicked on `reconnected`, and the
+    // restored canvas binding have finished one handshake. Opening the
+    // already-active workflow in that window compares content against a canvas
+    // the restore is still rewriting, reports CONTENT_UNVERIFIED, and publishes
+    // no fence — so the orchestrator answers "FENCE: NOT cleared (active identity
+    // UNCONFIRMED after reconnect handshake)". A retry a moment later succeeds
+    // without changing the workflow. Wait here, BEFORE the freeze and the load,
+    // so the first open is the one that succeeds. If the handshake never lands
+    // the open still proceeds: it is the #646 recovery for a restore that never
+    // settles. Bounded (~2.9s); a healthy already-settled tab returns immediately.
+    await waitForReconnectHandshakeBeforeOpen({
+      needsWait: () =>
+        comfyBackendIsDown() ||
+        postReconnectBindingSettleWindow() ||
+        nodeDefRefreshInFlight != null,
+      isReady: () => {
+        if (comfyBackendIsDown()) return false;
+        if (nodeDefRefreshInFlight != null) return false;
+        if (!postReconnectBindingSettleWindow()) return true;
+        // Same evidence bar the settle watch runs: if the restored canvas is
+        // already bound, stamp the proof so we do not wait out the budget for a
+        // handshake that has in fact landed.
+        const { graph, rootGraph } = getGraphCtx();
+        assertGraphBoundToActiveWorkflow(graph, rootGraph, { includeBaselineReadGuard: true });
+        if (backendReconnectEpoch === openedForEpoch) postReconnectBindingProofEpoch = openedForEpoch;
+        return true;
+      },
+    });
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas
     // would silently keep the pre-edit graph and this open would report a bland
@@ -18389,11 +18419,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // reads it fresh from disk. openWorkflow does NOT mutate originalContent for an
     // already-open tab (its load() early-returns), so the baseline stays valid.
     const wasOpen = !!target.changeTracker;
-    // #442 / codex — SNAPSHOT the tab's unsaved-edit state BEFORE any await. It cannot be
-    // recovered later: `clearSpuriousOpenModified` below force-clears `isModified`, so by
-    // the time the reload gate samples the flag, a tab that arrived here WITH unsaved
-    // edits (or was edited during `openWorkflow`) already reads clean. That erased signal
-    // is what would authorize the destructive re-read to discard the user's work.
+    // #442 / codex — SNAPSHOT the tab's unsaved-edit state BEFORE the mutating
+    // awaits (`openWorkflow`, the freeze, the re-baseline). The #1641 handshake
+    // wait above is not one of those: it does not touch `isModified`. The flag
+    // cannot be recovered later — `clearSpuriousOpenModified` below force-clears
+    // it — so by the time the reload gate samples, a tab that arrived here WITH
+    // unsaved edits (or was edited during `openWorkflow`) already reads clean.
+    // That erased signal is what would authorize the destructive re-read to
+    // discard the user's work.
     const wasDirty = !!target.isModified;
     // #1215 — WHO was active before this open moves the pointer, snapshotted now:
     // `s.openWorkflow(target)` below changes the answer. The #874 canvas capture's
