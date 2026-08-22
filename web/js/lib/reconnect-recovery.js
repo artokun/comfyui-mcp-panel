@@ -94,6 +94,72 @@ export async function watchPostReconnectSettle({
 }
 
 /**
+ * #1641 — wait for the post-restart handshake before `workflow_open` compares
+ * content.
+ *
+ * After a ComfyUI restart the tab can answer `workflow_open` (and even
+ * `workflow_list`) before the backend socket, the node-def refresh kicked on
+ * `reconnected`, and the restored canvas binding have finished one synchronized
+ * handshake. The first open of the already-active workflow then reports
+ * CONTENT_UNVERIFIED — "the graph on it does not match the state that was
+ * loaded" — and publishes no `workflow_uuid`, so the orchestrator answers
+ * `FENCE: NOT cleared (active identity UNCONFIRMED after reconnect handshake)`.
+ * A retry a moment later succeeds without changing the workflow.
+ *
+ * This wait is NOT a binding proof and does not repaint. If the handshake never
+ * lands, the open proceeds: it is the documented recovery for a restore that
+ * never settles (#646). The wait only buys a settled canvas for the common
+ * case so the first open is the one that succeeds.
+ *
+ * Cadence matches the orchestrator's post-open handshake ([400, 900, 1600] ms)
+ * so a caller that already waited there is not waiting a second, longer budget
+ * here; a caller that hits the panel first pays the same ~2.9s once.
+ */
+export const OPEN_RECONNECT_HANDSHAKE_STEPS_MS = Object.freeze([400, 900, 1600]);
+
+/**
+ * @param {{
+ *   needsWait?: () => boolean,  // true while the handshake is still in flight
+ *   isReady?: () => boolean,    // true when the open may compare content
+ *   sleep?: (ms: number) => Promise<void>,
+ *   stepsMs?: readonly number[],
+ * }} o
+ * @returns {Promise<"ready"|"timeout">}
+ */
+export async function waitForReconnectHandshakeBeforeOpen({
+  needsWait,
+  isReady,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  stepsMs = OPEN_RECONNECT_HANDSHAKE_STEPS_MS,
+} = {}) {
+  const pending = () => {
+    try {
+      return typeof needsWait === "function" && needsWait() === true;
+    } catch {
+      // An unreadable probe is not a reason to stall the open — the open itself
+      // is the recovery (#646). Same direction as a throwing settle-watch proof.
+      return false;
+    }
+  };
+  const ready = () => {
+    try {
+      return typeof isReady === "function" && isReady() === true;
+    } catch {
+      return false;
+    }
+  };
+  if (!pending()) return "ready";
+  if (ready()) return "ready";
+  const steps = Array.isArray(stepsMs) && stepsMs.length ? stepsMs : OPEN_RECONNECT_HANDSHAKE_STEPS_MS;
+  for (const waitMs of steps) {
+    const ms = Number(waitMs);
+    if (Number.isFinite(ms) && ms > 0) await sleep(ms);
+    if (ready() || !pending()) return "ready";
+  }
+  return ready() ? "ready" : "timeout";
+}
+
+/**
  * The #646 graph-mutation gate: the refusal message for a mutating graph
  * command that arrives while the post-reconnect environment is known-unstable,
  * or null when the command may run. Two independent instability signals:
