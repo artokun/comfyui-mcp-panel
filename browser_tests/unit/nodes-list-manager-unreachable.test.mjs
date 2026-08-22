@@ -201,7 +201,7 @@ test("#1645 a failing object_info fetch degrades to structured unavailable, neve
 });
 
 test("#1645 a non-map object_info response degrades to structured unavailable", async () => {
-  for (const malformed of [null, [], "offline", 204]) {
+  for (const malformed of [null, [], "offline", 204, {}, { error: "backend unavailable" }, { error: { message: "backend unavailable" } }]) {
     const res = await listNodesVia(throwUnreachable, throwUnreachable, {
       args: {},
       objectInfoGet: async () => malformed,

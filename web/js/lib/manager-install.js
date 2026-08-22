@@ -1075,6 +1075,14 @@ export async function objectInfoListFallback(objectInfoGet, args, err) {
   if (!info || typeof info !== "object" || Array.isArray(info)) {
     return managerListUnavailableResult(err);
   }
+  const hasNodeDefinition = Object.values(info).some((meta) => {
+    if (!meta || typeof meta !== "object" || Array.isArray(meta)) return false;
+    return ["python_module", "input", "output", "display_name", "category", "description"]
+      .some((key) => Object.prototype.hasOwnProperty.call(meta, key));
+  });
+  if (Object.keys(info).length === 0 || !hasNodeDefinition) {
+    return managerListUnavailableResult(err);
+  }
   const listed = listedNodesResult(installedPacksFromObjectInfo(info), args);
   return {
     ...listed,
