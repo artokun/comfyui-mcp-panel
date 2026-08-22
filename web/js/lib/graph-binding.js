@@ -3,6 +3,7 @@ import {
   definitionsDifferOnlyByRenumber,
 } from "./definitions-renumber.js";
 import { nodeInputsDifferOnlyByDefinitionRebuild } from "./node-inputs-rebuild.js";
+import { nodePropertiesDifferOnlyByRandomRangeNormalization } from "./node-properties-random-range.js";
 import {
   isEmptyBaselineMismatch,
   emptyBaselineNote,
@@ -878,6 +879,13 @@ export function graphRootMatchesState({ rootGraph, state } = {}) {
  *              appended), so a faithful open cannot round-trip what was saved.
  *              Admitted only when every difference fits that rebuild.
  *
+ * `properties` is deliberately absent even though #1608 characterised a rewrite
+ * inside it. The field is a bag: membership here would admit ANY key that moved
+ * on the strength of evidence about `randomMin`/`randomMax`. Those two keys are
+ * filtered out below, the same way a height-only `size` is admitted by its own
+ * check rather than by the field name. `geometry_rewritten`'s note asserts a
+ * height-only rewrite, so a properties-only proof must not land in that list.
+ *
  * `widgets_values` is deliberately absent despite ALSO being rewritten on every
  * load (`migrateWidgetsValues`): it is the field a genuine partial load drops,
  * which is what #1111/#1089 are about, so admitting it would gut this guard.
@@ -1336,15 +1344,43 @@ export function graphRootReproducesStateContent({ rootGraph, state, loadRanToCom
     ) {
       return notProven;
     }
+    // #1608 — `properties` is a bag, and the characterised rewrite is two keys
+    // inside it (`randomMin`/`randomMax`), not the field. A field-name allowlist
+    // would admit a pack-version stamp on the strength of evidence about Seed
+    // range bounds. The check refuses any other key; when it passes, drop
+    // `properties` from the remaining list so it cannot ride into
+    // `geometry_rewritten` (that note asserts a height-only rewrite).
+    let remaining = fields;
+    if (fields.includes("properties")) {
+      if (!nodePropertiesDifferOnlyByRandomRangeNormalization(state?.nodes, actualState?.nodes)) {
+        return notProven;
+      }
+      remaining = fields.filter((field) => field !== "properties");
+    }
     // An empty field list with a differing `nodes` surface means the two disagreed
     // somewhere this classifier could not name — proving content off a difference
     // nobody can point at is exactly the fabricated all-clear to avoid.
-    if (!fields.length) return notProven;
-    if (!fields.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return notProven;
+    // An empty REMAINING list after the properties account is the opposite: the
+    // difference was named (`properties`) and fully characterised, same shape as
+    // a definitions-only renumber (proven, not exact, nothing to disclose as
+    // geometry).
+    if (!remaining.length) {
+      if (!fields.length) return notProven;
+      return {
+        proven: true,
+        exact: false,
+        fields: [],
+        presentationOnly: false,
+        normalizedOnly: false,
+        normalizedFields: [],
+        definitionsNormalized: false,
+      };
+    }
+    if (!remaining.every((field) => RECOMPUTED_NODE_FIELDS.has(field))) return notProven;
     return {
       proven: true,
       exact: false,
-      fields,
+      fields: remaining,
       presentationOnly: false,
       normalizedOnly: false,
       normalizedFields: [],
