@@ -25,6 +25,18 @@
 import { duplicateCompletionNote } from "./completion-dedupe.js";
 import { withTimeout } from "./bounded-step.js";
 
+// #1610 — stills metadata (HEAD /view for size + Image() decode for pixels) is
+// best-effort decoration on the completion note. It is NOT needed to attach the
+// output refs the agent was promised. The helpers themselves are bounded at 8 s
+// each, which is LONGER than the orchestrator's synthesis grace on 0.52.45
+// (`DEFAULT_SYNTHESIS_GRACE_MS = 5_000`). A stalled HEAD against a ComfyUI busy
+// with the next job is enough for the orchestrator to declare the panel silent
+// and synthesise a notice ~6 s later — the reported shape, and the stills twin
+// of #1485. This bound is the panel's half: wait this long for metadata, then
+// send the frame with the filenames it already has. Fast localhost probes still
+// enrich the note; a stall cannot beat the grace.
+export const STILLS_METADATA_TIMEOUT_MS = 1000;
+
 /**
  * Build and send the single consolidated completion frame for one finished
  * prompt. Resolves to the frame that was sent (for tests), or null when the
@@ -84,6 +96,9 @@ export async function composeRunCompletionFrame(
     // and, on timeout, degrades to its note-only fallback so the one frame always
     // sends. Injectable for tests.
     videoStoryboardTimeoutMs = 25000,
+    // #1610 — same shape as the video bound, for the stills metadata probes.
+    // Injectable so a test can prove a hung HEAD cannot delay sendFrame past it.
+    stillsMetadataTimeoutMs = STILLS_METADATA_TIMEOUT_MS,
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = (t) => clearTimeout(t),
   } = deps;
@@ -144,31 +159,33 @@ export async function composeRunCompletionFrame(
   const leadingSectionCount = noteSections.length;
   let metadata = [];
 
-  // ── Stills segment ─────────────────────────────────────────────────────
-  if (images.length) {
-    const seg = await buildStillsSegment(images, {
-      coerceMessageText,
-      imageViewUrl,
-      fetchImageBytes,
-      fetchImageDimensions,
-      humanizeBytes,
-      duration,
-      durationMs,
-      finishedClock,
-      finishedAt,
-    });
-    outImages.push(...seg.images);
-    if (seg.note) noteSections.push(seg.note);
-    metadata = seg.metadata;
-  }
-
-  // ── Video segments (built in PARALLEL, each bounded, then folded in order) ─
-  // Parallel + per-segment timeout means neither a slow nor a permanently-
-  // pending storyboard for one video can delay or suppress the single frame:
-  // the worst case is ONE timeout window, and a stalled segment degrades to its
-  // note-only fallback. Order is preserved (Promise.all keeps input order), so
-  // the storyboards appear in video order.
-  const videoSegs = await Promise.all(
+  // ── Stills + video segments in PARALLEL ────────────────────────────────
+  // #1610 — these used to be sequential: stills metadata (HEAD + Image decode,
+  // each bounded at 8 s inside the helpers) ran to completion BEFORE the
+  // storyboard even started. A stalled /view against a busy ComfyUI therefore
+  // delayed EVERYTHING, including a mixed run's sheet, past the orchestrator's
+  // 5 s synthesis grace. They share no data, so they overlap; the stills
+  // metadata gather is itself bounded (see buildStillsSegment) so a hang
+  // cannot serialise in front of the sheet OR hold the one send. Video
+  // segments stay parallel with each other, same as before. Fold order is
+  // stills then videos, unchanged.
+  const stillsP = images.length
+    ? buildStillsSegment(images, {
+        coerceMessageText,
+        imageViewUrl,
+        fetchImageBytes,
+        fetchImageDimensions,
+        humanizeBytes,
+        duration,
+        durationMs,
+        finishedClock,
+        finishedAt,
+        stillsMetadataTimeoutMs,
+        setTimer,
+        clearTimer,
+      })
+    : Promise.resolve({ images: [], note: "", metadata: [] });
+  const videosP = Promise.all(
     videos.map((v) =>
       buildVideoSegment(v, {
         coerceMessageText,
@@ -196,6 +213,10 @@ export async function composeRunCompletionFrame(
       }),
     ),
   );
+  const [stillsSeg, videoSegs] = await Promise.all([stillsP, videosP]);
+  outImages.push(...stillsSeg.images);
+  if (stillsSeg.note) noteSections.push(stillsSeg.note);
+  metadata = stillsSeg.metadata;
   // #609 — ONE sighted/blind decision for the whole frame, made HERE: after the
   // slowest segment resolved and immediately before send (nothing below awaits
   // until sendFrame, so the toggle cannot interleave). A per-segment read would
@@ -359,6 +380,9 @@ async function buildStillsSegment(bufImages, deps) {
     durationMs,
     finishedClock,
     finishedAt,
+    stillsMetadataTimeoutMs = STILLS_METADATA_TIMEOUT_MS,
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (t) => clearTimeout(t),
   } = deps;
 
   if (!bufImages.length) return { images: [], note: "", metadata: [] };
@@ -401,42 +425,52 @@ async function buildStillsSegment(bufImages, deps) {
   }
 
   // ── Rich per-output metadata (parallel, bounded, never drops the note) ──
+  // #1610 — the helpers' own 8 s AbortController / Image() timeouts are NOT
+  // this bound. Those stop a hang from lasting forever; this one stops a hang
+  // from lasting past the orchestrator's grace. On timeout the filename note
+  // still sends; size/pixels are omitted the same way a thrown gather is.
   const total = finals.length;
   const finalNameSet = finalNames;
   let metadata = [];
   try {
-    metadata = await Promise.all(
-      finals.map(async (m, idx) => {
-        const filename = coerceMessageText(m?.filename) || "(unknown)";
-        const subfolder = coerceMessageText(m?.subfolder);
-        const path = subfolder ? `${subfolder}/${filename}` : filename;
-        const url = imageViewUrl(m);
-        const [sizeRes, dimRes] = await Promise.allSettled([
-          fetchImageBytes(url),
-          fetchImageDimensions(url),
-        ]);
-        const sizeBytes = sizeRes.status === "fulfilled" ? sizeRes.value : null;
-        const dim = dimRes.status === "fulfilled" ? dimRes.value : null;
-        const siblings = finalNameSet.filter((n) => n !== filename);
-        return {
-          filename,
-          path,
-          subfolder,
-          sizeBytes,
-          size: humanizeBytes(sizeBytes),
-          width: dim?.w ?? null,
-          height: dim?.h ?? null,
-          dimensions: dim ? `${dim.w}×${dim.h}` : null,
-          index: idx + 1,
-          total,
-          siblings,
-          durationMs,
-          duration,
-          finishedAt: finishedAt.toISOString?.() ?? null,
-          finishedClock,
-        };
-      }),
+    const gathered = await withTimeout(
+      Promise.all(
+        finals.map(async (m, idx) => {
+          const filename = coerceMessageText(m?.filename) || "(unknown)";
+          const subfolder = coerceMessageText(m?.subfolder);
+          const path = subfolder ? `${subfolder}/${filename}` : filename;
+          const url = imageViewUrl(m);
+          const [sizeRes, dimRes] = await Promise.allSettled([
+            fetchImageBytes(url),
+            fetchImageDimensions(url),
+          ]);
+          const sizeBytes = sizeRes.status === "fulfilled" ? sizeRes.value : null;
+          const dim = dimRes.status === "fulfilled" ? dimRes.value : null;
+          const siblings = finalNameSet.filter((n) => n !== filename);
+          return {
+            filename,
+            path,
+            subfolder,
+            sizeBytes,
+            size: humanizeBytes(sizeBytes),
+            width: dim?.w ?? null,
+            height: dim?.h ?? null,
+            dimensions: dim ? `${dim.w}×${dim.h}` : null,
+            index: idx + 1,
+            total,
+            siblings,
+            durationMs,
+            duration,
+            finishedAt: finishedAt.toISOString?.() ?? null,
+            finishedClock,
+          };
+        }),
+      ),
+      stillsMetadataTimeoutMs,
+      () => [],
+      { setTimer, clearTimer },
     );
+    metadata = Array.isArray(gathered) ? gathered : [];
   } catch {
     metadata = [];
   }
