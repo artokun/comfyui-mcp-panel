@@ -166,8 +166,24 @@ test("#1645 core-only object_info is still an inspectable inventory, not a throw
   });
   assert.equal(res.managerReachable, false);
   assert.equal(res.source, "object_info");
-  assert.deepEqual(res.installed, {});
+  assert.deepEqual(res.installed, Object.create(null));
   assert.match(res.note, /object_info/);
+});
+
+test("#1645 object_info pack names cannot reach inherited object keys", async () => {
+  const res = await listNodesVia(throwUnreachable, throwUnreachable, {
+    args: {},
+    objectInfoGet: async () => ({
+      ProtoNode: { python_module: "custom_nodes.__proto__" },
+      ConstructorNode: { python_module: "custom_nodes.constructor" },
+      ToStringNode: { python_module: "custom_nodes.toString" },
+    }),
+  });
+  assert.deepEqual(Object.keys(res.installed).sort(), ["__proto__", "constructor", "toString"]);
+  assert.deepEqual(res.installed.__proto__.classes, ["ProtoNode"]);
+  assert.deepEqual(res.installed.constructor.classes, ["ConstructorNode"]);
+  assert.deepEqual(res.installed.toString.classes, ["ToStringNode"]);
+  assert.equal(Object.prototype.classes, undefined);
 });
 
 test("#1645 a failing object_info fetch degrades to structured unavailable, never throws", async () => {

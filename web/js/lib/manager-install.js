@@ -243,7 +243,7 @@ export function filterInstalledPayload(raw, query) {
     const entries = Object.entries(raw);
     const total = entries.length;
     if (!terms.length) return { installed: raw, total, count: total };
-    const installed = {};
+    const installed = Object.create(null);
     for (const [k, v] of entries) {
       if (matchesAllTerms(installedEntryHay(v, k), terms)) installed[k] = v;
     }
@@ -1032,7 +1032,10 @@ export async function searchNodesVia(
  * would have listed. Core modules (`nodes`, `comfy_extras.*`) are not packs.
  */
 export function installedPacksFromObjectInfo(objectInfo) {
-  const installed = {};
+  // Pack names come from the connected ComfyUI's untrusted /object_info
+  // response. A null-prototype map keeps names such as __proto__, constructor,
+  // and toString as ordinary pack keys instead of inherited properties.
+  const installed = Object.create(null);
   if (!objectInfo || typeof objectInfo !== "object") return installed;
   for (const [cls, meta] of Object.entries(objectInfo)) {
     const pythonModule = meta && typeof meta === "object" ? meta.python_module : "";

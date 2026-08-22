@@ -84,7 +84,7 @@ test("#1496 a miss discloses total so it cannot be read as nothing installed", (
   const res = listedNodesResult(INSTALLED_MAP, { search: "definitely-not-here" });
   assert.equal(res.count, 0);
   assert.equal(res.total, 3);
-  assert.deepEqual(res.installed, {});
+  assert.deepEqual(res.installed, Object.create(null));
   assert.match(res.note, /0 of 3 installed packs matched search "definitely-not-here"/);
   assert.match(res.note, /panel_search_nodes/);
   assert.match(res.note, /query/);
