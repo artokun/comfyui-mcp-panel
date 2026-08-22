@@ -6,15 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.39] - 2026-08-22
+
+### Fixed
+- deliberate-sweep runs retain their prompt and SaveImage filename widgets when the frontend queue is already busy (#1588)
+
+
 ## [0.15.38] - 2026-08-22
 
 ### Fixed
 - panel_open_workflow no longer reports unknown content when only randomMin/randomMax normalize (#1613)
 - a finished stills render notifies the agent before the orchestrator fallback (#1612)
 - trust live VIDEO producers for add-node socket proof
-
-### Fixed
-- deliberate-sweep runs retain their prompt and SaveImage filename widgets when the frontend queue is already busy (#1588)
 
 ## [0.15.37] - 2026-08-22
 
