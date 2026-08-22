@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- a restart confirmation card is brought on screen instead of timing out unseen: the Agent tab opens, stick-to-bottom is forced, and the card scrolls immediately rather than waiting on an rAF a backgrounded tab will never fire (#1625)
+
 ## [0.15.41] - 2026-08-22
 
 ### Fixed
@@ -17,7 +20,6 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_open_workflow keeps authored node size/order and leaves a clean tab unmodified (#1621)
 - replay remote PreviewImage completion (#1624)
-
 
 ## [0.15.39] - 2026-08-22
 
