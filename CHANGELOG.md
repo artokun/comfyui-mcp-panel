@@ -6,8 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.42] - 2026-08-22
+
 ### Fixed
 - a restart confirmation card is brought on screen instead of timing out unseen: the Agent tab opens, stick-to-bottom is forced, and the card scrolls immediately rather than waiting on an rAF a backgrounded tab will never fire (#1625)
+- resolve Manager installed directory IDs before update
+
 
 ## [0.15.41] - 2026-08-22
 
