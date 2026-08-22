@@ -241,6 +241,8 @@ function buildEnterSubgraph(doubles) {
     "describeActiveGraph",
     "assertGraphBoundToActiveWorkflow",
     "coerceMessageText",
+    "pinReconnectScope",
+    "releaseReconnectScopePin",
     `return (${body});`,
   );
   return factory(
@@ -250,6 +252,8 @@ function buildEnterSubgraph(doubles) {
     doubles.describeActiveGraph,
     doubles.assertGraphBoundToActiveWorkflow,
     doubles.coerceMessageText ?? ((v) => String(v)),
+    doubles.pinReconnectScope ?? (() => {}),
+    doubles.releaseReconnectScopePin ?? (() => {}),
   );
 }
 
@@ -443,6 +447,8 @@ function buildExitSubgraph(doubles) {
     "clearAutoLayoutScope",
     "rememberAutoLayoutScope",
     "layoutScopeFingerprint",
+    "pinReconnectScope",
+    "releaseReconnectScopePin",
     `return (${body});`,
   );
   return factory(
@@ -455,6 +461,8 @@ function buildExitSubgraph(doubles) {
     doubles.clearAutoLayoutScope ?? (() => {}),
     doubles.rememberAutoLayoutScope ?? (() => {}),
     doubles.layoutScopeFingerprint ?? (() => ({ scope: "root" })),
+    doubles.pinReconnectScope ?? (() => {}),
+    doubles.releaseReconnectScopePin ?? (() => {}),
   );
 }
 

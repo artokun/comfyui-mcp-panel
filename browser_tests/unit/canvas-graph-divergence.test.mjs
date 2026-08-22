@@ -56,6 +56,7 @@ import {
   rememberAutoLayoutScope,
   layoutScopeFingerprint,
 } from "../../web/js/lib/auto-layout-scope.js";
+import { applyReconnectScopeFence } from "../../web/js/lib/reconnect-scope-fence.js";
 import {
   graphBindingRefusalMessage,
   graphCommandBindingBar,
@@ -107,10 +108,11 @@ function buildGetGraphCtx(app) {
     "app",
     "window",
     "resolveScope",
+    "applyReconnectScopeFence",
     "rememberAutoLayoutScope",
     "layoutScopeFingerprint",
     `${source}\nreturn getGraphCtx;`,
-  )(app, { LiteGraph: {} }, resolveScope, rememberAutoLayoutScope, layoutScopeFingerprint);
+  )(app, { LiteGraph: {} }, resolveScope, applyReconnectScopeFence, rememberAutoLayoutScope, layoutScopeFingerprint);
 }
 
 function nodes(n, offset = 0) {

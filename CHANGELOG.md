@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.15.44] - 2026-08-22
 
 ### Fixed
+- after a reconnect, a graph outline that reports viewing.scope root makes the immediately following enter/mutation use root, instead of rejecting a root node as "currently inside a subgraph" (#1636)
 - panel_set_widget no longer re-waits on silent `api.getNodeDefs()` / `GET /object_info` probes when a same-connection schema snapshot is already held (#1582)
 
 ### Fixed
