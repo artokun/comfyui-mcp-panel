@@ -4580,7 +4580,14 @@ function activeWorkflowUuidForOpenReply(target, activeSnapshot) {
   // internally contradictory diagnostics #887/#716 exist to prevent. Omit rather
   // than guess when the snapshot is missing (#1014).
   const active = activeSnapshot;
-  if (!target || !active || active !== target) return null;
+  // #1581 — SAME WORKFLOW, not same reference. `target` is resolved from
+  // `openWorkflows` (Vue proxies) while `activeWorkflowRef()` can yield the raw
+  // object the uuid WeakMap is keyed on. A bare `!==` then withholds
+  // `workflow_uuid` from a perfectly good open of an already-open saved tab, so
+  // the MCP never refreshes its command fence and the next graph_outline is
+  // refused as a stale-instance mismatch. `sameWorkflowObject` is the comparison
+  // the rest of this file already uses for this exact proxy/raw split (#558).
+  if (!target || !active || !sameWorkflowObject(active, target)) return null;
   const activeIdentity = establishedWorkflowReplyIdentity(active);
   const targetIdentity = establishedWorkflowReplyIdentity(target);
   if (!activeIdentity || !targetIdentity || activeIdentity.routingKey !== targetIdentity.routingKey) return null;
