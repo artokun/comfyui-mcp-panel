@@ -678,6 +678,7 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphRootReproducesStateContent,
+  applySavedNodePresentation,
   describeRepaintSourceBinding,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
@@ -6961,9 +6962,9 @@ function nextFrame() {
  *
  *  Callers must hold the canvas interaction freeze around this — the awaited
  *  frame below is exactly the gap in which an UNPROTECTED edit would be adopted
- *  as the new clean baseline (a silent clean-slate over real work). A first-time
- *  open is never frozen by design, so it does not get this cleanup at all: it
- *  keeps the spurious flag (loud, cosmetic) instead. */
+ *  as the new clean baseline (a silent clean-slate over real work). First-time
+ *  opens freeze for that reason too (#1618): without this cleanup, frontend
+ *  size/order hydration leaves a clean tab `modified:true`. */
 async function clearSpuriousOpenModified(wf, { stillOwns } = {}) {
   if (!wf) return;
   try {
@@ -18278,9 +18279,11 @@ const GRAPH_TOOL_EXECUTORS = {
     const canvasView = app?.canvas;
     // FREEZE canvas interaction across the WHOLE mutating sequence — the tab switch, the
     // repaint, the re-baseline, the bounded disk read and the reload — so no edit can land
-    // in a window whose dirty signal we are about to overwrite. Scoped to `wasOpen` (the
-    // only case that can reload) so a plain first-time open never freezes, and restored in
-    // a finally on every path.
+    // in a window whose dirty signal we are about to overwrite. First-time opens freeze
+    // too: that is what makes the post-open re-baseline safe, and without it a clean
+    // open stays `modified:true` from frontend size/order hydration (#1618). The disk
+    // reload stays gated on `wasOpen` via decideOpenStaleness. Restored in a finally
+    // on every path.
     // Taken through the OWNED lock so this and a concurrent snapshot restore cannot
     // release each other's freeze: `allow_interaction` is a bare boolean, and a
     // section that saved `true` before the other one froze would otherwise unlock
@@ -18288,7 +18291,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // meaning here — non-null means "the freeze is holding", which the re-baseline
     // and disk-reload steps below gate on — it is now a token rather than the saved
     // boolean, and the saved boolean lives inside the lock.
-    const priorInteraction = wasOpen ? acquireCanvasInteractionLock(canvasView) : null;
+    const priorInteraction = acquireCanvasInteractionLock(canvasView);
     let onDiskContent = null;
     let dirtyNow = false;
     let staleInfo = { stale: false, reload: false };
@@ -18465,8 +18468,9 @@ const GRAPH_TOOL_EXECUTORS = {
       // edit the user makes during that frame is absorbed as the new CLEAN baseline, so the
       // later dirty gate reads false and would authorize the disk reload to overwrite that
       // very edit. Sampling the flag later cannot fix that — the signal is already gone — so
-      // the window has to be closed instead. Scoped to `wasOpen` (the only case that can
-      // reload) so a plain first-time open never freezes, and always restored in a finally.
+      // the window has to be closed instead. First-time opens freeze too (#1618): the
+      // re-baseline that keeps a clean open clean needs the same protected frame. Always
+      // restored in a finally.
       // Bound to a local whose name does NOT end in "s": the #268 frontend-contract scanner
       // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
       // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
@@ -18789,6 +18793,14 @@ const GRAPH_TOOL_EXECUTORS = {
               // report "could not prove rebound" on every call with no way to learn
               // which check fired. Evidence first, verdict second.
               const { rootGraph } = getGraphCtx();
+              // #1618 — undo configure's size/order rewrite against the payload we
+              // just loaded, before the content proof, so a faithful open compares
+              // exact and a later save does not persist hydration.
+              try {
+                applySavedNodePresentation(rootGraph, repaintState);
+              } catch {
+                /* live graph stays as the frontend left it */
+              }
               const activeNow = activeWorkflowRef();
               // Proxy-safe, like every other workflow-object comparison in this file:
               // the store hands out Vue proxies while lookups can yield raw objects, so
@@ -18978,12 +18990,25 @@ const GRAPH_TOOL_EXECUTORS = {
         // helper's awaited frame is otherwise unprotected: an edit landing in it would be
         // captured as the new CLEAN baseline, silently erasing unsaved-work protection —
         // and a later stale open could then auto-reload the disk file over that work.
-        // That excludes BOTH the no-freeze frontend (priorInteraction === null, the same
-        // condition that skips the reload below) AND the first-time open, which is never
-        // frozen by design (the freeze stays scoped to wasOpen — see above). A spurious
-        // "modified" flag on a fresh open is cosmetic (it may block an unforced close
-        // until a save) and keeps the dirty signal alive; a silent clean-slate over a
-        // real edit is neither.
+        // That excludes the no-freeze frontend (priorInteraction === null, the same
+        // condition that skips the reload below). First-time opens now freeze too, so
+        // they can re-baseline: otherwise size/order hydration leaves a clean tab
+        // modified and the next save writes those live values (#1618).
+        // #1618 — a first-time open loaded through openWorkflow, which already
+        // rewrote presentation into activeState. Restore the FILE's size/order
+        // (and subgraph host widgets) before the re-baseline so the clean
+        // snapshot is the authored graph.
+        if (!wasOpen) {
+          try {
+            const raw = target.originalContent ?? target.content;
+            const saved = typeof raw === "string" ? JSON.parse(raw) : raw;
+            applySavedSubgraphHostWidgets(app?.graph, saved);
+            applySavedNodePresentation(app?.graph, saved);
+            applySavedNodePresentation(app?.rootGraph, saved);
+          } catch {
+            /* unreadable file content — live graph stays as the frontend left it */
+          }
+        }
         // Ownership re-check before EVERY re-baseline / destructive step: if this open
         // outlived its own section (the 30s safety expiry, or a newer open taking over),
         // other commands have been let through and we must not keep mutating as though we
@@ -19149,6 +19174,7 @@ const GRAPH_TOOL_EXECUTORS = {
             await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
             try {
               applySavedSubgraphHostWidgets(app?.graph, diskGraph);
+              applySavedNodePresentation(app?.graph, diskGraph);
             } catch {
               /* live graph stays as the file load left it */
             }
@@ -19202,21 +19228,10 @@ const GRAPH_TOOL_EXECUTORS = {
       releaseWorkflowReloadGuard(reloadGuardToken);
       releaseCanvasInteractionLock(priorInteraction, canvasView);
     }
-    // #874 — a FIRST-TIME open loads through ComfyUI's openWorkflow, which runs
-    // the same SubgraphNode.configure that drops host widgets_values. Apply the
-    // FILE's host values AFTER content proof so a widget rewrite cannot fail the
-    // open, and only when this tab was not already open (an already-open tab
-    // may hold unsaved edits the file does not). Skip if the disk re-read
-    // already applied the on-disk graph.
-    if (!openFailed && !rebindFailed && !wasOpen && !reloaded) {
-      try {
-        const raw = target.originalContent ?? target.content;
-        const saved = typeof raw === "string" ? JSON.parse(raw) : raw;
-        applySavedSubgraphHostWidgets(app?.graph, saved);
-      } catch {
-        /* unreadable file content — live graph stays as the frontend left it */
-      }
-    }
+    // #874 — first-time host widgets (and #1618 presentation) are restored
+    // inside the freeze, before re-baseline, so they cannot fail the open and
+    // cannot dirty a tab that was just marked clean. Skip here if that ran, or
+    // if the disk re-read already applied the on-disk graph.
     if (openFailed) throw failOpen(openFailed);
     if (rebindFailed) {
       // #1089 follow-up — the foreign-source finding rides the FAILURE too.

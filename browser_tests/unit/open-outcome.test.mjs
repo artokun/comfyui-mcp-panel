@@ -847,8 +847,9 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
   // makes that frame safe. On a frontend WITHOUT the flag the reload is skipped for
   // exactly that reason (priorInteraction === null) — so the tracker must not be
   // re-baselined either: an edit landing in the unprotected frame would be adopted as
-  // clean, erasing unsaved-work protection and inviting later silent loss. (Round 3
-  // extended the same exclusion to the first-time open — see the round-3 test below.)
+  // clean, erasing unsaved-work protection and inviting later silent loss. Round 3
+  // keeps the freeze-gated re-baseline; #1618 makes first-time opens freeze too so
+  // they can take that gated path.
   const skipGate = body.indexOf("if (staleInfo.reload && !dirtyNow && !wasDirty && priorInteraction === null)");
   const firstRebaseline = body.indexOf("await clearSpuriousOpenModified(target, {");
   assert.notEqual(skipGate, -1, "the no-freeze skip gate must exist");
@@ -872,23 +873,28 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
   );
 });
 
-test("#442 round-3: a FIRST-TIME open never re-baselines without the freeze (edit in the frame stays dirty)", () => {
+test("#442 round-3 / #1618: re-baseline stays gated on the freeze; first-time opens freeze too", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
-  // The freeze handle is non-null ONLY for an already-open tab on a frontend exposing
-  // allow_interaction — exactly the case where the freeze below is actually applied.
+  // #1618 — a first-time open must freeze so the post-open re-baseline is safe.
+  // Without it, frontend size/order hydration leaves a clean tab modified.
+  // priorInteraction !== null still means "the freeze is holding"; the acquire
+  // is no longer gated on wasOpen. Disk reload stays gated on wasOpen via
+  // decideOpenStaleness (`if (!wasOpen) return { stale: false, reload: false }`).
   assert.match(
     body,
+    /const priorInteraction = acquireCanvasInteractionLock\(canvasView\);/,
+    "first-time opens freeze too — that is what makes the re-baseline safe",
+  );
+  assert.doesNotMatch(
+    body,
     /const priorInteraction = wasOpen \? acquireCanvasInteractionLock\(canvasView\) : null;/,
-    "priorInteraction !== null ⟺ the freeze is held",
+    "the freeze must not skip first-time opens",
   );
   // clearSpuriousOpenModified awaits a frame, then captures the canvas as the CLEAN
-  // baseline and forces isModified=false. A first-time open holds NO freeze by design,
-  // so if the cleanup ran there an edit landing in that frame would be adopted as
-  // clean — and a later stale open could then auto-reload the disk file over that
-  // unsaved work (the round-3 DATA-LOSS finding). The gate must require the freeze
-  // with NO !wasOpen exception; the fresh tab keeps a spurious flag (loud, cosmetic)
-  // instead of a silent clean-slate.
+  // baseline and forces isModified=false. The gate must still require the freeze
+  // with NO !wasOpen exception: a frontend without allow_interaction still must
+  // not re-baseline in an unprotected frame (the round-3 DATA-LOSS finding).
   const gate = body.match(
     /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
   );
@@ -898,9 +904,6 @@ test("#442 round-3: a FIRST-TIME open never re-baselines without the freeze (edi
     /!wasOpen/,
     "no first-time-open exception may re-open the unprotected frame",
   );
-  // …which means a first-time open (wasOpen false ⇒ priorInteraction null) can NEVER
-  // reach the capture/reset: an in-frame edit keeps the tracker dirty, so BOTH reload
-  // paths below (each requires !dirtyNow && !wasDirty) stay closed over that work.
   const gates = [...body.matchAll(/if \(staleInfo\.reload && !dirtyNow[^)]*\)/g)].map((m) => m[0]);
   assert.ok(gates.length >= 2, "both reload paths stay gated on the fresh dirty re-check");
 });

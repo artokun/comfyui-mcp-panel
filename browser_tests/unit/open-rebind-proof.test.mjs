@@ -869,10 +869,9 @@ test("#1089: the tab's dirty flag is NOT an input — it is wrong in both direct
   //   marks the tab modified, and was never saved. An auto-correct from disk gated on
   //   "clean" would silently replace exactly what an agent just generated.
   //
-  //   spuriously TRUE — a first-time open never runs clearSpuriousOpenModified (it is
-  //   gated on the freeze, and the freeze is scoped to wasOpen), so a cold-opened tab
-  //   reads modified for its whole life. Gating on it would have disarmed this guard
-  //   for that entire population — the #1089 report, unprevented.
+  //   spuriously TRUE — a first-time open still reads modified when the freeze
+  //   is unavailable (no allow_interaction), so gating on it would have disarmed
+  //   this guard for that population — the #1089 report, unprevented.
   //
   // So the classification is evidence-only and the flag is not consulted. Passing one
   // must change nothing, in either direction.
