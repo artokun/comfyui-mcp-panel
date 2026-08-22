@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.45] - 2026-08-22
+
+### Fixed
+- outline reporting root after reconnect lets enter_subgraph use the root (#1639)
+
+
 ## [0.15.44] - 2026-08-22
 
 ### Fixed
