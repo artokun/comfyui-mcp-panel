@@ -200,6 +200,19 @@ test("#1645 a failing object_info fetch degrades to structured unavailable, neve
   assert.match(res.message, /panel_graph_outline/);
 });
 
+test("#1645 a non-map object_info response degrades to structured unavailable", async () => {
+  for (const malformed of [null, [], "offline", 204]) {
+    const res = await listNodesVia(throwUnreachable, throwUnreachable, {
+      args: {},
+      objectInfoGet: async () => malformed,
+    });
+    assert.equal(res.supported, false, `malformed object_info: ${String(malformed)}`);
+    assert.equal(res.managerReachable, false);
+    assert.deepEqual(res.installed, {});
+    assert.equal(res.source, undefined);
+  }
+});
+
 test("#1645 with no objectInfoGet, BOTH unreachable returns structured unavailable — never throws", async () => {
   const res = await listNodesVia(throwUnreachable, throwUnreachable, { args: {} });
   assert.equal(res.supported, false);

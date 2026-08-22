@@ -1072,6 +1072,9 @@ export async function objectInfoListFallback(objectInfoGet, args, err) {
   } catch {
     return managerListUnavailableResult(err);
   }
+  if (!info || typeof info !== "object" || Array.isArray(info)) {
+    return managerListUnavailableResult(err);
+  }
   const listed = listedNodesResult(installedPacksFromObjectInfo(info), args);
   return {
     ...listed,
