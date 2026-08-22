@@ -115,7 +115,22 @@ function backendObjectInfo() {
   };
 }
 
-function makeComfy() {
+function wildcardDictObjectInfo() {
+  return {
+    JsonParseNode: {
+      name: "JsonParseNode",
+      input: { required: {} },
+      output: ["*,IMAGE"],
+    },
+    DictGetNode: {
+      name: "DictGetNode",
+      input: { required: { py_dict: ["DICT", {}] } },
+      output: ["DICT_VALUE"],
+    },
+  };
+}
+
+function makeComfy(defs = backendObjectInfo()) {
   const widgets = {
     COMBO(node, name, spec) {
       return { widget: node.addWidget("combo", name, spec[0][0], null, { values: spec[0] }) };
@@ -172,7 +187,7 @@ function makeComfy() {
 
   // Step 4 of the report: the tab was NOT reloaded, but the panel reconnected and the
   // pack's three classes are registered. That is precisely what arms the #780 fast path.
-  void app.registerNodesFromDefs(backendObjectInfo());
+  void app.registerNodesFromDefs(defs);
 
   const graph = {
     _nodes: [],
@@ -390,6 +405,34 @@ test("#821: refusal is not merely deferred — it does not spend the wait window
     Date.now() - startedAt < 150,
     `add should not consume the registration wait window (took ${Date.now() - startedAt}ms)`,
   );
+});
+
+test("#1584: a live wildcard producer makes a custom dict input addable", async () => {
+  const comfy = makeComfy(wildcardDictObjectInfo());
+  const { graph_add_node } = realGraphAddNode(comfy, {
+    api: {
+      async getNodeDefs() {
+        return wildcardDictObjectInfo();
+      },
+      async fetchApi(route) {
+        const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+        const defs = wildcardDictObjectInfo();
+        const body = Object.prototype.hasOwnProperty.call(defs, classType)
+          ? { [classType]: defs[classType] }
+          : {};
+        return { status: 200, json: async () => body };
+      },
+    },
+  });
+
+  const producer = await graph_add_node({ class_type: "JsonParseNode" });
+  assert.equal(producer.added.type, "JsonParseNode");
+  assert.equal(comfy.graph._nodes[0].type, "JsonParseNode", "the wildcard producer is live");
+
+  const consumer = await graph_add_node({ class_type: "DictGetNode" });
+  assert.equal(consumer.added.type, "DictGetNode");
+  assert.deepEqual(consumer.added.inputs, ["py_dict"]);
+  assert.equal(comfy.graph._nodes.length, 2);
 });
 
 // ---------------------------------------------------------------------------
