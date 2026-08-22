@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.43] - 2026-08-22
+
+### Fixed
+- panel_new_workflow no longer claims a blank tab while the previous graph is still on the canvas (#1632)
+
+
 ## [0.15.42] - 2026-08-22
 
 ### Fixed
