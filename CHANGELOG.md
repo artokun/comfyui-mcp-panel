@@ -6,8 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.44] - 2026-08-22
+
 ### Fixed
 - panel_set_widget no longer re-waits on silent `api.getNodeDefs()` / `GET /object_info` probes when a same-connection schema snapshot is already held (#1582)
+
+### Fixed
+- installed nested models on Windows are not reported missing (#1637)
+- panel_set_widget no longer re-waits on silent schema probes (#1638)
+
 
 ## [0.15.43] - 2026-08-22
 
