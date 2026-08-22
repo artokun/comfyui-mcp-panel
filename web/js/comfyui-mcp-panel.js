@@ -640,6 +640,7 @@ import {
   classifyInteractiveCard,
   refusedInteractiveCardError,
 } from "./lib/interactive-card-fence.js";
+import { revealInteractiveCard } from "./lib/interactive-card-reveal.js";
 import {
   saveActiveWorkflow,
   shouldGroundBeforeTurn,
@@ -32123,7 +32124,27 @@ function buildPanel() {
     card.appendChild(otherRow);
 
     log.appendChild(card);
-    scrollLog();
+    // #1625 — the Discord-style autoscroll helper is not enough: it honours
+    // stick-to-bottom (a scrolled-up reader never sees the card) and defers to rAF
+    // (paused in a backgrounded tab). A restart confirm blocks the tool until they
+    // click, so the card has to be on screen — Agent tab forward, stick forced,
+    // scroll NOW.
+    revealInteractiveCard({
+      openTab: openSidebarTab,
+      forceStick: () => {
+        stickToBottom = true;
+        newMsgBtn.hidden = true;
+      },
+      scrollNow: () => {
+        log.scrollTop = log.scrollHeight;
+        try {
+          card.scrollIntoView({ block: "nearest" });
+        } catch {
+          /* detached keep-alive root: the tab-forward above re-attaches it */
+        }
+      },
+      schedule: (fn, ms) => setTimeout(fn, ms),
+    });
     // #952 — REGISTER THE CARD AGAINST THE CONNECTION THAT PAINTED IT. A reply of this
     // kind is deliberately not replayed across a reconnect, so once this connection is
     // replaced the card cannot deliver an answer to anyone — while still looking exactly
@@ -32391,7 +32412,25 @@ function buildPanel() {
 
     card.appendChild(row);
     log.appendChild(card);
-    scrollLog();
+    // #1625 — same reveal as paintQuestion: a secret card the user cannot see is
+    // the same failure as not painting it. Settings-button callers already open
+    // the tab; this is idempotent and covers the agent-initiated path.
+    revealInteractiveCard({
+      openTab: openSidebarTab,
+      forceStick: () => {
+        stickToBottom = true;
+        newMsgBtn.hidden = true;
+      },
+      scrollNow: () => {
+        log.scrollTop = log.scrollHeight;
+        try {
+          card.scrollIntoView({ block: "nearest" });
+        } catch {
+          /* detached keep-alive root: the tab-forward above re-attaches it */
+        }
+      },
+      schedule: (fn, ms) => setTimeout(fn, ms),
+    });
     setTimeout(() => input.focus(), 0);
     // #952 — the SECRET card needs this more than the question card does (codex). It is
     // a live password field whose reply has nowhere to go once its connection is
