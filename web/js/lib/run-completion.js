@@ -52,7 +52,7 @@ export const NO_PROMPT_KEY = "__no_prompt__";
 
 /**
  * @param {object} opts
- * @param {(payload:{key:string, promptId:(string|null), images:any[], videos:any[], durationMs:number|null, finishedAt:(number|null), reconciled?:boolean}) => void} opts.onFlush
+ * @param {(payload:{key:string, promptId:(string|null), images:any[], videos:any[], durationMs:number|null, finishedAt:(number|null), reconciled?:boolean, replayed?:boolean}) => void} opts.onFlush
  *   `finishedAt` is epoch ms. On the LIVE paths it is the flush clock; on the
  *   RECONCILED path (`reconciled:true`) it is the run's real execution_success
  *   time recovered from /history, or **null** when that entry records none —
@@ -107,6 +107,14 @@ export function createRunCompletionTracker({
   const promptIdOf = (k) => (k === NO_PROMPT_KEY ? null : k);
   const deduper = createCompletionDeduper({ ttlMs: duplicateWindowMs, now });
   const buffers = new Map(); // key -> { images: any[], videos: any[], timer, rearms }
+  // A live PreviewImage completion is retained until the caller CONFIRMS its
+  // frame reached the agent. If the bridge send fails after execution_success,
+  // replay this exact executed batch before falling back to /history. This
+  // matters when a remote proxy permits the panel websocket but rejects the
+  // separate history request: the panel already has the temp reference and
+  // must not throw it away with the failed send. SaveImage/video recovery keeps
+  // its existing /history behavior.
+  const liveReplays = new Map(); // key -> onFlush payload containing type:"temp"
   const active = new Set(); // keys ComfyUI currently reports as running
   const starts = new Map(); // key -> start timestamp
   // Keys whose start came from a real lifecycle signal, not a fallback (#986).
@@ -439,7 +447,7 @@ export function createRunCompletionTracker({
     // it settled mid-window (#585). Set synchronously, before onFlush, so no
     // observer can sample the gap.
     markDispatched(k);
-    onFlush({
+    const payload = {
       key: k,
       promptId: promptIdOf(k),
       images: buf.images,
@@ -452,7 +460,14 @@ export function createRunCompletionTracker({
       ...(verdict.duplicateOf
         ? { duplicateOf: verdict.duplicateOf, looksCached: !!verdict.looksCached }
         : {}),
-    });
+    };
+    if (
+      k !== NO_PROMPT_KEY &&
+      payload.images.some((image) => image?.type === "temp")
+    ) {
+      liveReplays.set(k, payload);
+    }
+    onFlush(payload);
   }
 
   /**
@@ -485,6 +500,17 @@ export function createRunCompletionTracker({
   async function reconcileKey(promptId, fetchHistory, fetchQueued, isVideo) {
     const k = key(promptId);
     if (delivered.has(k) || !pending.has(k)) return null;
+    // #1619 — a live executed batch is stronger than a remote history probe:
+    // it is the exact output for this prompt, already observed on the panel's
+    // authenticated websocket. Retain the temp PreviewImage descriptor when a
+    // bridge send failed, and replay it without requiring /history to succeed.
+    const liveReplay = liveReplays.get(k);
+    if (liveReplay) {
+      markDelivered(k);
+      markDispatched(k);
+      onFlush({ ...liveReplay, replayed: true });
+      return { promptId, status: "success", delivered: true };
+    }
     let entry = null;
     let fetchThrew = false;
     try {
@@ -664,6 +690,7 @@ export function createRunCompletionTracker({
     startObserved.delete(k);
     pending.delete(k); // EVICT — bounds the ledger
     panelQueued.delete(k); // #356 Bug 2 — evicted with it
+    liveReplays.delete(k);
     markTerminal(promptId); // fence any stray late execution_start; ages out (not pinned)
     if (typeof onReconcileGiveUp === "function") {
       try {
@@ -908,7 +935,8 @@ export function createRunCompletionTracker({
 
     /**
      * Caller reports the completion frame for `id` was CONFIRMED delivered to the
-     * agent (sendFrame succeeded / batch was empty). Retires it from pending.
+     * agent (sendFrame succeeded / batch was empty). Retires it from pending and
+     * drops any retained live replay.
      */
     markDelivered(id) {
       // The CALLER confirming delivery is the only proof the agent was told, so
@@ -918,14 +946,15 @@ export function createRunCompletionTracker({
       // #356 Bug 2 — and it is the only point at which the panel-queued mark can be
       // retired safely, for the same reason: before this, a re-pend is still possible.
       panelQueued.delete(key(id));
+      liveReplays.delete(key(id));
       markDelivered(id);
     },
 
     /**
      * Caller reports the completion frame for `id` could NOT be delivered (bridge
-     * down when the flush fired). Re-pend it so the next reconnect recovers it via
-     * /history — this is what makes a bridge-down drop, where we DID observe the
-     * terminal success, still deliver the result on reconnect (#370).
+     * down when the flush fired). Re-pend it so the next reconnect first replays
+     * the live batch, then falls back to /history when the lifecycle output was
+     * not observed (#370/#1619).
      */
     markUndelivered(id) {
       if (id == null) return;
@@ -1051,10 +1080,11 @@ export function createRunCompletionTracker({
     async reconcile({ fetchHistory, fetchQueued, isVideo } = {}) {
       const summary = [];
       pruneFences(); // reconnect is a natural sweep point for old fences
-      if (typeof fetchHistory !== "function") return summary;
+      const canFetchHistory = typeof fetchHistory === "function";
       for (const [, info] of [...pending.entries()]) {
         const promptId = info.promptId;
         if (promptId == null) continue;
+        if (!canFetchHistory && !liveReplays.has(key(promptId))) continue;
         const row = await reconcileKey(promptId, fetchHistory, fetchQueued, isVideo);
         if (!row) continue; // resolved by a live event meanwhile — nothing to report
         const clean = { promptId: row.promptId, status: row.status };
@@ -1094,6 +1124,7 @@ export function createRunCompletionTracker({
     // Introspection for tests / diagnostics.
     _active: active,
     _buffers: buffers,
+    _liveReplays: liveReplays,
     _starts: starts,
     _pending: pending,
     _delivered: delivered,
