@@ -121,7 +121,7 @@ import {
   taskHistoryBlindNote,
   installGitUrl,
   installedListRoute,
-  listedNodesResult,
+  listNodesVia,
   isManagerRouteMissing,
   isManagerUnreachable,
   markManagerUnreachable,
@@ -7405,11 +7405,12 @@ async function resolveManagerUpdateTarget(requestedId) {
   return resolveInstalledUpdateId(requestedId, installed);
 }
 
-/** #426 — fetch the connected ComfyUI's full `/object_info` map (node CLASS →
+/** #426/#1645 — fetch the connected ComfyUI's full `/object_info` map (node CLASS →
  *  metadata). Always present on a running ComfyUI (no Manager needed), so it is
- *  the installed-node fallback for nodes_search when the Manager registry search
- *  is unreachable. Bounded by the shared Manager timeout; throws on any non-ok /
- *  parse failure (searchNodesVia's fallback swallows it and degrades). */
+ *  the installed-node fallback for nodes_search and the installed-pack fallback
+ *  for nodes_list when Manager is unreachable. Bounded by the shared Manager
+ *  timeout; throws on any non-ok / parse failure (the Via fallbacks swallow it
+ *  and degrade). */
 async function fetchObjectInfo() {
   const res = await api.fetchApi("/object_info", {
     method: "GET",
@@ -22234,32 +22235,23 @@ const GRAPH_TOOL_EXECUTORS = {
 
   async nodes_list(args = {}) {
     // #423: route the installed-node list by dialect (managerGet strips /v2 for
-    // legacy) with an explicit ?mode=default — matching the live-tested
-    // orchestrator. A pip Manager in --enable-manager-legacy-ui mode can answer
-    // the /v2 queue probe yet NOT register the /v2 data GETs, so the dialect-
-    // routed /v2/customnode/installed 404s ("not reachable") while the absolute
-    // /customnode/installed serves fine. On that unreachable signal, fall back
-    // to the absolute (no-/v2) legacy list route instead of surfacing a generic
-    // "unreachable" error. managerGet already self-heals a stale dialect and
-    // retries legacy internally (#605); this catch is the last-resort layer for
-    // when BOTH routed attempts reported unreachable.
-    const route = installedListRoute();
+    // legacy) with an explicit ?mode=default. A pip Manager in
+    // --enable-manager-legacy-ui mode can answer the /v2 queue probe yet NOT
+    // register the /v2 data GETs, so the dialect-routed GET 404s while the
+    // absolute /customnode/installed serves. listNodesVia retries that absolute
+    // route, then #1645: when BOTH Manager routes are unreachable, reconstruct
+    // loaded custom-node packs from /object_info (or a structured unavailable
+    // result) instead of throwing. managerGet already self-heals a stale
+    // dialect (#605).
     // #332 — immediately after panel_restart_comfyui, a Manager fetch throws a
-    // bare transport error ("Failed to fetch") before any HTTP status exists, so
-    // the 404/unreachable fallback below never fires and the raw error leaked to
-    // the agent. Retry transient transport failures with a short bounded backoff,
-    // then reword into an actionable "still reconnecting" status.
+    // bare transport error ("Failed to fetch") before any HTTP status exists.
+    // Retry transient transport failures with a short bounded backoff, then
+    // reword into an actionable "still reconnecting" status.
     // #1496 — `search` (reporter) or `query` (panel_search_nodes alias) filters
-    // the installed payload. The MCP schema is still empty `{}` today, so this
-    // is inert until the orchestrator forwards the key.
-    return retryDuringReconnect(async () => {
-      try {
-        return listedNodesResult(await managerGet(route), args);
-      } catch (err) {
-        if (!isManagerUnreachable(err)) throw err;
-        return listedNodesResult(await managerCall(route), args);
-      }
-    });
+    // the installed payload.
+    return retryDuringReconnect(async () =>
+      listNodesVia(managerGet, managerCall, { args, objectInfoGet: fetchObjectInfo }),
+    );
   },
 
   async nodes_install(args) {
