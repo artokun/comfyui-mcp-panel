@@ -11795,7 +11795,7 @@ function pruneLateSaveReceipts() {
   }
 }
 
-function rememberLateWorkflowSave(rid, raw) {
+function rememberLateWorkflowSave(rid, raw, cmd = "workflow_save") {
   if (typeof rid !== "string" || !rid) return;
   if (!raw || typeof raw !== "object") return;
   const producedRecord = raw.producedRecord;
@@ -11813,7 +11813,7 @@ function rememberLateWorkflowSave(rid, raw) {
   pruneLateSaveReceipts();
   lateSaveReceipts.set(rid, {
     rid,
-    cmd: "workflow_save",
+    cmd,
     completed_at: Date.now(),
     result: outcome,
   });
@@ -17852,7 +17852,7 @@ const GRAPH_TOOL_EXECUTORS = {
     return { saved: true, workflow, ...outcome, ...saveReplyIdentity(outcome.saved_as ? replyIdentity : replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
-  async workflow_save_as({ name }) {
+  async workflow_save_as({ name, rid }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
     // #1434 — same bound as workflow_save: both go through programmaticSave, both
     // are relayed at 15 s, and a hung copy trio is the same silence.
@@ -17865,6 +17865,9 @@ const GRAPH_TOOL_EXECUTORS = {
         observeWorkflow: observeActiveWorkflowSaveState,
         // #1455 — the destination, not whatever the canvas shows when the budget fires.
         targetName: name,
+        onLateSuccess: (result) => {
+          if (typeof rid === "string" && rid) rememberLateWorkflowSave(rid, result, "workflow_save_as");
+        },
       },
     );
     // #747 — this path ALWAYS changes which workflow is active, so it is the one

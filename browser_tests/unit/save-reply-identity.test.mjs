@@ -84,11 +84,11 @@ test("#747 WIRING: BOTH save handlers report the identity, and the FLAG follows 
   assert.match(src, /import \{[^}]*saveReplyIdentity[^}]*\} from "\.\/lib\/save-reply-identity\.js"/);
 
   const saveIdx = src.search(/async workflow_save\(\{ name(?:, rid)? \} = \{\}\)/);
-  const saveAsIdx = src.indexOf("async workflow_save_as({ name })");
+  const saveAsIdx = src.search(/async workflow_save_as\(\{ name(?:, rid)? \}\)/);
   assert.ok(saveIdx > 0 && saveAsIdx > saveIdx);
 
   const saveBlock = src.slice(saveIdx, saveAsIdx);
-  const saveAsBlock = src.slice(saveAsIdx, saveAsIdx + 1600);
+  const saveAsBlock = src.slice(saveAsIdx, saveAsIdx + 2200);
 
   // workflow_save is only a Save-As when the outcome says so…
   assert.match(saveBlock, /saveReplyIdentity\(outcome\.saved_as \? replyIdentity : replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
