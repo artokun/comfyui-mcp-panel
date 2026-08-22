@@ -18007,7 +18007,10 @@ const GRAPH_TOOL_EXECUTORS = {
       // #2078 — exact command-rid receipts for saves that completed after the bounded
       // workflow_save reply. The orchestrator must match the rid and the active identity;
       // this field is not a generic "some save succeeded" flag.
-      ...(lateSaveReceipts.length ? { late_save_receipts: lateSaveReceipts } : {}),
+      // Always advertise the receipt capability, including an empty list. The
+      // orchestrator uses absence to recognize an older panel and presence to
+      // fail closed when a current panel has no receipt for this save RID.
+      late_save_receipts: lateSaveReceipts,
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
         : {}),
