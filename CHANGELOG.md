@@ -6,8 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.37] - 2026-08-22
+
 ### Fixed
 - opening an already-open saved workflow publishes the live fence uuid, so the next graph read is not refused as a stale instance (#1581)
+
+- opening a saved workflow leaves graph tools on that canvas
+- report the tab re-list from the open LIST, and hold the fence across the load
+- the adopt arm requires the same workflow FILE, not just a matching selector
+- reopening a closed tab loads the workflow the store's early return skipped
+
 
 ## [0.15.36] - 2026-08-22
 
