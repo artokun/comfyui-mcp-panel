@@ -589,6 +589,7 @@ function buildGraphUpdateNode(deps) {
 function graphUpdateDeps(overrides) {
   return {
     detectManagerDialect: async () => "legacy",
+    resolveManagerUpdateTarget: async (id) => id,
     crypto: { randomUUID: () => "u-1" },
     api: { clientId: "c-1" },
     legacyUpdateBody,

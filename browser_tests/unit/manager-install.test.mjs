@@ -16,6 +16,7 @@ const {
   buildInstallRequest,
   parseInstalled,
   nodeInstalledMatches,
+  resolveInstalledUpdateId,
   queueDrained,
   isReadableInstalledList,
   queueFailureSignal,
@@ -215,6 +216,37 @@ test("nodeInstalledMatches accepts a full git URL directly and matches by repo n
   );
   assert.equal(nodeInstalledMatches(undefined, installed), false);
   assert.equal(nodeInstalledMatches("rgthree-comfy", {}), false);
+});
+
+test("#1600 resolves an installed directory to Manager's active_nodes identity", () => {
+  const installed = {
+    "comfyui-minimax-h3-prompt-enhancer-T8": {
+      ver: "nightly",
+      cnr_id: "comfyui-minimax-h3-prompt-enhancer",
+      aux_id: "example/comfyui-minimax-h3-prompt-enhancer",
+      enabled: true,
+    },
+  };
+  assert.equal(
+    resolveInstalledUpdateId("comfyui-minimax-h3-prompt-enhancer-T8", installed),
+    "comfyui-minimax-h3-prompt-enhancer",
+  );
+  assert.equal(
+    resolveInstalledUpdateId("comfyui-minimax-h3-prompt-enhancer", installed),
+    "comfyui-minimax-h3-prompt-enhancer",
+  );
+  assert.equal(resolveInstalledUpdateId("not-installed", installed), null);
+});
+
+test("#1600 uses the aux repository basename for an installed unknown git pack", () => {
+  const installed = {
+    "local-renamed-folder": {
+      ver: "unknown",
+      aux_id: "owner/original-repo",
+      enabled: true,
+    },
+  };
+  assert.equal(resolveInstalledUpdateId("local-renamed-folder", installed), "original-repo");
 });
 
 // --- queueDrained: POSITIVE evidence only (codex round 2 #1) ----------------

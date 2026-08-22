@@ -302,6 +302,39 @@ export function nodeInstalledMatches(idOrUrl, installed) {
   });
 }
 
+/**
+ * Resolve a caller's installed directory, registry id, or repository spelling
+ * to the key ComfyUI-Manager uses for `active_nodes` updates. The installed
+ * endpoint is keyed by the on-disk module name, but a registry install may
+ * carry a different `cnr_id`; Manager indexes that same pack by `cnr_id`.
+ * Unknown git packs use the repository basename from `aux_id` before their
+ * directory name.
+ * Returns null when the installed list does not identify a matching pack.
+ */
+export function resolveInstalledUpdateId(idOrUrl, installed) {
+  if (!idOrUrl) return null;
+  const nodes = Array.isArray(installed) && installed.every((n) => n && "module" in n)
+    ? installed
+    : parseInstalled(installed);
+  const wanted = String(idOrUrl).trim().toLowerCase();
+  const repoName = looksLikeGitUrl(idOrUrl) ? gitRepoName(idOrUrl).toLowerCase() : wanted;
+  const node = nodes.find((entry) => {
+    const candidates = [];
+    for (const value of [entry.module, entry.cnrId, entry.auxId]) {
+      if (!value) continue;
+      const normalized = String(value).trim().toLowerCase();
+      candidates.push(normalized, baseName(normalized));
+    }
+    return candidates.includes(wanted) || candidates.includes(repoName);
+  });
+  if (!node) return null;
+  return (
+    node.cnrId ||
+    (node.auxId ? baseName(node.auxId) : null) ||
+    (node.module && node.module !== "unknown" ? node.module : null)
+  );
+}
+
 /** Has the Manager queue POSITIVELY drained? True ONLY for a well-formed status
  *  object that says it stopped AND accounts for every task with coherent counts
  *  (is_processing===false, numeric done_count/total_count, done>=total). A null,

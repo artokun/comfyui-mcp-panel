@@ -270,11 +270,15 @@ function buildGraphUpdateNode(deps) {
     /async graph_update_node\(\{ id, version, channel, mode \}\) \{[\s\S]*?\n  \},\r?\n/,
     "graph_update_node",
   );
+  const boundDeps = {
+    resolveManagerUpdateTarget: async (id) => id,
+    ...deps,
+  };
   const factory = new Function(
-    ...Object.keys(deps),
+    ...Object.keys(boundDeps),
     `const handlers = { ${methodSrc} };\nreturn handlers.graph_update_node;`,
   );
-  return factory(...Object.values(deps));
+  return factory(...Object.values(boundDeps));
 }
 
 test("#1320 graph_update_node CALLS readUpdateTraceback on a generic Manager failure", () => {
