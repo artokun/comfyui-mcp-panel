@@ -83,7 +83,7 @@ test("#747 WIRING: BOTH save handlers report the identity, and the FLAG follows 
   // whether the reply is wired up.
   assert.match(src, /import \{[^}]*saveReplyIdentity[^}]*\} from "\.\/lib\/save-reply-identity\.js"/);
 
-  const saveIdx = src.indexOf("async workflow_save({ name } = {})");
+  const saveIdx = src.search(/async workflow_save\(\{ name(?:, rid)? \} = \{\}\)/);
   const saveAsIdx = src.indexOf("async workflow_save_as({ name })");
   assert.ok(saveIdx > 0 && saveAsIdx > saveIdx);
 

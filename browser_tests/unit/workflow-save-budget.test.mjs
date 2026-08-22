@@ -29,7 +29,7 @@ import {
 } from "../../web/js/lib/workflow-save-budget.js";
 import { PANEL_SRC } from "./_panel-constants.mjs";
 
-const workflowSaveMatch = PANEL_SRC.match(/\n {2}async workflow_save\(\{ name \} = \{\}\) \{[\s\S]*?\n {2}\},/);
+const workflowSaveMatch = PANEL_SRC.match(/\n {2}async workflow_save\(\{ name(?:, rid)? \} = \{\}\) \{[\s\S]*?\n {2}\},/);
 assert.ok(workflowSaveMatch, "could not locate workflow_save in panel source");
 
 const workflowSaveAsMatch = PANEL_SRC.match(/\n {2}async workflow_save_as\(\{ name \}\) \{[\s\S]*?\n {2}\},/);
