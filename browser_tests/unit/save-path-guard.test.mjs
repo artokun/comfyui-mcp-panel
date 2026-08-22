@@ -333,17 +333,26 @@ function staleFixture({ suppressed = true, live = "extra-group", active = true }
     groups: [{ id: 1, title: "Pre", bounding: [0, 0, 10, 10] }],
     extra: {},
   };
-  const liveState =
-    live === "extra-group"
-      ? {
-          nodes: [{ id: 1, type: "VAEDecode", pos: [0, 0] }],
-          groups: [
-            { id: 1, title: "Pre", bounding: [0, 0, 10, 10] },
-            { id: 2, title: "New17", bounding: [20, 0, 10, 10] },
-          ],
-          extra: {},
-        }
-      : JSON.parse(JSON.stringify(snapshot));
+  let liveState;
+  if (live === "extra-group") {
+    liveState = {
+      nodes: [{ id: 1, type: "VAEDecode", pos: [0, 0] }],
+      groups: [
+        { id: 1, title: "Pre", bounding: [0, 0, 10, 10] },
+        { id: 2, title: "New17", bounding: [20, 0, 10, 10] },
+      ],
+      extra: {},
+    };
+  } else if (live === "pos-only") {
+    liveState = JSON.parse(JSON.stringify(snapshot));
+    liveState.nodes[0].pos = [100, 50];
+  } else if (live === "widget-value") {
+    snapshot.nodes[0] = { ...snapshot.nodes[0], widgets_values: ["a"] };
+    liveState = JSON.parse(JSON.stringify(snapshot));
+    liveState.nodes[0].widgets_values = ["b"];
+  } else {
+    liveState = JSON.parse(JSON.stringify(snapshot));
+  }
   const wfA = {
     path: "workflows/A.json",
     isTemporary: false,
@@ -571,4 +580,50 @@ test("#1563 r4 WIRING: the guard is installed on the COPY point, from the source
   const throwAt = body.indexOf("throw workflowSaveRefusalError(verdict);");
   const callAt = body.indexOf("return origSaveAs(");
   assert.ok(throwAt > 0 && callAt > throwAt, "the refusal must precede the copy");
+});
+
+// ---------------------------------------------------------------------------
+// 5. panel#1580 — presentation-only drift is not a stale snapshot.
+//
+// `graphRootReproducesStateContent` answers `proven: false` AND `presentationOnly: true`
+// for a canvas that differs from the snapshot only by node geometry (`pos`). Conjunct
+// 2 used to read `proven !== true` alone, so a suppressed capture whose only drift
+// was a dragged node refused autosave and Ctrl+S. The classifier already vouches that
+// nothing AUTHORED is behind the canvas — the same reading #1477 and #1623 applied
+// on the open path. Widget values and groups stay refused: those are the defect
+// #1567 exists to stop.
+// ---------------------------------------------------------------------------
+
+test("#1580 WRAPPER: a suppressed capture whose only drift is node geometry still saves", async () => {
+  // The reported false positive: undo's `_restoringState` window is still open, the
+  // canvas and snapshot agree on every authored field, and a node was dragged. The
+  // save must go through — refusing it tells the user to reload the tab over a `pos`.
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture({ live: "pos-only" });
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  await fx.store.saveWorkflow(fx.wfA);
+  assert.deepEqual(fx.store.saved, ["workflows/A.json"]);
+});
+
+test("#1580 WRAPPER: a widget-value difference is still refused — authored drift is not cosmetic", async () => {
+  // Row 3 of the measured table: same suppression window, same `nodes` surface, but
+  // the field that moved is `widgets_values`. Softening conjunct 2 onto presentation-
+  // only must not also wave this through.
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture({ live: "widget-value" });
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  await assert.rejects(() => fx.store.saveWorkflow(fx.wfA), /BEHIND the live canvas/);
+  assert.deepEqual(fx.store.saved, []);
+});
+
+test("#1580 WRAPPER: a Save-As whose only drift is node geometry still copies", () => {
+  const { buildInstaller: build } = buildInstaller();
+  const fx = staleFixture({ live: "pos-only" });
+  const install = build({ activeWorkflow: fx.activeWorkflow, rootGraph: fx.rootGraph });
+  install(fx.appRef);
+  const made = fx.store.saveAs(fx.wfA, "workflows/Copy.json");
+  assert.equal(made.path, "workflows/Copy.json");
+  assert.deepEqual(fx.store.copies, [{ from: "workflows/A.json", to: "workflows/Copy.json" }]);
 });
