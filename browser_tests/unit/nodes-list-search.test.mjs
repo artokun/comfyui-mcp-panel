@@ -84,7 +84,7 @@ test("#1496 a miss discloses total so it cannot be read as nothing installed", (
   const res = listedNodesResult(INSTALLED_MAP, { search: "definitely-not-here" });
   assert.equal(res.count, 0);
   assert.equal(res.total, 3);
-  assert.deepEqual(res.installed, {});
+  assert.deepEqual(res.installed, Object.create(null));
   assert.match(res.note, /0 of 3 installed packs matched search "definitely-not-here"/);
   assert.match(res.note, /panel_search_nodes/);
   assert.match(res.note, /query/);
@@ -124,18 +124,15 @@ test("#1496 README names the accepted keys", () => {
   assert.match(row, /`query`/);
 });
 
-test("#1496 nodes_list feeds the command args through listedNodesResult on BOTH list routes", () => {
+test("#1496 nodes_list feeds the command args through listNodesVia", () => {
   const start = PANEL.indexOf("async nodes_list(");
   assert.notEqual(start, -1, "nodes_list executor must exist");
   const end = PANEL.indexOf("async nodes_install(", start);
   assert.ok(end > start, "nodes_install must follow nodes_list");
   const body = PANEL.slice(start, end);
   assert.match(body, /async nodes_list\(args\s*=\s*\{\}\)/);
-  assert.equal(
-    [...body.matchAll(/listedNodesResult\(/g)].length,
-    2,
-    "both the dialect-routed GET and the absolute legacy fallback must filter",
+  assert.match(
+    body,
+    /listNodesVia\(managerGet,\s*managerCall,\s*\{\s*args,\s*objectInfoGet:\s*fetchObjectInfo\s*\}\)/,
   );
-  assert.match(body, /listedNodesResult\(await managerGet\(route\), args\)/);
-  assert.match(body, /listedNodesResult\(await managerCall\(route\), args\)/);
 });
