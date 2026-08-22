@@ -1413,7 +1413,13 @@ test("the #1620 /view probe uses the panel browser session and the same media UR
   const src = panelSource();
   const start = src.indexOf("async function probeShowMediaView(url)");
   assert.ok(start > 0, "the browser-side /view probe is missing");
-  const body = src.slice(start, src.indexOf("\n}\n\n/** Load an Image", start) + 2);
+  // The checked-out panel bundle may be CRLF even though the source assertions
+  // are written with LF delimiters. Normalize only this inspected slice so the
+  // bound remains the probe's closing brace, regardless of checkout settings.
+  const afterStart = src.slice(start).replace(/\r\n/g, "\n");
+  const end = afterStart.indexOf("\n}\n\n/** Load an Image");
+  assert.ok(end > 0, "could not bound the browser-side /view probe");
+  const body = afterStart.slice(0, end + 2);
   assert.match(body, /fetch\(url,\s*\{/);
   assert.match(body, /credentials: "include"/);
   assert.match(body, /Range: "bytes=0-0"/);
