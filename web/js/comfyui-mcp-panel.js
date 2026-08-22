@@ -11477,6 +11477,7 @@ async function awaitRequiredCustomWidgetRegistration(
   classType,
   widenSocketProof,
   liveNodeOfClass,
+  liveOutputSocketTypes,
   budgetMs,
 ) {
   // MONOTONIC, like every other elapsed-time measurement in this panel. On the wall clock
@@ -11497,8 +11498,28 @@ async function awaitRequiredCustomWidgetRegistration(
       : CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS;
   const deadline = startedAt + wait;
   let socketTypes = knownSocketTypes;
-  const check = () =>
-    unavailableRequiredWidgetReport(nodeData, comfyApp?.widgets, socketTypes, currentDef);
+  const check = () => {
+    // A live output slot is direct evidence that its exact datatype is a link socket,
+    // even when the whole /object_info read that would normally prove it did not answer.
+    // Keep this on the OUTPUT side only: unavailableRequiredWidgetReport still requires
+    // the consumer input itself to declare socket shape, so a widget-valued input cannot
+    // be waived merely because another node emits the same type.
+    if (typeof liveOutputSocketTypes === "function") {
+      try {
+        const live = liveOutputSocketTypes();
+        if (live && typeof live[Symbol.iterator] === "function") {
+          const proof = new Set(socketTypes ?? []);
+          for (const type of live) {
+            if (typeof type === "string" && type) proof.add(type);
+          }
+          socketTypes = proof;
+        }
+      } catch {
+        // An unreadable live graph supplies no proof; keep the schema snapshot unchanged.
+      }
+    }
+    return unavailableRequiredWidgetReport(nodeData, comfyApp?.widgets, socketTypes, currentDef);
+  };
   let unavailable = check();
   // #821 — the socket proof may have been read off a single-class /object_info, which is
   // silent about every type a SIBLING node outputs. Widen it once against the whole
@@ -13704,6 +13725,28 @@ const GRAPH_TOOL_EXECUTORS = {
           const graph = getGraphCtx()?.graph ?? app?.graph ?? null;
           const nodes = graph?._nodes ?? graph?.nodes ?? [];
           return nodes.find((n) => n?.type === cls) ?? null;
+        } catch {
+          return null;
+        }
+      },
+      // A producer already materialised on this live graph is stronger evidence than an
+      // incomplete whole-schema read for the exact output type it exposes. This is read
+      // lazily by the registration guard, so ordinary adds keep the cheap path.
+      () => {
+        try {
+          const graph = capturedContext?.graph ?? null;
+          const nodes = Array.isArray(graph?._nodes)
+            ? graph._nodes
+            : Array.isArray(graph?.nodes)
+              ? graph.nodes
+              : [];
+          const types = new Set();
+          for (const node of nodes) {
+            for (const output of Array.isArray(node?.outputs) ? node.outputs : []) {
+              if (typeof output?.type === "string" && output.type) types.add(output.type);
+            }
+          }
+          return types;
         } catch {
           return null;
         }

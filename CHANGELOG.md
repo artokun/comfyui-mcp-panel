@@ -10,6 +10,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - opening an already-open saved workflow publishes the live fence uuid, so the next graph read is not refused as a stale instance (#1581)
+- `panel_add_node` accepts a core VIDEO socket when a live canvas producer exposes VIDEO, even if the full `/object_info` read times out (#1589)
 
 - opening a saved workflow leaves graph tools on that canvas
 - report the tab re-list from the open LIST, and hold the fence across the load
