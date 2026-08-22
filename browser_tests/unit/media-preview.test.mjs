@@ -19,6 +19,7 @@ import {
   isVideoShowMediaItem,
   MEDIA_PREVIEW_TIMEOUT_MS,
   MEDIA_SIZE_PROBE_TIMEOUT_MS,
+  MEDIA_VIEW_PROBE_TIMEOUT_MS,
 } from "../../web/js/lib/media-preview.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 
@@ -176,6 +177,75 @@ test("an image-only call paints exactly as before and claims no sampled preview"
   assert.equal(reply.painted, 2);
   assert.doesNotMatch(reply.note, /SAMPLED PREVIEW/);
   assert.doesNotMatch(reply.note, /contact sheet/);
+});
+
+test("a remote /view outage is dropped before it can be counted as painted (#1620)", async () => {
+  const h = harness({
+    probeMedia: async (url, ref) => {
+      assert.match(url, /\/view\?/);
+      assert.equal(ref.filename, "remote.png");
+      return { ok: false, reason: "/view returned HTTP 401" };
+    },
+  });
+  const reply = await composeShowMediaReply(
+    [{
+      kind: "viewRef",
+      viewRef: { filename: "remote.png", subfolder: "final", type: "output" },
+      filename: "remote.png",
+    }],
+    h.deps,
+  );
+
+  assert.equal(h.calls.paintedImages.length, 0, "the failed remote ref must never reach the painter");
+  assert.equal(reply.painted, 0, "an unavailable /view must not be called painted");
+  assert.equal(reply.unconfirmed, 0);
+  assert.match(reply.note, /remote\.png — the panel could not serve its ComfyUI \/view reference: \/view returned HTTP 401/);
+  assert.match(reply.note, /call get_image with filename "remote\.png", type "output", subfolder "final"/);
+  assert.match(reply.note, /fix the remote \/view authorization or target/);
+});
+
+test("a browser-verified /view ref still paints normally (#1620)", async () => {
+  const h = harness({ probeMedia: async () => ({ ok: true }) });
+  const reply = await composeShowMediaReply(
+    [{ kind: "viewRef", viewRef: { filename: "local.png", type: "output" }, filename: "local.png" }],
+    h.deps,
+  );
+
+  assert.equal(h.calls.paintedImages.length, 1);
+  assert.equal(reply.painted, 1);
+  assert.equal(reply.unconfirmed, 0);
+});
+
+test("the remote /view probe does not change verified inline media (#1620)", async () => {
+  let probes = 0;
+  const h = harness({
+    probeMedia: () => {
+      probes += 1;
+      return { ok: false, reason: "remote /view unavailable" };
+    },
+  });
+  const reply = await composeShowMediaReply(
+    [{ kind: "image", dataUrl: "data:image/png;base64,AAAA", filename: "local.png" }],
+    h.deps,
+  );
+
+  assert.equal(probes, 0, "inline bytes have no remote /view to probe");
+  assert.equal(h.calls.paintedImages.length, 1);
+  assert.equal(reply.painted, 1);
+});
+
+test("a hanging remote /view probe is bounded and not reported as painted (#1620)", async () => {
+  const h = harness({ probeMedia: () => new Promise(() => {}) });
+  const p = composeShowMediaReply(
+    [{ kind: "viewRef", viewRef: { filename: "remote.png", type: "output" }, filename: "remote.png" }],
+    h.deps,
+  );
+  await h.elapse(MEDIA_VIEW_PROBE_TIMEOUT_MS);
+  const reply = await p;
+
+  assert.equal(h.calls.paintedImages.length, 0);
+  assert.equal(reply.painted, 0);
+  assert.match(reply.note, /availability probe timed out before it answered/);
 });
 
 test("an inlined (under-cap) video is still disclosed as sampled, with its exact size", async () => {
@@ -1321,6 +1391,7 @@ test("onShowMedia routes through composeShowMediaReply with the storyboard pipel
     "storyboardFrameCount",
     "humanizeBytes",
     "fetchMediaBytes: fetchImageBytes",
+    "probeMedia: probeShowMediaView",
     "videoStoryboardEnabled",
   ]) {
     assert.ok(handler[0].includes(dep), `onShowMedia must pass ${dep} through`);
@@ -1336,6 +1407,24 @@ test("onShowMedia routes through composeShowMediaReply with the storyboard pipel
   for (const dep of ["paintAudio", "paintFileLink"]) {
     assert.ok(handler[0].includes(dep), `onShowMedia must pass ${dep} through (#710)`);
   }
+});
+
+test("the #1620 /view probe uses the panel browser session and the same media URL", () => {
+  const src = panelSource();
+  const start = src.indexOf("async function probeShowMediaView(url)");
+  assert.ok(start > 0, "the browser-side /view probe is missing");
+  // The checked-out panel bundle may be CRLF even though the source assertions
+  // are written with LF delimiters. Normalize only this inspected slice so the
+  // bound remains the probe's closing brace, regardless of checkout settings.
+  const afterStart = src.slice(start).replace(/\r\n/g, "\n");
+  const end = afterStart.indexOf("\n}\n\n/** Load an Image");
+  assert.ok(end > 0, "could not bound the browser-side /view probe");
+  const body = afterStart.slice(0, end + 2);
+  assert.match(body, /fetch\(url,\s*\{/);
+  assert.match(body, /credentials: "include"/);
+  assert.match(body, /Range: "bytes=0-0"/);
+  assert.match(body, /!res\?\.ok/);
+  assert.match(body, /content-type/);
 });
 
 /** One `function name(...) { … }` at the panel closure's 2-space indent, sliced

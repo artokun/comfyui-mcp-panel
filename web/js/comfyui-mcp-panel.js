@@ -7767,6 +7767,41 @@ async function fetchImageBytes(url) {
   }
 }
 
+/**
+ * Probe the exact browser URL a ComfyUI viewRef painter will use.
+ *
+ * A panel_show_media card is otherwise created before the browser makes its
+ * own /view request, so a remote/authenticated 401 becomes painted:1 followed
+ * by a later image error. The range request keeps this check bounded and
+ * cheap, while credentials:include keeps it in the panel browser's session.
+ * The caller treats every non-media, non-2xx, or unreachable response as a
+ * delivery failure; a probe from the orchestrator cannot stand in for this one.
+ */
+async function probeShowMediaView(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 4000);
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "include",
+      headers: { Range: "bytes=0-0" },
+      signal: ctrl.signal,
+    });
+    const mime = typeof res?.headers?.get === "function" ? res.headers.get("content-type") || "" : "";
+    if (!res?.ok) return { ok: false, reason: `/view returned HTTP ${res?.status ?? "no response"}` };
+    if (!/^(image|video|audio)\//i.test(mime)) {
+      return { ok: false, reason: `/view returned non-media content-type "${mime || "unset"}"` };
+    }
+    try { await res.body?.cancel?.(); } catch { /* best effort */ }
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: "the browser could not reach /view" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Load an Image() from a /view URL to read natural pixel dimensions. Resolves
  *  {w,h} or null. Bounded by a timeout so a stuck decode can't hang the flush. */
 function fetchImageDimensions(url) {
@@ -34362,6 +34397,7 @@ function buildPanel() {
         applyVideoPoster,
         humanizeBytes,
         fetchMediaBytes: fetchImageBytes,
+        probeMedia: probeShowMediaView,
         videoStoryboardEnabled: prefs.videoStoryboard !== false,
         warn: (...a) => console.warn(...a),
       });
