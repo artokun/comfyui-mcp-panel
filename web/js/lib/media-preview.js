@@ -58,6 +58,9 @@ export const MEDIA_PREVIEW_TIMEOUT_MS = 20000;
  *  the storyboard needs. Unknown size still produces a preview. */
 export const MEDIA_SIZE_PROBE_TIMEOUT_MS = 8000;
 
+/** Bound on the browser-side /view availability check for a ComfyUI ref. */
+export const MEDIA_VIEW_PROBE_TIMEOUT_MS = 4000;
+
 /**
  * WHAT THE PANEL CAN ACTUALLY PRESENT (#710).
  *
@@ -313,6 +316,19 @@ function safePaint(paint, url, caption, warn, what) {
   return deferred ? "unconfirmed" : "shown";
 }
 
+/** A failed browser-side /view check, or null when the check passed. */
+function viewProbeFailure(result) {
+  try {
+    if (result === true || (result && result.ok === true)) return null;
+    if (result && typeof result.reason === "string" && result.reason.trim()) {
+      return result.reason.trim();
+    }
+  } catch {
+    // A malformed probe result must still become an honest delivery failure.
+  }
+  return "the panel could not verify that the requested /view media was served";
+}
+
 /** A ComfyUI ref written the way `get_image` takes its arguments. */
 function refClause(ref, coerce) {
   const filename = coerce(ref?.filename);
@@ -359,6 +375,8 @@ export async function composeShowMediaReply(items, deps = {}) {
     warn = () => {},
     timeoutMs = MEDIA_PREVIEW_TIMEOUT_MS,
     sizeProbeTimeoutMs = MEDIA_SIZE_PROBE_TIMEOUT_MS,
+    viewProbeTimeoutMs = MEDIA_VIEW_PROBE_TIMEOUT_MS,
+    probeMedia,
     setTimer,
     clearTimer,
   } = deps;
@@ -494,6 +512,35 @@ export async function composeShowMediaReply(items, deps = {}) {
                 `player did not appear.`,
       });
       continue;
+    }
+    // A viewRef is fetched by the browser AFTER this handler returns. A card
+    // created before that request answers is not evidence that the requested
+    // media can be served — especially on a remote/authenticated /view route.
+    // Probe the same URL in the panel's browser session first, and fail closed
+    // when it is unavailable or the probe is inconclusive. Inline data URLs do
+    // not take this branch: their bytes are already in the panel.
+    if (ref && typeof probeMedia === "function") {
+      const probe = await withTimeout(
+        Promise.resolve().then(() => probeMedia(url, ref)),
+        viewProbeTimeoutMs,
+        () => ({
+          ok: false,
+          reason: "the panel's /view availability probe timed out before it answered",
+        }),
+        { setTimer, clearTimer },
+      );
+      const probeWhy = viewProbeFailure(probe);
+      if (probeWhy) {
+        dropped.push({
+          name,
+          why: `the panel could not serve its ComfyUI /view reference: ${probeWhy}`,
+          remedy:
+            `The reference itself is intact — call get_image with ${refClause(ref, text)} ` +
+            `to fetch it without relying on this panel's browser /view session, then fix the ` +
+            `remote /view authorization or target and retry panel_show_media.`,
+        });
+        continue;
+      }
     }
     const shownState = safePaint(painter, url, caption, note, name);
     if (shownState === "failed") {
