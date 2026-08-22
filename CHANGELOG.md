@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.36] - 2026-08-22
+
+### Fixed
+- the Agent tab appears in the sidebar after a clean load (#1609)
+- a save whose only drift is node geometry is no longer refused (#1606)
+- accept wildcard producers for custom sockets (#1584) (#1603)
+
+
 ## [0.15.35] - 2026-08-21
 
 ### Fixed
