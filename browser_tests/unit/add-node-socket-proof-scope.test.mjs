@@ -130,6 +130,42 @@ function wildcardDictObjectInfo() {
   };
 }
 
+function videoObjectInfo({ widgetInput = false } = {}) {
+  return {
+    LoadVideo: {
+      name: "LoadVideo",
+      input: { required: {} },
+      output: ["VIDEO"],
+    },
+    GetVideoComponents: {
+      name: "GetVideoComponents",
+      input: {
+        required: {
+          video: ["VIDEO", widgetInput ? { default: "a-video-value" } : {}],
+        },
+      },
+      output: ["IMAGE", "AUDIO"],
+    },
+  };
+}
+
+function apiForObjectInfo(defs) {
+  return {
+    // The issue is the bounded whole-schema read not answering. The per-class route still
+    // answers, which is the production fast path for an already-registered core class.
+    async getNodeDefs() {
+      return NODE_DEFS_NO_ANSWER;
+    },
+    async fetchApi(route) {
+      const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+      const body = Object.prototype.hasOwnProperty.call(defs, classType)
+        ? { [classType]: defs[classType] }
+        : {};
+      return { status: 200, json: async () => body };
+    },
+  };
+}
+
 function makeComfy(defs = backendObjectInfo()) {
   const widgets = {
     COMBO(node, name, spec) {
@@ -433,6 +469,83 @@ test("#1584: a live wildcard producer makes a custom dict input addable", async 
   assert.equal(consumer.added.type, "DictGetNode");
   assert.deepEqual(consumer.added.inputs, ["py_dict"]);
   assert.equal(comfy.graph._nodes.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// #1589 — a producer already live on the canvas is direct socket evidence even when the
+// bounded whole-schema widen cannot answer. The call-site tests below drive the shipped
+// graph_add_node body; helper-only coverage would miss the captured live graph callback.
+// ---------------------------------------------------------------------------
+
+function addLiveVideoProducer(comfy, outputType) {
+  comfy.graph._nodes.push({
+    type: "LoadVideo",
+    outputs: [{ name: "video", type: outputType }],
+    inputs: [],
+    widgets: [],
+  });
+}
+
+function videoAdd(comfy, defs = videoObjectInfo()) {
+  return realGraphAddNode(comfy, {
+    api: apiForObjectInfo(defs),
+    // Keep the regression test bounded without waiting ten seconds for a synthetic
+    // half-open whole-schema request.
+    boundedGetNodeDefs: async () => NODE_DEFS_NO_ANSWER,
+  });
+}
+
+test("#1589: GetVideoComponents adds when a live producer exposes VIDEO", async () => {
+  const comfy = makeComfy(videoObjectInfo());
+  addLiveVideoProducer(comfy, "VIDEO");
+  const { graph_add_node } = videoAdd(comfy);
+
+  const result = await graph_add_node({ class_type: "GetVideoComponents" });
+
+  assert.equal(result.added.type, "GetVideoComponents");
+  assert.deepEqual(result.added.inputs, ["video"]);
+  assert.deepEqual(result.added.widgets, []);
+  assert.equal(comfy.graph._nodes.length, 2);
+});
+
+test("#1589: no live VIDEO producer still refuses GetVideoComponents", async () => {
+  const comfy = makeComfy(videoObjectInfo());
+  const { graph_add_node } = videoAdd(comfy);
+
+  await assert.rejects(
+    () => graph_add_node({ class_type: "GetVideoComponents" }),
+    (err) => {
+      assert.match(err.message, /whether any installed node outputs it is UNKNOWN/);
+      assert.match(err.message, /VIDEO/);
+      return true;
+    },
+  );
+  assert.equal(comfy.graph._nodes.length, 0, "the refused add does not mutate the graph");
+});
+
+test("#1589: a live producer of another type does not prove VIDEO", async () => {
+  const comfy = makeComfy(videoObjectInfo());
+  addLiveVideoProducer(comfy, "IMAGE");
+  const { graph_add_node } = videoAdd(comfy);
+
+  await assert.rejects(
+    () => graph_add_node({ class_type: "GetVideoComponents" }),
+    /VIDEO/,
+  );
+  assert.equal(comfy.graph._nodes.length, 1, "the unrelated producer remains the only live node");
+});
+
+test("#1589: a VIDEO producer does not waive a widget-valued VIDEO input", async () => {
+  const defs = videoObjectInfo({ widgetInput: true });
+  const comfy = makeComfy(defs);
+  addLiveVideoProducer(comfy, "VIDEO");
+  const { graph_add_node } = videoAdd(comfy, defs);
+
+  await assert.rejects(
+    () => graph_add_node({ class_type: "GetVideoComponents" }),
+    /needs a registered widget/,
+  );
+  assert.equal(comfy.graph._nodes.length, 1, "the widget-shaped refusal does not add a node");
 });
 
 // ---------------------------------------------------------------------------
