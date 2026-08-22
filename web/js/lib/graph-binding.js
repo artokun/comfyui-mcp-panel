@@ -614,6 +614,108 @@ function nodeIdentityKey(node) {
 }
 
 /**
+ * #1618 — fields the ComfyUI frontend recomputes while loading a graph it
+ * otherwise reproduced. Restoring them from the payload we asked to load undoes
+ * that hydration so a later save does not persist box heights / execution order
+ * the user never authored. Color/bgcolor stay out: those are authored, and a
+ * difference in them is not a measured rewrite.
+ */
+const HYDRATED_PRESENTATION_FIELDS = ["size", "order"];
+
+function cloneHydratedPresentationValue(field, value) {
+  if (field === "size") {
+    if (!Array.isArray(value) || value.length < 2) return undefined;
+    const width = Number(value[0]);
+    const height = Number(value[1]);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return undefined;
+    return [width, height];
+  }
+  if (field === "order") {
+    const order = Number(value);
+    return Number.isFinite(order) ? order : undefined;
+  }
+  return undefined;
+}
+
+function presentationFieldEquals(field, liveValue, savedValue) {
+  const saved = cloneHydratedPresentationValue(field, savedValue);
+  if (saved === undefined) return false;
+  if (field === "size") {
+    const live = cloneHydratedPresentationValue("size", liveValue);
+    return live !== undefined && live[0] === saved[0] && live[1] === saved[1];
+  }
+  return Number(liveValue) === saved;
+}
+
+function writeHydratedPresentationField(live, field, value) {
+  const copy = cloneHydratedPresentationValue(field, value);
+  if (copy === undefined) return false;
+  if (field === "size") {
+    const cur = live.size;
+    if (cur && typeof cur === "object") {
+      cur[0] = copy[0];
+      cur[1] = copy[1];
+      return true;
+    }
+    live.size = copy;
+    return true;
+  }
+  live.order = copy;
+  return true;
+}
+
+/**
+ * Put the saved `size` / `order` back onto live nodes after `loadGraphData`.
+ *
+ * The frontend recomputes both during configure. Leaving them rewritten marks
+ * a clean tab modified and makes the next save persist hydration (#1618).
+ * Only nodes with the same id AND type are written; widgets, title, flags and
+ * mode are never touched. Missing or unreadable inputs are a no-op.
+ *
+ * @returns {{ restored: number, skipped: number }}
+ */
+export function applySavedNodePresentation(liveRoot, savedGraph) {
+  const result = { restored: 0, skipped: 0 };
+  if (!liveRoot || !savedGraph || typeof savedGraph !== "object") return result;
+  const savedNodes = savedGraph.nodes;
+  if (!Array.isArray(savedNodes)) return result;
+  let liveNodes;
+  try {
+    liveNodes = liveRoot._nodes ?? liveRoot.nodes;
+  } catch {
+    return result;
+  }
+  if (!Array.isArray(liveNodes)) return result;
+
+  const savedByKey = new Map();
+  for (const node of savedNodes) {
+    if (!node || typeof node !== "object") continue;
+    savedByKey.set(nodeIdentityKey(node), node);
+  }
+
+  for (const live of liveNodes) {
+    if (!live || typeof live !== "object") {
+      result.skipped += 1;
+      continue;
+    }
+    const saved = savedByKey.get(nodeIdentityKey(live));
+    if (!saved) {
+      result.skipped += 1;
+      continue;
+    }
+    let restoredThis = false;
+    for (const field of HYDRATED_PRESENTATION_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(saved, field) || saved[field] === undefined) continue;
+      if (presentationFieldEquals(field, live[field], saved[field])) continue;
+      if (writeHydratedPresentationField(live, field, saved[field])) restoredThis = true;
+    }
+    if (restoredThis) result.restored += 1;
+    else result.skipped += 1;
+  }
+  return result;
+}
+
+/**
  * WHY two node arrays differ — specifically, whether anything was LOST.
  *
  * THE DEFECT THIS ANSWERS (#825). `nodes` is a single surface holding the whole
@@ -1841,9 +1943,9 @@ export function graphRootCarriesOpenProof({ rootGraph, proofMarker } = {}) {
  *   NODE wrote (a populated wildcard, a rolled seed) is on the canvas, never marks
  *   the tab modified, and was never saved — the re-read would silently replace
  *   exactly what an agent just generated. The same flag fails in the other direction
- *   too: a first-time open never runs `clearSpuriousOpenModified`, so a cold-opened
- *   tab reads modified forever, and gating on it would have disarmed this guard for
- *   that entire population. #442's re-read survives the argument only because it
+ *   too: a first-time open can still read modified when freeze/re-baseline is
+ *   unavailable, and gating on it would have disarmed this guard for that
+ *   population. #442's re-read survives the argument only because it
  *   fires on the FILE provably having changed, which is independent evidence about
  *   the disk copy. A foreign source tag is no evidence about the file at all.
  *
