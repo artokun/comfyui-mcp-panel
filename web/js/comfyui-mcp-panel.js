@@ -503,6 +503,7 @@ import {
   trackerCaptureSuppressed,
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
+import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import {
   applyCurrentDefWidgetValues,
@@ -18240,6 +18241,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // tag-based classification answers "unknown" for it, which warns nobody —
     // and that is the configuration the wrong-canvas reports arrived in.
     let sourceUnproven = false;
+    // #1575 — what `settleOpenedWorkflowTarget` had to do after ComfyUI's
+    // store-level open resolved without loading anything. Null on every open that
+    // needed nothing, which is every open that works today. Drives the #874
+    // capture gate (a state we just read off disk must not be overwritten by the
+    // still-mounted canvas) and the reply's disclosure.
+    let openSettled = null;
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
@@ -18313,6 +18320,58 @@ const GRAPH_TOOL_EXECUTORS = {
         endWorkflowReloadStep(reloadGuardToken);
       }
       if (!openFailed) {
+        // #1575 — `s.openWorkflow(target)` RESOLVING is not proof it loaded anything.
+        //
+        // `app.extensionManager.workflow` is the workflow STORE (workspaceStore binds it
+        // as `computed(() => useWorkflowStore())`), so this command's close and open are
+        // the store's primitives, and they do not pair up the way the SERVICE's do:
+        // `closeWorkflow` unloads the tab and leaves `activeWorkflow` pointing at it,
+        // while `openWorkflow` opens with `if (isActive(workflow)) return workflow` and
+        // `isActive` compares BY PATH. So the tab this command just closed is still named
+        // as active, this open early-returns on that stale pointer, and nothing loads.
+        // Measured on a live frontend: hasTracker false and inOpenList false both before
+        // AND after the open, which makes the `st` read below null and this command refuse
+        // with "this frontend did not expose a complete workflow state" — blaming the
+        // frontend for a state that is one `load()` away on the object already in hand.
+        //
+        // Runs BEFORE the capture gate and the repaint so every later step — the identity
+        // stamp, the proof, the fence, the reply — reads the object that actually holds
+        // the workflow. Returns untouched (`reason: "loaded"`) whenever the open produced
+        // a usable state, which is every open that works today.
+        // INSIDE a reload STEP (review P1). `target.load()` is a `/userdata` fetch with
+        // no deadline of its own, and between steps the guard sits at `pending === 0`,
+        // where `activeWorkflowReloadGuard()` expires it after WORKFLOW_RELOAD_GUARD_MAX_MS.
+        // A stalled read would therefore drop the fence mid-load, let a concurrent
+        // graph_* command through and acknowledge it, and the repaint below would then
+        // overwrite it from the disk state — the data-loss shape the guard exists to
+        // prevent. A step keeps `pending > 0`, which is never expired.
+        beginWorkflowReloadStep(reloadGuardToken);
+        try {
+          openSettled = await settleOpenedWorkflowTarget({
+            wasOpen,
+            target,
+            selector: path,
+            activeAfterOpen: activeWorkflowRef(),
+            // A READER, not a snapshot: the helper re-reads it after the re-list to
+            // report what the store DID rather than that the call returned (review P1).
+            readOpenWorkflows: () => s.openWorkflows,
+            sameWorkflowObject,
+            matchesSelector: workflowRecordMatchesSelector,
+            // The exact call the store's own `openWorkflow` skipped. Guarded, so a
+            // frontend without it degrades to today's refusal rather than throwing.
+            loadWorkflowContent: (wf) => (typeof wf.load === "function" ? wf.load() : undefined),
+            // The store's own "add paths without loading them or changing the active
+            // workflow" entry point — the missing half of the early-returned open, and
+            // what clears the active-but-not-open state the report also named.
+            reopenTabInBackground: (p) =>
+              typeof s.openWorkflowsInBackground === "function"
+                ? s.openWorkflowsInBackground({ right: [p] })
+                : undefined,
+          });
+        } finally {
+          endWorkflowReloadStep(reloadGuardToken);
+        }
+        if (openSettled.target && openSettled.target !== target) target = openSettled.target;
       // We deliberately do NOT auto-reload the canvas from disk here: switching to an
       // already-open tab must not silently discard the user's in-memory graph, and a
       // re-read could race a concurrent canvas edit and clobber it. Instead the staleness
@@ -18460,8 +18519,14 @@ const GRAPH_TOOL_EXECUTORS = {
           const captureBinding = describeLiveCanvasBinding(target);
           pointerMovedThisOpen = !sameWorkflowObject(activeBefore, target);
           if (
-            captureBinding === "bound" ||
-            (captureBinding !== "foreign" && !pointerMovedThisOpen)
+            // #1575 — a state THIS command just read off disk is authoritative, and the
+            // canvas mounted behind it is whatever the closed tab left there. Serializing
+            // that over the fresh state is the #1215/#968 poisoning through a new entry
+            // point, and it can preserve nothing: nothing has run against a just-loaded
+            // tracker, so it holds no node-written values (#874) for the capture to save.
+            openSettled?.loaded !== true &&
+            (captureBinding === "bound" ||
+              (captureBinding !== "foreign" && !pointerMovedThisOpen))
           ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
@@ -19366,6 +19431,32 @@ const GRAPH_TOOL_EXECUTORS = {
       // passing. The two read identically now, so this discloses instead of
       // claiming. Its own key, like the foreign one: a caller can hit it with
       // neither `stale` nor `canvas_file_divergence` firing.
+      //
+      // #1575 — the open SUCCEEDED, and it succeeded because this command repaired a
+      // frontend state the frontend does not repair for itself. Say so rather than
+      // report a bland success: the canvas now shows the SAVED file, so any node-written
+      // value that only ever lived on the canvas of the tab that was closed is gone —
+      // and that is a real difference the caller may be about to build on.
+      ...(openSettled?.loaded === true
+        ? {
+            reopened_from_disk:
+              "This workflow's tab was closed while it was still the frontend's ACTIVE " +
+              "workflow, which leaves ComfyUI's workflow store naming it active with no " +
+              "content loaded and its tab absent from the open list. The store's own open " +
+              "returns early in that state (it matches the active workflow BY PATH), so it " +
+              "loaded nothing and this command loaded the saved file itself" +
+              (openSettled.reopened ? " and restored the tab to the open list" : "") +
+              ". The canvas therefore shows the ON-DISK copy: anything a NODE wrote and " +
+              "nobody saved — a populated wildcard, a rolled seed (#874) — is not in it. " +
+              "Re-read the graph (panel_graph_outline / panel_query_graph) before relying " +
+              "on values you generated before the close." +
+              (openSettled.reopened
+                ? ""
+                : " The tab could NOT be returned to the open list, so panel_list_workflows " +
+                  "may still show this workflow as active-but-not-open; reload the panel to " +
+                  "clear that."),
+          }
+        : {}),
       ...(sourceUnproven
         ? {
             unproven_source_state:
