@@ -162,7 +162,7 @@ test("#988 (codex) source guard: the scan runs BEFORE dispatch, not after", () =
   const dispatch = src.indexOf("app.queuePrompt(0, batch, undefined)");
   assert.match(
     src.slice(Math.max(0, dispatch - 200), dispatch + 200),
-    /Promise\.resolve\(app\.queuePrompt\(0, batch, undefined\)\)/,
+    /Promise\.resolve\(\s*queuePromptWithGraphToPromptSnapshot\([\s\S]*?app\.queuePrompt\(0, batch, undefined\)/,
     "the unscoped dispatch must stay bounded — an unbounded one hangs past the relay window",
   );
   const scopedDispatch = src.indexOf("runScopeResult = await dispatchScopedRun({");
