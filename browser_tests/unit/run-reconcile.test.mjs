@@ -208,6 +208,44 @@ test("#370 bridge-down drop: execution_success fired but frame was dropped → m
   assert.deepEqual(summary, [{ promptId: "p1", status: "success", delivered: true }]);
 });
 
+test("#1619 a live PreviewImage completion replays its temp ref when remote history is unauthorized", async () => {
+  const { tracker, flushes } = makeHarness();
+  const promptId = "p-preview-remote";
+  const preview = {
+    filename: "ComfyUI_temp_preview_00001_.png",
+    subfolder: "",
+    type: "temp",
+  };
+
+  // This is ComfyUI's actual PreviewImage producer shape: the executed output
+  // carries an image in the temp namespace, followed by execution_success.
+  tracker.onQueued(promptId);
+  tracker.onExecutionStart(promptId);
+  tracker.onExecuted(promptId, { images: [preview] });
+  tracker.onExecutionSuccess(promptId);
+  tracker.markUndelivered(promptId); // the bridge dropped the live frame
+
+  let historyCalls = 0;
+  const summary = await tracker.reconcile({
+    fetchHistory: async () => {
+      historyCalls += 1;
+      throw new Error("401 unauthorized");
+    },
+    isVideo,
+  });
+
+  assert.equal(historyCalls, 0, "a live websocket completion does not need remote /history");
+  assert.equal(flushes.length, 2, "the dropped completion is replayed");
+  assert.equal(flushes[1].replayed, true);
+  assert.deepEqual(flushes[1].images, [preview], "the PreviewImage temp reference survives the failed send");
+  assert.equal(flushes[1].reconciled, undefined, "this is a live replay, not a history reconstruction");
+  assert.deepEqual(summary, [{ promptId, status: "success", delivered: true }]);
+
+  tracker.markDelivered(promptId);
+  await tracker.reconcile({ fetchHistory: async () => { throw new Error("401 unauthorized"); }, isVideo });
+  assert.equal(flushes.length, 2, "confirmed delivery removes the replay and prevents duplicates");
+});
+
 test("#370 happy path: a CONFIRMED-delivered run is NOT reconciled (no double-delivery)", async () => {
   const { tracker, flushes } = makeHarness();
   tracker.onExecutionStart("p1");
