@@ -11775,6 +11775,55 @@ function rebootTargetFields() {
   return target ? { target } : {};
 }
 
+// #2078 — a timed-out save still has a live promise behind the bounded reply.
+// Keep a short, rid-correlated success receipt for the orchestrator's follow-up
+// workflow_list probe. Flags alone cannot tell which clean canvas completed a
+// save after a tab switch; the command rid is the transaction identity.
+const LATE_SAVE_RECEIPT_TTL_MS = 10 * 60 * 1000;
+const MAX_LATE_SAVE_RECEIPTS = 32;
+const lateSaveReceipts = new Map();
+
+function pruneLateSaveReceipts() {
+  const now = Date.now();
+  for (const [rid, receipt] of lateSaveReceipts) {
+    if (now - receipt.completed_at > LATE_SAVE_RECEIPT_TTL_MS) lateSaveReceipts.delete(rid);
+  }
+  while (lateSaveReceipts.size > MAX_LATE_SAVE_RECEIPTS) {
+    const oldest = lateSaveReceipts.keys().next();
+    if (oldest.done) break;
+    lateSaveReceipts.delete(oldest.value);
+  }
+}
+
+function rememberLateWorkflowSave(rid, raw, cmd = "workflow_save") {
+  if (typeof rid !== "string" || !rid) return;
+  if (!raw || typeof raw !== "object") return;
+  const producedRecord = raw.producedRecord;
+  const savedAs = raw.saved_as === true;
+  const firstSave = raw.first_save === true;
+  const identity = saveProducedIdentity(producedRecord, { savedAs, firstSave });
+  const outcome = {
+    saved: true,
+    ...(typeof raw.name === "string" ? { workflow: raw.name } : {}),
+    ...(savedAs ? { saved_as: true } : {}),
+    ...(firstSave ? { first_save: true } : {}),
+    ...(identity?.routingKey ? { routing_key: identity.routingKey } : {}),
+    ...(identity?.uuid ? { workflow_uuid: identity.uuid } : {}),
+  };
+  pruneLateSaveReceipts();
+  lateSaveReceipts.set(rid, {
+    rid,
+    cmd,
+    completed_at: Date.now(),
+    result: outcome,
+  });
+}
+
+function lateWorkflowSaveReceipts() {
+  pruneLateSaveReceipts();
+  return Array.from(lateSaveReceipts.values()).map((receipt) => ({ ...receipt }));
+}
+
 const GRAPH_TOOL_EXECUTORS = {
   // #608: force a fresh /object_info re-register + combo refresh so an asset that
   // appeared server-side AFTER page-load — an upload_image action:"stage" input, a freshly
@@ -17757,7 +17806,7 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  async workflow_save({ name } = {}) {
+  async workflow_save({ name, rid } = {}) {
     // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
     // workflow; saves in place otherwise.
     // #1434 — userdata HEAD/GET/PUT on this path can hang while the tab stays
@@ -17773,6 +17822,9 @@ const GRAPH_TOOL_EXECUTORS = {
         observeWorkflow: observeActiveWorkflowSaveState,
         // #1455 — the destination, not whatever the canvas shows when the budget fires.
         targetName: name,
+        onLateSuccess: (result) => {
+          if (typeof rid === "string" && rid) rememberLateWorkflowSave(rid, result);
+        },
       },
     );
     // #978 recurrence — a FIRST save swaps the active object too, and the #557 carry
@@ -17800,7 +17852,7 @@ const GRAPH_TOOL_EXECUTORS = {
     return { saved: true, workflow, ...outcome, ...saveReplyIdentity(outcome.saved_as ? replyIdentity : replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
   },
 
-  async workflow_save_as({ name }) {
+  async workflow_save_as({ name, rid }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
     // #1434 — same bound as workflow_save: both go through programmaticSave, both
     // are relayed at 15 s, and a hung copy trio is the same silence.
@@ -17813,6 +17865,9 @@ const GRAPH_TOOL_EXECUTORS = {
         observeWorkflow: observeActiveWorkflowSaveState,
         // #1455 — the destination, not whatever the canvas shows when the budget fires.
         targetName: name,
+        onLateSuccess: (result) => {
+          if (typeof rid === "string" && rid) rememberLateWorkflowSave(rid, result, "workflow_save_as");
+        },
       },
     );
     // #747 — this path ALWAYS changes which workflow is active, so it is the one
@@ -17899,6 +17954,7 @@ const GRAPH_TOOL_EXECUTORS = {
             "never received the answer.",
         }
       : null;
+    const lateSaveReceipts = lateWorkflowSaveReceipts();
     return {
       active: active
         ? {
@@ -17948,6 +18004,13 @@ const GRAPH_TOOL_EXECUTORS = {
       // workflow would otherwise be read as proof that a LATER, dropped open ran.
       // No correlating receipt ⇒ the honest verdict is UNDETERMINED, never "opened".
       ...(lastOpen ? { last_open: lastOpen } : {}),
+      // #2078 — exact command-rid receipts for saves that completed after the bounded
+      // workflow_save reply. The orchestrator must match the rid and the active identity;
+      // this field is not a generic "some save succeeded" flag.
+      // Always advertise the receipt capability, including an empty list. The
+      // orchestrator uses absence to recognize an older panel and presence to
+      // fail closed when a current panel has no receipt for this save RID.
+      late_save_receipts: lateSaveReceipts,
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
         : {}),

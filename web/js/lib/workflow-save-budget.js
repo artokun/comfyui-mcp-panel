@@ -220,7 +220,15 @@ export function describeWorkflowSaveTimeout({
  */
 export async function runBoundedWorkflowSave(
   saveFn,
-  { budgetMs = WORKFLOW_SAVE_COMMAND_BUDGET_MS, now, withTimeout, observeWorkflow, targetName } = {},
+  {
+    budgetMs = WORKFLOW_SAVE_COMMAND_BUDGET_MS,
+    now,
+    withTimeout,
+    observeWorkflow,
+    targetName,
+    onTimeout,
+    onLateSuccess,
+  } = {},
 ) {
   if (typeof saveFn !== "function") {
     throw new Error("runBoundedWorkflowSave requires a save function");
@@ -241,17 +249,36 @@ export async function runBoundedWorkflowSave(
   } catch {
     priorActive = {};
   }
+  let timedOut = false;
+  const saveWork = Promise.resolve()
+    .then(() => saveFn())
+    .then(
+      (result) => {
+        if (timedOut) {
+          try {
+            onLateSuccess?.(result);
+          } catch {
+            // A late-success observer is bookkeeping only; never rewrite the save result.
+          }
+        }
+        return { ok: true, result };
+      },
+      (error) => ({ ok: false, error }),
+    );
   const settled = await withTimeout(
-    Promise.resolve()
-      .then(() => saveFn())
-      .then(
-        (result) => ({ ok: true, result }),
-        (error) => ({ ok: false, error }),
-      ),
+    saveWork,
     budget.bounded(),
-    () => WORKFLOW_SAVE_TIMEOUT,
+    () => {
+      timedOut = true;
+      return WORKFLOW_SAVE_TIMEOUT;
+    },
   );
   if (settled === WORKFLOW_SAVE_TIMEOUT || settled == null) {
+    try {
+      onTimeout?.();
+    } catch {
+      // A timeout observer is bookkeeping only; it must never change the save verdict.
+    }
     let observed = {};
     try {
       observed = typeof observeWorkflow === "function" ? observeWorkflow() || {} : {};
