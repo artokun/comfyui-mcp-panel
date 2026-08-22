@@ -18030,16 +18030,42 @@ const GRAPH_TOOL_EXECUTORS = {
     // ACKNOWLEDGEMENT too (below) rather than being computed twice and drifting apart.
     // Evaluated BEFORE the stamp and in its own try/catch: a stamp that throws is
     // identity bookkeeping failing, not evidence that the tab has content.
+    //
+    // Recurrence (0.15.37, no reconnect): `graphRootProvenEmpty(app.graph)` can pass
+    // while the VIEWING canvas still holds the previous workflow, or while the shared
+    // LGraph was cleared of `_nodes` without resetting `last_node_id`. The next added
+    // node then continues the prior graph's ids (max 113 → 115) and `panel_run` names
+    // nodes that never belonged to this tab. `serializedStateProvenEmpty` correctly
+    // treats `last_node_id` as format metadata for BINDING proofs — a user-cleared
+    // canvas is empty of content even with leftover counters — but a brand-new blank
+    // tab must also look like ComfyUI's own `blankGraph` (`last_node_id: 0`). A
+    // missing counter is inconclusive (older serialize dialects), not a leftover.
     let provenEmpty = false;
     try {
-      const rootGraph = app?.graph;
-      provenEmpty = !!rootGraph && graphRootProvenEmpty(rootGraph) && activeWorkflowProvenEmpty(wf);
+      const rootGraph = app?.rootGraph ?? app?.graph;
+      const leftoverNodeIds = (g) => {
+        const live = g?.last_node_id;
+        const serialized = typeof g?.serialize === "function" ? g.serialize()?.last_node_id : undefined;
+        return [live, serialized].some((v) => v != null && Number(v) !== 0);
+      };
+      provenEmpty =
+        !!rootGraph &&
+        graphRootProvenEmpty(rootGraph) &&
+        !leftoverNodeIds(rootGraph) &&
+        activeWorkflowProvenEmpty(wf);
+      // #604: `app.graph` can be empty while `app.canvas.graph` still holds the
+      // previous workflow. Mutations target the viewing canvas; an empty root is
+      // not a blank tab if the canvas the user will edit still has nodes.
+      const canvasGraph = app?.canvas?.graph;
+      if (provenEmpty && canvasGraph && canvasGraph !== rootGraph) {
+        provenEmpty = graphRootProvenEmpty(canvasGraph) && !leftoverNodeIds(canvasGraph);
+      }
     } catch {
       provenEmpty = false; // an unreadable proof is not a proof
     }
     if (provenEmpty) {
       try {
-        stampGraphRootWorkflowUuid(app?.graph, newWorkflowUuid, wf);
+        stampGraphRootWorkflowUuid(app?.rootGraph ?? app?.graph, newWorkflowUuid, wf);
       } catch {
         // Identity bookkeeping must never break workflow creation.
       }
