@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.41] - 2026-08-22
+
+### Fixed
+- fail honestly when remote /view is unavailable (#1623)
+
+
 ## [0.15.40] - 2026-08-22
 
 ### Fixed
