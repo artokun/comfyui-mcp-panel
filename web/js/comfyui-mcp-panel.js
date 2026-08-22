@@ -524,9 +524,9 @@ import { isImeComposing } from "./lib/ime.js";
 import { installGraphToPromptNullSafety } from "./lib/widget-null-safety.js";
 import {
   installGraphToPromptSnapshotBarrier,
+  queuePromptWithGraphToPromptSnapshot,
   reserveGraphToPromptSnapshot,
   releaseGraphToPromptSnapshot,
-  withoutGraphToPromptSnapshot,
 } from "./lib/run-prompt-snapshot.js";
 import {
   recordCopiedNodes,
@@ -16333,6 +16333,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // cannot succeed, so this blocks no working run. It fails SOFT — a lookup that
     // could not be reached is `unknown`, never `missing`, because refusing on a
     // failed metadata probe would trade one false failure for another.
+    // #445/#1588 — install both serializer guards BEFORE this first pre-flight. The
+    // pre-flight is itself graphToPrompt and must not be the one serialization that
+    // can still hit a null widget or establish a reservation before the guard exists.
+    installGraphToPromptNullSafety(app);
+    installGraphToPromptSnapshotBarrier(app);
     try {
       // Inspect the SERIALIZED prompt, not the canvas. graphToPrompt has already
       // dropped or rewritten every virtual and frontend-only node (Note, Reroute,
@@ -16357,7 +16362,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // `.then` on it throws, and the catch below would silently skip a pre-flight that
       // used to run — a bound that removes a guard is the failure it exists to prevent.
       const preflightBuild = await withTimeout(
-        Promise.resolve(withoutGraphToPromptSnapshot(app, () => app.graphToPrompt())).then(
+        Promise.resolve(app.graphToPrompt()).then(
           (value) => ({ value }),
           (error) => ({ error }),
         ),
@@ -16520,23 +16525,8 @@ const GRAPH_TOOL_EXECUTORS = {
     const captureAcceptedNodeErrors = (ne) => {
       acceptedNodeErrors = { ...(ne ?? {}), ...(acceptedNodeErrors ?? {}) };
     };
-    // #445: guard the VHS null-widget serialization crash. ComfyUI core / node
-    // extensions (notably VHS_VideoCombine) serialize EVERY node's widgets when
-    // building the prompt — even unused branches, even under "run to node" — and
-    // call string ops like `.replace()` on those values (in graphToPrompt via the
-    // node's own serializeValue). A null widget value (e.g. VHS
-    // `filename_prefix:null`) throws `Cannot read properties of null (reading
-    // 'replace')` DURING serialization, killing the run before it queues. Install
-    // an idempotent, self-restoring wrap on app.graphToPrompt so every prompt
-    // build is null-safe for exactly its serialization window (which also covers
-    // the deferred serialization queuePrompt runs when its processor is already
-    // busy) without permanently altering the live workflow.
-    installGraphToPromptNullSafety(app);
-    // #1588 — ComfyUI may defer graphToPrompt until its busy queue processor
-    // reaches this item. Keep the prompt captured by this command for the
-    // single-prompt deliberate-sweep path so later widget mutations cannot
-    // rewrite a queued job. Batches retain their queue-time callback semantics.
-    installGraphToPromptSnapshotBarrier(app);
+    // #445/#1588 guards were installed before the pre-flight above. They remain
+    // installed here while the queue call and any deferred serializer run.
     // #988 — computed BEFORE dispatch (codex). Measuring it afterwards described a
     // run that had already been submitted, while the note claimed it let the caller
     // cancel — a remedy it could not offer. Reading the graph first means the finding
@@ -16583,7 +16573,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
       if (batch === 1 && preflightPrompt != null) {
-        promptSnapshotReservation = reserveGraphToPromptSnapshot(app, preflightPrompt);
+        promptSnapshotReservation = reserveGraphToPromptSnapshot(app, preflightPrompt, rootGraph);
       }
       if (origFetchApi) {
         runInterceptor = createRunFetchInterceptor({
@@ -16624,7 +16614,11 @@ const GRAPH_TOOL_EXECUTORS = {
         // The whole remainder of the budget, not a slice: unlike the scoped path there is
         // one queue call here, so nothing is owed to a later attempt.
         const queued = await withTimeout(
-          Promise.resolve(app.queuePrompt(0, batch, undefined)).then(
+          Promise.resolve(
+            queuePromptWithGraphToPromptSnapshot(app, promptSnapshotReservation, () =>
+              app.queuePrompt(0, batch, undefined),
+            ),
+          ).then(
             (value) => ({ value }),
             (error) => ({ error }),
           ),

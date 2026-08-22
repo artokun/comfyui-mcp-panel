@@ -52,9 +52,9 @@ import { buildQueueAcceptResult, summarizePromptRejection } from "../../web/js/l
 import { installGraphToPromptNullSafety } from "../../web/js/lib/widget-null-safety.js";
 import {
   installGraphToPromptSnapshotBarrier,
+  queuePromptWithGraphToPromptSnapshot,
   reserveGraphToPromptSnapshot,
   releaseGraphToPromptSnapshot,
-  withoutGraphToPromptSnapshot,
 } from "../../web/js/lib/run-prompt-snapshot.js";
 import { collectAllGraphs } from "../../web/js/lib/asset-staleness.js";
 import {
@@ -443,9 +443,9 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch }) {
     describeUnrunnable,
     installGraphToPromptNullSafety,
     installGraphToPromptSnapshotBarrier,
+    queuePromptWithGraphToPromptSnapshot,
     reserveGraphToPromptSnapshot,
     releaseGraphToPromptSnapshot,
-    withoutGraphToPromptSnapshot,
     collectAllGraphs,
     findRepeatingControlWidgets,
     findRgthreeSeedNodes,
@@ -544,6 +544,12 @@ test("#1588 CALL SITE: a busy queue serializes each deliberate-sweep prompt snap
     await built.graph_run({});
 
     livePrompt = promptFor("B");
+    const foreign = await app.graphToPrompt();
+    assert.equal(
+      foreign.output["1"].inputs.text,
+      "B",
+      "an intervening foreign graphToPrompt call uses the live graph and cannot consume A's reservation",
+    );
     await built.graph_run({});
     livePrompt = promptFor("C");
     await built.graph_run({});
@@ -563,6 +569,158 @@ test("#1588 CALL SITE: a busy queue serializes each deliberate-sweep prompt snap
         `${label}'s five SaveImage filename_prefix widgets must stay with its prompt`,
       );
     }
+  } finally {
+    stop();
+  }
+});
+
+test("#1588: deferred serialization runs queue hooks on the correct graph snapshot", async () => {
+  const stop = keepAlive();
+  try {
+    const widget = {
+      name: "seed",
+      type: "number",
+      value: 10,
+      beforeQueued() {
+        this.value += 1;
+      },
+    };
+    const calls = [];
+    const apiTarget = { fetchApi: makeServer() };
+    const app = {
+      graph: { _nodes: [{ id: 1, widgets: [widget] }] },
+      queueItems: [{ active: true }],
+      graphToPrompt: async () => ({
+        output: { "1": { class_type: "KSampler", inputs: { seed: widget.value } } },
+        workflow: {},
+      }),
+      queuePrompt: async (number, batchCount) => {
+        app.queueItems.push({ number, batchCount });
+        return false;
+      },
+      async drain() {
+        while (app.queueItems.length) {
+          const item = app.queueItems.pop();
+          if (!item.active) {
+            widget.beforeQueued({ isPartialExecution: false });
+            calls.push(await app.graphToPrompt(app.graph));
+          }
+        }
+      },
+    };
+
+    const built = realGraphRun({ app, apiTarget, budgetMs: 3000, serializeMs: 500 });
+    await built.graph_run({});
+    widget.value = 20;
+    await built.graph_run({});
+
+    await app.drain();
+
+    assert.deepEqual(
+      calls.map((prompt) => prompt.output["1"].inputs.seed),
+      [21, 11],
+      "the LIFO queue serializes each run's captured widget state, then applies beforeQueued",
+    );
+    assert.equal(widget.value, 20, "temporary snapshot restoration does not clobber the live graph");
+  } finally {
+    stop();
+  }
+});
+
+test("#1588/#445: the first graph_run preflight is null-widget safe", async () => {
+  const stop = keepAlive();
+  try {
+    const widget = { name: "filename_prefix", type: "text", value: null };
+    let preflightSawSafeValue = false;
+    const apiTarget = { fetchApi: makeServer() };
+    const app = {
+      graph: { _nodes: [{ id: 1, widgets: [widget] }] },
+      queueItems: [],
+      graphToPrompt: async () => {
+        if (widget.value == null) throw new Error("null widget reached serializer");
+        preflightSawSafeValue = true;
+        return {
+          output: { "1": { class_type: "SaveImage", inputs: { filename_prefix: widget.value } } },
+          workflow: {},
+        };
+      },
+      queuePrompt: async (number, batchCount) => {
+        app.queueItems.push({ number, batchCount });
+        return false;
+      },
+    };
+    const built = realGraphRun({ app, apiTarget, budgetMs: 3000, serializeMs: 500 });
+
+    await built.graph_run({});
+
+    assert.equal(preflightSawSafeValue, true, "null-safety was installed before the first preflight");
+    assert.equal(widget.value, null, "the preflight guard restores the live null widget");
+  } finally {
+    stop();
+  }
+});
+
+test("#1588: a post-enqueue queuePrompt failure removes its queued item", async () => {
+  const stop = keepAlive();
+  try {
+    const calls = [];
+    const apiTarget = { fetchApi: makeServer() };
+    const app = {
+      graph: { _nodes: [] },
+      queueItems: [],
+      graphToPrompt: async () => ({
+        output: { "1": { class_type: "KSampler", inputs: { text: "A" } } },
+        workflow: {},
+      }),
+      queuePrompt: async (number, batchCount) => {
+        app.queueItems.push({ number, batchCount });
+        throw new Error("post-enqueue queue failure");
+      },
+      async drain() {
+        while (app.queueItems.length) calls.push(await app.graphToPrompt(app.graph));
+      },
+    };
+    const built = realGraphRun({ app, apiTarget, budgetMs: 3000, serializeMs: 500 });
+
+    await assert.rejects(() => built.graph_run({}), /post-enqueue queue failure/);
+    await app.drain();
+
+    assert.equal(app.queueItems.length, 0, "the item that failed after enqueue is cleaned up");
+    assert.equal(calls.length, 0, "cleanup prevents a later serializer from using the wrong prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#1588: a failure after dequeue cancels an unsupported snapshot before serialization", async () => {
+  const stop = keepAlive();
+  try {
+    const widget = { name: "host_value", type: "custom", value: new WeakMap() };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = {
+      graph: { _nodes: [{ id: 1, widgets: [widget] }] },
+      queueItems: [],
+      graphToPrompt: async () => ({
+        output: { "1": { class_type: "Custom", inputs: { host_value: widget.value } } },
+        workflow: {},
+      }),
+      queuePrompt: async (number, batchCount) => {
+        app.queueItems.push({ number, batchCount });
+        await Promise.resolve();
+        app.queueItems.pop();
+        await Promise.resolve();
+        throw new Error("post-dequeue queue failure");
+      },
+    };
+    const built = realGraphRun({ app, apiTarget, budgetMs: 3000, serializeMs: 500 });
+
+    await assert.rejects(() => built.graph_run({}), /post-dequeue queue failure/);
+    assert.equal(app.queueItems.length, 0, "the dequeued item is no longer pending");
+    assert.throws(
+      () => app.graphToPrompt(app.graph),
+      /graph_run queue item was cancelled after queuePrompt failed/,
+      "a later serializer cannot fall through to the live graph after failure",
+    );
   } finally {
     stop();
   }
