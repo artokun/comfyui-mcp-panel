@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.48] - 2026-08-22
+
+### Fixed
+- reject empty object info maps
+- reject malformed object info fallback
+- harden fallback pack map keys
+- panel_list_nodes returns an inspectable fallback when Manager is unreachable
+
+
 ## [0.15.47] - 2026-08-22
 
 ### Changed
