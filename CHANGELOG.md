@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.40] - 2026-08-22
+
+### Fixed
+- panel_open_workflow keeps authored node size/order and leaves a clean tab unmodified (#1621)
+- replay remote PreviewImage completion (#1624)
+
+
 ## [0.15.39] - 2026-08-22
 
 ### Fixed
