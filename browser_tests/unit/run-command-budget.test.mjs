@@ -627,6 +627,51 @@ test("#1588: deferred serialization runs queue hooks on the correct graph snapsh
   }
 });
 
+test("#1588 P1: a foreign graphToPrompt between the hook and queue serializer cannot consume the item snapshot", async () => {
+  const stop = keepAlive();
+  try {
+    const widget = {
+      name: "seed",
+      type: "number",
+      value: 10,
+      beforeQueued() {
+        this.value += 1;
+      },
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = {
+      graph: { _nodes: [{ id: 1, widgets: [widget] }] },
+      queueItems: [{ active: true }],
+      graphToPrompt: async () => ({
+        output: { "1": { class_type: "KSampler", inputs: { seed: widget.value } } },
+        workflow: {},
+      }),
+      queuePrompt: async (number, batchCount) => {
+        app.queueItems.push({ number, batchCount });
+        return false;
+      },
+    };
+    const built = realGraphRun({ app, apiTarget, budgetMs: 3000, serializeMs: 500 });
+
+    await built.graph_run({});
+    widget.value = 20;
+
+    // This is the pinned queue gap: the exact item has been popped and its
+    // beforeQueued hook has run, but the queue loop has not called its real
+    // graphToPrompt(this.rootGraph) yet.
+    app.queueItems.pop();
+    widget.beforeQueued({ isPartialExecution: false });
+    const foreign = await app.graphToPrompt();
+    const actual = await app.graphToPrompt(app.graph);
+
+    assert.equal(foreign.output["1"].inputs.seed, 11, "the foreign call may observe the queue snapshot");
+    assert.equal(actual.output["1"].inputs.seed, 11, "the real queue serializer still consumes that same snapshot");
+    assert.equal(widget.value, 20, "finishing the exact queue item restores the live graph");
+  } finally {
+    stop();
+  }
+});
+
 test("#1588/#445: the first graph_run preflight is null-widget safe", async () => {
   const stop = keepAlive();
   try {

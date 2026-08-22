@@ -221,6 +221,25 @@ function installHookObservers(app, state, rootGraph) {
   });
 }
 
+function isQueueLoopSerializerCall(state, graph, argumentCount) {
+  // ComfyUI_frontend 1.48.7 calls graphToPrompt(this.rootGraph) from the queue
+  // loop. A foreign app.graphToPrompt() can run after beforeQueued while that
+  // loop is between its hook and serializer calls; it may observe the temporary
+  // queue state, but it must not consume the exact-item reservation.
+  if (argumentCount === 0 || graph == null) return false;
+  try {
+    const rootGraph = state.app?.rootGraph;
+    if (rootGraph) return graph === rootGraph;
+  } catch {
+    // Fall through to the legacy graph property when rootGraph is unavailable.
+  }
+  try {
+    return graph === state.app?.graph;
+  } catch {
+    return false;
+  }
+}
+
 function associateQueueItem(state, entry, beforeLength) {
   const queueItems = state.queueItems ?? queueItemsOf(state.app);
   if (!queueItems) return false;
@@ -304,7 +323,9 @@ export function installGraphToPromptSnapshotBarrier(app) {
     // A serializer called synchronously by a queue hook is not the queue loop's
     // serializer. It must see the temporary queue state but must not consume the
     // exact-item association needed by the call that follows the hook loop.
-    if (entry.inHook) return original(graph, ...rest);
+    if (entry.inHook || !isQueueLoopSerializerCall(state, graph, arguments.length)) {
+      return original(graph, ...rest);
+    }
 
     entry.consumed = true;
     state.active = null;
