@@ -666,7 +666,7 @@ const realIsCanonicalWorkflowInstanceUuid = new Function(
 /** The REAL `workflow_new` body, with its globals injected.
  *  `uuid` is what workflowStableUuid() returns for the created tab — default is the
  *  deliberately NON-canonical placeholder the existing tests were written against. */
-function buildWorkflowNew({ rootGraph, activeWorkflow, uuid = "uuid-new-tab" }) {
+function buildWorkflowNew({ rootGraph, activeWorkflow, uuid = "uuid-new-tab", canvas } = {}) {
   const sigStart = SRC.indexOf("async workflow_new({");
   assert.notEqual(sigStart, -1, "workflow_new not found");
   const bodyBrace = SRC.indexOf(") {", sigStart) + 1;
@@ -690,7 +690,7 @@ function buildWorkflowNew({ rootGraph, activeWorkflow, uuid = "uuid-new-tab" }) 
     "isCanonicalWorkflowInstanceUuid",
     `${methodSource}\nreturn workflow_new;`,
   )(
-    { graph: rootGraph, extensionManager: { command: { execute: async () => {} } } },
+    { graph: rootGraph, rootGraph, canvas, extensionManager: { command: { execute: async () => {} } } },
     () => activeWorkflow,
     () => "tmp:new-tab",
     () => uuid,
@@ -709,14 +709,34 @@ function buildWorkflowNew({ rootGraph, activeWorkflow, uuid = "uuid-new-tab" }) 
 /** A live root LiteGraph would produce for a given serialized state. */
 const liveRoot = (state) => ({
   _nodes: state.nodes,
+  last_node_id: state.last_node_id,
   extra: state.extra,
   serialize: () => clone(state),
+});
+
+const EMPTY_WORKFLOW = () => ({
+  isPersisted: false,
+  isModified: false,
+  changeTracker: { activeState: BLANK_GRAPH() },
+});
+
+/** Cleared `_nodes` with the previous graph's id counter still on the shared LGraph —
+ *  the 0.15.37 recurrence: empty:true, then the next added node is 115 after max 113. */
+const CLEARED_PREVIOUS = () => ({
+  last_node_id: 113,
+  last_link_id: 0,
+  nodes: [],
+  links: [],
+  groups: [],
+  config: {},
+  extra: {},
+  version: 0.4,
 });
 
 test("#708 ack: a PROVEN-empty new tab reports created:true — the honest success is unchanged", async () => {
   const workflow_new = buildWorkflowNew({
     rootGraph: liveRoot(BLANK_GRAPH()),
-    activeWorkflow: { isPersisted: false, isModified: false, changeTracker: { activeState: BLANK_GRAPH() } },
+    activeWorkflow: EMPTY_WORKFLOW(),
   });
 
   const out = await workflow_new({ rid: "r1" });
@@ -725,6 +745,97 @@ test("#708 ack: a PROVEN-empty new tab reports created:true — the honest succe
   assert.equal(out.empty, true);
   assert.equal(out.routing_key, "tmp:new-tab");
   assert.equal(out.note, undefined, "a proven blank tab needs no caveat");
+});
+
+test("#708 ack: leftover last_node_id is not a proven blank — the 0.15.37 recurrence", async () => {
+  // ComfyUI reuses one LGraph. NewBlankWorkflow can empty `_nodes` without resetting
+  // the id counter; serializedStateProvenEmpty treats last_node_id as metadata, so
+  // the old both-sides proof claimed empty:true. The next added node then continued
+  // the prior graph's ids (max 113 → 115) onto a canvas that still was that graph.
+  const workflow_new = buildWorkflowNew({
+    rootGraph: liveRoot(CLEARED_PREVIOUS()),
+    activeWorkflow: EMPTY_WORKFLOW(),
+  });
+
+  const out = await workflow_new({ rid: "r1" });
+
+  assert.notEqual(out.created, true, "a leftover id counter is not a confirmed blank tab");
+  assert.equal(out.created, "unknown");
+  assert.equal(out.empty, "unknown");
+  assert.equal(out.routing_key, "tmp:new-tab", "the tab is real — only 'blank' is unproven");
+  assert.match(out.note, /panel_graph_outline/);
+});
+
+test("#708 ack: an empty app.graph is not a blank tab if the VIEWING canvas still holds the previous workflow", async () => {
+  // #604's shape, hit without a reconnect: NewBlankWorkflow updated the root
+  // pointer while canvas.graph still referenced the prior 23-node graph.
+  // Mutations target the viewing canvas, so empty:true here is the same lie.
+  const workflow_new = buildWorkflowNew({
+    rootGraph: liveRoot(BLANK_GRAPH()),
+    canvas: { graph: liveRoot(PREVIOUS_WORKFLOW_GRAPH()) },
+    activeWorkflow: EMPTY_WORKFLOW(),
+  });
+
+  const out = await workflow_new({ rid: "r1" });
+
+  assert.equal(out.created, "unknown");
+  assert.equal(out.empty, "unknown");
+  assert.equal(out.routing_key, "tmp:new-tab");
+});
+
+test("#708 ack: a missing canvas does not un-prove a genuine blank root (older frontends)", async () => {
+  const workflow_new = buildWorkflowNew({
+    rootGraph: liveRoot(BLANK_GRAPH()),
+    canvas: undefined,
+    activeWorkflow: EMPTY_WORKFLOW(),
+  });
+
+  const out = await workflow_new({ rid: "r1" });
+
+  assert.equal(out.created, true);
+  assert.equal(out.empty, true);
+});
+
+test("#708 ack: canvas.graph that is the same object as the proven-empty root still reports created:true", async () => {
+  const root = liveRoot(BLANK_GRAPH());
+  const workflow_new = buildWorkflowNew({
+    rootGraph: root,
+    canvas: { graph: root },
+    activeWorkflow: EMPTY_WORKFLOW(),
+  });
+
+  const out = await workflow_new({ rid: "r1" });
+
+  assert.equal(out.created, true);
+  assert.equal(out.empty, true);
+});
+
+test("#708 ack: leftover last_node_id on serialize() alone is enough — the live property can be missing", async () => {
+  const workflow_new = buildWorkflowNew({
+    rootGraph: {
+      _nodes: [],
+      extra: {},
+      serialize: () => ({ nodes: [], last_node_id: 113, links: [], groups: [] }),
+    },
+    activeWorkflow: EMPTY_WORKFLOW(),
+  });
+
+  assert.equal((await workflow_new({ rid: "r1" })).created, "unknown");
+});
+
+test("#708 ack: omitting last_node_id is inconclusive, not a leftover — older serialize dialects still prove blank", async () => {
+  const workflow_new = buildWorkflowNew({
+    rootGraph: {
+      _nodes: [],
+      extra: {},
+      serialize: () => ({ nodes: [], links: [], groups: [] }),
+    },
+    activeWorkflow: EMPTY_WORKFLOW(),
+  });
+
+  const out = await workflow_new({ rid: "r1" });
+  assert.equal(out.created, true);
+  assert.equal(out.empty, true);
 });
 
 // #755 — workflow_new already MINTS the new canvas's fence identity, then dropped it
@@ -822,6 +933,8 @@ test("#708 ack: every unprovable side reports unknown — an empty ROOT is not p
       root: graph(0, 4),
       wf: { isPersisted: false, isModified: false, changeTracker: { activeState: BLANK_GRAPH() } },
     },
+    // 0.15.37 recurrence: `_nodes` empty but the prior graph's id counter remains.
+    { root: CLEARED_PREVIOUS(), wf: EMPTY_WORKFLOW() },
   ];
   for (const { root, wf } of unprovable) {
     const workflow_new = buildWorkflowNew({ rootGraph: liveRoot(root), activeWorkflow: wf });
