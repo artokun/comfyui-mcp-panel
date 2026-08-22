@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_widget no longer re-waits on silent `api.getNodeDefs()` / `GET /object_info` probes when a same-connection schema snapshot is already held (#1582)
+
 ## [0.15.43] - 2026-08-22
 
 ### Fixed

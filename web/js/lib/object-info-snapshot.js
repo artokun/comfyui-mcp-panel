@@ -134,6 +134,14 @@ export function noBackendAnswerEstablished(outcomes) {
 export function createObjectInfoSnapshot() {
   let defs = null;
   let epoch = null;
+  // #1582 — have the live whole-map routes already gone silent on THIS connection,
+  // after a snapshot was held? The first silent call still has to probe: that is how
+  // an answered error keeps refusing, and how a healthy backend still wins. Once
+  // silence is established, repeating the same 1s+0.5s wait on every widget write is
+  // the recurrence — graph reads stay healthy while set_widget stalls on routes that
+  // will not answer. Cleared by `record` (a live map means the routes work again)
+  // and by `clear` (the connection is no longer the one that went quiet).
+  let probesSilent = false;
 
   return {
     /**
@@ -200,6 +208,9 @@ export function createObjectInfoSnapshot() {
       // not a hole in the suite, and it is recorded here so the next run does not re-chase
       // it. `currentEpoch` is written because it is the one `authorize` compares against.
       epoch = currentEpoch;
+      // A live observation means the whole-map routes answered. The next widget write
+      // must be allowed to prefer that live path rather than inheriting a prior silence.
+      probesSilent = false;
       return true;
     },
 
@@ -209,9 +220,14 @@ export function createObjectInfoSnapshot() {
      * The reason is for the refusal message, so it names the condition that failed rather
      * than the general shape of the rule — a caller told "no snapshot" when the real cause
      * was a reconnect goes looking in the wrong place (#982's lesson).
+     *
+     * `requireSilence` defaults true: the first fallback still needs the transports to
+     * establish that the backend never answered. Pass `false` only after
+     * `shouldSkipProbe` has already recorded that silence on this connection (#1582), so
+     * a later write can reuse the held map without minting fake outcomes.
      */
-    authorize({ epoch: currentEpoch, socketDown, outcomes } = {}) {
-      if (!noBackendAnswerEstablished(outcomes)) {
+    authorize({ epoch: currentEpoch, socketDown, outcomes, requireSilence = true } = {}) {
+      if (requireSilence !== false && !noBackendAnswerEstablished(outcomes)) {
         return {
           defs: null,
           reason:
@@ -245,12 +261,14 @@ export function createObjectInfoSnapshot() {
     },
 
     /**
-     * Is this snapshot current enough to shorten the next probe budget?
+     * Is this snapshot current enough to shorten the next probe budget, or to skip a
+     * later probe after silence has already been established?
      *
-     * This does not authorize anything and does not expose the names-only map. The actual
+     * This does not authorize anything and does not expose the names-only map. The first
      * `authorize` call still requires the transport outcome to establish silence, preserving
      * the distinction between a busy backend and one that answered with an unusable schema.
-     * The same socket/epoch fence is used so a reconnect cannot inherit the shorter budget.
+     * The same socket/epoch fence is used so a reconnect cannot inherit the shorter budget
+     * or the skip.
      */
     isReusable({ epoch: currentEpoch, socketDown } = {}) {
       return (
@@ -261,10 +279,31 @@ export function createObjectInfoSnapshot() {
       );
     },
 
+    /**
+     * Remember that the live whole-map routes went silent while this snapshot was held.
+     *
+     * No-op when nothing is held: silence without a map must not license a later skip.
+     */
+    markProbesSilent() {
+      if (defs !== null) probesSilent = true;
+    },
+
+    /**
+     * May the next ordinary set_widget skip live whole-map probes?
+     *
+     * True only after `markProbesSilent` on a still-reusable snapshot. The first silent
+     * call still probes so an answered error can refuse; a reconnect, a down socket, or a
+     * later live `record` all return false.
+     */
+    shouldSkipProbe({ epoch: currentEpoch, socketDown } = {}) {
+      return probesSilent === true && this.isReusable({ epoch: currentEpoch, socketDown });
+    },
+
     /** Drop it — for anything that knows, or merely suspects, the schema moved. */
     clear() {
       defs = null;
       epoch = null;
+      probesSilent = false;
     },
 
     /** Test/diagnostic view. Never used to make a decision. */
