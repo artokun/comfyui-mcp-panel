@@ -84,6 +84,7 @@ import {
   describeUnguardedDuplicatePanelCopy,
   PANEL_EXTENSION_NAME,
 } from "./lib/duplicate-panel-guard.js";
+import { tryRegisterWhenReady } from "./lib/resolve-comfy-app.js";
 import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { sanitizeNodeAuxId, sanitizeNodesAuxId } from "./lib/aux-id-sanitize.js";
@@ -753,6 +754,11 @@ import {
 
 let app = null;
 let api = null;
+// #1585 — setup() is invoked by ComfyUI after registerExtension, AND by us
+// when the tab API is already live (a poller that missed the setup wave).
+// First successful entry wins; a second call is a no-op so the tab cannot
+// register twice.
+let panelSetupStarted = false;
 
 // The live run-completion tracker (created in buildPanel). Held at module scope
 // so the module-level tool handlers (e.g. graph_run) can register a freshly
@@ -40054,41 +40060,38 @@ function panelCopyGuardBlocksSetup(comfyApp) {
 }
 
 function registerExtensionWhenReady(tries = 0) {
-  const comfyApp = window.comfyAPI?.app?.app || window.app;
-  if (!comfyApp || typeof comfyApp.registerExtension !== "function") {
-    if (tries >= 1000) {
-      console.error(
-        "[comfyui-mcp-panel] app.registerExtension never became available — incompatible ComfyUI frontend version.",
-      );
-      return;
-    }
-    setTimeout(() => registerExtensionWhenReady(tries + 1), 10);
-    return;
-  }
-  app = comfyApp;
-  api = window.comfyAPI?.api?.api || window.api || null;
-  // #1269 — a copy that LOST the module-scope arbitration never registers: no
-  // sidebar tab, no bridge socket, no hello. Loud, never silent — a page with
-  // no panel and no explanation is the worst outcome.
-  if (!panelCopyArbitration.active()) return notePanelCopyStandDown();
-  // #570 P0 — wrap app.loadGraphData so every workflow CREATION (import/paste/duplicate/
-  // new) mints a fresh per-instance uuid, so a copy can't inherit the source's session.
-  installCreateBoundaryFork(app);
-  setupListeners();
+  let outcome;
+  try {
+    outcome = tryRegisterWhenReady({
+      root: globalThis,
+      active: () => panelCopyArbitration.active(),
+      register: ({ comfyApp, api: resolvedApi, invokeSetup }) => {
+        app = comfyApp;
+        api = resolvedApi || null;
+        // #1269 — a copy that LOST the module-scope arbitration never registers: no
+        // sidebar tab, no bridge socket, no hello. Loud, never silent — a page with
+        // no panel and no explanation is the worst outcome.
+        if (!panelCopyArbitration.active()) return notePanelCopyStandDown();
+        // #570 P0 — wrap app.loadGraphData so every workflow CREATION (import/paste/duplicate/
+        // new) mints a fresh per-instance uuid, so a copy can't inherit the source's session.
+        installCreateBoundaryFork(app);
+        setupListeners();
 
-  // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
-  app.registerExtension({
-    name: "comfyui-mcp.agent-panel",
-    // Standard ComfyUI Settings dialog entries (persisted to comfy.settings.json).
-    // Grouped under "Comfy MCP Agent". These seed the panel's runtime defaults and
-    // stay in sync with the in-panel pickers; token entries are secure buttons that
-    // never persist a raw value here. See panelSettingsList() above.
-    settings: panelSettingsList(),
-    async setup() {
-      // #1269 — the page arbitration can move AFTER registration (a later-
-      // evaluated newer copy stood this one down); honor it, and name a
-      // guardless duplicate, before anything wraps, probes, or connects.
-      if (panelCopyGuardBlocksSetup(app)) return;
+        // TODO(v2): replace with `defineExtension({ name, setup() {...} })`.
+        const extension = {
+          name: "comfyui-mcp.agent-panel",
+          // Standard ComfyUI Settings dialog entries (persisted to comfy.settings.json).
+          // Grouped under "Comfy MCP Agent". These seed the panel's runtime defaults and
+          // stay in sync with the in-panel pickers; token entries are secure buttons that
+          // never persist a raw value here. See panelSettingsList() above.
+          settings: panelSettingsList(),
+          async setup() {
+            // #1269 — the page arbitration can move AFTER registration (a later-
+            // evaluated newer copy stood this one down); honor it, and name a
+            // guardless duplicate, before anything wraps, probes, or connects.
+            if (panelCopyGuardBlocksSetup(app)) return;
+            if (panelSetupStarted) return;
+            panelSetupStarted = true;
       // #1667 P0 — wrap the workflow store's saveWorkflow with the stale-canvas
       // persist guard FIRST, before any of the below can trigger a graph change that
       // the frontend autosave would persist unchecked. setup() runs post-app-init, so
@@ -40232,8 +40235,28 @@ function registerExtensionWhenReady(tries = 0) {
         };
         setTimeout(reopen, 120);
       }
-    },
-  });
+          },
+        };
+        app.registerExtension(extension);
+        // #1585 — if the sidebar-tab API is already live, ComfyUI's setup()
+        // wave has passed or will not call us. Invoke it ourselves; the
+        // panelSetupStarted flag makes a later framework call a no-op.
+        if (invokeSetup) void extension.setup();
+      },
+    });
+    if (outcome.status === "stood-down") return notePanelCopyStandDown();
+    if (outcome.status === "pending") {
+      if (tries >= 1000) {
+        console.error(
+          "[comfyui-mcp-panel] app.registerExtension never became available — incompatible ComfyUI frontend version.",
+        );
+        return;
+      }
+      setTimeout(() => registerExtensionWhenReady(tries + 1), 10);
+    }
+  } catch (err) {
+    console.error("[comfyui-mcp-panel] registerExtension failed", err);
+  }
 }
 
 registerExtensionWhenReady();
