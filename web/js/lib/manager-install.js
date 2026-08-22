@@ -1025,6 +1025,109 @@ export async function searchNodesVia(
   return parsed.count === 0 ? { ...parsed, ...cachedCatalogueNoMatch(query, parsed.catalogue_size, route) } : parsed;
 }
 
+/**
+ * #1645 — reconstruct installed custom-node PACKS from ComfyUI's `/object_info`
+ * map. Each loaded class carries `python_module` (`custom_nodes.<folder>` or
+ * `custom_nodes.<folder>.<sub>`); the folder is the on-disk pack name Manager
+ * would have listed. Core modules (`nodes`, `comfy_extras.*`) are not packs.
+ */
+export function installedPacksFromObjectInfo(objectInfo) {
+  const installed = {};
+  if (!objectInfo || typeof objectInfo !== "object") return installed;
+  for (const [cls, meta] of Object.entries(objectInfo)) {
+    const pythonModule = meta && typeof meta === "object" ? meta.python_module : "";
+    const s = String(pythonModule || "").trim();
+    const m = /^(?:custom_nodes)[./]([^./\\]+)/i.exec(s);
+    if (!m) continue;
+    const pack = m[1];
+    if (!installed[pack]) {
+      installed[pack] = { python_module: s, classes: [] };
+    }
+    installed[pack].classes.push(cls);
+  }
+  return installed;
+}
+
+const LIST_OBJECT_INFO_NOTE =
+  "ComfyUI-Manager is unreachable; these packs were reconstructed from the connected " +
+  "ComfyUI's /object_info (loaded custom-node python_module folders). Manager metadata " +
+  "(version, cnr_id, enabled) is not available. Enable the built-in Manager for the " +
+  "full installed-pack inventory.";
+
+/**
+ * #1645 — when BOTH Manager installed-list routes are unreachable, try the
+ * loaded `/object_info` registry before giving up. On a readable map, return
+ * an inspectable pack inventory (possibly empty — core-only is still an
+ * inventory). Any `/object_info` failure degrades to managerListUnavailableResult
+ * rather than throwing.
+ */
+export async function objectInfoListFallback(objectInfoGet, args, err) {
+  if (typeof objectInfoGet !== "function") return managerListUnavailableResult(err);
+  let info;
+  try {
+    info = await objectInfoGet();
+  } catch {
+    return managerListUnavailableResult(err);
+  }
+  const listed = listedNodesResult(installedPacksFromObjectInfo(info), args);
+  return {
+    ...listed,
+    managerReachable: false,
+    source: "object_info",
+    note: listed.note ? `${listed.note} ${LIST_OBJECT_INFO_NOTE}` : LIST_OBJECT_INFO_NOTE,
+  };
+}
+
+/**
+ * #1645 — structured unavailable result for panel_list_nodes when Manager AND
+ * `/object_info` cannot inventory packs. Inspectable (never a raw throw) so a
+ * connected canvas is not blocked by a missing Manager.
+ */
+export function managerListUnavailableResult(err) {
+  return {
+    supported: false,
+    managerReachable: false,
+    installed: {},
+    reason: String(err?.message ?? err ?? "ComfyUI-Manager not reachable"),
+    message:
+      "Installed custom-node pack inventory from ComfyUI-Manager is unavailable: " +
+      "the built-in Manager could not be reached on this ComfyUI (it may be disabled, " +
+      "or a legacy/partial build without /customnode/installed). The live canvas is " +
+      "still usable — inspect the current graph with panel_graph_outline / " +
+      "panel_query_graph. Enable the built-in Manager for the full pack list " +
+      "(version, cnr_id, enabled).",
+  };
+}
+
+/**
+ * Run the nodes_list flow with graceful degradation against an unreachable
+ * ComfyUI-Manager (#1645). Same ladder as searchNodesVia: dialect-routed GET,
+ * absolute legacy retry on unreachable/404, then `/object_info` pack
+ * reconstruction, then a structured unavailable result. Never throws on
+ * unreachable. Genuine server errors (500/403) still propagate.
+ */
+export async function listNodesVia(
+  managerGet,
+  managerCall,
+  { args = {}, objectInfoGet } = {},
+) {
+  const route = installedListRoute();
+  let raw;
+  try {
+    raw = await managerGet(route);
+  } catch (err) {
+    if (!isManagerUnreachable(err)) throw err;
+    try {
+      raw = await managerCall(route);
+    } catch (err2) {
+      if (isManagerUnreachable(err2))
+        return objectInfoListFallback(objectInfoGet, args, err2);
+      throw err2;
+    }
+  }
+  return listedNodesResult(raw, args);
+}
+
 /** #425 — ordered reboot {route, method} candidates for the detected dialect.
  *  The released 3.x Manager serves ONLY `POST /manager/reboot` (the pre-#230
  *  panel tried `GET /manager/reboot` → 404, after `POST /v2/manager/reboot` →
