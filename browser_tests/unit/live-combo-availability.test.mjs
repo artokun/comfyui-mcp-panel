@@ -571,3 +571,73 @@ test("#745 gate-r2: comboOffers reproduces the interpreter EXACTLY over a measur
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// #1634 — Windows path separators. Nested model combos are enumerated by
+// folder_paths with os.path.relpath, so /object_info on Windows lists
+// `qwen-image\qwen_image_vae.safetensors` while the workflow stores
+// `qwen-image/qwen_image_vae.safetensors`. The live scan used to compare
+// those literally and emit missing_asset for a file the server has.
+// ---------------------------------------------------------------------------
+
+/** VAELoader.vae_name — reporter's nested model, listed the way Windows /object_info spells it. */
+const WIN_VAE = classBody("VAELoader", {
+  vae_name: [["qwen-image\\qwen_image_vae.safetensors"], {}],
+});
+
+test("#1634 Windows: a nested model listed with backslashes is not missing when the widget uses slashes", async () => {
+  const r = await scanComboAvailability(
+    [node(1, "VAELoader", [{ name: "vae_name", value: "qwen-image/qwen_image_vae.safetensors" }])],
+    async () => WIN_VAE,
+    { backslashIsSeparator: true },
+  );
+  assert.deepEqual(r.unavailable, [], "the server lists this file; only the separator spelling differs");
+  assert.deepEqual(r.unknown, []);
+});
+
+test("#1634 Windows: the reverse spelling (widget backslash, options slash) is the same file", async () => {
+  const body = classBody("VAELoader", {
+    vae_name: [["qwen-image/qwen_image_vae.safetensors"], {}],
+  });
+  const r = await scanComboAvailability(
+    [node(1, "VAELoader", [{ name: "vae_name", value: "qwen-image\\qwen_image_vae.safetensors" }])],
+    async () => body,
+    { backslashIsSeparator: true },
+  );
+  assert.deepEqual(r.unavailable, []);
+  assert.deepEqual(r.unknown, []);
+});
+
+test("#1634 POSIX: a backslash in the option is a literal character and does not match a slash path", async () => {
+  const r = await scanComboAvailability(
+    [node(1, "VAELoader", [{ name: "vae_name", value: "qwen-image/qwen_image_vae.safetensors" }])],
+    async () => WIN_VAE,
+    { backslashIsSeparator: false },
+  );
+  assert.equal(r.unavailable.length, 1, "on POSIX those are two different names");
+  assert.equal(r.unavailable[0].kind, "missing_asset");
+  assert.equal(r.unavailable[0].value, "qwen-image/qwen_image_vae.safetensors");
+});
+
+test("#1634 default is POSIX — never equate separators on a guess", async () => {
+  const r = await scanComboAvailability(
+    [node(1, "VAELoader", [{ name: "vae_name", value: "qwen-image/qwen_image_vae.safetensors" }])],
+    async () => WIN_VAE,
+  );
+  assert.equal(r.unavailable.length, 1);
+});
+
+test("#1634 Windows: a genuinely different nested model is still reported", async () => {
+  const r = await scanComboAvailability(
+    [node(1, "VAELoader", [{ name: "vae_name", value: "qwen-image/other.safetensors" }])],
+    async () => WIN_VAE,
+    { backslashIsSeparator: true },
+  );
+  assert.equal(r.unavailable.length, 1);
+  assert.equal(r.unavailable[0].kind, "missing_asset");
+});
+
+test("#1634 Windows separator equivalence never collapses string vs number", () => {
+  assert.equal(comboOffers([10], "10", { backslashIsSeparator: true }), false);
+  assert.equal(comboOffers(["10"], 10, { backslashIsSeparator: true }), false);
+});

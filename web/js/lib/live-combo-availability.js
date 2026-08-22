@@ -218,10 +218,18 @@ const UNENUMERABLE_PREFIX =
  * stringifying combo values on queue (Comfy-Org/ComfyUI_frontend#14641) is exactly
  * how a canvas acquires one — which makes reporting it the useful behaviour, since
  * the queue would fail with `Value not in list` and nothing else would have warned.
+ *
+ * #1634 — when `backslashIsSeparator` is true (the server's OS is Windows), a `\`
+ * in a STRING option is a path separator, not a filename character. folder_paths
+ * lists nested models with `os.path.relpath` (backslashes on Windows) while
+ * workflows store the same file with forward slashes, and the loader resolves
+ * either spelling via `os.path`. Treating them as distinct is a false
+ * `missing_asset`. Default false (POSIX): a backslash is literal, so `a\b` is
+ * NOT `a/b`. Never applied to number/boolean — `"10"` still is not `10`.
  */
-export function comboOffers(options, value) {
+export function comboOffers(options, value, { backslashIsSeparator = false } = {}) {
   if (!Array.isArray(options)) return false;
-  return options.some((o) => serverConsidersEqual(o, value));
+  return options.some((o) => serverConsidersEqual(o, value, backslashIsSeparator));
 }
 
 /**
@@ -243,8 +251,16 @@ export function comboOffers(options, value) {
  * A bare `===` would call `true` unavailable on options `[1, 2]`, which the server
  * accepts. JS has one number type, so `10 == 10.0` needs nothing extra.
  */
-function serverConsidersEqual(option, value) {
+function serverConsidersEqual(option, value, backslashIsSeparator = false) {
   if (option === value) return true;
+  if (
+    backslashIsSeparator &&
+    typeof option === "string" &&
+    typeof value === "string" &&
+    option.replace(/\\/g, "/") === value.replace(/\\/g, "/")
+  ) {
+    return true;
+  }
   // bool <-> number only. Never string <-> anything.
   const a = typeof option === "boolean" ? (option ? 1 : 0) : option;
   const b = typeof value === "boolean" ? (value ? 1 : 0) : value;
@@ -444,7 +460,7 @@ export async function scanComboAvailability(
         continue;
       }
       if (value === "") continue;
-      if (comboOffers(options, value)) continue;
+      if (comboOffers(options, value, { backslashIsSeparator })) continue;
       // #1357 — before calling it missing, check whether this combo could have
       // listed it at all. Only a STRING can name a file, so a numeric value skips
       // straight to the verdict rather than through the annotated-filepath parser.
