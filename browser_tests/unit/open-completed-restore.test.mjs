@@ -457,6 +457,56 @@ test("panel#1283 the fold is true only when BOTH halves looked and neither saw a
   assert.equal(loadRestoreCompleted({ nodeIsolation: { failures: [] }, graphWatch: watched(["x"]) }), false);
 });
 
+test("panel#1668 a verified link-disconnect recovery can license the completed-load ground", () => {
+  const watched = { throws: [], entered: 1 };
+  const failure = { id: 122, linkDisconnectCrash: true, linkDisconnectEvidence: true };
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure] },
+      graphWatch: watched,
+      recoveredFailures: [{ id: 122 }],
+    }),
+    true,
+  );
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [{ id: 122, linkDisconnectCrash: false }] },
+      graphWatch: watched,
+      recoveredFailures: [{ id: 122 }],
+    }),
+    false,
+  );
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure] },
+      graphWatch: watched,
+      recoveredFailures: [],
+    }),
+    false,
+  );
+});
+
+test("panel#1668 each duplicate failure needs its own recovery receipt", () => {
+  const watched = { throws: [], entered: 1 };
+  const failure = { id: 122, linkDisconnectCrash: true, linkDisconnectEvidence: true };
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure, { ...failure }] },
+      graphWatch: watched,
+      recoveredFailures: [{ id: 122 }],
+    }),
+    false,
+  );
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure, { ...failure }] },
+      graphWatch: watched,
+      recoveredFailures: [{ id: 122 }, { id: 122 }],
+    }),
+    true,
+  );
+});
+
 test("panel#1283 both wraps compose: a node throw is contained, the graph throw is not", () => {
   const LG = fakeLG();
   LG.LGraphNode.prototype.configure = function () {
@@ -601,7 +651,7 @@ test("panel#1283 wiring: workflow_open installs BOTH wraps around its own load",
   const repaint = src.slice(repaintAt, src.indexOf("} catch (err)", repaintAt));
   // The wraps must be installed BEFORE the load — a wrapper installed afterwards
   // observes nothing, and the whole ground rests on this ordering.
-  const nodeWrapAt = repaint.indexOf("installNodeConfigureIsolation(LGForOpen)");
+  const nodeWrapAt = repaint.indexOf("installNodeConfigureIsolation(LGForOpen, app?.graph)");
   const graphWrapAt = repaint.indexOf("installGraphConfigureWatch(LGForOpen)");
   const loadAt = repaint.indexOf("await app.loadGraphData(repaintState, true, true, target);");
   assert.notEqual(nodeWrapAt, -1, "the node-configure isolation must be installed on the open path");
@@ -624,7 +674,7 @@ test("panel#1283 wiring: the observation is FOLDED and reaches the proof and the
   const repaint = src.slice(repaintAt, src.indexOf("} catch (err)", repaintAt));
   assert.match(
     repaint,
-    /const loadRanToCompletion = loadRestoreCompleted\(\{ nodeIsolation, graphWatch \}\);/,
+    /const loadRanToCompletion = loadRestoreCompleted\(\{[\s\S]{0,180}?recoveredFailures: openRestoreRecovered,[\s\S]{0,80}?\}\);/,
     "the two observations must be folded by the helper that keeps `unknown` representable",
   );
   // It must reach the PROOF — this is the one line whose deletion silently restores the
@@ -724,8 +774,10 @@ test("panel#1283 wiring: a node the retry could not heal is still disclosed on t
   const openAt = src.indexOf("async workflow_open({");
   const repaintAt = src.indexOf("const targetUuid = workflowStableUuid", openAt);
   const repaint = src.slice(repaintAt, src.indexOf("} catch (err)", repaintAt));
-  assert.match(repaint, /retryNodeRestores\(app\?\.graph, containedNodeFailureList\)/);
+  assert.match(repaint, /retryNodeRestores\(app\?\.graph, containedNodeFailureList, \{/);
+  assert.match(repaint, /isCurrent: \(\) =>[\s\S]{0,160}sameWorkflowObject\(activeWorkflowRef\(\), target\)/);
   assert.match(repaint, /openRestoreFailures = retry\.failed;/);
+  assert.match(repaint, /openRestoreRecovered = retry\.recovered/);
 });
 
 // ── F1: INSTALLED IS NOT ENTERED (post-merge review of #1358) ────────────────

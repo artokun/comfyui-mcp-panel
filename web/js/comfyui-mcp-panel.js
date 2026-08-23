@@ -14307,6 +14307,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // same active tab twice, and a later save 409'd), and a soft-reload-then-
     // reload left graph routing stranded on a frozen Unsaved tab.
     const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+    let retryTargetWorkflow = activeWorkflow;
+    let retryTargetGraph = app?.graph;
+    const loadStillTargetsWorkflow = () => {
+      const currentWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+      if (app?.graph !== retryTargetGraph) return false;
+      if (retryTargetWorkflow) return sameWorkflowObject(currentWorkflow, retryTargetWorkflow);
+      return currentWorkflow == null && app?.graph === retryTargetGraph;
+    };
     // #570 P0b — this replaces the ACTIVE canvas with UNTRUSTED external JSON in place. Keep
     // the live workflow instance's identity (so the agent's live session/fence stays intact —
     // re-minting here would reject the agent's own follow-up commands and reset the very
@@ -14323,7 +14331,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // construction defaults and links/groups are never applied, while the load
     // reports a clean success. With the throw contained, the sequence
     // completes and only the throwing node needs the post-load retry below.
-    const isolation = installNodeConfigureIsolation(LG);
+    const isolation = installNodeConfigureIsolation(LG, app?.graph);
     try {
       if (activeWorkflow && typeof activeWorkflow === "object") {
         await app.loadGraphData(...loadArgs, { __cmcpKeepInstance: true });
@@ -14333,12 +14341,59 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       isolation?.restore();
     }
+    // A blank-canvas load has no workflow object before the call. The frontend
+    // may create one as part of loadGraphData, but a tab switch during that await
+    // is indistinguishable from the workflow the load created. Do not retry a
+    // failed node without a pre-load identity that can fence the target.
+    retryTargetGraph = app?.graph;
     // Retry each contained node ONCE, now that the load has settled and its
     // asynchronously-built widgets usually exist. A node that still throws is
     // DISCLOSED below — never folded into a clean `loaded: true`.
-    const { restored: retriedNodes, failed: unrestoredNodes } = isolation?.failures?.length
-      ? retryNodeRestores(app?.graph, isolation.failures)
-      : { restored: [], failed: [] };
+    let retriedNodes = [];
+    let unrestoredNodes = [];
+    if (isolation?.failures?.length) {
+      if (!retryTargetWorkflow) {
+        unrestoredNodes = isolation.failures.map(({ id, type, error }) => ({
+          id,
+          type,
+          error,
+          retry: "blank-load-target-unverified",
+        }));
+      } else {
+        // The retry waits for link state to settle. Freeze the user canvas across
+        // that await so a same-workflow edit cannot be overwritten by the saved
+        // node snapshot. If this frontend exposes no reliable interaction lock,
+        // disclose the failed nodes instead of attempting an unsafe retry.
+        const retryCanvas = app?.canvas;
+        const retryInteractionToken = acquireCanvasInteractionLock(retryCanvas);
+        if (retryInteractionToken === null) {
+          unrestoredNodes = isolation.failures.map(({ id, type, error }) => ({
+            id,
+            type,
+            error,
+            retry: "no-interaction-lock",
+          }));
+        } else {
+          try {
+            ({ restored: retriedNodes, failed: unrestoredNodes } = await retryNodeRestores(app?.graph, isolation.failures, {
+              isCurrent: loadStillTargetsWorkflow,
+              isGraphCurrent: (ownerGraph) =>
+                ownerGraph == null ||
+                ownerGraph === retryTargetGraph ||
+                !!findSubgraphOwner(retryTargetGraph, ownerGraph) ||
+                isSubgraphInRoot(retryTargetGraph, ownerGraph),
+            }));
+          } finally {
+            releaseCanvasInteractionLock(retryInteractionToken, retryCanvas);
+          }
+        }
+      }
+    }
+    if (isolation?.failures?.length && retryTargetWorkflow && !loadStillTargetsWorkflow()) {
+      throw new Error(
+        "graph_load target workflow changed while restore retry was settling; the retry was skipped",
+      );
+    }
     // #874 remaining load path — SubgraphNode.configure seeds host rails from
     // INNER definition widgets, so a saved subgraph host lands at defaults
     // (prompt, dimensions, length, selectors) while the file still holds the
@@ -18588,6 +18643,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // node threw and never got its values".
     let openRestoreFailures = [];
     let openRestoreRetried = [];
+    let openRestoreRecovered = [];
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
     // can neither be overwritten by the reload nor be silently re-baselined as clean.
@@ -18991,7 +19047,7 @@ const GRAPH_TOOL_EXECUTORS = {
             // handled: both wraps answer null, the fold answers UNKNOWN, and the open
             // behaves exactly as it did before this change.
             const LGForOpen = liteGraphGlobal();
-            const nodeIsolation = installNodeConfigureIsolation(LGForOpen);
+            const nodeIsolation = installNodeConfigureIsolation(LGForOpen, app?.graph);
             const graphWatch = installGraphConfigureWatch(LGForOpen);
             // The load is INSIDE the try whose finally strips the marker: the payload
             // carrying the marker is handed over the moment this call starts, so a
@@ -19007,6 +19063,7 @@ const GRAPH_TOOL_EXECUTORS = {
                 nodeIsolation?.restore();
                 graphWatch?.restore();
               }
+              const restoreTargetGraph = app?.graph;
               // Retry each contained node ONCE now that the load has settled — the
               // asynchronously-built widgets that made it throw usually exist by then, and
               // a healed node makes the content comparison below honest rather than
@@ -19017,14 +19074,34 @@ const GRAPH_TOOL_EXECUTORS = {
               // workflow-SERVICE dependency. Same reason `canvasView` exists below.
               const containedNodeFailureList = nodeIsolation?.failures ?? [];
               if (containedNodeFailureList.length) {
-                const retry = retryNodeRestores(app?.graph, containedNodeFailureList);
+                const retry = await retryNodeRestores(app?.graph, containedNodeFailureList, {
+                  isCurrent: () =>
+                    app?.graph === restoreTargetGraph && sameWorkflowObject(activeWorkflowRef(), target),
+                  isGraphCurrent: (ownerGraph) =>
+                    ownerGraph == null ||
+                    ownerGraph === restoreTargetGraph ||
+                    !!findSubgraphOwner(restoreTargetGraph, ownerGraph) ||
+                    isSubgraphInRoot(restoreTargetGraph, ownerGraph),
+                });
                 openRestoreRetried = retry.restored;
                 openRestoreFailures = retry.failed;
+                openRestoreRecovered = retry.recovered ?? [];
+                if (app?.graph !== restoreTargetGraph || !sameWorkflowObject(activeWorkflowRef(), target)) {
+                  throw failOpenRebindUnknown(
+                    new Error(
+                      "workflow_open target workflow changed while restore retry was settling; the retry was skipped",
+                    ),
+                  );
+                }
               }
               // THREE states, and the null one is the point: `loadRestoreCompleted`
               // answers null when either wrap could not be installed, i.e. the question
               // was never asked. Only an explicit `true` may license anything below.
-              const loadRanToCompletion = loadRestoreCompleted({ nodeIsolation, graphWatch });
+              const loadRanToCompletion = loadRestoreCompleted({
+                nodeIsolation,
+                graphWatch,
+                recoveredFailures: openRestoreRecovered,
+              });
               // A successful promise alone is not a binding receipt: old/partial frontend
               // implementations can resolve while leaving app.canvas on the previous root.
               // Demand the positive, attempt-specific marker even for dirty workflows —
@@ -19625,10 +19702,25 @@ const GRAPH_TOOL_EXECUTORS = {
             nodes_restored_on_retry: openRestoreRetried,
             nodes_restored_on_retry_note:
               `${openRestoreRetried.length} node(s) threw while their saved state was being applied ` +
-              `during this open, and were re-applied successfully after the load settled — their ` +
-              `widgets are built asynchronously by their own pack. Nothing is missing because of ` +
-              `it. That failure came from the node's own frontend code, not from the open; if it ` +
-              `recurs, update or report the pack.`,
+              `during this open, and were re-applied successfully after the load settled. ` +
+              (openRestoreRecovered.length
+                ? `A recognized LiteGraph link-disconnect crash was recovered and the affected ` +
+                  `node's serialized state was verified; any named linked-widget difference is ` +
+                  `reported separately. `
+                : `Their widgets are built asynchronously by their own pack. `) +
+              `Nothing is missing because of it. That failure came from the node's own frontend ` +
+              `code, not from the open; if it recurs, update or report the pack.`,
+          }
+        : {}),
+      ...(openRestoreRecovered.length
+        ? {
+            link_disconnect_recovered: openRestoreRecovered,
+            link_disconnect_recovered_note:
+              `The panel recognized a LiteGraph far-end slot lookup crash during restore, waited ` +
+              `for the link state to settle, retried the node once, and verified its serialized ` +
+              `state before allowing this open to proceed. A linked widget may display the ` +
+              `upstream value rather than the file's saved widget value; saving preserves the ` +
+              `verified live graph, so inspect that widget if its exact value matters.`,
           }
         : {}),
       ...(openDefinitionsUnverified
@@ -19648,8 +19740,12 @@ const GRAPH_TOOL_EXECUTORS = {
             content_normalized: openContentNormalized,
             content_normalized_note:
               `Every node in this workflow came back with the same id and type, nothing extra ` +
-              `appeared, and the panel WATCHED this load: no node's configure threw and the graph ` +
-              `restore ran to completion. So the load did not stop part-way — the failure mode ` +
+              `appeared, and the panel WATCHED this load: ` +
+              (openRestoreRecovered.length
+                ? `a recognized LiteGraph link-disconnect crash was repaired and the affected ` +
+                  `node's serialized state was verified after the post-load retry. `
+                : `no node's configure threw and the graph restore ran to completion. `) +
+              `So the load did not stop part-way — the failure mode ` +
               `that leaves a full node set over nodes that lost their values — and that is why ` +
               `the open is reported APPLIED and the workflow_uuid published rather than refused. ` +
               `What differs from the file is per-node ${openContentNormalized.join(", ")}. The ` +
