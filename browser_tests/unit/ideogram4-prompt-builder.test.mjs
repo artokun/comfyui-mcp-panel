@@ -136,14 +136,17 @@ test("#1569: the guard is WIRED into graph_set_widget, ahead of the generic writ
   assert.match(handler.slice(guardAt, writeAt), /throw new Error\(ideogram4PromptBuilderRefusal\(widget, node\.id\)\)/);
 });
 
-function editorFixture({ boxes = [], importLink = null } = {}) {
+function editorFixture({ boxes = [], importLink = null, importMode = "when empty", originMode = 0 } = {}) {
   const node = {
     id: 217,
     type: TYPE,
     _boxes: boxes.map((box) => ({ ...box })),
     _stylePalette: ["#112233"],
     inputs: [{ name: "import_json", link: importLink }],
-    graph: { links: importLink == null ? {} : { [importLink]: { origin_id: 91 } } },
+    graph: {
+      links: importLink == null ? {} : { [importLink]: { origin_id: 91 } },
+      getNodeById: () => ({ mode: originMode }),
+    },
     widgets: [
       { name: "high_level_description", value: "existing subject" },
       { name: "background", value: "existing background" },
@@ -152,6 +155,7 @@ function editorFixture({ boxes = [], importLink = null } = {}) {
       { name: "aesthetics", value: "grainy" },
       { name: "lighting", value: "soft" },
       { name: "medium", value: "35mm" },
+      { name: "import_mode", value: importMode },
       { name: "style_palette_data", value: "[\"#112233\"]" },
       {
         name: IDEOGRAM4_ELEMENTS_WIDGET,
@@ -237,13 +241,45 @@ test("#1650: an empty region list clears the editor without requiring an import 
   assert.deepEqual(node._boxes, []);
 });
 
-test("#1650: a connected import_json source remains authoritative", () => {
-  const node = editorFixture({ importLink: 7, boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
+test("#1650: always-mode import_json remains authoritative", () => {
+  const node = editorFixture({ importLink: 7, importMode: "always", boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
   assert.throws(
     () => applyIdeogram4PromptBuilderWrite(node, "[]"),
     /live import_json connection.*authoritative/,
   );
   assert.equal(node._boxes.length, 1, "the ambiguous write does not touch the editor");
+});
+
+test("#1650: when-empty import_json permits replacement while local regions exist", () => {
+  const node = editorFixture({ importLink: 7, boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
+  const result = applyIdeogram4PromptBuilderWrite(node, "[]");
+  assert.equal(result.ideogram4_prompt_builder.verified, true);
+  assert.deepEqual(node._boxes, []);
+});
+
+test("#1650: muted import_json links do not block local editor writes", () => {
+  const node = editorFixture({ importLink: 7, importMode: "always", originMode: 2, boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
+  const result = applyIdeogram4PromptBuilderWrite(node, "[]");
+  assert.equal(result.ideogram4_prompt_builder.verified, true);
+  assert.deepEqual(node._boxes, []);
+});
+
+test("#1650: nobbox regions retain unplaced semantics through rehydration", () => {
+  const node = editorFixture({ boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
+  const result = applyIdeogram4PromptBuilderWrite(node, JSON.stringify([
+    { x: 0.5, y: 0.5, w: 0.1, h: 0.1, nobbox: true, desc: "unplaced" },
+  ]));
+  assert.equal(result.ideogram4_prompt_builder.verified, true);
+  assert.equal(node._boxes[0].nobbox, true);
+  assert.equal(node._boxes[0].desc, "unplaced");
+});
+
+test("#1650: incompatible callback failures roll back the editor", () => {
+  const node = editorFixture({ boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2, desc: "old" }] });
+  const before = JSON.stringify(node._boxes);
+  node.onExecuted = () => { node._boxes = [{ x: 0.4, y: 0.4, w: 0.1, h: 0.1 }]; };
+  assert.throws(() => applyIdeogram4PromptBuilderWrite(node, "[]"), /did not rehydrate/);
+  assert.equal(JSON.stringify(node._boxes), before);
 });
 
 test("#1650: malformed region input is rejected before opening an undo step", () => {

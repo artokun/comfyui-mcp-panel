@@ -280,7 +280,13 @@ function connectedImportSource(node) {
     const input = (node?.inputs ?? []).find((entry) => entry?.name === "import_json");
     const link = input?.link;
     if (link == null) return null;
-    return node.graph?.links?.[link] ?? null;
+    const source = node.graph?.links?.[link] ?? null;
+    if (!source) return null;
+    // KJNodes deliberately keeps muted/bypassed links in the graph while treating
+    // them as disconnected for queue-time authority.
+    const origin = node.graph?.getNodeById?.(source.origin_id);
+    if (origin && [2, 4].includes(origin.mode)) return null;
+    return source;
   } catch {
     return null;
   }
@@ -307,8 +313,15 @@ function sameRegionShape(actual, expected) {
     a.text === e.text &&
     a.desc === e.desc &&
     a.nobbox === e.nobbox &&
-    ["x", "y", "w", "h"].every((key) => Math.abs(a[key] - e[key]) <= 0.001)
+    (e.nobbox || ["x", "y", "w", "h"].every((key) => Math.abs(a[key] - e[key]) <= 0.001))
   );
+}
+
+function cloneEditorBoxes(boxes) {
+  return (Array.isArray(boxes) ? boxes : []).map((box) => ({
+    ...box,
+    ...(Array.isArray(box?.palette) ? { palette: [...box.palette] } : {}),
+  }));
 }
 
 function readSerializedRegions(elementsWidget) {
@@ -327,9 +340,11 @@ function readSerializedRegions(elementsWidget) {
  * refreshes the hidden widgets, and repaints the editor. Calling the generic widget
  * setter cannot do that because `serializeValue()` ignores `widget.value`.
  *
- * A live import_json connection remains authoritative at queue time, so silently
- * changing the local editor would be overwritten by that source on the next run.
- * Refuse that ambiguous case and tell the caller to update the connected source.
+ * An active import_json connection is authoritative in "always" mode, and while
+ * the local editor is empty in "when empty" mode. In the latter mode, existing
+ * local regions are intentionally authoritative, matching KJNodes' serializer.
+ * Refuse only the source-authoritative cases and tell the caller to update the
+ * connected source.
  */
 export function applyIdeogram4PromptBuilderWrite(
   node,
@@ -343,13 +358,6 @@ export function applyIdeogram4PromptBuilderWrite(
     );
   }
   const importLink = connectedImportSource(node);
-  if (importLink) {
-    throw new Error(
-      `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} has a live import_json connection, which is ` +
-        "the queue's authoritative region source. Update the connected PrimitiveStringMultiline value " +
-        "and keep import_mode set to always; panel_set_widget cannot safely override that source.",
-    );
-  }
   const boxes = normalizeRegionBoxes(value);
   const elementsWidget = findWidget(node, IDEOGRAM4_ELEMENTS_WIDGET);
   let current;
@@ -367,6 +375,14 @@ export function applyIdeogram4PromptBuilderWrite(
         "nothing was changed.",
     );
   }
+  const importMode = stringWidgetValue(node, "import_mode");
+  if (importLink && (importMode === "always" || current.length === 0)) {
+    throw new Error(
+      `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} has a live import_json connection, which is ` +
+        "the queue's authoritative region source in the current import mode. Update the connected " +
+        "PrimitiveStringMultiline value or leave local regions in place before using panel_set_widget.",
+    );
+  }
   if (typeof node?.onExecuted !== "function") {
     throw new Error(
       `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} has no live import callback; ` +
@@ -374,6 +390,11 @@ export function applyIdeogram4PromptBuilderWrite(
     );
   }
 
+  const previousBoxes = cloneEditorBoxes(node._boxes);
+  const previousPalette = Array.isArray(node._stylePalette) ? [...node._stylePalette] : node._stylePalette;
+  const previousLastImported = node._lastImported;
+  const previousWidgets = (node.widgets ?? []).map((widget) => ({ widget, value: widget.value }));
+  const previousSize = Array.isArray(node.size) ? [...node.size] : null;
   beforeChange?.();
   try {
     node.onExecuted({ caption: [JSON.stringify(currentCaptionForRegions(node, boxes))] });
@@ -398,6 +419,16 @@ export function applyIdeogram4PromptBuilderWrite(
       if (boxes[i].locked === true && node._boxes?.[i]) node._boxes[i].locked = true;
     }
     elementsWidget.value = JSON.stringify(node._boxes ?? serialized);
+  } catch (error) {
+    // The callback is third-party node code. If a future KJNodes build changes its
+    // caption semantics, restore every state we can observe before exposing the
+    // failure to the generic handler.
+    node._boxes = previousBoxes;
+    node._stylePalette = previousPalette;
+    node._lastImported = previousLastImported;
+    for (const { widget, value: previousValue } of previousWidgets) widget.value = previousValue;
+    if (previousSize && typeof node.setSize === "function") node.setSize(previousSize);
+    throw error;
   } finally {
     afterChange?.();
   }
