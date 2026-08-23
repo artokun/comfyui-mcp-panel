@@ -486,6 +486,27 @@ test("panel#1668 a verified link-disconnect recovery can license the completed-l
   );
 });
 
+test("panel#1668 each duplicate failure needs its own recovery receipt", () => {
+  const watched = { throws: [], entered: 1 };
+  const failure = { id: 122, linkDisconnectCrash: true, linkDisconnectEvidence: true };
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure, { ...failure }] },
+      graphWatch: watched,
+      recoveredFailures: [{ id: 122 }],
+    }),
+    false,
+  );
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure, { ...failure }] },
+      graphWatch: watched,
+      recoveredFailures: [{ id: 122 }, { id: 122 }],
+    }),
+    true,
+  );
+});
+
 test("panel#1283 both wraps compose: a node throw is contained, the graph throw is not", () => {
   const LG = fakeLG();
   LG.LGraphNode.prototype.configure = function () {

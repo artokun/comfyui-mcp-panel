@@ -606,15 +606,20 @@ export function loadRestoreCompleted({ nodeIsolation, graphWatch, recoveredFailu
   if (graphThrows.length !== 0) return false;
   if (nodeFailures.length === 0) return true;
   const recovered = Array.isArray(recoveredFailures) ? recoveredFailures : [];
+  const usedRecovered = new Set();
   return nodeFailures.every(
     (failure) => {
       if (failure?.linkDisconnectCrash !== true || failure?.linkDisconnectEvidence !== true) return false;
       const ownerGraphToken = failure?.ownerGraphToken ?? graphIdentityToken(failure?.ownerGraph);
-      return recovered.some(
-        (candidate) =>
+      const recoveredIndex = recovered.findIndex(
+        (candidate, index) =>
+          !usedRecovered.has(index) &&
           sameNodeId(candidate?.id, failure?.id) &&
           (ownerGraphToken == null || candidate?.ownerGraphToken === ownerGraphToken),
       );
+      if (recoveredIndex < 0) return false;
+      usedRecovered.add(recoveredIndex);
+      return true;
     },
   );
 }
