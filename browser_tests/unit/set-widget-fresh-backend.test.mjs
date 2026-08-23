@@ -238,7 +238,7 @@ test("#718 wiring: graph_set_widget passes the execution-time workflow fence int
   const body = src.slice(start, end);
   assert.match(
     body,
-    /assertTargetStillCurrent:\s*\(\)\s*=>\s*assertActiveWorkflowCommandTarget\([\s\S]*workflow_uuid/,
+    /assertTargetStillCurrent:\s*\(\)\s*=>\s*\{[\s\S]*assertActiveWorkflowCommandTarget\([\s\S]*workflow_uuid/,
     "the post-await write boundary must recheck the exact command stamp",
   );
 });

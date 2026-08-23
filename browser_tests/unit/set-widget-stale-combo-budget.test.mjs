@@ -167,7 +167,7 @@ test("#1418 a never-started recovery says NOTHING IS RUNNING — never 'still ru
 // shipped body with the real coalescer answers that.
 
 const SET_WIDGET_SRC = (() => {
-  const m = PANEL_SRC.match(/ {2}async graph_set_widget\(\{ node_id, widget, value, workflow_uuid, builder_state \}\) \{[\s\S]*?\n {2}\},/);
+  const m = PANEL_SRC.match(/ {2}async graph_set_widget\(\{ node_id, widget, value, workflow_uuid, builder_state(?:, expected_node_type)? \}\) \{[\s\S]*?\n {2}\},/);
   assert.ok(m, "could not locate graph_set_widget in the panel source");
   return m[0];
 })();

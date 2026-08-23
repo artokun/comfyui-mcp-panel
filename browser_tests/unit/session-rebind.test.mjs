@@ -270,12 +270,17 @@ test("#570/#718: hello ALWAYS advertises both workflow-stamp fences so the orche
   // server never treats this build like an older unsafe bundle.
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_workflow_stamp, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_workflow_stamp_at_write, true);
+  assert.equal(buildHelloPayload({ tabId: "t" }).enforces_expected_node_type_at_write, true);
   assert.equal(
     buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).enforces_workflow_stamp,
     true,
   );
   assert.equal(
     buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).enforces_workflow_stamp_at_write,
+    true,
+  );
+  assert.equal(
+    buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).enforces_expected_node_type_at_write,
     true,
   );
 });
