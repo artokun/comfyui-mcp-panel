@@ -91,6 +91,33 @@ test("the retry snapshot is not aliased to configure's mutable input", () => {
   assert.equal(isolation.failures[0].info.properties.p, "original");
 });
 
+test("the retry snapshot preserves an own serialized __proto__ field", async () => {
+  const LG = makeLiteGraph();
+  const base = LG.LGraphNode.prototype.configure;
+  let first = true;
+  LG.LGraphNode.prototype.configure = function (info) {
+    if (first) {
+      first = false;
+      throw new Error("first configure failed");
+    }
+    return base.call(this, info);
+  };
+  const node = new LG.LGraphNode(22);
+  const graph = { getNodeById: (id) => (id === 22 ? node : null) };
+  const isolation = installNodeConfigureIsolation(LG, graph);
+  const info = JSON.parse('{"id":22,"properties":{"__proto__":{"x":1}}}');
+  try {
+    node.configure(info);
+  } finally {
+    isolation.restore();
+  }
+  const result = await retryNodeRestores(graph, isolation.failures);
+  assert.deepEqual(result.restored, [{ id: 22, type: null }]);
+  const retried = node.configured[0];
+  assert.equal(Object.prototype.hasOwnProperty.call(retried.properties, "__proto__"), true);
+  assert.deepEqual(retried.properties.__proto__, { x: 1 });
+});
+
 test("the wrapper preserves a non-throwing configure's return value and `this`", () => {
   const LG = makeLiteGraph();
   const isolation = installNodeConfigureIsolation(LG);

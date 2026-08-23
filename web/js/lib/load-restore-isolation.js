@@ -34,7 +34,14 @@ function cloneSerializedValue(value, seen = new Map()) {
   if (prior) return prior;
   const clone = Array.isArray(value) ? [] : {};
   seen.set(value, clone);
-  for (const key of Object.keys(value)) clone[key] = cloneSerializedValue(value[key], seen);
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(clone, key, {
+      configurable: true,
+      enumerable: true,
+      value: cloneSerializedValue(value[key], seen),
+      writable: true,
+    });
+  }
   return clone;
 }
 
