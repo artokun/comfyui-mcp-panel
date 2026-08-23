@@ -17199,14 +17199,15 @@ const GRAPH_TOOL_EXECUTORS = {
       accept.fixed_seed_nodes = repeatingRgthreeSeeds(rgthreeSeeds);
       accept.fixed_seed_note = fixedSeedNote;
     }
-    // #572/#1124/#1331 — TRUTHFUL drift-coverage note for a scoped run: the drift
+    // #572/#1124/#1331/#2099 — TRUTHFUL drift-coverage note for a scoped run: the drift
     // hash excluded the inputs that mutate at queue time by the known
     // mechanisms — beforeQueued carriers + their linked, serialized targets
     // (e.g. a control_after_generate seed reroll), the seed of an ARMED
     // rgthree Seed node (no hook: rgthree substitutes inside its own
     // api.queuePrompt patch), leftover values of link-driven converted
-    // widgets (clip/vae/model settling after reconnect), and UE broadcast
-    // targets. A user edit to exactly THOSE inputs during the queue window
+    // widgets (clip/vae/model settling after reconnect), UE broadcast targets,
+    // and VHS date-template filename_prefix values. A user edit to exactly THOSE
+    // inputs during the queue window
     // is indistinguishable from the queue-time mutation (accepted residual),
     // so the result names the uncovered inputs instead of implying full-graph
     // drift proof. Every other input was covered.
@@ -17222,8 +17223,9 @@ const GRAPH_TOOL_EXECUTORS = {
         note:
           "These inputs mutate at queue time — a beforeQueued hook (e.g. a " +
           "control_after_generate seed reroll), an extension that rewrites the prompt in " +
-          "its own api.queuePrompt patch (an armed Seed (rgthree) node), or a leftover " +
-          "link-driven widget value settling after reconnect (clip/vae/model) — so they were " +
+          "its own api.queuePrompt patch (an armed Seed (rgthree) node), a leftover " +
+          "link-driven widget value settling after reconnect (clip/vae/model), or a " +
+          "VHS_VideoCombine date-template filename_prefix — so they were " +
           "excluded from this run's graph-drift check: a user edit to exactly these inputs " +
           "during the queue window is indistinguishable from that mutation and would NOT " +
           "have been caught. Every other input was drift-covered.",
