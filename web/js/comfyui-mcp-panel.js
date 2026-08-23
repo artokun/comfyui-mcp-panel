@@ -14307,7 +14307,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // same active tab twice, and a later save 409'd), and a soft-reload-then-
     // reload left graph routing stranded on a frozen Unsaved tab.
     const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
-    const retryTargetWorkflow = activeWorkflow;
+    let retryTargetWorkflow = activeWorkflow;
     const retryTargetGraph = app?.graph;
     const loadStillTargetsWorkflow = () => {
       const currentWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
@@ -14339,6 +14339,12 @@ const GRAPH_TOOL_EXECUTORS = {
       }
     } finally {
       isolation?.restore();
+    }
+    // A blank-canvas load has no workflow object before the call: the frontend
+    // creates its active workflow as part of loadGraphData. Bind that newly
+    // created target before the asynchronous retry can yield.
+    if (!retryTargetWorkflow) {
+      retryTargetWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
     }
     // Retry each contained node ONCE, now that the load has settled and its
     // asynchronously-built widgets usually exist. A node that still throws is
