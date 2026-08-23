@@ -15463,7 +15463,7 @@ const GRAPH_TOOL_EXECUTORS = {
         }
         const current = getGraphCtx();
         const liveTarget = resolveNode(current.graph, node_id);
-        if (!liveTarget || liveTarget.type !== expected_node_type) {
+        if (!liveTarget || liveTarget !== node || liveTarget.type !== expected_node_type) {
           throw new Error(
             `panel_set_widget target changed before dispatch: expected ${expected_node_type}, ` +
               `found ${liveTarget?.type ?? "missing"}`,

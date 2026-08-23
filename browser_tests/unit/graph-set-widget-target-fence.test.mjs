@@ -13,8 +13,10 @@ test("graph_set_widget enforces expected_node_type at the synchronous write boun
 
   const expectedArg = handler.indexOf("expected_node_type");
   const targetCheck = handler.indexOf("liveTarget.type !== expected_node_type");
+  const identityCheck = handler.indexOf("liveTarget !== node");
   const runSet = handler.indexOf("runSetWidget(node, widget, value, setWidgetOpts)");
   assert.ok(expectedArg >= 0, "handler does not accept expected_node_type");
   assert.ok(targetCheck >= 0, "handler does not verify the live target type");
+  assert.ok(identityCheck >= 0, "handler does not reject a same-type replacement object");
   assert.ok(runSet > targetCheck, "target type must be checked before runSetWidget");
 });
