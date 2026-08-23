@@ -17754,11 +17754,35 @@ const GRAPH_TOOL_EXECUTORS = {
         const store = getPiniaStore("executi" + "on" + "Error");
         e = store?.["lastExecuti" + "on" + "Error"] ?? null;
       }
-      const applied = applyRuntimeExecFailure(e, byId);
+      let applied = applyRuntimeExecFailure(e, byId);
+      // #1685 — execution_error uses a scoped locator for nodes inside a native
+      // subgraph (for example `140:125`), while `byId` only indexes the graph
+      // currently visible on the canvas. Resolve that locator against the active
+      // root graph and run the same type-safe correlation before retaining it.
+      if (!applied.detail && e?.node_id != null) {
+        const scopedNode = findNodeByScopedId(rootGraph, e.node_id);
+        if (scopedNode) {
+          applied = applyRuntimeExecFailure(
+            e,
+            new Map([[String(e.node_id), scopedNode]]),
+          );
+        }
+      }
+      let visibleFailureNode = null;
+      if (e?.node_id != null) {
+        visibleFailureNode =
+          findVisibleNodeByScopedId(rootGraph, nodes, e.node_id) ??
+          // On the root canvas, a qualified inner id is represented by its host.
+          (graph === rootGraph ? byId.get(String(e.node_id).split(":")[0]) : null);
+        // A valid node in another subgraph/workflow must not dirty this view. Keep
+        // the root-host exception above, but otherwise discard it before the three
+        // correlated output surfaces are assigned.
+        if (!visibleFailureNode) applied = { detail: null, failure: null, reason: null };
+      }
       execFailureDetail = applied.detail;
       execFailure = applied.failure;
-      if (applied.reason && e?.node_id != null) {
-        addReason(e.node_id, applied.reason);
+      if (applied.reason && visibleFailureNode) {
+        addReason(visibleFailureNode.id, applied.reason);
       }
     } catch {
       /* optional */
