@@ -22508,6 +22508,16 @@ const GRAPH_TOOL_EXECUTORS = {
       const detected = await detectManagerDialect({
         signal: AbortSignal.timeout(bounded(MANAGER_FETCH_TIMEOUT_MS)),
       });
+      // #1539 — real Manager v4's v2 install handler does not clone arbitrary
+      // URLs. Refuse before creating or submitting a task; the v2-batch/legacy
+      // dialects intentionally keep their measured files:[url] escape hatch.
+      if (detected === "v2" && installGitUrl(args)) {
+        throw new Error(
+          "Manager v4 does not clone the supplied arbitrary URL; no install was queued. " +
+            "Use a Manager registry id, or install the repository on the ComfyUI host " +
+            "from a local verified path.",
+        );
+      }
       const ui_id = crypto.randomUUID();
       const client_id = api.clientId ?? api.initialClientId ?? "comfyui-mcp-panel";
       // A git URL or an owner/repo id can install under a directory name that
@@ -22616,8 +22626,8 @@ const GRAPH_TOOL_EXECUTORS = {
       // draws on whatever the command budget has LEFT (#671).
       phase = "verify";
       // #1539 — `ui_id` is what makes the Manager's own terminal verdict for THIS
-      // task readable. Without it the verifier is back to drain + name-presence,
-      // and a v4 registry rejection of a git URL reports queued/pending.
+      // registry task readable. Git-routed targets on real v4 are refused above;
+      // v2-batch/legacy retain their direct-URL files:[url] path.
       const outcome = await verifyInstalled(target, dialect, {
         batchFailed, renameProne, budgetMs: remaining(), ui_id,
       });

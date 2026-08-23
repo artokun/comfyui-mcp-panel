@@ -1139,6 +1139,68 @@ test("#671 nodes_install (real panel source) happy path still verifies inside th
   assert.deepEqual(calls, ["manager/queue/task"], "exactly one submit, on the v2 task route");
 });
 
+test("#1539 v4 refuses a Git-routed target before any Manager mutation", async () => {
+  const calls = [];
+  const nodes_install = loadNodesInstall({
+    budgetMs: 2500,
+    detect: async () => "v2",
+    managerV2: async (...args) => { calls.push(["v2", ...args]); },
+    managerCall: async (...args) => { calls.push(["legacy", ...args]); },
+    managerQueueControl: async (...args) => { calls.push(["start", ...args]); },
+    verifyInstalled: async (...args) => { calls.push(["verify", ...args]); },
+  });
+  const err = await nodes_install({
+    repository: "https://github.com/example/arbitrary-node.git",
+  }).then(() => null, (e) => e);
+
+  assert.ok(err, "an arbitrary Git URL must be refused on real v4");
+  assert.match(err.message, /Manager v4 does not clone the supplied arbitrary URL/);
+  assert.match(err.message, /no install was queued/i);
+  assert.match(err.message, /Manager registry id/);
+  assert.match(err.message, /ComfyUI host/);
+  assert.match(err.message, /local verified path/);
+  assert.deepEqual(calls, [], "v4 Git rejection must send no submit, start, or verification mutation");
+});
+
+for (const dialect of ["v2-batch", "legacy"]) {
+  test(`#1539 ${dialect} keeps the direct-URL files path`, async () => {
+    const url = "https://github.com/example/arbitrary-node.git";
+    const calls = [];
+    const managerV2 = async (route, opts) => {
+      calls.push(["v2", route, opts]);
+      return { failed: [] };
+    };
+    const managerCall = async (route, opts) => {
+      calls.push(["legacy", route, opts]);
+      return null;
+    };
+    const nodes_install = loadNodesInstall({
+      budgetMs: 2500,
+      detect: async () => dialect,
+      managerV2,
+      managerCall,
+      managerQueueControl: async (_call, route) => {
+        calls.push(["start", route]);
+      },
+      verifyInstalled: async (target, actualDialect) => {
+        assert.equal(actualDialect, dialect);
+        return { state: "installed" };
+      },
+    });
+    const result = await nodes_install({ repository: url });
+
+    assert.equal(result.installed, true);
+    const submit = calls.find(([kind, route]) =>
+      kind === (dialect === "v2-batch" ? "v2" : "legacy") &&
+      route === (dialect === "v2-batch" ? "manager/queue/batch" : "manager/queue/install"),
+    );
+    assert.ok(submit, `${dialect} must still submit the install`);
+    const body = dialect === "v2-batch" ? submit[2].body.install[0] : submit[2].body;
+    assert.deepEqual(body.files, [url], `${dialect} must preserve files:[url] direct-URL routing`);
+    assert.ok(calls.some(([kind, route]) => kind === "start" && route === "manager/queue/start"));
+  });
+}
+
 test("#671 nodes_install a stalled dialect detection reports NOTHING queued (a retry is safe)", async () => {
   // Detection hangs (signal-aware); NO mutation may run. The budget error must
   // say so — this phase can vouch for it (codex r2 P2).
