@@ -100,6 +100,36 @@ test("#396 a FORCED payload-less call while a refresh is in flight runs a TRAILI
   assert.equal(registered.length, 2, "the forced call ran its OWN trailing refresh, not just a join");
 });
 
+test("#1680: a forced payload-less caller can explicitly join an in-flight refresh", async () => {
+  const gate = deferred();
+  const { coalescer, registered } = makeHarness(async () => {
+    if (registered.length === 1) await gate.promise;
+  });
+
+  const inFlight = coalescer();
+  const joined = coalescer(undefined, { force: true, joinInFlight: true, joinMs: 500 });
+
+  gate.resolve();
+  await Promise.all([inFlight, joined]);
+
+  assert.equal(registered.length, 1, "the opt-in joins the existing run without a trailing pass");
+});
+
+test("#1680: a failed joined refresh returns no freshness verdict", async () => {
+  const gate = deferred();
+  const { coalescer } = makeHarnessReturning(async () => {
+    await gate.promise;
+    throw new Error("refresh failed");
+  });
+
+  const inFlight = coalescer();
+  const joined = coalescer(undefined, { force: true, joinInFlight: true, joinMs: 500 });
+  gate.resolve();
+
+  await inFlight.catch(() => {});
+  assert.equal(await joined, undefined, "a rejected run must fail closed instead of claiming fresh");
+});
+
 test("#396 many FORCED calls during one in-flight run coalesce into ONE trailing run", async () => {
   const gate = deferred();
   const { coalescer, registered } = makeHarness(async () => {

@@ -178,15 +178,16 @@ test("#1562: refresh_nodes answers before synchronous reapply and keeps registra
     "the caller must reply before registerNodesFromDefs/reapply can block the main thread",
   );
 
-  // This retry sees the still-live first promise and queues one trailing forced run. Both
-  // runs may register eventually, but the coalescer must never let those passes overlap.
+  // This retry sees the still-live first promise and subscribes to its completion. The
+  // acknowledgement path must return that run's settled verdict without queueing a second
+  // forced pass.
   const retryReply = await refresh_nodes();
-  assert.equal(retryReply.reason, "refresh_still_running");
+  assert.equal(retryReply.refreshed, true, "the retry observes the completed first refresh");
   while (inFlight) {
     const current = inFlight;
     await current;
   }
-  assert.equal(registrationCalls, 2, "the retry joined/queued behind the first run, then refreshed once");
+  assert.equal(registrationCalls, 1, "the retry joined the first run instead of queueing another");
   assert.equal(maxConcurrentRegistrations, 1, "registration passes must remain single-flight");
 });
 

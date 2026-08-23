@@ -1,22 +1,17 @@
-// panel#1404 — `panel_refresh_nodes` timed out with no acknowledgement for 30 s against a
-// ComfyUI that stayed healthy and idle, and the IDENTICAL call succeeded on the retry.
-//
-// The reply was not lost in transit. It was never COMPOSED inside the window: `refresh_nodes`
-// is relayed at comfyui-mcp's `OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS` (30,000 ms) and was the
-// only command relayed there that never took a command budget, so its forced coalescer call
-// waited unbounded on an in-flight run AND on the trailing run queued behind it. Each run is
-// ~14.5 s wall clock on the #610 install (NODE_DEFS_RUN_BUDGET_MS bounds only the WAITING it
-// controls and stops its clock across `registerNodesFromDefs`), and two of them do not fit.
-// The retry succeeds because by then the trailing run has settled and it pays for ONE.
+// panel#1680 — `panel_refresh_nodes` must observe an already-running node-definition refresh
+// instead of queueing a second forced run behind it. The command is an acknowledgement
+// surface: it joins the existing single-flight promise up to its command budget, returns the
+// completed freshness verdict when that promise settles, and reports a bounded retryable
+// status when it does not. When no run exists, it still starts its own forced refresh.
 //
 // THE HARNESS RUNS THE SHIPPED `refresh_nodes` BODY, extracted from the panel source and
 // given injected collaborators, over the REAL coalescer with a REAL in-flight run — the same
 // technique as add-node-command-budget.test.mjs, and for the same reason. A helper-level test
-// cannot reach this defect: `makeRefreshCoalescer` already accepts `joinMs` and already
-// implements it correctly (#1192/#1351), and `refresh_nodes` already handled a non-fresh
-// verdict. The whole bug was that the call site passed no bound. Only an assertion on THAT
-// CALL SITE can see it — which is why every test below drives the extracted executor rather
-// than the coalescer directly, and why deleting `joinMs` from the panel makes them fail.
+// cannot reach the whole defect: the coalescer's opt-in join and the existing budget are
+// individually testable, but only an assertion on THAT CALL SITE can prove that
+// `refresh_nodes` both opts into joining and preserves its idle forced-refresh behavior.
+// Every production-path case below therefore drives the extracted executor rather than
+// relying on a helper-only test.
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -123,19 +118,35 @@ async function withWatchdog(run, ms, what) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. The reported shape: a run already in flight, and the tool call behind it.
+// 1. The reported shape: a run already in flight, and the tool call subscribed to it.
 // ---------------------------------------------------------------------------
 
-test("#1404: refresh_nodes REPLIES at its budget instead of waiting two runs out", async () => {
+test("#1680: refresh_nodes returns the completed verdict from an already-running refresh", async () => {
+  const gate = deferred();
+  const built = realRefreshNodes({ holdFirstRun: gate.promise, budgetMs: 500 });
+  const pending = built.refresh_nodes();
+
+  assert.equal(built.runs.length, 1, "the existing refresh owns the single-flight slot");
+  gate.resolve();
+
+  const { value } = await withWatchdog(
+    () => pending,
+    1500,
+    "refresh_nodes did not return after the already-running refresh settled",
+  );
+  assert.deepEqual(value, { ok: true, refreshed: true });
+  assert.equal(built.runs.length, 1, "joining the completion must not queue a trailing refresh");
+  await built.inFlightStarted?.catch(() => {});
+});
+
+test("#1680: refresh_nodes replies at its budget instead of waiting for the joined run", async () => {
   const gate = deferred();
   const built = realRefreshNodes({ holdFirstRun: gate.promise, budgetMs: 150 });
 
   const { value, elapsed } = await withWatchdog(
     () => built.refresh_nodes(),
     1500,
-    "refresh_nodes never replied: the command budget is not reaching the coalescer, so the " +
-      "forced call is waiting for a run someone else started PLUS its own — the composition " +
-      "that does not fit the 30,000 ms relay window",
+    "refresh_nodes never replied: the command budget did not reach the in-flight completion",
   );
 
   assert.equal(value.ok, true, "nothing failed, so the command still succeeds");
@@ -147,9 +158,11 @@ test("#1404: refresh_nodes REPLIES at its budget instead of waiting two runs out
 
   gate.resolve();
   await built.inFlightStarted?.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(built.runs.length, 1, "a timed-out join must not create a trailing refresh");
 });
 
-test("#1404: the reply NAMES the cause instead of collapsing it into 'unknown'", async () => {
+test("#1680: the bounded status names the still-running refresh and its remedy", async () => {
   const gate = deferred();
   const built = realRefreshNodes({ holdFirstRun: gate.promise, budgetMs: 150 });
 
@@ -183,9 +196,8 @@ test("#1404: the reply NAMES the cause instead of collapsing it into 'unknown'",
     /[Nn]othing failed/,
     "the caller must know nothing was left half-done before it retries",
   );
-  // BOTH runs. The coalescer returns one symbol whether the budget went on a run someone
-  // else started or on this command's own, so a detail naming only the first would be
-  // flatly wrong on an uncontended big install — the case with no concurrency at all.
+  // The status remains compatible with the existing bounded own-run path: the same
+  // structured token is used whether the command joined an existing run or started one.
   assert.match(value.detail, /something else started/, "the contended case");
   assert.match(value.detail, /own registration/, "…and this command's own run");
 
@@ -193,7 +205,7 @@ test("#1404: the reply NAMES the cause instead of collapsing it into 'unknown'",
   await built.inFlightStarted?.catch(() => {});
 });
 
-test("#1404: the abandoned run is NOT cancelled, and the retry it asks for succeeds", async () => {
+test("#1680: a timed-out joined refresh is not cancelled and a later call can refresh", async () => {
   // This is why the remedy is honest rather than hopeful, and it is also the reporter's
   // observation: the identical call succeeded on the second attempt. The coalescer does not
   // cancel what it stopped waiting for, so the retry pays for ONE run rather than two.
@@ -210,6 +222,8 @@ test("#1404: the abandoned run is NOT cancelled, and the retry it asks for succe
 
   gate.resolve();
   await built.inFlightStarted?.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(built.runs.length, 1, "the abandoned join did not start a competing refresh");
 
   const second = await withWatchdog(
     () => built.refresh_nodes(),
@@ -217,6 +231,18 @@ test("#1404: the abandoned run is NOT cancelled, and the retry it asks for succe
     "the retry the remedy prescribes never replied either",
   );
   assert.deepEqual(second.value, { ok: true, refreshed: true });
+  assert.equal(built.runs.length, 2, "the later idle call starts exactly one new refresh");
+});
+
+test("#1680: with no refresh in flight, refresh_nodes starts its own forced run", async () => {
+  const built = realRefreshNodes({ startInFlight: false, budgetMs: 500 });
+  const { value } = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes did not start an idle refresh",
+  );
+  assert.deepEqual(value, { ok: true, refreshed: true });
+  assert.equal(built.runs.length, 1, "an idle call starts one forced refresh");
 });
 
 test("#1404: an UNCONTENDED run that outlives the budget lands on the same named verdict", async () => {
@@ -331,7 +357,7 @@ test("#1404: the shipped call site passes the budget — the helper alone cannot
   // but BOTH options are required by name.
   assert.match(
     refreshNodesMatch[0],
-    /refreshComfyNodeDefs\(undefined, \{[\s\S]*?force: true,[\s\S]*?joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,[\s\S]*?runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS,\s*\}\)/,
-    "refresh_nodes must bound its own wait on the coalescer AND state the run's allowance",
+    /refreshComfyNodeDefs\(undefined, \{[\s\S]*?force: true,[\s\S]*?joinInFlight: true,[\s\S]*?joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,[\s\S]*?runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS,\s*\}\)/,
+    "refresh_nodes must join an existing run, bound its wait, and state the run's allowance",
   );
 });
