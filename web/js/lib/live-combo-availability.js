@@ -57,6 +57,19 @@ const FILE_LIKE = /\.[A-Za-z0-9_]{2,12}$/;
 /** Existing production type-scoped object-info reads use this same concurrency. */
 const LIVE_SCAN_BATCH_SIZE = 8;
 
+/** The direct helper is also used by focused callers outside the panel IIFE. */
+function defaultMonotonicNow() {
+  try {
+    if (typeof performance !== "undefined" && typeof performance.now === "function") {
+      const value = performance.now();
+      if (Number.isFinite(value)) return value;
+    }
+  } catch {
+    // Fall through to the legacy runtime clock.
+  }
+  return Date.now();
+}
+
 /** True when the options look like files on disk. An empty list cannot be judged
  *  this way, so the caller supplies the fallback (see `optionsNameFiles`). */
 export function optionsLookLikeFiles(options) {
@@ -272,6 +285,11 @@ function serverConsidersEqual(option, value, backslashIsSeparator = false) {
   return typeof a === "number" && typeof b === "number" && a === b;
 }
 
+/**
+ * `fetchClassInfo` receives `(className, signal)`. Production forwards that signal
+ * to the panel API, so a shared-budget timeout can cancel the underlying fetch;
+ * callers that do not accept the second argument still get the bounded fallback.
+ */
 export async function scanComboAvailability(
   nodes,
   fetchClassInfo,
@@ -279,7 +297,7 @@ export async function scanComboAvailability(
     maxClasses = 80,
     maxAssetProbes = 48,
     budgetMs = 0,
-    now = () => Date.now(),
+    now = defaultMonotonicNow,
     confirmServerAsset = null,
     backslashIsSeparator = false,
   } = {},
@@ -309,6 +327,9 @@ export async function scanComboAvailability(
   const cache = new Map();
   const classLimit = new Set();
   const budgetLimit = new Set();
+  // Every shipped browser has AbortController. If a legacy runtime does not, keep
+  // the fallback serial so one unabortable request cannot leave a whole batch live.
+  const batchSize = typeof AbortController === "function" ? LIVE_SCAN_BATCH_SIZE : 1;
   const entryFromResponse = (className, response) => {
     let branded = false;
     let kind;
@@ -361,14 +382,22 @@ export async function scanComboAvailability(
       return;
     }
     const run = (className) => {
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
       const request = Promise.resolve()
-        .then(() => fetchClassInfo(className))
+        .then(() => fetchClassInfo(className, controller?.signal))
         .then(
           (value) => ({ value, settledAt: now() }),
           () => ({ error: true, settledAt: now() }),
         );
       return Number.isFinite(remaining)
-        ? withTimeout(request, remaining, () => null)
+        ? withTimeout(request, remaining, () => {
+            try {
+              controller?.abort();
+            } catch {
+              // A broken AbortController cannot turn a bounded step into a hang.
+            }
+            return null;
+          })
         : request;
     };
     const results = await Promise.all(batch.map((className) => run(className)));
@@ -385,8 +414,8 @@ export async function scanComboAvailability(
     }
   };
 
-  for (let offset = 0; offset < allowedClasses.length; offset += LIVE_SCAN_BATCH_SIZE) {
-    const batch = allowedClasses.slice(offset, offset + LIVE_SCAN_BATCH_SIZE);
+  for (let offset = 0; offset < allowedClasses.length; offset += batchSize) {
+    const batch = allowedClasses.slice(offset, offset + batchSize);
     if (outOfBudget || !(now() < deadline)) {
       outOfBudget = true;
       for (const className of allowedClasses.slice(offset)) budgetLimit.add(className);

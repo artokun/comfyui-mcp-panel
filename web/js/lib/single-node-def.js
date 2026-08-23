@@ -69,12 +69,13 @@ export function singleDefConfirms(body, classType) {
  */
 export const SINGLE_NODE_INFO_OUTCOME = Symbol.for("comfyui-mcp.singleNodeInfoOutcome");
 
-export async function fetchSingleNodeInfo(classType, fetchApi) {
+export async function fetchSingleNodeInfo(classType, fetchApi, signal) {
   const unknown = () => ({ [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" });
   if (typeof classType !== "string" || classType === "") return unknown();
   if (typeof fetchApi !== "function") return unknown();
   try {
-    const response = await fetchApi(`/object_info/${encodeURIComponent(classType)}`);
+    const route = `/object_info/${encodeURIComponent(classType)}`;
+    const response = signal ? await fetchApi(route, { signal }) : await fetchApi(route);
     if (!response || (typeof response.status === "number" && (response.status < 200 || response.status >= 300))) {
       return unknown();
     }
@@ -104,11 +105,12 @@ export async function fetchSingleNodeInfo(classType, fetchApi) {
  * Ask the backend about ONE node type.
  *
  * @param {string} classType
- * @param {(route: string) => Promise<{ status?: number, json?: () => Promise<unknown> }>} fetchApi
+ * @param {(route: string, options?: { signal?: AbortSignal }) => Promise<{ status?: number, json?: () => Promise<unknown> }>} fetchApi
+ * @param {AbortSignal} [signal]
  * @returns {Promise<object|null>} the defs object when it CONFIRMS the type,
  *   null in every other case — including every kind of doubt.
  */
-export async function fetchSingleNodeDef(classType, fetchApi) {
-  const outcome = await fetchSingleNodeInfo(classType, fetchApi);
+export async function fetchSingleNodeDef(classType, fetchApi, signal) {
+  const outcome = await fetchSingleNodeInfo(classType, fetchApi, signal);
   return outcome.kind === "present" ? outcome.body : null;
 }

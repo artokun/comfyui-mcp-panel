@@ -191,6 +191,22 @@ test("#1691 a hung class batch returns an explicit budget cutoff", async () => {
   assert.match(r.unknown[0].reason, /budget/);
 });
 
+test("#1691 a timed-out class batch aborts its in-flight lookups", async () => {
+  const signals = [];
+  const r = await scanComboAvailability(
+    Array.from({ length: 8 }, (_, i) => node(i, `Hung${i}`, [{ name: "pick", value: "ok" }])),
+    (_className, signal) => new Promise((_resolve, reject) => {
+      signals.push(signal);
+      signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    }),
+    { budgetMs: 25 },
+  );
+  assert.equal(signals.length, 8, "the production batch should start all eight bounded reads");
+  assert.ok(signals.every((signal) => signal?.aborted), "every timed-out read must be aborted");
+  assert.equal(r.unchecked_budget_exhausted, true);
+  assert.equal(r.unavailable.length, 0);
+});
+
 test("#745 empty / malformed input is answered with empty, never a throw", async () => {
   assert.deepEqual(await scanComboAvailability(null, async () => LORA), { unavailable: [], unknown: [] });
   assert.deepEqual(await scanComboAvailability([], null), { unavailable: [], unknown: [] });

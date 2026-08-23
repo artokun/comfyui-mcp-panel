@@ -89,6 +89,18 @@ test("#1691 the scan-facing route distinguishes absent from transport uncertaint
   }
 });
 
+test("#1691 the scan-facing route forwards its abort signal", async () => {
+  const controller = new AbortController();
+  let seenOptions;
+  const fetchApi = async (_route, options) => {
+    seenOptions = options;
+    return { status: 200, json: async () => ({ WorkingPack: { input: {} } }) };
+  };
+  const result = await fetchSingleNodeInfo("WorkingPack", fetchApi, controller.signal);
+  assert.equal(result.kind, "present");
+  assert.equal(seenOptions.signal, controller.signal);
+});
+
 test("#767 every kind of DOUBT returns null, never a conclusion", async () => {
   // An older ComfyUI without the route.
   assert.equal(await fetchSingleNodeDef("KSampler", fakeApi({ status: 404, body: {} })), null);

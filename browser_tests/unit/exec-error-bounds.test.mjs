@@ -471,10 +471,14 @@ async function runProductionGraphGetErrors({
   lastExecFailure,
   scan = async () => null,
   fetchSingleNodeInfo = () => {},
-  stepBudget = () => 0,
+  // The extracted executor's default scan is a no-op test double. Give it a
+  // usable budget so legacy tests that are not exercising live-scan exhaustion
+  // retain their clean-note assertions.
+  stepBudget = () => 1000,
+  monotonicNow = () => 0,
 }) {
   const deps = {
-    monotonicNow: () => 0,
+    monotonicNow,
     getErrorsStepBudgetMs: stepBudget,
     hasRawMissingAssetCandidates: () => false,
     GET_ERRORS_REFRESH_CAP_MS: 18000,
@@ -565,6 +569,44 @@ test("#1691 production graph_get_errors batches live class reads and keeps uncer
   assert.equal(result.unchecked_nodes.length, 1);
   assert.equal(result.unchecked_nodes[0].type, "InstalledButUnreachablePack");
   assert.match(result.unchecked_nodes[0].reason, /could not be looked up/);
+  assert.equal(result.note, undefined, "an unchecked live scan must not emit a clean note");
+});
+
+test("#1691 production graph_get_errors keeps budget-cutoff scans non-clean and uses its monotonic clock", async () => {
+  const graph = { _nodes: [], getNodeById: () => null };
+  const monotonicNow = () => 123;
+  let scanOptions;
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: async (_nodes, _fetch, options) => {
+      scanOptions = options;
+      return { unavailable: [], unknown: [], unchecked_budget_exhausted: true };
+    },
+    stepBudget: () => 1000,
+    monotonicNow,
+  });
+
+  assert.equal(scanOptions.now, monotonicNow);
+  assert.equal(result.unchecked_budget_exhausted, true);
+  assert.equal(result.note, undefined, "a budget-cutoff live scan must not emit a clean note");
+});
+
+test("#1691 production graph_get_errors discloses a scan skipped after the shared budget is spent", async () => {
+  const graph = { _nodes: [], getNodeById: () => null };
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: async () => {
+      throw new Error("the scan must not start without a budget");
+    },
+    stepBudget: () => 0,
+  });
+
+  assert.equal(result.unchecked_budget_exhausted, true);
+  assert.equal(result.note, undefined, "a skipped live scan must not emit a clean note");
 });
 
 test("#1685 production graph_get_errors preserves a scoped runtime error and blames its root host", async () => {
