@@ -245,6 +245,12 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     if (current) {
       // No payload, not forced ⇒ joining the settled refresh is enough.
       if (preloadedDefs == null && (!force || joinInFlight)) {
+        // #1680 — an unbounded refresh may still be waiting at the explicit handoff before
+        // synchronous registration. Ask it to yield BEFORE arming/waiting on this bounded
+        // acknowledgement, so its local work cannot consume the acknowledgement's deadline.
+        // The opt-in is intentionally limited to this join path; default forced callers still
+        // queue the trailing freshness run below.
+        if (joinInFlight) current.requestEarlyYield?.();
         if (!(await joinBounded(current, joinMs, withTimeout))) return REFRESH_JOIN_ABANDONED;
         // #1680 — an acknowledgement caller needs the run's freshness verdict, not just
         // proof that the promise settled. Ordinary payload-less joins intentionally retain

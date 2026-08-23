@@ -54,6 +54,7 @@ function realRefreshNodes({
   startInFlight = true,
   budgetMs = 150,
   verdicts = [{ refreshed: true, reason: "refreshed" }],
+  runHook = null,
 } = {}) {
   let inFlight = null;
   const runs = [];
@@ -62,10 +63,11 @@ function realRefreshNodes({
     setInFlight: (p) => {
       inFlight = p;
     },
-    runRegister: async () => {
+    runRegister: async (_defs, _runOpts, control) => {
       const index = runs.length;
       runs.push(index);
       if (index === 0 && holdFirstRun) await holdFirstRun;
+      if (runHook) return runHook({ index, control });
       return verdicts[Math.min(index, verdicts.length - 1)];
     },
     withTimeout,
@@ -160,6 +162,63 @@ test("#1680: refresh_nodes replies at its budget instead of waiting for the join
   await built.inFlightStarted?.catch(() => {});
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(built.runs.length, 1, "a timed-out join must not create a trailing refresh");
+});
+
+test("#1680: a joined acknowledgement yields before delayed synchronous registration", async () => {
+  const gate = deferred();
+  const localWorkMs = 100;
+  const built = realRefreshNodes({
+    holdFirstRun: gate.promise,
+    budgetMs: 1,
+    runHook: async ({ control }) => {
+      const handoff = control.beforeLocalWork?.();
+      if (handoff) await handoff;
+      const end = Date.now() + localWorkMs;
+      while (Date.now() < end) {}
+      return { refreshed: true, reason: "refreshed" };
+    },
+  });
+
+  const pending = built.refresh_nodes();
+  // Let the acknowledgement arm its one-millisecond join timer before releasing the
+  // external refresh toward the synchronous section that used to block that timer.
+  await Promise.resolve();
+  gate.resolve();
+
+  const { value, elapsed } = await withWatchdog(
+    () => pending,
+    500,
+    "refresh_nodes waited through the joined refresh's synchronous work",
+  );
+  assert.equal(value.reason, "refresh_still_running");
+  assert.ok(
+    elapsed < localWorkMs,
+    `replied in ${elapsed}ms instead of blocking through ${localWorkMs}ms of local work`,
+  );
+
+  await built.inFlightStarted?.catch(() => {});
+});
+
+test("#1680: a settled joined non-fresh verdict is forwarded truthfully", async () => {
+  const gate = deferred();
+  const verdict = {
+    refreshed: false,
+    reason: NODE_DEF_REFRESH_REASONS.OBJECT_INFO_FETCH_FAILED,
+    remedy: "check that ComfyUI is running",
+  };
+  const built = realRefreshNodes({ holdFirstRun: gate.promise, budgetMs: 500, verdicts: [verdict] });
+  const pending = built.refresh_nodes();
+
+  gate.resolve();
+  const { value } = await withWatchdog(
+    () => pending,
+    1500,
+    "refresh_nodes did not return the joined non-fresh verdict",
+  );
+  assert.equal(value.refreshed, false);
+  assert.equal(value.reason, verdict.reason);
+  assert.equal(value.remedy, verdict.remedy);
+  await built.inFlightStarted?.catch(() => {});
 });
 
 test("#1680: the bounded status names the still-running refresh and its remedy", async () => {
