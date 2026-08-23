@@ -80,6 +80,17 @@ test("#745 an EMPTY option list is a real answer, not an unknown one", async () 
   assert.deepEqual(r.unknown, []);
 });
 
+test("#1651 frontend-authored CustomCombo choices are not judged by /object_info", async () => {
+  let lookups = 0;
+  const r = await scanComboAvailability(
+    [node(73, "CustomCombo", [{ name: "choice", value: "Auto - Smart Engine + Compatible LoRA" }])],
+    async () => { lookups += 1; return EMPTY_LORA; },
+  );
+  assert.deepEqual(r.unavailable, []);
+  assert.deepEqual(r.unknown, []);
+  assert.equal(lookups, 0, "the server's intentionally empty CustomCombo list is not authoritative");
+});
+
 test("#745 an ABSENT class is UNKNOWN — never a finding, never healthy", async () => {
   // /object_info/<absent> answers `{}` with HTTP 200, not a 404. If that collapsed
   // into "no combos", every widget on the node would pass as fine; if it collapsed

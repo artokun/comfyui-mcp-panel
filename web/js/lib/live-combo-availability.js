@@ -414,6 +414,10 @@ export async function scanComboAvailability(
     // A node whose pack is NOT loaded is a defless placeholder, carries no `isVirtualNode`,
     // and is still scanned and still reported (see frontend-virtual-nodes.js).
     if (isFrontendVirtualNode(node)) continue;
+    // panel#1651 — CustomCombo choices are authored by the frontend widget. Its
+    // intentionally empty server COMBO list is not evidence that the selected
+    // frontend value names a missing asset, so /object_info has no authority here.
+    if (className === "CustomCombo") continue;
     const entry = await comboMapFor(className);
     if (!entry.combos) {
       // Unjudgeable. Report the node once, with the REASON it was skipped — a
