@@ -124,6 +124,42 @@ export function graphToPromptUnusable(built) {
 }
 
 /**
+ * A refusal for a graph serializer that THREW rather than returning an unusable result.
+ *
+ * `graph_run` preflights `graphToPrompt()` before handing the graph to the frontend queue.
+ * The thrown value is the only useful evidence when a dynamic widget or extension
+ * serializer rejects the live graph, so keep a bounded, total rendering of it in the
+ * refusal. This is deliberately a separate helper from `unserializableGraphRefusal`: a
+ * thrown serializer does not establish that any node type is missing.
+ */
+export function graphToPromptFailureRefusal(error) {
+  let raw = "";
+  try {
+    if (error instanceof Error) raw = error.message;
+    else if (typeof error === "string") raw = error;
+    else raw = String(error ?? "");
+  } catch {
+    raw = "";
+  }
+  let detail = "";
+  try {
+    detail = String(raw ?? "").trim().replace(/\s+/g, " ");
+  } catch {
+    detail = "";
+  }
+  if (detail.length > 400) detail = `${detail.slice(0, 400)}…`;
+  const cause = detail
+    ? ` The frontend serializer reported: "${detail}".`
+    : " The frontend did not provide an error detail.";
+  return (
+    `NOT queued: this workflow could not be serialized into a prompt because ` +
+    `graphToPrompt threw.${cause} Nothing was queued and the queue is untouched. ` +
+    `This is the ComfyUI frontend or an extension's serializer error, not evidence that ` +
+    `a node type is missing; inspect the named widget or extension before retrying.`
+  );
+}
+
+/**
  * #1582 — every node type in the workflow the frontend cannot resolve, ROOT-SCOPED.
  *
  * Serialization is root-scoped: `graphToPrompt` walks the whole workflow, including every

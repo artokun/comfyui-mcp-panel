@@ -25,6 +25,7 @@ import assert from "node:assert/strict";
 import {
   unrunnableNodeIds,
   graphToPromptUnusable,
+  graphToPromptFailureRefusal,
   unserializableGraphRefusal,
   unresolvedNodeTypes,
 } from "../../web/js/lib/missing-node-preflight.js";
@@ -51,6 +52,30 @@ test("#1582 a USABLE result is not flagged", () => {
   ]) {
     assert.equal(graphToPromptUnusable(ok), false, JSON.stringify(ok));
   }
+});
+
+test("#1654 a frontend serializer throw is preserved as a fail-closed refusal", () => {
+  const msg = graphToPromptFailureRefusal(new Error("Dynamic widget doesn't exist on node"));
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /graphToPrompt threw/);
+  assert.match(msg, /Dynamic widget doesn't exist on node/);
+  assert.match(msg, /Nothing was queued/);
+  assert.match(msg, /frontend or an extension's serializer/);
+});
+
+test("#1654 serializer refusal rendering is total and bounded for hostile throws", () => {
+  const hostile = new Proxy({}, {
+    get() {
+      throw new Error("hostile getter");
+    },
+  });
+  const msg = graphToPromptFailureRefusal(hostile);
+  assert.match(msg, /^NOT queued:/);
+  assert.ok(msg.length < 1400);
+
+  const long = graphToPromptFailureRefusal("x".repeat(1000));
+  assert.ok(long.length < 1400);
+  assert.match(long, /…/);
 });
 
 test("#1582 the refusal says WHAT failed and that nothing was queued", () => {
@@ -136,6 +161,19 @@ test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async (
   assert.match(block, /unserializableGraphRefusal\(/);
 });
 
+test("#1654 the real graph_run preflight surfaces a serializer throw and refuses queueing", async () => {
+  const msg = await runPreflight({
+    graphToPrompt: async () => {
+      throw new Error("Dynamic widget doesn't exist on node");
+    },
+    nodes: [{ id: 136, type: "MiniMaxH3ReferenceToVideo" }],
+    registry: { MiniMaxH3ReferenceToVideo: {} },
+  });
+  assert.match(msg, /^NOT queued:/);
+  assert.match(msg, /Dynamic widget doesn't exist on node/);
+  assert.match(msg, /Nothing was queued/);
+});
+
 test("#1582 the refusal keeps the prefix its own catch requires", async () => {
   // The pre-flight is wrapped in a try whose catch re-throws ONLY /^NOT queued:/ — anything
   // else is swallowed so a broken pre-flight cannot become a new failure mode. A refusal
@@ -174,6 +212,7 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     "describeUnrunnable",
     "missingNodeRunRefusal",
     "graphToPromptUnusable",
+    "graphToPromptFailureRefusal",
     "unserializableGraphRefusal",
     // #1582 review: the block became ROOT-scoped, so the harness has to supply the root
     // graph and the walker. Not injecting them made the extracted body throw a
@@ -209,6 +248,7 @@ async function buildPreflight({ graphToPrompt, nodes = [], viewedNodes, registry
     mod.describeUnrunnable,
     mod.missingNodeRunRefusal,
     mod.graphToPromptUnusable,
+    mod.graphToPromptFailureRefusal,
     mod.unserializableGraphRefusal,
     { _nodes: nodes },
     mod.unresolvedNodeTypes,
