@@ -159,6 +159,20 @@ function stringWidgetValue(node, name) {
   return typeof value === "string" ? value : value == null ? "" : String(value);
 }
 
+function currentStylePalette(node) {
+  const widgetValue = findWidget(node, "style_palette_data")?.value;
+  if (typeof widgetValue === "string") {
+    try {
+      const parsed = JSON.parse(widgetValue);
+      if (Array.isArray(parsed) && parsed.every((color) => typeof color === "string")) return parsed;
+    } catch {
+      // Fall through to the live editor state. A malformed hidden widget is not
+      // evidence that the editor has no palette.
+    }
+  }
+  return Array.isArray(node?._stylePalette) ? node._stylePalette : [];
+}
+
 function finiteBoxNumber(value, field, index) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new Error(`elements_data[${index}].${field} must be a finite number`);
@@ -252,8 +266,9 @@ function currentCaptionForRegions(node, boxes) {
     };
     if (style === "photo") styleDescription.photo = stringWidgetValue(node, "style.photo");
     else styleDescription.art_style = stringWidgetValue(node, "style.art_style");
-    if (Array.isArray(node?._stylePalette) && node._stylePalette.length) {
-      styleDescription.color_palette = [...node._stylePalette];
+    const palette = currentStylePalette(node);
+    if (palette.length) {
+      styleDescription.color_palette = [...palette];
     }
     caption.style_description = styleDescription;
   }
@@ -296,6 +311,14 @@ function sameRegionShape(actual, expected) {
   );
 }
 
+function readSerializedRegions(elementsWidget) {
+  const raw = elementsWidget.serializeValue();
+  // KJNodes uses an empty string for an empty editor, not JSON `[]`.
+  if (raw === "") return [];
+  const parsed = JSON.parse(raw);
+  return Array.isArray(parsed) ? parsed : null;
+}
+
 /**
  * Rehydrate the live KJNodes editor from an elements_data region list.
  *
@@ -331,7 +354,7 @@ export function applyIdeogram4PromptBuilderWrite(
   const elementsWidget = findWidget(node, IDEOGRAM4_ELEMENTS_WIDGET);
   let current;
   try {
-    current = JSON.parse(elementsWidget.serializeValue());
+    current = readSerializedRegions(elementsWidget);
   } catch {
     throw new Error(
       `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} did not expose a readable elements_data serialization; ` +
@@ -357,7 +380,7 @@ export function applyIdeogram4PromptBuilderWrite(
     // The callback is the mutation boundary. Verify the exact semantic fields that
     // the caption format carries before reporting success; a callback that exists but
     // is from an incompatible KJNodes build must not become a silent success.
-    const serialized = JSON.parse(elementsWidget.serializeValue());
+    const serialized = readSerializedRegions(elementsWidget);
     if (
       !Array.isArray(serialized) ||
       serialized.length !== boxes.length ||

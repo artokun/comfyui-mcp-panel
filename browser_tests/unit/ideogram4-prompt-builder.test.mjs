@@ -152,7 +152,13 @@ function editorFixture({ boxes = [], importLink = null } = {}) {
       { name: "aesthetics", value: "grainy" },
       { name: "lighting", value: "soft" },
       { name: "medium", value: "35mm" },
-      { name: IDEOGRAM4_ELEMENTS_WIDGET, value: "", serializeValue: () => JSON.stringify(node._boxes) },
+      { name: "style_palette_data", value: "[\"#112233\"]" },
+      {
+        name: IDEOGRAM4_ELEMENTS_WIDGET,
+        value: "",
+        // KJNodes returns an empty string, rather than JSON [], for an empty editor.
+        serializeValue: () => (node._boxes.length ? JSON.stringify(node._boxes) : ""),
+      },
     ],
   };
   node.onExecuted = (message) => {
@@ -172,6 +178,7 @@ function editorFixture({ boxes = [], importLink = null } = {}) {
         ...(element.bbox ? {} : { nobbox: true }),
       };
     });
+    node._stylePalette = caption.style_description?.color_palette ?? [];
   };
   return node;
 }
@@ -180,6 +187,7 @@ test("#1650: elements_data rehydrates the live editor and verifies the serialize
   const node = editorFixture({
     boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2, type: "obj", text: "", desc: "old" }],
   });
+  node.widgets.find((w) => w.name === "style_palette_data").value = "[\"#abcdef\"]";
   const calls = [];
   const result = applyIdeogram4PromptBuilderWrite(
     node,
@@ -216,6 +224,7 @@ test("#1650: elements_data rehydrates the live editor and verifies the serialize
   assert.equal(node._boxes[0].locked, true, "editor-only lock state survives the import route");
   assert.equal(node.widgets.find((w) => w.name === IDEOGRAM4_ELEMENTS_WIDGET).value, JSON.stringify(node._boxes));
   assert.equal(node.widgets.find((w) => w.name === "high_level_description").value, "existing subject");
+  assert.deepEqual(node._stylePalette, ["#abcdef"], "the live hidden palette value is preserved");
 });
 
 test("#1650: an empty region list clears the editor without requiring an import wire", () => {
