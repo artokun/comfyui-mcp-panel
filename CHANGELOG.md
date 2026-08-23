@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.58] - 2026-08-23
+
+### Fixed
+- reject replaced panel targets
+- advertise expected node type fence
+- enforce expected target type at write boundary
+
+
 ## [0.15.57] - 2026-08-23
 
 ### Fixed
