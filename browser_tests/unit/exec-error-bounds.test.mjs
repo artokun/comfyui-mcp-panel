@@ -436,12 +436,20 @@ function makeScopedErrorGraph() {
     _nodes: [inner],
     getNodeById: (id) => (String(id) === "125" ? inner : null),
   };
-  const host = { id: 140, type: "Subgraph", subgraph: innerGraph };
-  const rootGraph = {
-    _nodes: [host],
-    getNodeById: (id) => (String(id) === "140" ? host : null),
+  const siblingInner = { id: 225, type: "SamplerCustomAdvanced" };
+  const siblingGraph = {
+    _nodes: [siblingInner],
+    getNodeById: (id) => (String(id) === "225" ? siblingInner : null),
   };
-  return { inner, innerGraph, host, rootGraph };
+  const host = { id: 140, type: "Subgraph", subgraph: innerGraph };
+  const siblingHost = { id: 141, type: "Subgraph", subgraph: siblingGraph };
+  const rootNode = { id: 900, type: "SamplerCustomAdvanced" };
+  const rootGraph = {
+    _nodes: [host, siblingHost, rootNode],
+    getNodeById: (id) =>
+      ({ 140: host, 141: siblingHost, 900: rootNode })[String(id)] ?? null,
+  };
+  return { inner, innerGraph, host, siblingInner, siblingGraph, siblingHost, rootNode, rootGraph };
 }
 
 async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }) {
@@ -537,6 +545,26 @@ test("#1685 production graph_get_errors blames the inner node when that subgraph
   assert.equal(result.errored_count, 1);
   assert.equal(result.nodes[0].id, inner.id);
   assert.equal(result.nodes[0].reasons[0].message, "inner failure");
+});
+
+test("#1685 production graph_get_errors omits same-type errors outside the visible subgraph", async () => {
+  const { innerGraph, rootGraph } = makeScopedErrorGraph();
+  for (const node_id of ["141:225", "900"]) {
+    const result = await runProductionGraphGetErrors({
+      graph: innerGraph,
+      rootGraph,
+      lastExecFailure: {
+        node_id,
+        node_type: "SamplerCustomAdvanced",
+        exception_message: "foreign failure",
+      },
+    });
+
+    assert.equal(result.errored_count, 0, `foreign ${node_id} must not create an errored node`);
+    assert.deepEqual(result.nodes, [], `foreign ${node_id} must not receive a reason`);
+    assert.equal(result.last_execution_error, null, `foreign ${node_id} must be omitted`);
+    assert.equal(result.note, "no errors recorded since the last execution start");
+  }
 });
 
 test("#1685 production graph_get_errors still rejects a type-mismatched scoped failure", async () => {

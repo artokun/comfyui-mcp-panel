@@ -17768,13 +17768,23 @@ const GRAPH_TOOL_EXECUTORS = {
           );
         }
       }
+      let visibleFailureNode = null;
+      if (e?.node_id != null) {
+        visibleFailureNode =
+          findVisibleNodeByScopedId(rootGraph, nodes, e.node_id) ??
+          // A plain id may already be local to the graph currently shown.
+          byId.get(String(e.node_id)) ??
+          // On the root canvas, a qualified inner id is represented by its host.
+          (graph === rootGraph ? byId.get(String(e.node_id).split(":")[0]) : null);
+        // A valid node in another subgraph/workflow must not dirty this view. Keep
+        // the root-host exception above, but otherwise discard it before the three
+        // correlated output surfaces are assigned.
+        if (!visibleFailureNode) applied = { detail: null, failure: null, reason: null };
+      }
       execFailureDetail = applied.detail;
       execFailure = applied.failure;
-      if (applied.reason && e?.node_id != null) {
-        const visibleFailureNode =
-          findVisibleNodeByScopedId(rootGraph, nodes, e.node_id) ??
-          (graph === rootGraph ? byId.get(String(e.node_id).split(":")[0]) : null);
-        addReason(visibleFailureNode?.id ?? e.node_id, applied.reason);
+      if (applied.reason && visibleFailureNode) {
+        addReason(visibleFailureNode.id, applied.reason);
       }
     } catch {
       /* optional */
