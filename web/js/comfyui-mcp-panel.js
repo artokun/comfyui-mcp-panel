@@ -198,7 +198,7 @@ import {
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
-import { fetchSingleNodeDef } from "./lib/single-node-def.js";
+import { fetchSingleNodeDef, fetchSingleNodeInfo } from "./lib/single-node-def.js";
 import { withWorkflowUuid } from "./lib/graph-view-identity.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
@@ -17611,17 +17611,28 @@ const GRAPH_TOOL_EXECUTORS = {
       if (scanBudgetMs > 0) {
         liveScan = await scanComboAvailability(
           nodes,
-          (cls) => fetchSingleNodeDef(cls, (route) => api?.fetchApi?.(route)),
+          (cls, signal) =>
+            fetchSingleNodeInfo(
+              cls,
+              (route, options) => api?.fetchApi?.(route, options),
+              signal,
+            ),
           {
             budgetMs: scanBudgetMs,
+            now: monotonicNow,
             backslashIsSeparator,
             confirmServerAsset: (_value, ref) =>
               probeInputAssetPresence(ref, errorsStepBudget(GET_ERRORS_STEP_CAP_MS)),
           },
         );
+      } else {
+        liveScan = { unavailable: [], unknown: [], unchecked_budget_exhausted: true };
       }
     } catch {
-      liveScan = null; // never let the scan take down the error report
+      liveScan = {
+        unavailable: [],
+        unknown: [{ reason: "the live error scan could not complete" }],
+      }; // never let the scan take down the error report
     }
 
     let postProbeRootGraph = null;
@@ -17844,6 +17855,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // emitted `unavailable_widget_values: [...]` and "no errors recorded" in ONE
     // payload. Every entry in that list is a value the server does not offer, so the
     // node fails on it at queue time whichever kind it is.
+    const liveScanIncomplete = Boolean(
+      liveScan?.unknown?.length || liveScan?.unchecked_budget_exhausted,
+    );
     const clean =
       !nodeErrors &&
       !execFailure &&
@@ -17853,7 +17867,8 @@ const GRAPH_TOOL_EXECUTORS = {
       !missingNodeTypes.length &&
       !missingNodeCount &&
       !stalePlaceholders.length &&
-      !liveScan?.unavailable?.length;
+      !liveScan?.unavailable?.length &&
+      !liveScanIncomplete;
     return {
       viewing: describeActiveGraph(graph),
       node_count: nodes.length,

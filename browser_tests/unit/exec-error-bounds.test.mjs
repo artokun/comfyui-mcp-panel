@@ -26,6 +26,8 @@ import {
   applyRuntimeExecFailure,
 } from "../../web/js/lib/exec-error-bounds.js";
 import { findNodeByScopedId, findVisibleNodeByScopedId } from "../../web/js/lib/asset-staleness.js";
+import { scanComboAvailability } from "../../web/js/lib/live-combo-availability.js";
+import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PANEL_SOURCE = readFileSync(
@@ -396,7 +398,7 @@ const GRAPH_GET_ERRORS_DEPS = [
   "filterServerConfirmedInputSubfolderMedia",
   "inputAssetServerUsesWindowsPaths",
   "scanComboAvailability",
-  "fetchSingleNodeDef",
+  "fetchSingleNodeInfo",
   "probeInputAssetPresence",
   "graphReadBindingChanged",
   "collectAllGraphs",
@@ -463,10 +465,21 @@ function makeScopedErrorGraph() {
   };
 }
 
-async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }) {
+async function runProductionGraphGetErrors({
+  graph,
+  rootGraph,
+  lastExecFailure,
+  scan = async () => null,
+  fetchSingleNodeInfo = () => {},
+  // The extracted executor's default scan is a no-op test double. Give it a
+  // usable budget so legacy tests that are not exercising live-scan exhaustion
+  // retain their clean-note assertions.
+  stepBudget = () => 1000,
+  monotonicNow = () => 0,
+}) {
   const deps = {
-    monotonicNow: () => 0,
-    getErrorsStepBudgetMs: () => 0,
+    monotonicNow,
+    getErrorsStepBudgetMs: stepBudget,
     hasRawMissingAssetCandidates: () => false,
     GET_ERRORS_REFRESH_CAP_MS: 18000,
     refreshMissingAssetTrust: async () => false,
@@ -482,8 +495,8 @@ async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }
     GET_ERRORS_STEP_CAP_MS: 4000,
     filterServerConfirmedInputSubfolderMedia: async (media) => media,
     inputAssetServerUsesWindowsPaths: async () => false,
-    scanComboAvailability: async () => null,
-    fetchSingleNodeDef: () => {},
+    scanComboAvailability: scan,
+    fetchSingleNodeInfo,
     probeInputAssetPresence: () => {},
     graphReadBindingChanged: () => false,
     collectAllGraphs: (value) => [value],
@@ -514,6 +527,87 @@ async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }
   const executor = makeGraphGetErrors(...GRAPH_GET_ERRORS_DEPS.map((name) => deps[name]));
   return executor();
 }
+
+test("#1691 production graph_get_errors batches live class reads and keeps uncertain types unchecked", async () => {
+  const working = {
+    id: 1,
+    type: "WorkingPack",
+    widgets: [{ name: "pick", value: "bad" }],
+    has_errors: true,
+  };
+  const uncertain = {
+    id: 2,
+    type: "InstalledButUnreachablePack",
+    widgets: [{ name: "pick", value: "ok" }],
+    constructor: { nodeData: { output_node: true } },
+  };
+  const graph = {
+    _nodes: [working, uncertain],
+    getNodeById: (id) => ([working, uncertain].find((node) => String(node.id) === String(id)) ?? null),
+  };
+  const fetchInfo = async (className) => {
+    if (className === "WorkingPack") {
+      return {
+        [SINGLE_NODE_INFO_OUTCOME]: true,
+        kind: "present",
+        body: { WorkingPack: { input: { required: { pick: [["ok"], {}] } } } },
+      };
+    }
+    return { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" };
+  };
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    stepBudget: () => 1000,
+  });
+
+  assert.equal(result.unavailable_widget_values.length, 1);
+  assert.equal(result.unavailable_widget_values[0].type, "WorkingPack");
+  assert.equal(result.unchecked_nodes.length, 1);
+  assert.equal(result.unchecked_nodes[0].type, "InstalledButUnreachablePack");
+  assert.match(result.unchecked_nodes[0].reason, /could not be looked up/);
+  assert.equal(result.note, undefined, "an unchecked live scan must not emit a clean note");
+});
+
+test("#1691 production graph_get_errors keeps budget-cutoff scans non-clean and uses its monotonic clock", async () => {
+  const graph = { _nodes: [], getNodeById: () => null };
+  const monotonicNow = () => 123;
+  let scanOptions;
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: async (_nodes, _fetch, options) => {
+      scanOptions = options;
+      return { unavailable: [], unknown: [], unchecked_budget_exhausted: true };
+    },
+    stepBudget: () => 1000,
+    monotonicNow,
+  });
+
+  assert.equal(scanOptions.now, monotonicNow);
+  assert.equal(result.unchecked_budget_exhausted, true);
+  assert.equal(result.note, undefined, "a budget-cutoff live scan must not emit a clean note");
+});
+
+test("#1691 production graph_get_errors discloses a scan skipped after the shared budget is spent", async () => {
+  const graph = { _nodes: [], getNodeById: () => null };
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: async () => {
+      throw new Error("the scan must not start without a budget");
+    },
+    stepBudget: () => 0,
+  });
+
+  assert.equal(result.unchecked_budget_exhausted, true);
+  assert.equal(result.note, undefined, "a skipped live scan must not emit a clean note");
+});
 
 test("#1685 production graph_get_errors preserves a scoped runtime error and blames its root host", async () => {
   const { rootGraph, host } = makeScopedErrorGraph();

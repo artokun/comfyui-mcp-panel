@@ -22,7 +22,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { fetchSingleNodeDef, singleDefConfirms } from "../../web/js/lib/single-node-def.js";
+import {
+  fetchSingleNodeDef,
+  fetchSingleNodeInfo,
+  singleDefConfirms,
+  SINGLE_NODE_INFO_OUTCOME,
+} from "../../web/js/lib/single-node-def.js";
 import { OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -66,6 +71,34 @@ test("#767 ABSENCE is {} with HTTP 200 on this route, and is NOT a verdict", asy
   // an observation collapsed into a definite negative.
   const got = await fetchSingleNodeDef("LTXVImgToVideoConditionOnly", fakeApi({ body: {} }));
   assert.equal(got, null);
+});
+
+test("#1691 the scan-facing route distinguishes absent from transport uncertainty", async () => {
+  const absent = await fetchSingleNodeInfo("MissingPack", fakeApi({ body: {} }));
+  assert.equal(absent[SINGLE_NODE_INFO_OUTCOME], true);
+  assert.equal(absent.kind, "absent");
+
+  for (const options of [
+    { status: 404, body: {} },
+    { throws: true },
+    { body: { SomeOtherPack: {} } },
+  ]) {
+    const unknown = await fetchSingleNodeInfo("WorkingPack", fakeApi(options));
+    assert.equal(unknown[SINGLE_NODE_INFO_OUTCOME], true);
+    assert.equal(unknown.kind, "unknown");
+  }
+});
+
+test("#1691 the scan-facing route forwards its abort signal", async () => {
+  const controller = new AbortController();
+  let seenOptions;
+  const fetchApi = async (_route, options) => {
+    seenOptions = options;
+    return { status: 200, json: async () => ({ WorkingPack: { input: {} } }) };
+  };
+  const result = await fetchSingleNodeInfo("WorkingPack", fetchApi, controller.signal);
+  assert.equal(result.kind, "present");
+  assert.equal(seenOptions.signal, controller.signal);
 });
 
 test("#767 every kind of DOUBT returns null, never a conclusion", async () => {
