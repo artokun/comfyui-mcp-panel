@@ -214,12 +214,18 @@ export function installNodeConfigureIsolation(LG, graph = null) {
     try {
       return original.call(this, info);
     } catch (err) {
+      const ownerGraph = this?.graph ?? null;
+      const evidenceGraph = this?.graph ?? graph ?? null;
       failures.push({
         id: info?.id ?? this?.id ?? null,
         type: info?.type ?? this?.type ?? null,
         error: errorText(err),
         linkDisconnectCrash: isLinkDisconnectCrash(err),
-        linkDisconnectEvidence: isLinkDisconnectCrash(err) && hasBrokenLinkEndpoint(graph, this, err),
+        linkDisconnectEvidence: isLinkDisconnectCrash(err) && hasBrokenLinkEndpoint(evidenceGraph, this, err),
+        // A node inside a subgraph can share an id with a root node. Keep the
+        // graph that owned the failed configure so the retry cannot retarget
+        // the root graph by id alone.
+        ownerGraph,
         // configure implementations can mutate their input before throwing;
         // retain an independent serialized snapshot for the retry/verification.
         info: serializedSnapshot,
@@ -276,9 +282,10 @@ export async function retryNodeRestores(graph, failures, options = {}) {
       });
       continue;
     }
+    const retryGraph = failure?.ownerGraph ?? graph;
     const node =
-      failure?.id != null && typeof graph?.getNodeById === "function"
-        ? graph.getNodeById(failure.id)
+      failure?.id != null && typeof retryGraph?.getNodeById === "function"
+        ? retryGraph.getNodeById(failure.id)
         : null;
     if (!node || !failure.info || typeof node.configure !== "function") {
       failed.push({
@@ -302,7 +309,7 @@ export async function retryNodeRestores(graph, failures, options = {}) {
     // Check the same discriminator safeRemoveNode uses while the failed
     // restore's residual link state is still observable. Do not let configure
     // manufacture links during the retry and then use those as proof.
-    if (linkDisconnectCrash && !nodeHasResidualLinks(graph, node)) {
+    if (linkDisconnectCrash && !nodeHasResidualLinks(retryGraph, node)) {
       failed.push({
         id: failure.id,
         type: failure.type,
@@ -350,6 +357,7 @@ export async function retryNodeRestores(graph, failures, options = {}) {
         recovered.push({
           id: failure.id,
           type: failure.type,
+          ...(failure.ownerGraph ? { ownerGraph: failure.ownerGraph } : {}),
           linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences,
         });
         continue;
@@ -546,13 +554,15 @@ export function loadRestoreCompleted({ nodeIsolation, graphWatch, recoveredFailu
   if (typeof graphEntered !== "number" || !(graphEntered >= 1)) return null;
   if (graphThrows.length !== 0) return false;
   if (nodeFailures.length === 0) return true;
-  const recoveredIds = new Set(
-    (Array.isArray(recoveredFailures) ? recoveredFailures : []).map((failure) => String(failure?.id)),
-  );
+  const recovered = Array.isArray(recoveredFailures) ? recoveredFailures : [];
   return nodeFailures.every(
-    (failure) =>
-      failure?.linkDisconnectCrash === true &&
-      failure?.linkDisconnectEvidence === true &&
-      recoveredIds.has(String(failure?.id)),
+    (failure) => {
+      if (failure?.linkDisconnectCrash !== true || failure?.linkDisconnectEvidence !== true) return false;
+      return recovered.some(
+        (candidate) =>
+          sameNodeId(candidate?.id, failure?.id) &&
+          (failure?.ownerGraph == null || candidate?.ownerGraph === failure.ownerGraph),
+      );
+    },
   );
 }

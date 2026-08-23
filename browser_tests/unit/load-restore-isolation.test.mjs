@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 
 import {
   installNodeConfigureIsolation,
+  loadRestoreCompleted,
   retryNodeRestores,
   verifyNodeRestore,
 } from "../../web/js/lib/load-restore-isolation.js";
@@ -359,6 +360,63 @@ test("#1668 does not treat the message alone as restore evidence", async () => {
   assert.deepEqual(result.failed, [
     { id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", retry: "link-disconnect-unverified" },
   ]);
+});
+
+test("#1668 retries a subgraph node in its owning graph when the id collides with a root node", async () => {
+  const info = { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] };
+  let rootConfigured = 0;
+  let definitionConfigured = 0;
+  const definitionNode = {
+    id: 122,
+    inputs: [{ link: 901 }],
+    outputs: [],
+    configure: () => {
+      definitionConfigured += 1;
+    },
+    serialize: () => ({ ...info }),
+  };
+  const rootNode = {
+    id: 122,
+    inputs: [],
+    outputs: [],
+    configure: () => {
+      rootConfigured += 1;
+    },
+    serialize: () => ({ ...info }),
+  };
+  const definitionGraph = { getNodeById: (id) => (id === 122 ? definitionNode : null) };
+  const rootGraph = { getNodeById: (id) => (id === 122 ? rootNode : null) };
+  const failure = {
+    id: 122,
+    type: "ImpactSwitch",
+    error: "t.findInputSlot is not a function",
+    linkDisconnectCrash: true,
+    linkDisconnectEvidence: true,
+    ownerGraph: definitionGraph,
+    info,
+  };
+
+  const result = await retryNodeRestores(rootGraph, [failure]);
+  assert.equal(definitionConfigured, 1, "the definition node receives the retry");
+  assert.equal(rootConfigured, 0, "the colliding root node is not retargeted");
+  assert.equal(result.failed.length, 0);
+  assert.equal(result.recovered[0].ownerGraph, definitionGraph);
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure] },
+      graphWatch: { throws: [], entered: 1 },
+      recoveredFailures: result.recovered,
+    }),
+    true,
+  );
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure] },
+      graphWatch: { throws: [], entered: 1 },
+      recoveredFailures: [{ id: 122, ownerGraph: rootGraph }],
+    }),
+    false,
+  );
 });
 
 test("#1668 does not wait forever when animation frames are paused", async () => {
