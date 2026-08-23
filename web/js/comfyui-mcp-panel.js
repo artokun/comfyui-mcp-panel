@@ -14947,7 +14947,7 @@ const GRAPH_TOOL_EXECUTORS = {
     };
   },
 
-  async graph_set_widget({ node_id, widget, value, workflow_uuid, builder_state }) {
+  async graph_set_widget({ node_id, widget, value, workflow_uuid, builder_state, expected_node_type }) {
     // #1413 — ONE deadline for the whole command, taken BEFORE anything awaits, so the
     // bounded steps inside it compose instead of adding (#1192, #671). The step this
     // exists for is the stale-combo recovery's refresh join below: reached only after
@@ -15452,11 +15452,24 @@ const GRAPH_TOOL_EXECUTORS = {
       // and the fresh /object_info request. A user can switch workflows while either
       // promise is pending, so re-read the ACTIVE uuid at the exact shared write
       // boundary. runSetWidget calls this synchronously before every write path.
-      assertTargetStillCurrent: () =>
+      assertTargetStillCurrent: () => {
         assertActiveWorkflowCommandTarget({
           cmd: "graph_set_widget",
           [WORKFLOW_UUID_FIELD]: workflow_uuid,
-        }),
+        });
+        if (expected_node_type === undefined) return;
+        if (typeof expected_node_type !== "string" || !expected_node_type) {
+          throw new Error("graph_set_widget expected_node_type must be a non-empty string");
+        }
+        const current = getGraphCtx();
+        const liveTarget = resolveNode(current.graph, node_id);
+        if (!liveTarget || liveTarget !== node || liveTarget.type !== expected_node_type) {
+          throw new Error(
+            `panel_set_widget target changed before dispatch: expected ${expected_node_type}, ` +
+              `found ${liveTarget?.type ?? "missing"}`,
+          );
+        }
+      },
       // Stale-combo retry: reuse the /object_info already fetched for authorization
       // (passed by runSetWidget) to refresh THIS target's combo option lists in place
       // — a single fetch total (#458 P2). When a payload IS present we NEVER re-fetch,

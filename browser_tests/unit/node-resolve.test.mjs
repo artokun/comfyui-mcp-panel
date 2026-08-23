@@ -538,6 +538,28 @@ test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no m
   assert.equal(node.widgets[0].value, "");
 });
 
+test("#2107: the real runSetWidget refuses a replacement object before mutation", async () => {
+  const reg = loadedRegistry();
+  const node = regNode("KSampler", [{ name: "steps", type: "INT", value: 0 }]);
+  const replacement = regNode("KSampler", [{ name: "steps", type: "INT", value: 99 }]);
+  let liveTarget = replacement;
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "steps", 20, {
+        registry: reg,
+        getFreshObjectInfo: async () => FRESH_ALL,
+        resolveSource: () => null,
+        ...HOOKS,
+        assertTargetStillCurrent: () => {
+          if (liveTarget !== node) throw new Error("panel_set_widget target changed before dispatch");
+        },
+      }),
+    /target changed before dispatch/,
+  );
+  assert.equal(node.widgets[0].value, 0, "the captured stale object was not mutated");
+  liveTarget = node;
+});
+
 // ---- HANDLER ORDERING through the REAL runSetWidget (#458) -------------------
 // reconcileUnknownWidgetNames RENAMES widgets in place. The handler must preflight
 // (refuse a placeholder) BEFORE reconcile, and reconcile only a resolved direct
