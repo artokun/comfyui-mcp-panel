@@ -474,6 +474,103 @@ test("#1273 promptContentHash: an untouched UE graph stamps EQUAL to its dispatc
 });
 
 // ---------------------------------------------------------------------------
+// #2099 — VHS_VideoCombine resolves Comfy save-file date templates in
+// filename_prefix as the prompt is queued. That queue-time clock substitution is
+// not graph drift, but only the exact VHS filename_prefix date-template input is
+// volatile; ordinary prefixes and every other input stay covered.
+// ---------------------------------------------------------------------------
+
+const vhsNode = (id, filenamePrefix, extra = {}) => ({
+  id,
+  type: "VHS_VideoCombine",
+  widgets: [
+    { name: "frame_rate", value: 24 },
+    { name: "filename_prefix", value: filenamePrefix },
+    { name: "format", value: "video/h264-mp4" },
+  ],
+  ...extra,
+});
+
+test("#2099 collectVolatileInputs: only VHS_VideoCombine filename_prefix with a recognized date template is volatile", () => {
+  const root = {
+    _nodes: [
+      vhsNode(223, "video/%date:yyyyMMdd_hhmmss%"),
+      vhsNode(224, "video/fixed_prefix"),
+      vhsNode(225, "video/%not_a_date_template%"),
+      vhsNode(226, "video/%date:folder%"),
+      vhsNode(227, "video/%date:yyyy-MM-ddThh:mm:ss%"),
+      { id: 9, type: "SaveImage", widgets: [{ name: "filename_prefix", value: "%date:yyyyMMdd_hhmmss%" }] },
+      { id: 10, widgets: [], subgraph: { _nodes: [vhsNode(15, "nested/%date:yyyy-MM-dd%")] } },
+    ],
+  };
+  const pairs = collectVolatileInputs(root);
+  assert.deepEqual(
+    [...pairs].sort(),
+    ["10:15 filename_prefix", "223 filename_prefix", "227 filename_prefix"],
+    "exact VHS node + exact input + recognized date template; nested execIds are preserved",
+  );
+});
+
+test("#2099 promptContentHash: VHS date-template substitution is stable, ordinary prefixes and sibling edits are still drift", () => {
+  const graph = { _nodes: [vhsNode(223, "video/%date:yyyyMMdd_hhmmss%")] };
+  const volatileInputs = collectVolatileInputs(graph);
+  const stamped = {
+    "223": {
+      class_type: "VHS_VideoCombine",
+      inputs: { images: ["1000", 0], filename_prefix: "video/%date:yyyyMMdd_hhmmss%", frame_rate: 24 },
+    },
+    "14": { class_type: "PreviewAny", inputs: {} },
+  };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const body = (inputs) => JSON.stringify({
+    prompt: {
+      "223": { class_type: "VHS_VideoCombine", inputs },
+      "14": { class_type: "PreviewAny", inputs: {} },
+    },
+  });
+  assert.equal(
+    promptContentHashFromBody(
+      body({ images: ["1000", 0], filename_prefix: "video/20260823_142233", frame_rate: 24 }),
+      volatileInputs,
+    ),
+    atHash,
+    "the queue-time clock substitution is the exclusion's purpose",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(
+      body({ images: ["1000", 0], filename_prefix: "video/20260823_142233", frame_rate: 30 }),
+      volatileInputs,
+    ),
+    atHash,
+    "a sibling input on the same VHS node is still drift-covered",
+  );
+
+  const ordinaryVolatileInputs = collectVolatileInputs({ _nodes: [vhsNode(223, "video/fixed_prefix")] });
+  const ordinaryStamped = {
+    "223": {
+      class_type: "VHS_VideoCombine",
+      inputs: { images: ["1000", 0], filename_prefix: "video/fixed_prefix", frame_rate: 24 },
+    },
+  };
+  assert.equal(ordinaryVolatileInputs.size, 0, "an ordinary VHS prefix excludes nothing");
+  assert.notEqual(
+    promptContentHashFromBody(
+      JSON.stringify({
+        prompt: {
+          "223": {
+            class_type: "VHS_VideoCombine",
+            inputs: { images: ["1000", 0], filename_prefix: "video/changed_prefix", frame_rate: 24 },
+          },
+        },
+      }),
+      ordinaryVolatileInputs,
+    ),
+    promptContentHash(ordinaryStamped, ordinaryVolatileInputs),
+    "ordinary filename_prefix edits remain drift-covered",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // #1331 — the FOURTH volatility mechanism: after reconnect, leftover values of
 // link-driven converted widgets (MiniMax H3 clip/vae/model/length, …) settle
 // between the pre-dispatch stamp and the POST body. The #1050 single retry
@@ -2490,6 +2587,82 @@ test("#1124 integration: the exclusion is ONE input — an armed rgthree Seed do
       // the refusal names the REAL change instead of the red herring the reporter
       // was handed.
       assert.doesNotMatch(result.error, /47 seed/, `${label}: the substituted seed is no longer blamed`);
+    }
+  } finally {
+    stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #2099 integration — VHS_VideoCombine's filename_prefix date-template
+// substitution is driven through dispatchScopedRun, while another changed input
+// in the same queued body still trips the graph-drift refusal.
+// ---------------------------------------------------------------------------
+
+const VHS_STAMP = {
+  "1000": { class_type: "VAEDecode", inputs: { samples: ["4", 0] } },
+  "223": {
+    class_type: "VHS_VideoCombine",
+    inputs: { images: ["1000", 0], filename_prefix: "video/%date:yyyyMMdd_hhmmss%", frame_rate: 24 },
+  },
+};
+
+function makeVhsDateFrontend({ apiTarget, alsoEdit = null } = {}) {
+  const app = {
+    queueItems: [],
+    posted: [],
+    graph: { _nodes: [vhsNode(223, "video/%date:yyyyMMdd_hhmmss%")] },
+    graphToPrompt: async () => ({ output: structuredClone(VHS_STAMP), workflow: {} }),
+    queuePrompt: async (number, batch, arg) => {
+      const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const output = structuredClone(VHS_STAMP);
+      output["223"].inputs.filename_prefix = "video/20260823_142233";
+      if (alsoEdit) alsoEdit(output);
+      const body = frontendBody({ output, number, targets: targets?.length ? targets : null });
+      app.posted.push(body);
+      await apiTarget.fetchApi(...promptPost(body));
+      return true;
+    },
+  };
+  return app;
+}
+
+test("#2099 integration: VHS_VideoCombine date-template filename_prefix substitution is OUR dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeVhsDateFrontend({ apiTarget });
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+    });
+    assert.equal(result.outcome, "dispatched", "the date substitution is not treated as graph drift");
+    assert.equal(server.calls.length, 1, "the scoped prompt reached ComfyUI");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["223"]);
+    assert.deepEqual(result.volatileInputs, ["223 filename_prefix"], "the coverage gap is disclosed");
+  } finally {
+    stop();
+  }
+});
+
+test("#2099 integration: VHS date-template exclusion does NOT let real edits elsewhere ride along", async () => {
+  const stop = keepAlive();
+  try {
+    for (const [label, edit, token] of [
+      ["a sibling VHS input", (output) => { output["223"].inputs.frame_rate = 30; }, /223 frame_rate/],
+      ["an upstream node input", (output) => { output["1000"].inputs.samples = ["5", 0]; }, /1000 samples/],
+    ]) {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = makeVhsDateFrontend({ apiTarget, alsoEdit: edit });
+      const result = await dispatchScopedRun({
+        app, apiTarget, execIds: ["223"], batch: 1, toNodeId: 223, verifyTimeoutMs: 500,
+      });
+      assert.equal(result.outcome, "refused", `${label} edit is still drift`);
+      assert.match(result.error, /graph CHANGED/i);
+      assert.match(result.error, token);
+      assert.doesNotMatch(result.error, /223 filename_prefix/, "the volatile date template is not blamed");
+      assert.equal(server.calls.length, 0, `${label}: the edited workflow never left the tab`);
     }
   } finally {
     stop();

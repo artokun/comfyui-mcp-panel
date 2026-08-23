@@ -427,7 +427,7 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
 /**
  * The "execId inputName" pairs whose values MUTATE AT QUEUE TIME — after our
  * pre-dispatch stamp and before the POST body is built — collected from the live
- * root graph and every nested subgraph. FOUR signals, one per mechanism: a
+ * root graph and every nested subgraph. FIVE signals, one per mechanism: a
  * widget-level `beforeQueued` hook (#572), an extension that patches
  * `api.queuePrompt` and rewrites the outgoing prompt directly (rgthree's armed
  * Seed node, #1124 — invisible to any widget scan, matched by node identity),
@@ -436,7 +436,9 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
  * record, see ueQueueTimeLinkPairs), and a leftover widget value whose
  * SAME-NAMED input is already link-connected (#1331 — after reconnect the
  * serialized form flips from the stale widget default to the incoming link,
- * or the leftover filename itself settles, while the canvas is idle).
+ * or the leftover filename itself settles, while the canvas is idle), plus
+ * VHS_VideoCombine filename_prefix date templates (#2099), which the frontend
+ * resolves at queue time.
  * execId is the flattened prompt id: String(node.id) at root, the
  * colon-joined subgraph-instance path for nested nodes ("10:15:359") — the
  * same path buildNodeExecutionId produces, so pairs line up with the keys of
@@ -497,6 +499,24 @@ function linkDrivenWidgetInputNames(node) {
     /* a malformed node contributes no pairs — fail toward detecting drift */
   }
   return names;
+}
+
+function hasRecognizedDateFilenameTemplate(value) {
+  if (typeof value !== "string") return false;
+  // Comfy save-file formatting documents `%date:FORMAT%`; the recognized date
+  // format specifiers are d, M, y, h, m, and s. Accept only those plus common
+  // filename/path separators so arbitrary percent strings stay drift-covered.
+  return /%date:[dMyhms][-dMyhms ._:/\\T]*%/.test(value);
+}
+
+function vhsQueueTimeFilenamePrefixInput(node) {
+  if (node?.type !== "VHS_VideoCombine") return null;
+  for (const w of node?.widgets ?? []) {
+    if (w?.name === "filename_prefix" && hasRecognizedDateFilenameTemplate(w.value)) {
+      return "filename_prefix";
+    }
+  }
+  return null;
 }
 
 export function collectVolatileInputs(rootGraph) {
@@ -577,6 +597,17 @@ export function collectVolatileInputs(rootGraph) {
         addPair(execId, entry.widget);
         if (entry.control !== entry.widget) addPair(execId, entry.control);
       }
+      // #2099 — THE FIFTH VOLATILITY SIGNAL. VHS_VideoCombine applies Comfy's
+      // save-file date templates in its filename_prefix as the prompt is queued:
+      // `%date:yyyyMMdd_hhmmss%` in the stamped graph becomes the current clock
+      // value in the POST body. That is queue-time substitution, not graph drift.
+      //
+      // NARROW BY CONSTRUCTION: exact node class, exact input name, and a
+      // recognized `%date:FORMAT%` token only. Ordinary VHS prefixes, arbitrary
+      // percent strings, other VHS inputs, and every other node class keep full
+      // drift coverage.
+      const vhsFilenamePrefixInput = vhsQueueTimeFilenamePrefixInput(node);
+      if (vhsFilenamePrefixInput != null) addPair(execId, vhsFilenamePrefixInput);
       if (node.subgraph) walk(node.subgraph, execId);
     }
   };
