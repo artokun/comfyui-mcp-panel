@@ -282,6 +282,19 @@ test("#1650: incompatible callback failures roll back the editor", () => {
   assert.equal(JSON.stringify(node._boxes), before);
 });
 
+test("#1650: palette mismatches are not reported as verified", () => {
+  const node = editorFixture({ boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2, palette: ["#00f"] }] });
+  const before = JSON.stringify(node._boxes);
+  node.onExecuted = () => { node._boxes = [{ x: 0, y: 0, w: 0.2, h: 0.2, palette: ["#00f"] }]; };
+  assert.throws(
+    () => applyIdeogram4PromptBuilderWrite(node, JSON.stringify([
+      { x: 0, y: 0, w: 0.2, h: 0.2, palette: ["#f00"] },
+    ])),
+    /did not rehydrate/,
+  );
+  assert.equal(JSON.stringify(node._boxes), before);
+});
+
 test("#1650: malformed region input is rejected before opening an undo step", () => {
   const node = editorFixture();
   let before = 0;

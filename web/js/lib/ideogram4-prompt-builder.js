@@ -302,6 +302,7 @@ function regionShape(box) {
     w: Number(box?.w),
     h: Number(box?.h),
     nobbox: box?.nobbox === true,
+    palette: Array.isArray(box?.palette) ? box.palette.map((color) => String(color)) : [],
   };
 }
 
@@ -313,6 +314,8 @@ function sameRegionShape(actual, expected) {
     a.text === e.text &&
     a.desc === e.desc &&
     a.nobbox === e.nobbox &&
+    a.palette.length === e.palette.length &&
+    a.palette.every((color, index) => color === e.palette[index]) &&
     (e.nobbox || ["x", "y", "w", "h"].every((key) => Math.abs(a[key] - e[key]) <= 0.001))
   );
 }
