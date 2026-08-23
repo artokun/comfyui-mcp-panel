@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.59] - 2026-08-23
+
+### Fixed
+- refuse derived MiniMaxH3Director prompt writes (#1697)
+
+
 ## [0.15.58] - 2026-08-23
 
 ### Fixed
