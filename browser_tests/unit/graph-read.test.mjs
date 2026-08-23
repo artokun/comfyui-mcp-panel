@@ -13,6 +13,8 @@ import assert from "node:assert/strict";
 
 import {
   WIDGET_VALUE_CAP,
+  DETAIL_WIDGET_VALUE_CEILING,
+  clampDetailWidgetCap,
   COMPACT_VALUE_CLIP,
   linkDrivenWidgets,
   drivenWidgetsFor,
@@ -123,6 +125,28 @@ test("capWidgetValue clips an oversized string and reports the drop (#609)", () 
   assert.ok(out.startsWith("x".repeat(1000)), "keeps the head");
   assert.match(out, /…\(\+\d+ chars cut at the 2048-char per-widget cap, which `max_chars` does not raise\)$/, "#809: reports how much was dropped AND that max_chars cannot raise this cap");
   assert.ok(JSON.stringify(out).length <= WIDGET_VALUE_CAP, "ESCAPED size within the cap");
+});
+
+test("#1681 detail widget cap keeps the default and clamps opt-in requests", () => {
+  assert.equal(clampDetailWidgetCap(undefined), WIDGET_VALUE_CAP);
+  assert.equal(clampDetailWidgetCap(1024), WIDGET_VALUE_CAP, "the default cap is not lowered");
+  assert.equal(clampDetailWidgetCap(8192), 8192);
+  assert.equal(clampDetailWidgetCap(1e9), DETAIL_WIDGET_VALUE_CEILING);
+  assert.equal(clampDetailWidgetCap("not-a-number"), WIDGET_VALUE_CAP);
+});
+
+test("#1681 an explicit detail cap returns a long widget without changing its shape", () => {
+  const value = "prompt-" + "x".repeat(5000);
+  const summary = capSummaryWidgets({ id: 78, type: "MarkdownNote", widgets: { text: value } }, 8192, 12000);
+  assert.deepEqual(Object.keys(summary), ["id", "type", "widgets"]);
+  assert.equal(summary.widgets.text, value);
+  assert.equal(JSON.parse(JSON.stringify(summary)).widgets.text, value);
+});
+
+test("#1681 an opt-in cap still yields to the total max_chars budget", () => {
+  const capped = capSummaryWidgets({ id: 78, widgets: { text: "x".repeat(50000), other: 1 } }, 32768, 5000);
+  assert.ok(JSON.stringify(capped).length < 5000 * 2, "detail remains bounded by the total budget");
+  assert.match(capped.widgets.text, /over the `max_chars` budget/);
 });
 
 test("capWidgetValue bounds by ESCAPED size for control chars / surrogates (#609)", () => {
