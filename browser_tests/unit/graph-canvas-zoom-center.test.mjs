@@ -15,6 +15,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { normalizeCanvasDsInPlace } from "../../web/js/lib/canvas-ds.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -29,9 +30,10 @@ function realGraphCanvas(getGraphCtx, resolveNode, activePanelRoot = null) {
     "getGraphCtx",
     "resolveNode",
     "activePanelRoot",
+    "normalizeCanvasDsInPlace",
     `const executors = { ${methodMatch[0]} };\nreturn executors.graph_canvas;`,
   );
-  return factory(getGraphCtx, resolveNode, activePanelRoot);
+  return factory(getGraphCtx, resolveNode, activePanelRoot, normalizeCanvasDsInPlace);
 }
 
 /** A canvas stub whose transform mirrors litegraph's DragAndScale: ds.scale +
@@ -154,4 +156,24 @@ test("#401 zoom still validates scale bounds (no regression)", () => {
   const fn = realGraphCanvas(() => ({ graph: {}, canvas }));
   assert.throws(() => fn({ action: "zoom", scale: 0 }), /scale must be in/);
   assert.throws(() => fn({ action: "zoom", scale: 5 }), /scale must be in/);
+});
+
+test("#1655 graph_canvas repairs a malformed live viewport before returning it", () => {
+  const canvas = makeCanvas({ scale: null, offset: [null, null] });
+  const fn = realGraphCanvas(() => ({ graph: {}, canvas }));
+
+  const result = fn({ action: "pan", dx: 0, dy: 0 });
+
+  assert.deepEqual(result.canvas, { action: "pan", scale: 1, offset: [0, 0] });
+});
+
+test("#1655 graph_canvas replaces a non-writable offset shape", () => {
+  const canvas = makeCanvas();
+  canvas.ds.offset = "ab";
+  const fn = realGraphCanvas(() => ({ graph: {}, canvas }));
+
+  const result = fn({ action: "pan", dx: 0, dy: 0 });
+
+  assert.deepEqual(result.canvas, { action: "pan", scale: 1, offset: [0, 0] });
+  assert.deepEqual(canvas.ds.offset, [0, 0]);
 });

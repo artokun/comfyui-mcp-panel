@@ -18,6 +18,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { normalizeCanvasDsInPlace } from "../../web/js/lib/canvas-ds.js";
 
 const src = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
@@ -44,6 +45,7 @@ function run({ canvas, ds }, args) {
   const deps = {
     getGraphCtx: () => ({ graph, canvas }),
     resolveNode: () => node,
+    normalizeCanvasDsInPlace,
   };
   const names = Object.keys(deps);
   const fn = new Function(...names, `const e = {${body[0]}}; return e.graph_canvas;`);

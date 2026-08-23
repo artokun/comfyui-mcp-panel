@@ -8,6 +8,8 @@
 // module merges linearData / linearMode onto the EXISTING bag and never replaces
 // extra or touches that namespace.
 
+import { normalizedCanvasDs } from "./canvas-ds.js";
+
 export const APP_MODE_META_NAMESPACE = "comfyui_mcp";
 
 function isPlainObject(value) {
@@ -256,6 +258,10 @@ export function configureAppMode({
   before?.();
   try {
     const extra = extraBag(rootGraph);
+    // `extra.ds` is part of the saved ROOT workflow. Normalize that object in
+    // place; the currently viewed canvas may be a subgraph with a different
+    // viewport and must never overwrite the root's transform.
+    extra.ds = normalizedCanvasDs(extra.ds);
     mergeAppModeExtra(extra, {
       inputTuples,
       outputIds,

@@ -450,6 +450,7 @@ import {
 
 import { canonicalNodeId, isQualifiedNodeId } from "./lib/node-id.js";
 import { configureAppMode } from "./lib/configure-app-mode.js";
+import { normalizeCanvasDsInPlace } from "./lib/canvas-ds.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
 import { classifyManualChangeBaseline } from "./lib/manual-change-gate.js";
 import { reconcileWidgetClaims, supersededNote } from "./lib/manual-change-claims.js";
@@ -16262,6 +16263,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph, canvas } = getGraphCtx();
     if (!canvas?.ds) throw new Error("Canvas is not available");
     const ds = canvas.ds;
+    normalizeCanvasDsInPlace(ds);
     switch (action) {
       case "center_on_node": {
         const node = resolveNode(graph, node_id);
