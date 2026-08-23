@@ -417,6 +417,7 @@ import {
   describeUnrunnable,
   missingNodeRunRefusal,
   graphToPromptUnusable,
+  graphToPromptFailureRefusal,
   unserializableGraphRefusal,
   unresolvedNodeTypes,
 } from "./lib/missing-node-preflight.js";
@@ -16535,7 +16536,13 @@ const GRAPH_TOOL_EXECUTORS = {
       if (preflightBuild == null) throw new Error("graph_run pre-flight: graphToPrompt did not answer in time");
       // `"error" in` rather than a truthiness test: a falsy thrown value must still reach
       // the pre-flight catch as a throw, exactly as the bare await delivered it.
-      if ("error" in preflightBuild) throw preflightBuild.error;
+      if ("error" in preflightBuild) {
+        // #1654 — a frontend dynamic-widget/extension serializer throw is a real
+        // graph failure, not an unavailable preflight. Preserve the frontend's
+        // bounded detail and refuse before queuePrompt can retry the same broken
+        // graph or replace it with a less useful queue-time error.
+        throw new Error(graphToPromptFailureRefusal(preflightBuild.error));
+      }
       const built = preflightBuild.value;
       preflightPrompt = built;
       // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
