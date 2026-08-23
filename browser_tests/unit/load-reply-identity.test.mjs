@@ -100,6 +100,17 @@ test("#1478 the UI path reads through the same gate, against its own pre-load ta
   );
 });
 
+test("#1668 graph_load freezes the canvas across restore retry and refuses unsafe fallback", () => {
+  const body = graphLoadBody();
+  const retryAt = body.indexOf("retryNodeRestores(app?.graph");
+  assert.notEqual(retryAt, -1, "the UI path must retain the restore retry");
+  const acquireAt = body.lastIndexOf("acquireCanvasInteractionLock(app?.canvas)", retryAt);
+  const releaseAt = body.indexOf("releaseCanvasInteractionLock(retryInteractionToken, app?.canvas)", retryAt);
+  assert.ok(acquireAt >= 0 && acquireAt < retryAt, "the retry must acquire the user interaction fence first");
+  assert.ok(releaseAt > retryAt, "the interaction fence must be released after the awaited retry");
+  assert.match(body, /retry:\s*"no-interaction-lock"/, "an unfreezable canvas must disclose rather than retry unsafely");
+});
+
 test("#1478 the identity is published only when it is PROVABLY this load's", () => {
   // THE PROPERTY THAT MATTERS, and the one review had to force. Reading "whatever is
   // active now" after the await is the SAME wrong-graph hazard the orchestrator-side

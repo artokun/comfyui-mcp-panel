@@ -14351,9 +14351,31 @@ const GRAPH_TOOL_EXECUTORS = {
     // Retry each contained node ONCE, now that the load has settled and its
     // asynchronously-built widgets usually exist. A node that still throws is
     // DISCLOSED below — never folded into a clean `loaded: true`.
-    const { restored: retriedNodes, failed: unrestoredNodes } = isolation?.failures?.length
-      ? await retryNodeRestores(app?.graph, isolation.failures, { isCurrent: loadStillTargetsWorkflow })
-      : { restored: [], failed: [] };
+    let retriedNodes = [];
+    let unrestoredNodes = [];
+    if (isolation?.failures?.length) {
+      // The retry waits for link state to settle. Freeze the user canvas across
+      // that await so a same-workflow edit cannot be overwritten by the saved
+      // node snapshot. If this frontend exposes no reliable interaction lock,
+      // disclose the failed nodes instead of attempting an unsafe retry.
+      const retryInteractionToken = acquireCanvasInteractionLock(app?.canvas);
+      if (retryInteractionToken === null) {
+        unrestoredNodes = isolation.failures.map(({ id, type, error }) => ({
+          id,
+          type,
+          error,
+          retry: "no-interaction-lock",
+        }));
+      } else {
+        try {
+          ({ restored: retriedNodes, failed: unrestoredNodes } = await retryNodeRestores(app?.graph, isolation.failures, {
+            isCurrent: loadStillTargetsWorkflow,
+          }));
+        } finally {
+          releaseCanvasInteractionLock(retryInteractionToken, app?.canvas);
+        }
+      }
+    }
     if (isolation?.failures?.length && !loadStillTargetsWorkflow()) {
       throw new Error(
         "graph_load target workflow changed while restore retry was settling; the retry was skipped",
