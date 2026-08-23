@@ -911,7 +911,7 @@ def _local_comfyui_path():
     except Exception:
         # folder_paths not importable (headless / older host) — use the
         # configured fallback below, if one exists.
-        pass
+        return override
     return override
 
 
