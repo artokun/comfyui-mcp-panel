@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { makeRefreshCoalescer } from "../../web/js/lib/refresh-coalesce.js";
 import { NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
+import { isStaleAssetCandidate } from "../../web/js/lib/asset-staleness.js";
 import {
   PANEL_SRC,
   ADD_NODE_COMMAND_BUDGET_MS,
@@ -139,6 +140,48 @@ test("#1680: refresh_nodes returns the completed verdict from an already-running
   assert.deepEqual(value, { ok: true, refreshed: true });
   assert.equal(built.runs.length, 1, "joining the completion must not queue a trailing refresh");
   await built.inFlightStarted?.catch(() => {});
+});
+
+test("#1682: refresh_nodes waits through a queued freshness run before the missing-asset scan", async () => {
+  const gate = deferred();
+  const node = {
+    id: 7,
+    widgets: [{ name: "model", value: "taeh3.safetensors", options: { values: [] } }],
+  };
+  const rootGraph = { _nodes: [node] };
+  const built = realRefreshNodes({
+    holdFirstRun: gate.promise,
+    budgetMs: 500,
+    runHook: async ({ index }) => {
+      if (index === 1) node.widgets[0].options.values = ["taeh3.safetensors"];
+      return { refreshed: index === 1, reason: index === 1 ? "refreshed" : "object_info_fetch_failed" };
+    },
+  });
+
+  // The first run represents a refresh already started by a background missing-asset check.
+  // The second is its forced trailing fetch, which is the one that can observe the file copied
+  // into the configured model directory after the first /object_info request began.
+  const trailing = built.refreshComfyNodeDefs(undefined, { force: true });
+  const reply = built.refresh_nodes();
+  gate.resolve();
+
+  const { value } = await withWatchdog(
+    () => reply,
+    1500,
+    "refresh_nodes did not observe the queued freshness run",
+  );
+  assert.equal(value.refreshed, true, "the acknowledgement reports the run that saw the new file");
+  assert.equal(built.runs.length, 2, "the background refresh and its one trailing freshness run completed");
+  assert.equal(
+    isStaleAssetCandidate(rootGraph, {
+      nodeId: 7,
+      name: "taeh3.safetensors",
+      widgetName: "model",
+    }, { trustCombo: true }),
+    true,
+    "the post-refresh missing-asset scan clears the candidate from the refreshed combo",
+  );
+  await Promise.all([built.inFlightStarted, trailing]);
 });
 
 test("#1680: refresh_nodes replies at its budget instead of waiting for the joined run", async () => {
