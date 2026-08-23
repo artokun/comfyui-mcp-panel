@@ -6,6 +6,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.65] - 2026-08-23
+
+### Fixed
+- fail closed on incomplete live scans (#1691)
+- bound live error lookups (#1691)
+- preserve refusal precedence for mixed receipts (#1690)
+- make incomplete run receipts uncertain (#1690)
+- refuse id-less run acknowledgements (#1690)
+- reject ambiguous inner error ids
+- reject foreign scoped execution errors
+- preserve scoped execution errors
+
+### Changed
+- release-0.15.62 (#1704)
+- fix/1682 refresh join (#1703)
+- release-0.15.61 (#1702)
+- fix/1681 widget detail budget (#1701)
+- release-0.15.60 (#1700)
+- fix/1680 refresh completion handle (#1699)
+
+
 ## [0.15.64] - 2026-08-23
 
 ### Fixed
