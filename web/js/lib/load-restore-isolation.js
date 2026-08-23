@@ -1,6 +1,6 @@
 // #1260 — one node's restore must not abort the rest of the load.
 //
-import { isLinkDisconnectCrash } from "./safe-remove-node.js";
+import { isLinkDisconnectCrash, nodeHasResidualLinks } from "./safe-remove-node.js";
 
 // LiteGraph restores a serialized graph in passes: every node is CREATED
 // first, then each node is configured in `nodes` order through the PROTOTYPE's
@@ -26,6 +26,16 @@ function errorText(err) {
   } catch {
     return "an unprintable error";
   }
+}
+
+function cloneSerializedValue(value, seen = new Map()) {
+  if (value === null || typeof value !== "object") return value;
+  const prior = seen.get(value);
+  if (prior) return prior;
+  const clone = Array.isArray(value) ? [] : {};
+  seen.set(value, clone);
+  for (const key of Object.keys(value)) clone[key] = cloneSerializedValue(value[key], seen);
+  return clone;
 }
 
 function sameSerializedValue(a, b) {
@@ -156,6 +166,13 @@ export function installNodeConfigureIsolation(LG) {
   const wrapped = function (info) {
     if (!active) return original.call(this, info);
     entered += 1;
+    let serializedSnapshot = null;
+    try {
+      serializedSnapshot = info == null ? null : cloneSerializedValue(info);
+    } catch {
+      // An uncloneable payload cannot be safely verified after a throw.
+      serializedSnapshot = null;
+    }
     try {
       return original.call(this, info);
     } catch (err) {
@@ -164,7 +181,9 @@ export function installNodeConfigureIsolation(LG) {
         type: info?.type ?? this?.type ?? null,
         error: errorText(err),
         linkDisconnectCrash: isLinkDisconnectCrash(err),
-        info: info ?? null,
+        // configure implementations can mutate their input before throwing;
+        // retain an independent serialized snapshot for the retry/verification.
+        info: serializedSnapshot,
       });
       return undefined;
     }
@@ -212,21 +231,32 @@ export async function retryNodeRestores(graph, failures) {
       });
       continue;
     }
-    if (failure.linkDisconnectCrash) await waitForLinkStateToSettle();
+    const linkDisconnectCrash = failure.linkDisconnectCrash === true;
+    // Check the same discriminator safeRemoveNode uses while the failed
+    // restore's residual link state is still observable. Do not let configure
+    // manufacture links during the retry and then use those as proof.
+    if (linkDisconnectCrash && !nodeHasResidualLinks(graph, node)) {
+      failed.push({
+        id: failure.id,
+        type: failure.type,
+        error: failure.error ?? "link-disconnect restore failure",
+        retry: "no-residual-links",
+      });
+      continue;
+    }
+    if (linkDisconnectCrash) await waitForLinkStateToSettle();
     let retryError = null;
     try {
       node.configure(failure.info);
     } catch (err) {
       retryError = err;
     }
-    const retryLinkDisconnectCrash = isLinkDisconnectCrash(retryError);
-    const linkDisconnectCrash = failure.linkDisconnectCrash || retryLinkDisconnectCrash;
     if (linkDisconnectCrash) {
       // The initial crash makes the retry worth attempting, but it does not
       // bless a DIFFERENT exception from the retry. That is a new failure and
       // must remain fail-closed even if the node happened to serialize cleanly
       // after partially mutating itself.
-      if (retryError && !retryLinkDisconnectCrash) {
+      if (retryError && !isLinkDisconnectCrash(retryError)) {
         failed.push({ id: failure.id, type: failure.type, error: errorText(retryError) });
         continue;
       }
