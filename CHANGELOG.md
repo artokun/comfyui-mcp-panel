@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.53] - 2026-08-23
+
+### Fixed
+- normalize app mode canvas metadata
+
+
 ## [0.15.52] - 2026-08-23
 
 ### Fixed
