@@ -19,9 +19,19 @@
 //          inputs[].link backlink so the outline never renders an orphaned link
 //          against a slot it no longer feeds.
 
-/** Per-widget-value character cap for the `detail` projection (#609). Big enough
- *  to identify a value, small enough that one blob can't starve a whole query. */
+/** Default per-widget-value character cap for the `detail` projection (#609). Big
+ *  enough to identify a value, small enough that one blob can't starve a whole query.
+ *  An explicit detail read may opt into the bounded ceiling below. */
 export const WIDGET_VALUE_CAP = 2048;
+export const DETAIL_WIDGET_VALUE_CEILING = 32768;
+
+/** Normalize the optional detail-only per-widget cap without changing the default. */
+export function clampDetailWidgetCap(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > WIDGET_VALUE_CAP
+    ? Math.min(Math.floor(n), DETAIL_WIDGET_VALUE_CEILING)
+    : WIDGET_VALUE_CAP;
+}
 
 // #809: the REAL clamps for panel_query_graph / panel_graph_outline, exported so every
 // remedy string below quotes a ceiling the runtime actually enforces. A hint that names
@@ -129,21 +139,25 @@ export function drivenTag(src) {
  *  escape to 6 chars each, not 2. Returns the value unchanged when it already fits;
  *  otherwise the longest head prefix whose encoding fits `cap`, with an honest marker
  *  naming how many raw chars were dropped. */
-export function capWidgetValue(value, cap = WIDGET_VALUE_CAP, maxChars = Infinity) {
+export function capWidgetValue(value, cap = WIDGET_VALUE_CAP, maxChars = Infinity, fixedCap = cap) {
   if (value == null) return value;
   const isString = typeof value === "string";
   const s = isString ? value : (() => { try { return JSON.stringify(value); } catch { return String(value); } })();
   if (typeof s !== "string") return value;
-  if (JSON.stringify(s).length <= cap) return value;
+  // Strings are emitted as JSON strings, so their quotes/escapes count twice. A
+  // non-string is emitted as its serialized JSON value, so serializing `s` again
+  // would double-count escapes and turn a fitting object/array into a string.
+  const serializedSize = isString ? JSON.stringify(s).length : s.length;
+  if (serializedSize <= cap) return value;
   // #809: name the lever that ACTUALLY applies. capSummaryWidgets() tightens the
-  // per-value cap to the char budget only when the budget is the smaller of the two, so
-  // `cap < WIDGET_VALUE_CAP` ⟺ max_chars is what cut this value and raising it helps. At
-  // the FIXED 2048 cap raising max_chars does nothing, and saying so stops the caller
-  // burning a retry on a parameter that cannot move this.
+  // per-value cap to the char budget only when the budget is smaller than the requested
+  // fixed cap, so `cap < fixedCap` means max_chars is what cut this value and raising it
+  // helps. At the fixed per-widget cap raising max_chars does nothing, and saying so stops
+  // the caller burning a retry on a parameter that cannot move this.
   const remedy =
-    cap < WIDGET_VALUE_CAP
+    cap < fixedCap
       ? `over the \`max_chars\` budget; ${raiseOrCeiling("max_chars", maxChars, MAX_CHARS_CEILING)}`
-      : `at the ${WIDGET_VALUE_CAP}-char per-widget cap, which \`max_chars\` does not raise`;
+      : `at the ${fixedCap}-char per-widget cap, which \`max_chars\` does not raise`;
   const marker = (dropped) => `…(+${dropped} chars cut ${remedy})`;
   // Binary-search the longest raw prefix whose ESCAPED length fits, reserving EXACTLY
   // the marker's own worst-case size (its digit count is bounded by s.length) rather
@@ -198,7 +212,7 @@ export function capSummaryWidgets(summary, cap = WIDGET_VALUE_CAP, totalCap = In
     const [rawKey, v] = entries[i];
     const k = capKey(rawKey);
     if (k !== rawKey) changed = true;
-    const capped = capWidgetValue(v, perValueCap, totalCap);
+    const capped = capWidgetValue(v, perValueCap, totalCap, cap);
     if (capped !== v) changed = true;
     const size = entrySize(k, capped);
     // Keep at least one widget, then stop once the total would exceed the budget.
@@ -240,7 +254,7 @@ export function capSummaryWidgets(summary, cap = WIDGET_VALUE_CAP, totalCap = In
       if (k !== rawKey) changed = true;
       for (const row of Array.isArray(rows) ? rows : []) {
         if (stopped) { dOmitted++; continue; }
-        const value = capWidgetValue(row?.value, perValueCap, totalCap);
+        const value = capWidgetValue(row?.value, perValueCap, totalCap, cap);
         if (value !== row?.value) changed = true;
         const entry = { ...row, value };
         // Keep at least ONE occurrence, then stop once the total would exceed the

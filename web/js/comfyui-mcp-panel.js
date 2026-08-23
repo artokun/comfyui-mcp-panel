@@ -380,6 +380,7 @@ import {
   // #1634: the pinpoint per-value cap for an explicit-`ids` read is derived from these.
   WIDGET_VALUE_CAP,
   COMPACT_VALUE_CLIP,
+  clampDetailWidgetCap,
   // #1748: which frontend node types carry on-canvas prose as a widget value.
   NOTE_NODE_TYPES,
   OUTLINE_DETAIL_LEVELS,
@@ -12719,7 +12720,7 @@ const GRAPH_TOOL_EXECUTORS = {
   //   → group_by:"type" counts, or projection (ids | compact lines | detail =
   //     summarizeNode JSON rows), char-bounded with an explicit truncation tail.
   // graph_get_state stays registered for BACK-COMPAT with older orchestrators.
-  graph_query({ types, title, where, ids, upstream_of, downstream_of, depth, fields, group_by, limit, max_chars }) {
+  graph_query({ types, title, where, ids, upstream_of, downstream_of, depth, fields, group_by, limit, max_chars, widget_max_chars }) {
     const { graph, rootGraph } = getGraphCtx();
     // #429: resync cached node rects to live geometry before the `groups` block
     // recomputes geometric membership (summarizeGroup), so it never reports stale ids.
@@ -12729,6 +12730,13 @@ const GRAPH_TOOL_EXECUTORS = {
     const total = nodes.length;
     const lim = Math.min(Math.max(Number(limit) || 40, 1), 200);
     const maxChars = Math.min(Math.max(Number(max_chars) || 12000, 500), 60000);
+    // #1681: only a single explicitly named detail node gets the escape hatch for a
+    // long widget. Broad/multi-ID detail and the outline/compact projections retain the
+    // default cap; the helper still applies the total max_chars budget and final guard.
+    const detailWidgetCap =
+      fields === "detail" && Array.isArray(ids) && ids.length === 1
+        ? clampDetailWidgetCap(widget_max_chars)
+        : WIDGET_VALUE_CAP;
 
     // Adjacency over live links.
     const up = new Map();
@@ -12994,7 +13002,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // #609: bound each widget value AND the total widgets size so a
         // ResolutionMaster/LTXDirector/VHS blob (or a many-widget node) can't consume
         // the entire budget in one node's detail — even the protected first line.
-        const summary = capSummaryWidgets(summarizeNode(n), undefined, maxChars);
+        const summary = capSummaryWidgets(summarizeNode(n), detailWidgetCap, maxChars);
         line = JSON.stringify(summary);
         // Final guard: if the fully-capped detail STILL exceeds max_chars (a node with
         // very many/large slots, which capSummaryWidgets doesn't touch), degrade the
