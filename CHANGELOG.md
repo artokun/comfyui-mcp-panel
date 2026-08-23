@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.54] - 2026-08-23
+
+### Fixed
+- recover link-disconnect restore crashes
+
+
 ## [0.15.53] - 2026-08-23
 
 ### Fixed
