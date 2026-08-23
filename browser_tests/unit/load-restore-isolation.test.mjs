@@ -299,6 +299,26 @@ test("#1668 does not bless the same link-disconnect exception on the retry", asy
   assert.deepEqual(result.failed, [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function" }]);
 });
 
+test("#1668 verifies against the untouched snapshot when retry configure mutates its input", async () => {
+  const node = {
+    inputs: [{ link: 901 }],
+    outputs: [],
+    configure: (info) => {
+      info.widgets_values[0] = "wrong";
+    },
+    serialize: () => ({ id: 122, type: "ImpactSwitch", widgets_values: ["wrong"] }),
+  };
+  const result = await retryNodeRestores(
+    { getNodeById: () => node },
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+  );
+  assert.deepEqual(result.restored, []);
+  assert.deepEqual(result.recovered, []);
+  assert.deepEqual(result.failed, [
+    { id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", widgetDifferences: ["widgets_values.#0"] },
+  ]);
+});
+
 test("#1668 does not bless a link-shaped retry without residual links", async () => {
   const node = {
     id: 122,

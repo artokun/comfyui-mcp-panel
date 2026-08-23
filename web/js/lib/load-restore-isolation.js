@@ -284,9 +284,18 @@ export async function retryNodeRestores(graph, failures, options = {}) {
       });
       continue;
     }
+    let retryInfo;
+    try {
+      // configure may mutate its input too; keep the failure's independent
+      // snapshot untouched for verification after this retry.
+      retryInfo = cloneSerializedValue(failure.info);
+    } catch {
+      failed.push({ id: failure.id, type: failure.type, error: "restore payload could not be cloned", retry: "uncloneable-info" });
+      continue;
+    }
     let retryError = null;
     try {
-      node.configure(failure.info);
+      node.configure(retryInfo);
     } catch (err) {
       retryError = err;
     }
