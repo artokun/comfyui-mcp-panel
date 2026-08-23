@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.49] - 2026-08-23
+
+### Fixed
+- make path fallback explicit
+- prefer live ComfyUI base path
+
+
 ## [0.15.48] - 2026-08-22
 
 ### Fixed
