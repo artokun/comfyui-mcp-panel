@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.60] - 2026-08-23
+
+### Changed
+- fix/1680 refresh completion handle (#1699)
+
+
 ## [0.15.59] - 2026-08-23
 
 ### Fixed
