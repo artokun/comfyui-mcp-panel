@@ -14,6 +14,7 @@ import {
   parseAppModeArgs,
   validateAppModeTargets,
 } from "../../web/js/lib/configure-app-mode.js";
+import { normalizedCanvasDs } from "../../web/js/lib/canvas-ds.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -137,7 +138,7 @@ test("#1429 configureAppMode writes tuples, one undo envelope, then captures", (
   assert.equal(captures, 1);
   assert.equal(captureDuringEnvelope, false, "captureCanvasState must run after afterChange");
   assert.equal(graph.extra.comfyui_mcp.workflow_uuid, "wf-A");
-  assert.deepEqual(graph.extra.ds, { scale: 0.8 });
+  assert.deepEqual(graph.extra.ds, { scale: 0.8, offset: [0, 0] });
   assert.deepEqual(graph.extra.linearData.inputs, [[6, "text", { description: "Prompt" }]]);
   assert.deepEqual(graph.extra.linearData.outputs, [9]);
   assert.equal(graph.extra.linearMode, true);
@@ -145,6 +146,29 @@ test("#1429 configureAppMode writes tuples, one undo envelope, then captures", (
   assert.equal(result.default_mode, "app");
   assert.equal(result.preserved_meta, true);
   assert.equal(result.linearMode, true);
+});
+
+test("#1655 configureAppMode repairs malformed persisted canvas metadata", () => {
+  const graph = makeGraph([], { ds: { scale: null, offset: [null, null] } });
+
+  configureAppMode({
+    rootGraph: graph,
+    resolveNode: resolverFor(graph),
+    args: { default_mode: "app" },
+  });
+
+  assert.deepEqual(graph.extra.ds, { scale: 1, offset: [0, 0] });
+});
+
+test("#1655 normalizedCanvasDs defaults malformed and typed viewport values", () => {
+  assert.deepEqual(normalizedCanvasDs({ scale: 0, offset: Float32Array.of(NaN, Infinity) }), {
+    scale: 1,
+    offset: [0, 0],
+  });
+  assert.deepEqual(normalizedCanvasDs({ scale: 0.8, offset: [12, -4] }), {
+    scale: 0.8,
+    offset: [12, -4],
+  });
 });
 
 test("#1429 configureAppMode prefers a live widgetId when the frontend assigned one", () => {
