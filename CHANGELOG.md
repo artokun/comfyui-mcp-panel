@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.57] - 2026-08-23
+
+### Fixed
+- panel_find_nodes now matches raw quoted substrings in STRING widget values (#1678)
+
+
 ## [0.15.56] - 2026-08-23
 
 ### Fixed
