@@ -11852,9 +11852,13 @@ const GRAPH_TOOL_EXECUTORS = {
   // composition `graph_add_node`'s budget note describes — a forced call pays an in-flight
   // run AND its own, serially, which does not fit the 30,000 ms window this command is
   // relayed in. See REFRESH_NODES_COMMAND_BUDGET_MS.
+  // #1680 — when a refresh already owns the single-flight slot, this command is an
+  // acknowledgement of that work: subscribe to it instead of queueing a second
+  // trailing run. When the slot is empty, force:true still starts a fresh refresh.
   async refresh_nodes() {
     const verdict = await refreshComfyNodeDefs(undefined, {
       force: true,
+      joinInFlight: true,
       joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,
       // #1562 — the run announces this handoff after /object_info and yields one turn
       // before registration, so this caller can return its structured retryable verdict

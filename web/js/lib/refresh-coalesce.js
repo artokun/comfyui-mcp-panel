@@ -21,6 +21,11 @@
 // combos. So a forced call GUARANTEES a fresh registration whose fetch begins
 // AFTER the current run settles. Multiple forced calls that arrive during one
 // in-flight run coalesce into a SINGLE trailing run (no /object_info stampede).
+// #1680 — an acknowledgement caller can opt into the opposite behavior with
+// `joinInFlight:true`: when a forced, payload-less call finds an existing run,
+// it subscribes to that run instead of queueing a trailing one. The opt-in is
+// deliberately narrow so freshness-triggered forced callers keep #396's
+// guarantee.
 //
 // #1192 / #1351 — A CALLER MAY BOUND ITS OWN WAIT. That wait is the whole invocation,
 // not just the join.
@@ -215,6 +220,11 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
   };
   return async function refresh(preloadedDefs, opts) {
     const force = !!(opts && opts.force);
+    // #1680 — panel_refresh_nodes forces a refresh when idle, but an already-running
+    // node-def refresh is the completion it needs to observe. This does not alter the
+    // default forced-refresh contract above; only callers that explicitly opt in join
+    // the current run instead of creating a trailing one.
+    const joinInFlight = !!(opts && opts.joinInFlight);
     // #1192 — a bound only when the caller asked for one AND a primitive was wired. Both
     // halves matter: `Number.isFinite` rejects the `Infinity`/`NaN` a caller can compute
     // from an unset budget, and an unwired `withTimeout` must leave today's unbounded wait
@@ -234,8 +244,27 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     const current = getInFlight();
     if (current) {
       // No payload, not forced ⇒ joining the settled refresh is enough.
-      if (preloadedDefs == null && !force) {
+      if (preloadedDefs == null && (!force || joinInFlight)) {
+        // #1680 — an unbounded refresh may still be waiting at the explicit handoff before
+        // synchronous registration. Ask it to yield BEFORE arming/waiting on this bounded
+        // acknowledgement, so its local work cannot consume the acknowledgement's deadline.
+        // The opt-in is intentionally limited to this join path; default forced callers still
+        // queue the trailing freshness run below.
+        if (joinInFlight) current.requestEarlyYield?.();
         if (!(await joinBounded(current, joinMs, withTimeout))) return REFRESH_JOIN_ABANDONED;
+        // #1680 — an acknowledgement caller needs the run's freshness verdict, not just
+        // proof that the promise settled. Ordinary payload-less joins intentionally retain
+        // their historical undefined result because their callers only use the completion
+        // as a synchronization point.
+        if (joinInFlight) {
+          try {
+            return await current;
+          } catch {
+            // A failed joined run is settled but has no freshness verdict. Preserve the
+            // fail-closed undefined result so the caller reports a non-fresh outcome.
+            return;
+          }
+        }
         return;
       }
       // Payload present ⇒ wait for the in-flight run, then register the NEWER
