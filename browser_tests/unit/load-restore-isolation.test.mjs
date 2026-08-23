@@ -281,6 +281,24 @@ test("#1668 does not bless an unrelated exception on the retry", async () => {
   assert.deepEqual(result.failed, [{ id: 122, type: "ImpactSwitch", error: "unrelated retry failure" }]);
 });
 
+test("#1668 does not bless the same link-disconnect exception on the retry", async () => {
+  const node = {
+    inputs: [{ link: 901 }],
+    outputs: [],
+    serialize: () => ({ id: 122, type: "ImpactSwitch", widgets_values: ["saved"] }),
+    configure: () => {
+      throw new TypeError("t.findInputSlot is not a function");
+    },
+  };
+  const result = await retryNodeRestores(
+    { getNodeById: () => node },
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+  );
+  assert.deepEqual(result.restored, []);
+  assert.deepEqual(result.recovered, []);
+  assert.deepEqual(result.failed, [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function" }]);
+});
+
 test("#1668 does not bless a link-shaped retry without residual links", async () => {
   const node = {
     id: 122,

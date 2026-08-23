@@ -263,11 +263,10 @@ export async function retryNodeRestores(graph, failures) {
       retryError = err;
     }
     if (linkDisconnectCrash) {
-      // The initial crash makes the retry worth attempting, but it does not
-      // bless a DIFFERENT exception from the retry. That is a new failure and
-      // must remain fail-closed even if the node happened to serialize cleanly
-      // after partially mutating itself.
-      if (retryError && !isLinkDisconnectCrash(retryError)) {
+      // The initial crash makes the retry worth attempting, but ANY exception
+      // from that retry means configure still failed. Serialization after a
+      // throwing configure is not proof that the node was restored.
+      if (retryError) {
         failed.push({ id: failure.id, type: failure.type, error: errorText(retryError) });
         continue;
       }
