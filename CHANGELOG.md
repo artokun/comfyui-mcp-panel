@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.50] - 2026-08-23
+
+### Fixed
+- verify region palettes
+- respect import authority and rollback
+- handle empty editor and palette state
+- rehydrate Ideogram region editor writes
+
+
 ## [0.15.49] - 2026-08-23
 
 ### Fixed
