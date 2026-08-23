@@ -25,6 +25,7 @@ import {
   executionErrorMatchesCurrentGraph,
   applyRuntimeExecFailure,
 } from "../../web/js/lib/exec-error-bounds.js";
+import { findNodeByScopedId, findVisibleNodeByScopedId } from "../../web/js/lib/asset-staleness.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PANEL_SOURCE = readFileSync(
@@ -341,4 +342,216 @@ test("graph_get_errors correlates runtime failures through applyRuntimeExecFailu
     !/const clean =\s*!nodeErrors &&\s*!lastExecFailure &&/.test(PANEL_SOURCE),
     "clean must not be dirtied by a stale lastExecFailure from another workflow",
   );
+});
+
+// #1685: the regression is in the shipped graph_get_errors executor, not in the
+// standalone correlation helper. Run that executor against a root graph with a
+// native subgraph so a scoped execution_error must survive the complete scan.
+function extractExecutorMethod(source, signature) {
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `${signature} not found in panel source`);
+  const open = source.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === "/" && source[i + 1] === "/") {
+      i = source.indexOf("\n", i + 2);
+      continue;
+    }
+    if (ch === "/" && source[i + 1] === "*") {
+      i = source.indexOf("*/", i + 2) + 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < source.length; i += 1) {
+        if (source[i] === "\\") i += 1;
+        else if (source[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return source.slice(start, i + 1);
+  }
+  throw new Error(`unterminated ${signature}`);
+}
+
+const GRAPH_GET_ERRORS_SOURCE = extractExecutorMethod(PANEL_SOURCE, "  async graph_get_errors() {");
+const GRAPH_GET_ERRORS_DEPS = [
+  "monotonicNow",
+  "getErrorsStepBudgetMs",
+  "hasRawMissingAssetCandidates",
+  "GET_ERRORS_REFRESH_CAP_MS",
+  "refreshMissingAssetTrust",
+  "refreshComfyNodeDefs",
+  "withRefreshTimeout",
+  "getRefreshInFlight",
+  "nodeDefRefreshInFlight",
+  "getGraphCtx",
+  "assertGraphBoundToActiveWorkflow",
+  "graphCommandBindingBar",
+  "collectMissingAssets",
+  "activeWorkflowRef",
+  "GET_ERRORS_STEP_CAP_MS",
+  "filterServerConfirmedInputSubfolderMedia",
+  "inputAssetServerUsesWindowsPaths",
+  "scanComboAvailability",
+  "fetchSingleNodeDef",
+  "probeInputAssetPresence",
+  "graphReadBindingChanged",
+  "collectAllGraphs",
+  "adjudicateRecordedMissingNodeTypes",
+  "isRegisteredNodeType",
+  "LiteGraph",
+  "findVisibleNodeByScopedId",
+  "findNodeByScopedId",
+  "getPiniaStore",
+  "combineNodeErrorMaps",
+  "coerceMessageText",
+  "lastExecFailure",
+  "applyRuntimeExecFailure",
+  "collectUnexplainedRedOutlines",
+  "summarizeNode",
+  "tr",
+  "describeActiveGraph",
+  "MAX_STATE_NODES",
+  "fixedCapNote",
+  "missingAssetScanMayBeStale",
+  "missingAssetScopeNote",
+  "comboAvailabilityNote",
+  "uncheckedNodesNote",
+  "stalePlaceholderNote",
+  "boundExecFailurePayload",
+  "collectMissingNodeTypeReasons",
+];
+
+const makeGraphGetErrors = new Function(
+  ...GRAPH_GET_ERRORS_DEPS,
+  `return ({ ${GRAPH_GET_ERRORS_SOURCE} }).graph_get_errors;`,
+);
+
+function makeScopedErrorGraph() {
+  const inner = { id: 125, type: "SamplerCustomAdvanced" };
+  const innerGraph = {
+    _nodes: [inner],
+    getNodeById: (id) => (String(id) === "125" ? inner : null),
+  };
+  const host = { id: 140, type: "Subgraph", subgraph: innerGraph };
+  const rootGraph = {
+    _nodes: [host],
+    getNodeById: (id) => (String(id) === "140" ? host : null),
+  };
+  return { inner, innerGraph, host, rootGraph };
+}
+
+async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }) {
+  const deps = {
+    monotonicNow: () => 0,
+    getErrorsStepBudgetMs: () => 0,
+    hasRawMissingAssetCandidates: () => false,
+    GET_ERRORS_REFRESH_CAP_MS: 18000,
+    refreshMissingAssetTrust: async () => false,
+    refreshComfyNodeDefs: () => {},
+    withRefreshTimeout: () => {},
+    getRefreshInFlight: () => null,
+    nodeDefRefreshInFlight: null,
+    getGraphCtx: () => ({ app: { lastNodeErrors: null }, graph, rootGraph }),
+    assertGraphBoundToActiveWorkflow: () => {},
+    graphCommandBindingBar: () => ({}),
+    collectMissingAssets: () => ({ models: [], media: [], nodeTypes: [], nodeCount: 0 }),
+    activeWorkflowRef: () => null,
+    GET_ERRORS_STEP_CAP_MS: 4000,
+    filterServerConfirmedInputSubfolderMedia: async (media) => media,
+    inputAssetServerUsesWindowsPaths: async () => false,
+    scanComboAvailability: async () => null,
+    fetchSingleNodeDef: () => {},
+    probeInputAssetPresence: () => {},
+    graphReadBindingChanged: () => false,
+    collectAllGraphs: (value) => [value],
+    adjudicateRecordedMissingNodeTypes: (types) => ({ stillMissing: types, stalePlaceholders: [] }),
+    isRegisteredNodeType: () => false,
+    LiteGraph: {},
+    findVisibleNodeByScopedId,
+    findNodeByScopedId,
+    getPiniaStore: () => null,
+    combineNodeErrorMaps: () => null,
+    coerceMessageText: (value) => String(value ?? ""),
+    lastExecFailure,
+    applyRuntimeExecFailure,
+    collectUnexplainedRedOutlines: () => [],
+    summarizeNode: (node) => ({ id: node.id, type: node.type }),
+    tr: (_key, fallback) => fallback,
+    describeActiveGraph: () => ({ scope: "root" }),
+    MAX_STATE_NODES: 50,
+    fixedCapNote: () => "cap",
+    missingAssetScanMayBeStale: () => false,
+    missingAssetScopeNote: () => "stale",
+    comboAvailabilityNote: () => "combo",
+    uncheckedNodesNote: () => "unchecked",
+    stalePlaceholderNote: () => "placeholder",
+    boundExecFailurePayload,
+    collectMissingNodeTypeReasons: () => [],
+  };
+  const executor = makeGraphGetErrors(...GRAPH_GET_ERRORS_DEPS.map((name) => deps[name]));
+  return executor();
+}
+
+test("#1685 production graph_get_errors preserves a scoped runtime error and blames its root host", async () => {
+  const { rootGraph, host } = makeScopedErrorGraph();
+  const result = await runProductionGraphGetErrors({
+    graph: rootGraph,
+    rootGraph,
+    lastExecFailure: {
+      node_id: "140:125",
+      node_type: "SamplerCustomAdvanced",
+      exception_type: "NotImplementedError",
+      exception_message: "aten::_int_mm",
+    },
+  });
+
+  assert.equal(result.errored_count, 1);
+  assert.equal(result.nodes[0].id, host.id);
+  assert.deepEqual(result.nodes[0].reasons, [
+    {
+      kind: "execution",
+      exception_type: "NotImplementedError",
+      message: "aten::_int_mm",
+    },
+  ]);
+  assert.equal(result.last_execution_error.node_id, "140:125");
+  assert.equal(result.note, undefined, "a scoped execution failure must not be reported clean");
+});
+
+test("#1685 production graph_get_errors blames the inner node when that subgraph is visible", async () => {
+  const { inner, innerGraph, rootGraph } = makeScopedErrorGraph();
+  const result = await runProductionGraphGetErrors({
+    graph: innerGraph,
+    rootGraph,
+    lastExecFailure: {
+      node_id: "140:125",
+      node_type: "SamplerCustomAdvanced",
+      exception_message: "inner failure",
+    },
+  });
+
+  assert.equal(result.errored_count, 1);
+  assert.equal(result.nodes[0].id, inner.id);
+  assert.equal(result.nodes[0].reasons[0].message, "inner failure");
+});
+
+test("#1685 production graph_get_errors still rejects a type-mismatched scoped failure", async () => {
+  const { rootGraph } = makeScopedErrorGraph();
+  const result = await runProductionGraphGetErrors({
+    graph: rootGraph,
+    rootGraph,
+    lastExecFailure: {
+      node_id: "140:125",
+      node_type: "DifferentNodeType",
+      exception_message: "foreign failure",
+    },
+  });
+
+  assert.equal(result.errored_count, 0);
+  assert.equal(result.last_execution_error, null);
+  assert.equal(result.note, "no errors recorded since the last execution start");
 });

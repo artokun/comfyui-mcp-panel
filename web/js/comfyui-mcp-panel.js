@@ -17754,11 +17754,27 @@ const GRAPH_TOOL_EXECUTORS = {
         const store = getPiniaStore("executi" + "on" + "Error");
         e = store?.["lastExecuti" + "on" + "Error"] ?? null;
       }
-      const applied = applyRuntimeExecFailure(e, byId);
+      let applied = applyRuntimeExecFailure(e, byId);
+      // #1685 — execution_error uses a scoped locator for nodes inside a native
+      // subgraph (for example `140:125`), while `byId` only indexes the graph
+      // currently visible on the canvas. Resolve that locator against the active
+      // root graph and run the same type-safe correlation before retaining it.
+      if (!applied.detail && e?.node_id != null) {
+        const scopedNode = findNodeByScopedId(rootGraph, e.node_id);
+        if (scopedNode) {
+          applied = applyRuntimeExecFailure(
+            e,
+            new Map([[String(e.node_id), scopedNode]]),
+          );
+        }
+      }
       execFailureDetail = applied.detail;
       execFailure = applied.failure;
       if (applied.reason && e?.node_id != null) {
-        addReason(e.node_id, applied.reason);
+        const visibleFailureNode =
+          findVisibleNodeByScopedId(rootGraph, nodes, e.node_id) ??
+          (graph === rootGraph ? byId.get(String(e.node_id).split(":")[0]) : null);
+        addReason(visibleFailureNode?.id ?? e.node_id, applied.reason);
       }
     } catch {
       /* optional */
