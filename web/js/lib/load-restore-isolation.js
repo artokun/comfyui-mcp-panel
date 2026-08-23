@@ -289,6 +289,9 @@ export function installNodeConfigureIsolation(LG, graph = null) {
  * again" with "there is nothing to restore onto". Callers that can observe
  * workflow identity may pass `{ isCurrent }`; the check runs before configure
  * and again after the settle wait so a tab switch cannot retarget the retry.
+ * Callers whose root graph can be replaced may also pass `{ isGraphCurrent }`;
+ * it receives the graph selected for this failure and must prove that graph is
+ * still owned by the caller's post-load root before configure runs.
  */
 export async function retryNodeRestores(graph, failures, options = {}) {
   const restored = [];
@@ -313,6 +316,23 @@ export async function retryNodeRestores(graph, failures, options = {}) {
       continue;
     }
     const retryGraph = failure?.ownerGraph ?? graph;
+    if (typeof options?.isGraphCurrent === "function") {
+      let graphCurrent = false;
+      try {
+        graphCurrent = options.isGraphCurrent(retryGraph, failure) === true;
+      } catch {
+        graphCurrent = false;
+      }
+      if (!graphCurrent) {
+        failed.push({
+          id: failure?.id ?? null,
+          type: failure?.type ?? null,
+          error: "restore graph changed during retry",
+          retry: "graph-switched",
+        });
+        continue;
+      }
+    }
     const node =
       failure?.id != null && typeof retryGraph?.getNodeById === "function"
         ? retryGraph.getNodeById(failure.id)

@@ -472,6 +472,37 @@ test("#1668 retries a subgraph node in its owning graph when the id collides wit
   );
 });
 
+test("#1668 refuses a failure whose owning graph was detached by the load", async () => {
+  let configured = 0;
+  const oldNode = {
+    id: 122,
+    inputs: [{ link: 901 }],
+    outputs: [],
+    configure: () => {
+      configured += 1;
+    },
+    serialize: () => ({ id: 122, type: "ImpactSwitch", widgets_values: ["saved"] }),
+  };
+  const oldGraph = { getNodeById: () => oldNode };
+  const currentGraph = { getNodeById: () => null };
+  const result = await retryNodeRestores(
+    currentGraph,
+    [{
+      id: 122,
+      type: "ImpactSwitch",
+      error: "t.findInputSlot is not a function",
+      linkDisconnectCrash: true,
+      linkDisconnectEvidence: true,
+      ownerGraph: oldGraph,
+      info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] },
+    }],
+    { isGraphCurrent: () => false },
+  );
+  assert.equal(configured, 0, "a detached node must never receive the retry");
+  assert.deepEqual(result.recovered, []);
+  assert.deepEqual(result.failed, [{ id: 122, type: "ImpactSwitch", error: "restore graph changed during retry", retry: "graph-switched" }]);
+});
+
 test("#1668 does not wait forever when animation frames are paused", async () => {
   const priorRequestAnimationFrame = globalThis.requestAnimationFrame;
   globalThis.requestAnimationFrame = () => {};

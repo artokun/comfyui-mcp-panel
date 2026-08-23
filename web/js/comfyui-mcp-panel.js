@@ -14377,6 +14377,11 @@ const GRAPH_TOOL_EXECUTORS = {
           try {
             ({ restored: retriedNodes, failed: unrestoredNodes } = await retryNodeRestores(app?.graph, isolation.failures, {
               isCurrent: loadStillTargetsWorkflow,
+              isGraphCurrent: (ownerGraph) =>
+                ownerGraph == null ||
+                ownerGraph === retryTargetGraph ||
+                !!findSubgraphOwner(retryTargetGraph, ownerGraph) ||
+                isSubgraphInRoot(retryTargetGraph, ownerGraph),
             }));
           } finally {
             releaseCanvasInteractionLock(retryInteractionToken, retryCanvas);
@@ -19072,6 +19077,11 @@ const GRAPH_TOOL_EXECUTORS = {
                 const retry = await retryNodeRestores(app?.graph, containedNodeFailureList, {
                   isCurrent: () =>
                     app?.graph === restoreTargetGraph && sameWorkflowObject(activeWorkflowRef(), target),
+                  isGraphCurrent: (ownerGraph) =>
+                    ownerGraph == null ||
+                    ownerGraph === restoreTargetGraph ||
+                    !!findSubgraphOwner(restoreTargetGraph, ownerGraph) ||
+                    isSubgraphInRoot(restoreTargetGraph, ownerGraph),
                 });
                 openRestoreRetried = retry.restored;
                 openRestoreFailures = retry.failed;
