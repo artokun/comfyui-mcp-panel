@@ -14341,12 +14341,10 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       isolation?.restore();
     }
-    // A blank-canvas load has no workflow object before the call: the frontend
-    // creates its active workflow as part of loadGraphData. Bind that newly
-    // created target before the asynchronous retry can yield.
-    if (!retryTargetWorkflow) {
-      retryTargetWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
-    }
+    // A blank-canvas load has no workflow object before the call. The frontend
+    // may create one as part of loadGraphData, but a tab switch during that await
+    // is indistinguishable from the workflow the load created. Do not retry a
+    // failed node without a pre-load identity that can fence the target.
     retryTargetGraph = app?.graph;
     // Retry each contained node ONCE, now that the load has settled and its
     // asynchronously-built widgets usually exist. A node that still throws is
@@ -14354,29 +14352,39 @@ const GRAPH_TOOL_EXECUTORS = {
     let retriedNodes = [];
     let unrestoredNodes = [];
     if (isolation?.failures?.length) {
-      // The retry waits for link state to settle. Freeze the user canvas across
-      // that await so a same-workflow edit cannot be overwritten by the saved
-      // node snapshot. If this frontend exposes no reliable interaction lock,
-      // disclose the failed nodes instead of attempting an unsafe retry.
-      const retryInteractionToken = acquireCanvasInteractionLock(app?.canvas);
-      if (retryInteractionToken === null) {
+      if (!retryTargetWorkflow) {
         unrestoredNodes = isolation.failures.map(({ id, type, error }) => ({
           id,
           type,
           error,
-          retry: "no-interaction-lock",
+          retry: "blank-load-target-unverified",
         }));
       } else {
-        try {
-          ({ restored: retriedNodes, failed: unrestoredNodes } = await retryNodeRestores(app?.graph, isolation.failures, {
-            isCurrent: loadStillTargetsWorkflow,
+        // The retry waits for link state to settle. Freeze the user canvas across
+        // that await so a same-workflow edit cannot be overwritten by the saved
+        // node snapshot. If this frontend exposes no reliable interaction lock,
+        // disclose the failed nodes instead of attempting an unsafe retry.
+        const retryCanvas = app?.canvas;
+        const retryInteractionToken = acquireCanvasInteractionLock(retryCanvas);
+        if (retryInteractionToken === null) {
+          unrestoredNodes = isolation.failures.map(({ id, type, error }) => ({
+            id,
+            type,
+            error,
+            retry: "no-interaction-lock",
           }));
-        } finally {
-          releaseCanvasInteractionLock(retryInteractionToken, app?.canvas);
+        } else {
+          try {
+            ({ restored: retriedNodes, failed: unrestoredNodes } = await retryNodeRestores(app?.graph, isolation.failures, {
+              isCurrent: loadStillTargetsWorkflow,
+            }));
+          } finally {
+            releaseCanvasInteractionLock(retryInteractionToken, retryCanvas);
+          }
         }
       }
     }
-    if (isolation?.failures?.length && !loadStillTargetsWorkflow()) {
+    if (isolation?.failures?.length && retryTargetWorkflow && !loadStillTargetsWorkflow()) {
       throw new Error(
         "graph_load target workflow changed while restore retry was settling; the retry was skipped",
       );
