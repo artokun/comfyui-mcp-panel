@@ -753,7 +753,8 @@ test("panel#1283 wiring: a node the retry could not heal is still disclosed on t
   const openAt = src.indexOf("async workflow_open({");
   const repaintAt = src.indexOf("const targetUuid = workflowStableUuid", openAt);
   const repaint = src.slice(repaintAt, src.indexOf("} catch (err)", repaintAt));
-  assert.match(repaint, /retryNodeRestores\(app\?\.graph, containedNodeFailureList\)/);
+  assert.match(repaint, /retryNodeRestores\(app\?\.graph, containedNodeFailureList, \{/);
+  assert.match(repaint, /isCurrent: \(\) => sameWorkflowObject\(activeWorkflowRef\(\), target\)/);
   assert.match(repaint, /openRestoreFailures = retry\.failed;/);
   assert.match(repaint, /openRestoreRecovered = retry\.recovered/);
 });

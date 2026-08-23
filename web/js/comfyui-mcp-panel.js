@@ -14307,6 +14307,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // same active tab twice, and a later save 409'd), and a soft-reload-then-
     // reload left graph routing stranded on a frozen Unsaved tab.
     const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+    const retryTargetWorkflow = activeWorkflow;
+    const retryTargetGraph = app?.graph;
+    const loadStillTargetsWorkflow = () => {
+      const currentWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+      if (retryTargetWorkflow) return sameWorkflowObject(currentWorkflow, retryTargetWorkflow);
+      return currentWorkflow == null && app?.graph === retryTargetGraph;
+    };
     // #570 P0b — this replaces the ACTIVE canvas with UNTRUSTED external JSON in place. Keep
     // the live workflow instance's identity (so the agent's live session/fence stays intact —
     // re-minting here would reject the agent's own follow-up commands and reset the very
@@ -14337,8 +14344,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // asynchronously-built widgets usually exist. A node that still throws is
     // DISCLOSED below — never folded into a clean `loaded: true`.
     const { restored: retriedNodes, failed: unrestoredNodes } = isolation?.failures?.length
-      ? await retryNodeRestores(app?.graph, isolation.failures)
+      ? await retryNodeRestores(app?.graph, isolation.failures, { isCurrent: loadStillTargetsWorkflow })
       : { restored: [], failed: [] };
+    if (isolation?.failures?.length && !loadStillTargetsWorkflow()) {
+      throw new Error(
+        "graph_load target workflow changed while restore retry was settling; the retry was skipped",
+      );
+    }
     // #874 remaining load path — SubgraphNode.configure seeds host rails from
     // INNER definition widgets, so a saved subgraph host lands at defaults
     // (prompt, dimensions, length, selectors) while the file still holds the
@@ -19018,10 +19030,17 @@ const GRAPH_TOOL_EXECUTORS = {
               // workflow-SERVICE dependency. Same reason `canvasView` exists below.
               const containedNodeFailureList = nodeIsolation?.failures ?? [];
               if (containedNodeFailureList.length) {
-                const retry = await retryNodeRestores(app?.graph, containedNodeFailureList);
+                const retry = await retryNodeRestores(app?.graph, containedNodeFailureList, {
+                  isCurrent: () => sameWorkflowObject(activeWorkflowRef(), target),
+                });
                 openRestoreRetried = retry.restored;
                 openRestoreFailures = retry.failed;
                 openRestoreRecovered = retry.recovered ?? [];
+                if (!sameWorkflowObject(activeWorkflowRef(), target)) {
+                  throw new Error(
+                    "workflow_open target workflow changed while restore retry was settling; the retry was skipped",
+                  );
+                }
               }
               // THREE states, and the null one is the point: `loadRestoreCompleted`
               // answers null when either wrap could not be installed, i.e. the question

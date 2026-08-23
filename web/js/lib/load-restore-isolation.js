@@ -222,13 +222,32 @@ export function installNodeConfigureIsolation(LG) {
  * A recorded failure whose node never landed on the graph (creation failed
  * too, not just configure) cannot be retried; it is disclosed with
  * `retry: "node-not-on-graph"` so the caller does not confuse "restore threw
- * again" with "there is nothing to restore onto".
+ * again" with "there is nothing to restore onto". Callers that can observe
+ * workflow identity may pass `{ isCurrent }`; the check runs before configure
+ * and again after the settle wait so a tab switch cannot retarget the retry.
  */
-export async function retryNodeRestores(graph, failures) {
+export async function retryNodeRestores(graph, failures, options = {}) {
   const restored = [];
   const failed = [];
   const recovered = [];
+  const isCurrent = () => {
+    if (typeof options?.isCurrent !== "function") return true;
+    try {
+      return options.isCurrent() === true;
+    } catch {
+      return false;
+    }
+  };
   for (const failure of failures ?? []) {
+    if (!isCurrent()) {
+      failed.push({
+        id: failure?.id ?? null,
+        type: failure?.type ?? null,
+        error: "active workflow changed during restore retry",
+        retry: "workflow-switched",
+      });
+      continue;
+    }
     const node =
       failure?.id != null && typeof graph?.getNodeById === "function"
         ? graph.getNodeById(failure.id)
@@ -256,6 +275,15 @@ export async function retryNodeRestores(graph, failures) {
       continue;
     }
     if (linkDisconnectCrash) await waitForLinkStateToSettle();
+    if (!isCurrent()) {
+      failed.push({
+        id: failure.id,
+        type: failure.type,
+        error: "active workflow changed during restore retry",
+        retry: "workflow-switched",
+      });
+      continue;
+    }
     let retryError = null;
     try {
       node.configure(failure.info);

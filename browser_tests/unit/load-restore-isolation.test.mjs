@@ -341,6 +341,31 @@ test("#1668 does not wait forever when animation frames are paused", async () =>
   }
 });
 
+test("#1668 skips the retry when the workflow changes during the settle wait", async () => {
+  let configured = 0;
+  let checks = 0;
+  const node = {
+    id: 122,
+    inputs: [{ link: 901 }],
+    outputs: [],
+    serialize: () => ({ id: 122, type: "ImpactSwitch", widgets_values: ["saved"] }),
+    configure: () => {
+      configured += 1;
+    },
+  };
+  const result = await retryNodeRestores(
+    { getNodeById: () => node },
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+    { isCurrent: () => ++checks === 1 },
+  );
+  assert.equal(configured, 0, "the old node must not be configured after a workflow switch");
+  assert.deepEqual(result.restored, []);
+  assert.deepEqual(result.recovered, []);
+  assert.deepEqual(result.failed, [
+    { id: 122, type: "ImpactSwitch", error: "active workflow changed during restore retry", retry: "workflow-switched" },
+  ]);
+});
+
 test("#1668 cannot upgrade an unrelated initial failure from a link-shaped retry", async () => {
   const node = {
     id: 122,
