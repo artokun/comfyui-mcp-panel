@@ -14308,9 +14308,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // reload left graph routing stranded on a frozen Unsaved tab.
     const activeWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
     let retryTargetWorkflow = activeWorkflow;
-    const retryTargetGraph = app?.graph;
+    let retryTargetGraph = app?.graph;
     const loadStillTargetsWorkflow = () => {
       const currentWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
+      if (app?.graph !== retryTargetGraph) return false;
       if (retryTargetWorkflow) return sameWorkflowObject(currentWorkflow, retryTargetWorkflow);
       return currentWorkflow == null && app?.graph === retryTargetGraph;
     };
@@ -14330,7 +14331,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // construction defaults and links/groups are never applied, while the load
     // reports a clean success. With the throw contained, the sequence
     // completes and only the throwing node needs the post-load retry below.
-    const isolation = installNodeConfigureIsolation(LG);
+    const isolation = installNodeConfigureIsolation(LG, app?.graph);
     try {
       if (activeWorkflow && typeof activeWorkflow === "object") {
         await app.loadGraphData(...loadArgs, { __cmcpKeepInstance: true });
@@ -14346,6 +14347,7 @@ const GRAPH_TOOL_EXECUTORS = {
     if (!retryTargetWorkflow) {
       retryTargetWorkflow = app?.extensionManager?.workflow?.activeWorkflow || null;
     }
+    retryTargetGraph = app?.graph;
     // Retry each contained node ONCE, now that the load has settled and its
     // asynchronously-built widgets usually exist. A node that still throws is
     // DISCLOSED below — never folded into a clean `loaded: true`.
@@ -19010,7 +19012,7 @@ const GRAPH_TOOL_EXECUTORS = {
             // handled: both wraps answer null, the fold answers UNKNOWN, and the open
             // behaves exactly as it did before this change.
             const LGForOpen = liteGraphGlobal();
-            const nodeIsolation = installNodeConfigureIsolation(LGForOpen);
+            const nodeIsolation = installNodeConfigureIsolation(LGForOpen, app?.graph);
             const graphWatch = installGraphConfigureWatch(LGForOpen);
             // The load is INSIDE the try whose finally strips the marker: the payload
             // carrying the marker is handed over the moment this call starts, so a
@@ -19026,6 +19028,7 @@ const GRAPH_TOOL_EXECUTORS = {
                 nodeIsolation?.restore();
                 graphWatch?.restore();
               }
+              const restoreTargetGraph = app?.graph;
               // Retry each contained node ONCE now that the load has settled — the
               // asynchronously-built widgets that made it throw usually exist by then, and
               // a healed node makes the content comparison below honest rather than
@@ -19037,12 +19040,13 @@ const GRAPH_TOOL_EXECUTORS = {
               const containedNodeFailureList = nodeIsolation?.failures ?? [];
               if (containedNodeFailureList.length) {
                 const retry = await retryNodeRestores(app?.graph, containedNodeFailureList, {
-                  isCurrent: () => sameWorkflowObject(activeWorkflowRef(), target),
+                  isCurrent: () =>
+                    app?.graph === restoreTargetGraph && sameWorkflowObject(activeWorkflowRef(), target),
                 });
                 openRestoreRetried = retry.restored;
                 openRestoreFailures = retry.failed;
                 openRestoreRecovered = retry.recovered ?? [];
-                if (!sameWorkflowObject(activeWorkflowRef(), target)) {
+                if (app?.graph !== restoreTargetGraph || !sameWorkflowObject(activeWorkflowRef(), target)) {
                   throw failOpenRebindUnknown(
                     new Error(
                       "workflow_open target workflow changed while restore retry was settling; the retry was skipped",

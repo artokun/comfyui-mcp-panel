@@ -207,11 +207,16 @@ test("#1668 records the narrow link-disconnect crash and verifies a linked-widge
     if (info.id === 122) throw new TypeError("t.findInputSlot is not a function");
     return base.call(this, info);
   };
-  const isolation = installNodeConfigureIsolation(LG);
   const node = new LG.LGraphNode(122);
   node.type = "ImpactSwitch";
   node.inputs = [{ name: "select", link: 901, widget: { name: "select" } }];
   node.widgets = [{ name: "select" }, { name: "other" }];
+  const brokenFarEnd = { id: 321 };
+  const graph = {
+    _links: new Map([[901, { id: 901, origin_id: 321, target_id: 122 }]]),
+    getNodeById: (id) => (id === 122 ? node : id === 321 ? brokenFarEnd : null),
+  };
+  const isolation = installNodeConfigureIsolation(LG, graph);
   const info = {
     id: 122,
     type: "ImpactSwitch",
@@ -227,6 +232,7 @@ test("#1668 records the narrow link-disconnect crash and verifies a linked-widge
     isolation.restore();
   }
   assert.equal(isolation.failures[0].linkDisconnectCrash, true);
+  assert.equal(isolation.failures[0].linkDisconnectEvidence, true);
 
   node.serialize = () => ({
     ...info,
@@ -235,7 +241,6 @@ test("#1668 records the narrow link-disconnect crash and verifies a linked-widge
   node.configure = () => {
     // The second call is allowed to succeed after the link state settles.
   };
-  const graph = { getNodeById: (id) => (id === 122 ? node : null) };
   const result = await retryNodeRestores(graph, isolation.failures);
   assert.deepEqual(result.restored, [{ id: 122, type: "ImpactSwitch" }]);
   assert.deepEqual(result.failed, []);
@@ -274,7 +279,7 @@ test("#1668 does not bless an unrelated exception on the retry", async () => {
   };
   const result = await retryNodeRestores(
     { getNodeById: () => node },
-    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, linkDisconnectEvidence: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
   );
   assert.deepEqual(result.restored, []);
   assert.deepEqual(result.recovered, []);
@@ -292,7 +297,7 @@ test("#1668 does not bless the same link-disconnect exception on the retry", asy
   };
   const result = await retryNodeRestores(
     { getNodeById: () => node },
-    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, linkDisconnectEvidence: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
   );
   assert.deepEqual(result.restored, []);
   assert.deepEqual(result.recovered, []);
@@ -310,7 +315,7 @@ test("#1668 verifies against the untouched snapshot when retry configure mutates
   };
   const result = await retryNodeRestores(
     { getNodeById: () => node },
-    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, linkDisconnectEvidence: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
   );
   assert.deepEqual(result.restored, []);
   assert.deepEqual(result.recovered, []);
@@ -329,12 +334,30 @@ test("#1668 does not bless a link-shaped retry without residual links", async ()
   };
   const result = await retryNodeRestores(
     { getNodeById: () => node },
-    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, linkDisconnectEvidence: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
   );
   assert.deepEqual(result.restored, []);
   assert.deepEqual(result.recovered, []);
   assert.deepEqual(result.failed, [
     { id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", retry: "no-residual-links" },
+  ]);
+});
+
+test("#1668 does not treat the message alone as restore evidence", async () => {
+  const node = {
+    inputs: [{ link: 901 }],
+    outputs: [],
+    serialize: () => ({ id: 122, type: "ImpactSwitch", widgets_values: ["saved"] }),
+    configure: () => {},
+  };
+  const result = await retryNodeRestores(
+    { getNodeById: () => node },
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+  );
+  assert.deepEqual(result.restored, []);
+  assert.deepEqual(result.recovered, []);
+  assert.deepEqual(result.failed, [
+    { id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", retry: "link-disconnect-unverified" },
   ]);
 });
 
@@ -351,7 +374,7 @@ test("#1668 does not wait forever when animation frames are paused", async () =>
   try {
     const result = await retryNodeRestores(
       { getNodeById: () => node },
-      [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+      [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, linkDisconnectEvidence: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
     );
     assert.deepEqual(result.restored, [{ id: 122, type: "ImpactSwitch" }]);
     assert.deepEqual(result.failed, []);
@@ -375,7 +398,7 @@ test("#1668 skips the retry when the workflow changes during the settle wait", a
   };
   const result = await retryNodeRestores(
     { getNodeById: () => node },
-    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+      [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, linkDisconnectEvidence: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
     { isCurrent: () => ++checks === 1 },
   );
   assert.equal(configured, 0, "the old node must not be configured after a workflow switch");

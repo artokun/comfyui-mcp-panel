@@ -38,6 +38,33 @@ function cloneSerializedValue(value, seen = new Map()) {
   return clone;
 }
 
+function sameNodeId(left, right) {
+  return left === right || (left != null && right != null && String(left) === String(right));
+}
+
+function graphLinkEntries(graph) {
+  const map = graph?._links;
+  if (map && typeof map.entries === "function") return [...map.entries()];
+  const links = graph?.links;
+  if (links && typeof links === "object") return Object.keys(links).map((key) => [key, links[key]]);
+  return [];
+}
+
+function hasBrokenLinkEndpoint(graph, node, err) {
+  const nodeId = node?.id;
+  if (nodeId == null || typeof graph?.getNodeById !== "function") return false;
+  const message = String(err?.message ?? "");
+  const method = /findOutputSlot/.test(message) ? "findOutputSlot" : "findInputSlot";
+  for (const [, link] of graphLinkEntries(graph)) {
+    if (!link) continue;
+    const farId = sameNodeId(link.origin_id, nodeId) ? link.target_id : sameNodeId(link.target_id, nodeId) ? link.origin_id : null;
+    if (farId == null) continue;
+    const far = graph.getNodeById(farId);
+    if (far != null && typeof far[method] !== "function") return true;
+  }
+  return false;
+}
+
 function sameSerializedValue(a, b) {
   const seen = new Map();
   const equal = (left, right) => {
@@ -167,7 +194,7 @@ function waitForLinkStateToSettle() {
  * on it; `loadRestoreCompleted` explains why the graph-level count is the one
  * that licenses the verdict and this one must not.
  */
-export function installNodeConfigureIsolation(LG) {
+export function installNodeConfigureIsolation(LG, graph = null) {
   const proto = LG?.LGraphNode?.prototype;
   if (!proto || typeof proto.configure !== "function") return null;
   const original = proto.configure;
@@ -192,6 +219,7 @@ export function installNodeConfigureIsolation(LG) {
         type: info?.type ?? this?.type ?? null,
         error: errorText(err),
         linkDisconnectCrash: isLinkDisconnectCrash(err),
+        linkDisconnectEvidence: isLinkDisconnectCrash(err) && hasBrokenLinkEndpoint(graph, this, err),
         // configure implementations can mutate their input before throwing;
         // retain an independent serialized snapshot for the retry/verification.
         info: serializedSnapshot,
@@ -262,6 +290,15 @@ export async function retryNodeRestores(graph, failures, options = {}) {
       continue;
     }
     const linkDisconnectCrash = failure.linkDisconnectCrash === true;
+    if (linkDisconnectCrash && failure.linkDisconnectEvidence !== true) {
+      failed.push({
+        id: failure.id,
+        type: failure.type,
+        error: failure.error ?? "link-disconnect restore failure",
+        retry: "link-disconnect-unverified",
+      });
+      continue;
+    }
     // Check the same discriminator safeRemoveNode uses while the failed
     // restore's residual link state is still observable. Do not let configure
     // manufacture links during the retry and then use those as proof.
@@ -513,6 +550,9 @@ export function loadRestoreCompleted({ nodeIsolation, graphWatch, recoveredFailu
     (Array.isArray(recoveredFailures) ? recoveredFailures : []).map((failure) => String(failure?.id)),
   );
   return nodeFailures.every(
-    (failure) => failure?.linkDisconnectCrash === true && recoveredIds.has(String(failure?.id)),
+    (failure) =>
+      failure?.linkDisconnectCrash === true &&
+      failure?.linkDisconnectEvidence === true &&
+      recoveredIds.has(String(failure?.id)),
   );
 }
