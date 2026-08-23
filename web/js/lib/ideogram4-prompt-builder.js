@@ -149,3 +149,302 @@ export function ideogram4PromptBuilderRefusal(widgetName, nodeId) {
     `string widgets that reach the render normally.`
   );
 }
+
+function findWidget(node, name) {
+  return Array.isArray(node?.widgets) ? node.widgets.find((w) => w?.name === name) : null;
+}
+
+function stringWidgetValue(node, name) {
+  const value = findWidget(node, name)?.value;
+  return typeof value === "string" ? value : value == null ? "" : String(value);
+}
+
+function currentStylePalette(node) {
+  const widgetValue = findWidget(node, "style_palette_data")?.value;
+  if (typeof widgetValue === "string") {
+    try {
+      const parsed = JSON.parse(widgetValue);
+      if (Array.isArray(parsed) && parsed.every((color) => typeof color === "string")) return parsed;
+    } catch {
+      // Fall through to the live editor state. A malformed hidden widget is not
+      // evidence that the editor has no palette.
+    }
+  }
+  return Array.isArray(node?._stylePalette) ? node._stylePalette : [];
+}
+
+function finiteBoxNumber(value, field, index) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`elements_data[${index}].${field} must be a finite number`);
+  }
+  return value;
+}
+
+function normalizeRegionBoxes(value) {
+  let parsed = value;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return [];
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error("elements_data must be a JSON array of Ideogram region objects");
+    }
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("elements_data must be a JSON array of Ideogram region objects");
+  }
+  return parsed.map((box, index) => {
+    if (!box || typeof box !== "object" || Array.isArray(box)) {
+      throw new Error(`elements_data[${index}] must be an object`);
+    }
+    const x = finiteBoxNumber(box.x, "x", index);
+    const y = finiteBoxNumber(box.y, "y", index);
+    const w = finiteBoxNumber(box.w, "w", index);
+    const h = finiteBoxNumber(box.h, "h", index);
+    if (x < 0 || y < 0 || w < 0 || h < 0 || x + w > 1 || y + h > 1) {
+      throw new Error(`elements_data[${index}] has a region outside the normalized 0..1 canvas`);
+    }
+    const text = box.text == null ? "" : box.text;
+    const desc = box.desc == null ? "" : box.desc;
+    if (typeof text !== "string" || typeof desc !== "string") {
+      throw new Error(`elements_data[${index}].text and .desc must be strings when present`);
+    }
+    const palette = box.palette == null ? [] : box.palette;
+    if (!Array.isArray(palette) || palette.some((color) => typeof color !== "string")) {
+      throw new Error(`elements_data[${index}].palette must be an array of strings when present`);
+    }
+    return {
+      x,
+      y,
+      w,
+      h,
+      type: box.type === "text" ? "text" : "obj",
+      text,
+      desc,
+      palette: [...palette],
+      ...(box.nobbox === true ? { nobbox: true } : {}),
+      ...(box.locked === true ? { locked: true } : {}),
+    };
+  });
+}
+
+function regionToCaptionElement(box) {
+  const element = { type: box.type, desc: box.desc };
+  if (box.type === "text") element.text = box.text;
+  if (!box.nobbox) {
+    // KJNodes' import callback accepts the same 0..1000 y/x/y/x order that its
+    // caption exporter emits. Round at the boundary so the rehydrated editor has
+    // the exact representation its own serializer will produce.
+    element.bbox = [
+      Math.round(box.y * 1000),
+      Math.round(box.x * 1000),
+      Math.round((box.y + box.h) * 1000),
+      Math.round((box.x + box.w) * 1000),
+    ];
+  }
+  if (box.palette.length) element.color_palette = [...box.palette];
+  return element;
+}
+
+function currentCaptionForRegions(node, boxes) {
+  const caption = {
+    compositional_deconstruction: {
+      background: stringWidgetValue(node, "background"),
+      elements: boxes.map(regionToCaptionElement),
+    },
+  };
+  const highLevel = stringWidgetValue(node, "high_level_description");
+  if (highLevel) caption.high_level_description = highLevel;
+
+  const style = stringWidgetValue(node, "style");
+  if (style === "photo" || style === "art_style") {
+    const styleDescription = {
+      aesthetics: stringWidgetValue(node, "aesthetics"),
+      lighting: stringWidgetValue(node, "lighting"),
+      medium: stringWidgetValue(node, "medium"),
+    };
+    if (style === "photo") styleDescription.photo = stringWidgetValue(node, "style.photo");
+    else styleDescription.art_style = stringWidgetValue(node, "style.art_style");
+    const palette = currentStylePalette(node);
+    if (palette.length) {
+      styleDescription.color_palette = [...palette];
+    }
+    caption.style_description = styleDescription;
+  }
+  return caption;
+}
+
+function connectedImportSource(node) {
+  try {
+    const input = (node?.inputs ?? []).find((entry) => entry?.name === "import_json");
+    const link = input?.link;
+    if (link == null) return null;
+    const source = node.graph?.links?.[link] ?? null;
+    if (!source) return null;
+    // KJNodes deliberately keeps muted/bypassed links in the graph while treating
+    // them as disconnected for queue-time authority.
+    const origin = node.graph?.getNodeById?.(source.origin_id);
+    if (origin && [2, 4].includes(origin.mode)) return null;
+    return source;
+  } catch {
+    return null;
+  }
+}
+
+function regionShape(box) {
+  return {
+    type: box?.type === "text" ? "text" : "obj",
+    text: typeof box?.text === "string" ? box.text : "",
+    desc: typeof box?.desc === "string" ? box.desc : "",
+    x: Number(box?.x),
+    y: Number(box?.y),
+    w: Number(box?.w),
+    h: Number(box?.h),
+    nobbox: box?.nobbox === true,
+    palette: Array.isArray(box?.palette) ? box.palette.map((color) => String(color)) : [],
+  };
+}
+
+function sameRegionShape(actual, expected) {
+  const a = regionShape(actual);
+  const e = regionShape(expected);
+  return (
+    a.type === e.type &&
+    a.text === e.text &&
+    a.desc === e.desc &&
+    a.nobbox === e.nobbox &&
+    a.palette.length === e.palette.length &&
+    a.palette.every((color, index) => color === e.palette[index]) &&
+    (e.nobbox || ["x", "y", "w", "h"].every((key) => Math.abs(a[key] - e[key]) <= 0.001))
+  );
+}
+
+function cloneEditorBoxes(boxes) {
+  return (Array.isArray(boxes) ? boxes : []).map((box) => ({
+    ...box,
+    ...(Array.isArray(box?.palette) ? { palette: [...box.palette] } : {}),
+  }));
+}
+
+function readSerializedRegions(elementsWidget) {
+  const raw = elementsWidget.serializeValue();
+  // KJNodes uses an empty string for an empty editor, not JSON `[]`.
+  if (raw === "") return [];
+  const parsed = JSON.parse(raw);
+  return Array.isArray(parsed) ? parsed : null;
+}
+
+/**
+ * Rehydrate the live KJNodes editor from an elements_data region list.
+ *
+ * The node's own `onExecuted({caption:[…]})` callback is the frontend half of its
+ * supported `import_json` path: KJNodes parses the caption, rebuilds `_boxes`,
+ * refreshes the hidden widgets, and repaints the editor. Calling the generic widget
+ * setter cannot do that because `serializeValue()` ignores `widget.value`.
+ *
+ * An active import_json connection is authoritative in "always" mode, and while
+ * the local editor is empty in "when empty" mode. In the latter mode, existing
+ * local regions are intentionally authoritative, matching KJNodes' serializer.
+ * Refuse only the source-authoritative cases and tell the caller to update the
+ * connected source.
+ */
+export function applyIdeogram4PromptBuilderWrite(
+  node,
+  value,
+  { beforeChange, afterChange, setDirty } = {},
+) {
+  if (classifyIdeogram4PromptBuilderWrite(node, IDEOGRAM4_ELEMENTS_WIDGET) !== "derived") {
+    throw new Error(
+      `Ideogram4PromptBuilder node ${node?.id ?? "?"} does not expose the live elements editor serializer; ` +
+        "refresh the ComfyUI tab and retry.",
+    );
+  }
+  const importLink = connectedImportSource(node);
+  const boxes = normalizeRegionBoxes(value);
+  const elementsWidget = findWidget(node, IDEOGRAM4_ELEMENTS_WIDGET);
+  let current;
+  try {
+    current = readSerializedRegions(elementsWidget);
+  } catch {
+    throw new Error(
+      `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} did not expose a readable elements_data serialization; ` +
+        "nothing was changed.",
+    );
+  }
+  if (!Array.isArray(current)) {
+    throw new Error(
+      `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} returned a non-array elements_data serialization; ` +
+        "nothing was changed.",
+    );
+  }
+  const importMode = stringWidgetValue(node, "import_mode");
+  if (importLink && (importMode === "always" || current.length === 0)) {
+    throw new Error(
+      `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} has a live import_json connection, which is ` +
+        "the queue's authoritative region source in the current import mode. Update the connected " +
+        "PrimitiveStringMultiline value or leave local regions in place before using panel_set_widget.",
+    );
+  }
+  if (typeof node?.onExecuted !== "function") {
+    throw new Error(
+      `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} has no live import callback; ` +
+        "refresh the ComfyUI tab and retry.",
+    );
+  }
+
+  const previousBoxes = cloneEditorBoxes(node._boxes);
+  const previousPalette = Array.isArray(node._stylePalette) ? [...node._stylePalette] : node._stylePalette;
+  const previousLastImported = node._lastImported;
+  const previousWidgets = (node.widgets ?? []).map((widget) => ({ widget, value: widget.value }));
+  const previousSize = Array.isArray(node.size) ? [...node.size] : null;
+  beforeChange?.();
+  try {
+    node.onExecuted({ caption: [JSON.stringify(currentCaptionForRegions(node, boxes))] });
+    // The callback is the mutation boundary. Verify the exact semantic fields that
+    // the caption format carries before reporting success; a callback that exists but
+    // is from an incompatible KJNodes build must not become a silent success.
+    const serialized = readSerializedRegions(elementsWidget);
+    if (
+      !Array.isArray(serialized) ||
+      serialized.length !== boxes.length ||
+      serialized.some((box, index) => !sameRegionShape(box, boxes[index]))
+    ) {
+      throw new Error(
+        `Ideogram4PromptBuilderKJ node ${node?.id ?? "?"} did not rehydrate elements_data to the requested ` +
+          "regions; nothing was reported as applied.",
+      );
+    }
+    // The caption format has no lock bit; restore that editor-only flag after the
+    // node's own import callback and refresh the serialized hidden widget so a locked
+    // region is not silently unlocked by a programmatic replacement.
+    for (let i = 0; i < boxes.length; i++) {
+      if (boxes[i].locked === true && node._boxes?.[i]) node._boxes[i].locked = true;
+    }
+    elementsWidget.value = JSON.stringify(node._boxes ?? serialized);
+  } catch (error) {
+    // The callback is third-party node code. If a future KJNodes build changes its
+    // caption semantics, restore every state we can observe before exposing the
+    // failure to the generic handler.
+    node._boxes = previousBoxes;
+    node._stylePalette = previousPalette;
+    node._lastImported = previousLastImported;
+    for (const { widget, value: previousValue } of previousWidgets) widget.value = previousValue;
+    if (previousSize && typeof node.setSize === "function") node.setSize(previousSize);
+    throw error;
+  } finally {
+    afterChange?.();
+  }
+  setDirty?.();
+  return {
+    ideogram4_prompt_builder: {
+      node_id: node?.id,
+      widget: IDEOGRAM4_ELEMENTS_WIDGET,
+      driven: true,
+      editor_driven: true,
+      previous_regions: current.length,
+      regions: boxes.length,
+      verified: true,
+    },
+  };
+}

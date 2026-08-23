@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 
 import {
   classifyIdeogram4PromptBuilderWrite,
+  applyIdeogram4PromptBuilderWrite,
   ideogram4PromptBuilderRefusal,
   IDEOGRAM4_PROMPT_BUILDER_TYPE,
   IDEOGRAM4_ELEMENTS_WIDGET,
@@ -123,7 +124,7 @@ test("#1569: the guard is WIRED into graph_set_widget, ahead of the generic writ
   // failure this asserts against. The refusal has to run BEFORE runSetWidget, or the write
   // lands and reports success before anyone asks whether it can reach the render.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  assert.match(src, /import \{\s*classifyIdeogram4PromptBuilderWrite,\s*ideogram4PromptBuilderRefusal,\s*\} from "\.\/lib\/ideogram4-prompt-builder\.js";/);
+  assert.match(src, /import \{[\s\S]*classifyIdeogram4PromptBuilderWrite,[\s\S]*applyIdeogram4PromptBuilderWrite,[\s\S]*ideogram4PromptBuilderRefusal,[\s\S]*\} from "\.\/lib\/ideogram4-prompt-builder\.js";/);
 
   const handler = src.slice(src.indexOf("async graph_set_widget("));
   assert.ok(handler.startsWith("async graph_set_widget("), "graph_set_widget handler not found");
@@ -133,4 +134,173 @@ test("#1569: the guard is WIRED into graph_set_widget, ahead of the generic writ
   assert.ok(writeAt > 0, "runSetWidget call site not found in graph_set_widget");
   assert.ok(guardAt < writeAt, "the guard must run BEFORE runSetWidget");
   assert.match(handler.slice(guardAt, writeAt), /throw new Error\(ideogram4PromptBuilderRefusal\(widget, node\.id\)\)/);
+});
+
+function editorFixture({ boxes = [], importLink = null, importMode = "when empty", originMode = 0 } = {}) {
+  const node = {
+    id: 217,
+    type: TYPE,
+    _boxes: boxes.map((box) => ({ ...box })),
+    _stylePalette: ["#112233"],
+    inputs: [{ name: "import_json", link: importLink }],
+    graph: {
+      links: importLink == null ? {} : { [importLink]: { origin_id: 91 } },
+      getNodeById: () => ({ mode: originMode }),
+    },
+    widgets: [
+      { name: "high_level_description", value: "existing subject" },
+      { name: "background", value: "existing background" },
+      { name: "style", value: "photo" },
+      { name: "style.photo", value: "film still" },
+      { name: "aesthetics", value: "grainy" },
+      { name: "lighting", value: "soft" },
+      { name: "medium", value: "35mm" },
+      { name: "import_mode", value: importMode },
+      { name: "style_palette_data", value: "[\"#112233\"]" },
+      {
+        name: IDEOGRAM4_ELEMENTS_WIDGET,
+        value: "",
+        // KJNodes returns an empty string, rather than JSON [], for an empty editor.
+        serializeValue: () => (node._boxes.length ? JSON.stringify(node._boxes) : ""),
+      },
+    ],
+  };
+  node.onExecuted = (message) => {
+    const caption = JSON.parse(message.caption[0]);
+    const elements = caption.compositional_deconstruction.elements;
+    node._boxes = elements.map((element) => {
+      const [ymin, xmin, ymax, xmax] = element.bbox ?? [30, 30, 170, 250];
+      return {
+        x: xmin / 1000,
+        y: ymin / 1000,
+        w: (xmax - xmin) / 1000,
+        h: (ymax - ymin) / 1000,
+        type: element.type,
+        text: element.text || "",
+        desc: element.desc || "",
+        palette: element.color_palette || [],
+        ...(element.bbox ? {} : { nobbox: true }),
+      };
+    });
+    node._stylePalette = caption.style_description?.color_palette ?? [];
+  };
+  return node;
+}
+
+test("#1650: elements_data rehydrates the live editor and verifies the serialized regions", () => {
+  const node = editorFixture({
+    boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2, type: "obj", text: "", desc: "old" }],
+  });
+  node.widgets.find((w) => w.name === "style_palette_data").value = "[\"#abcdef\"]";
+  const calls = [];
+  const result = applyIdeogram4PromptBuilderWrite(
+    node,
+    JSON.stringify([
+      {
+        x: 0.1,
+        y: 0.2,
+        w: 0.3,
+        h: 0.4,
+        type: "text",
+        text: "NEW",
+        desc: "new region",
+        palette: ["#abcdef"],
+        locked: true,
+      },
+    ]),
+    {
+      beforeChange: () => calls.push("before"),
+      afterChange: () => calls.push("after"),
+      setDirty: () => calls.push("dirty"),
+    },
+  );
+  assert.deepEqual(calls, ["before", "after", "dirty"]);
+  assert.deepEqual(result.ideogram4_prompt_builder, {
+    node_id: 217,
+    widget: "elements_data",
+    driven: true,
+    editor_driven: true,
+    previous_regions: 1,
+    regions: 1,
+    verified: true,
+  });
+  assert.equal(node._boxes[0].text, "NEW");
+  assert.equal(node._boxes[0].locked, true, "editor-only lock state survives the import route");
+  assert.equal(node.widgets.find((w) => w.name === IDEOGRAM4_ELEMENTS_WIDGET).value, JSON.stringify(node._boxes));
+  assert.equal(node.widgets.find((w) => w.name === "high_level_description").value, "existing subject");
+  assert.deepEqual(node._stylePalette, ["#abcdef"], "the live hidden palette value is preserved");
+});
+
+test("#1650: an empty region list clears the editor without requiring an import wire", () => {
+  const node = editorFixture({
+    boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2, type: "obj", text: "", desc: "old" }],
+  });
+  const result = applyIdeogram4PromptBuilderWrite(node, "[]");
+  assert.equal(result.ideogram4_prompt_builder.previous_regions, 1);
+  assert.equal(result.ideogram4_prompt_builder.regions, 0);
+  assert.deepEqual(node._boxes, []);
+});
+
+test("#1650: always-mode import_json remains authoritative", () => {
+  const node = editorFixture({ importLink: 7, importMode: "always", boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
+  assert.throws(
+    () => applyIdeogram4PromptBuilderWrite(node, "[]"),
+    /live import_json connection.*authoritative/,
+  );
+  assert.equal(node._boxes.length, 1, "the ambiguous write does not touch the editor");
+});
+
+test("#1650: when-empty import_json permits replacement while local regions exist", () => {
+  const node = editorFixture({ importLink: 7, boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
+  const result = applyIdeogram4PromptBuilderWrite(node, "[]");
+  assert.equal(result.ideogram4_prompt_builder.verified, true);
+  assert.deepEqual(node._boxes, []);
+});
+
+test("#1650: muted import_json links do not block local editor writes", () => {
+  const node = editorFixture({ importLink: 7, importMode: "always", originMode: 2, boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
+  const result = applyIdeogram4PromptBuilderWrite(node, "[]");
+  assert.equal(result.ideogram4_prompt_builder.verified, true);
+  assert.deepEqual(node._boxes, []);
+});
+
+test("#1650: nobbox regions retain unplaced semantics through rehydration", () => {
+  const node = editorFixture({ boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2 }] });
+  const result = applyIdeogram4PromptBuilderWrite(node, JSON.stringify([
+    { x: 0.5, y: 0.5, w: 0.1, h: 0.1, nobbox: true, desc: "unplaced" },
+  ]));
+  assert.equal(result.ideogram4_prompt_builder.verified, true);
+  assert.equal(node._boxes[0].nobbox, true);
+  assert.equal(node._boxes[0].desc, "unplaced");
+});
+
+test("#1650: incompatible callback failures roll back the editor", () => {
+  const node = editorFixture({ boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2, desc: "old" }] });
+  const before = JSON.stringify(node._boxes);
+  node.onExecuted = () => { node._boxes = [{ x: 0.4, y: 0.4, w: 0.1, h: 0.1 }]; };
+  assert.throws(() => applyIdeogram4PromptBuilderWrite(node, "[]"), /did not rehydrate/);
+  assert.equal(JSON.stringify(node._boxes), before);
+});
+
+test("#1650: palette mismatches are not reported as verified", () => {
+  const node = editorFixture({ boxes: [{ x: 0, y: 0, w: 0.2, h: 0.2, palette: ["#00f"] }] });
+  const before = JSON.stringify(node._boxes);
+  node.onExecuted = () => { node._boxes = [{ x: 0, y: 0, w: 0.2, h: 0.2, palette: ["#00f"] }]; };
+  assert.throws(
+    () => applyIdeogram4PromptBuilderWrite(node, JSON.stringify([
+      { x: 0, y: 0, w: 0.2, h: 0.2, palette: ["#f00"] },
+    ])),
+    /did not rehydrate/,
+  );
+  assert.equal(JSON.stringify(node._boxes), before);
+});
+
+test("#1650: malformed region input is rejected before opening an undo step", () => {
+  const node = editorFixture();
+  let before = 0;
+  assert.throws(
+    () => applyIdeogram4PromptBuilderWrite(node, JSON.stringify([{ x: 0, y: 0, w: 2, h: 0.1 }]), { beforeChange: () => before++ }),
+    /outside the normalized/,
+  );
+  assert.equal(before, 0);
 });
