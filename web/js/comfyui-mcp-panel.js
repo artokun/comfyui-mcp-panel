@@ -453,6 +453,7 @@ import {
 } from "./lib/rgthree-fast-groups.js";
 import {
   classifyIdeogram4PromptBuilderWrite,
+  applyIdeogram4PromptBuilderWrite,
   ideogram4PromptBuilderRefusal,
 } from "./lib/ideogram4-prompt-builder.js";
 import {
@@ -14515,16 +14516,22 @@ const GRAPH_TOOL_EXECUTORS = {
     if (classifyRgthreeFastGroupsWrite(node, widget) === "derived") {
       throw new Error(rgthreeFastGroupsRefusal(widget, node.id, node.type));
     }
-    // comfyui-mcp#1569: KJNodes' Ideogram4PromptBuilderKJ holds its regions in the node's
-    // own in-browser editor and installs a `serializeValue()` on `elements_data` that builds
-    // the queued value from that state without ever reading the widget. ComfyUI queues
-    // `serializeValue()`, so a direct write showed a clean success AND showed up in
-    // panel_query_graph while the render kept using the old regions. Refused loudly, keyed to
-    // the node type, the widget name, AND the live presence of the serializer — so nothing
-    // else on the node is affected and the guard cannot outlive the pack behaviour that
-    // justifies it. See the lib for the four source facts and for why style_palette_data,
-    // which has no serializer of its own, is deliberately still writable.
+    // comfyui-mcp#1569/#1650: KJNodes' Ideogram4PromptBuilderKJ holds its regions in the
+    // node's own in-browser editor and installs a `serializeValue()` on `elements_data` that
+    // builds the queued value from that state without ever reading the widget. Route this
+    // one derived write through the node's import callback, which is the frontend half of
+    // its supported `import_json` path, and verify the callback's serialized result before
+    // reporting success. A live import_json wire remains refused by the helper because its
+    // source is authoritative at queue time. Other widgets on the node remain on the normal
+    // path. See the lib for the mechanism and the fail-closed validation.
     if (classifyIdeogram4PromptBuilderWrite(node, widget) === "derived") {
+      if (widget === "elements_data") {
+        return applyIdeogram4PromptBuilderWrite(node, value, {
+          beforeChange: () => graph.beforeChange(),
+          afterChange: () => graph.afterChange(),
+          setDirty: () => graph.setDirtyCanvas(true, true),
+        });
+      }
       throw new Error(ideogram4PromptBuilderRefusal(widget, node.id));
     }
     // #1549: MiniMaxH3PromptBuilder's editor Save writes prompt_text and builder_state
