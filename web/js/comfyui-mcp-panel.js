@@ -13328,9 +13328,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // can never quote a ceiling the runtime does not enforce.
     const cap = Math.min(Math.max(Number(limit ?? 40), 1), LIMIT_CEILING);
     const lc = (s) => String(s ?? "").toLowerCase();
-    // Safe stringify for widget values — a BigInt or circular/custom value would
-    // throw in JSON.stringify and fail the whole find call; fall back to String().
+    // Preserve string widget values exactly so searches can match embedded quotes. Non-string
+    // values still use JSON for readable matching, while exotic values stay non-fatal.
     const safeJson = (v) => {
+      if (typeof v === "string") return v;
       try {
         return JSON.stringify(v) ?? String(v);
       } catch {
