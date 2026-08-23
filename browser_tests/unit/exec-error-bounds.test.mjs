@@ -26,6 +26,8 @@ import {
   applyRuntimeExecFailure,
 } from "../../web/js/lib/exec-error-bounds.js";
 import { findNodeByScopedId, findVisibleNodeByScopedId } from "../../web/js/lib/asset-staleness.js";
+import { scanComboAvailability } from "../../web/js/lib/live-combo-availability.js";
+import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PANEL_SOURCE = readFileSync(
@@ -396,7 +398,7 @@ const GRAPH_GET_ERRORS_DEPS = [
   "filterServerConfirmedInputSubfolderMedia",
   "inputAssetServerUsesWindowsPaths",
   "scanComboAvailability",
-  "fetchSingleNodeDef",
+  "fetchSingleNodeInfo",
   "probeInputAssetPresence",
   "graphReadBindingChanged",
   "collectAllGraphs",
@@ -463,10 +465,17 @@ function makeScopedErrorGraph() {
   };
 }
 
-async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }) {
+async function runProductionGraphGetErrors({
+  graph,
+  rootGraph,
+  lastExecFailure,
+  scan = async () => null,
+  fetchSingleNodeInfo = () => {},
+  stepBudget = () => 0,
+}) {
   const deps = {
     monotonicNow: () => 0,
-    getErrorsStepBudgetMs: () => 0,
+    getErrorsStepBudgetMs: stepBudget,
     hasRawMissingAssetCandidates: () => false,
     GET_ERRORS_REFRESH_CAP_MS: 18000,
     refreshMissingAssetTrust: async () => false,
@@ -482,8 +491,8 @@ async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }
     GET_ERRORS_STEP_CAP_MS: 4000,
     filterServerConfirmedInputSubfolderMedia: async (media) => media,
     inputAssetServerUsesWindowsPaths: async () => false,
-    scanComboAvailability: async () => null,
-    fetchSingleNodeDef: () => {},
+    scanComboAvailability: scan,
+    fetchSingleNodeInfo,
     probeInputAssetPresence: () => {},
     graphReadBindingChanged: () => false,
     collectAllGraphs: (value) => [value],
@@ -514,6 +523,49 @@ async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }
   const executor = makeGraphGetErrors(...GRAPH_GET_ERRORS_DEPS.map((name) => deps[name]));
   return executor();
 }
+
+test("#1691 production graph_get_errors batches live class reads and keeps uncertain types unchecked", async () => {
+  const working = {
+    id: 1,
+    type: "WorkingPack",
+    widgets: [{ name: "pick", value: "bad" }],
+    has_errors: true,
+  };
+  const uncertain = {
+    id: 2,
+    type: "InstalledButUnreachablePack",
+    widgets: [{ name: "pick", value: "ok" }],
+    constructor: { nodeData: { output_node: true } },
+  };
+  const graph = {
+    _nodes: [working, uncertain],
+    getNodeById: (id) => ([working, uncertain].find((node) => String(node.id) === String(id)) ?? null),
+  };
+  const fetchInfo = async (className) => {
+    if (className === "WorkingPack") {
+      return {
+        [SINGLE_NODE_INFO_OUTCOME]: true,
+        kind: "present",
+        body: { WorkingPack: { input: { required: { pick: [["ok"], {}] } } } },
+      };
+    }
+    return { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" };
+  };
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    stepBudget: () => 1000,
+  });
+
+  assert.equal(result.unavailable_widget_values.length, 1);
+  assert.equal(result.unavailable_widget_values[0].type, "WorkingPack");
+  assert.equal(result.unchecked_nodes.length, 1);
+  assert.equal(result.unchecked_nodes[0].type, "InstalledButUnreachablePack");
+  assert.match(result.unchecked_nodes[0].reason, /could not be looked up/);
+});
 
 test("#1685 production graph_get_errors preserves a scoped runtime error and blames its root host", async () => {
   const { rootGraph, host } = makeScopedErrorGraph();

@@ -43,6 +43,8 @@ import {
   uploadConfigOf,
   uploadInputAccepts,
 } from "./input-asset.js";
+import { withTimeout } from "./bounded-step.js";
+import { SINGLE_NODE_INFO_OUTCOME } from "./single-node-def.js";
 
 /** Inputs whose combo lists name files on disk, rather than modes like
  *  `sampler_name: [euler, …]`. A value outside ANY combo's options is a genuine
@@ -51,6 +53,9 @@ import {
  *  themselves — a filename carries an extension — never from the input name, so a
  *  pack using its own naming is judged on what it actually offers. */
 const FILE_LIKE = /\.[A-Za-z0-9_]{2,12}$/;
+
+/** Existing production type-scoped object-info reads use this same concurrency. */
+const LIVE_SCAN_BATCH_SIZE = 8;
 
 /** True when the options look like files on disk. An empty list cannot be judged
  *  this way, so the caller supplies the fallback (see `optionsNameFiles`). */
@@ -291,40 +296,117 @@ export async function scanComboAvailability(
   // agent with NO error surface at all (#589). That is strictly worse than the
   // omission this scan exists to close, so the scan fails CLOSED: when the budget
   // is gone the remaining classes are UNCHECKED and say so.
-  const deadline = budgetMs > 0 ? now() + budgetMs : Infinity;
+  const startedAt = now();
+  const clockUsable = Number.isFinite(startedAt);
+  const deadline = budgetMs > 0 && clockUsable ? startedAt + budgetMs : Infinity;
+  if (budgetMs > 0 && !clockUsable) outOfBudget = true;
 
   // One fetch per distinct CLASS, not per node — a canvas with thirty
-  // KSamplers must not become thirty requests.
+  // KSamplers must not become thirty requests. The production type-scoped
+  // object-info path already proves that eight concurrent class routes are a
+  // supported shape; use the same bound here, while charging the whole batch
+  // to this scan's one deadline.
   const cache = new Map();
-  const comboMapFor = async (className) => {
+  const classLimit = new Set();
+  const budgetLimit = new Set();
+  const entryFromResponse = (className, response) => {
+    let branded = false;
+    let kind;
+    let body = response;
+    try {
+      branded = response?.[SINGLE_NODE_INFO_OUTCOME] === true;
+      kind = response?.kind;
+      if (branded) body = response.body;
+    } catch {
+      return { reason: "node type could not be looked up (/object_info response was unreadable)" };
+    }
+    if (branded && kind === "unknown") {
+      return { reason: "node type could not be looked up (/object_info call failed)" };
+    }
+    if (branded && kind === "absent") return { reason: "node type not found in /object_info" };
+    const combos = comboInputsOf(body, className);
+    if (combos === null) {
+      return {
+        reason: branded
+          ? "node type could not be looked up (/object_info response was malformed)"
+          : "node type not found in /object_info",
+      };
+    }
+    return { combos, configs: comboConfigsOf(body, className) ?? new Map() };
+  };
+
+  const classNames = new Map();
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    const className = typeof node?.type === "string" ? node.type : null;
+    if (!className || !Array.isArray(node.widgets)) continue;
+    if (isFrontendVirtualNode(node) || className === "CustomCombo") continue;
+    const priority = (node?.has_errors === true ? 2 : 0) +
+      (node?.constructor?.nodeData?.output_node === true ? 1 : 0);
+    const previous = classNames.get(className);
+    if (!previous || priority > previous.priority) classNames.set(className, { priority, index });
+  }
+  const orderedClasses = [...classNames.entries()]
+    .sort((a, b) => b[1].priority - a[1].priority || a[1].index - b[1].index)
+    .map(([className]) => className);
+  const allowedClasses = orderedClasses.slice(0, Math.max(0, maxClasses));
+  for (const className of orderedClasses.slice(allowedClasses.length)) classLimit.add(className);
+
+  const budgetReason = "not checked: get_errors ran out of its shared server-call budget";
+  const fetchBatch = async (batch) => {
+    const remaining = deadline - now();
+    if (!(remaining > 0)) {
+      outOfBudget = true;
+      for (const className of batch) budgetLimit.add(className);
+      return;
+    }
+    const run = (className) => {
+      const request = Promise.resolve()
+        .then(() => fetchClassInfo(className))
+        .then(
+          (value) => ({ value, settledAt: now() }),
+          () => ({ error: true, settledAt: now() }),
+        );
+      return Number.isFinite(remaining)
+        ? withTimeout(request, remaining, () => null)
+        : request;
+    };
+    const results = await Promise.all(batch.map((className) => run(className)));
+    for (let i = 0; i < batch.length; i += 1) {
+      const result = results[i];
+      if (!result || result.error || !Number.isFinite(result.settledAt) || result.settledAt > deadline) {
+        const overBudget = !result || !Number.isFinite(result?.settledAt) || result.settledAt > deadline;
+        outOfBudget = outOfBudget || overBudget;
+        if (overBudget) budgetLimit.add(batch[i]);
+        else cache.set(batch[i], { reason: "node type could not be looked up (/object_info call failed)" });
+        continue;
+      }
+      cache.set(batch[i], entryFromResponse(batch[i], result.value));
+    }
+  };
+
+  for (let offset = 0; offset < allowedClasses.length; offset += LIVE_SCAN_BATCH_SIZE) {
+    const batch = allowedClasses.slice(offset, offset + LIVE_SCAN_BATCH_SIZE);
+    if (outOfBudget || !(now() < deadline)) {
+      outOfBudget = true;
+      for (const className of allowedClasses.slice(offset)) budgetLimit.add(className);
+      break;
+    }
+    await fetchBatch(batch);
+  }
+
+  const comboMapFor = (className) => {
     if (cache.has(className)) return cache.get(className);
-    // A bound on DISTINCT classes, not nodes. get_errors answers inside the
-    // orchestrator's reply deadline, and an unbounded scan on a pathological
-    // canvas would spend it on lookups. Past the cap every further class is
-    // UNCHECKED and says so — silently skipping them would make a truncated
-    // scan read exactly like a clean one.
-    if (cache.size >= maxClasses) {
+    if (classLimit.has(className)) {
       truncated += 1;
       return { reason: `not checked: this call's ${maxClasses}-node-type lookup cap was reached` };
     }
-    if (now() >= deadline) {
-      outOfBudget = true;
+    if (budgetLimit.has(className) || outOfBudget) {
       truncated += 1;
-      return { reason: "not checked: get_errors ran out of its shared server-call budget" };
+      return { reason: budgetReason };
     }
-    let entry;
-    try {
-      const body = await fetchClassInfo(className);
-      const combos = comboInputsOf(body, className);
-      entry = combos === null
-        ? { reason: "node type not found in /object_info" }
-        : { combos, configs: comboConfigsOf(body, className) ?? new Map() };
-    } catch {
-      // A failed lookup is UNKNOWN, never "no combos".
-      entry = { reason: "node type could not be looked up (/object_info call failed)" };
-    }
-    cache.set(className, entry);
-    return entry;
+    truncated += 1;
+    return { reason: "not checked: get_errors could not schedule this node type lookup" };
   };
 
   // #1357 — an UPLOAD combo is the one option list the server cannot fully

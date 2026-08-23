@@ -198,7 +198,7 @@ import {
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
-import { fetchSingleNodeDef } from "./lib/single-node-def.js";
+import { fetchSingleNodeDef, fetchSingleNodeInfo } from "./lib/single-node-def.js";
 import { withWorkflowUuid } from "./lib/graph-view-identity.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
@@ -17611,7 +17611,7 @@ const GRAPH_TOOL_EXECUTORS = {
       if (scanBudgetMs > 0) {
         liveScan = await scanComboAvailability(
           nodes,
-          (cls) => fetchSingleNodeDef(cls, (route) => api?.fetchApi?.(route)),
+          (cls) => fetchSingleNodeInfo(cls, (route) => api?.fetchApi?.(route)),
           {
             budgetMs: scanBudgetMs,
             backslashIsSeparator,

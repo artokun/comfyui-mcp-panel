@@ -62,6 +62,45 @@ export function singleDefConfirms(body, classType) {
 }
 
 /**
+ * The live error scan needs to distinguish a class the server answered as absent
+ * from a per-class route that did not answer. The add-node fast path deliberately
+ * collapses both to null so it can fall through to its whole-schema authority; the
+ * read path cannot do that because null currently reads as "node type not found".
+ */
+export const SINGLE_NODE_INFO_OUTCOME = Symbol.for("comfyui-mcp.singleNodeInfoOutcome");
+
+export async function fetchSingleNodeInfo(classType, fetchApi) {
+  const unknown = () => ({ [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" });
+  if (typeof classType !== "string" || classType === "") return unknown();
+  if (typeof fetchApi !== "function") return unknown();
+  try {
+    const response = await fetchApi(`/object_info/${encodeURIComponent(classType)}`);
+    if (!response || (typeof response.status === "number" && (response.status < 200 || response.status >= 300))) {
+      return unknown();
+    }
+    const body = typeof response.json === "function" ? await response.json() : null;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return unknown();
+    if (singleDefConfirms(body, classType)) {
+      return { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "present", body };
+    }
+    // ComfyUI's per-class route answers a missing class as an empty 200 object.
+    // A non-empty body naming some other class is a malformed/proxy response, not
+    // evidence about the requested class.
+    let empty = false;
+    try {
+      empty = Object.keys(body).length === 0;
+    } catch {
+      return unknown();
+    }
+    return empty
+      ? { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "absent" }
+      : unknown();
+  } catch {
+    return unknown();
+  }
+}
+
+/**
  * Ask the backend about ONE node type.
  *
  * @param {string} classType
@@ -70,22 +109,6 @@ export function singleDefConfirms(body, classType) {
  *   null in every other case — including every kind of doubt.
  */
 export async function fetchSingleNodeDef(classType, fetchApi) {
-  if (typeof classType !== "string" || classType === "") return null;
-  if (typeof fetchApi !== "function") return null;
-  let body;
-  try {
-    const res = await fetchApi(`/object_info/${encodeURIComponent(classType)}`);
-    // A non-2xx is not evidence of anything about the type — an older build
-    // without this route answers 404, and a proxy sign-in page answers 200 with
-    // HTML. Both must reach the full fetch, not a conclusion.
-    if (!res || (typeof res.status === "number" && (res.status < 200 || res.status >= 300))) {
-      return null;
-    }
-    body = typeof res.json === "function" ? await res.json() : null;
-  } catch {
-    // Network failure, abort, unparseable body. All of them mean "I did not find
-    // out", and this returns the value that says exactly that.
-    return null;
-  }
-  return singleDefConfirms(body, classType) ? body : null;
+  const outcome = await fetchSingleNodeInfo(classType, fetchApi);
+  return outcome.kind === "present" ? outcome.body : null;
 }

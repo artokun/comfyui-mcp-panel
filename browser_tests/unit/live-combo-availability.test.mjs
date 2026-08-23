@@ -27,6 +27,7 @@ import {
   comboAvailabilityNote,
   linkDrivenWidgetNames,
 } from "../../web/js/lib/live-combo-availability.js";
+import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
 
 /** An /object_info/<class> body in the verified shape. */
 const classBody = (name, required) => ({ [name]: { input: { required } } });
@@ -142,6 +143,52 @@ test("#745 one fetch per distinct CLASS, not per node", async () => {
     node(i, "LoraLoaderModelOnly", [{ name: "lora_name", value: "a.safetensors" }]));
   await scanComboAvailability(nodes, async (cls) => { seen.push(cls); return LORA; });
   assert.equal(seen.length, 1);
+});
+
+test("#1691 class lookups are bounded batches, with red/output classes first", async () => {
+  const seen = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const nodes = Array.from({ length: 16 }, (_, i) =>
+    node(i, `Class${i}`, [{ name: "pick", value: "ok" }]));
+  nodes[15].has_errors = true;
+  nodes[14].constructor = { nodeData: { output_node: true } };
+  const r = await scanComboAvailability(nodes, async (cls) => {
+    seen.push(cls);
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    inFlight -= 1;
+    return classBody(cls, { pick: [["ok"], {}] });
+  });
+  assert.equal(r.unknown.length, 0);
+  assert.equal(seen.length, 16);
+  assert.ok(maxInFlight <= 8, `batch concurrency ${maxInFlight} exceeded the bound`);
+  assert.deepEqual(seen.slice(0, 2), ["Class15", "Class14"]);
+});
+
+test("#1691 an uncertain per-class route is unchecked, never a missing type", async () => {
+  const r = await scanComboAvailability(
+    [node(7, "WorkingPack", [{ name: "pick", value: "ok" }])],
+    async () => ({ [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" }),
+  );
+  assert.deepEqual(r.unavailable, []);
+  assert.equal(r.unknown.length, 1);
+  assert.match(r.unknown[0].reason, /could not be looked up/);
+  assert.doesNotMatch(r.unknown[0].reason, /not found/);
+});
+
+test("#1691 a hung class batch returns an explicit budget cutoff", async () => {
+  const started = Date.now();
+  const r = await scanComboAvailability(
+    [node(8, "HungPack", [{ name: "pick", value: "ok" }])],
+    () => new Promise(() => {}),
+    { budgetMs: 25 },
+  );
+  assert.ok(Date.now() - started < 1000, "the live scan must not await a hung class route");
+  assert.equal(r.unchecked_budget_exhausted, true);
+  assert.equal(r.unavailable.length, 0);
+  assert.match(r.unknown[0].reason, /budget/);
 });
 
 test("#745 empty / malformed input is answered with empty, never a throw", async () => {
