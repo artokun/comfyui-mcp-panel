@@ -782,6 +782,7 @@
       "roll_back_resend": "Roll back & resend",
       "run_blocked": "Run blocked",
       "run_blocked_by_node_errors": "Run blocked by node errors",
+      "run_outcome_uncertain": "Run outcome uncertain",
       "run_the_workflow_and_tell_me_if": "Run the workflow and tell me if it errors",
       "running": "Running",
       "running_lowercase": "running",

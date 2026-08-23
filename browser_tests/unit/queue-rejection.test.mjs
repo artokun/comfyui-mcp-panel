@@ -156,6 +156,16 @@ test("no captured prompt_id is outcome-unknown, never a queued success", () => {
   assert.equal(blank.prompt_id, undefined);
 });
 
+test("#1690: a mixed batch keeps known ids but makes the whole acknowledgement uncertain", () => {
+  const r = buildQueueAcceptResult({ batchCount: 2, promptIds: ["   ", "p2"], uncertainCount: 1 });
+  assert.equal(r.queued_unknown, true);
+  assert.equal(r.queued, undefined);
+  assert.equal(r.prompt_id, "p2", "the known receipt remains available for correlation");
+  assert.equal(r.queued_count, 1);
+  assert.equal(r.indeterminate_count, 1);
+  assert.match(r.error, /incomplete|usable prompt_id/i);
+});
+
 test("a NUMERIC prompt_id is normalized to a string at ingestion (#370)", () => {
   const r = buildQueueAcceptResult({ batchCount: 1, promptIds: [7] });
   assert.strictEqual(r.prompt_id, "7"); // string, not number

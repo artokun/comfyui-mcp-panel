@@ -75,6 +75,19 @@ test("a number that is not a count never selects a plural form", () => {
   assert.equal(say("graph_screenshot", { width: 1024, height: 768 }), "Captured workflow image (1024×768)");
 });
 
+test("#1690: queued_unknown activity is uncertain, not blocked or duplicate-retry messaging", () => {
+  __setCatalogForTest("en", {});
+  const card = describeCommand("graph_run", {}, { ok: true, result: {
+    queued_unknown: true,
+    error: "The queue acknowledgement was incomplete",
+    retry_guidance: "A blind retry can duplicate the render",
+  } });
+  assert.equal(card.text, "Run outcome uncertain");
+  assert.equal(card.detail, "The queue acknowledgement was incomplete");
+  assert.doesNotMatch(card.text, /blocked/i);
+  assert.doesNotMatch(String(card.detail), /retry|duplicate/i);
+});
+
 test("Korean gets its single form for every number", () => {
   // The exact case `n === 1 ? "" : "s"` cannot express: Korean has ONE plural category, so
   // a catalog that supplies only `_other` must serve 1 and 4 alike.
