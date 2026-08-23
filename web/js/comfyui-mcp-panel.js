@@ -486,6 +486,10 @@ import {
   applyMiniMaxH3PromptBuilderWrite,
 } from "./lib/minimax-h3-prompt-builder.js";
 import {
+  classifyMiniMaxH3DirectorWrite,
+  miniMaxH3DirectorPromptRefusal,
+} from "./lib/minimax-h3-director.js";
+import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
 } from "./lib/control-after-generate.js";
@@ -14956,6 +14960,12 @@ const GRAPH_TOOL_EXECUTORS = {
     const budget = makeCommandBudget(SET_WIDGET_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
+    // #1679: MiniMaxH3Director's prompt is regenerated from its in-memory builderState.
+    // Refuse this exact derived widget immediately after synchronous target resolution,
+    // before the generic authorization/refresh awaits or any graph mutation can begin.
+    if (classifyMiniMaxH3DirectorWrite(node, widget) === "derived") {
+      throw new Error(miniMaxH3DirectorPromptRefusal(widget, node.id));
+    }
     // #982 — PER-REQUEST, not module state (codex). A concurrent refresh or a second
     // widget write would otherwise overwrite this between one request's failed fetch and
     // its refusal, so the message would name routes another call tried. Declared in the
