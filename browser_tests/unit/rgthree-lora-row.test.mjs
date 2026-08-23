@@ -595,7 +595,12 @@ function powerLoraNode({ separate = false, drawnRows = [] } = {}) {
     id: 153,
     type: POWER_LORA_LOADER_TYPE,
     properties: { "Show Strengths": separate ? "Separate Model & Clip" : "Single Strength" },
-    widgets: [{ name: "divider" }, { name: "PowerLoraLoaderHeaderWidget" }, { name: "divider" }, { name: "➕ Add Lora" }],
+    widgets: [
+      { name: "divider" },
+      { name: "PowerLoraLoaderHeaderWidget" },
+      { name: "divider" },
+      { name: "➕ Add Lora", type: "custom", onMouseClick() {}, mouseClickCallback() {} },
+    ],
     loraWidgetsCounter: 0,
     size: [200, 60],
     computeSize: () => [200, 60 + 20 * node.widgets.filter((w) => /^lora_\d+$/.test(w?.name ?? "")).length],
@@ -624,7 +629,7 @@ const loraOracle = { getFreshObjectInfo: async () => ({ [POWER_LORA_LOADER_TYPE]
  * ChangeTracker captures by serializing the graph, which is what runs each widget's
  * `serializeValue` — so a probe that does not serialize cannot see this class of defect at all.
  */
-async function loraWriteThrough(node, { create }) {
+async function loraWriteThrough(node, { create, value = SLOT_JSON } = {}) {
   let depth = 0;
   const serializeAll = () => {
     for (const w of node.widgets) {
@@ -648,6 +653,7 @@ async function loraWriteThrough(node, { create }) {
     ...(create
       ? {
           prepareWriteTarget: () => {
+            if (!isRgthreeLoraRowCreation(node, "lora_1", value)) return null;
             const made = createRgthreeLoraRow(node, "lora_1", {});
             return { undo: () => made.remove().incomplete };
           },
@@ -655,7 +661,7 @@ async function loraWriteThrough(node, { create }) {
       : {}),
   };
   try {
-    return { ok: true, result: await runSetWidget(node, "lora_1", SLOT_JSON, opts) };
+    return { ok: true, result: await runSetWidget(node, "lora_1", value, opts) };
   } catch (err) {
     return { ok: false, message: err.message };
   }
@@ -689,6 +695,29 @@ test("#757 a Single Strength creation still SUCCEEDS — the originally reported
   const row = node.widgets.find((w) => w.name === "lora_1");
   assert.equal(row.value.lora, "x.safetensors", "and the requested value is on the row");
   assert.equal(row.value.strengthTwo, null, "untouched, because this mode does not use it");
+});
+
+test("#1694 the production write boundary explains the object route without accepting a bare filename", async () => {
+  const node = powerLoraNode({ separate: false });
+  const before = node.widgets.map((w) => w.name);
+
+  const bare = await loraWriteThrough(node, { create: true, value: "some_lora.safetensors" });
+  assert.equal(bare.ok, false, "a bare filename is not a lora-slot value");
+  assert.match(bare.message, /lora-slot OBJECT rather than a bare filename/i);
+  assert.deepEqual(node.widgets.map((w) => w.name), before, "the refused bare filename creates no row");
+  assert.equal(node.loraWidgetsCounter, 0, "the refused bare filename does not spend a row name");
+
+  const created = await loraWriteThrough(node, { create: true, value: SLOT_JSON });
+  assert.equal(created.ok, true, created.message);
+  assert.equal(node.widgets.find((w) => w.name === "lora_1").value.lora, "x.safetensors");
+
+  const existing = await loraWriteThrough(node, {
+    create: true,
+    value: JSON.stringify({ on: true, lora: "replacement.safetensors", strength: 0.75 }),
+  });
+  assert.equal(existing.ok, true, existing.message);
+  assert.equal(node.widgets.find((w) => w.name === "lora_1").value.lora, "replacement.safetensors");
+  assert.equal(node.loraWidgetsCounter, 1, "the existing-row write does not mint another row");
 });
 
 test("#757 the created row is settled to the SAME mode an existing row has", async () => {

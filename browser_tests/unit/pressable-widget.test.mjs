@@ -114,6 +114,17 @@ test("#757 the hint does not PROMISE that clicking creates the slot", () => {
   assert.doesNotMatch(hint, /will create|creates the widget you asked for/i);
 });
 
+test("#1694 the hint discloses the narrow programmatic rgthree route", () => {
+  const hint = pressableWidgetHint(freshPowerLoraLoader(), "lora_1");
+  assert.match(hint, /do not need the click/i);
+  assert.match(hint, /lora-slot OBJECT rather than a bare filename/i);
+  assert.match(hint, /\{"on": true, "lora": "<file>\.safetensors", "strength": 1\}/);
+
+  const wrongType = pressableWidgetHint({ ...freshPowerLoraLoader(), type: "Other Node" }, "lora_1");
+  assert.doesNotMatch(wrongType, /do not need the click|bare filename/i);
+  assert.doesNotMatch(pressableWidgetHint(freshPowerLoraLoader(), "lora1"), /do not need the click|bare filename/i);
+});
+
 test("#757 it says the missing capability out loud", () => {
   // Otherwise the next reasonable move is to hunt for a press tool that does not
   // exist, which is its own dead end.
