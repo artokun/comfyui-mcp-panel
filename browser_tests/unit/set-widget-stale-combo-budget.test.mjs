@@ -188,6 +188,8 @@ const EXECUTOR_DEPS = [
   "ideogram4PromptBuilderRefusal",
   "classifyMiniMaxH3PromptBuilderWrite",
   "applyMiniMaxH3PromptBuilderWrite",
+  "classifyMiniMaxH3DirectorWrite",
+  "miniMaxH3DirectorPromptRefusal",
   "awaitObjectInfoHistorySeed",
   "isRgthreeLoraRowCreation",
   "createRgthreeLoraRow",
@@ -324,6 +326,8 @@ function realGraphSetWidget({
     classifyRgthreeFastGroupsWrite: () => null,
     classifyIdeogram4PromptBuilderWrite: () => null,
     classifyMiniMaxH3PromptBuilderWrite: () => null,
+    classifyMiniMaxH3DirectorWrite: () => null,
+    miniMaxH3DirectorPromptRefusal: () => "",
     // #1418 — honors the cap it is handed, the way the shipped one does: it waits at most
     // waitMs, and a slow seed simply spends it.
     awaitObjectInfoHistorySeed: (waitMs) =>

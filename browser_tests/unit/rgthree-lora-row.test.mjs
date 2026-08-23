@@ -1298,6 +1298,8 @@ const EXECUTOR_DEPS = [
   "ideogram4PromptBuilderRefusal",
   "classifyMiniMaxH3PromptBuilderWrite",
   "applyMiniMaxH3PromptBuilderWrite",
+  "classifyMiniMaxH3DirectorWrite",
+  "miniMaxH3DirectorPromptRefusal",
   "awaitObjectInfoHistorySeed",
   "isRgthreeLoraRowCreation",
   "createRgthreeLoraRow",
@@ -1462,6 +1464,8 @@ function executor(node, overrides = {}) {
     // other pack classifiers above.
     classifyIdeogram4PromptBuilderWrite: () => null,
     classifyMiniMaxH3PromptBuilderWrite: () => null,
+    classifyMiniMaxH3DirectorWrite: () => null,
+    miniMaxH3DirectorPromptRefusal: () => "",
     awaitObjectInfoHistorySeed: async () => {},
     // The REAL classifier and creator: a double here would let the executor pass against a
     // route that never fires, which is precisely the defect under test.
