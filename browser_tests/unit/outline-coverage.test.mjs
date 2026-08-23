@@ -109,7 +109,8 @@ test("#809 the query path fits its tail and footer INSIDE max_chars", () => {
 test("#1681 only an explicit detail query can raise the per-widget cap", () => {
   const body = handlerBody(readFileSync(PANEL_JS, "utf8"), "graph_query({");
   assert.match(body, /widget_max_chars/, "the opt-in cap is an argument to graph_query");
-  assert.match(body, /fields === "detail" \? clampDetailWidgetCap\(widget_max_chars\)/);
+  assert.match(body, /fields === "detail" && Array\.isArray\(ids\) && ids\.length === 1/);
+  assert.match(body, /clampDetailWidgetCap\(widget_max_chars\)/);
   assert.match(body, /capSummaryWidgets\(summarizeNode\(n\), detailWidgetCap, maxChars\)/);
   assert.match(body, /fitDetailLine\(line, \{ id: summary\.id, type: summary\.type, title: summary\.title \}, maxChars\)/);
 });

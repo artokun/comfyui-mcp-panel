@@ -12730,10 +12730,13 @@ const GRAPH_TOOL_EXECUTORS = {
     const total = nodes.length;
     const lim = Math.min(Math.max(Number(limit) || 40, 1), 200);
     const maxChars = Math.min(Math.max(Number(max_chars) || 12000, 500), 60000);
-    // #1681: detail is the explicit escape hatch for a named long widget. Keep the
-    // default and the outline/compact projections unchanged; the helper still applies
-    // the total max_chars budget and the final JSON-line guard.
-    const detailWidgetCap = fields === "detail" ? clampDetailWidgetCap(widget_max_chars) : WIDGET_VALUE_CAP;
+    // #1681: only a single explicitly named detail node gets the escape hatch for a
+    // long widget. Broad/multi-ID detail and the outline/compact projections retain the
+    // default cap; the helper still applies the total max_chars budget and final guard.
+    const detailWidgetCap =
+      fields === "detail" && Array.isArray(ids) && ids.length === 1
+        ? clampDetailWidgetCap(widget_max_chars)
+        : WIDGET_VALUE_CAP;
 
     // Adjacency over live links.
     const up = new Map();
