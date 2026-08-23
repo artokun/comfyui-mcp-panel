@@ -17195,19 +17195,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // batch response was missing its receipt.
     const missingPromptIds = Number(runInterceptor?.state?.missingPromptIds) || 0;
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
-    // per-node errors the frontend stashed. null ⇒ genuinely accepted.
-    if (missingPromptIds === 0) {
-      const rejection = summarizePromptRejection({
-        rejection: promptRejection,
-        lastNodeErrors: missingPromptIds === 0 ? app.lastNodeErrors : null,
-        runToNode: runToNodeInfo,
-        // #1504 — the prompt_id(s) ComfyUI MINTED for this run. A minted id is a
-        // receipt of acceptance, so per-node errors that arrive beside one are
-        // dropped outputs, not a refusal of the whole prompt.
-        acceptedPromptIds: queuedPromptIds,
-      });
-      if (rejection) return rejection;
-    }
+    // per-node errors the frontend stashed. null ⇒ genuinely accepted. Missing
+    // receipts suppress only the stale frontend fallback; an explicit refusal
+    // captured from /prompt still wins over the unknown acknowledgement.
+    const rejection = summarizePromptRejection({
+      rejection: promptRejection,
+      lastNodeErrors: missingPromptIds === 0 ? app.lastNodeErrors : null,
+      runToNode: runToNodeInfo,
+      // #1504 — the prompt_id(s) ComfyUI MINTED for this run. A minted id is a
+      // receipt of acceptance, so per-node errors that arrive beside one are
+      // dropped outputs, not a refusal of the whole prompt.
+      acceptedPromptIds: queuedPromptIds,
+    });
+    if (rejection) return rejection;
     // Surface the queued prompt_id(s) so the agent can correlate/track the run —
     // #370 reconciliation and mcp#531 (panel_run must return the prompt_id even
     // when a render is already running) both depend on this being reported.

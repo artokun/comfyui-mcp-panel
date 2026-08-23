@@ -137,8 +137,9 @@ function makeServerSequence(bodies) {
   const calls = [];
   const fetchApi = async (route, options) => {
     calls.push({ route, options, at: Date.now() });
-    const body = bodies[Math.min(calls.length - 1, bodies.length - 1)];
-    return jsonResponse(200, body);
+    const entry = bodies[Math.min(calls.length - 1, bodies.length - 1)];
+    const described = entry && typeof entry === "object" && Object.hasOwn(entry, "status");
+    return jsonResponse(described ? entry.status : 200, described ? entry.body : entry);
   };
   fetchApi.calls = calls;
   return fetchApi;
@@ -1076,6 +1077,30 @@ test("#1690 production path: a missing receipt with node errors stays queued_unk
     assert.equal(res.queued, undefined, "missing receipt must not become queued:false from stale node errors");
     assert.notEqual(res.queued, false);
     assert.match(String(res.error), /prompt_id|acknowledgement/i);
+  } finally {
+    stop();
+  }
+});
+
+test("#1690 production path: a definitive refusal beats another batch item's missing receipt", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = {
+      fetchApi: makeServerSequence([
+        {},
+        {
+          status: 400,
+          body: { error: { type: "prompt_outputs_failed_validation", message: "definitive refusal" } },
+        },
+      ]),
+    };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({ batch_count: 2 });
+    assert.equal(apiTarget.fetchApi.calls.length, 2, "the production batch path observed both /prompt responses");
+    assert.equal(res.queued, false, "a definitive refusal remains a refusal for the whole acknowledgement");
+    assert.equal(res.queued_unknown, undefined);
+    assert.match(String(res.error), /definitive refusal|prompt_outputs_failed_validation/i);
   } finally {
     stop();
   }
