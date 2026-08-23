@@ -400,7 +400,8 @@ test("#1668 retries a subgraph node in its owning graph when the id collides wit
   assert.equal(definitionConfigured, 1, "the definition node receives the retry");
   assert.equal(rootConfigured, 0, "the colliding root node is not retargeted");
   assert.equal(result.failed.length, 0);
-  assert.equal(result.recovered[0].ownerGraph, definitionGraph);
+  assert.equal(typeof result.recovered[0].ownerGraphToken, "number");
+  assert.doesNotThrow(() => JSON.stringify(result.recovered), "recovery receipts remain bridge-serializable");
   assert.equal(
     loadRestoreCompleted({
       nodeIsolation: { failures: [failure] },
@@ -413,7 +414,7 @@ test("#1668 retries a subgraph node in its owning graph when the id collides wit
     loadRestoreCompleted({
       nodeIsolation: { failures: [failure] },
       graphWatch: { throws: [], entered: 1 },
-      recoveredFailures: [{ id: 122, ownerGraph: rootGraph }],
+      recoveredFailures: [{ id: 122, ownerGraphToken: 999999 }],
     }),
     false,
   );

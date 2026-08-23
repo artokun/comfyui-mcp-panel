@@ -42,6 +42,19 @@ function sameNodeId(left, right) {
   return left === right || (left != null && right != null && String(left) === String(right));
 }
 
+const graphIdentityTokens = new WeakMap();
+let nextGraphIdentityToken = 1;
+
+function graphIdentityToken(graph) {
+  if ((typeof graph !== "object" || graph === null) && typeof graph !== "function") return null;
+  let token = graphIdentityTokens.get(graph);
+  if (token == null) {
+    token = nextGraphIdentityToken++;
+    graphIdentityTokens.set(graph, token);
+  }
+  return token;
+}
+
 function graphLinkEntries(graph) {
   const map = graph?._links;
   if (map && typeof map.entries === "function") return [...map.entries()];
@@ -226,6 +239,7 @@ export function installNodeConfigureIsolation(LG, graph = null) {
         // graph that owned the failed configure so the retry cannot retarget
         // the root graph by id alone.
         ownerGraph,
+        ownerGraphToken: graphIdentityToken(ownerGraph),
         // configure implementations can mutate their input before throwing;
         // retain an independent serialized snapshot for the retry/verification.
         info: serializedSnapshot,
@@ -354,10 +368,11 @@ export async function retryNodeRestores(graph, failures, options = {}) {
       const verification = verifyNodeRestore(node, failure.info);
       if (verification.verified) {
         restored.push({ id: failure.id, type: failure.type });
+        const ownerGraphToken = failure.ownerGraphToken ?? graphIdentityToken(failure.ownerGraph);
         recovered.push({
           id: failure.id,
           type: failure.type,
-          ...(failure.ownerGraph ? { ownerGraph: failure.ownerGraph } : {}),
+          ...(ownerGraphToken != null ? { ownerGraphToken } : {}),
           linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences,
         });
         continue;
@@ -558,10 +573,11 @@ export function loadRestoreCompleted({ nodeIsolation, graphWatch, recoveredFailu
   return nodeFailures.every(
     (failure) => {
       if (failure?.linkDisconnectCrash !== true || failure?.linkDisconnectEvidence !== true) return false;
+      const ownerGraphToken = failure?.ownerGraphToken ?? graphIdentityToken(failure?.ownerGraph);
       return recovered.some(
         (candidate) =>
           sameNodeId(candidate?.id, failure?.id) &&
-          (failure?.ownerGraph == null || candidate?.ownerGraph === failure.ownerGraph),
+          (ownerGraphToken == null || candidate?.ownerGraphToken === ownerGraphToken),
       );
     },
   );
