@@ -16774,7 +16774,9 @@ const GRAPH_TOOL_EXECUTORS = {
     const capturePromptId = (pid) => {
       // EVERY accepted prompt_id, string-normalized at capture (0 and "0"
       // are the same run) so #370 reconcile stays string-vs-string.
-      if (!queuedPromptIds.includes(pid)) queuedPromptIds.push(pid);
+      const id = String(pid).trim();
+      if (!id) return;
+      if (!queuedPromptIds.includes(id)) queuedPromptIds.push(id);
     };
     // #1504 — node_errors that arrived on an ACCEPTED (200) reply: the outputs
     // ComfyUI dropped from a prompt it queued anyway ("Output will be ignored").

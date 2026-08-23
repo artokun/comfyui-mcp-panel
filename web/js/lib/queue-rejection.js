@@ -181,7 +181,9 @@ function normalizeNodeErrors(ne) {
  * the agent can correlate/track the run — #370 reconciliation and mcp#531
  * (panel_run must return the prompt_id, even when a render is already running)
  * both depend on this. `prompt_id` is the first accepted id; `prompt_ids` is only
- * added for a batch that queued more than one.
+ * added for a batch that queued more than one. A missing id is not represented as
+ * `queued:true`: the request may have reached ComfyUI, but the panel has no receipt
+ * with which to prove or correlate that outcome.
  *
  * #1504 — an accepted run may have DROPPED some outputs. ComfyUI reports those on the
  * 200 body's `node_errors`, and they are reported here verbatim, on an otherwise normal
@@ -203,16 +205,26 @@ export function buildQueueAcceptResult({
   ranToNode = null,
   droppedOutputs = null,
 } = {}) {
-  // NORMALIZE to strings at this ingestion boundary (drop null/undefined) so the
-  // reported prompt_id(s), and everything that later reconciles against them, are
-  // string-vs-string — a numeric /prompt id can't slip through as a number (#370).
-  // Dedupe AFTER normalization (via Set) so a mixed 0 / "0" batch reports one id.
-  const ids = [
-    ...new Set(
-      (Array.isArray(promptIds) ? promptIds : []).filter((x) => x != null).map((x) => String(x)),
-    ),
-  ];
+  // NORMALIZE to trimmed strings at this ingestion boundary (drop null/undefined
+  // and blank values) so the reported prompt_id(s), and everything that later
+  // reconciles against them, are string-vs-string — a numeric /prompt id can't slip
+  // through as a number (#370). Dedupe AFTER normalization so a mixed 0 / "0" batch
+  // reports one id.
+  const ids = normalizeAcceptedIds(promptIds);
   const dropped = normalizeNodeErrors(droppedOutputs);
+  if (!ids.length) {
+    const count = Math.max(1, Math.floor(Number(batchCount)) || 1);
+    return {
+      queued_unknown: true,
+      batch_count: batchCount,
+      indeterminate_count: count,
+      error:
+        "The queue acknowledgement did not include a usable prompt_id, so the panel cannot confirm or correlate this run.",
+      retry_guidance:
+        "The run may have been accepted. Check the ComfyUI queue or history before retrying; a blind retry can duplicate the render.",
+      ...(ranToNode != null ? { ran_to_node: ranToNode } : {}),
+    };
+  }
   return {
     queued: true,
     batch_count: batchCount,

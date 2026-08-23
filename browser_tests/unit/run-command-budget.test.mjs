@@ -123,6 +123,16 @@ function makeServer() {
   return fetchApi;
 }
 
+function makeServerWithoutPromptId() {
+  const calls = [];
+  const fetchApi = async (route, options) => {
+    calls.push({ route, options, at: Date.now() });
+    return jsonResponse(200, {});
+  };
+  fetchApi.calls = calls;
+  return fetchApi;
+}
+
 /**
  * @param {object} o
  * @param {number} o.drainMs how long the busy processor takes to get to our item
@@ -998,6 +1008,23 @@ test("#1565 P1: a HEALTHY full run is untouched — same accept result, no budge
     const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
     const res = await built.graph_run({});
     assert.deepEqual(res, { queued: true, batch_count: 1, prompt_id: "srv-1" });
+  } finally {
+    stop();
+  }
+});
+
+test("#1690 production path: a full run without a prompt_id is outcome-unknown, never queued:true", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServerWithoutPromptId() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({});
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "the production queue path made one /prompt request");
+    assert.equal(res.queued_unknown, true);
+    assert.notEqual(res.queued, true, "a queue acknowledgement without a receipt must not claim success");
+    assert.equal(res.prompt_id, undefined);
+    assert.match(String(res.error), /prompt_id/);
   } finally {
     stop();
   }
