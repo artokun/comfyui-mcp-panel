@@ -67,12 +67,21 @@ function hasBrokenLinkEndpoint(graph, node, err) {
   const nodeId = node?.id;
   if (nodeId == null || typeof graph?.getNodeById !== "function") return false;
   const message = String(err?.message ?? "");
+  const mirrorWrite = /Cannot set propert(?:y|ies) of (?:undefined|null) \(setting ['\"](?:link|links)['\"]\)|Cannot set property ['\"](?:link|links)['\"] of (?:undefined|null)/.test(message);
   const method = /findOutputSlot/.test(message) ? "findOutputSlot" : "findInputSlot";
   for (const [, link] of graphLinkEntries(graph)) {
     if (!link) continue;
-    const farId = sameNodeId(link.origin_id, nodeId) ? link.target_id : sameNodeId(link.target_id, nodeId) ? link.origin_id : null;
+    const nodeIsOrigin = sameNodeId(link.origin_id, nodeId);
+    const nodeIsTarget = sameNodeId(link.target_id, nodeId);
+    const farId = nodeIsOrigin ? link.target_id : nodeIsTarget ? link.origin_id : null;
     if (farId == null) continue;
     const far = graph.getNodeById(farId);
+    if (mirrorWrite) {
+      const farSlot = nodeIsOrigin ? link.target_slot : link.origin_slot;
+      const farSlots = nodeIsOrigin ? far?.inputs : far?.outputs;
+      if (far != null && farSlot != null && (!Array.isArray(farSlots) || farSlots[Number(farSlot)] == null)) return true;
+      continue;
+    }
     if (far != null && typeof far[method] !== "function") return true;
   }
   return false;

@@ -251,6 +251,31 @@ test("#1668 records the narrow link-disconnect crash and verifies a linked-widge
   assert.deepEqual(verifyNodeRestore(node, info).linkDrivenWidgetDifferences, ["select"]);
 });
 
+test("#1668 records mirror-write evidence when the far node is valid but its referenced slot is missing", () => {
+  const LG = makeLiteGraph();
+  const base = LG.LGraphNode.prototype.configure;
+  LG.LGraphNode.prototype.configure = function (info) {
+    if (info.id === 122) throw new TypeError("Cannot set properties of undefined (setting 'link')");
+    return base.call(this, info);
+  };
+  const node = new LG.LGraphNode(122);
+  node.inputs = [{ name: "select", link: 902, widget: { name: "select" } }];
+  node.widgets = [{ name: "select" }];
+  const farNode = { id: 321, findInputSlot: () => 0, findOutputSlot: () => 0, outputs: [] };
+  const graph = {
+    _links: new Map([[902, { id: 902, origin_id: 321, origin_slot: 0, target_id: 122, target_slot: 0 }]]),
+    getNodeById: (id) => (id === 122 ? node : id === 321 ? farNode : null),
+  };
+  const isolation = installNodeConfigureIsolation(LG, graph);
+  try {
+    node.configure({ id: 122, type: "ImpactSwitch" });
+  } finally {
+    isolation.restore();
+  }
+  assert.equal(isolation.failures[0].linkDisconnectCrash, true);
+  assert.equal(isolation.failures[0].linkDisconnectEvidence, true);
+});
+
 test("#1668 does not verify a non-linked widget difference", () => {
   const info = {
     id: 122,
