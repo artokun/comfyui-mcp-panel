@@ -16774,7 +16774,9 @@ const GRAPH_TOOL_EXECUTORS = {
     const capturePromptId = (pid) => {
       // EVERY accepted prompt_id, string-normalized at capture (0 and "0"
       // are the same run) so #370 reconcile stays string-vs-string.
-      if (!queuedPromptIds.includes(pid)) queuedPromptIds.push(pid);
+      const id = String(pid).trim();
+      if (!id) return;
+      if (!queuedPromptIds.includes(id)) queuedPromptIds.push(id);
     };
     // #1504 — node_errors that arrived on an ACCEPTED (200) reply: the outputs
     // ComfyUI dropped from a prompt it queued anyway ("Output will be ignored").
@@ -17044,8 +17046,8 @@ const GRAPH_TOOL_EXECUTORS = {
       // recoverable gap. So a partial reports queued:true with complete:false,
       // and the reason moves out of `error` (which reads as "this did not
       // happen") into `incomplete_reason`.
-      if (runScopeResult.verified > 0) {
-        const unknown = runScopeResult.indeterminate > 0;
+      const unresolved = (runScopeResult.indeterminate ?? 0) + (runScopeResult.inFlight ?? 0);
+      if (runScopeResult.verified > 0 && unresolved === 0) {
         return {
           queued: true,
           complete: false,
@@ -17059,16 +17061,11 @@ const GRAPH_TOOL_EXECUTORS = {
           // threw, or its response was unparseable — ComfyUI may or may not
           // have queued it. Naming a precise remainder there would send the
           // caller to re-run something that could already be rendering.
-          retry_guidance: unknown
-            ? `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to ` +
-              `node ${to_node_id} (prompt_ids above). ${runScopeResult.indeterminate} more ` +
-              `left the panel but their outcome could NOT be determined — ComfyUI may or ` +
-              `may not have queued them. Check the ComfyUI queue before re-running anything: ` +
-              `the remaining count cannot be stated from here without risking a duplicate render.`
-            : `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to ` +
-              `node ${to_node_id}; they are running and are tracked by the prompt_ids above. ` +
-              `Re-run only the remaining ${Math.max(0, batch - runScopeResult.verified)} — ` +
-              `re-running the full batch would queue the already-running prompt(s) again.`,
+          retry_guidance:
+            `${runScopeResult.verified} of ${batch} prompt(s) ARE queued and scoped to ` +
+            `node ${to_node_id}; they are running and are tracked by the prompt_ids above. ` +
+            `Re-run only the remaining ${Math.max(0, batch - runScopeResult.verified)} — ` +
+            `re-running the full batch would queue the already-running prompt(s) again.`,
         };
       }
       // Nothing verified. But "nothing verified" is still not always "nothing
@@ -17086,18 +17083,25 @@ const GRAPH_TOOL_EXECUTORS = {
       // `inFlight` counts requests that HAD LEFT the panel and were still
       // awaiting a response when the wait expired (gate r9) — same epistemic
       // status as an indeterminate one: it may be accepted a moment from now.
-      const unresolved = (runScopeResult.indeterminate ?? 0) + (runScopeResult.inFlight ?? 0);
       if (unresolved > 0) {
         return {
           queued_unknown: true,
+          ...(runScopeResult.verified > 0
+            ? {
+                queued_count: runScopeResult.verified,
+                prompt_id: queuedPromptIds[0],
+                ...(queuedPromptIds.length > 1 ? { prompt_ids: queuedPromptIds.slice() } : {}),
+              }
+            : {}),
           error: runScopeResult.error,
           indeterminate_count: unresolved,
           retry_guidance:
-            `No prompt was CONFIRMED queued, but ${unresolved} request(s) ` +
-            `DID leave the panel and their outcome could not be determined — ComfyUI may have ` +
+            `${runScopeResult.verified > 0 ? `${runScopeResult.verified} prompt(s) WERE confirmed queued, but ` : "No prompt was CONFIRMED queued, but "}` +
+            `${unresolved} request(s) DID leave the panel and their outcome could not be determined — ComfyUI may have ` +
             `queued them, and they carried the run-to-node scope. Check the ComfyUI queue ` +
-            `before retrying rather than assuming nothing ran; a blind retry can render the ` +
-            `branch twice. This result deliberately omits "queued" because neither true nor ` +
+            `before re-running anything rather than assuming nothing ran; a blind retry can render the ` +
+            `branch twice; the remaining count cannot be stated from here without risking a ` +
+            `duplicate render. This result deliberately omits "queued" because neither true nor ` +
             `false is an honest answer here.`,
         };
       }
@@ -17183,11 +17187,20 @@ const GRAPH_TOOL_EXECUTORS = {
           `"queued" because neither true nor false is honest here.`,
       };
     }
+    // A 200 response without a usable receipt is not a node-error refusal. The
+    // frontend may have left stale lastNodeErrors from an earlier attempt (or
+    // recorded node metadata before the receipt was lost), so receipt
+    // uncertainty takes precedence over that fallback channel. A raw top-level
+    // rejection captured from /prompt remains definitive, even if another
+    // batch response was missing its receipt.
+    const missingPromptIds = Number(runInterceptor?.state?.missingPromptIds) || 0;
     // Verdict from BOTH channels: the captured top-level rejection (#358) and the
-    // per-node errors the frontend stashed. null ⇒ genuinely accepted.
+    // per-node errors the frontend stashed. null ⇒ genuinely accepted. Missing
+    // receipts suppress only the stale frontend fallback; an explicit refusal
+    // captured from /prompt still wins over the unknown acknowledgement.
     const rejection = summarizePromptRejection({
       rejection: promptRejection,
-      lastNodeErrors: app.lastNodeErrors,
+      lastNodeErrors: missingPromptIds === 0 ? app.lastNodeErrors : null,
       runToNode: runToNodeInfo,
       // #1504 — the prompt_id(s) ComfyUI MINTED for this run. A minted id is a
       // receipt of acceptance, so per-node errors that arrive beside one are
@@ -17201,6 +17214,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const accept = buildQueueAcceptResult({
       batchCount: batch,
       promptIds: queuedPromptIds,
+      uncertainCount: missingPromptIds,
       ranToNode: partialTargets ? Number(to_node_id) : null,
       // #1504 — outputs ComfyUI dropped from the prompt it queued.
       droppedOutputs: acceptedNodeErrors,
@@ -27278,6 +27292,15 @@ function describeCommand(cmd, msg, reply) {
         text: tr("panel.canvas_action", "Canvas: {action}", { action: r.canvas?.action?.replace(/_/g, " ") }),
       };
     case "graph_run":
+      if (r.queued_unknown) {
+        return {
+          icon: "pi-question-circle",
+          text: tr("panel.run_outcome_uncertain", "Run outcome uncertain"),
+          // Do not render retry_guidance here: the activity card must not turn
+          // an ambiguous acknowledgement into duplicate-retry messaging.
+          detail: r.error ?? "The panel could not confirm the queue acknowledgement.",
+        };
+      }
       return r.queued
         ? {
             // #985 — an accepted prompt carrying outputs from muted/bypassed

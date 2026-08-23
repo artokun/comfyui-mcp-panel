@@ -984,6 +984,41 @@ test("#556 r6: an attributed post with a MALFORMED response (200 without prompt_
   }
 });
 
+test("#1690: a scoped batch with a blank receipt and a valid receipt is uncertain, not queued:true", async () => {
+  const stop = keepAlive();
+  try {
+    const responses = [jsonResponse(200, { prompt_id: "   " }), jsonResponse(200, { prompt_id: "p2" })];
+    let responseIndex = 0;
+    const server = makeServer(() => responses[responseIndex++]);
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.queuePrompt = async (number, batch) => {
+      for (let i = 0; i < batch; i++) {
+        const body = frontendBody({ number, targets: ["14"] });
+        app.posted.push(body);
+        await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      }
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget,
+      execIds: ["14"],
+      batch: 2,
+      toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(server.calls.length, 2);
+    assert.deepEqual(ids, ["p2"], "the usable receipt remains ledger-eligible");
+    assert.equal(result.verified, 1);
+    assert.equal(result.indeterminate, 1, "the blank receipt consumes an uncertain batch slot");
+    assert.notEqual(result.outcome, "dispatched", "one blank receipt prevents a full-batch claim");
+  } finally {
+    stop();
+  }
+});
+
 test("#556 r6: a GENUINE server rejection still flows through the established #358 rejection channel (not a dispatch failure)", async () => {
   const rejectionBody = { error: { type: "prompt_outputs_failed_validation", message: "bad input" } };
   const spy = makeServer(async () => jsonResponse(400, rejectionBody));
@@ -1630,7 +1665,7 @@ test("#630 gate r8 P1: an INDETERMINATE dispatch omits `queued` — neither true
   // Bound the slice to THIS branch's return, or it runs on into the
   // nothing-dispatched `queued: false` below and the assertion means nothing.
   const indetBlock = block.slice(indetStart, block.indexOf("}; }", indetStart) + 4);
-  assert.ok(indetBlock.length > 100 && indetBlock.length < 900, "the branch was isolated, not the whole tail");
+  assert.ok(indetBlock.length > 100 && indetBlock.length < 1400, "the branch was isolated, not the whole tail");
   assert.doesNotMatch(indetBlock, /queued: false/,
     "a definite negative about a request whose fate we say we cannot determine");
   assert.match(indetBlock, /queued_unknown: true/);
@@ -1841,7 +1876,7 @@ test("#630 gate r5 P1: graph_run discloses a PARTIAL batch's queued work instead
   const start = source.indexOf("if (runScopeResult && runScopeResult.outcome !== \"dispatched\")");
   assert.ok(start > 0);
   const block = source.slice(start, start + 4600).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
-  assert.match(block, /if \(runScopeResult\.verified > 0\)/, "the partial case is distinguished from a total failure");
+  assert.match(block, /if \(runScopeResult\.verified > 0 && unresolved === 0\)/, "only a fully verified partial is reported queued");
   assert.match(block, /partially_queued: true/);
   assert.match(block, /queued_prompt_ids: queuedPromptIds\.slice\(\)/, "the caller can TRACK what is already running");
   assert.match(block, /Re-run only the remaining/, "and is told not to re-run the whole batch");
@@ -1946,18 +1981,22 @@ test("#630 gate r6: graph_run never states a remainder it cannot count, and neve
   const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
   const start = source.indexOf('if (runScopeResult && runScopeResult.outcome !== "dispatched")');
   assert.ok(start > 0);
-  const block = source.slice(start, start + 4200).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
+  const block = source.slice(start, start + 5600).replace(/`\s*\+\s*\n\s*`/g, "").replace(/\s+/g, " ");
   // A partial no longer asserts "not queued" for prompts that are executing.
   assert.match(block, /queued: true, complete: false, partially_queued: true/,
     "a partial batch is queued-but-incomplete, never a flat failure");
   assert.match(block, /incomplete_reason: runScopeResult\.error/,
     "and its reason does not masquerade as an error about work that did happen");
   // The remainder is only named when it is actually knowable.
-  assert.match(block, /const unknown = runScopeResult\.indeterminate > 0;/);
-  // …and that flag must actually SELECT the guidance. Asserting only that both
-  // strings exist would pass a version that always names a remainder.
-  assert.match(block, /retry_guidance: unknown \?/,
-    "the indeterminate flag gates which guidance is given, it is not merely computed");
+  assert.match(block, /const unresolved = \(runScopeResult\.indeterminate \?\? 0\) \+ \(runScopeResult\.inFlight \?\? 0\);/);
+  // …and that count must actually SELECT the uncertain result. Asserting only
+  // that both strings exist would pass a version that still reports queued:true.
+  assert.match(block, /if \(runScopeResult\.verified > 0 && unresolved === 0\)/,
+    "unresolved receipts veto the partial queued:true result");
+  assert.match(block, /if \(unresolved > 0\)/,
+    "the unresolved count selects the queued_unknown result");
+  assert.match(block, /queued_count: runScopeResult\.verified/,
+    "known prompt ids remain disclosed as partial evidence");
   assert.match(block, /the remaining count cannot be stated from here without risking a duplicate render/);
   assert.match(block, /Check the ComfyUI queue before re-running anything/);
   // Zero verified + an indeterminate dispatch is still not "nothing ran".

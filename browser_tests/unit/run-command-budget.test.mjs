@@ -123,6 +123,28 @@ function makeServer() {
   return fetchApi;
 }
 
+function makeServerWithoutPromptId() {
+  const calls = [];
+  const fetchApi = async (route, options) => {
+    calls.push({ route, options, at: Date.now() });
+    return jsonResponse(200, {});
+  };
+  fetchApi.calls = calls;
+  return fetchApi;
+}
+
+function makeServerSequence(bodies) {
+  const calls = [];
+  const fetchApi = async (route, options) => {
+    calls.push({ route, options, at: Date.now() });
+    const entry = bodies[Math.min(calls.length - 1, bodies.length - 1)];
+    const described = entry && typeof entry === "object" && Object.hasOwn(entry, "status");
+    return jsonResponse(described ? entry.status : 200, described ? entry.body : entry);
+  };
+  fetchApi.calls = calls;
+  return fetchApi;
+}
+
 /**
  * @param {object} o
  * @param {number} o.drainMs how long the busy processor takes to get to our item
@@ -880,7 +902,7 @@ function makeUnscopedFrontend({ apiTarget, mode, drainMs = 5 }) {
     queueItems: [],
     graph: { _nodes: [] },
     graphToPrompt: async () => ({ output: OUR_OUTPUT, workflow: {} }),
-    queuePrompt: async () => {
+    queuePrompt: async (_number, batch = 1) => {
       const post = () =>
         apiTarget.fetchApi("/prompt", {
           method: "POST",
@@ -897,7 +919,7 @@ function makeUnscopedFrontend({ apiTarget, mode, drainMs = 5 }) {
         if (typeof t.unref === "function") t.unref();
         return new Promise(() => {});
       }
-      await post();
+      for (let i = 0; i < Math.max(1, Math.floor(Number(batch)) || 1); i++) await post();
       return true;
     },
   };
@@ -1003,6 +1025,87 @@ test("#1565 P1: a HEALTHY full run is untouched — same accept result, no budge
   }
 });
 
+test("#1690 production path: a full run without a prompt_id is outcome-unknown, never queued:true", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServerWithoutPromptId() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({});
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "the production queue path made one /prompt request");
+    assert.equal(res.queued_unknown, true);
+    assert.notEqual(res.queued, true, "a queue acknowledgement without a receipt must not claim success");
+    assert.equal(res.prompt_id, undefined);
+    assert.match(String(res.error), /prompt_id/);
+  } finally {
+    stop();
+  }
+});
+
+test("#1690 production path: a blank plus valid batch receipt is outcome-unknown, never queued:true", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = {
+      fetchApi: makeServerSequence([{ prompt_id: "   " }, { prompt_id: "p2" }]),
+    };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({ batch_count: 2 });
+    assert.equal(apiTarget.fetchApi.calls.length, 2, "the production batch path made both /prompt requests");
+    assert.equal(res.queued_unknown, true);
+    assert.notEqual(res.queued, true, "one unusable receipt taints the whole batch acknowledgement");
+    assert.equal(res.prompt_id, "p2", "the valid receipt remains available for correlation");
+    assert.equal(res.queued_count, 1);
+    assert.equal(res.indeterminate_count, 1);
+  } finally {
+    stop();
+  }
+});
+
+test("#1690 production path: a missing receipt with node errors stays queued_unknown", async () => {
+  const stop = keepAlive();
+  try {
+    const nodeErrors = { "9": { errors: [{ message: "stale validation metadata" }] } };
+    const apiTarget = { fetchApi: makeServerSequence([{ node_errors: nodeErrors }]) };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    // This is the frontend fallback channel under review: it is populated even
+    // though the current 200 response did not provide a usable receipt.
+    app.lastNodeErrors = nodeErrors;
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({});
+    assert.equal(res.queued_unknown, true);
+    assert.equal(res.queued, undefined, "missing receipt must not become queued:false from stale node errors");
+    assert.notEqual(res.queued, false);
+    assert.match(String(res.error), /prompt_id|acknowledgement/i);
+  } finally {
+    stop();
+  }
+});
+
+test("#1690 production path: a definitive refusal beats another batch item's missing receipt", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = {
+      fetchApi: makeServerSequence([
+        {},
+        {
+          status: 400,
+          body: { error: { type: "prompt_outputs_failed_validation", message: "definitive refusal" } },
+        },
+      ]),
+    };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({ batch_count: 2 });
+    assert.equal(apiTarget.fetchApi.calls.length, 2, "the production batch path observed both /prompt responses");
+    assert.equal(res.queued, false, "a definitive refusal remains a refusal for the whole acknowledgement");
+    assert.equal(res.queued_unknown, undefined);
+    assert.match(String(res.error), /definitive refusal|prompt_outputs_failed_validation/i);
+  } finally {
+    stop();
+  }
+});
+
 test("#1565 P1: the run interceptor COUNTS what left the panel, so the reply states it rather than assuming it", async () => {
   const stop = keepAlive();
   try {
@@ -1013,15 +1116,15 @@ test("#1565 P1: the run interceptor COUNTS what left the panel, so the reply sta
       return { status: 200, clone: () => ({ json: async () => ({ prompt_id: "p1" }) }), text: async () => "{}" };
     };
     const interceptor = createRunFetchInterceptor({ origFetchApi: inner });
-    assert.deepEqual(interceptor.state, { posted: 0, inFlight: 0 });
+    assert.deepEqual(interceptor.state, { posted: 0, inFlight: 0, missingPromptIds: 0 });
     const post = interceptor("/prompt", { method: "POST", body: JSON.stringify({ prompt: {} }) });
-    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 1 }, "counted BEFORE the request leaves");
+    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 1, missingPromptIds: 0 }, "counted BEFORE the request leaves");
     release();
     await post;
-    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 0 }, "and settled when it answers");
+    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 0, missingPromptIds: 0 }, "and settled when it answers");
     // A non-prompt request is never counted as this run's work.
     await interceptor("/queue", { method: "GET" });
-    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 0 });
+    assert.deepEqual(interceptor.state, { posted: 1, inFlight: 0, missingPromptIds: 0 });
   } finally {
     stop();
   }

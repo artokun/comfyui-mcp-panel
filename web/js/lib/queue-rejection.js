@@ -181,7 +181,9 @@ function normalizeNodeErrors(ne) {
  * the agent can correlate/track the run — #370 reconciliation and mcp#531
  * (panel_run must return the prompt_id, even when a render is already running)
  * both depend on this. `prompt_id` is the first accepted id; `prompt_ids` is only
- * added for a batch that queued more than one.
+ * added for a batch that queued more than one. A missing id is not represented as
+ * `queued:true`: the request may have reached ComfyUI, but the panel has no receipt
+ * with which to prove or correlate that outcome.
  *
  * #1504 — an accepted run may have DROPPED some outputs. ComfyUI reports those on the
  * 200 body's `node_errors`, and they are reported here verbatim, on an otherwise normal
@@ -194,25 +196,44 @@ function normalizeNodeErrors(ne) {
  * @param {object} args
  * @param {number} args.batchCount
  * @param {(string|null)[]} [args.promptIds]  Accepted prompt_ids, in queue order.
+ * @param {number} [args.uncertainCount] Accepted responses without a usable prompt_id.
  * @param {number|null} [args.ranToNode]      Present for a run-to-node partial run.
  * @param {object|null} [args.droppedOutputs] `node_errors` from the ACCEPTED 200 reply.
  */
 export function buildQueueAcceptResult({
   batchCount,
   promptIds = [],
+  uncertainCount = 0,
   ranToNode = null,
   droppedOutputs = null,
 } = {}) {
-  // NORMALIZE to strings at this ingestion boundary (drop null/undefined) so the
-  // reported prompt_id(s), and everything that later reconciles against them, are
-  // string-vs-string — a numeric /prompt id can't slip through as a number (#370).
-  // Dedupe AFTER normalization (via Set) so a mixed 0 / "0" batch reports one id.
-  const ids = [
-    ...new Set(
-      (Array.isArray(promptIds) ? promptIds : []).filter((x) => x != null).map((x) => String(x)),
-    ),
-  ];
+  // NORMALIZE to trimmed strings at this ingestion boundary (drop null/undefined
+  // and blank values) so the reported prompt_id(s), and everything that later
+  // reconciles against them, are string-vs-string — a numeric /prompt id can't slip
+  // through as a number (#370). Dedupe AFTER normalization so a mixed 0 / "0" batch
+  // reports one id.
+  const ids = normalizeAcceptedIds(promptIds);
   const dropped = normalizeNodeErrors(droppedOutputs);
+  const unknown = Math.max(0, Math.floor(Number(uncertainCount)) || 0);
+  if (!ids.length || unknown > 0) {
+    const count = Math.max(1, Math.floor(Number(batchCount)) || 1);
+    return {
+      queued_unknown: true,
+      batch_count: batchCount,
+      ...(ids.length ? { queued_count: ids.length, prompt_id: ids[0] } : {}),
+      ...(ids.length > 1 ? { prompt_ids: [...ids] } : {}),
+      indeterminate_count: unknown || count,
+      error:
+        unknown > 0
+          ? "The queue acknowledgement was incomplete: at least one accepted prompt did not include a usable prompt_id, so the panel cannot confirm or correlate the full run."
+          : "The queue acknowledgement did not include a usable prompt_id, so the panel cannot confirm or correlate this run.",
+      retry_guidance:
+        unknown > 0
+          ? "Some prompts may have been accepted. Check the ComfyUI queue or history before retrying; a blind retry can duplicate the render."
+          : "The run may have been accepted. Check the ComfyUI queue or history before retrying; a blind retry can duplicate the render.",
+      ...(ranToNode != null ? { ran_to_node: ranToNode } : {}),
+    };
+  }
   return {
     queued: true,
     batch_count: batchCount,

@@ -1200,19 +1200,39 @@ export function scopeDispatchError({ toNodeId, detail, verified, batch }) {
  * prompt id was minted AND which outputs were dropped, in one structured receipt.
  * `lastNodeErrors` cannot distinguish those two cases at all.
  */
-async function captureRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors }) {
+function normalizePromptId(value) {
+  if (value == null) return null;
+  const id = String(value).trim();
+  return id || null;
+}
+
+async function captureRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors, onMissingPromptId }) {
   try {
     const body = await res.clone().json();
     if (res.status !== 200) {
       if (body && (body.error || body.node_errors)) {
         onRejection?.({ error: body.error ?? null, node_errors: body.node_errors ?? null });
+      } else {
+        onMissingPromptId?.();
       }
-    } else if (body && body.prompt_id != null) {
-      onPromptId?.(String(body.prompt_id));
-      reportAcceptedNodeErrors(body, onAcceptedNodeErrors);
+    } else {
+      const promptId = normalizePromptId(body?.prompt_id);
+      if (promptId != null) {
+        onPromptId?.(promptId);
+        reportAcceptedNodeErrors(body, onAcceptedNodeErrors);
+      } else {
+        // A 200 proves the request reached the server, but without a usable
+        // receipt it cannot prove which batch item was accepted or correlate
+        // its completion. Do not let stale app.lastNodeErrors turn this into
+        // a definitive refusal.
+        onMissingPromptId?.();
+      }
     }
   } catch {
-    // non-JSON body / clone unsupported — the caller falls back to lastNodeErrors.
+    // An unreadable body cannot establish either a definitive refusal or a
+    // usable acceptance receipt, regardless of status. Keep the acknowledgement
+    // uncertain so a mixed batch cannot be reported as fully queued.
+    onMissingPromptId?.();
   }
 }
 
@@ -1235,8 +1255,9 @@ async function classifyRunResponse(res, { onRejection, onPromptId, onAcceptedNod
   try {
     const body = await res.clone().json();
     if (res.status === 200) {
-      if (body && body.prompt_id != null) {
-        onPromptId?.(String(body.prompt_id));
+      const promptId = normalizePromptId(body?.prompt_id);
+      if (promptId != null) {
+        onPromptId?.(promptId);
         reportAcceptedNodeErrors(body, onAcceptedNodeErrors); // #1504
         return "accepted";
       }
@@ -1263,6 +1284,8 @@ async function classifyRunResponse(res, { onRejection, onPromptId, onAcceptedNod
  * #1565 — IT ALSO COUNTS WHAT LEFT. `interceptor.state` is live:
  *   - `posted`   /prompt requests this run handed to the network, ever;
  *   - `inFlight` those whose response has not come back yet.
+ *   - `missingPromptIds` responses that did come back but carried no usable
+ *     prompt_id receipt (including an unreadable/empty acknowledgement).
  * A full run whose `app.queuePrompt` is abandoned at the command budget has to say
  * whether anything actually left the panel, and "nothing was queued" and "a request
  * is in flight" are different answers with different retry advice — only one of them
@@ -1275,7 +1298,7 @@ export function createRunFetchInterceptor({
   onPromptId = null,
   onAcceptedNodeErrors = null,
 } = {}) {
-  const state = { posted: 0, inFlight: 0 };
+  const state = { posted: 0, inFlight: 0, missingPromptIds: 0 };
   const interceptor = async function runFetchInterceptor(route, options) {
     // Classified BEFORE the request leaves, because that is the only moment at which
     // "this one is ours to count" can still be decided. Guarded: reading `options`
@@ -1294,8 +1317,17 @@ export function createRunFetchInterceptor({
     }
     try {
       const res = await origFetchApi(route, options);
-      if (isPost && res) {
-        await captureRunResponse(res, { onRejection, onPromptId, onAcceptedNodeErrors });
+      if (isPost) {
+        if (res) {
+          await captureRunResponse(res, {
+            onRejection,
+            onPromptId,
+            onAcceptedNodeErrors,
+            onMissingPromptId: () => state.missingPromptIds++,
+          });
+        } else {
+          state.missingPromptIds++;
+        }
       }
       return res;
     } finally {
