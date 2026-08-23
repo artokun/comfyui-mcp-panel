@@ -375,10 +375,10 @@ test("#1332 source guard: get_errors adjudicates AFTER the node-def refresh, aga
   const end = src.indexOf("async workflow_save(", at);
   assert.ok(end > at, "the executor's end must still be recognisable");
   const body = src.slice(at, end);
-  const refreshAt = body.indexOf("refreshComfyNodeDefs(undefined, { force: true })");
+  const refreshAt = body.indexOf("refreshMissingAssetTrust({");
   const adjudicateAt = body.indexOf("adjudicateRecordedMissingNodeTypes(");
   const reasonsAt = body.indexOf("collectMissingNodeTypeReasons(nodes, missingNodeTypes)");
-  assert.ok(refreshAt > 0, "get_errors still force-refreshes node defs");
+  assert.ok(refreshAt > 0, "get_errors still reaches the forced node-def refresh seam");
   assert.ok(adjudicateAt > refreshAt, "adjudication must run AFTER the refresh so LiteGraph is current");
   assert.ok(reasonsAt > adjudicateAt, "per-node missing_node_type blame uses the FILTERED list");
   assert.match(

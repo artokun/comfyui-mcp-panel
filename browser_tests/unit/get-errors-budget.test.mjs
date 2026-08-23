@@ -120,8 +120,8 @@ test("graph_get_errors spends the shared budget and the old 4 s constant is gone
   );
   assert.match(
     PANEL_SOURCE,
-    /withRefreshTimeout\(\s*refreshComfyNodeDefs\(undefined, \{ force: true \}\),\s*refreshBudgetMs,?\s*\)/,
-    "the forced refresh race must RECEIVE that budget (an unpassed budget silently reverts #610)",
+    /refreshMissingAssetTrust\(\{[\s\S]*?refreshBudgetMs,[\s\S]*?withRefreshTimeout,[\s\S]*?\}\)/,
+    "the graph_get_errors refresh seam must RECEIVE the shared budget and timeout",
   );
   assert.match(
     PANEL_SOURCE,
