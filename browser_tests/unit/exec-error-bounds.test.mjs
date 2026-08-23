@@ -444,12 +444,23 @@ function makeScopedErrorGraph() {
   const host = { id: 140, type: "Subgraph", subgraph: innerGraph };
   const siblingHost = { id: 141, type: "Subgraph", subgraph: siblingGraph };
   const rootNode = { id: 900, type: "SamplerCustomAdvanced" };
+  const collidingRootNode = { id: 125, type: "SamplerCustomAdvanced" };
   const rootGraph = {
-    _nodes: [host, siblingHost, rootNode],
+    _nodes: [host, siblingHost, rootNode, collidingRootNode],
     getNodeById: (id) =>
-      ({ 140: host, 141: siblingHost, 900: rootNode })[String(id)] ?? null,
+      ({ 140: host, 141: siblingHost, 900: rootNode, 125: collidingRootNode })[String(id)] ?? null,
   };
-  return { inner, innerGraph, host, siblingInner, siblingGraph, siblingHost, rootNode, rootGraph };
+  return {
+    inner,
+    innerGraph,
+    host,
+    siblingInner,
+    siblingGraph,
+    siblingHost,
+    rootNode,
+    collidingRootNode,
+    rootGraph,
+  };
 }
 
 async function runProductionGraphGetErrors({ graph, rootGraph, lastExecFailure }) {
@@ -565,6 +576,26 @@ test("#1685 production graph_get_errors omits same-type errors outside the visib
     assert.equal(result.last_execution_error, null, `foreign ${node_id} must be omitted`);
     assert.equal(result.note, "no errors recorded since the last execution start");
   }
+});
+
+test("#1685 production graph_get_errors rejects an ambiguous plain id colliding with the visible inner node", async () => {
+  const { inner, innerGraph, rootGraph, collidingRootNode } = makeScopedErrorGraph();
+  assert.equal(inner.id, collidingRootNode.id, "the fixture must reproduce the root/inner id collision");
+  assert.equal(inner.type, collidingRootNode.type, "the fixture must reproduce the same-type collision");
+  const result = await runProductionGraphGetErrors({
+    graph: innerGraph,
+    rootGraph,
+    lastExecFailure: {
+      node_id: String(collidingRootNode.id),
+      node_type: collidingRootNode.type,
+      exception_message: "root collision failure",
+    },
+  });
+
+  assert.equal(result.errored_count, 0);
+  assert.deepEqual(result.nodes, []);
+  assert.equal(result.last_execution_error, null);
+  assert.equal(result.note, "no errors recorded since the last execution start");
 });
 
 test("#1685 production graph_get_errors still rejects a type-mismatched scoped failure", async () => {
