@@ -115,6 +115,61 @@ test("#1680: a forced payload-less caller can explicitly join an in-flight refre
   assert.equal(registered.length, 1, "the opt-in joins the existing run without a trailing pass");
 });
 
+test("#1682: an acknowledgement join observes an already-queued fresh trailing run", async () => {
+  const firstGate = deferred();
+  let run = 0;
+  const { coalescer } = makeHarnessReturning(async () => {
+    run += 1;
+    if (run === 1) await firstGate.promise;
+    return { refreshed: run === 2, generation: run };
+  });
+
+  const current = coalescer(undefined, { force: true });
+  const trailing = coalescer(undefined, { force: true });
+  const acknowledgement = coalescer(undefined, {
+    force: true,
+    joinInFlight: true,
+    joinMs: 500,
+  });
+
+  firstGate.resolve();
+  assert.deepEqual(
+    await acknowledgement,
+    { refreshed: true, generation: 2 },
+    "the acknowledgement must report the fresh trailing generation, not the stale current run",
+  );
+  await Promise.all([current, trailing]);
+});
+
+test("#1682: the completion chain remains bounded when its fresh trailing run stalls", async () => {
+  const firstGate = deferred();
+  const trailingGate = deferred();
+  let run = 0;
+  const { coalescer } = makeHarnessReturning(async () => {
+    run += 1;
+    if (run === 1) await firstGate.promise;
+    if (run === 2) await trailingGate.promise;
+    return { refreshed: true };
+  });
+
+  const current = coalescer(undefined, { force: true });
+  const trailing = coalescer(undefined, { force: true });
+  const acknowledgement = coalescer(undefined, {
+    force: true,
+    joinInFlight: true,
+    joinMs: 25,
+  });
+
+  firstGate.resolve();
+  assert.equal(
+    await acknowledgement,
+    REFRESH_JOIN_ABANDONED,
+    "a queued refresh that does not settle stays a bounded, retryable refusal",
+  );
+  trailingGate.resolve();
+  await Promise.all([current, trailing]);
+});
+
 test("#1680: a failed joined refresh returns no freshness verdict", async () => {
   const gate = deferred();
   const { coalescer } = makeHarnessReturning(async () => {

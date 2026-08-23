@@ -177,6 +177,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
   let trailing = null;
   const startRun = (preloadedDefs, runOpts, abandonBeforeLocalWork) => {
     let yieldBeforeLocalWork = !!abandonBeforeLocalWork;
+    let nextCompletion = null;
     let announceBeforeLocalWork;
     const beforeLocalWork = new Promise((resolve) => {
       announceBeforeLocalWork = resolve;
@@ -212,11 +213,37 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     // no later caller can safely interrupt that JavaScript turn.
     const requestEarlyYield = () => {
       yieldBeforeLocalWork = true;
+      nextCompletion?.requestEarlyYield?.();
     };
+    const attachNextCompletion = (next) => {
+      nextCompletion = next;
+      if (yieldBeforeLocalWork) next?.requestEarlyYield?.();
+    };
+    // A forced freshness caller may queue one trailing run while this run is still active.
+    // Keep that successor in the acknowledgement handle's completion chain: joining only
+    // `p` can report the older /object_info generation as complete while the fresh combo
+    // rebuild is still pending (#1682). The chain is bounded once by the caller, so it cannot
+    // turn a queued refresh into an unbounded acknowledgement wait.
+    const completion = p.then(
+      (value) => (nextCompletion ? nextCompletion.promise : value),
+      (err) => (nextCompletion ? nextCompletion.promise : Promise.reject(err)),
+    );
+    // The completion chain is an optional observation handle. Mark its rejection handled
+    // until an acknowledgement caller elects to await it; the original run promise still
+    // preserves the caller-visible rejection semantics for ordinary/coalesced paths.
+    completion.catch(() => {});
+    const handle = { promise: p, beforeLocalWork, requestEarlyYield };
+    handle.completion = {
+      promise: completion,
+      requestEarlyYield,
+    };
+    handle.attachNextCompletion = attachNextCompletion;
     p.beforeLocalWork = beforeLocalWork;
     p.requestEarlyYield = requestEarlyYield;
+    p.completion = handle.completion;
+    p.attachNextCompletion = attachNextCompletion;
     setInFlight(p);
-    return { promise: p, beforeLocalWork, requestEarlyYield };
+    return handle;
   };
   return async function refresh(preloadedDefs, opts) {
     const force = !!(opts && opts.force);
@@ -250,15 +277,20 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
         // acknowledgement, so its local work cannot consume the acknowledgement's deadline.
         // The opt-in is intentionally limited to this join path; default forced callers still
         // queue the trailing freshness run below.
-        if (joinInFlight) current.requestEarlyYield?.();
-        if (!(await joinBounded(current, joinMs, withTimeout))) return REFRESH_JOIN_ABANDONED;
+        const joined = joinInFlight ? current.completion ?? current : current;
+        if (joinInFlight) {
+          current.requestEarlyYield?.();
+          joined.requestEarlyYield?.();
+        }
+        const joinedPromise = joined.promise ?? joined;
+        if (!(await joinBounded(joinedPromise, joinMs, withTimeout))) return REFRESH_JOIN_ABANDONED;
         // #1680 — an acknowledgement caller needs the run's freshness verdict, not just
         // proof that the promise settled. Ordinary payload-less joins intentionally retain
         // their historical undefined result because their callers only use the completion
         // as a synchronization point.
         if (joinInFlight) {
           try {
-            return await current;
+            return await joinedPromise;
           } catch {
             // A failed joined run is settled but has no freshness verdict. Preserve the
             // fail-closed undefined result so the caller reports a non-fresh outcome.
@@ -318,6 +350,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
             earlyYieldRequested = true;
           },
         };
+        current.attachNextCompletion?.(trailing);
       }
       return waitForRun(trailing, joinMs, withTimeout, abandonBeforeLocalWork);
     }

@@ -268,6 +268,7 @@ import {
 } from "./lib/bridge-defaults.js";
 import { createObjectInfoHistory, awaitHistoryBaseline } from "./lib/object-info-history.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "./lib/refresh-coalesce.js";
+import { refreshMissingAssetTrust } from "./lib/missing-asset-refresh.js";
 import {
   NODE_DEF_REFRESH_REASONS,
   describeNodeDefRefresh,
@@ -17491,29 +17492,16 @@ const GRAPH_TOOL_EXECUTORS = {
       const refreshBudgetMs = hasRawMissingAssetCandidates()
         ? errorsStepBudget(GET_ERRORS_REFRESH_CAP_MS)
         : 0;
-      if (refreshBudgetMs > 0) {
-        // force:true so we never JOIN an /object_info fetch that began BEFORE the current
-        // asset state (a joined stale run would trust a combo snapshot predating a just-
-        // deleted asset and suppress the now-genuine miss). The coalescer guarantees a
-        // trailing fetch that STARTS after the in-flight run settles and dedups concurrent
-        // forced calls into one (#396 / codex round-4 P0), and FORWARDS that trailing run's
-        // own freshness verdict back here — so the value below reflects the fetch THIS call
-        // triggered, not any concurrent run's global write.
-        comboTrustedForQuery = await withRefreshTimeout(
-          refreshComfyNodeDefs(undefined, { force: true }),
-          refreshBudgetMs,
-        );
-        // …AND only if no OTHER refresh is still in flight at this synchronous point. The
-        // shared coalescer lets a concurrent PAYLOAD refresh (graph_add_node) run its own
-        // registration alongside our forced one; if that payload carries an older combo
-        // snapshot and its refreshComboInNodes lands LAST, the live combos are stale even
-        // though our forced refresh returned true. When the slot still holds a run after
-        // ours settled, it points at that other in-flight registration — distrust and keep
-        // the raw candidate reported rather than risk suppressing a genuine miss off a
-        // combo another run may still overwrite (codex round-10 P0). Read synchronously,
-        // no intervening await, so the value is current for the collect below.
-        comboTrustedForQuery = comboTrustedForQuery && nodeDefRefreshInFlight === null;
-      }
+      // force:true so we never JOIN an /object_info fetch that began BEFORE the current
+      // asset state. The seam guarantees a trailing fetch, returns its own freshness
+      // verdict, and rejects trust if another refresh still owns the slot at the exact
+      // handoff into collectMissingAssets.
+      comboTrustedForQuery = await refreshMissingAssetTrust({
+        refreshBudgetMs,
+        refreshComfyNodeDefs,
+        withRefreshTimeout,
+        getRefreshInFlight: () => nodeDefRefreshInFlight,
+      });
     } catch {
       // best-effort; on any failure distrust the combo and keep raw candidates reported.
       comboTrustedForQuery = false;

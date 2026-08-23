@@ -19,6 +19,13 @@ import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { makeRefreshCoalescer } from "../../web/js/lib/refresh-coalesce.js";
 import { NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import {
+  collectAllGraphs,
+  isStaleAssetCandidate as isStaleAssetCandidateLib,
+  resolveMissingModelDirectory,
+} from "../../web/js/lib/asset-staleness.js";
+import { withoutFrontendVirtualTypes } from "../../web/js/lib/frontend-virtual-nodes.js";
+import { refreshMissingAssetTrust } from "../../web/js/lib/missing-asset-refresh.js";
+import {
   PANEL_SRC,
   ADD_NODE_COMMAND_BUDGET_MS,
   REFRESH_NODES_COMMAND_BUDGET_MS,
@@ -27,6 +34,77 @@ import {
 
 const refreshNodesMatch = PANEL_SRC.match(/\n {2}async refresh_nodes\(\) \{[\s\S]*?\n {2}\},/);
 assert.ok(refreshNodesMatch, "could not locate refresh_nodes in panel source");
+
+function extractPanelFn(sig) {
+  const start = PANEL_SRC.indexOf(sig);
+  assert.notEqual(start, -1, `${sig} not found in the panel source`);
+  const open = PANEL_SRC.indexOf(") {", start) + 1;
+  let depth = 0;
+  for (let i = open; i < PANEL_SRC.length; i += 1) {
+    const ch = PANEL_SRC[i];
+    if (ch === "/" && PANEL_SRC[i + 1] === "/") {
+      i = PANEL_SRC.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "/" && PANEL_SRC[i + 1] === "*") {
+      i = PANEL_SRC.indexOf("*/", i + 2);
+      if (i < 0) break;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < PANEL_SRC.length; i += 1) {
+        if (PANEL_SRC[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (PANEL_SRC[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return PANEL_SRC.slice(start, i + 1);
+  }
+  throw new Error(`unterminated: ${sig}`);
+}
+
+// Execute the shipped local wrapper and collector together. This keeps the regression at
+// the production consumer boundary: a refresh verdict changes the trust supplied to the
+// same `collectMissingAssets` body graph_get_errors and validationBanner use.
+const STALE_ASSET_BODY = extractPanelFn("function isStaleAssetCandidate(c, trustComboOverride) {");
+const COLLECTOR_BODY = extractPanelFn("function collectMissingAssets(trustComboOverride) {");
+const WITH_REFRESH_TIMEOUT_BODY = extractPanelFn("function withRefreshTimeout(promise, timeoutMs) {");
+const productionWithRefreshTimeout = new Function(
+  `${WITH_REFRESH_TIMEOUT_BODY}; return withRefreshTimeout;`,
+)();
+
+function makeProductionMissingAssetCollector({ stores, rootGraph }) {
+  const factory = new Function(
+    "getPiniaStore",
+    "isStaleAssetCandidateLib",
+    "resolveMissingModelDirectory",
+    "withoutFrontendVirtualTypes",
+    "collectAllGraphs",
+    "getGraphCtx",
+    `let nodeDefsRefreshConfirmed = false;
+     ${STALE_ASSET_BODY}
+     ${COLLECTOR_BODY}
+     return {
+       collectMissingAssets,
+       setRefreshConfirmed: (value) => { nodeDefsRefreshConfirmed = value === true; },
+     };`,
+  );
+  return factory(
+    (name) => stores[name],
+    isStaleAssetCandidateLib,
+    resolveMissingModelDirectory,
+    withoutFrontendVirtualTypes,
+    collectAllGraphs,
+    () => ({ rootGraph }),
+  );
+}
 
 /** A tiny deferred so a test can hold the in-flight refresh open until it chooses. */
 function deferred() {
@@ -140,6 +218,193 @@ test("#1680: refresh_nodes returns the completed verdict from an already-running
   assert.equal(built.runs.length, 1, "joining the completion must not queue a trailing refresh");
   await built.inFlightStarted?.catch(() => {});
 });
+
+test("#1682: refresh_nodes waits through a queued freshness run before the missing-asset scan", async () => {
+  const gate = deferred();
+  const candidate = {
+    nodeId: 7,
+    name: "taeh3.safetensors",
+    widgetName: "model",
+    directory: "checkpoints",
+    isMissing: true,
+  };
+  const node = {
+    id: 7,
+    widgets: [{ name: "model", value: "taeh3.safetensors", options: { values: [] } }],
+  };
+  const rootGraph = {
+    _nodes: [node],
+    getNodeById: (id) => node.id === id || String(node.id) === String(id) ? node : null,
+  };
+  const productionCollector = makeProductionMissingAssetCollector({
+    stores: {
+      missingModel: { missingModelCandidates: [candidate] },
+      missingMedia: { missingMediaCandidates: [] },
+      missingNodesError: { hasMissingNodes: false, missingNodeCount: 0, missingNodesError: [] },
+    },
+    rootGraph,
+  });
+  const built = realRefreshNodes({
+    holdFirstRun: gate.promise,
+    budgetMs: 500,
+    runHook: async ({ index }) => {
+      if (index === 1) node.widgets[0].options.values = ["taeh3.safetensors"];
+      return { refreshed: index === 1, reason: index === 1 ? "refreshed" : "object_info_fetch_failed" };
+    },
+  });
+
+  // The first run represents a refresh already started by a background missing-asset check.
+  // The second is its forced trailing fetch, which is the one that can observe the file copied
+  // into the configured model directory after the first /object_info request began.
+  const trailing = built.refreshComfyNodeDefs(undefined, { force: true });
+  const reply = built.refresh_nodes();
+  gate.resolve();
+
+  const { value } = await withWatchdog(
+    () => reply,
+    1500,
+    "refresh_nodes did not observe the queued freshness run",
+  );
+  assert.equal(value.refreshed, true, "the acknowledgement reports the run that saw the new file");
+  assert.equal(built.runs.length, 2, "the background refresh and its one trailing freshness run completed");
+  productionCollector.setRefreshConfirmed(value.refreshed);
+  const assets = productionCollector.collectMissingAssets();
+  assert.equal(
+    assets.models.length,
+    0,
+    "the shipped collectMissingAssets path clears the candidate from the refreshed combo",
+  );
+  assert.equal(assets.any, false, "the shipped collector reports no stale missing-asset error");
+  await Promise.all([built.inFlightStarted, trailing]);
+});
+
+test("#1682: graph_get_errors refresh seam scans with the completed trailing combo", async () => {
+  const gate = deferred();
+  const node = {
+    id: 7,
+    widgets: [{ name: "model", value: "taeh3.safetensors", options: { values: [] } }],
+  };
+  const rootGraph = {
+    _nodes: [node],
+    getNodeById: (id) => node.id === id || String(node.id) === String(id) ? node : null,
+  };
+  const candidate = {
+    nodeId: 7,
+    name: "taeh3.safetensors",
+    widgetName: "model",
+    directory: "checkpoints",
+    isMissing: true,
+  };
+  const productionCollector = makeProductionMissingAssetCollector({
+    stores: {
+      missingModel: { missingModelCandidates: [candidate] },
+      missingMedia: { missingMediaCandidates: [] },
+      missingNodesError: { hasMissingNodes: false, missingNodeCount: 0, missingNodesError: [] },
+    },
+    rootGraph,
+  });
+  const built = realRefreshNodes({
+    holdFirstRun: gate.promise,
+    budgetMs: 500,
+    runHook: async ({ index }) => {
+      if (index === 1) node.widgets[0].options.values = ["taeh3.safetensors"];
+      return { refreshed: index === 1, reason: index === 1 ? "refreshed" : "object_info_fetch_failed" };
+    },
+  });
+
+  // This is the exact refresh/scan boundary used by graph_get_errors. The first refresh
+  // started before the scan cannot see the file; the forced call queues the one that can.
+  const trustPromise = refreshMissingAssetTrust({
+    refreshBudgetMs: 500,
+    refreshComfyNodeDefs: built.refreshComfyNodeDefs,
+    withRefreshTimeout: productionWithRefreshTimeout,
+    getRefreshInFlight: built.getInFlight,
+  });
+  gate.resolve();
+
+  const trusted = await withWatchdog(
+    () => trustPromise,
+    1500,
+    "graph_get_errors refresh seam did not complete the trailing refresh",
+  );
+  assert.equal(trusted.value, true, "only the refresh that saw the new combo may grant trust");
+  productionCollector.setRefreshConfirmed(trusted.value);
+  const assets = productionCollector.collectMissingAssets();
+  assert.equal(assets.models.length, 0, "graph_get_errors' shipped collector clears the stale error");
+  assert.equal(assets.any, false, "the production scan is clean after the trailing refresh");
+  assert.equal(built.runs.length, 2, "the graph error refresh used one trailing run");
+  await built.inFlightStarted;
+});
+
+for (const [label, runHook, release] of [
+  [
+    "timeout",
+    async ({ index }) => {
+      if (index === 1) await release.promise;
+      return { refreshed: index === 0, reason: index === 0 ? "refreshed" : "object_info_fetch_failed" };
+    },
+    deferred(),
+  ],
+  [
+    "rejection",
+    async ({ index }) => {
+      if (index === 1) throw new Error("trailing refresh failed");
+      return { refreshed: index === 0, reason: index === 0 ? "refreshed" : "object_info_fetch_failed" };
+    },
+    null,
+  ],
+]) {
+  test(`#1682: graph_get_errors keeps a trailing ${label} fail-closed`, async () => {
+    const gate = deferred();
+    const node = {
+      id: 7,
+      widgets: [{ name: "model", value: "taeh3.safetensors", options: { values: [] } }],
+    };
+    const rootGraph = {
+      _nodes: [node],
+      getNodeById: (id) => node.id === id || String(node.id) === String(id) ? node : null,
+    };
+    const candidate = {
+      nodeId: 7,
+      name: "taeh3.safetensors",
+      widgetName: "model",
+      directory: "checkpoints",
+      isMissing: true,
+    };
+    const productionCollector = makeProductionMissingAssetCollector({
+      stores: {
+        missingModel: { missingModelCandidates: [candidate] },
+        missingMedia: { missingMediaCandidates: [] },
+        missingNodesError: { hasMissingNodes: false, missingNodeCount: 0, missingNodesError: [] },
+      },
+      rootGraph,
+    });
+    const built = realRefreshNodes({ holdFirstRun: gate.promise, budgetMs: 500, runHook });
+    const trustPromise = refreshMissingAssetTrust({
+      refreshBudgetMs: 25,
+      refreshComfyNodeDefs: built.refreshComfyNodeDefs,
+      withRefreshTimeout: productionWithRefreshTimeout,
+      getRefreshInFlight: built.getInFlight,
+    });
+    gate.resolve();
+
+    const trusted = await withWatchdog(
+      () => trustPromise,
+      1500,
+      `graph_get_errors trailing ${label} case did not return`,
+    );
+    assert.equal(trusted.value, false, `a trailing ${label} must not grant combo trust`);
+    productionCollector.setRefreshConfirmed(trusted.value);
+    const assets = productionCollector.collectMissingAssets();
+    assert.equal(assets.models.length, 1, `a trailing ${label} keeps the raw missing candidate`);
+    assert.equal(assets.any, true, `a trailing ${label} remains visible to graph_get_errors`);
+
+    release?.resolve();
+    await built.inFlightStarted?.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(built.getInFlight(), null, `the trailing ${label} eventually releases its slot`);
+  });
+}
 
 test("#1680: refresh_nodes replies at its budget instead of waiting for the joined run", async () => {
   const gate = deferred();
