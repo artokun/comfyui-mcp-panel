@@ -59,6 +59,24 @@ export function pressableWidgets(node) {
 }
 
 /**
+ * The extra sentence for the one dynamic row this panel can mint without pressing a control.
+ *
+ * Keep this keyed to the same type/name boundary as the production creation route. The
+ * caller's value is deliberately not inspected here: `slotValue()` remains the single source
+ * of truth for what the route accepts, and a bare filename must continue to refuse.
+ */
+function rgthreeLoraRowCreationHint(node, widgetName) {
+  const type = node?.type ?? node?.comfyClass;
+  if (type !== "Power Lora Loader (rgthree)") return "";
+  if (typeof widgetName !== "string" || !/^lora_\d+$/.test(widgetName)) return "";
+  return (
+    ` For THIS node you do not need the click: pass a lora-slot OBJECT rather than a bare ` +
+    `filename and the row is minted for you — e.g. ` +
+    `{"on": true, "lora": "<file>.safetensors", "strength": 1}.`
+  );
+}
+
+/**
  * The sentence to append to a missing-widget refusal, or "" when there is
  * nothing to add.
  *
@@ -83,6 +101,7 @@ export function pressableWidgetHint(node, widgetName) {
     `${plural ? "one is" : "it is"} clicked (rgthree's Power Lora Loader builds its ` +
     `\`lora_1\`, \`lora_2\`, … rows this way). If "${widgetName}" is a slot of that kind, ask the ` +
     `user to click ${plural ? "the relevant button" : names} in the ComfyUI tab and then set it — ` +
-    `writing an existing slot works normally. There is no tool to press a widget yet.`
+    `writing an existing slot works normally. There is no tool to press a widget yet.` +
+    rgthreeLoraRowCreationHint(node, widgetName)
   );
 }
