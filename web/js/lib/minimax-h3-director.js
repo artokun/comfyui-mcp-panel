@@ -9,14 +9,8 @@ export const MINIMAX_H3_DIRECTOR_TYPE = "MiniMaxH3Director";
 /** The one derived widget this guard covers. */
 export const MINIMAX_H3_DIRECTOR_PROMPT_WIDGET = "prompt";
 
-function baseWidgetName(widgetName) {
-  if (typeof widgetName !== "string") return "";
-  const dot = widgetName.indexOf(".");
-  return dot === -1 ? widgetName : widgetName.slice(0, dot);
-}
-
 /**
- * "derived" only for the exact Director node type and the exact base prompt widget name.
+ * "derived" only for the exact Director node type and the exact prompt widget name.
  * Every other node and every other MiniMax widget stays on the normal write path.
  *
  * @param {{type?: unknown}} node
@@ -26,7 +20,7 @@ function baseWidgetName(widgetName) {
 export function classifyMiniMaxH3DirectorWrite(node, widgetName) {
   const type = node && typeof node === "object" ? node.type : undefined;
   if (type !== MINIMAX_H3_DIRECTOR_TYPE) return null;
-  return baseWidgetName(widgetName) === MINIMAX_H3_DIRECTOR_PROMPT_WIDGET ? "derived" : null;
+  return widgetName === MINIMAX_H3_DIRECTOR_PROMPT_WIDGET ? "derived" : null;
 }
 
 /**

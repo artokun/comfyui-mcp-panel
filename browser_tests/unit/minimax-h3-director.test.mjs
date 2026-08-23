@@ -18,10 +18,7 @@ test("#1679: the Director prompt base widget is classified as derived", () => {
     classifyMiniMaxH3DirectorWrite({ type: MINIMAX_H3_DIRECTOR_TYPE }, MINIMAX_H3_DIRECTOR_PROMPT_WIDGET),
     "derived",
   );
-  assert.equal(
-    classifyMiniMaxH3DirectorWrite({ type: MINIMAX_H3_DIRECTOR_TYPE }, "prompt.0"),
-    "derived",
-  );
+  assert.equal(classifyMiniMaxH3DirectorWrite({ type: MINIMAX_H3_DIRECTOR_TYPE }, "prompt.0"), null);
 });
 
 test("#1679: other MiniMax widgets remain writable", () => {
@@ -46,9 +43,21 @@ test("#1679: malformed nodes and widget names fail closed without throwing", () 
   for (const widgetName of [null, undefined, 42, {}, [], "", ".prompt"]) {
     assert.equal(classifyMiniMaxH3DirectorWrite({ type: MINIMAX_H3_DIRECTOR_TYPE }, widgetName), null);
   }
-  // Composite addressing is keyed by the base widget name, matching the existing widget
-  // guard modules; even a suffix-shaped address must not broaden the match to other names.
-  assert.equal(classifyMiniMaxH3DirectorWrite({ type: MINIMAX_H3_DIRECTOR_TYPE }, "prompt."), "derived");
+  // This is a scalar prompt widget, not a composite. Suffix-shaped addresses must not
+  // broaden the refusal beyond the exact widget the issue describes.
+  assert.equal(classifyMiniMaxH3DirectorWrite({ type: MINIMAX_H3_DIRECTOR_TYPE }, "prompt."), null);
+});
+
+test("#1679: classifying the derived write is side-effect free", () => {
+  const node = {
+    id: 17,
+    type: MINIMAX_H3_DIRECTOR_TYPE,
+    builderState: { prompt: "old" },
+    widgets: [{ name: "prompt", value: "old" }],
+  };
+  const before = structuredClone(node);
+  assert.equal(classifyMiniMaxH3DirectorWrite(node, "prompt"), "derived");
+  assert.deepEqual(node, before);
 });
 
 test("#1679: the refusal names external_prompt_overwrite and the PrimitiveNode workaround", () => {
