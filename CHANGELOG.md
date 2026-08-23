@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.51] - 2026-08-23
+
+### Fixed
+- skip frontend-authored CustomCombo availability
+
+
 ## [0.15.50] - 2026-08-23
 
 ### Fixed
