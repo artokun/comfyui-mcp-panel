@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.56] - 2026-08-23
+
+### Fixed
+- refuse arbitrary Git URLs on Manager v4 before queueing (#1539)
+
+
 ## [0.15.55] - 2026-08-23
 
 ### Fixed
