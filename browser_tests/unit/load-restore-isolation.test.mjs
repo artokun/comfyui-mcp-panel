@@ -300,6 +300,29 @@ test("#1668 does not bless a link-shaped retry without residual links", async ()
   ]);
 });
 
+test("#1668 does not wait forever when animation frames are paused", async () => {
+  const priorRequestAnimationFrame = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = () => {};
+  const node = {
+    id: 122,
+    inputs: [{ link: 901 }],
+    outputs: [],
+    serialize: () => ({ id: 122, type: "ImpactSwitch", widgets_values: ["saved"] }),
+    configure: () => {},
+  };
+  try {
+    const result = await retryNodeRestores(
+      { getNodeById: () => node },
+      [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+    );
+    assert.deepEqual(result.restored, [{ id: 122, type: "ImpactSwitch" }]);
+    assert.deepEqual(result.failed, []);
+  } finally {
+    if (priorRequestAnimationFrame === undefined) delete globalThis.requestAnimationFrame;
+    else globalThis.requestAnimationFrame = priorRequestAnimationFrame;
+  }
+});
+
 test("#1668 cannot upgrade an unrelated initial failure from a link-shaped retry", async () => {
   const node = {
     id: 122,

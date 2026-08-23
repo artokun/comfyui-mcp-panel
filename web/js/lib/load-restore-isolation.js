@@ -122,12 +122,23 @@ export function verifyNodeRestore(node, info) {
 
 function waitForLinkStateToSettle() {
   return new Promise((resolve) => {
-    if (typeof requestAnimationFrame === "function") {
-      requestAnimationFrame(() => resolve());
-    } else if (typeof setTimeout === "function") {
-      setTimeout(resolve, 0);
-    } else {
+    let settled = false;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer != null && typeof clearTimeout === "function") clearTimeout(timer);
       resolve();
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(finish);
+      // requestAnimationFrame may be paused indefinitely for a hidden tab;
+      // retain a bounded recovery path for background graph loads.
+      if (typeof setTimeout === "function") timer = setTimeout(finish, 100);
+    } else if (typeof setTimeout === "function") {
+      timer = setTimeout(finish, 0);
+    } else {
+      finish();
     }
   });
 }
