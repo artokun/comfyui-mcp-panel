@@ -2206,7 +2206,16 @@ function abortedRestoreClause(observed = {}) {
   // not grow this clause without bound. The cap trims the LIST, never the claim.
   const named = failures
     .slice(0, 10)
-    .map((f) => `${f?.type ?? "node"} (id ${f?.id ?? "?"})${f?.error ? `: ${f.error}` : ""}`)
+    .map((f) => {
+      const widgets = Array.isArray(f?.widgetDifferences) && f.widgetDifferences.length
+        ? `; widgets not verified: ${f.widgetDifferences.join(", ")}`
+        : "";
+      const linkDriven =
+        Array.isArray(f?.linkDrivenWidgetDifferences) && f.linkDrivenWidgetDifferences.length
+          ? `; link-driven widgets observed: ${f.linkDrivenWidgetDifferences.join(", ")}`
+          : "";
+      return `${f?.type ?? "node"} (id ${f?.id ?? "?"})${f?.error ? `: ${f.error}` : ""}${widgets}${linkDriven}`;
+    })
     .join("; ");
   if (!named) {
     // Something threw, and nothing is still broken that the panel can name — a node

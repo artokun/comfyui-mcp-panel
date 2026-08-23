@@ -457,6 +457,35 @@ test("panel#1283 the fold is true only when BOTH halves looked and neither saw a
   assert.equal(loadRestoreCompleted({ nodeIsolation: { failures: [] }, graphWatch: watched(["x"]) }), false);
 });
 
+test("panel#1668 a verified link-disconnect recovery can license the completed-load ground", () => {
+  const watched = { throws: [], entered: 1 };
+  const failure = { id: 122, linkDisconnectCrash: true };
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure] },
+      graphWatch: watched,
+      recoveredFailures: [{ id: 122 }],
+    }),
+    true,
+  );
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [{ id: 122, linkDisconnectCrash: false }] },
+      graphWatch: watched,
+      recoveredFailures: [{ id: 122 }],
+    }),
+    false,
+  );
+  assert.equal(
+    loadRestoreCompleted({
+      nodeIsolation: { failures: [failure] },
+      graphWatch: watched,
+      recoveredFailures: [],
+    }),
+    false,
+  );
+});
+
 test("panel#1283 both wraps compose: a node throw is contained, the graph throw is not", () => {
   const LG = fakeLG();
   LG.LGraphNode.prototype.configure = function () {
@@ -624,7 +653,7 @@ test("panel#1283 wiring: the observation is FOLDED and reaches the proof and the
   const repaint = src.slice(repaintAt, src.indexOf("} catch (err)", repaintAt));
   assert.match(
     repaint,
-    /const loadRanToCompletion = loadRestoreCompleted\(\{ nodeIsolation, graphWatch \}\);/,
+    /const loadRanToCompletion = loadRestoreCompleted\(\{[\s\S]{0,180}?recoveredFailures: openRestoreRecovered,[\s\S]{0,80}?\}\);/,
     "the two observations must be folded by the helper that keeps `unknown` representable",
   );
   // It must reach the PROOF — this is the one line whose deletion silently restores the
@@ -726,6 +755,7 @@ test("panel#1283 wiring: a node the retry could not heal is still disclosed on t
   const repaint = src.slice(repaintAt, src.indexOf("} catch (err)", repaintAt));
   assert.match(repaint, /retryNodeRestores\(app\?\.graph, containedNodeFailureList\)/);
   assert.match(repaint, /openRestoreFailures = retry\.failed;/);
+  assert.match(repaint, /openRestoreRecovered = retry\.recovered/);
 });
 
 // ── F1: INSTALLED IS NOT ENTERED (post-merge review of #1358) ────────────────

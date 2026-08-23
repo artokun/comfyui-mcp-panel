@@ -14337,7 +14337,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // asynchronously-built widgets usually exist. A node that still throws is
     // DISCLOSED below — never folded into a clean `loaded: true`.
     const { restored: retriedNodes, failed: unrestoredNodes } = isolation?.failures?.length
-      ? retryNodeRestores(app?.graph, isolation.failures)
+      ? await retryNodeRestores(app?.graph, isolation.failures)
       : { restored: [], failed: [] };
     // #874 remaining load path — SubgraphNode.configure seeds host rails from
     // INNER definition widgets, so a saved subgraph host lands at defaults
@@ -18588,6 +18588,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // node threw and never got its values".
     let openRestoreFailures = [];
     let openRestoreRetried = [];
+    let openRestoreRecovered = [];
     // Hold the switch+reload critical section across the WHOLE mutating sequence. The canvas
     // freeze keeps the USER out; this keeps the BRIDGE out, so a concurrent graph_* command
     // can neither be overwritten by the reload nor be silently re-baselined as clean.
@@ -19017,14 +19018,19 @@ const GRAPH_TOOL_EXECUTORS = {
               // workflow-SERVICE dependency. Same reason `canvasView` exists below.
               const containedNodeFailureList = nodeIsolation?.failures ?? [];
               if (containedNodeFailureList.length) {
-                const retry = retryNodeRestores(app?.graph, containedNodeFailureList);
+                const retry = await retryNodeRestores(app?.graph, containedNodeFailureList);
                 openRestoreRetried = retry.restored;
                 openRestoreFailures = retry.failed;
+                openRestoreRecovered = retry.recovered ?? [];
               }
               // THREE states, and the null one is the point: `loadRestoreCompleted`
               // answers null when either wrap could not be installed, i.e. the question
               // was never asked. Only an explicit `true` may license anything below.
-              const loadRanToCompletion = loadRestoreCompleted({ nodeIsolation, graphWatch });
+              const loadRanToCompletion = loadRestoreCompleted({
+                nodeIsolation,
+                graphWatch,
+                recoveredFailures: openRestoreRecovered,
+              });
               // A successful promise alone is not a binding receipt: old/partial frontend
               // implementations can resolve while leaving app.canvas on the previous root.
               // Demand the positive, attempt-specific marker even for dirty workflows —
@@ -19625,10 +19631,25 @@ const GRAPH_TOOL_EXECUTORS = {
             nodes_restored_on_retry: openRestoreRetried,
             nodes_restored_on_retry_note:
               `${openRestoreRetried.length} node(s) threw while their saved state was being applied ` +
-              `during this open, and were re-applied successfully after the load settled — their ` +
-              `widgets are built asynchronously by their own pack. Nothing is missing because of ` +
-              `it. That failure came from the node's own frontend code, not from the open; if it ` +
-              `recurs, update or report the pack.`,
+              `during this open, and were re-applied successfully after the load settled. ` +
+              (openRestoreRecovered.length
+                ? `A recognized LiteGraph link-disconnect crash was recovered and the affected ` +
+                  `node's serialized state was verified; any named linked-widget difference is ` +
+                  `reported separately. `
+                : `Their widgets are built asynchronously by their own pack. `) +
+              `Nothing is missing because of it. That failure came from the node's own frontend ` +
+              `code, not from the open; if it recurs, update or report the pack.`,
+          }
+        : {}),
+      ...(openRestoreRecovered.length
+        ? {
+            link_disconnect_recovered: openRestoreRecovered,
+            link_disconnect_recovered_note:
+              `The panel recognized a LiteGraph far-end slot lookup crash during restore, waited ` +
+              `for the link state to settle, retried the node once, and verified its serialized ` +
+              `state before allowing this open to proceed. A linked widget may display the ` +
+              `upstream value rather than the file's saved widget value; saving preserves the ` +
+              `verified live graph, so inspect that widget if its exact value matters.`,
           }
         : {}),
       ...(openDefinitionsUnverified
@@ -19648,8 +19669,12 @@ const GRAPH_TOOL_EXECUTORS = {
             content_normalized: openContentNormalized,
             content_normalized_note:
               `Every node in this workflow came back with the same id and type, nothing extra ` +
-              `appeared, and the panel WATCHED this load: no node's configure threw and the graph ` +
-              `restore ran to completion. So the load did not stop part-way — the failure mode ` +
+              `appeared, and the panel WATCHED this load: ` +
+              (openRestoreRecovered.length
+                ? `a recognized LiteGraph link-disconnect crash was repaired and the affected ` +
+                  `node's serialized state was verified after the post-load retry. `
+                : `no node's configure threw and the graph restore ran to completion. `) +
+              `So the load did not stop part-way — the failure mode ` +
               `that leaves a full node set over nodes that lost their values — and that is why ` +
               `the open is reported APPLIED and the workflow_uuid published rather than refused. ` +
               `What differs from the file is per-node ${openContentNormalized.join(", ")}. The ` +

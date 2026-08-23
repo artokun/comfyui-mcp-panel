@@ -1,5 +1,7 @@
 // #1260 — one node's restore must not abort the rest of the load.
 //
+import { isLinkDisconnectCrash } from "./safe-remove-node.js";
+
 // LiteGraph restores a serialized graph in passes: every node is CREATED
 // first, then each node is configured in `nodes` order through the PROTOTYPE's
 // `LGraphNode.prototype.configure`, and only afterwards are links and groups
@@ -24,6 +26,100 @@ function errorText(err) {
   } catch {
     return "an unprintable error";
   }
+}
+
+function sameSerializedValue(a, b) {
+  const seen = new Map();
+  const equal = (left, right) => {
+    if (Object.is(left, right)) return true;
+    if (left === null || right === null || typeof left !== typeof right) return false;
+    if (typeof left !== "object") return false;
+    const prior = seen.get(left);
+    if (prior) return prior === right;
+    seen.set(left, right);
+    if (Array.isArray(left) || Array.isArray(right)) {
+      if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+      return left.every((value, index) => equal(value, right[index]));
+    }
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    if (leftKeys.length !== rightKeys.length || leftKeys.some((key) => !Object.prototype.hasOwnProperty.call(right, key))) {
+      return false;
+    }
+    return leftKeys.every((key) => equal(left[key], right[key]));
+  };
+  try {
+    return equal(a, b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify the state of one node after a link-disconnect configure failure.
+ *
+ * A linked widget is allowed to differ: ComfyUI's connection propagation can
+ * replace its displayed value while the link, mode, flags, properties, and
+ * every other widget remain the serialized values. That is an explicit,
+ * inspectable warning, not a general normalization exemption. Every other
+ * serialized field must match, including the node's position and topology.
+ */
+export function verifyNodeRestore(node, info) {
+  try {
+    const actual = node?.serialize?.();
+    if (!actual || !info || typeof actual !== "object" || typeof info !== "object") {
+      return { comparable: false, verified: false, differences: [], linkDrivenWidgetDifferences: [] };
+    }
+    const linkedWidgetNames = new Set();
+    for (const input of [...(info.inputs ?? []), ...(node.inputs ?? [])]) {
+      if (input?.link != null && typeof input?.widget?.name === "string") {
+        linkedWidgetNames.add(input.widget.name);
+      }
+    }
+    const serializedWidgets = (node.widgets ?? []).filter((widget) => widget && widget.serialize !== false);
+    const widgetNames = serializedWidgets.map((widget) => widget.name);
+    const differences = [];
+    const linkDrivenWidgetDifferences = [];
+    const fields = new Set([...Object.keys(info), ...Object.keys(actual)]);
+    for (const field of fields) {
+      const expectedHas = Object.prototype.hasOwnProperty.call(info, field) && info[field] !== undefined;
+      const actualHas = Object.prototype.hasOwnProperty.call(actual, field) && actual[field] !== undefined;
+      if (!expectedHas && !actualHas) continue;
+      if (field === "widgets_values" && Array.isArray(info[field]) && Array.isArray(actual[field])) {
+        const length = Math.max(info[field].length, actual[field].length);
+        for (let index = 0; index < length; index += 1) {
+          if (sameSerializedValue(info[field][index], actual[field][index])) continue;
+          const name = widgetNames[index] ?? `#${index}`;
+          if (linkedWidgetNames.has(name)) linkDrivenWidgetDifferences.push(name);
+          else differences.push(`widgets_values.${name}`);
+        }
+        continue;
+      }
+      if (expectedHas !== actualHas || !sameSerializedValue(info[field], actual[field])) {
+        differences.push(field);
+      }
+    }
+    return {
+      comparable: true,
+      verified: differences.length === 0,
+      differences: [...new Set(differences)],
+      linkDrivenWidgetDifferences: [...new Set(linkDrivenWidgetDifferences)],
+    };
+  } catch {
+    return { comparable: false, verified: false, differences: [], linkDrivenWidgetDifferences: [] };
+  }
+}
+
+function waitForLinkStateToSettle() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => resolve());
+    } else if (typeof setTimeout === "function") {
+      setTimeout(resolve, 0);
+    } else {
+      resolve();
+    }
+  });
 }
 
 /**
@@ -67,6 +163,7 @@ export function installNodeConfigureIsolation(LG) {
         id: info?.id ?? this?.id ?? null,
         type: info?.type ?? this?.type ?? null,
         error: errorText(err),
+        linkDisconnectCrash: isLinkDisconnectCrash(err),
         info: info ?? null,
       });
       return undefined;
@@ -97,9 +194,10 @@ export function installNodeConfigureIsolation(LG) {
  * `retry: "node-not-on-graph"` so the caller does not confuse "restore threw
  * again" with "there is nothing to restore onto".
  */
-export function retryNodeRestores(graph, failures) {
+export async function retryNodeRestores(graph, failures) {
   const restored = [];
   const failed = [];
+  const recovered = [];
   for (const failure of failures ?? []) {
     const node =
       failure?.id != null && typeof graph?.getNodeById === "function"
@@ -114,14 +212,49 @@ export function retryNodeRestores(graph, failures) {
       });
       continue;
     }
+    if (failure.linkDisconnectCrash) await waitForLinkStateToSettle();
+    let retryError = null;
     try {
       node.configure(failure.info);
-      restored.push({ id: failure.id, type: failure.type });
     } catch (err) {
-      failed.push({ id: failure.id, type: failure.type, error: errorText(err) });
+      retryError = err;
     }
+    const retryLinkDisconnectCrash = isLinkDisconnectCrash(retryError);
+    const linkDisconnectCrash = failure.linkDisconnectCrash || retryLinkDisconnectCrash;
+    if (linkDisconnectCrash) {
+      // The initial crash makes the retry worth attempting, but it does not
+      // bless a DIFFERENT exception from the retry. That is a new failure and
+      // must remain fail-closed even if the node happened to serialize cleanly
+      // after partially mutating itself.
+      if (retryError && !retryLinkDisconnectCrash) {
+        failed.push({ id: failure.id, type: failure.type, error: errorText(retryError) });
+        continue;
+      }
+      const verification = verifyNodeRestore(node, failure.info);
+      if (verification.verified) {
+        restored.push({ id: failure.id, type: failure.type });
+        recovered.push({
+          id: failure.id,
+          type: failure.type,
+          linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences,
+        });
+        continue;
+      }
+      failed.push({
+        id: failure.id,
+        type: failure.type,
+        error: errorText(retryError ?? new TypeError(failure.error ?? "link-disconnect restore failure")),
+        ...(verification.differences.length ? { widgetDifferences: verification.differences } : {}),
+        ...(verification.linkDrivenWidgetDifferences.length
+          ? { linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences }
+          : {}),
+      });
+      continue;
+    }
+    if (!retryError) restored.push({ id: failure.id, type: failure.type });
+    else failed.push({ id: failure.id, type: failure.type, error: errorText(retryError) });
   }
-  return { restored, failed };
+  return { restored, failed, recovered };
 }
 
 /**
@@ -286,7 +419,7 @@ export function installGraphConfigureWatch(LG) {
  *    that node; it does not lose the OBSERVATION. An unentered graph watch loses
  *    the observation outright, which is why only that one may answer null.
  */
-export function loadRestoreCompleted({ nodeIsolation, graphWatch } = {}) {
+export function loadRestoreCompleted({ nodeIsolation, graphWatch, recoveredFailures = [] } = {}) {
   if (!nodeIsolation || !graphWatch) return null;
   const nodeFailures = Array.isArray(nodeIsolation.failures) ? nodeIsolation.failures : null;
   const graphThrows = Array.isArray(graphWatch.throws) ? graphWatch.throws : null;
@@ -297,5 +430,12 @@ export function loadRestoreCompleted({ nodeIsolation, graphWatch } = {}) {
   // `>= 1` and not `< 1`: NaN fails every comparison, so a `< 1` test would let it
   // through as "entered" — the same fold, hiding in an operator.
   if (typeof graphEntered !== "number" || !(graphEntered >= 1)) return null;
-  return nodeFailures.length === 0 && graphThrows.length === 0;
+  if (graphThrows.length !== 0) return false;
+  if (nodeFailures.length === 0) return true;
+  const recoveredIds = new Set(
+    (Array.isArray(recoveredFailures) ? recoveredFailures : []).map((failure) => String(failure?.id)),
+  );
+  return nodeFailures.every(
+    (failure) => failure?.linkDisconnectCrash === true && recoveredIds.has(String(failure?.id)),
+  );
 }

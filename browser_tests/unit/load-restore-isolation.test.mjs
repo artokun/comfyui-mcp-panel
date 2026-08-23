@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import {
   installNodeConfigureIsolation,
   retryNodeRestores,
+  verifyNodeRestore,
 } from "../../web/js/lib/load-restore-isolation.js";
 
 /** A minimal LiteGraph/LGraphNode pair: configure dispatches through the
@@ -145,7 +146,7 @@ test("chained isolations: restoring the INNER one first does not drop the outer'
   assert.equal(node.configure({ id: 8, type: "Y" }), "configured", "non-throwing nodes are unaffected");
 });
 
-test("#1260 retry: a node whose widgets exist by retry time restores; a still-throwing node is disclosed with the NEW error", () => {
+test("#1260 retry: a node whose widgets exist by retry time restores; a still-throwing node is disclosed with the NEW error", async () => {
   const LG = makeLiteGraph();
   const healed = new LG.LGraphNode(15);
   healed.type = "FaceDetailer";
@@ -166,7 +167,7 @@ test("#1260 retry: a node whose widgets exist by retry time restores; a still-th
     { id: 21, type: "MarkdownNote", error: "first boom", info: { id: 21, widgets_values: ["hi"] } },
     { id: 99, type: "Ghost", error: "creation failed too", info: { id: 99 } },
   ];
-  const { restored, failed } = retryNodeRestores(graph, failures);
+  const { restored, failed } = await retryNodeRestores(graph, failures);
   assert.deepEqual(restored, [{ id: 15, type: "FaceDetailer" }]);
   assert.deepEqual(healed.configured, [{ id: 15, widgets_values: [768] }], "the serialized data was re-applied");
   assert.equal(failed.length, 2);
@@ -175,7 +176,93 @@ test("#1260 retry: a node whose widgets exist by retry time restores; a still-th
   assert.equal(failed[1].retry, "node-not-on-graph", "a node that never landed is told apart from a re-throw");
 });
 
-test("retry tolerates a missing graph and empty failures (nothing to heal, nothing to disclose)", () => {
-  assert.deepEqual(retryNodeRestores(null, []), { restored: [], failed: [] });
-  assert.deepEqual(retryNodeRestores(undefined, undefined), { restored: [], failed: [] });
+test("retry tolerates a missing graph and empty failures (nothing to heal, nothing to disclose)", async () => {
+  assert.deepEqual(await retryNodeRestores(null, []), { restored: [], failed: [], recovered: [] });
+  assert.deepEqual(await retryNodeRestores(undefined, undefined), { restored: [], failed: [], recovered: [] });
+});
+
+test("#1668 records the narrow link-disconnect crash and verifies a linked-widget normalization", async () => {
+  const LG = makeLiteGraph();
+  const base = LG.LGraphNode.prototype.configure;
+  LG.LGraphNode.prototype.configure = function (info) {
+    if (info.id === 122) throw new TypeError("t.findInputSlot is not a function");
+    return base.call(this, info);
+  };
+  const isolation = installNodeConfigureIsolation(LG);
+  const node = new LG.LGraphNode(122);
+  node.type = "ImpactSwitch";
+  node.widgets = [{ name: "select" }, { name: "other" }];
+  const info = {
+    id: 122,
+    type: "ImpactSwitch",
+    mode: 4,
+    flags: { collapsed: true },
+    inputs: [{ name: "select", link: 901, widget: { name: "select" } }],
+    outputs: [{ name: "out", links: [902] }],
+    widgets_values: ["saved-selection", "saved-other"],
+  };
+  try {
+    node.configure(info);
+  } finally {
+    isolation.restore();
+  }
+  assert.equal(isolation.failures[0].linkDisconnectCrash, true);
+
+  node.serialize = () => ({
+    ...info,
+    widgets_values: ["upstream-selection", "saved-other"],
+  });
+  node.configure = () => {
+    // The second call is allowed to succeed after the link state settles.
+  };
+  const graph = { getNodeById: (id) => (id === 122 ? node : null) };
+  const result = await retryNodeRestores(graph, isolation.failures);
+  assert.deepEqual(result.restored, [{ id: 122, type: "ImpactSwitch" }]);
+  assert.deepEqual(result.failed, []);
+  assert.deepEqual(result.recovered, [
+    { id: 122, type: "ImpactSwitch", linkDrivenWidgetDifferences: ["select"] },
+  ]);
+  assert.deepEqual(verifyNodeRestore(node, info).linkDrivenWidgetDifferences, ["select"]);
+});
+
+test("#1668 does not verify a non-linked widget difference", () => {
+  const info = {
+    id: 122,
+    type: "ImpactSwitch",
+    inputs: [{ name: "select", link: 901, widget: { name: "select" } }],
+    widgets_values: ["saved-selection", "saved-other"],
+  };
+  const node = {
+    inputs: info.inputs,
+    widgets: [{ name: "select" }, { name: "other" }],
+    serialize: () => ({ ...info, widgets_values: ["upstream-selection", "lost-other"] }),
+  };
+  const result = verifyNodeRestore(node, info);
+  assert.equal(result.verified, false);
+  assert.deepEqual(result.differences, ["widgets_values.other"]);
+  assert.deepEqual(result.linkDrivenWidgetDifferences, ["select"]);
+});
+
+test("#1668 does not bless an unrelated exception on the retry", async () => {
+  const node = {
+    serialize: () => ({ id: 122, type: "ImpactSwitch", widgets_values: ["saved"] }),
+    configure: () => {
+      throw new Error("unrelated retry failure");
+    },
+  };
+  const result = await retryNodeRestores(
+    { getNodeById: () => node },
+    [{ id: 122, type: "ImpactSwitch", error: "t.findInputSlot is not a function", linkDisconnectCrash: true, info: { id: 122, type: "ImpactSwitch", widgets_values: ["saved"] } }],
+  );
+  assert.deepEqual(result.restored, []);
+  assert.deepEqual(result.recovered, []);
+  assert.deepEqual(result.failed, [{ id: 122, type: "ImpactSwitch", error: "unrelated retry failure" }]);
+});
+
+test("#1668 does not equate JSON null with a live NaN widget value", () => {
+  const info = { id: 122, type: "ImpactSwitch", widgets_values: [null] };
+  const node = { widgets: [{ name: "value" }], serialize: () => ({ ...info, widgets_values: [Number.NaN] }) };
+  const result = verifyNodeRestore(node, info);
+  assert.equal(result.verified, false);
+  assert.deepEqual(result.differences, ["widgets_values.value"]);
 });
