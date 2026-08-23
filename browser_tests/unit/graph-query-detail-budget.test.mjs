@@ -67,6 +67,14 @@ const graph = {
       inputs: [],
       outputs: [],
     },
+    {
+      id: 81,
+      type: "MarkdownNote",
+      title: "Escaped note",
+      widgets: [{ name: "text", value: { prompt: '"'.repeat(3000), items: ["\\", '"', "\n"] } }],
+      inputs: [],
+      outputs: [],
+    },
   ],
 };
 
@@ -180,4 +188,11 @@ test("#1681 shipped graph_query normalizes invalid/ceiling caps and keeps max_ch
   assert.ok(budgeted.text.length <= 5000, `text must remain within max_chars, got ${budgeted.text.length}`);
   assert.match(budgeted.text, /over the `max_chars` budget/);
   assert.doesNotMatch(budgeted.text, /32768-char per-widget cap/);
+});
+
+test("#1681 shipped graph_query preserves a fitting quote-heavy object at the opt-in cap", () => {
+  const row = detailRows(query({ ids: [81], fields: "detail", widget_max_chars: 8192 }))[0];
+  assert.equal(typeof row.widgets.text, "object");
+  assert.deepEqual(row.widgets.text, graph._nodes[3].widgets[0].value);
+  assert.equal(JSON.stringify(row.widgets.text), JSON.stringify(graph._nodes[3].widgets[0].value));
 });

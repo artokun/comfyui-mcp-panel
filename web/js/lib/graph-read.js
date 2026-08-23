@@ -144,7 +144,11 @@ export function capWidgetValue(value, cap = WIDGET_VALUE_CAP, maxChars = Infinit
   const isString = typeof value === "string";
   const s = isString ? value : (() => { try { return JSON.stringify(value); } catch { return String(value); } })();
   if (typeof s !== "string") return value;
-  if (JSON.stringify(s).length <= cap) return value;
+  // Strings are emitted as JSON strings, so their quotes/escapes count twice. A
+  // non-string is emitted as its serialized JSON value, so serializing `s` again
+  // would double-count escapes and turn a fitting object/array into a string.
+  const serializedSize = isString ? JSON.stringify(s).length : s.length;
+  if (serializedSize <= cap) return value;
   // #809: name the lever that ACTUALLY applies. capSummaryWidgets() tightens the
   // per-value cap to the char budget only when the budget is smaller than the requested
   // fixed cap, so `cap < fixedCap` means max_chars is what cut this value and raising it

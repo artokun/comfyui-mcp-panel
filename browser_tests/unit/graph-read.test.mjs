@@ -127,6 +127,18 @@ test("capWidgetValue clips an oversized string and reports the drop (#609)", () 
   assert.ok(JSON.stringify(out).length <= WIDGET_VALUE_CAP, "ESCAPED size within the cap");
 });
 
+test("capWidgetValue preserves a quote-heavy object whose single JSON encoding fits (#1681)", () => {
+  const value = { prompt: '"'.repeat(3000), items: ["\\", '"', "\n"] };
+  const serialized = JSON.stringify(value);
+  assert.ok(serialized.length < 8192, "the actual object encoding fits the explicit cap");
+  assert.ok(JSON.stringify(serialized).length > 8192, "double-escaping would incorrectly reject it");
+
+  const out = capWidgetValue(value, 8192);
+  assert.equal(out, value, "fitting non-string values keep identity");
+  assert.equal(typeof out, "object");
+  assert.equal(JSON.stringify(out), serialized, "JSON output is unchanged");
+});
+
 test("#1681 detail widget cap keeps the default and clamps opt-in requests", () => {
   assert.equal(clampDetailWidgetCap(undefined), WIDGET_VALUE_CAP);
   assert.equal(clampDetailWidgetCap(1024), WIDGET_VALUE_CAP, "the default cap is not lowered");
