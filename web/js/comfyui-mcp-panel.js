@@ -19037,8 +19037,10 @@ const GRAPH_TOOL_EXECUTORS = {
                 openRestoreFailures = retry.failed;
                 openRestoreRecovered = retry.recovered ?? [];
                 if (!sameWorkflowObject(activeWorkflowRef(), target)) {
-                  throw new Error(
-                    "workflow_open target workflow changed while restore retry was settling; the retry was skipped",
+                  throw failOpenRebindUnknown(
+                    new Error(
+                      "workflow_open target workflow changed while restore retry was settling; the retry was skipped",
+                    ),
                   );
                 }
               }
