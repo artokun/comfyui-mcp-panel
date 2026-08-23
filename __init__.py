@@ -897,22 +897,22 @@ def _local_comfyui_path():
     so the panel can advertise it in its session-init hello (#296/#291).
 
     READ-ONLY/advisory only — never used to spawn or write. Prefers an explicit
-    COMFYUI_PATH override, then folder_paths.base_path. Returns "" when it cannot
-    be determined (headless/older host) so the panel advertises no local path and
-    the orchestrator falls back to its own workspace detection."""
+    live folder_paths.base_path, then falls back to the COMFYUI_PATH override.
+    Returns "" when it cannot be determined (headless/older host) so the panel
+    advertises no local path and the orchestrator falls back to its own workspace
+    detection."""
     override = (environ.get("COMFYUI_PATH") or "").strip()
-    if override:
-        return override
     try:
         import folder_paths  # type: ignore
 
         base = getattr(folder_paths, "base_path", None)
-        if base and isinstance(base, str):
-            return base
+        if isinstance(base, str) and base.strip():
+            return base.strip()
     except Exception:
-        # folder_paths not importable (headless / older host) — no local path.
-        return ""
-    return ""
+        # folder_paths not importable (headless / older host) — use the
+        # configured fallback below, if one exists.
+        pass
+    return override
 
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", _ANY_IPV4_HOST, ""}
