@@ -354,6 +354,79 @@ export const TRANSPORT_OUTCOME = Object.freeze({
 const GATEWAY_STATUSES = Object.freeze([504]);
 
 /**
+ * #1739 — a request this oracle has STOPPED LISTENING TO must stop OCCUPYING the backend.
+ *
+ * `bounded-step.js` says in its own header that it "does not CANCEL the work it bounds",
+ * and for every other caller that is the right contract — the caller is composing a reply,
+ * not managing a pipeline's lifetime. This route is the one place where it is not, and the
+ * reason is in ComfyUI's own `server.py`:
+ *
+ *     @routes.get("/object_info")
+ *     async def get_object_info(request):
+ *         asset_seeder.start(...)
+ *         with folder_paths.cache_helper:
+ *             out = {}
+ *             for x in nodes.NODE_CLASS_MAPPINGS:   # 8534 types on the report
+ *                 out[x] = node_info(x)
+ *             return web.json_response(out)         # json.dumps of ~52 MB
+ *
+ * There is NO `await` anywhere in that body. It is a coroutine that blocks aiohttp's single
+ * event loop for as long as it runs — measured at 16.08 s on the reporting install — and
+ * while it runs the backend cannot answer ANY other request, including the per-class
+ * `/object_info/{node_class}` route defined twelve lines below it.
+ *
+ * That is what made #1560's type-scoped last resort — the one route that CAN answer a
+ * backend this size — report a timeout on a URL the reporter measured at 1.2 ms by hand.
+ * It was not slow. It was queued behind two whole-map computations THIS MODULE had left
+ * running on a single-threaded server after abandoning both of them.
+ *
+ * The second one is pure cost and is provably unreachable on such a backend: it is only
+ * issued after the client route has already spent its whole share, so on a backend that
+ * serializes it starts behind a computation of the IDENTICAL document that is still
+ * running, and its own share is smaller than the one that just expired. It cannot answer;
+ * it can only add another full computation to the loop, and the type-scoped read issued
+ * moments later is what pays for it.
+ *
+ * WHY THE CLIENT ROUTE IS NOT ALSO CANCELLED: `api.getNodeDefs()` is the frontend's own
+ * method and takes no signal. Nothing here can reach the request it made. That route is
+ * FIRST, so it is not the one blocking the fallback — it is the work the fallback is
+ * queued behind — and cancelling the fallback is what frees the loop for the next question.
+ *
+ * ABORTING IS BEST-EFFORT AND NEVER LOAD-BEARING. A runtime with no `AbortController`
+ * (`live-combo-availability.js` guards for the same one) simply passes no init and behaves
+ * exactly as before, and every failure of the cancel itself is swallowed: a module that
+ * documents "every failure path returns `defs: null`" must not start throwing out of its
+ * own cleanup.
+ */
+function createRouteCancellation() {
+  let controller = null;
+  try {
+    if (typeof AbortController === "function") controller = new AbortController();
+  } catch {
+    controller = null;
+  }
+  let init;
+  try {
+    init = controller ? { signal: controller.signal } : undefined;
+  } catch {
+    init = undefined;
+  }
+  return {
+    // `undefined` rather than `{}` so a `fetchApi` that never took a second argument — every
+    // test double in this repo, and the panel's own wiring before this change — is called
+    // exactly as it was.
+    init,
+    cancel() {
+      try {
+        controller?.abort();
+      } catch {
+        // A cancellation that throws must never replace the answer this route produced.
+      }
+    },
+  };
+}
+
+/**
  * Fetch the whole `/object_info` schema, trying the frontend client first and the raw
  * HTTP route second.
  *
@@ -637,7 +710,14 @@ export async function fetchWholeObjectInfo({
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the
   // client call does not — it is the one they ran by hand to show the backend was fine.
   if (typeof fetchApi === "function") {
-    const { outcome, grant: fallbackMs } = await runStep(() => fetchApi("/object_info"), FALLBACK_RESPONSE_SHARE);
+    // #1739 — see `createRouteCancellation`. The init is threaded through `fetchApi` so a
+    // caller that forwards it (the panel does, to `api.fetchApi(route, init)`) can have this
+    // request dropped the moment the oracle stops waiting on it.
+    const httpRoute = createRouteCancellation();
+    const { outcome, grant: fallbackMs } = await runStep(
+      () => fetchApi("/object_info", httpRoute.init),
+      FALLBACK_RESPONSE_SHARE,
+    );
     const kind = outcomeKind(outcome);
     if (kind === "not-tried") {
       // TRUTHFUL ABOUT WHAT WAS NOT DONE. Saying this route "did not answer" when no
@@ -691,6 +771,11 @@ export async function fetchWholeObjectInfo({
           TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
           describeFailure("GET /object_info returned an unreadable response", err),
         );
+        // #1739 — the ONE early return out of this branch that leaves a body unread. The
+        // two below it return after `res.json()` has already settled, where the cancel the
+        // end of this block performs is a no-op; this one would otherwise leave a 52 MB
+        // download running against a backend the caller is about to ask another question of.
+        httpRoute.cancel();
         return { [CACHE_OUTCOME]: true, defs: null, failures, outcomes };
       }
       if (!responseOk) {
@@ -757,6 +842,16 @@ export async function fetchWholeObjectInfo({
         }
       }
     }
+    // #1739 — ONE unconditional cancel covering every path that reaches here: the response
+    // that never came, the body that never came, the body that was never attempted, the
+    // non-OK reply whose body is never read, and the parse that failed. Written as a single
+    // statement AFTER the chain rather than repeated inside each arm, so a branch added
+    // later cannot forget it — the failure this fixes is precisely a request nobody
+    // remembered to stop.
+    //
+    // A no-op on every path where the body WAS consumed, which is why the two early returns
+    // above it need nothing: `abort()` after a response is fully read does nothing at all.
+    httpRoute.cancel();
   } else {
     record("http", TRANSPORT_OUTCOME.NOT_ATTEMPTED, "no fetchApi is wired for the fallback route");
   }

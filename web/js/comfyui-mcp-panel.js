@@ -1739,7 +1739,7 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
           // out of the HTTP cache with the pre-install schema — which would be worse than
           // failing, since it would report refreshed:true over the definitions the caller
           // just installed a pack to replace.
-          fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+          fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
           // WHAT IS LEFT OF THE RUN, not of the fetch phase. The fetch phase's own share
           // has by definition been spent by the route that just failed, so sizing this from
           // it hands the second transport the 1ms floor — a bound that only a synchronous
@@ -12174,7 +12174,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const observedAtGeneration = verifiedNodeDefCache.generation();
     const { defs, authoritativeEmpty, failures } = await fetchWholeObjectInfo({
       getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
-      fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+      fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
     });
     // #1223 — file it. A reader that successfully obtains a whole schema and drops it on the
     // floor leaves the next render-time widget edit refused for want of the very map this
@@ -15566,7 +15566,7 @@ const GRAPH_TOOL_EXECUTORS = {
             // write fails closed on the same path, inside the window.
             return fetchWholeObjectInfo({
               getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
-              fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+              fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
               deadlineMs: budget.bounded(
                 reuseSnapshot &&
                   typeof objectInfoSnapshot.isReusable === "function" &&
@@ -15747,7 +15747,7 @@ const GRAPH_TOOL_EXECUTORS = {
           };
         }
         const scoped = await fetchTypeScopedObjectInfo(types, {
-          fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+          fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
           deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
         });
         if (Array.isArray(scoped.covered)) {
@@ -16032,7 +16032,7 @@ const GRAPH_TOOL_EXECUTORS = {
           liveSchemaGeneration = verifiedNodeDefCache.generation();
           return fetchWholeObjectInfo({
             getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
-            fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+            fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
           });
         })(),
       { stamp: () => backendReconnectEpoch },
