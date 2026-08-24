@@ -363,7 +363,10 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
           return startRun(undefined, runOpts, earlyYieldRequested);
         })();
         trailing = {
-          promise: queued.then((handle) => handle.promise),
+          // Follow the successor's own completion chain. A forced refresh can queue another
+          // successor after this one starts; exposing only the raw promise would let an older
+          // acknowledgement report success while that later run is still in flight.
+          promise: queued.then((handle) => handle.completion?.promise ?? handle.promise),
           beforeLocalWork: queued.then((handle) => handle.beforeLocalWork),
           requestEarlyYield: () => {
             earlyYieldRequested = true;

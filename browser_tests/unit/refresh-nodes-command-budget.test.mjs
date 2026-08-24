@@ -263,6 +263,58 @@ test("#1695: reconnect queues a successor and refresh_nodes refuses while that s
   await built.inFlightStarted?.catch(() => {});
 });
 
+test("#1695: refresh_nodes follows multiple forced successors before reporting success", async () => {
+  const run0Gate = deferred();
+  const run1Gate = deferred();
+  const run2Gate = deferred();
+  let lastCompletedRun = -1;
+  const built = realRefreshNodes({
+    holdFirstRun: run0Gate.promise,
+    budgetMs: 150,
+    runHook: async ({ index }) => {
+      if (index === 1) await run1Gate.promise;
+      if (index === 2) await run2Gate.promise;
+      lastCompletedRun = index;
+      return { refreshed: true, reason: "refreshed" };
+    },
+  });
+
+  // Reproduce the restart lifecycle exactly: run1 is queued behind run0, the acknowledgement
+  // starts while that successor is pending, and run2 is queued after run1 becomes current.
+  const run1 = built.refreshComfyNodeDefs(undefined, { force: true });
+  const acknowledgement = built.refresh_nodes();
+  run0Gate.resolve();
+  await waitForRunCount(built, 2);
+  const run2 = built.refreshComfyNodeDefs(undefined, { force: true });
+  run1Gate.resolve();
+  await waitForRunCount(built, 3);
+
+  const first = await withWatchdog(
+    () => acknowledgement,
+    1500,
+    "refresh_nodes reported neither the chained in-flight status nor success",
+  );
+  assert.equal(first.value.reason, NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING);
+  assert.equal(lastCompletedRun, 1, "run2 is still held when the bounded acknowledgement returns");
+  assert.notEqual(built.getInFlight(), null, "the second forced successor still owns the slot");
+
+  // The prescribed retry joins run2 while it is still live. Releasing run2 must complete that
+  // same chain, rather than making the retry falsely refuse or start a fourth run.
+  const retry = built.refresh_nodes();
+  run2Gate.resolve();
+  const second = await withWatchdog(
+    () => retry,
+    1500,
+    "refresh_nodes retry did not observe the settled second successor",
+  );
+  assert.deepEqual(second.value, { ok: true, refreshed: true });
+  assert.equal(lastCompletedRun, 2);
+  assert.equal(built.runs.length, 3, "the retry completes the existing successor chain");
+  await run1;
+  await run2;
+  await built.inFlightStarted?.catch(() => {});
+});
+
 test("#1680: refresh_nodes returns the completed verdict from an already-running refresh", async () => {
   const gate = deferred();
   const built = realRefreshNodes({ holdFirstRun: gate.promise, budgetMs: 500 });
