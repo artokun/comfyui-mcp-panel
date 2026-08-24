@@ -3365,6 +3365,78 @@ test('#939: repeated tab switches that leave a newer tab stable cannot persist o
   assert.equal(details.savedRecord, undefined, 'no succession identity was carried')
 })
 
+test('#939: overlapping Save-As keeps a newer operation\'s active source copy intact', async () => {
+  const sourcePath = 'workflows/Source-overlap.json'
+  const staleCopyPath = 'workflows/Stale-overlap.json'
+  const newerTargetPath = 'workflows/Newer-overlap.json'
+  const sourceState = graphState('overlap-source')
+  const source = {
+    path: sourcePath,
+    filename: 'Source-overlap.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
+  let generation = 1
+  let overlapCopy = null
+  let newerEnteredResolve
+  const newerEntered = new Promise((resolve) => {
+    newerEnteredResolve = resolve
+  })
+  let releaseNewerResolve
+  const releaseNewer = new Promise((resolve) => {
+    releaseNewerResolve = resolve
+  })
+  let newerSave
+  let restoreCalls = 0
+
+  const probe = async (path) => {
+    if (path === newerTargetPath) {
+      newerEnteredResolve()
+      await releaseNewer
+    }
+    return existsOnDisk(path)
+  }
+
+  const olderSave = saveActiveWorkflow(svc, 'Stale-overlap', {
+    existsOnDisk,
+    canvasBinding: () => 'bound',
+    canvasFence: ({ workflow }) => generation === 1 && svc.activeWorkflow === workflow,
+    repaintCanvas: async (copy) => {
+      overlapCopy = copy
+      generation = 2 // The newer panel Save-As advances the shared generation.
+      newerSave = saveActiveWorkflow(svc, 'Newer-overlap', {
+        existsOnDisk: probe,
+      })
+      await newerEntered // Newer Save-As is in its awaited probe with the same copy active.
+      return false
+    },
+    restoreCanvas: async () => {
+      restoreCalls += 1
+      return true
+    },
+  })
+
+  await assert.rejects(
+    () => olderSave,
+    /active copy is owned by a newer Save-As operation/,
+  )
+  assert.equal(svc.activeWorkflow, overlapCopy, 'the newer operation still has its source copy active')
+  assert.equal(svc.getWorkflowByPath(staleCopyPath), overlapCopy, 'the stale copy remains indexed')
+  assert.ok(svc.openWorkflows.includes(overlapCopy), 'the newer operation\'s unsaved source tab remains open')
+  assert.equal(restoreCalls, 0, 'stale cleanup did not restore over the newer operation')
+
+  releaseNewerResolve()
+  await newerSave
+  assert.equal(svc.disk.has(newerTargetPath), true, 'the newer Save-As completed')
+  assert.deepEqual(
+    JSON.parse(svc.disk.get(newerTargetPath)),
+    sourceState,
+    'the newer Save-As persisted the active source copy\'s unsaved graph',
+  )
+})
+
 for (const [label, restoreCanvas, expected] of [
   ['false', async () => false, /source canvas restore returned false/],
   ['throws', async () => { throw new Error('restore exploded') }, /source canvas restore threw \(restore exploded\)/],

@@ -1456,8 +1456,19 @@ function resolveSaveAsCopy(
         // Capture ownership BEFORE removing the copy. ComfyUI's closeWorkflow may
         // auto-select the first remaining tab, so checking `activeWorkflow` after the
         // purge would mistake our own store cleanup for a user tab switch.
-        const ownedBeforeRemoval =
-          isSameCopy(copy, svc.activeWorkflow) && canvasFenceAllows("restore-owner", copy);
+        const copyIsActive = isSameCopy(copy, svc.activeWorkflow);
+        const ownedBeforeRemoval = copyIsActive && canvasFenceAllows("restore-owner", copy);
+        // A newer Save-As can start while this copy is still active. Its generation
+        // fence makes this operation stale, but the copy is now the newer operation's
+        // source/current record. Do not close or coerce it: that destroys the newer
+        // operation's unsaved state (#939). A copy that is no longer active remains
+        // eligible for the identity-safe orphan purge below.
+        if (copyIsActive && !ownedBeforeRemoval) {
+          return {
+            ok: false,
+            reason: "the active copy is owned by a newer Save-As operation",
+          };
+        }
         removeInMemoryWorkflow(svc, copy);
         // The copy is the only active record this operation may replace. A tab switch,
         // a newer Save-As generation, or an unreadable fence means ownership is gone:
