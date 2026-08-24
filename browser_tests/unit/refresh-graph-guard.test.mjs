@@ -246,7 +246,8 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "NODE_DEFS_RETRY_DELAYS_MS",
     "objectInfoCache",
     "objectInfoSnapshot",
-    "backendReconnectEpoch",
+     "backendReconnectEpoch",
+     "comfyBackendSocketDown",
     // #1275 — the guard's collaborators, REAL lib functions, so this harness proves
     // the shipped wiring and not a re-implementation of it.
     "liveGraphNodeInventory",
@@ -266,8 +267,8 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
        if ("err" in settled) throw settled.err;
        return settled.value;
      };
-     let nodeDefsRefreshConfirmed = false;
-     ${body}
+      let nodeDefsRefreshConfirmed = false;
+      ${body}
      return { registerComfyNodeDefs };`,
   );
   return factory(
@@ -294,7 +295,8 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     NODE_DEFS_RETRY_DELAYS_MS,
     { invalidate: () => {}, read: async (f) => f() },
     { clear: () => {}, record: () => true },
-    7,
+     7,
+     false,
     liveGraphNodeInventory,
     vanishedLiveNodes,
     missingInventoryIds,

@@ -70,6 +70,13 @@ function extractPanelFn(sig) {
   throw new Error(`unterminated: ${sig}`);
 }
 
+function extractPanelEvent(event) {
+  const start = PANEL_SRC.indexOf(`api.addEventListener("${event}"`);
+  assert.notEqual(start, -1, `${event} listener not found in the panel source`);
+  const next = PANEL_SRC.indexOf("api.addEventListener(", start + 1);
+  return PANEL_SRC.slice(start, next === -1 ? PANEL_SRC.length : next);
+}
+
 // Execute the shipped local wrapper and collector together. This keeps the regression at
 // the production consumer boundary: a refresh verdict changes the trust supplied to the
 // same `collectMissingAssets` body graph_get_errors and validationBanner use.
@@ -197,9 +204,64 @@ async function withWatchdog(run, ms, what) {
   }
 }
 
+async function waitForRunCount(built, count) {
+  for (let attempts = 0; attempts < 100; attempts += 1) {
+    if (built.runs.length >= count) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`refresh did not start run ${count}`);
+}
+
 // ---------------------------------------------------------------------------
 // 1. The reported shape: a run already in flight, and the tool call subscribed to it.
 // ---------------------------------------------------------------------------
+
+test("#1695: reconnect queues a successor and refresh_nodes refuses while that successor runs", async () => {
+  const reconnected = extractPanelEvent("reconnected");
+  assert.match(
+    reconnected,
+    /refreshComfyNodeDefs\(undefined,\s*\{\s*force:\s*true\s*\}\)\.catch/,
+    "the production reconnect path must force a trailing refresh",
+  );
+
+  const staleGate = deferred();
+  const successorGate = deferred();
+  const built = realRefreshNodes({
+    holdFirstRun: staleGate.promise,
+    budgetMs: 25,
+    runHook: async ({ index }) => {
+      if (index === 1) await successorGate.promise;
+      return { refreshed: true, reason: "refreshed" };
+    },
+  });
+
+  // This is the exact coalescer call the shipped reconnected listener makes. It must queue
+  // one post-reconnect run behind the stale pre-restart promise.
+  const reconnectRefresh = built.refreshComfyNodeDefs(undefined, { force: true });
+  staleGate.resolve();
+  await waitForRunCount(built, 2);
+
+  const { value } = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes did not return while the post-reconnect successor was held",
+  );
+  assert.equal(value.ok, true);
+  assert.equal(value.refreshed, false);
+  assert.equal(value.reason, NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING);
+  assert.notEqual(built.getInFlight(), null, "the successor remains the live refresh promise");
+
+  successorGate.resolve();
+  await reconnectRefresh;
+  const retry = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes retry did not observe the settled post-reconnect refresh",
+  );
+  assert.deepEqual(retry.value, { ok: true, refreshed: true });
+  assert.equal(built.runs.length, 3, "the retry starts only after the successor has settled");
+  await built.inFlightStarted?.catch(() => {});
+});
 
 test("#1680: refresh_nodes returns the completed verdict from an already-running refresh", async () => {
   const gate = deferred();

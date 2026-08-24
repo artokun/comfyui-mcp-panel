@@ -2080,7 +2080,13 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     //
     // The two inputs are kept apart rather than merged into one boolean: the verdict words
     // them differently, and a caller must be able to see which one held.
-    nodeDefsRefreshConfirmed = !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
+    // #1695 — a refresh that crossed a backend down/reconnect interval is stale even if its
+    // own phases completed. It may have fetched the pre-restart registry, and its promise can
+    // still be the one a bounded acknowledgement is joining. Do not let that old run re-open
+    // combo trust while the post-reconnect successor is pending.
+    const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
+    nodeDefsRefreshConfirmed =
+      runIsCurrent && !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
   // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
@@ -2088,27 +2094,39 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // coalescer forwards this through a forced trailing run, so get_errors' awaited
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
-  const verdict = describeNodeDefRefresh({
-    appAvailable,
-    defsObtained: !!defs,
-    defsRegistered,
-    comboApiPresent,
-    comboRan,
-    // #1193 — the panel's own sweep, reported separately from the frontend's call so the
-    // verdict can say which one made the dropdowns current.
-    comboRebuiltLocally: comboAbandonedAfterRebuild,
-    comboWaitMs,
-    phase,
-    didThrow,
-    thrown,
-    // #608 — what every transport in the fetch phase did, so a refusal about /object_info
-    // names the routes it actually tried.
-    fetchRouteFailures,
-    // #1562 — and whether every one of them was ABANDONED AT ITS BOUND rather than failing,
-    // which is what separates "the server did not answer" from "the server answered too
-    // slowly for this command's window".
-    fetchAbandonedAtBound,
-  });
+  const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
+  const verdict = runIsCurrent
+    ? describeNodeDefRefresh({
+        appAvailable,
+        defsObtained: !!defs,
+        defsRegistered,
+        comboApiPresent,
+        comboRan,
+        // #1193 — the panel's own sweep, reported separately from the frontend's call so the
+        // verdict can say which one made the dropdowns current.
+        comboRebuiltLocally: comboAbandonedAfterRebuild,
+        comboWaitMs,
+        phase,
+        didThrow,
+        thrown,
+        // #608 — what every transport in the fetch phase did, so a refusal about /object_info
+        // names the routes it actually tried.
+        fetchRouteFailures,
+        // #1562 — and whether every one of them was ABANDONED AT ITS BOUND rather than failing,
+        // which is what separates "the server did not answer" from "the server answered too
+        // slowly for this command's window".
+        fetchAbandonedAtBound,
+      })
+    : {
+        refreshed: false,
+        reason: NODE_DEF_REFRESH_REASONS.REFRESH_SUPERSEDED,
+        detail:
+          "This refresh started before the current ComfyUI connection was established, so its " +
+          "completion cannot certify the node definitions now served by the backend.",
+        remedy:
+          "The refresh was superseded by a ComfyUI reconnect. Retry after the post-reconnect " +
+          "refresh settles; do not rely on this run's registry or combo lists.",
+      };
   // #1275 — VERIFY the refresh was ADDITIVE over the live graph.
   //
   // The snapshot above was taken immediately before the register phase, so this
@@ -2361,7 +2379,10 @@ function setupListeners() {
       // describes a server that is gone. Drop it so the next Manager call
       // re-probes the backend that is actually answering now.
       invalidateManagerDialectCache();
-      void refreshComfyNodeDefs();
+      // #1695 — force a trailing run instead of joining a refresh that began before this
+      // reconnect. The old promise may still be registering the replaced backend's defs;
+      // the acknowledgement path must observe the post-reconnect successor.
+      void refreshComfyNodeDefs(undefined, { force: true }).catch(() => {});
       // #663: PROACTIVELY re-prove the canvas binding instead of leaving the
       // settle window to run its full 30s (or, for a restore that never
       // settles, to hard-refuse until a manual panel_open_workflow/reload).

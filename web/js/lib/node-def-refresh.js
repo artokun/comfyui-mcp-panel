@@ -43,6 +43,9 @@ export const NODE_DEF_REFRESH_REASONS = Object.freeze({
   // token above by the fact that matters to a caller — nothing failed, so a retry is
   // expected to succeed rather than hoped to.
   REFRESH_STILL_RUNNING: "refresh_still_running",
+  // #1695 — a run that crossed a backend reconnect cannot certify the replacement
+  // connection's node registry or combo lists.
+  REFRESH_SUPERSEDED: "refresh_superseded",
 });
 
 function detailSuffix(thrown) {

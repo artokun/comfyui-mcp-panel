@@ -56,6 +56,7 @@ function buildRun({ appValue, apiValue }) {
     "COMBO_OK", "COMBO_NO_ANSWER", "NODE_DEFS_FETCH_TIMEOUT_MS", "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE", "fetchWholeObjectInfo", "nodeDefsBudgetLeft", "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS", "objectInfoCache", "objectInfoSnapshot", "backendReconnectEpoch",
+    "comfyBackendSocketDown",
     "TRANSPORT_OUTCOME",
   ];
   const vals = {
@@ -76,6 +77,7 @@ function buildRun({ appValue, apiValue }) {
     objectInfoCache: cacheSpy,
     objectInfoSnapshot: snapshotSpy,
     backendReconnectEpoch: 7,
+    comfyBackendSocketDown: false,
     TRANSPORT_OUTCOME,
   };
   const factory = new Function(...names, `
