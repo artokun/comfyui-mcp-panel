@@ -515,6 +515,9 @@ import {
 import {
   snapshotGraphState,
   describeInputLink,
+  orphanedInputLinkId,
+  clearOrphanedInputLink,
+  clearStrandedInputLinks,
   verifyDisconnect,
 } from "./lib/disconnect-verify.js";
 import {
@@ -15193,13 +15196,67 @@ const GRAPH_TOOL_EXECUTORS = {
     const inputNamesBefore = (node.inputs ?? []).map((s) => s?.name ?? null);
     const removedLink = describeInputLink(graph, node, inIdx);
     if (!removedLink) {
-      // Nothing to remove: reporting `disconnected` here would fabricate a
-      // mutation that never happened. REFUSE (the graph is untouched).
-      throw new Error(
-        `panel_disconnect: node ${node.id} input "${inputName}" is not connected — ` +
-          `there is no link to remove. Check the live wiring with panel_graph_outline; ` +
-          `if a previous disconnect already removed it, no retry is needed (#668).`,
-      );
+      // #1750 — describeInputLink answers null for TWO different slots, and they
+      // need OPPOSITE handling. `link == null` is genuinely unconnected: the #668
+      // refusal below is right, the graph is untouched, nothing to do. But a slot
+      // whose `link` id has no record in the store is ORPHANED, and that graph is
+      // ALREADY unqueueable — ComfyUI's serializer resolves every input of a live
+      // node and throws `No link found in parent graph for id [...] slot [...]` on
+      // exactly this shape. Refusing there gave #1750's reporter "no retry is
+      // needed" about the one reference that was failing every run, and left the
+      // only tool that can clear a slot's link declining to clear it. Nothing else
+      // shows it either: panel_graph_outline resolves through the link store, so
+      // the input renders as cleanly disconnected. REPAIR it instead of refusing.
+      const orphanLinkId = orphanedInputLinkId(graph, node, inIdx);
+      if (orphanLinkId == null) {
+        // Nothing to remove: reporting `disconnected` here would fabricate a
+        // mutation that never happened. REFUSE (the graph is untouched).
+        throw new Error(
+          `panel_disconnect: node ${node.id} input "${inputName}" is not connected — ` +
+            `there is no link to remove. Check the live wiring with panel_graph_outline; ` +
+            `if a previous disconnect already removed it, no retry is needed (#668).`,
+        );
+      }
+      // Same undo envelope the real mutation uses, so one Ctrl+Z reverts the
+      // repair — the panel's "Undoable with Ctrl+Z" contract does not get an
+      // exemption for a write the user did not know they needed.
+      let repairErr = null;
+      let clearedOrphan = null;
+      graph.beforeChange();
+      try {
+        clearedOrphan = clearOrphanedInputLink(graph, node, inIdx);
+      } catch (err) {
+        repairErr = err;
+      }
+      try {
+        graph.afterChange();
+      } catch (err) {
+        repairErr ??= err;
+      }
+      graph.setDirtyCanvas(true, true);
+      if (clearedOrphan == null || node.inputs?.[inIdx]?.link != null) {
+        throw new Error(
+          `panel_disconnect: node ${node.id} input "${inputName}" carries link id ` +
+            `${orphanLinkId}, which the graph's link store has no record of, and the panel ` +
+            `could not clear it` +
+            (repairErr ? ` (${repairErr?.message ?? repairErr})` : "") +
+            `. Nothing can be queued while that reference stands — ComfyUI refuses the ` +
+            `graph with "No link found in parent graph". Reload the workflow from disk ` +
+            `with panel_load_workflow and redo the edit (#1750).`,
+        );
+      }
+      // Deliberately NOT reported as `disconnected`: no wire was removed, because
+      // none existed. What changed is that the slot no longer names a link that
+      // does not exist.
+      return {
+        cleared_orphan_link: { node_id: node.id, input: inputName, link_id: clearedOrphan },
+        warning:
+          `nothing was disconnected — the input was not wired to anything. It carried link ` +
+          `id ${clearedOrphan}, which the graph's link store has no record of, and that ` +
+          `ORPHANED reference is what ComfyUI rejects with "No link found in parent graph" ` +
+          `when the workflow is queued. The panel cleared it, so the graph is queueable ` +
+          `again (#1750). Undoable with Ctrl+Z.`,
+      };
     }
     const before = snapshotGraphState(graph);
     // The mutation can throw AFTER partially applying (a node hook or the
@@ -15220,6 +15277,18 @@ const GRAPH_TOOL_EXECUTORS = {
       envelopeErr = err;
     }
     graph.setDirtyCanvas(true, true);
+    // #1750 POST-CONDITION: once the link is out of the store, no input slot may
+    // still name it. litegraph's own disconnectInput nulls the slot BEFORE it
+    // touches the store, so this is normally a no-op — but the graph #1750 saved
+    // held the opposite end state (record gone, slot still carrying the id) on
+    // four optional inputs, and a slot in that state makes the whole workflow
+    // unqueueable. Assert the post-condition rather than assume it, and repair
+    // what the assertion catches: leaving it is a "success" that hands back a
+    // graph ComfyUI will refuse. Repairs NOTHING while the store still HAS the
+    // link — that is a disconnect that did not land, and #668's disclosure below
+    // is what must fire for it. Runs BEFORE verifyDisconnect so the verdict
+    // describes the state the caller is actually left in.
+    const strandedSlots = clearStrandedInputLinks(graph, node, removedLink.linkId);
     const verdict = verifyDisconnect(graph, node, before, removedLink.linkId);
     // Shared disclosure bullets: observed post-state facts ONLY — the verifier
     // proves what changed, never why, so no bucket is narrated as a cause.
@@ -15291,17 +15360,36 @@ const GRAPH_TOOL_EXECUTORS = {
     const slotsShifted =
       inputNamesBefore.length !== inputNamesAfter.length ||
       inputNamesBefore.some((n, i) => n !== inputNamesAfter[i]);
+    const warnings = [];
+    if (strandedSlots.length) {
+      warnings.push(
+        `the link was removed from the graph's link store but input ` +
+          `${strandedSlots.map((s) => `"${s.name ?? s.slot}"`).join(", ")} still named it ` +
+          `afterwards — an orphaned reference ComfyUI rejects with "No link found in parent ` +
+          `graph" when the workflow is queued. The panel cleared it as part of this ` +
+          `disconnect (#1750), so no separate repair is needed.`,
+      );
+    }
+    if (slotsShifted) {
+      warnings.push(
+        `the node's input slots changed during the disconnect (count, order, or names ` +
+          `differ) — re-resolve input names with panel_graph_outline before any further ` +
+          `disconnect by index`,
+      );
+    }
     return {
       disconnected: { node_id: node.id, input: inputName },
       removed_link: { node_id: removedLink.node_id, output: removedLink.output },
-      ...(slotsShifted
+      ...(strandedSlots.length
         ? {
-            warning:
-              `the node's input slots changed during the disconnect (count, order, or names ` +
-              `differ) — re-resolve input names with panel_graph_outline before any further ` +
-              `disconnect by index`,
+            cleared_orphan_link: {
+              node_id: node.id,
+              link_id: removedLink.linkId,
+              inputs: strandedSlots.map((s) => s.name ?? s.slot),
+            },
           }
         : {}),
+      ...(warnings.length ? { warning: warnings.join(" ") } : {}),
     };
   },
 

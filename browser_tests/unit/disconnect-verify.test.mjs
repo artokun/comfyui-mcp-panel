@@ -16,6 +16,9 @@ import assert from "node:assert/strict";
 import {
   snapshotGraphState,
   describeInputLink,
+  orphanedInputLinkId,
+  clearOrphanedInputLink,
+  clearStrandedInputLinks,
   verifyDisconnect,
 } from "../../web/js/lib/disconnect-verify.js";
 
@@ -281,4 +284,78 @@ test("string-vs-number node ids across the boundary are not false positives", ()
   const v = verifyDisconnect(g2, g2.getNodeById(7), before, null);
   assert.deepEqual(v.missingNodes, []);
   assert.deepEqual(v.addedNodes, []);
+});
+
+// ---------------------------------------------------------------------------
+// #1750 — orphaned input link ids (a slot naming a link the store does not have)
+// ---------------------------------------------------------------------------
+
+test("#1750 orphanedInputLinkId tells the THREE slot states apart", () => {
+  const g = reproGraph();
+  const n121 = g.getNodeById(121);
+  // Connected to a link the store HAS: not an orphan.
+  assert.equal(orphanedInputLinkId(g, n121, 0), null);
+  // Genuinely unconnected: not an orphan either.
+  n121.inputs.push({ name: "mask", link: null });
+  assert.equal(orphanedInputLinkId(g, n121, 1), null);
+  // Naming a link the store does NOT have: the #1750 shape.
+  n121.inputs.push({ name: "image_b", link: 404 });
+  assert.equal(orphanedInputLinkId(g, n121, 2), 404);
+  // describeInputLink answers null for the last two alike — which is exactly why
+  // the caller cannot decide between repair and refusal from that answer.
+  assert.equal(describeInputLink(g, n121, 1), null);
+  assert.equal(describeInputLink(g, n121, 2), null);
+});
+
+test("#1750 clearOrphanedInputLink clears ONLY a reference the store cannot resolve", () => {
+  const g = reproGraph();
+  const n121 = g.getNodeById(121);
+  // A live wire is untouchable: nulling it here would strand the origin output's
+  // own `links` entry instead — the same corruption, pointed the other way.
+  assert.equal(clearOrphanedInputLink(g, n121, 0), null);
+  assert.equal(n121.inputs[0].link, 1);
+
+  n121.inputs.push({ name: "image_b", link: 404 });
+  assert.equal(clearOrphanedInputLink(g, n121, 1), 404);
+  assert.equal(n121.inputs[1].link, null);
+  // Idempotent: a second call has nothing left to clear.
+  assert.equal(clearOrphanedInputLink(g, n121, 1), null);
+});
+
+test("#1750 clearStrandedInputLinks repairs every slot naming a REMOVED link", () => {
+  const g = reproGraph();
+  const n121 = g.getNodeById(121);
+  // The link is gone from the store; two slots still name it (a boundary cascade
+  // can shift `node.inputs`, so the whole array is scanned, not one index).
+  delete g.links[1];
+  n121.inputs.push({ name: "image_b", link: 1 });
+  const cleared = clearStrandedInputLinks(g, n121, 1);
+  assert.deepEqual(cleared, [
+    { slot: 0, name: "image", link_id: 1 },
+    { slot: 1, name: "image_b", link_id: 1 },
+  ]);
+  assert.equal(n121.inputs[0].link, null);
+  assert.equal(n121.inputs[1].link, null);
+});
+
+test("#1750 clearStrandedInputLinks declines while the store still HAS the link", () => {
+  const g = reproGraph();
+  const n121 = g.getNodeById(121);
+  // The wire is still there — the disconnect did not land. Repairing the slot
+  // would turn #668's disclosure into a false success.
+  assert.deepEqual(clearStrandedInputLinks(g, n121, 1), []);
+  assert.equal(n121.inputs[0].link, 1);
+  assert.deepEqual(clearStrandedInputLinks(g, n121, null), []);
+});
+
+test("#1750 helpers read the modern Map store, not just the legacy record", () => {
+  const n = node(2, [{ name: "image", link: 9 }]);
+  const g = { _nodes: [node(1), n], _links: new Map(), getNodeById: () => null };
+  // Map-keyed by NUMBER, as LGraph keys it: a stringified lookup must not miss.
+  g._links.set(9, { id: 9, origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 });
+  assert.equal(orphanedInputLinkId(g, n, 0), null);
+  assert.deepEqual(clearStrandedInputLinks(g, n, 9), []);
+  g._links.delete(9);
+  assert.equal(orphanedInputLinkId(g, n, 0), 9);
+  assert.deepEqual(clearStrandedInputLinks(g, n, 9), [{ slot: 0, name: "image", link_id: 9 }]);
 });

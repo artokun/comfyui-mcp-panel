@@ -122,11 +122,12 @@ function collectNodeIds(graph, prefix, out) {
  * name the wire's former source (symmetric with graph_connect's replaced_link).
  *
  * A slot whose `link` id has NO record in the graph's link store is a DANGLING
- * reference, not a connection — null is returned so the caller's not-connected
- * refusal covers it (reporting a "removed" wire that never existed would
- * fabricate a mutation). The inverse is fine: the ORIGIN NODE may be gone while
- * its link record still exists, in which case the description falls back to the
- * origin slot index.
+ * reference, not a connection — null is returned so the caller never reports a
+ * "removed" wire that never existed. That null is NOT the same answer as an
+ * unconnected slot's, though: see {@link orphanedInputLinkId}, which tells the
+ * two apart so #1750's repair can run on one and the #668 refusal on the other.
+ * The inverse is fine: the ORIGIN NODE may be gone while its link record still
+ * exists, in which case the description falls back to the origin slot index.
  */
 export function describeInputLink(graph, node, inIdx) {
   const linkId = node?.inputs?.[inIdx]?.link;
@@ -140,6 +141,74 @@ export function describeInputLink(graph, node, inIdx) {
     output: origin?.outputs?.[link.origin_slot]?.name ?? link.origin_slot,
     output_index: link.origin_slot,
   };
+}
+
+/**
+ * The link id `node`'s input `inIdx` carries that the graph's link store has NO
+ * record of — an ORPHANED reference (#1750) — or null when the slot is either
+ * genuinely unconnected (`link == null`) or connected to a link that exists.
+ *
+ * This is the distinction {@link describeInputLink}'s null hides, and the two
+ * states need opposite handling. An unconnected slot is fine and a disconnect of
+ * it is a no-op. An orphaned slot has already made the whole workflow
+ * unqueueable: ComfyUI's serializer resolves every input of a live node and
+ * throws `No link found in parent graph for id [...] slot [...]` on exactly this
+ * shape, while the panel's own outline resolves THROUGH the store and so renders
+ * the input as cleanly disconnected — the corruption is invisible everywhere the
+ * caller would look for it.
+ */
+export function orphanedInputLinkId(graph, node, inIdx) {
+  const linkId = node?.inputs?.[inIdx]?.link;
+  if (linkId == null) return null;
+  return getLinkRecord(graph, linkId) ? null : linkId;
+}
+
+/**
+ * Clear ONE orphaned slot reference: null out `node.inputs[inIdx].link` when it
+ * names a link the store has no record of. Returns the id that was cleared, or
+ * null when there was nothing to clear.
+ *
+ * Re-reads the store at the moment of the write rather than trusting a verdict
+ * taken earlier — a slot pointing at a link that EXISTS is a live wire, and
+ * nulling it here would silently strand the origin output's `links` entry
+ * instead (the same corruption, pointed the other way).
+ */
+export function clearOrphanedInputLink(graph, node, inIdx) {
+  const slot = node?.inputs?.[inIdx];
+  const linkId = slot?.link;
+  if (linkId == null) return null;
+  if (getLinkRecord(graph, linkId)) return null;
+  slot.link = null;
+  return linkId;
+}
+
+/**
+ * Clear every input slot of `node` still naming `linkId` after that link has
+ * been removed from the store — the post-condition a disconnect owes its caller
+ * (#1750). Returns `[{ slot, name, link_id }]` for what was cleared, so the
+ * caller can DISCLOSE the repair instead of absorbing it silently.
+ *
+ * Scans the whole inputs array rather than one index for the same reason
+ * {@link verifyDisconnect} does: a boundary-slot cascade can shift `node.inputs`
+ * under the disconnect, so the requested index may no longer be the slot that
+ * carried the link.
+ *
+ * Returns `[]` — repairing NOTHING — while the store still HAS the link. A slot
+ * naming a live link is a disconnect that did not land, which is #668's
+ * disclosure to make; papering over it here would convert a loud failure into a
+ * quiet one.
+ */
+export function clearStrandedInputLinks(graph, node, linkId) {
+  if (linkId == null) return [];
+  if (getLinkRecord(graph, linkId)) return [];
+  const target = String(linkId);
+  const cleared = [];
+  for (const [slot, input] of (node?.inputs ?? []).entries()) {
+    if (input?.link == null || String(input.link) !== target) continue;
+    input.link = null;
+    cleared.push({ slot, name: input?.name ?? null, link_id: linkId });
+  }
+  return cleared;
 }
 
 /**
