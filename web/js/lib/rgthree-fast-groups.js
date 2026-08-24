@@ -1,16 +1,18 @@
-// #983 — rgthree's Fast Groups Muter/Bypasser toggle is DERIVED, and a widget write to it
-// cannot take effect. Refused loudly rather than reported as a success that silently reverts.
+// #983 — rgthree's Fast Groups Muter toggle is DERIVED, and a widget write to it cannot take
+// effect. Refused loudly rather than reported as a success that silently reverts.
 //
-// The reported shape: `panel_set_widget` on `RGTHREE_TOGGLE_AND_NAV.toggled = false` returned
-// a clean success showing `{"toggled": false}`, and the very next `panel_query_graph` showed
-// `{"toggled": true}` again, with the target node still active.
+// The original reported shape: `panel_set_widget` on `RGTHREE_TOGGLE_AND_NAV.toggled = false`
+// returned a clean success showing `{"toggled": false}`, and the very next `panel_query_graph`
+// showed `{"toggled": true}` again, with the target node still active.
 //
 // THREE FACTS FROM THE PACK'S OWN SOURCE (rgthree-comfy `src_web/comfyui/`), any one of which
-// is enough on its own — this is not inferred from the report:
+// is enough on its own — this is not inferred from the report. They apply to the Fast Groups
+// Muter. Fast Groups Bypasser rows are action controls and stay on the normal transactional
+// write path; widget-write.js owns rollback for the mode changes their callbacks can cause.
 //
 //  1. `BaseFastGroupsModeChanger` sets `override serialize_widgets = false`
-//     (fast_groups_muter.ts). Both Muter and Bypasser extend it, so these nodes NEVER
-//     serialize widget values into the workflow. A write cannot persist even in principle.
+//     (fast_groups_muter.ts). The Fast Groups Muter never serializes widget values into the
+//     workflow. A write cannot persist even in principle.
 //
 //  2. The node's own refresh loop OVERWRITES the value from the live graph:
 //
@@ -52,10 +54,11 @@
 
 /** The rgthree node types whose toggle rows are derived readouts. `addRgthree()` in the pack's
  *  constants.ts appends " (rgthree)" to every name, which is what reaches `node.type`. */
-const FAST_GROUPS_TYPES = new Set(["Fast Groups Muter (rgthree)", "Fast Groups Bypasser (rgthree)"]);
+const FAST_GROUPS_TYPES = new Set(["Fast Groups Muter (rgthree)".toLowerCase()]);
 
 /** The widget name the pack gives every toggle row. */
 export const RGTHREE_TOGGLE_WIDGET = "RGTHREE_TOGGLE_AND_NAV";
+const NORMALIZED_RGTHREE_TOGGLE_WIDGET = RGTHREE_TOGGLE_WIDGET.toLowerCase();
 
 /** The base widget name a request addresses, with any composite sub-field removed:
  *  `"RGTHREE_TOGGLE_AND_NAV.toggled"` and `"RGTHREE_TOGGLE_AND_NAV"` both name the same widget. */
@@ -79,8 +82,8 @@ function baseWidgetName(widgetName) {
  */
 export function classifyRgthreeFastGroupsWrite(node, widgetName) {
   const type = node && typeof node === "object" ? node.type : undefined;
-  if (typeof type !== "string" || !FAST_GROUPS_TYPES.has(type)) return null;
-  return baseWidgetName(widgetName) === RGTHREE_TOGGLE_WIDGET ? "derived" : null;
+  if (typeof type !== "string" || !FAST_GROUPS_TYPES.has(type.toLowerCase())) return null;
+  return baseWidgetName(widgetName).toLowerCase() === NORMALIZED_RGTHREE_TOGGLE_WIDGET ? "derived" : null;
 }
 
 /**

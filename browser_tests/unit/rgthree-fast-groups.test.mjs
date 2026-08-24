@@ -1,5 +1,5 @@
 /**
- * #983 — a write to rgthree's Fast Groups toggle row is refused, because it cannot land.
+ * #983 — a write to rgthree's Fast Groups Muter toggle row is refused, because it cannot land.
  *
  * Established from the pack's own source (rgthree-comfy `src_web/comfyui/`), not from the
  * report: `BaseFastGroupsModeChanger` declares `serialize_widgets = false` (so the value never
@@ -19,20 +19,35 @@ import {
 const BYPASSER = "Fast Groups Bypasser (rgthree)";
 const MUTER = "Fast Groups Muter (rgthree)";
 
-test("#983: the reported write is classified derived", () => {
+test("#983: the Fast Groups Muter write is classified derived", () => {
   // The exact address from the report, including the composite sub-field.
   assert.equal(
-    classifyRgthreeFastGroupsWrite({ type: BYPASSER }, "RGTHREE_TOGGLE_AND_NAV.toggled"),
+    classifyRgthreeFastGroupsWrite({ type: MUTER }, "RGTHREE_TOGGLE_AND_NAV.toggled"),
     "derived",
   );
   // And the bare widget name, which addresses the same widget.
-  assert.equal(classifyRgthreeFastGroupsWrite({ type: BYPASSER }, RGTHREE_TOGGLE_WIDGET), "derived");
+  assert.equal(classifyRgthreeFastGroupsWrite({ type: MUTER }, RGTHREE_TOGGLE_WIDGET), "derived");
 });
 
-test("#983: the Muter is covered too — it is the same base class", () => {
-  // FastGroupsBypasser extends BaseFastGroupsModeChanger, which is where serialize_widgets =
-  // false and the refresh-overwrite live, so both node types have the identical problem.
-  assert.equal(classifyRgthreeFastGroupsWrite({ type: MUTER }, "RGTHREE_TOGGLE_AND_NAV.toggled"), "derived");
+test("#983: the Muter refusal survives case-insensitive widget resolution", () => {
+  assert.equal(
+    classifyRgthreeFastGroupsWrite({ type: MUTER }, "rgthree_toggle_and_nav.toggled"),
+    "derived",
+  );
+  assert.equal(
+    classifyRgthreeFastGroupsWrite({ type: BYPASSER }, "rgthree_toggle_and_nav.toggled"),
+    null,
+  );
+});
+
+test("#2146: a Fast Groups Bypasser row remains a writable action control", () => {
+  // Bypasser callbacks change linked node modes. They are transactional at the widget-write
+  // boundary, so this existing refusal must not broaden to them.
+  assert.equal(
+    classifyRgthreeFastGroupsWrite({ type: BYPASSER }, "RGTHREE_TOGGLE_AND_NAV.toggled"),
+    null,
+  );
+  assert.equal(classifyRgthreeFastGroupsWrite({ type: BYPASSER }, RGTHREE_TOGGLE_WIDGET), null);
 });
 
 test("#983: ANOTHER widget on the same node is NOT refused", () => {
