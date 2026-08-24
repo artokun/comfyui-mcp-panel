@@ -2367,6 +2367,13 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // The deferred combo completion returns the same verdict after updating its authoritative
   // phase state, including any graph-loss/placeholder disclosures added above.
   initialRefreshVerdict = verdict;
+  // #1725 — once /object_info and node registration have produced a terminal schema verdict,
+  // expose it to panel_refresh_nodes even when the frontend combo mutation still owns the
+  // single-flight slot. The coalescer keeps the late mutation fenced; this is only the
+  // caller-facing status, so a retry or a graph mutation cannot start a competing refresh.
+  if (comboCompletionPending && verdict?.refreshed === true && verdict?.combo_refresh_confirmed === false) {
+    runControl?.publishEarlyResult?.(verdict);
+  }
   return verdict;
 }
 
@@ -12001,6 +12008,10 @@ const GRAPH_TOOL_EXECUTORS = {
     const verdict = await refreshComfyNodeDefs(undefined, {
       force: true,
       joinInFlight: true,
+      // #1725 — a completed /object_info + registration verdict may be available while a
+      // late combo mutation remains fenced. Surface that terminal status without releasing
+      // the shared refresh slot or allowing a competing successor.
+      allowEarlyResult: true,
       joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,
       // #1562 — the run announces this handoff after /object_info and yields one turn
       // before registration, so this caller can return its structured retryable verdict

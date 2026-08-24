@@ -702,6 +702,52 @@ test("#1695: repeated retries share one pending completion and eventually succee
   await built.inFlightStarted?.catch(() => {});
 });
 
+test("#1725: refresh_nodes returns the completed schema verdict while late combo work stays fenced", async () => {
+  const lateCompletion = deferred();
+  const terminal = {
+    refreshed: true,
+    reason: "refreshed",
+    combo_refresh_confirmed: false,
+    combo_refresh_note: "the frontend combo refresh is still settling",
+  };
+  const built = realRefreshNodes({
+    budgetMs: 25,
+    runHook: async ({ index, control }) => {
+      // This is the production shape after /object_info and registration have completed:
+      // the panel has a terminal schema verdict, but refreshComboInNodes() still owns a
+      // shared frontend mutation and must remain behind the single-flight fence.
+      if (index > 0) return { refreshed: true, reason: "refreshed" };
+      control.publishEarlyResult?.(terminal);
+      control.deferCompletion(lateCompletion.promise);
+      return terminal;
+    },
+  });
+
+  const first = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes did not expose the completed schema verdict",
+  );
+  assert.deepEqual(first.value, {
+    ok: true,
+    refreshed: true,
+    combo_refresh_confirmed: false,
+    combo_refresh_note: terminal.combo_refresh_note,
+  });
+  assert.notEqual(built.getInFlight(), null, "late combo mutation remains fenced");
+  assert.equal(built.runs.length, 1, "the terminal acknowledgement does not start a successor");
+
+  lateCompletion.resolve({ refreshed: true, reason: "refreshed" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const settled = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "retry after late combo completion did not settle",
+  );
+  assert.deepEqual(settled.value, { ok: true, refreshed: true });
+  assert.equal(built.runs.length, 2, "a retry after settlement starts one fresh forced refresh");
+});
+
 test("#1680: with no refresh in flight, refresh_nodes starts its own forced run", async () => {
   const built = realRefreshNodes({ startInFlight: false, budgetMs: 500 });
   const { value } = await withWatchdog(
