@@ -404,6 +404,10 @@ function widgetBaseName(widgetName) {
   return dot === -1 ? widgetName : widgetName.slice(0, dot);
 }
 
+function normalizedWidgetBaseName(widgetName) {
+  return widgetBaseName(widgetName).toLowerCase();
+}
+
 function isModePassThrough(node) {
   const type = runtimeNodeType(node);
   return type.includes("Reroute") || type.includes("Node Combiner") || type.includes("Node Collector");
@@ -417,6 +421,28 @@ function modeTransactionFailure(node, detail) {
   );
 }
 
+function relayDispatchesMode(node, owner) {
+  try {
+    const inputs = Array.isArray(node.inputs) ? node.inputs : [];
+    // rgthree's NodeModeRelay dispatches only when it has at most one input slot,
+    // input 0 is unconnected, and an output is connected. A multi-input relay with
+    // empty slots is not an input-less dispatcher.
+    if (inputs.length > 1) return false;
+    const inputConnected =
+      typeof node.isInputConnected === "function"
+        ? node.isInputConnected(0)
+        : inputs[0]?.link != null;
+    const outputConnected =
+      typeof node.isAnyOutputConnected === "function"
+        ? node.isAnyOutputConnected()
+        : Array.isArray(node.outputs) &&
+          node.outputs.some((output) => Array.isArray(output?.links) && output.links.length > 0);
+    return !inputConnected && outputConnected;
+  } catch {
+    throw modeTransactionFailure(owner, `relay ${node?.id ?? "?"}'s connection state is unreadable`);
+  }
+}
+
 /**
  * Capture only the mode targets a Fast Groups Bypasser row can reach:
  *   - members of each Fast Bypasser group row on this node;
@@ -427,10 +453,10 @@ function modeTransactionFailure(node, detail) {
  * This intentionally does not walk or snapshot the graph generally. The returned journal is
  * used only after a write has already failed verification/refused after dispatch.
  */
-function captureFastBypasserModeTransaction(node, widgetName, writtenWidget) {
+function captureFastBypasserModeTransaction(node, writtenWidget) {
   if (
     runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
-    widgetBaseName(widgetName) !== FAST_GROUPS_TOGGLE_WIDGET
+    normalizedWidgetBaseName(writtenWidget?.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
   ) {
     return null;
   }
@@ -459,7 +485,9 @@ function captureFastBypasserModeTransaction(node, widgetName, writtenWidget) {
 
   const entries = [];
   const seenNodes = new Set();
+  const entriesByNode = new Map();
   const propagationQueue = [];
+  const propagationEdges = new Map();
 
   const addNodeTree = (candidate) => {
     if (!candidate || typeof candidate !== "object" || seenNodes.has(candidate)) return;
@@ -471,8 +499,13 @@ function captureFastBypasserModeTransaction(node, widgetName, writtenWidget) {
       throw modeTransactionFailure(node, `node ${candidate.id ?? "?"}'s mode is unreadable`);
     }
     seenNodes.add(candidate);
-    entries.push({ node: candidate, previous: mode });
-    if (type === NODE_MODE_REPEATER_TYPE || type === NODE_MODE_RELAY_TYPE) {
+    const propagates =
+      type === NODE_MODE_REPEATER_TYPE ||
+      (type === NODE_MODE_RELAY_TYPE && relayDispatchesMode(candidate, node));
+    const entry = { node: candidate, previous: mode, propagates };
+    entries.push(entry);
+    entriesByNode.set(candidate, entry);
+    if (propagates) {
       propagationQueue.push(candidate);
     }
 
@@ -494,12 +527,24 @@ function captureFastBypasserModeTransaction(node, widgetName, writtenWidget) {
     }
   };
 
+  const recordPropagationEdge = (source, target) => {
+    const sourceEntry = entriesByNode.get(source);
+    const targetEntry = entriesByNode.get(target);
+    if (!sourceEntry?.propagates || !targetEntry?.propagates || source === target) return;
+    let targets = propagationEdges.get(source);
+    if (!targets) {
+      targets = new Set();
+      propagationEdges.set(source, targets);
+    }
+    targets.add(target);
+  };
+
   const graphFor = (candidate, group) => candidate?.graph ?? group?.graph ?? node?.graph;
   const connectedRoots = (start, direction, group, skipRelays) => {
-    const queue = [start];
+    const queue = [{ node: start, source: start }];
     const walked = new Set();
     while (queue.length) {
-      const current = queue.shift();
+      const { node: current, source } = queue.shift();
       if (!current || walked.has(current)) continue;
       walked.add(current);
       const graph = graphFor(current, group);
@@ -514,8 +559,11 @@ function captureFastBypasserModeTransaction(node, widgetName, writtenWidget) {
               const link = graph.links?.[outputLinkId];
               const connected = graph.getNodeById?.(link?.target_id);
               if (!connected) continue;
-              if (isModePassThrough(connected)) queue.push(connected);
-              else addNodeTree(connected);
+              if (isModePassThrough(connected)) queue.push({ node: connected, source });
+              else {
+                addNodeTree(connected);
+                recordPropagationEdge(source, connected);
+              }
             }
             continue;
           }
@@ -533,8 +581,11 @@ function captureFastBypasserModeTransaction(node, widgetName, writtenWidget) {
         }
         if (!connected) continue;
         if (skipRelays && runtimeNodeType(connected) === NODE_MODE_RELAY_TYPE) continue;
-        if (isModePassThrough(connected)) queue.push(connected);
-        else addNodeTree(connected);
+        if (isModePassThrough(connected)) queue.push({ node: connected, source });
+        else {
+          addNodeTree(connected);
+          recordPropagationEdge(source, connected);
+        }
       }
     }
   };
@@ -564,27 +615,55 @@ function captureFastBypasserModeTransaction(node, widgetName, writtenWidget) {
       const group = groups.find((candidate) => candidate?.graph === current?.graph) ?? groups[0];
       connectedRoots(current, "input", group, true);
     } else if (type === NODE_MODE_RELAY_TYPE) {
-      let hasInput = false;
-      try {
-        hasInput = Array.isArray(current.inputs) && current.inputs.some((input) => input?.link != null);
-      } catch {
-        throw modeTransactionFailure(node, `relay ${current.id ?? "?"}'s inputs are unreadable`);
-      }
-      if (!hasInput) {
+      if (entriesByNode.get(current)?.propagates) {
         const group = groups.find((candidate) => candidate?.graph === current?.graph) ?? groups[0];
         connectedRoots(current, "output", group, false);
       }
     }
   }
 
+  const propagationRestoreOrder = () => {
+    const propagating = entries.filter((entry) => entry.propagates);
+    const indegree = new Map(propagating.map((entry) => [entry.node, 0]));
+    for (const [source, targets] of propagationEdges) {
+      if (!indegree.has(source)) continue;
+      for (const target of targets) {
+        if (indegree.has(target)) indegree.set(target, indegree.get(target) + 1);
+      }
+    }
+    const ready = propagating.filter((entry) => indegree.get(entry.node) === 0);
+    const ordered = [];
+    while (ready.length) {
+      const entry = ready.shift();
+      ordered.push(entry);
+      for (const target of propagationEdges.get(entry.node) ?? []) {
+        if (!indegree.has(target)) continue;
+        const next = indegree.get(target) - 1;
+        indegree.set(target, next);
+        if (next === 0) ready.push(entriesByNode.get(target));
+      }
+    }
+    // A cyclic mode graph cannot be topologically ordered; keep the captured order and
+    // let the authoritative read-back report any irreconcilable mode conflict honestly.
+    return ordered.length === propagating.length ? ordered : propagating;
+  };
+
   return {
     restore() {
-      for (const entry of entries) {
+      const restoreEntry = (entry) => {
         try {
           if (!Object.is(entry.node.mode, entry.previous)) entry.node.mode = entry.previous;
         } catch {
           // Read-back below turns this into an honest partial-state error.
         }
+      };
+      // Restore mode-propagating roots in upstream-to-downstream order, then restore every
+      // ordinary node after the last propagation. This handles a group whose iteration order
+      // places a linked node before its repeater: the repeater may overwrite it during restore,
+      // so linked nodes must be the final writes.
+      for (const entry of propagationRestoreOrder()) restoreEntry(entry);
+      for (const entry of entries) {
+        if (!entry.propagates) restoreEntry(entry);
       }
     },
     unrestored() {
@@ -1942,7 +2021,7 @@ export function applyWidgetWrite(
   // #2146 — capture the narrow Fast Bypasser mode boundary before the undo envelope opens.
   // If the live row shape cannot be bounded, refuse before assigning the widget value rather
   // than allowing a callback to mutate linked modes that this writer cannot restore.
-  const fastBypasserModes = captureFastBypasserModeTransaction(node, widgetName, w);
+  const fastBypasserModes = captureFastBypasserModeTransaction(targetNode, w);
 
   // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
   // so a throwing hook can never bypass our verification/rollback and leave a silent
