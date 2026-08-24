@@ -257,6 +257,7 @@ import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
 import { installSidebarRenderWatchdog } from "./lib/sidebar-render-watchdog.js";
 import { displayLabel, boundaryInputLabel, widgetLabelMap } from "./lib/slot-labels.js";
 import { duplicateWidgetRows } from "./lib/widget-rows.js";
+import { redactWidgetValue } from "./lib/widget-secret-redaction.js";
 import { pickAdvertisedBridgeUrl, acceptableLoopbackBridgeUrl } from "./lib/advertised-bridge-url.js";
 import {
   DEFAULT_BRIDGE_URL,
@@ -10759,7 +10760,7 @@ async function revertGraphSnapshotByMid(mid) {
 function summarizeNode(node) {
   const widgets = {};
   for (const w of node.widgets ?? []) {
-    if (w && typeof w.name === "string") widgets[w.name] = w.value;
+    if (w && typeof w.name === "string") widgets[w.name] = redactWidgetValue(w.name, w.value);
   }
   // #1402: several widgets can legitimately share ONE name — every toggle row of
   // rgthree's Fast Groups Bypasser/Muter is named `RGTHREE_TOGGLE_AND_NAV`. The
@@ -12584,8 +12585,9 @@ const GRAPH_TOOL_EXECUTORS = {
      * quote/backslash-dense value can render slightly longer than 60; that costs a few
      * characters against max_chars and cannot reintroduce a forgeable tag (codex).
      */
-    const fmtVal = (v, node) => {
-      const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
+    const fmtVal = (v, node, widgetName) => {
+      const safeValue = redactWidgetValue(widgetName, v);
+      const s = String(typeof safeValue === "string" ? safeValue : JSON.stringify(safeValue) ?? "").replace(/\s+/g, " ");
       let clipped = s;
       if (s.length > 60) {
         outlineClipped++;
@@ -12658,7 +12660,7 @@ const GRAPH_TOOL_EXECUTORS = {
             .map((w) => {
               // At "no_values" the widget NAMES still tell an agent what is configurable;
               // the VALUES are the bulk of the bytes, so they go first.
-              const base = level === "full" ? `${w.name}=${fmtVal(w.value, n)}` : w.name;
+              const base = level === "full" ? `${w.name}=${fmtVal(w.value, n, w.name)}` : w.name;
               // The NAME stays the addressable key and stays first — panel_set_widget
               // takes the name, not the label — with the label annotated beside it in the
               // same bracket idiom as [after_gen=…] and [bypass].
@@ -13008,9 +13010,12 @@ const GRAPH_TOOL_EXECUTORS = {
       if (op === "<=") return l <= r;
       return false;
     };
-    const widgetsOf = (n) => {
+    const widgetsOf = (n, redactValues = false) => {
       const out = {};
-      for (const w of n.widgets ?? []) if (w && typeof w.name === "string") out[w.name] = w.value;
+      for (const w of n.widgets ?? []) {
+        if (w && typeof w.name === "string")
+          out[w.name] = redactValues ? redactWidgetValue(w.name, w.value) : w.value;
+      }
       return out;
     };
     const matched = candidates.filter((n) => {
@@ -13194,7 +13199,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // #1181: virtually-fed promoted inputs get the tag that says the stored
         // value executes — drivenTag would claim the opposite.
         const vFed = virtualFedInputs(n);
-        const w = Object.entries(widgetsOf(n))
+        const w = Object.entries(widgetsOf(n, true))
           .map(([k, v]) => {
             // ONE cap across the row (see compactValueCap above). A per-widget cap that
             // varied as a budget drained made the clip note incoherent: values cut at
