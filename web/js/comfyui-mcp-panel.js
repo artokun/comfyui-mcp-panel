@@ -6809,6 +6809,13 @@ async function programmaticSave(name) {
       if (repainted) details.canvasRepainted = true;
       return repainted;
     },
+    restoreCanvas: async ({ workflow }) => {
+      // The adapter restores the record before calling this hook. Repaint only when
+      // that record is still the active instance; a concurrent tab switch must not
+      // load the source graph over the user's other canvas.
+      if (!workflow || !sameWorkflowObject(activeWorkflowRef(), workflow)) return false;
+      return repaintSaveAsCanvas(workflow, workflow.path);
+    },
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
     // #771 — ComfyUI answers EVERY filesystem error on the userdata write with one
     // 400 that blames the FILENAME, and logs the real cause a line earlier. This

@@ -3208,3 +3208,53 @@ test('#939: Save-As repaints destination metadata before a graph edit and no-nam
   assert.equal(edited.extra.comfyui_mcp.workflow_path, destinationPath)
   assert.equal(edited.nodes.some((node) => node.type === 'EditedAfterSaveAs'), true)
 })
+
+test('#939: an incomplete Save-As repaint restores the shared canvas with the source record', async () => {
+  const sourcePath = 'workflows/Source.json'
+  const destinationPath = 'workflows/Destination.json'
+  const sourceState = {
+    nodes: [{ id: 1, type: 'KSampler', widgets_values: ['source'] }],
+    links: [],
+    version: 1,
+  }
+  const source = {
+    path: sourcePath,
+    filename: 'Source.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
+  let canvasState = structuredClone(sourceState)
+  let restoreActive = null
+  let restoreCalls = 0
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, 'Destination', {
+        existsOnDisk,
+        canvasBinding: () => 'bound',
+        // Model the production repaint's real failure shape: the shared canvas is
+        // changed before completion proof rejects the load.
+        repaintCanvas: async () => {
+          canvasState = { nodes: [{ id: 1, type: 'KSampler', widgets_values: ['partial'] }], links: [], version: 1 }
+          return false
+        },
+        restoreCanvas: async ({ workflow }) => {
+          restoreCalls += 1
+          restoreActive = workflow
+          canvasState = structuredClone(workflow.changeTracker.activeState)
+          return true
+        },
+      }),
+    /could not be proven active/,
+  )
+
+  assert.equal(restoreCalls, 1, 'cleanup reconciled the shared canvas once')
+  assert.equal(restoreActive, source, 'cleanup restored the source record before repainting')
+  assert.equal(svc.activeWorkflow, source, 'active record returned to the source')
+  assert.deepEqual(canvasState, sourceState, 'the partially repainted canvas returned to source content')
+  assert.equal(svc.getWorkflowByPath(destinationPath), null, 'temporary copy was removed from the store')
+  assert.equal(svc.disk.has(destinationPath), false, 'the refusal did not persist a destination file')
+  assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false, 'failure never reported or attempted success')
+})
