@@ -436,7 +436,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef }) {
   const seen = { dispatchArgs: null };
   const deps = {
     RUN_COMMAND_BUDGET_MS: budgetMs,
@@ -489,8 +489,8 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch }) {
     describeQueuePromptChain,
     describeQueuePromptChainForReport,
     queuePromptChainDeps,
-    runCompletionRef: { onQueued() {} },
-    armRunReconcileSweepRef: () => {},
+    runCompletionRef: runCompletionRef ?? { onQueued() {} },
+    armRunReconcileSweepRef: armRunReconcileSweepRef ?? (() => {}),
   };
   const names = Object.keys(deps);
   const factory = new Function(
@@ -825,6 +825,40 @@ test("#1565 CALL SITE: graph_run answers inside its budget when the frontend que
       typeof answer.replied.error === "string" && answer.replied.error.length > 0,
       "with words, not a bare relay timeout that blames a tab which is answering reads fine",
     );
+  } finally {
+    stop();
+  }
+});
+
+test("#1728 CALL SITE: a prompt_id captured after the scoped budget still enters completion recovery", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const queued = [];
+    let sweepArms = 0;
+    let latePromptId;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      runCompletionRef: { onQueued: (id) => queued.push(id) },
+      armRunReconcileSweepRef: () => sweepArms++,
+      dispatch: async (args) => {
+        // The production guard can invoke this callback after dispatchScopedRun
+        // has returned its bounded unverified result.
+        latePromptId = () => args.onPromptId("late-prompt-1728");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    const result = await built.graph_run({ to_node_id: 327 });
+    assert.equal(result.queued_unknown, true, "the bounded call remains honest about its unknown receipt");
+    latePromptId();
+    assert.deepEqual(queued, ["late-prompt-1728"], "the late receipt enters the completion ledger");
+    assert.equal(sweepArms, 1, "the late receipt arms reconciliation exactly once");
   } finally {
     stop();
   }

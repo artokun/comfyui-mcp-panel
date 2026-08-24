@@ -17179,12 +17179,26 @@ const GRAPH_TOOL_EXECUTORS = {
       // Capture the FIRST top-level rejection only (see above).
       if (promptRejection == null) promptRejection = r;
     };
-    const capturePromptId = (pid) => {
+    const registerPromptId = (pid) => {
       // EVERY accepted prompt_id, string-normalized at capture (0 and "0"
       // are the same run) so #370 reconcile stays string-vs-string.
       const id = String(pid).trim();
-      if (!id) return;
-      if (!queuedPromptIds.includes(id)) queuedPromptIds.push(id);
+      if (!id || queuedPromptIds.includes(id)) return;
+      queuedPromptIds.push(id);
+      // #1728 — dispatchScopedRun may return its bounded queued_unknown result
+      // while this request is still in flight. Register at capture time, not only
+      // after dispatch returns, so a late prompt_id still opens the local recovery
+      // ledger and arms the sweep. The MCP consumer performs its own bounded
+      // reconciliation before opening the server-side completion ticket.
+      try {
+        runCompletionRef?.onQueued(id);
+      } catch {}
+      try {
+        armRunReconcileSweepRef?.();
+      } catch {}
+    };
+    const capturePromptId = (pid) => {
+      registerPromptId(pid);
     };
     // #1504 — node_errors that arrived on an ACCEPTED (200) reply: the outputs
     // ComfyUI dropped from a prompt it queued anyway ("Output will be ignored").
@@ -17418,26 +17432,10 @@ const GRAPH_TOOL_EXECUTORS = {
         /* keep the unfiltered scan - over-warning is the safe direction here */
       }
     }
-    // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
-    // BEFORE the rejection check. With batch>1, app.queuePrompt breaks its loop on
-    // the first rejection, so an EARLIER repetition can be accepted (already
-    // queued + running) while a LATER one rejects. That accepted run still needs a
-    // recovery-ledger entry, or a disconnect that swallows its whole lifecycle
-    // would leave it unreconcilable even though we return a rejection here.
-    for (const pid of queuedPromptIds) {
-      try {
-        runCompletionRef?.onQueued(pid);
-      } catch {}
-    }
-    // panel#356 Bug 2: kick the periodic safety-sweep reconcile now that a run is
-    // pending, so a completion landing during an UNOBSERVED WS reconnect (idle gap,
-    // no `reconnected` edge) is still recovered. No-op if the sweep is already armed
-    // or the ledger is empty; self-disarms when every pending run drains.
-    if (queuedPromptIds.length) {
-      try {
-        armRunReconcileSweepRef?.();
-      } catch {}
-    }
+    // #1728: capturePromptId registers accepted ids immediately, including ids
+    // delivered after this bounded dispatch has returned. Keep the result-local
+    // list for the synchronous response and for the existing idempotent return
+    // shaping below.
     // A scoped run that did NOT fully verify (r5: refused / unverified /
     // unverifiable) carries a truthful error naming what couldn't be resolved —
     // and guarantees no scopeless full-graph dispatch left the tab. The return
