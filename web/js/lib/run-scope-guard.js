@@ -105,7 +105,9 @@ import { withTimeout } from "./bounded-step.js";
 //    rewritten by an extension's own api.queuePrompt patch, which carry no hook
 //    at all — rgthree's armed Seed node, #1124; plus leftover values of
 //    link-driven converted widgets that settle from the widget default to the
-//    incoming link after reconnect — MiniMax H3 clip/vae/model, #1331), which change
+//    incoming link after reconnect — MiniMax H3 clip/vae/model, #1331), and known
+//    serializer-backed derived fields such as Ideogram4PromptBuilderKJ's
+//    elements_data (#2130), which change
 //    between any two serializations of the SAME graph by design (#572: the
 //    exclusion must reach the hook's serialized TARGET, not just the
 //    unserialized control the hook hangs on), and (b) inputs whose value the
@@ -247,7 +249,9 @@ const fnv1aHex = (s) =>
  *     collectVolatileInputs knows about: a `beforeQueued` hook (stock seed
  *     widgets re-rolled by their linked control_after_generate, third-party hook
  *     widgets), or an extension rewriting the outgoing prompt in its own
- *     `api.queuePrompt` patch (rgthree's armed Seed node, #1124). Those change
+ *     `api.queuePrompt` patch (rgthree's armed Seed node, #1124), or a known
+ *     serializer-backed derived widget (Ideogram4PromptBuilderKJ's
+ *     `elements_data`, #2130). Those change
  *     between any two serializations of the SAME graph by design, so hashing
  *     them would refuse our own dispatch. Exclusions are PER-NODE pairs
  *     (prompt node id + input name, r8): an edit to a NON-hook node's
@@ -427,7 +431,7 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
 /**
  * The "execId inputName" pairs whose values MUTATE AT QUEUE TIME — after our
  * pre-dispatch stamp and before the POST body is built — collected from the live
- * root graph and every nested subgraph. FIVE signals, one per mechanism: a
+ * root graph and every nested subgraph. SIX signals, one per mechanism: a
  * widget-level `beforeQueued` hook (#572), an extension that patches
  * `api.queuePrompt` and rewrites the outgoing prompt directly (rgthree's armed
  * Seed node, #1124 — invisible to any widget scan, matched by node identity),
@@ -438,7 +442,9 @@ export function promptContentHashFromBody(bodyText, volatileInputs = null) {
  * serialized form flips from the stale widget default to the incoming link,
  * or the leftover filename itself settles, while the canvas is idle), plus
  * VHS_VideoCombine filename_prefix date templates (#2099), which the frontend
- * resolves at queue time.
+ * resolves at queue time, and the known Ideogram4PromptBuilderKJ `elements_data`
+ * serializer-backed editor state (#2130), which can be rewritten while the prompt
+ * is serialized.
  * execId is the flattened prompt id: String(node.id) at root, the
  * colon-joined subgraph-instance path for nested nodes ("10:15:359") — the
  * same path buildNodeExecutionId produces, so pairs line up with the keys of
@@ -517,6 +523,28 @@ function vhsQueueTimeFilenamePrefixInput(node) {
     }
   }
   return null;
+}
+
+/**
+ * #2130 — KJNodes' Ideogram4PromptBuilderKJ owns `elements_data` through its
+ * editor-backed `serializeValue` implementation. The widget is executable prompt
+ * input, so this is deliberately NOT a general "any serializeValue" exemption:
+ * only the measured node type + field + live serializer qualify. A later build
+ * that drops the override is drift-covered automatically.
+ *
+ * Returns the exact serialized input name, or null when the current node does
+ * not prove the queue-time-derived mechanism.
+ */
+function ideogramQueueTimeDerivedInput(node) {
+  if (node?.type !== "Ideogram4PromptBuilderKJ") return null;
+  try {
+    const widget = (node.widgets ?? []).find((w) => w?.name === "elements_data");
+    return typeof widget?.serializeValue === "function" ? "elements_data" : null;
+  } catch {
+    // An unreadable serializer accessor is not proof of queue-time mutation;
+    // keep the input drift-covered rather than widening the exclusion.
+    return null;
+  }
 }
 
 export function collectVolatileInputs(rootGraph) {
@@ -608,6 +636,12 @@ export function collectVolatileInputs(rootGraph) {
       // drift coverage.
       const vhsFilenamePrefixInput = vhsQueueTimeFilenamePrefixInput(node);
       if (vhsFilenamePrefixInput != null) addPair(execId, vhsFilenamePrefixInput);
+      // #2130 — THE SIXTH VOLATILITY SIGNAL. This exact KJNodes field is a
+      // derived editor write-back whose live serializeValue can change the
+      // prompt during queue-time serialization. Keep every other serializer-
+      // backed input drift-covered.
+      const ideogramDerivedInput = ideogramQueueTimeDerivedInput(node);
+      if (ideogramDerivedInput != null) addPair(execId, ideogramDerivedInput);
       if (node.subgraph) walk(node.subgraph, execId);
     }
   };
