@@ -6692,6 +6692,12 @@ function carryIdentityAcrossSaveSwap({ svc, preWf, preSwapUuid, savedAs = false,
 // workflow check below is the tab fence; this monotonic generation is the operation
 // fence for overlapping/re-mounted panel work.
 let saveAsCanvasGeneration = 0;
+// A tab can switch while each reconciliation load is suspended. Keep recovery
+// finite: an unstable canvas must refuse the Save-As rather than chase an
+// unbounded stream of active tabs or eventually report success for an unknown
+// canvas. The initial Save-As load plus these bounded retries is the complete
+// reconciliation budget for one operation.
+const MAX_SAVE_AS_CANVAS_RECONCILIATIONS = 3;
 
 /** Rebind a persisted Save-As copy onto the shared canvas before its first persist.
  *
@@ -6701,91 +6707,112 @@ let saveAsCanvasGeneration = 0;
  * payload, repaint through the production load path, then require all three observations
  * (active record, root uuid, root path) to agree. The save adapter captures the copy only
  * after this returns true; a failed or partial repaint is a pre-commit refusal. */
-async function repaintSaveAsCanvas(copy, targetPath, { canvasFence, reconcileCanvas } = {}) {
-  const ownsCanvas = () => {
+async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
+  const ownsWorkflow = (workflow) => {
     if (typeof canvasFence !== "function") return true;
     try {
-      return canvasFence(copy) === true;
+      return canvasFence(workflow) === true;
     } catch {
       return false;
     }
   };
-  try {
-    if (!ownsCanvas()) return false;
-    const state = copy?.changeTracker?.activeState ?? copy?.activeState;
-    if (!state || !Array.isArray(state.nodes) || typeof app?.loadGraphData !== "function") return false;
-    const destinationPath = typeof copy?.path === "string" && copy.path ? copy.path : targetPath;
-    if (typeof destinationPath !== "string" || !destinationPath) return false;
-    const targetUuid = workflowStableUuid(copy, { embed: true });
-    if (typeof targetUuid !== "string" || !targetUuid) return false;
-    const saveAsPayload = JSON.parse(JSON.stringify(state));
-    const existingExtra =
-      saveAsPayload.extra && typeof saveAsPayload.extra === "object" && !Array.isArray(saveAsPayload.extra)
-        ? saveAsPayload.extra
-        : {};
-    const existingMeta =
-      existingExtra[WORKFLOW_META_NAMESPACE] &&
-      typeof existingExtra[WORKFLOW_META_NAMESPACE] === "object" &&
-      !Array.isArray(existingExtra[WORKFLOW_META_NAMESPACE])
-        ? existingExtra[WORKFLOW_META_NAMESPACE]
-        : {};
-    saveAsPayload.extra = {
-      ...existingExtra,
-      [WORKFLOW_META_NAMESPACE]: {
-        ...existingMeta,
-        [WORKFLOW_UUID_FIELD]: targetUuid,
-        [WORKFLOW_PATH_FIELD]: destinationPath,
-      },
-    };
-    // A tab switch can happen only while the real load below is suspended. If that
-    // happens, the Save-As load is no longer allowed to decide what the shared canvas
-    // should show. Reconcile the tab that is active NOW, using that tab's own tracker
-    // state and a fresh fence; never repaint the predecessor or the failed copy.
-    const reconcileAfterOwnershipLoss = async (phase) => {
-      if (ownsCanvas() || typeof reconcileCanvas !== "function") return false;
-      try {
-        await reconcileCanvas({ copy, targetPath, phase });
-      } catch {
-        // The Save-As remains a refusal. The caller's cleanup reports the explicit
-        // no-success state, and a failed reconciliation must not get a second chance
-        // to paint an unknown tab.
-      }
-      return false;
-    };
-    if (!ownsCanvas()) return false;
-    const LGForSaveAs = liteGraphGlobal();
-    const restore = await loadGraphDataWithCompletionProof({
-      liteGraph: LGForSaveAs,
-      graph: app?.graph,
-      load: () => app.loadGraphData(saveAsPayload, true, true, copy, { __cmcpKeepInstance: true }),
-    });
-    if (restore.completed !== true) {
-      return reconcileAfterOwnershipLoss("save-as-load-incomplete");
+  // One load attempt is deliberately non-recursive. The caller below owns the
+  // finite state machine so every awaited load has the same post-await fence and
+  // can advance to the newly active record exactly once.
+  const repaintOne = async (workflow, workflowPath) => {
+    if (!ownsWorkflow(workflow)) {
+      return { ok: false, ownerChanged: true };
     }
-    // loadGraphData is awaited and can settle after the user switched tabs. Do not
-    // accept that late load as proof. Repaint the CURRENT tab from its own state before
-    // the fail-closed cleanup returns; repainting the predecessor here would clobber the
-    // newer tab just as surely as accepting the stale Save-As load.
-    if (!ownsCanvas()) return reconcileAfterOwnershipLoss("save-as-load-owner-lost");
-    const rootGraph = app?.graph;
-    const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
-    const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
-    return (
-      sameWorkflowObject(activeWorkflowRef(), copy) &&
-      canvasIsRoot &&
-      rootMeta?.[WORKFLOW_UUID_FIELD] === targetUuid &&
-      normalizedWorkflowPath(rootMeta?.[WORKFLOW_PATH_FIELD]) === normalizedWorkflowPath(destinationPath)
-    );
-  } catch {
-    if (typeof reconcileCanvas === "function") {
-      try {
-        if (!ownsCanvas()) await reconcileCanvas({ copy, targetPath, phase: "save-as-load-threw" });
-      } catch {
-        // The outer Save-As path reports the refusal; no success or persistence follows.
+    try {
+      const state = workflow?.changeTracker?.activeState ?? workflow?.activeState;
+      if (!state || !Array.isArray(state.nodes) || typeof app?.loadGraphData !== "function") {
+        return { ok: false, ownerChanged: false };
       }
+      const destinationPath =
+        typeof workflow?.path === "string" && workflow.path ? workflow.path : workflowPath;
+      if (typeof destinationPath !== "string" || !destinationPath) {
+        return { ok: false, ownerChanged: false };
+      }
+      const targetUuid = workflowStableUuid(workflow, { embed: true });
+      if (typeof targetUuid !== "string" || !targetUuid) {
+        return { ok: false, ownerChanged: false };
+      }
+      const saveAsPayload = JSON.parse(JSON.stringify(state));
+      const existingExtra =
+        saveAsPayload.extra && typeof saveAsPayload.extra === "object" && !Array.isArray(saveAsPayload.extra)
+          ? saveAsPayload.extra
+          : {};
+      const existingMeta =
+        existingExtra[WORKFLOW_META_NAMESPACE] &&
+        typeof existingExtra[WORKFLOW_META_NAMESPACE] === "object" &&
+        !Array.isArray(existingExtra[WORKFLOW_META_NAMESPACE])
+          ? existingExtra[WORKFLOW_META_NAMESPACE]
+          : {};
+      saveAsPayload.extra = {
+        ...existingExtra,
+        [WORKFLOW_META_NAMESPACE]: {
+          ...existingMeta,
+          [WORKFLOW_UUID_FIELD]: targetUuid,
+          [WORKFLOW_PATH_FIELD]: destinationPath,
+        },
+      };
+      const LGForSaveAs = liteGraphGlobal();
+      const restore = await loadGraphDataWithCompletionProof({
+        liteGraph: LGForSaveAs,
+        graph: app?.graph,
+        load: () => app.loadGraphData(saveAsPayload, true, true, workflow, { __cmcpKeepInstance: true }),
+      });
+      // This is the required post-await re-read. `canvasFence` includes both the
+      // active workflow record and this Save-As operation's monotonic generation.
+      const ownerChanged = !ownsWorkflow(workflow);
+      if (ownerChanged) return { ok: false, ownerChanged: true };
+      if (restore.completed !== true) return { ok: false, ownerChanged: false };
+      const rootGraph = app?.graph;
+      const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
+      const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
+      return {
+        ok:
+          sameWorkflowObject(activeWorkflowRef(), workflow) &&
+          canvasIsRoot &&
+          rootMeta?.[WORKFLOW_UUID_FIELD] === targetUuid &&
+          normalizedWorkflowPath(rootMeta?.[WORKFLOW_PATH_FIELD]) === normalizedWorkflowPath(destinationPath),
+        ownerChanged: false,
+      };
+    } catch {
+      // A throw is recoverable only when the awaited load also lost ownership. If
+      // the same owner remains active, preserve the existing fail-closed refusal.
+      return {
+        ok: false,
+        ownerChanged: !ownsWorkflow(workflow),
+      };
     }
-    return false;
+  };
+
+  if (!ownsWorkflow(copy)) return false;
+  let workflow = copy;
+  let workflowPath = targetPath;
+  for (let reconciliation = 0; reconciliation <= MAX_SAVE_AS_CANVAS_RECONCILIATIONS; reconciliation += 1) {
+    const result = await repaintOne(workflow, workflowPath);
+    if (result.ok) return true;
+    if (!result.ownerChanged) return false;
+
+    const current = activeWorkflowRef();
+    if (!current || sameWorkflowObject(current, workflow)) return false;
+    if (reconciliation >= MAX_SAVE_AS_CANVAS_RECONCILIATIONS) {
+      throw new Error(
+        `Save-As canvas reconciliation entered an unsafe state after ${
+          MAX_SAVE_AS_CANVAS_RECONCILIATIONS + 1
+        } bounded loads; active workflow kept changing, so nothing was persisted (#939).`,
+      );
+    }
+    const currentPath = typeof current.path === "string" && current.path ? current.path : null;
+    if (!currentPath) return false;
+    // Advance the state machine to the record that is active NOW. Do not call
+    // repaintSaveAsCanvas here: that recursive shape was the unbounded-race bug.
+    workflow = current;
+    workflowPath = currentPath;
   }
+  return false;
 }
 
 /** Programmatically save the active workflow — NO Save/Rename dialog.
@@ -6856,26 +6883,6 @@ async function programmaticSave(name) {
     repaintCanvas: async (copy, targetPath) => {
       const repainted = await repaintSaveAsCanvas(copy, targetPath, {
         canvasFence: (workflow) => canvasFence({ workflow }),
-        reconcileCanvas: async ({ copy: failedCopy, targetPath: failedTargetPath, phase }) => {
-          const current = activeWorkflowRef();
-          // The failed copy is no longer allowed to own the canvas. A missing or
-          // pathless current record gives us no verified state to restore, so leave the
-          // canvas untouched and let the Save-As fail closed explicitly.
-          if (!current || sameWorkflowObject(current, failedCopy)) return false;
-          const currentPath = typeof current.path === "string" && current.path ? current.path : null;
-          if (!currentPath) return false;
-          const currentFence = (workflow) => sameWorkflowObject(activeWorkflowRef(), workflow);
-          const reconciled = await repaintSaveAsCanvas(current, currentPath, {
-            canvasFence: currentFence,
-          });
-          if (!reconciled) {
-            console.warn(
-              `[comfyui-mcp-panel] Save-As canvas reconciliation failed during ${phase}; ` +
-                `active workflow remains unverified (${failedTargetPath || "unknown target"})`,
-            );
-          }
-          return reconciled;
-        },
       });
       if (repainted) details.canvasRepainted = true;
       return repainted;

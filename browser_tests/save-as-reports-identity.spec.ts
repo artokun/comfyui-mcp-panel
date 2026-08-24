@@ -268,3 +268,139 @@ test('a tab switch during the real Save-As load reconciles the newer canvas and 
     }
   }
 })
+
+test('a second tab switch during reconciliation is re-read and remains bounded', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  test.setTimeout(120_000)
+  const cleanup: string[] = []
+  try {
+    await panel.goto()
+    await panel.setBridgeUrl(mockBridge.url)
+    await panel.openSidebar()
+    await panel.connect()
+
+    const first = await mockBridge.command('workflow_save', {})
+    expect(first.ok, 'the setup save must succeed').toBe(true)
+    const original = String(first.result?.workflow || '')
+    expect(original).toBeTruthy()
+    cleanup.push(original)
+
+    // Prepare two persisted routed tabs so the production reconciliation has a
+    // path-bearing owner to load, followed by another owner to switch to.
+    const reconcileAName = `e2e-939-reconcile-a-${Date.now()}`
+    const reconcileA = await mockBridge.command('workflow_new')
+    expect(reconcileA.ok).toBe(true)
+    const savedA = await mockBridge.command('workflow_save', { name: reconcileAName })
+    expect(savedA.ok, `the first reconciliation tab must save: ${savedA.error || ''}`).toBe(true)
+    cleanup.push(reconcileAName)
+
+    const reconcileBName = `e2e-939-reconcile-b-${Date.now()}`
+    const reconcileB = await mockBridge.command('workflow_new')
+    expect(reconcileB.ok).toBe(true)
+    const savedB = await mockBridge.command('workflow_save', { name: reconcileBName })
+    expect(savedB.ok, `the second reconciliation tab must save: ${savedB.error || ''}`).toBe(true)
+    cleanup.push(reconcileBName)
+
+    const openedOriginal = await mockBridge.command('workflow_open', {
+      path: `workflows/${original}.json`
+    })
+    expect(openedOriginal.ok, `the source tab must be active: ${openedOriginal.error || ''}`).toBe(true)
+
+    const edited = await mockBridge.command('graph_add_node', { class_type: 'VAEDecode' })
+    expect(edited.ok, `the source setup edit must succeed: ${edited.error || ''}`).toBe(true)
+
+    const copyName = `e2e-939-second-switch-${Date.now()}`
+    const copyPath = `workflows/${copyName}.json`
+    const reconcileAPath = `workflows/${reconcileAName}.json`
+    const reconcileBPath = `workflows/${reconcileBName}.json`
+    cleanup.push(copyName)
+
+    // Hold the initial Save-As load and the first reconciliation load. The
+    // second switch happens while the reconciliation await is suspended.
+    await page.evaluate(({ copyPath, reconcileAPath }) => {
+      const w = window as any
+      const app = w.comfyAPI?.app?.app || w.app
+      if (typeof app?.loadGraphData !== 'function') throw new Error('loadGraphData unavailable')
+      const gate: any = {
+        copyEntered: false,
+        reconcileEntered: false,
+        copyRelease: null,
+        reconcileRelease: null
+      }
+      const originalLoad = app.loadGraphData.bind(app)
+      app.loadGraphData = async (...args: any[]) => {
+        const path = args[0]?.extra?.comfyui_mcp?.workflow_path
+        const isSaveAsRepaint = args[4]?.__cmcpKeepInstance === true
+        if (isSaveAsRepaint && path === copyPath && !gate.copyEntered) {
+          gate.copyEntered = true
+          await new Promise<void>((resolve) => { gate.copyRelease = resolve })
+        } else if (isSaveAsRepaint && path === reconcileAPath && !gate.reconcileEntered) {
+          gate.reconcileEntered = true
+          await new Promise<void>((resolve) => { gate.reconcileRelease = resolve })
+        }
+        return originalLoad(...args)
+      }
+      w.__cmcp939SecondSwitchGate = gate
+    }, { copyPath, reconcileAPath })
+
+    const saving = mockBridge.command('workflow_save', { name: copyName })
+    await page.waitForFunction(() => Boolean((window as any).__cmcp939SecondSwitchGate?.copyEntered))
+
+    const switchedA = await mockBridge.command('workflow_open', { path: reconcileAPath })
+    expect(switchedA.ok, `the first concurrent switch must succeed: ${switchedA.error || ''}`).toBe(true)
+    await page.evaluate(() => {
+      const gate = (window as any).__cmcp939SecondSwitchGate
+      if (typeof gate?.copyRelease !== 'function') throw new Error('initial Save-As gate was not releasable')
+      gate.copyRelease()
+    })
+    await page.waitForFunction(() => Boolean((window as any).__cmcp939SecondSwitchGate?.reconcileEntered))
+
+    const switchedB = await mockBridge.command('workflow_open', { path: reconcileBPath })
+    expect(switchedB.ok, `the second concurrent switch must succeed: ${switchedB.error || ''}`).toBe(true)
+    await page.evaluate(() => {
+      const gate = (window as any).__cmcp939SecondSwitchGate
+      if (typeof gate?.reconcileRelease !== 'function') throw new Error('reconciliation gate was not releasable')
+      gate.reconcileRelease()
+    })
+
+    const saved = await saving
+    expect(saved.ok, 'losing ownership during reconciliation must refuse the Save-As').toBe(false)
+    expect(String(saved.error || '')).toMatch(/could not be proven active|canvas owner|reconciliation/i)
+
+    const listed = await mockBridge.command('workflow_list')
+    expect(listed.ok).toBe(true)
+    expect(listed.result?.active?.path).toBe(reconcileBPath)
+
+    const canvas = await page.evaluate(() => {
+      const w = window as any
+      const app = w.comfyAPI?.app?.app || w.app
+      const graph = app?.canvas?.graph ?? app?.graph
+      return {
+        nodeCount: graph?.nodes?.length ?? -1,
+        workflowUuid: graph?.extra?.comfyui_mcp?.workflow_uuid ?? null
+      }
+    })
+    expect(canvas.nodeCount, 'the newest tab must not retain the Save-As source graph').toBe(0)
+    expect(canvas.workflowUuid, 'the second reconciliation must preserve the newest identity').toBe(
+      listed.result?.active?.workflow_uuid
+    )
+
+    const onDisk = await page.evaluate(async (path) => {
+      const api = (window as any).comfyAPI?.api?.api
+      const response = await api.fetchApi(`/userdata/${encodeURIComponent(path)}`)
+      return response?.status
+    }, copyPath)
+    expect(onDisk, 'bounded fail-closed reconciliation must not persist the destination').toBe(404)
+  } finally {
+    for (const name of cleanup.reverse()) {
+      try {
+        await deleteSavedWorkflow(page, name)
+      } catch {
+        // Best-effort cleanup must never mask the assertion that failed.
+      }
+    }
+  }
+})
