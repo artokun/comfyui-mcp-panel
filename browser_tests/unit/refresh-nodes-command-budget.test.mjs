@@ -702,6 +702,97 @@ test("#1695: repeated retries share one pending completion and eventually succee
   await built.inFlightStarted?.catch(() => {});
 });
 
+test("#1725: refresh_nodes returns the completed schema verdict while late combo work stays fenced", async () => {
+  const lateCompletion = deferred();
+  const terminal = {
+    refreshed: true,
+    reason: "refreshed",
+    combo_refresh_confirmed: false,
+    combo_refresh_note: "the frontend combo refresh is still settling",
+  };
+  const built = realRefreshNodes({
+    budgetMs: 25,
+    runHook: async ({ index, control }) => {
+      // This is the production shape after /object_info and registration have completed:
+      // the panel has a terminal schema verdict, but refreshComboInNodes() still owns a
+      // shared frontend mutation and must remain behind the single-flight fence.
+      if (index > 0) return { refreshed: true, reason: "refreshed" };
+      control.publishEarlyResult?.(terminal);
+      control.deferCompletion(lateCompletion.promise);
+      return terminal;
+    },
+  });
+
+  const first = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes did not expose the completed schema verdict",
+  );
+  assert.deepEqual(first.value, {
+    ok: true,
+    refreshed: true,
+    combo_refresh_confirmed: false,
+    combo_refresh_note: terminal.combo_refresh_note,
+  });
+  assert.notEqual(built.getInFlight(), null, "late combo mutation remains fenced");
+  assert.equal(built.runs.length, 1, "the terminal acknowledgement does not start a successor");
+
+  lateCompletion.resolve({ refreshed: true, reason: "refreshed" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const settled = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "retry after late combo completion did not settle",
+  );
+  assert.deepEqual(settled.value, { ok: true, refreshed: true });
+  assert.equal(built.runs.length, 2, "a retry after settlement starts one fresh forced refresh");
+});
+
+test("#1725: an early verdict cannot outrun a reconnect successor queued in the next turn", async () => {
+  const lateCompletion = deferred();
+  const terminal = {
+    refreshed: true,
+    reason: "refreshed",
+    combo_refresh_confirmed: false,
+    combo_refresh_note: "the frontend combo refresh is still settling",
+  };
+  let built;
+  let successorQueued = false;
+  let successorRefresh;
+  built = realRefreshNodes({
+    budgetMs: 25,
+    runHook: async ({ index, control }) => {
+      if (index > 0) return { refreshed: true, reason: "refreshed" };
+      control.publishEarlyResult?.(terminal);
+      // Model the ComfyUI reconnected listener arriving after publication but before the
+      // acknowledgement continuation composes its reply. The late combo mutation still
+      // owns the slot, so this force call queues a successor rather than starting run 2.
+      queueMicrotask(() => {
+        successorQueued = true;
+        successorRefresh = built.refreshComfyNodeDefs(undefined, { force: true });
+      });
+      control.deferCompletion(lateCompletion.promise);
+      return terminal;
+    },
+  });
+
+  const first = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes returned before the reconnect successor race settled",
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(successorQueued, true, "the reconnect successor was queued after publication");
+  assert.equal(built.runs.length, 1, "the successor remains behind the fenced late mutation");
+  assert.notEqual(built.getInFlight(), null, "the original late mutation still owns the slot");
+  assert.equal(first.value.reason, "refresh_still_running");
+  assert.equal(first.value.refreshed, false, "MCP must not receive an early schema-ready verdict");
+
+  lateCompletion.resolve();
+  await successorRefresh;
+  assert.equal(built.runs.length, 2, "the queued successor starts only after the fence releases");
+});
+
 test("#1680: with no refresh in flight, refresh_nodes starts its own forced run", async () => {
   const built = realRefreshNodes({ startInFlight: false, budgetMs: 500 });
   const { value } = await withWatchdog(

@@ -114,29 +114,56 @@ async function joinBounded(current, joinMs, withTimeout) {
  * `abandonBeforeLocalWork` also lets a caller stop at the explicit handoff immediately
  * before a run begins synchronous schema work; the run itself is not cancelled.
  */
-async function waitForRun(runHandle, ms, withTimeout, abandonBeforeLocalWork = false) {
+async function waitForRun(
+  runHandle,
+  ms,
+  withTimeout,
+  abandonBeforeLocalWork = false,
+  allowEarlyResult = false,
+) {
   const run = runHandle.promise;
-  if (ms === null) return run;
+  // Use the run's own early result, not the completion-chain result. The latter is a
+  // one-shot promise that can resolve to this run before a reconnect attaches its forced
+  // successor; the synchronous successor check below then keeps that stale observation
+  // fail-closed.
+  const earlyResult = allowEarlyResult ? (runHandle.earlyResult ?? runHandle.result) : null;
+  if (ms === null) return earlyResult ? Promise.race([run, earlyResult]) : run;
   // An abandoned wait is not a reason to turn the run's failure into an unhandled rejection.
   run.catch(() => {});
+  earlyResult?.catch(() => {});
   if (!(ms > 0)) return REFRESH_JOIN_ABANDONED;
   const runOutcome = Promise.resolve(run).then(
-    (value) => ({ value }),
-    (err) => ({ err }),
+    (value) => ({ value, source: "run" }),
+    (err) => ({ err, source: "run" }),
   );
+  const observedOutcome = earlyResult
+    ? Promise.race([
+        runOutcome,
+        Promise.resolve(earlyResult).then(
+          (value) => ({ value, source: "early" }),
+          (err) => ({ err, source: "early" }),
+        ),
+      ])
+    : runOutcome;
   const settled = await withTimeout(
     abandonBeforeLocalWork
       ? Promise.race([
-          runOutcome,
+          observedOutcome,
           runHandle.beforeLocalWork.then(() => ({ beforeLocalWork: true })),
         ])
-      : runOutcome,
+      : observedOutcome,
     ms,
     () => null,
   );
   if (settled === null) return REFRESH_JOIN_ABANDONED;
   if (settled?.beforeLocalWork === true) return REFRESH_JOIN_ABANDONED;
   if ("err" in settled) throw settled.err;
+  // A forced reconnect successor may have been attached after the early promise resolved
+  // but before this bounded caller resumed. The old verdict is no longer authoritative;
+  // return the existing retryable status rather than reporting schema-ready over a queued
+  // post-reconnect run. If the successor settled first, `runOutcome` above already wins and
+  // forwards its result.
+  if (settled.source === "early" && runHandle.hasSuccessor?.()) return REFRESH_JOIN_ABANDONED;
   return settled.value;
 }
 
@@ -167,7 +194,9 @@ async function waitForRun(runHandle, ms, withTimeout, abandonBeforeLocalWork = f
 //                                carries the pre-local-work handoff used by a bounded caller,
 //                                plus `deferCompletion(promise)` for work that may outlive
 //                                the register function's observation budget but still owns
-//                                shared refresh state.
+//                                shared refresh state, and `publishEarlyResult(result)` for
+//                                an optional terminal observation before that deferred work
+//                                releases the slot.
 //   withTimeout                : the repo's ONE bounding primitive (bounded-step.js),
 //                                injected rather than imported so this module stays a
 //                                pure coordinator and a test can drive the clock. Omit it
@@ -182,6 +211,11 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     let yieldBeforeLocalWork = !!abandonBeforeLocalWork;
     let nextCompletion = null;
     let deferredCompletion = null;
+    let earlyResultResolve;
+    let earlyResultPublished = false;
+    const earlyResult = new Promise((resolve) => {
+      earlyResultResolve = resolve;
+    });
     let announceBeforeLocalWork;
     const beforeLocalWork = new Promise((resolve) => {
       announceBeforeLocalWork = resolve;
@@ -209,6 +243,14 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
         deferredCompletion = deferredCompletion ? deferredCompletion.then(() => next) : next;
         return next;
       },
+      // A refresh may have a terminal schema verdict while a late frontend mutation still
+      // owns the single-flight slot. Publish that observation separately: callers may opt
+      // into the verdict, but the completion promise remains fenced until the mutation ends.
+      publishEarlyResult: (result) => {
+        if (earlyResultPublished) return;
+        earlyResultPublished = true;
+        earlyResultResolve(result);
+      },
     };
     const p = (async () => {
       try {
@@ -234,6 +276,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       yieldBeforeLocalWork = true;
       nextCompletion?.requestEarlyYield?.();
     };
+    const hasSuccessor = () => nextCompletion !== null;
     const attachNextCompletion = (next) => {
       nextCompletion = next;
       if (yieldBeforeLocalWork) next?.requestEarlyYield?.();
@@ -247,18 +290,36 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       (value) => (nextCompletion ? nextCompletion.promise : value),
       (err) => (nextCompletion ? nextCompletion.promise : Promise.reject(err)),
     );
+    const observedCompletion = earlyResult.then(
+      (value) => (nextCompletion ? nextCompletion.result : value),
+      (err) => (nextCompletion ? nextCompletion.result : Promise.reject(err)),
+    );
     // The completion chain is an optional observation handle. Mark its rejection handled
     // until an acknowledgement caller elects to await it; the original run promise still
     // preserves the caller-visible rejection semantics for ordinary/coalesced paths.
     completion.catch(() => {});
-    const handle = { promise: p, beforeLocalWork, requestEarlyYield };
+    observedCompletion.catch(() => {});
+    const handle = {
+      promise: p,
+      result: earlyResult,
+      earlyResult,
+      beforeLocalWork,
+      requestEarlyYield,
+      hasSuccessor,
+    };
     handle.completion = {
       promise: completion,
+      result: observedCompletion,
+      earlyResult,
       requestEarlyYield,
+      hasSuccessor,
     };
     handle.attachNextCompletion = attachNextCompletion;
     p.beforeLocalWork = beforeLocalWork;
     p.requestEarlyYield = requestEarlyYield;
+    p.result = earlyResult;
+    p.earlyResult = earlyResult;
+    p.hasSuccessor = hasSuccessor;
     p.completion = handle.completion;
     p.attachNextCompletion = attachNextCompletion;
     setInFlight(p);
@@ -308,6 +369,15 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
           joined.requestEarlyYield?.();
         }
         const joinedPromise = joined.promise ?? joined;
+        if (joinInFlight && opts?.allowEarlyResult === true) {
+          try {
+            return await waitForRun(joined, joinMs, withTimeout, false, true);
+          } catch {
+            // Preserve #1680's fail-closed joined-run behavior for a run that rejected
+            // before publishing its optional terminal observation.
+            return;
+          }
+        }
         if (!(await joinBounded(joinedPromise, joinMs, withTimeout))) return REFRESH_JOIN_ABANDONED;
         // #1680 — an acknowledgement caller needs the run's freshness verdict, not just
         // proof that the promise settled. Ordinary payload-less joins intentionally retain
@@ -359,6 +429,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       }
       if (!trailing) {
         let earlyYieldRequested = abandonBeforeLocalWork;
+        let queuedHandle = null;
         const queued = (async () => {
           try {
             await current;
@@ -366,13 +437,17 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
             /* the in-flight refresh failed — run our own anyway */
           }
           trailing = null;
-          return startRun(undefined, runOpts, earlyYieldRequested);
+          queuedHandle = startRun(undefined, runOpts, earlyYieldRequested);
+          return queuedHandle;
         })();
         trailing = {
           // Follow the successor's own completion chain. A forced refresh can queue another
           // successor after this one starts; exposing only the raw promise would let an older
           // acknowledgement report success while that later run is still in flight.
           promise: queued.then((handle) => handle.completion?.promise ?? handle.promise),
+          result: queued.then((handle) => handle.completion?.result ?? handle.result),
+          earlyResult: queued.then((handle) => handle.completion?.earlyResult ?? handle.result),
+          hasSuccessor: () => queuedHandle?.hasSuccessor?.() === true,
           beforeLocalWork: queued.then((handle) => handle.beforeLocalWork),
           requestEarlyYield: () => {
             earlyYieldRequested = true;
@@ -380,7 +455,13 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
         };
         current.attachNextCompletion?.(trailing);
       }
-      return waitForRun(trailing, joinMs, withTimeout, abandonBeforeLocalWork);
+      return waitForRun(
+        trailing,
+        joinMs,
+        withTimeout,
+        abandonBeforeLocalWork,
+        opts?.allowEarlyResult === true,
+      );
     }
     // #1351 — nothing in flight, so `joinMs` has no join to bound. It still bounds THIS
     // run: the 8.0× measurement was a 2,251 ms own run against a 280 ms bound with the
@@ -392,6 +473,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       joinMs,
       withTimeout,
       abandonBeforeLocalWork,
+      opts?.allowEarlyResult === true,
     );
   };
 }

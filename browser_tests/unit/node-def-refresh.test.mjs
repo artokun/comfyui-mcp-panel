@@ -359,6 +359,11 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
     /const runIsCurrent =\s*!comfyBackendSocketDown &&\s*runStartedAtEpoch === backendReconnectEpoch &&\s*runStartedAtGeneration === verifiedNodeDefCache\.generation\(\);/,
   );
   assert.match(body, /reason: NODE_DEF_REFRESH_REASONS\.REFRESH_SUPERSEDED/);
+  assert.match(
+    body,
+    /if \(comboCompletionPending && verdict\?\.refreshed === true && verdict\?\.combo_refresh_confirmed === false\) \{[\s\S]*publishEarlyResult/,
+    "a locally complete schema verdict is observable before late combo completion, without releasing the fence",
+  );
   // #1193 — the two inputs must stay SEPARATE all the way to the verdict. Merging them
   // into one flag would make an abandoned-but-locally-rebuilt run indistinguishable from
   // a confirmed one, which is the distinction the disclosure exists to carry.
