@@ -28,7 +28,20 @@ import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widg
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
-import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "../../web/js/lib/object-info-oracle.js";
+import {
+  fetchWholeObjectInfo,
+  objectInfoOracleFailureNote,
+  TRANSPORT_OUTCOME,
+} from "../../web/js/lib/object-info-oracle.js";
+import {
+  createObjectInfoSnapshot,
+  noBackendAnswerEstablished,
+} from "../../web/js/lib/object-info-snapshot.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
+import {
+  fetchTypeScopedObjectInfo,
+  SCOPED_OBJECT_INFO_DEADLINE_MS,
+} from "../../web/js/lib/scoped-object-info.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "../../web/js/lib/rgthree-lora-row.js";
 import { inputAssetViewQuery } from "../../web/js/lib/input-asset.js";
 import {
@@ -37,6 +50,11 @@ import {
   SET_WIDGET_COMMAND_BUDGET_MS,
   SET_WIDGET_POST_REFRESH_RESERVE_MS,
 } from "./_panel-constants.mjs";
+
+const graphGetMatch = PANEL_SRC.match(
+  /\n  async graph_get_object_info\(\{ if_none_match \} = \{\}\) \{[\s\S]*?\n  \},/,
+);
+assert.ok(graphGetMatch, "could not locate graph_get_object_info in the panel source");
 
 // ---------------------------------------------------------------------------
 // 1. The lib: an abandoned refresh is a worded, honest, retryable refusal.
@@ -204,6 +222,7 @@ const EXECUTOR_DEPS = [
   "objectInfoSnapshot",
   "recordObjectInfoTypes",
   "objectInfoOracleFailureNote",
+  "noBackendAnswerEstablished",
   "comfyBackendSocketDown",
   "comfyBackendIsDown",
   "objectInfoHistory",
@@ -223,6 +242,9 @@ const EXECUTOR_DEPS = [
   "OBJECT_INFO_DEADLINE_MS",
   "REFRESH_JOIN_ABANDONED",
   "COMBO_REFRESH_NEVER_RAN",
+  "verifiedNodeDefCache",
+  "fetchTypeScopedObjectInfo",
+  "SCOPED_OBJECT_INFO_DEADLINE_MS",
   // The coalescer's live slot. The shipped refreshCombos reads it BEFORE calling the
   // coalescer, so the value captured at build time is exactly what that read must see:
   // the in-flight run a test started before dispatching the command.
@@ -271,6 +293,11 @@ function realGraphSetWidget({
   oracleDefs = null,
   // /view probe behaviour: default answers 404 (the asset is not there).
   fetchApiImpl = null,
+  getNodeDefsImpl = null,
+  objectInfoCache = createObjectInfoCache(),
+  objectInfoSnapshot = { record: () => true, authorize: () => ({ defs: null, reason: "none recorded" }) },
+  verifiedNodeDefCache = createVerifiedNodeDefCache(),
+  registeredNodeTypes = { LoadImage: {}, Note: {} },
 } = {}) {
   const graph = {
     _nodes: [node],
@@ -283,8 +310,9 @@ function realGraphSetWidget({
     graph,
     // "Note" registered with NO nodeData/comfyClass — a genuine frontend-only class, the
     // two positive signals the #475 exemption requires.
-    LG: { registered_node_types: { LoadImage: {}, Note: {} } },
+    LG: { registered_node_types: registeredNodeTypes },
     rootGraph: graph,
+    workflow: { uuid: "wf" },
   };
 
   // The authorization oracle answers with a schema that does NOT contain the (frontend-
@@ -294,6 +322,7 @@ function realGraphSetWidget({
   const api = {
     getNodeDefs: async () => {
       if (oracleDelayMs) await sleep(oracleDelayMs);
+      if (getNodeDefsImpl) return getNodeDefsImpl();
       return oracleDefs ?? { LoadImage: { input: { required: { image: [["old_a.png"], {}] } } } };
     },
     fetchApi: fetchApiImpl ?? (async () => ({ ok: false, status: 404 })),
@@ -339,14 +368,15 @@ function realGraphSetWidget({
     assertActiveWorkflowCommandTarget: () => {},
     WORKFLOW_UUID_FIELD: "workflow_uuid",
     runSetWidget,
-    objectInfoCache: createObjectInfoCache(),
+    objectInfoCache,
     CACHE_OUTCOME,
     fetchWholeObjectInfo,
     api,
     backendReconnectEpoch: 0,
-    objectInfoSnapshot: { record: () => true, authorize: () => ({ defs: null, reason: "none recorded" }) },
+    objectInfoSnapshot,
     recordObjectInfoTypes: (defs) => defs,
     objectInfoOracleFailureNote,
+    noBackendAnswerEstablished,
     comfyBackendSocketDown: false,
     comfyBackendIsDown: () => false,
     // "Note" is frontend-only and never seen on a backend — never-seen is the verdict that
@@ -358,6 +388,9 @@ function realGraphSetWidget({
     clearStaleRedFlag: () => {},
     snapshotAuthorizationNote: () => "",
     ...setWidgetCommandBudgetDeps(),
+    verifiedNodeDefCache,
+    fetchTypeScopedObjectInfo,
+    SCOPED_OBJECT_INFO_DEADLINE_MS,
     SET_WIDGET_COMMAND_BUDGET_MS: budgetMs,
     SET_WIDGET_POST_REFRESH_RESERVE_MS: reserveMs,
     // Captured AFTER the held-open run above has taken the slot — the value the shipped
@@ -374,7 +407,45 @@ function realGraphSetWidget({
     graph_set_widget: factory(...EXECUTOR_DEPS.map((n) => deps[n])),
     runs,
     inFlightStarted,
+    verifiedNodeDefCache: deps.verifiedNodeDefCache,
+    verifiedSchemaContext: context,
+    api,
+    objectInfoCache,
+    objectInfoSnapshot,
   };
+}
+
+/** Build the shipped whole-schema reader with the same cache/snapshot trust roots. */
+function realGraphGetObjectInfo({ api, objectInfoCache, objectInfoSnapshot, verifiedNodeDefCache }) {
+  const names = [
+    "api",
+    "backendReconnectEpoch",
+    "fetchWholeObjectInfo",
+    "objectInfoCache",
+    "verifiedNodeDefCache",
+    "objectInfoSnapshot",
+    "pageComfyOrigin",
+    "objectInfoOracleFailureNote",
+    "objectInfoFingerprint",
+    "objectInfoUnchanged",
+  ];
+  const factory = new Function(
+    ...names,
+    `const executors = {${graphGetMatch[0]}}; return executors.graph_get_object_info;`,
+  );
+  return factory(
+    api,
+    0,
+    fetchWholeObjectInfo,
+    objectInfoCache,
+    verifiedNodeDefCache,
+    objectInfoSnapshot,
+    () => "http://127.0.0.1:8188",
+    objectInfoOracleFailureNote,
+    noBackendAnswerEstablished,
+    () => "fp",
+    () => false,
+  );
 }
 
 // A "Note" node is on the reserved frontend-only allowlist (#475): registered with no
@@ -523,6 +594,166 @@ test("#1418 wiring: a hung /view probe gives up at the budget instead of outlivi
   );
   assert.ok(probed, "the probe did run — it is bounded, not skipped");
   assert.equal(widget.value, "example.png", "nothing was written");
+});
+
+test("#1709: a live graph_set_widget schema read retires cached add-node proof", async () => {
+  const node = { id: 211, type: "RemovedNode", widgets: [{ name: "mode", type: "combo", value: "a" }] };
+  const built = realGraphSetWidget({
+    node,
+    oracleDefs: { OtherNode: { input: { required: {} } } },
+  });
+  const binding = { app: {}, graph: {}, rootGraph: {}, workflow: {} };
+  const cached = { input: { required: {} } };
+  const generation = built.verifiedNodeDefCache.generation();
+  built.verifiedNodeDefCache.set("RemovedNode", cached, { epoch: 0, context: binding, generation });
+  assert.equal(
+    built.verifiedNodeDefCache.get("RemovedNode", { epoch: 0, context: binding, generation }),
+    cached,
+    "the precondition is a live verified add proof",
+  );
+
+  await assert.rejects(
+    () => built.graph_set_widget({ node_id: 211, widget: "mode", value: "b", workflow_uuid: "u" }),
+    /Cannot set widget|refused/i,
+    "the authoritative whole schema refuses the removed backend type",
+  );
+  assert.equal(
+    built.verifiedNodeDefCache.get("RemovedNode", {
+      epoch: 0,
+      context: binding,
+      generation: built.verifiedNodeDefCache.generation(),
+    }),
+    undefined,
+    "the live whole-schema observation retired the stale add proof",
+  );
+});
+
+test("#1709: scoped graph_set_widget reads retire proof on definitive presence and absence", async () => {
+  const def = { input: { required: { mode: ["STRING", {}] } } };
+  const node = {
+    id: 213,
+    type: "RemovedNode",
+    widgets: [{ name: "mode", type: "text", value: "old" }],
+    constructor: { nodeData: def, comfyClass: "RemovedNode" },
+  };
+  const cache = createVerifiedNodeDefCache();
+  const registeredNodeTypes = {
+    LoadImage: {},
+    Note: {},
+    RemovedNode: { nodeData: def, comfyClass: "RemovedNode" },
+  };
+  let present = true;
+  const built = realGraphSetWidget({
+    node,
+    verifiedNodeDefCache: cache,
+    registeredNodeTypes,
+    getNodeDefsImpl: async () => undefined,
+    fetchApiImpl: async (route) => {
+      if (route === "/object_info") return { ok: false, status: 504 };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => (present ? { RemovedNode: def } : {}),
+      };
+    },
+  });
+  const context = built.verifiedSchemaContext;
+  let generation = cache.generation();
+  cache.set("RemovedNode", def, { epoch: 0, context, generation });
+  assert.ok(
+    cache.get("RemovedNode", { epoch: 0, context, generation }),
+    "the scoped reader starts with reusable add proof",
+  );
+
+  const first = await built.graph_set_widget({ node_id: 213, widget: "mode", value: "new", workflow_uuid: "u" });
+  assert.equal(first.set.value, "new", "a definitive scoped presence still authorizes the widget write");
+  assert.ok(cache.generation() > generation, "scoped presence retired the pre-existing proof");
+
+  present = false;
+  generation = cache.generation();
+  cache.set("RemovedNode", def, { epoch: 0, context, generation });
+  await assert.rejects(
+    () => built.graph_set_widget({ node_id: 213, widget: "mode", value: "refused", workflow_uuid: "u" }),
+    /Cannot set widget|does not provide|refused/i,
+    "a definitive scoped absence refuses the removed class",
+  );
+  assert.ok(cache.generation() > generation, "scoped absence retired the pre-existing proof");
+  assert.equal(
+    cache.get("RemovedNode", { epoch: 0, context, generation: cache.generation() }),
+    undefined,
+    "the absent scoped answer leaves no reusable add proof",
+  );
+});
+
+test("#1709: authoritative empty retires whole cache and snapshot before ordinary timeout refusal", async () => {
+  const widget = { name: "text", type: "text", value: "old" };
+  const node = { id: 212, type: "LoadImage", widgets: [widget] };
+  const oldDefs = { LoadImage: { input: { required: { text: ["STRING", {}] } } } };
+  const objectInfoCache = createObjectInfoCache();
+  const objectInfoSnapshot = createObjectInfoSnapshot();
+  const calls = [];
+  let unavailable = false;
+  let authoritativeEmpty = false;
+  const built = realGraphSetWidget({
+    node,
+    objectInfoCache,
+    objectInfoSnapshot,
+    getNodeDefsImpl: async () => {
+      calls.push("/object_info");
+      if (unavailable) return undefined;
+      return authoritativeEmpty ? {} : oldDefs;
+    },
+    fetchApiImpl: async (route) => {
+      calls.push(route);
+      return unavailable ? { status: 503, json: async () => ({}) } : { status: 200, json: async () => oldDefs };
+    },
+  });
+
+  const first = await built.graph_set_widget({ node_id: 212, widget: "text", value: "new", workflow_uuid: "u" });
+  assert.equal(first.set.value, "new", "the initial live schema authorizes the ordinary write");
+  assert.equal(objectInfoCache.peek().cached, true, "the initial whole payload is in the burst cache");
+  assert.equal(objectInfoSnapshot.peek().held, true, "the initial whole payload is in the last-observed snapshot");
+  assert.ok(
+    objectInfoSnapshot.authorize({
+      epoch: 0,
+      outcomes: [{ kind: TRANSPORT_OUTCOME.NO_ANSWER }],
+    }).defs,
+    "the old snapshot really could authorize during silence before the deny-all answer",
+  );
+
+  authoritativeEmpty = true;
+  const get = realGraphGetObjectInfo({
+    api: built.api,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: built.verifiedNodeDefCache,
+  });
+  const denied = await get({});
+  assert.equal(denied.ok, false, "the live empty whole schema is a deny-all answer");
+  assert.equal(objectInfoCache.peek().cached, false, "authoritative empty retired the old whole payload");
+  assert.equal(objectInfoSnapshot.peek().held, false, "authoritative empty retired old membership proof");
+  assert.equal(
+    objectInfoSnapshot.authorize({
+      epoch: 0,
+      outcomes: [{ kind: TRANSPORT_OUTCOME.NO_ANSWER }],
+    }).defs,
+    null,
+    "the cleared snapshot cannot authorize the removed type during a later outage",
+  );
+
+  authoritativeEmpty = false;
+  unavailable = true;
+  await assert.rejects(
+    () => built.graph_set_widget({ node_id: 212, widget: "text", value: "refused", workflow_uuid: "u" }),
+    /Cannot set widget|object_info is unavailable|refused/i,
+    "the later ordinary timeout path refuses instead of serving old whole-schema state",
+  );
+  assert.equal(widget.value, "new", "the timeout refusal did not write");
+  assert.deepEqual(
+    calls.slice(-2),
+    ["/object_info", "/object_info"],
+    "the later ordinary read reached both live routes after the cache was retired",
+  );
 });
 
 // ---------------------------------------------------------------------------

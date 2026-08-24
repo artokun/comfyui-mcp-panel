@@ -35,6 +35,7 @@ import {
 } from "../../web/js/lib/object-info-oracle.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
 import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 
 const SCHEMA = { KSampler: { input: {} }, H3Keyframes: { input: {} } };
 const silence = [
@@ -42,8 +43,14 @@ const silence = [
   { route: "http", kind: TRANSPORT_OUTCOME.NO_ANSWER },
 ];
 /** The v2 record contract: an epoch captured before the fetch, unchanged since, and a claim. */
-const stored = (snap, defs = SCHEMA, epoch = 3) =>
-  snap.record(defs, { observedAtEpoch: epoch, currentEpoch: epoch, whole: true });
+const stored = (snap, defs = SCHEMA, epoch = 3, generation = 0) =>
+  snap.record(defs, {
+    observedAtEpoch: epoch,
+    currentEpoch: epoch,
+    observedAtGeneration: generation,
+    currentGeneration: generation,
+    whole: true,
+  });
 
 // ---------------------------------------------------------------------------
 // Condition 4: the backend never ANSWERED
@@ -404,7 +411,13 @@ test("#1223 a reconnect DURING the fetch is refused at record time", () => {
   // captured before the request goes out and re-checked when the answer lands.
   const snap = createObjectInfoSnapshot();
   assert.equal(
-    snap.record(SCHEMA, { observedAtEpoch: 3, currentEpoch: 4, whole: true }),
+    snap.record(SCHEMA, {
+      observedAtEpoch: 3,
+      currentEpoch: 4,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
     false,
     "the connection was replaced while this payload was in flight",
   );
@@ -417,16 +430,52 @@ test("#1223 a payload nobody vouched for as WHOLE is refused", () => {
   // type read as absent and the ever-seen gate diagnose the whole install as removed packs.
   // `record` cannot judge wholeness from the value, so it requires the claim.
   const snap = createObjectInfoSnapshot();
-  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1 }), false);
-  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1, whole: false }), false);
-  assert.equal(snap.record(SCHEMA, { observedAtEpoch: 1, currentEpoch: 1, whole: "yes" }), false);
+  assert.equal(
+    snap.record(SCHEMA, {
+      observedAtEpoch: 1,
+      currentEpoch: 1,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+    }),
+    false,
+  );
+  assert.equal(
+    snap.record(SCHEMA, {
+      observedAtEpoch: 1,
+      currentEpoch: 1,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: false,
+    }),
+    false,
+  );
+  assert.equal(
+    snap.record(SCHEMA, {
+      observedAtEpoch: 1,
+      currentEpoch: 1,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: "yes",
+    }),
+    false,
+  );
   assert.equal(snap.peek().held, false);
 });
 
 test("#1223 an unreadable epoch refuses, at record time and at authorize time", () => {
   const snap = createObjectInfoSnapshot();
   for (const bad of [undefined, null, NaN, Infinity, "3"]) {
-    assert.equal(snap.record(SCHEMA, { observedAtEpoch: bad, currentEpoch: bad, whole: true }), false, `record ${String(bad)}`);
+    assert.equal(
+      snap.record(SCHEMA, {
+        observedAtEpoch: bad,
+        currentEpoch: bad,
+        observedAtGeneration: 0,
+        currentGeneration: 0,
+        whole: true,
+      }),
+      false,
+      `record ${String(bad)}`,
+    );
   }
   stored(snap);
   for (const bad of [undefined, null, NaN, Infinity, "3"]) {
@@ -475,7 +524,13 @@ test("#1223 only a payload that could authorize anything is stored", () => {
   // `undefined` silently tested the good schema and the case passed for the wrong reason.
   for (const bad of [null, undefined, {}, [], "schema", 7, [SCHEMA]]) {
     assert.equal(
-      snap.record(bad, { observedAtEpoch: 3, currentEpoch: 3, whole: true }),
+      snap.record(bad, {
+        observedAtEpoch: 3,
+        currentEpoch: 3,
+        observedAtGeneration: 0,
+        currentGeneration: 0,
+        whole: true,
+      }),
       false,
       `${String(bad)} is not a schema`,
     );
@@ -511,6 +566,28 @@ test("#1223 clear() retires it — a suspicion of change outranks a stored schem
   snap.clear();
   assert.equal(snap.authorize({ epoch: 2, socketDown: false, outcomes: silence }).defs, null);
   assert.equal(snap.peek().held, false);
+});
+
+test("#1709 a same-epoch generation retirement rejects a late snapshot writer", () => {
+  const snap = createObjectInfoSnapshot();
+  assert.equal(stored(snap, SCHEMA, 3, 4), true);
+  snap.clear();
+  assert.equal(
+    snap.record(SCHEMA, {
+      observedAtEpoch: 3,
+      currentEpoch: 3,
+      observedAtGeneration: 4,
+      currentGeneration: 5,
+      whole: true,
+    }),
+    false,
+    "same-epoch refresh invalidation still fences the old writer",
+  );
+  assert.equal(
+    snap.authorize({ epoch: 3, generation: 5, socketDown: false, outcomes: silence }).defs,
+    null,
+    "the retired snapshot cannot authorize at the new generation",
+  );
 });
 
 test("#1223 a successful write authorized this way DISCLOSES it", () => {
@@ -575,7 +652,16 @@ function extractSetWidgetOracle() {
  * `epochDuringFetch` lets a test move the connection epoch WHILE the read is in flight —
  * the reconnect-mid-fetch hazard, which cannot be exercised any other way.
  */
-function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epochDuringFetch = null, onFetch = null }) {
+function buildShippedOracle({
+  api,
+  socketDown = false,
+  epoch = 5,
+  snapshot,
+  verifiedNodeDefCache = createVerifiedNodeDefCache(),
+  objectInfoCache = createObjectInfoCache(),
+  epochDuringFetch = null,
+  onFetch = null,
+}) {
   const body = extractSetWidgetOracle();
   const factory = new Function(
     "api",
@@ -583,6 +669,7 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
     "realFetchWholeObjectInfo",
     "CACHE_OUTCOME",
     "objectInfoSnapshot",
+    "verifiedNodeDefCache",
     "initialEpoch",
     "epochDuringFetch",
     "comfyBackendSocketDown",
@@ -643,11 +730,12 @@ function buildShippedOracle({ api, socketDown = false, epoch = 5, snapshot, epoc
   );
   return factory(
     api,
-    createObjectInfoCache(),
+    objectInfoCache,
     fetchWholeObjectInfo,
-    CACHE_OUTCOME,
-    snapshot,
-    epoch,
+     CACHE_OUTCOME,
+     snapshot,
+     verifiedNodeDefCache,
+     epoch,
     epochDuringFetch,
     socketDown,
     objectInfoOracleFailureNote,
@@ -668,6 +756,41 @@ test("#1223 SHIPPED: a live answer is returned and snapshotted", async () => {
   assert.deepEqual(snapshot.peek(), { held: true, epoch: 5 }, "stamped with the connection it was read on");
   assert.equal(o.readNote(), null, "a live authorization discloses nothing, because there is nothing to disclose");
   assert.deepEqual(o.readHistory(), [SCHEMA], "and it IS a real observation, so the ever-seen history takes it");
+});
+
+test("#1709 SHIPPED: authoritative empty retires cache and snapshot, while timeout stays non-authoritative", async () => {
+  let defs = SCHEMA;
+  const api = {
+    getNodeDefs: async () => defs,
+    fetchApi: async () => ({ status: 503, json: async () => ({}) }),
+  };
+  const snapshot = createObjectInfoSnapshot();
+  const cache = createObjectInfoCache();
+  const o = buildShippedOracle({ api, snapshot, objectInfoCache: cache, epoch: 5 });
+
+  assert.deepEqual(await o.getFreshObjectInfo(), SCHEMA, "the initial whole read establishes both old trust roots");
+  assert.equal(cache.peek().cached, true);
+  assert.equal(snapshot.peek().held, true);
+
+  defs = undefined;
+  const timedOut = await o.refetchObjectInfoLive();
+  assert.equal(timedOut, null, "an unavailable forced read has no schema to promote");
+  assert.equal(cache.peek().cached, true, "timeout did not turn a still-valid old cache into an invalidation");
+  assert.equal(snapshot.peek().held, true, "timeout did not turn a still-valid old snapshot into an invalidation");
+
+  defs = {};
+  const denied = await o.refetchObjectInfoLive();
+  assert.equal(denied, null, "authoritative empty remains fail-closed");
+  assert.equal(cache.peek().cached, false, "authoritative empty retired the old whole payload");
+  assert.equal(snapshot.peek().held, false, "authoritative empty retired old membership proof");
+
+  defs = undefined;
+  assert.equal(
+    await o.getFreshObjectInfo(),
+    null,
+    "the later ordinary timeout cannot resurrect the retired schema through cache or snapshot fallback",
+  );
+  assert.match(o.readIneligibility(), /no snapshot|schema/i, "the timeout path remains a refusal without old authority");
 });
 
 test("#1223 SHIPPED: a reconnect DURING the read means the answer is not snapshotted", async () => {
@@ -946,9 +1069,10 @@ function extractExecutor(name) {
 }
 
 function buildExecutor(name, deps) {
-  const names = Object.keys(deps);
+  const runtimeDeps = { verifiedNodeDefCache: createVerifiedNodeDefCache(), ...deps };
+  const names = Object.keys(runtimeDeps);
   const factory = new Function(...names, `const executors = { ${extractExecutor(name)} };\nreturn executors.${name};`);
-  return factory(...names.map((n) => deps[n]));
+  return factory(...names.map((n) => runtimeDeps[n]));
 }
 
 test("#1223 SHIPPED get_object_info: a successful whole read IS filed", async () => {
@@ -1006,6 +1130,28 @@ test("#1223 SHIPPED get_object_info: a FAILED read files nothing", async () => {
   assert.equal(snapshot.peek().held, false);
 });
 
+test("#1709 SHIPPED get_object_info: a same-epoch refresh crossing the read cannot file its snapshot", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const get = buildExecutor("graph_get_object_info", {
+    fetchWholeObjectInfo: async () => {
+      verifiedNodeDefCache.clear();
+      return { defs: SCHEMA, failures: [], outcomes: [] };
+    },
+    objectInfoSnapshot: snapshot,
+    verifiedNodeDefCache,
+    backendReconnectEpoch: 9,
+    api: { getNodeDefs: async () => SCHEMA },
+    pageComfyOrigin: () => "http://127.0.0.1:8188",
+    objectInfoOracleFailureNote: () => "",
+    objectInfoFingerprint: () => "fp",
+    objectInfoUnchanged: () => false,
+  });
+  const res = await get({});
+  assert.equal(res.ok, true, "the read itself still returns its live payload");
+  assert.equal(snapshot.peek().held, false, "the old-generation result was not accepted as snapshot authority");
+});
+
 function buildRemoveWidget({ snapshot, epoch = 4, cache, defs = SCHEMA }) {
   const node = { id: 3, type: "KSampler", comfyClass: "KSampler", widgets: [{ name: "seed" }] };
   return buildExecutor("graph_remove_widget", {
@@ -1061,17 +1207,18 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
   // type read as absent and the ever-seen gate diagnose the install as removed packs.
   assert.match(
     PANEL_SRC,
-    /if \(freshDefs && !freshDefsAreSingleClass && addNodeObservedAtEpoch !== null\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
+    /addNodeObservedAtEpoch !== null[\s\S]*addNodeObservedAtGeneration !== null[\s\S]*objectInfoSnapshot\.record\(/,
     "add_node files its payload only when it fetched the WHOLE schema, and only then",
   );
   for (const site of sites) {
-    const call = PANEL_SRC.slice(site.index, site.index + 260);
+    const call = PANEL_SRC.slice(site.index, site.index + 420);
     assert.match(call, /whole: true/, `the record site at index ${site.index} states the wholeness claim`);
     assert.match(call, /observedAtEpoch/, `the record site at index ${site.index} stamps the issuance epoch`);
+    assert.match(call, /observedAtGeneration/, `the record site at index ${site.index} stamps the schema generation`);
   }
   assert.match(
     PANEL_SRC,
-    /if \(!preloadedDefs\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
+    /if \(!preloadedDefs && refreshResponseIsCurrent\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
     "the refresh run records only a payload it fetched itself — a caller-supplied one is not provably whole",
   );
 });
@@ -1083,7 +1230,14 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
  * MATCHES the pattern, so disabling the startup snapshot left the assertion green. Mutation
  * caught that. A test for whether code RUNS has to run it.
  */
-function buildShippedSeed({ api, epoch = 2, snapshot, epochDuringFetch = null }) {
+function buildShippedSeed({
+  api,
+  epoch = 2,
+  snapshot,
+  verifiedNodeDefCache = createVerifiedNodeDefCache(),
+  epochDuringFetch = null,
+  generationDuringFetch = false,
+}) {
   const start = PANEL_SRC.indexOf("function seedObjectInfoHistory()");
   assert.notEqual(start, -1, "seedObjectInfoHistory not found");
   const open = PANEL_SRC.indexOf("{", start);
@@ -1107,6 +1261,7 @@ function buildShippedSeed({ api, epoch = 2, snapshot, epochDuringFetch = null })
   const factory = new Function(
     "api",
     "objectInfoSnapshot",
+    "verifiedNodeDefCache",
     "initialEpoch",
     "epochDuringFetch",
     "objectInfoHistory",
@@ -1124,17 +1279,23 @@ function buildShippedSeed({ api, epoch = 2, snapshot, epochDuringFetch = null })
        setEpoch: (n) => { backendReconnectEpoch = n; },
      };`,
   );
+  let seedFetchCount = 0;
   const built = factory(
     {
       getNodeDefs: async () => {
         // Move the epoch WHILE the request is outstanding — the reconnect-mid-fetch hazard.
-        if (epochDuringFetch !== null) built.setEpoch(epochDuringFetch);
-        return api.defs;
+        if (epochDuringFetch !== null && seedFetchCount++ === 0) {
+          built.setEpoch(epochDuringFetch);
+          return api.defs;
+        }
+        if (generationDuringFetch) verifiedNodeDefCache.clear();
+        return epochDuringFetch !== null ? null : api.defs;
       },
-    },
-    snapshot,
-    epoch,
-    null,
+     },
+     snapshot,
+     verifiedNodeDefCache,
+     epoch,
+    epochDuringFetch,
     { loseBaseline: () => {} },
   );
   return built;
@@ -1164,8 +1325,24 @@ test("#1223 SHIPPED STARTUP: a reconnect during the seed's fetch is not filed", 
   const snapshot = createObjectInfoSnapshot();
   const seed = buildShippedSeed({ api: { defs: SCHEMA }, epoch: 2, snapshot, epochDuringFetch: 3 });
   await seed.run();
-  assert.equal(seed.wasSeeded(), true, "the history is still seeded — that trust root is separate");
+  assert.equal(seed.wasSeeded(), false, "a replaced connection cannot establish the history baseline");
   assert.equal(snapshot.peek().held, false, "but the payload describes the connection that was replaced");
+});
+
+test("#1709 SHIPPED STARTUP: a same-epoch refresh during the seed's fetch is not filed", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const seed = buildShippedSeed({
+    api: { defs: SCHEMA },
+    epoch: 2,
+    snapshot,
+    verifiedNodeDefCache,
+    generationDuringFetch: true,
+  });
+  await seed.run();
+  assert.equal(seed.wasSeeded(), false, "a generation that changes on every retry keeps the baseline unseeded");
+  assert.deepEqual(seed.readRecorded(), [], "no pre-refresh result was recorded as history");
+  assert.equal(snapshot.peek().held, false, "the pre-refresh whole result was not recorded at the same epoch");
 });
 
 test("#1223 the socket handlers clear the snapshot DIRECTLY, not by way of a refresh", () => {
@@ -1197,6 +1374,18 @@ test("#1223 the disclosure rides on its OWN field, never on `warning`", () => {
     !/warning:[^\n]*snapshotAuthorizationNote/.test(body),
     "the provenance note never competes for the warning slot",
   );
+});
+
+test("#1709 every live whole-schema reader retires cache and snapshot on authoritative empty", () => {
+  for (const name of ["graph_get_object_info", "graph_set_widget", "graph_remove_widget"]) {
+    const start = PANEL_SRC.indexOf(`  async ${name}(`);
+    assert.notEqual(start, -1, `${name} not found`);
+    const next = PANEL_SRC.indexOf("\n  async graph_", start + 1);
+    const handler = PANEL_SRC.slice(start, next === -1 ? PANEL_SRC.length : next);
+    assert.match(handler, /authoritativeEmpty/, `${name} classifies authoritative empty`);
+    assert.match(handler, /objectInfoCache\.invalidate\(\)/, `${name} retires the burst payload`);
+    assert.match(handler, /objectInfoSnapshot\.clear\(\)/, `${name} retires membership proof`);
+  }
 });
 
 test("#1223 no comment cites a symbol that does not exist", () => {

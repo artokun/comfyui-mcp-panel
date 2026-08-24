@@ -65,6 +65,7 @@ import {
   NODE_DEF_REFRESH_REASONS,
 } from "../../web/js/lib/node-def-refresh.js";
 import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -347,7 +348,10 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
     "the shared global stays a strict boolean, and #1193 admits the panel's OWN completed " +
       "combo rebuild as the second way the live lists became current",
   );
-  assert.match(body, /const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;/);
+  assert.match(
+    body,
+    /const runIsCurrent =\s*!comfyBackendSocketDown &&\s*runStartedAtEpoch === backendReconnectEpoch &&\s*runStartedAtGeneration === verifiedNodeDefCache\.generation\(\);/,
+  );
   assert.match(body, /reason: NODE_DEF_REFRESH_REASONS\.REFRESH_SUPERSEDED/);
   // #1193 — the two inputs must stay SEPARATE all the way to the verdict. Merging them
   // into one flag would make an abandoned-but-locally-rebuilt run indistinguishable from
@@ -418,6 +422,7 @@ function buildRegisterComfyNodeDefs({
   socketDown = false,
   // #608 — defaults to the REAL oracle. Overridden only to OBSERVE what it is handed.
   fetchWholeObjectInfo: fetchWholeObjectInfoImpl = fetchWholeObjectInfo,
+  verifiedNodeDefCache = createVerifiedNodeDefCache(),
 }) {
   const body = extractFunction("async function registerComfyNodeDefs(");
   const factory = new Function(
@@ -452,6 +457,7 @@ function buildRegisterComfyNodeDefs({
     // recording is stamped with. Both are module state in the panel, so the extracted
     // body throws ReferenceError without them.
     "objectInfoSnapshot",
+    "verifiedNodeDefCache",
     "initialBackendReconnectEpoch",
     "comfyBackendSocketDown",
     // #1562 — the oracle's per-route OUTCOME vocabulary. The fetch phase reads route 2's
@@ -516,6 +522,7 @@ function buildRegisterComfyNodeDefs({
     // #1223 — a spy, so a test can prove the run retires the last-observed schema and
     // re-records only a payload it fetched itself.
     snapshotSpy,
+    verifiedNodeDefCache,
     7,
     socketDown,
     TRANSPORT_OUTCOME,

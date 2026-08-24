@@ -36,7 +36,8 @@ import {
   assertAddNodeResolvableRefreshing,
   isRegisteredNodeType,
 } from "../../web/js/lib/node-resolve.js";
-import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
+import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
+import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "../../web/js/lib/object-info-oracle.js";
 import {
   describeUnmaterializedRequiredWidgets,
   snapshotBackendDef,
@@ -50,6 +51,9 @@ import {
 } from "./_panel-constants.mjs";
 import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-preview-attach.js";
 import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
+import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
+import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -58,6 +62,11 @@ const addNodeMatch = panelSrc.match(
   /\n {2}async graph_add_node\(\{ class_type, pos, title \}\) \{[\s\S]*?\n {2}\},/,
 );
 assert.ok(addNodeMatch, "could not locate graph_add_node in panel source");
+
+const graphGetMatch = panelSrc.match(
+  /\n  async graph_get_object_info\(\{ if_none_match \} = \{\}\) \{[\s\S]*?\n  \},/,
+);
+assert.ok(graphGetMatch, "could not locate graph_get_object_info in panel source");
 
 const awaitWidgetsMatch = panelSrc.match(
   /\nasync function awaitRequiredCustomWidgetRegistration\([\s\S]*?\n\}/,
@@ -173,6 +182,9 @@ function realGraphAddNode({
   // is the older reconnect that did NOT see NewNode, so this add's own run is what
   // registers it.
   inFlightDefs = undefined,
+  // Hook the refresh boundary used by the production coalescer. Tests use it to model the
+  // same-epoch refresh invalidation that happens before the payload is registered.
+  onRunRegister = null,
   budgetMs = 400,
   reserveMs = 120,
   registrationMs = 200,
@@ -208,6 +220,7 @@ function realGraphAddNode({
       // #1351 — this add's own registration, after any join. Distinct from holdInFlight:
       // that is someone else's run, this is ours.
       if (defs != null && ownRunMs > 0) await sleep(ownRunMs);
+      onRunRegister?.(defs);
       app.registerNodesFromDefs(defs ?? inFlightDefs ?? (await api.getNodeDefs()));
       return true;
     },
@@ -226,6 +239,7 @@ function realGraphAddNode({
     recordObjectInfoTypes: (defs) => defs,
     objectInfoHistory: { wasTypeEverDefined: () => false },
     objectInfoSnapshot: { record: () => true, clear: () => {} },
+    verifiedNodeDefCache: createVerifiedNodeDefCache(),
     backendReconnectEpoch: 0,
     readPackImportFailures: async () => [],
     api,
@@ -240,7 +254,7 @@ function realGraphAddNode({
     unavailableRequiredWidgetMessage,
     snapshotBackendDef,
     isRegisteredNodeType,
-    fetchSingleNodeDef,
+    fetchSingleNodeInfo,
     describeUnmaterializedRequiredWidgets,
     NODE_DEFS_NO_ANSWER,
     WIDEN_SOCKET_PROOF_TIMEOUT_MS,
@@ -287,8 +301,460 @@ function realGraphAddNode({
     comfy: c,
     runs,
     inFlightStarted,
+    verifiedNodeDefCache: deps.verifiedNodeDefCache,
+    verifiedSchemaContext: context,
   };
 }
+
+function realGraphGetObjectInfo({
+  api,
+  verifiedNodeDefCache,
+  objectInfoCache = createObjectInfoCache(),
+  objectInfoSnapshot = { record: () => true, clear: () => {} },
+}) {
+  const names = [
+    "api",
+    "backendReconnectEpoch",
+    "fetchWholeObjectInfo",
+    "objectInfoCache",
+    "verifiedNodeDefCache",
+    "objectInfoSnapshot",
+    "pageComfyOrigin",
+    "objectInfoOracleFailureNote",
+    "objectInfoFingerprint",
+    "objectInfoUnchanged",
+  ];
+  const factory = new Function(
+    ...names,
+    `const executors = {${graphGetMatch[0]}};
+     return executors.graph_get_object_info;`,
+  );
+  return factory(
+    api,
+    0,
+    fetchWholeObjectInfo,
+    objectInfoCache,
+    verifiedNodeDefCache,
+    objectInfoSnapshot,
+    () => "http://127.0.0.1:8188",
+    objectInfoOracleFailureNote,
+    () => "fp",
+    () => false,
+  );
+}
+
+test("#1709: cached reuse still probes authority and refuses after backend removal", async () => {
+  const comfy = makeComfy();
+  const defs = backendObjectInfo();
+  // The class is already registered, matching the reported repeated-add path and keeping
+  // the first verification on the single-class route.
+  comfy.app.registerNodesFromDefs(defs);
+  const calls = [];
+  let unavailable = false;
+  let removed = false;
+  const api = {
+    async fetchApi(route) {
+      calls.push(route);
+      if (unavailable) return { status: 503, json: async () => ({}) };
+      if (removed) return { status: 503, json: async () => ({}) };
+      const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+      return {
+        status: 200,
+        json: async () =>
+          Object.prototype.hasOwnProperty.call(defs, classType) ? { [classType]: defs[classType] } : {},
+      };
+    },
+    async getNodeDefs() {
+      calls.push("/object_info");
+      if (removed) return {};
+      return NODE_DEFS_NO_ANSWER;
+    },
+  };
+  const built = realGraphAddNode({
+    comfy,
+    overrides: { api, objectInfoHistory: { wasTypeEverDefined: () => true } },
+  });
+
+  const first = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(first.added.type, "ExistingNode");
+  unavailable = true;
+
+  const second = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(second.added.type, "ExistingNode");
+  assert.equal(comfy.graph._nodes.length, 2);
+  assert.deepEqual(
+    calls,
+    ["/object_info/ExistingNode", "/object_info/ExistingNode", "/object_info"],
+    "the second add used the verified proof only after both live routes timed out",
+  );
+
+  unavailable = false;
+  removed = true;
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "ExistingNode" }),
+    /ABSENT from the current \/object_info|since-removed/i,
+    "an authoritative whole-schema absence cannot be bypassed by the cached proof",
+  );
+  assert.equal(comfy.graph._nodes.length, 2, "the removed backend type was not added again");
+
+  removed = false;
+  const restored = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(restored.added.type, "ExistingNode", "a fresh authoritative re-add still works");
+  assert.equal(comfy.graph._nodes.length, 3);
+});
+
+test("#1709: an overlapping authoritative absence fences a late cached-proof write", async () => {
+  const comfy = makeComfy();
+  const defs = {
+    ...backendObjectInfo(),
+    ExistingNode: {
+      name: "ExistingNode",
+      input: { required: { mode: ["RACE_WIDGET", { default: "ready" }] } },
+      output: ["IMAGE"],
+    },
+  };
+  const customWidget = (node, name, spec) => {
+    const widget = {
+      name,
+      type: "custom",
+      value: spec?.[1]?.default ?? "ready",
+      options: { serialize: true },
+    };
+    node.widgets.push(widget);
+    return { widget };
+  };
+  comfy.widgets.RACE_WIDGET = customWidget;
+  comfy.app.registerNodesFromDefs(defs);
+
+  const calls = [];
+  let unavailable = false;
+  let removed = false;
+  const api = {
+    async fetchApi(route) {
+      calls.push(route);
+      if (unavailable || removed) return { status: 503, json: async () => ({}) };
+      const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+      return {
+        status: 200,
+        json: async () =>
+          Object.prototype.hasOwnProperty.call(defs, classType) ? { [classType]: defs[classType] } : {},
+      };
+    },
+    async getNodeDefs() {
+      calls.push("/object_info");
+      return removed ? {} : NODE_DEFS_NO_ANSWER;
+    },
+  };
+  const built = realGraphAddNode({
+    comfy,
+    overrides: { api, objectInfoHistory: { wasTypeEverDefined: () => true } },
+  });
+
+  const initial = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(initial.added.type, "ExistingNode");
+  delete comfy.widgets.RACE_WIDGET;
+
+  // The real shipped awaitRequiredCustomWidgetRegistration supplies the async pause after
+  // the cached proof has been accepted. Its production widget registry is proxied only to
+  // observe that the first add reached that wait; the actual constructor is restored below.
+  const customWidgetWait = deferred();
+  let waitObserved = false;
+  const widgetRegistry = comfy.app.widgets;
+  comfy.app.widgets = new Proxy(widgetRegistry, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === "RACE_WIDGET" && typeof value !== "function" && !waitObserved) {
+        waitObserved = true;
+        customWidgetWait.resolve();
+      }
+      return value;
+    },
+  });
+
+  unavailable = true;
+  const overlappingAdd = built.graph_add_node({ class_type: "ExistingNode" });
+  await customWidgetWait.promise;
+
+  removed = true;
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "ExistingNode" }),
+    /ABSENT from the current \/object_info|since-removed/i,
+    "the overlapping command observes authoritative removal and invalidates proof",
+  );
+  const invalidatedGeneration = built.verifiedNodeDefCache.generation();
+  assert.equal(
+    built.verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: invalidatedGeneration,
+    }),
+    undefined,
+    "authoritative absence removed the pre-existing proof before the first add resumed",
+  );
+
+  comfy.widgets.RACE_WIDGET = customWidget;
+  const resumed = await overlappingAdd;
+  assert.equal(resumed.added.type, "ExistingNode");
+  assert.equal(comfy.graph._nodes.length, 2, "the paused add completed once");
+  assert.equal(
+    built.verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: invalidatedGeneration,
+    }),
+    undefined,
+    "the paused add could not resurrect proof with its pre-invalidation generation",
+  );
+
+  unavailable = true;
+  removed = false;
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "ExistingNode" }),
+    /cannot verify node type|object_info is unavailable|Refusing to add/i,
+    "a later silent add fails closed instead of reusing the stale proof",
+  );
+  assert.equal(comfy.graph._nodes.length, 2, "the later silent add did not mutate the graph");
+  assert.deepEqual(
+    calls,
+    [
+      "/object_info/ExistingNode",
+      "/object_info/ExistingNode",
+      "/object_info",
+      "/object_info",
+      "/object_info/ExistingNode",
+      "/object_info",
+      "/object_info/ExistingNode",
+      "/object_info",
+    ],
+    "the later add still probes both live routes after the fenced write",
+  );
+});
+
+test("#1709: an authoritative empty whole read retires cached proof before timeout fallback", async () => {
+  const comfy = makeComfy();
+  const defs = backendObjectInfo();
+  comfy.app.registerNodesFromDefs(defs);
+  const calls = [];
+  let removed = false;
+  let unavailable = false;
+  const api = {
+    async getNodeDefs() {
+      calls.push("/object_info");
+      if (unavailable) return NODE_DEFS_NO_ANSWER;
+      if (removed) return {};
+      return defs;
+    },
+    async fetchApi(route) {
+      calls.push(route);
+      if (unavailable || removed) return { status: 503, json: async () => ({}) };
+      const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+      return { status: 200, json: async () => ({ [classType]: defs[classType] }) };
+    },
+  };
+  const built = realGraphAddNode({
+    comfy,
+    overrides: { api, objectInfoHistory: { wasTypeEverDefined: () => true } },
+  });
+  const first = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(first.added.type, "ExistingNode");
+  const beforeGeneration = built.verifiedNodeDefCache.generation();
+  assert.ok(
+    built.verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: beforeGeneration,
+    }),
+    "the first production add established reusable proof",
+  );
+
+  removed = true;
+  const getObjectInfo = realGraphGetObjectInfo({
+    api,
+    verifiedNodeDefCache: built.verifiedNodeDefCache,
+    objectInfoCache: createObjectInfoCache(),
+  });
+  const denied = await getObjectInfo({});
+  assert.equal(denied.ok, false, "the authoritative empty whole schema still refuses");
+  const afterGeneration = built.verifiedNodeDefCache.generation();
+  assert.ok(afterGeneration > beforeGeneration, "the live deny-all answer advanced the cache fence");
+  assert.equal(
+    built.verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: afterGeneration,
+    }),
+    undefined,
+    "the authoritative empty whole read retired the cached proof",
+  );
+
+  removed = false;
+  unavailable = true;
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "ExistingNode" }),
+    /cannot verify node type|object_info is unavailable|Refusing to add/i,
+    "a later timeout cannot fall back to proof retired by the empty answer",
+  );
+  assert.equal(comfy.graph._nodes.length, 1, "the refused timeout fallback did not add a node");
+  assert.deepEqual(
+    calls,
+    ["/object_info/ExistingNode", "/object_info", "/object_info/ExistingNode", "/object_info"],
+    "the later add reached both live probes rather than bypassing them",
+  );
+});
+
+test("#1709: a direct schema response crossing refresh cannot authorize a later timeout fallback", async () => {
+  const comfy = makeComfy();
+  const defs = backendObjectInfo();
+  comfy.app.registerNodesFromDefs(defs);
+  const snapshot = createObjectInfoSnapshot();
+  assert.equal(
+    snapshot.record(defs, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
+    true,
+    "the pre-refresh production state has an old whole-schema snapshot",
+  );
+
+  const directStarted = deferred();
+  const oldDirectResponse = deferred();
+  let holdDirect = false;
+  const calls = [];
+  const api = {
+    async fetchApi(route) {
+      calls.push(route);
+      if (route === "/object_info/ExistingNode" && holdDirect) {
+        directStarted.resolve();
+        await oldDirectResponse.promise;
+      }
+      const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+      return {
+        status: 200,
+        json: async () =>
+          Object.prototype.hasOwnProperty.call(defs, classType) ? { [classType]: defs[classType] } : {},
+      };
+    },
+    async getNodeDefs() {
+      calls.push("/object_info");
+      return NODE_DEFS_NO_ANSWER;
+    },
+  };
+  const built = realGraphAddNode({
+    comfy,
+    overrides: {
+      api,
+      objectInfoSnapshot: snapshot,
+      objectInfoHistory: { wasTypeEverDefined: () => true },
+    },
+  });
+
+  const initial = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(initial.added.type, "ExistingNode");
+  const beforeRefreshGeneration = built.verifiedNodeDefCache.generation();
+  assert.ok(
+    built.verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: beforeRefreshGeneration,
+    }),
+    "the initial add established the reusable proof",
+  );
+
+  holdDirect = true;
+  const pendingAdd = built.graph_add_node({ class_type: "ExistingNode" });
+  await directStarted.promise;
+
+  // This is the same state transition registerComfyNodeDefs performs at refresh start:
+  // old whole-schema membership and verified per-class proof are both retired before the
+  // refresh fetch is allowed to establish new authority.
+  snapshot.clear();
+  built.verifiedNodeDefCache.clear();
+  const afterRefreshGeneration = built.verifiedNodeDefCache.generation();
+  assert.ok(afterRefreshGeneration > beforeRefreshGeneration);
+
+  oldDirectResponse.resolve();
+  await assert.rejects(
+    () => pendingAdd,
+    /cannot verify node type|object_info is unavailable|Refusing to add/i,
+    "the old direct response cannot authorize after refresh; the timeout fallback refuses",
+  );
+  assert.equal(comfy.graph._nodes.length, 1, "the stale response did not mutate the graph");
+  assert.equal(snapshot.peek().held, false, "the old whole-schema snapshot stayed retired");
+  assert.equal(
+    built.verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: afterRefreshGeneration,
+    }),
+    undefined,
+    "the old direct response did not repopulate verified proof",
+  );
+  assert.deepEqual(
+    calls,
+    ["/object_info/ExistingNode", "/object_info/ExistingNode", "/object_info"],
+    "the stale direct response was discarded and the add reached the timeout fallback",
+  );
+});
+
+test("#1709: a same-epoch refresh fences graph_add_node's late whole-schema snapshot write", async () => {
+  const comfy = makeComfy();
+  const defs = backendObjectInfo();
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  assert.equal(
+    snapshot.record(defs, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
+    true,
+    "the pre-refresh state starts with a whole-schema snapshot",
+  );
+  let unavailable = false;
+  const api = {
+    async getNodeDefs() {
+      return unavailable ? NODE_DEFS_NO_ANSWER : defs;
+    },
+    async fetchApi(route) {
+      if (unavailable) return { status: 503, json: async () => ({}) };
+      const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+      return { status: 200, json: async () => ({ [classType]: defs[classType] }) };
+    },
+  };
+  const built = realGraphAddNode({
+    comfy,
+    onRunRegister: (refreshDefs) => {
+      if (refreshDefs != null) {
+        // registerComfyNodeDefs performs this transition before registration. Keep the
+        // backend epoch unchanged: this is precisely the same-epoch race under review.
+        snapshot.clear();
+        verifiedNodeDefCache.clear();
+      }
+    },
+    overrides: {
+      api,
+      objectInfoSnapshot: snapshot,
+      verifiedNodeDefCache,
+    },
+  });
+
+  const first = await built.graph_add_node({ class_type: "NewNode" });
+  assert.equal(first.added.type, "NewNode", "the refresh still registers and adds the requested class");
+  assert.equal(snapshot.peek().held, false, "the pre-refresh whole result was not filed after refresh cleared it");
+
+  unavailable = true;
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "NewNode" }),
+    /cannot verify node type|object_info is unavailable|Refusing to add/i,
+    "a later silent add refuses because the fenced snapshot supplied no stale fallback",
+  );
+  assert.equal(comfy.graph._nodes.length, 1, "the later timeout did not add through old snapshot authority");
+});
 
 // ---------------------------------------------------------------------------
 // 1. The reported composition: the join alone would exhaust the command.

@@ -30,7 +30,7 @@
 // THE HARNESS: these tests run the SHIPPED `graph_add_node` body, extracted from the panel
 // source and given injected collaborators — the same technique as
 // add-node-upload-widget.test.mjs. A helper-only test could not have caught this: both
-// `registeredSocketTypes` and `fetchSingleNodeDef` are individually correct. The defect is
+// `registeredSocketTypes` and `fetchSingleNodeInfo` are individually correct. The defect is
 // entirely in which payload the CALL SITE hands to which question.
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -50,7 +50,7 @@ import {
   assertAddNodeResolvableRefreshing,
   isRegisteredNodeType,
 } from "../../web/js/lib/node-resolve.js";
-import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
+import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
 import {
   describeUnmaterializedRequiredWidgets,
   snapshotBackendDef,
@@ -310,7 +310,7 @@ function realGraphAddNode(comfy, overrides = {}) {
     unavailableRequiredWidgetMessage,
     snapshotBackendDef,
     isRegisteredNodeType,
-    fetchSingleNodeDef,
+    fetchSingleNodeInfo,
     describeUnmaterializedRequiredWidgets,
     // #1180 — the panel's bounded `api.getNodeDefs()` and its timeout sentinel. Both are
     // module-scope in the real file; this harness rebuilds `graph_add_node` in a synthetic

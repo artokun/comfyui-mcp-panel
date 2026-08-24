@@ -53,7 +53,13 @@
  *      refresh path to do it. Provenance, not freshness — a snapshot from a replaced
  *      process is refused outright rather than aged out, so there is no time bound to get
  *      wrong.
- *   4. THE BACKEND NEVER ANSWERED, not merely "the fetch failed". Only outcomes that leave
+ *   4. NO SAME-CONNECTION INVALIDATION SINCE — `verifiedNodeDefCache` advances its
+ *      generation when a refresh/install/download retires schema proof without a reconnect.
+ *      A whole response issued before that event must not be filed under the unchanged epoch,
+ *      or the snapshot fallback would resurrect the pre-refresh type set during the next
+ *      timeout. `record` therefore takes the generation captured before the request and the
+ *      generation at delivery, just as it takes the two epoch values.
+ *   5. THE BACKEND NEVER ANSWERED, not merely "the fetch failed". Only outcomes that leave
  *      the question unanswered license the snapshot: a timeout, a client that returned
  *      NOTHING, a proxy's gateway error (which is the proxy reporting the same silence over
  *      HTTP). Anything that ANSWERED — threw, a non-gateway status, an empty schema, a body
@@ -134,6 +140,7 @@ export function noBackendAnswerEstablished(outcomes) {
 export function createObjectInfoSnapshot() {
   let defs = null;
   let epoch = null;
+  let generation = null;
   // #1582 — have the live whole-map routes already gone silent on THIS connection,
   // after a snapshot was held? The first silent call still has to probe: that is how
   // an answered error keeps refusing, and how a healthy backend still wins. Once
@@ -145,10 +152,10 @@ export function createObjectInfoSnapshot() {
 
   return {
     /**
-     * Store the type membership of a whole map that was OBSERVED at `observedAtEpoch`, if
-     * that is still the epoch we are on.
+     * Store the type membership of a whole map that was OBSERVED at `observedAtEpoch` and
+     * `observedAtGeneration`, if those are still the epoch and schema generation we are on.
      *
-     * THREE THINGS THIS REFUSES, each from a defect found in review:
+     * FOUR THINGS THIS REFUSES, each from a defect found in review:
      *
      * 1. AN EPOCH READ AFTER THE FETCH. `observedAtEpoch` must be captured BEFORE the
      *    request is issued, and is only stored if `currentEpoch` still matches. The first
@@ -166,7 +173,10 @@ export function createObjectInfoSnapshot() {
      *    that payload CAN reach the refresh path (`assertAddNodeResolvableRefreshing`
      *    re-reads the registry across an await and may hand its single-class defs to
      *    `refresh`). The flag makes each call site state the claim rather than imply it.
-     * 3. ANYTHING THAT COULD NOT AUTHORIZE A WRITE ANYWAY — null, empty, an array, a
+     * 3. A RESPONSE THAT SPANNED A SAME-EPOCH INVALIDATION. The verified node-definition
+     *    cache generation is the panel's schema invalidation fence; epoch equality alone is
+     *    insufficient when refresh_nodes clears proof on the same backend connection.
+     * 4. ANYTHING THAT COULD NOT AUTHORIZE A WRITE ANYWAY — null, empty, an array, a
      *    non-object, or an unreadable shape.
      *
      * WHAT IS STORED IS A DETACHED MAP OF TYPE NAMES, never the payload. `registerNodesFromDefs`
@@ -178,10 +188,21 @@ export function createObjectInfoSnapshot() {
      * ~5.4MB schema from being pinned in memory for the life of a connection, and it means
      * the values cannot supply stale combo option lists to anything downstream.
      */
-    record(candidate, { observedAtEpoch, currentEpoch, whole = false } = {}) {
+    record(
+      candidate,
+      {
+        observedAtEpoch,
+        currentEpoch,
+        observedAtGeneration,
+        currentGeneration,
+        whole = false,
+      } = {},
+    ) {
       if (whole !== true) return false;
       if (!Number.isFinite(observedAtEpoch) || !Number.isFinite(currentEpoch)) return false;
       if (observedAtEpoch !== currentEpoch) return false;
+      if (!Number.isFinite(observedAtGeneration) || !Number.isFinite(currentGeneration)) return false;
+      if (observedAtGeneration !== currentGeneration) return false;
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
       let keys;
       try {
@@ -208,6 +229,7 @@ export function createObjectInfoSnapshot() {
       // not a hole in the suite, and it is recorded here so the next run does not re-chase
       // it. `currentEpoch` is written because it is the one `authorize` compares against.
       epoch = currentEpoch;
+      generation = currentGeneration;
       // A live observation means the whole-map routes answered. The next widget write
       // must be allowed to prefer that live path rather than inheriting a prior silence.
       probesSilent = false;
@@ -226,7 +248,19 @@ export function createObjectInfoSnapshot() {
      * `shouldSkipProbe` has already recorded that silence on this connection (#1582), so
      * a later write can reuse the held map without minting fake outcomes.
      */
-    authorize({ epoch: currentEpoch, socketDown, outcomes, requireSilence = true } = {}) {
+    authorize(options = {}) {
+      const {
+        epoch: currentEpoch,
+        socketDown,
+        outcomes,
+        requireSilence = true,
+      } = options;
+      // The default keeps standalone snapshot callers source-compatible; every shipped
+      // panel caller passes the live generation explicitly. A caller with no generation
+      // authority must not be able to choose a different generation by omission.
+      const currentGeneration = Object.prototype.hasOwnProperty.call(options, "generation")
+        ? options.generation
+        : generation;
       if (requireSilence !== false && !noBackendAnswerEstablished(outcomes)) {
         return {
           defs: null,
@@ -257,6 +291,14 @@ export function createObjectInfoSnapshot() {
             "ComfyUI process that has been replaced",
         };
       }
+      if (!Number.isFinite(currentGeneration) || currentGeneration !== generation) {
+        return {
+          defs: null,
+          reason:
+            "the node-definition schema was refreshed since that whole map was observed, " +
+            "so the last-observed snapshot is no longer authority",
+        };
+      }
       return { defs, reason: "" };
     },
 
@@ -270,12 +312,18 @@ export function createObjectInfoSnapshot() {
      * The same socket/epoch fence is used so a reconnect cannot inherit the shorter budget
      * or the skip.
      */
-    isReusable({ epoch: currentEpoch, socketDown } = {}) {
+    isReusable(options = {}) {
+      const { epoch: currentEpoch, socketDown } = options;
+      const currentGeneration = Object.prototype.hasOwnProperty.call(options, "generation")
+        ? options.generation
+        : generation;
       return (
         defs !== null &&
         !socketDown &&
         Number.isFinite(currentEpoch) &&
-        currentEpoch === epoch
+        currentEpoch === epoch &&
+        Number.isFinite(currentGeneration) &&
+        currentGeneration === generation
       );
     },
 
@@ -295,14 +343,20 @@ export function createObjectInfoSnapshot() {
      * call still probes so an answered error can refuse; a reconnect, a down socket, or a
      * later live `record` all return false.
      */
-    shouldSkipProbe({ epoch: currentEpoch, socketDown } = {}) {
-      return probesSilent === true && this.isReusable({ epoch: currentEpoch, socketDown });
+    shouldSkipProbe(options = {}) {
+      const { epoch: currentEpoch, socketDown } = options;
+      const reusableOptions = { epoch: currentEpoch, socketDown };
+      if (Object.prototype.hasOwnProperty.call(options, "generation")) {
+        reusableOptions.generation = options.generation;
+      }
+      return probesSilent === true && this.isReusable(reusableOptions);
     },
 
     /** Drop it — for anything that knows, or merely suspects, the schema moved. */
     clear() {
       defs = null;
       epoch = null;
+      generation = null;
       probesSilent = false;
     },
 

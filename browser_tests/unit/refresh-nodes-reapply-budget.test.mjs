@@ -19,6 +19,7 @@ import {
   resolveMissingModelDirectory,
 } from "../../web/js/lib/asset-staleness.js";
 import { withoutFrontendVirtualTypes } from "../../web/js/lib/frontend-virtual-nodes.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 
 const SRC = readFileSync(fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
 
@@ -61,7 +62,7 @@ function buildRun({ appValue, apiValue, withTimeoutImpl = withTimeout, runBudget
     "describeNodeDefRefresh", "NODE_DEF_REFRESH_REASONS", "fetchNodeDefsWithRetry", "withTimeout", "NODE_DEFS_NO_ANSWER",
     "COMBO_OK", "COMBO_NO_ANSWER", "NODE_DEFS_FETCH_TIMEOUT_MS", "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE", "fetchWholeObjectInfo", "nodeDefsBudgetLeft", "monotonicNow",
-    "NODE_DEFS_RETRY_DELAYS_MS", "objectInfoCache", "objectInfoSnapshot", "backendReconnectEpoch",
+    "NODE_DEFS_RETRY_DELAYS_MS", "objectInfoCache", "objectInfoSnapshot", "verifiedNodeDefCache", "backendReconnectEpoch",
     "comfyBackendSocketDown",
     "TRANSPORT_OUTCOME",
   ];
@@ -83,6 +84,7 @@ function buildRun({ appValue, apiValue, withTimeoutImpl = withTimeout, runBudget
     NODE_DEFS_RETRY_DELAYS_MS: OBJECT_INFO_RETRY_DELAYS_MS,
     objectInfoCache: cacheSpy,
     objectInfoSnapshot: snapshotSpy,
+    verifiedNodeDefCache: createVerifiedNodeDefCache(),
     backendReconnectEpoch: 7,
     comfyBackendSocketDown: false,
     TRANSPORT_OUTCOME,

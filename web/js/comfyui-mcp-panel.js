@@ -198,7 +198,8 @@ import {
   resolveMissingModelDirectory,
 } from "./lib/asset-staleness.js";
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
-import { fetchSingleNodeDef, fetchSingleNodeInfo } from "./lib/single-node-def.js";
+import { fetchSingleNodeInfo } from "./lib/single-node-def.js";
+import { createVerifiedNodeDefCache } from "./lib/verified-node-def-cache.js";
 import { withWorkflowUuid } from "./lib/graph-view-identity.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
@@ -1281,6 +1282,10 @@ const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
 const markObjectInfoHistorySeeded = () => objectInfoHistory.markSeeded();
 // #716 — one /object_info per BURST of widget writes, instead of one per write.
 const objectInfoCache = createObjectInfoCache();
+// #1709 — a successful add proves this class definition for the current backend and graph
+// binding. Reuse only that detached class snapshot; whole /object_info remains the authority
+// for every class not already verified in this exact session/workflow instance.
+const verifiedNodeDefCache = createVerifiedNodeDefCache();
 // #1223 — the last WHOLE /object_info observed on the CURRENT backend connection, so a
 // widget edit is not refused merely because the schema probe went silent while ComfyUI was
 // busy rendering. Consulted only AFTER the oracle has failed, and only under the four
@@ -1311,15 +1316,21 @@ function seedObjectInfoHistory() {
           // — the first widget edit lands while ComfyUI is rendering and both probes time
           // out — found no snapshot and was refused exactly as before the fix.
           const observedAtEpoch = backendReconnectEpoch;
+          const observedAtGeneration = verifiedNodeDefCache.generation();
           const defs = await api.getNodeDefs();
           if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
+            const currentEpoch = backendReconnectEpoch;
+            const currentGeneration = verifiedNodeDefCache.generation();
+            if (currentEpoch !== observedAtEpoch || currentGeneration !== observedAtGeneration) continue;
             recordObjectInfoTypes(defs);
             // A whole payload, and this is the only reader of it — nothing registers these
             // defs, so no beforeRegisterNodeDef hook can have mutated them yet. `record`
             // still copies out the type names rather than trusting that.
             objectInfoSnapshot.record(defs, {
               observedAtEpoch,
-              currentEpoch: backendReconnectEpoch,
+              currentEpoch,
+              observedAtGeneration,
+              currentGeneration,
               whole: true,
             });
             markObjectInfoHistorySeeded();
@@ -1442,10 +1453,12 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // not to. Re-recorded below if this run's fetch succeeds, so the cost of being wrong here
   // is one refused write during an outage, not a stale authorization.
   objectInfoSnapshot.clear();
+  if (typeof verifiedNodeDefCache !== "undefined") verifiedNodeDefCache.clear();
   // #1223 — the epoch this run STARTED on, captured before any fetch. The recording below
   // is refused if a reconnect lands while the fetch is in flight, so a pre-restart schema
   // can never be filed under post-restart provenance.
   const runStartedAtEpoch = backendReconnectEpoch;
+  const runStartedAtGeneration = verifiedNodeDefCache.generation();
   // A refresh is not authoritative while any of its frontend mutation work is still
   // outstanding. Consumers such as collectMissingAssets must fail closed during that
   // window, even if an earlier run had established trust.
@@ -1837,10 +1850,15 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     // await and can pass its SINGLE-CLASS defs to refresh(), and a one-type map recorded
     // here would make every other type read as absent — the ever-seen gate would then
     // report the entire install as removed packs.
-    if (!preloadedDefs) {
+    const refreshResponseIsCurrent =
+      runStartedAtEpoch === backendReconnectEpoch &&
+      runStartedAtGeneration === verifiedNodeDefCache.generation();
+    if (!preloadedDefs && refreshResponseIsCurrent) {
       objectInfoSnapshot.record(defs, {
         observedAtEpoch: runStartedAtEpoch,
-        currentEpoch: backendReconnectEpoch,
+        currentEpoch: runStartedAtEpoch,
+        observedAtGeneration: runStartedAtGeneration,
+        currentGeneration: runStartedAtGeneration,
         whole: true,
       });
     }
@@ -2018,7 +2036,10 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
               console.warn("[comfyui-mcp-panel] late combo refresh did not complete:", thrown);
             }
             comboCompletionPending = false;
-            const currentRun = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
+            const currentRun =
+              !comfyBackendSocketDown &&
+              runStartedAtEpoch === backendReconnectEpoch &&
+              runStartedAtGeneration === verifiedNodeDefCache.generation();
             nodeDefsRefreshConfirmed =
               currentRun && !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
             const lateVerdict = buildRefreshVerdict?.();
@@ -2140,7 +2161,10 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     // own phases completed. It may have fetched the pre-restart registry, and its promise can
     // still be the one a bounded acknowledgement is joining. Do not let that old run re-open
     // combo trust while the post-reconnect successor is pending.
-    const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
+    const runIsCurrent =
+      !comfyBackendSocketDown &&
+      runStartedAtEpoch === backendReconnectEpoch &&
+      runStartedAtGeneration === verifiedNodeDefCache.generation();
     nodeDefsRefreshConfirmed =
       runIsCurrent && !comboCompletionPending && !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
   }
@@ -2151,7 +2175,10 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
   buildRefreshVerdict = () => {
-    const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
+    const runIsCurrent =
+      !comfyBackendSocketDown &&
+      runStartedAtEpoch === backendReconnectEpoch &&
+      runStartedAtGeneration === verifiedNodeDefCache.generation();
     return runIsCurrent
     ? describeNodeDefRefresh({
         appAvailable,
@@ -2397,6 +2424,7 @@ function setupListeners() {
       comfyBackendSocketDown = true;
       comfyBackendOutage.noteDown(landedHelloCount); // #654 — open the outage clock on the FIRST down signal.
       objectInfoSnapshot.clear(); // #1223 — see condition 3 in lib/object-info-snapshot.js.
+      verifiedNodeDefCache.clear(); // #1709 — the old backend cannot vouch for a cached class.
     });
     api.addEventListener("status", (ev) => {
       // A null status payload is ComfyUI's "backend connection lost" signal.
@@ -2421,6 +2449,7 @@ function setupListeners() {
         // too or the restart measures as no outage at all.
         comfyBackendOutage.noteDown(landedHelloCount);
         objectInfoSnapshot.clear(); // #1223 — same reasoning as `reconnecting`.
+        verifiedNodeDefCache.clear(); // #1709 — the old backend cannot vouch for a cached class.
       }
     });
     // ComfyUI's own socket to its backend re-establishing is the reliable
@@ -2436,6 +2465,7 @@ function setupListeners() {
       // new window (codex P1); only an open/new AFTER this reconnect will.
       backendReconnectEpoch += 1;
       backendReconnectedAt = monotonicNow();
+      verifiedNodeDefCache.clear(); // #1709 — require a post-reconnect verification.
       // #605: this reconnect can be a backend RESTART that swapped the Manager
       // generation (3.x ↔ pip v4) under the live tab — the cached dialect then
       // describes a server that is gone. Drop it so the next Manager call
@@ -12114,7 +12144,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // through the burst cache, so every success here is a first-hand observation of the
     // connection it was issued on, and there is no cache hit to exclude.
     const observedAtEpoch = backendReconnectEpoch;
-    const { defs, failures } = await fetchWholeObjectInfo({
+    const observedAtGeneration = verifiedNodeDefCache.generation();
+    const { defs, authoritativeEmpty, failures } = await fetchWholeObjectInfo({
       getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
       fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
     });
@@ -12122,10 +12153,29 @@ const GRAPH_TOOL_EXECUTORS = {
     // floor leaves the next render-time widget edit refused for want of the very map this
     // command just read. Recorded BEFORE the fingerprint/if_none_match early-returns below,
     // so a caller polling with `if_none_match` still keeps the snapshot fed.
-    if (defs) {
+    const epochIsCurrent = backendReconnectEpoch === observedAtEpoch;
+    const generationIsCurrent = verifiedNodeDefCache.generation() === observedAtGeneration;
+    const responseIsCurrent = epochIsCurrent && generationIsCurrent;
+    if ((defs || authoritativeEmpty) && responseIsCurrent) {
+      if (authoritativeEmpty) {
+        // An empty whole response is an authoritative deny-all answer. The burst cache and
+        // last-observed snapshot are separate trust roots from the per-class proof cache, so
+        // retire them too; otherwise a later ordinary read or silent fallback can resurrect
+        // a definition this live answer just proved absent.
+        objectInfoCache.invalidate();
+        objectInfoSnapshot.clear();
+      }
+      if (typeof verifiedNodeDefCache !== "undefined") {
+        verifiedNodeDefCache.clear(); // #1709 — this whole live observation may contain changed or absent classes.
+      }
+    }
+    if (defs && responseIsCurrent) {
+      const currentGeneration = verifiedNodeDefCache.generation();
       objectInfoSnapshot.record(defs, {
         observedAtEpoch,
         currentEpoch: backendReconnectEpoch,
+        observedAtGeneration: currentGeneration,
+        currentGeneration,
         whole: true,
       });
     }
@@ -13598,9 +13648,21 @@ const GRAPH_TOOL_EXECUTORS = {
     // below say WHICH step ran out — the property the whole issue is about, since the
     // alternative was a bare "tab did not reply" that names nothing.
     const budget = makeCommandBudget(ADD_NODE_COMMAND_BUDGET_MS, monotonicNow);
+    // #1709 — the cache is scoped to the exact binding captured before this command's
+    // preflight. A generation fence also makes a proof captured here ineligible for a
+    // late cache write if another overlapping command invalidates the schema meanwhile.
+    const verifiedSchemaContext = capturedContext;
+    const verifiedSchemaStartGeneration = verifiedNodeDefCache.generation();
+    const verifiedSchemaStartEpoch = backendReconnectEpoch;
+    let verifiedSchemaWriteGeneration = null;
+    let verifiedSchemaWriteEpoch = null;
+    const schemaProbeIsCurrent = (issued) =>
+      issued.generation === verifiedNodeDefCache.generation() &&
+      issued.epoch === backendReconnectEpoch;
     // Resolve BEFORE creating so an unresolved type can never be added as a
     // fabricated placeholder (#458). The go/no-go is decided against the CURRENT
-    // backend /object_info (fetched fresh) — NOT the LiteGraph registry, which
+    // backend /object_info, or a class definition already verified for this exact binding
+    // (#1709) — NOT the LiteGraph registry, which
     // keeps STALE POSITIVES for uninstalled packs (#458/P1-C) and MISSES freshly-
     // installed ones (#289). When the backend defines the type but the stale
     // page-load registry lacks it, the defs are refreshed + re-registered so
@@ -13649,6 +13711,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // and the snapshot (already cleared by the reconnect) would stay empty, refusing the very
     // next render-time widget edit. The epoch has to be read where the request goes out.
     let addNodeObservedAtEpoch = null;
+    let addNodeObservedAtGeneration = null;
     // #1192 — set when this add stopped WAITING for a node-def refresh someone else had
     // already started, because waiting longer would have spent the command's whole budget.
     // A FLAG, not a parsed message: `assertAddNodeResolvableRefreshing` swallows a refresh
@@ -13675,15 +13738,15 @@ const GRAPH_TOOL_EXECUTORS = {
         // that branch is unreachable, so the hazard is removed by construction
         // rather than by remembering not to trip it.
         //
-        // The fast path only ever CONFIRMS. Any doubt — an empty {}, a non-200, an
-        // older build without the route, an unparseable body — returns null and
-        // falls through to the identical full fetch below, so no refusal, removal
-        // verdict or history check is decided on anything new.
+        // The fast path only ever CONFIRMS or establishes explicit absence. Any doubt — a
+        // non-200, an older build without the route, an unparseable body, or a timeout —
+        // falls through to the identical full fetch below, so no refusal or removal verdict
+        // is decided on an uncertain smaller payload.
         if (isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)) {
           // #1180 — THE FAST PATH IS BOUNDED TOO, and it has to be: it runs FIRST, so a
           // half-open connection hangs here before the bounded fallback below is ever
           // reached. Bounding only the fallback left `graph_add_node` hanging on exactly
-          // the connection this issue is about. `fetchSingleNodeDef` awaits both the
+          // the connection this issue is about. `fetchSingleNodeInfo` awaits both the
           // response and its body, so the whole call is wrapped rather than the request
           // alone. A timeout resolves null, which is the same answer it already gives for
           // every other doubt and which sends the add to the full fetch — no new branch.
@@ -13691,13 +13754,32 @@ const GRAPH_TOOL_EXECUTORS = {
           // bound on this path. On a timeout it falls through to the whole-schema fetch,
           // so the two are additive: 10s + 10s of a 30s window on the branch that has not
           // even reached the refresh yet.
+          const issued = {
+            generation: verifiedNodeDefCache.generation(),
+            epoch: backendReconnectEpoch,
+          };
           const one = await withTimeout(
-            fetchSingleNodeDef(class_type, (route) => api?.fetchApi?.(route)),
+            fetchSingleNodeInfo(class_type, (route) => api?.fetchApi?.(route)),
             budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS),
             () => null,
           );
-          if (one) {
-            freshDefs = recordObjectInfoTypes(one);
+          if (schemaProbeIsCurrent(issued) && one?.kind === "absent") {
+            // A 200 `{}` is authoritative absence from the class-scoped route. Do not
+            // let a later whole-schema timeout turn that answer into permission to use
+            // an older verified proof.
+            verifiedNodeDefCache.invalidate(class_type);
+            freshDefs = recordObjectInfoTypes({});
+            freshDefsAreSingleClass = true;
+            currentDef = undefined;
+            return freshDefs;
+          }
+          if (schemaProbeIsCurrent(issued) && one?.kind === "present") {
+            // A live present answer can describe a changed schema. Retire the previous
+            // proof before any later add failure can leave it available as a fallback.
+            verifiedNodeDefCache.invalidate(class_type);
+            verifiedSchemaWriteGeneration = verifiedNodeDefCache.generation();
+            verifiedSchemaWriteEpoch = issued.epoch;
+            freshDefs = recordObjectInfoTypes(one.body);
             freshDefsAreSingleClass = true;
             currentDef = snapshotBackendDef(freshDefs, class_type);
             return freshDefs;
@@ -13710,7 +13792,11 @@ const GRAPH_TOOL_EXECUTORS = {
         // add then fails closed on the same path an empty payload already takes, rather
         // than parking.
         // #1223 — read the epoch HERE, immediately before the whole request is issued.
-        addNodeObservedAtEpoch = backendReconnectEpoch;
+        const issued = {
+          generation: verifiedNodeDefCache.generation(),
+          epoch: backendReconnectEpoch,
+        };
+        addNodeObservedAtEpoch = issued.epoch;
         // #1192 — allowed 10,000 ms here, capped by the caller's remaining budget.
         // #1418 — what this comment used to claim about the OTHER path was never true: it
         // said `graph_set_widget`'s oracle "allows 10,000 ms" and that both were capped, but
@@ -13720,8 +13806,49 @@ const GRAPH_TOOL_EXECUTORS = {
         // deleted because it did real harm twice: a reassurance-shaped claim concealed the
         // very next occurrence of the defect it described (#1413's note, then this one).
         const whole = await boundedGetNodeDefs(budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS));
+        if (!schemaProbeIsCurrent(issued)) {
+          // A response issued on the previous cache generation or backend connection is no
+          // answer for this command. In particular, do not let it become a whole-schema
+          // snapshot or a new verified proof after refresh/reconnect invalidated it.
+          freshDefs = null;
+          freshDefsAreSingleClass = false;
+          currentDef = undefined;
+          return freshDefs;
+        }
+        if (whole === NODE_DEFS_NO_ANSWER) {
+          // #1709 — the verified proof is a last-resort answer only when both live routes
+          // were silent. An explicit whole-schema answer, including an absent class, must
+          // reach node-resolve and invalidate the old proof below.
+          const cachedDef = verifiedNodeDefCache.get(class_type, {
+            epoch: verifiedSchemaStartEpoch,
+            context: verifiedSchemaContext,
+            generation: verifiedSchemaStartGeneration,
+          });
+          if (cachedDef) {
+            verifiedSchemaWriteGeneration = verifiedSchemaStartGeneration;
+            verifiedSchemaWriteEpoch = verifiedSchemaStartEpoch;
+            freshDefs = { [class_type]: cachedDef };
+            freshDefsAreSingleClass = true;
+            currentDef = cachedDef;
+            return freshDefs;
+          }
+        }
         freshDefs = recordObjectInfoTypes(whole === NODE_DEFS_NO_ANSWER ? null : whole);
         freshDefsAreSingleClass = false;
+        if (
+          whole &&
+          typeof whole === "object" &&
+          !Array.isArray(whole)
+        ) {
+          // A live whole-schema answer is authoritative for every class whether it is
+          // present, absent, or changed. Retire all old proofs before downstream validation.
+          verifiedNodeDefCache.clear();
+          verifiedSchemaWriteGeneration = verifiedNodeDefCache.generation();
+          verifiedSchemaWriteEpoch = issued.epoch;
+          // The clear above is this accepted whole answer's own proof retirement. Record the
+          // post-clear generation, so a later refresh can still fence this add's snapshot.
+          addNodeObservedAtGeneration = verifiedNodeDefCache.generation();
+        }
         currentDef = snapshotBackendDef(freshDefs, class_type);
         return freshDefs;
       },
@@ -13810,10 +13937,18 @@ const GRAPH_TOOL_EXECUTORS = {
     // is the honest wholeness claim; the single-class fast path is only taken for an
     // already-registered type, and it sets that flag. Mutation by a beforeRegisterNodeDef
     // hook (#700) is irrelevant here because `record` copies out only the type NAMES.
-    if (freshDefs && !freshDefsAreSingleClass && addNodeObservedAtEpoch !== null) {
+    if (
+      freshDefs &&
+      !freshDefsAreSingleClass &&
+      addNodeObservedAtEpoch !== null &&
+      addNodeObservedAtGeneration !== null
+    ) {
+      const currentGeneration = verifiedNodeDefCache.generation();
       objectInfoSnapshot.record(freshDefs, {
         observedAtEpoch: addNodeObservedAtEpoch,
         currentEpoch: backendReconnectEpoch,
+        observedAtGeneration: addNodeObservedAtGeneration,
+        currentGeneration,
         whole: true,
       });
     }
@@ -13935,7 +14070,7 @@ const GRAPH_TOOL_EXECUTORS = {
           // then name types that payload had already proven — the class's OWN outputs —
           // and say no installed node produces them. That is the false-cause message #695
           // and #700 were about. Any doubt returns null and leaves the proof we have,
-          // which is the same answer-shape fetchSingleNodeDef gives for the same reason.
+          // which is the same answer-shape fetchSingleNodeInfo gives for the same reason.
           if (!whole || typeof whole !== "object" || Array.isArray(whole)) return null;
           if (Object.keys(whole).length === 0) return null;
           return registeredSocketTypes(recordObjectInfoTypes(whole));
@@ -14025,7 +14160,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // No await follows this validation. Re-read the graph/workflow now so a
     // tab or subgraph switch during the async preflight cannot commit to the
     // graph captured at command start.
-    const { graph } = revalidateGraphMutationContext(capturedContext);
+    const validatedContext = revalidateGraphMutationContext(capturedContext);
+    const { graph } = validatedContext;
     graph.beforeChange();
     try {
       node.pos = placementFor(graph, pos);
@@ -14033,6 +14169,20 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.add(node);
     } finally {
       graph.afterChange();
+    }
+    // #1709 — only a node that reached the live graph earns reuse. The definition is already
+    // detached by snapshotBackendDef, and the epoch/context fence prevents it crossing a
+    // reconnect or workflow/graph switch.
+    if (
+      verifiedSchemaWriteGeneration !== null &&
+      verifiedSchemaWriteEpoch === backendReconnectEpoch &&
+      verifiedSchemaWriteGeneration === verifiedNodeDefCache.generation()
+    ) {
+      verifiedNodeDefCache.set(class_type, currentDef, {
+        epoch: verifiedSchemaWriteEpoch,
+        context: validatedContext,
+        generation: verifiedSchemaWriteGeneration,
+      });
     }
     // #1411 — sanitize the freshly created node's aux_id install-hint, mirroring
     // the load-path sanitizer in graph_load. The frontend/Manager
@@ -15270,8 +15420,10 @@ const GRAPH_TOOL_EXECUTORS = {
         // answer for the blind-write recovery.
         const snapshotFence = {
           epoch: backendReconnectEpoch,
+          generation: verifiedNodeDefCache.generation(),
           socketDown: comfyBackendIsDown(),
         };
+        let liveSchemaGeneration = null;
         if (
           reuseSnapshot &&
           typeof objectInfoSnapshot.shouldSkipProbe === "function" &&
@@ -15279,6 +15431,7 @@ const GRAPH_TOOL_EXECUTORS = {
         ) {
           const held = objectInfoSnapshot.authorize({
             epoch: snapshotFence.epoch,
+            generation: snapshotFence.generation,
             socketDown: snapshotFence.socketDown,
             requireSilence: false,
           });
@@ -15319,6 +15472,11 @@ const GRAPH_TOOL_EXECUTORS = {
           provenanceNow,
         } = await readThroughCache(
           async () => {
+            // Capture the schema generation at the actual live request issuance point. The
+            // command may have spent time in the burst cache before its loader starts; a
+            // same-epoch refresh in that gap must not make a pre-refresh fence reject a
+            // post-refresh response, nor let a post-refresh response be filed as pre-refresh.
+            liveSchemaGeneration = verifiedNodeDefCache.generation();
             // #982 — TWO TRANSPORTS for the same question. The reporter's fence refused
             // for "object_info is unavailable" while `/object_info/VAELoader` answered on
             // the same machine, so the frontend client can fail where the HTTP route does
@@ -15346,6 +15504,7 @@ const GRAPH_TOOL_EXECUTORS = {
                   typeof objectInfoSnapshot.isReusable === "function" &&
                   objectInfoSnapshot.isReusable({
                     epoch: backendReconnectEpoch,
+                    generation: verifiedNodeDefCache.generation(),
                     socketDown: comfyBackendIsDown(),
                   })
                   ? OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS
@@ -15355,14 +15514,46 @@ const GRAPH_TOOL_EXECUTORS = {
           },
           { stamp: () => backendReconnectEpoch },
         );
-        const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
+        const authoritativeEmpty =
+          outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true
+            ? outcome.authoritativeEmpty === true
+            : false;
+        const observedDefs =
+          outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
+        const generationAtIssuance = liveSchemaGeneration ?? snapshotFence.generation;
+        const generationIsCurrent = verifiedNodeDefCache.generation() === generationAtIssuance;
+        // object-info-cache deliberately returns a retired/reconnected payload to its waiter
+        // so the caller can explain the refusal. It is not current authority, however: do
+        // not hand that old map to runSetWidget's type guard after a same-epoch refresh or a
+        // reconnect crossed the request. The cache verdict and this generation fence are both
+        // acceptance gates; the response may still be disclosed, never authorized.
+        const schemaResponseIsCurrent =
+          generationIsCurrent && readProvenance !== "retired" && readProvenance !== "reconnected";
+        const defs = observedDefs;
         oracleFailures = defs ? [] : (outcome?.failures ?? []);
+        if ((defs || authoritativeEmpty) && readProvenance === "live" && generationIsCurrent) {
+          if (authoritativeEmpty) {
+            // Do not let a prior whole payload or last-observed membership snapshot answer
+            // after the backend has authoritatively said that no classes exist.
+            objectInfoCache.invalidate();
+            objectInfoSnapshot.clear();
+          }
+          if (typeof verifiedNodeDefCache !== "undefined") {
+            verifiedNodeDefCache.clear(); // #1709 — a live whole deny-all answer retires per-class proofs too.
+          }
+        }
         if (defs) {
           // #1126 — ONE fact, from the one component that can establish it. The cache says
           // whether the answer it just handed back is the server speaking NOW ("live") or a
           // payload that was served, joined, reconnected out from under, or retired by an
           // `invalidate()` mid-flight. This file no longer re-derives any of that.
           setWidgetSchemaProvenance = provenanceNow;
+          if (!schemaResponseIsCurrent) {
+            // Preserve the payload for the refusal diagnostic, but do not promote it into
+            // backend history or snapshot authority. runSetWidget re-reads this provenance
+            // before type authorization and turns retired/reconnected evidence into a refusal.
+            return defs;
+          }
           // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
           // above), so it is one #1223's fallback may hold — but ONLY if it is live.
           //
@@ -15372,10 +15563,13 @@ const GRAPH_TOOL_EXECUTORS = {
           // epoch — so the snapshot could retain a schema the panel itself had just superseded.
           // Reading the cache's verdict closes that without weakening `record`, whose own
           // checks stay as defence in depth for callers that do not have a verdict to offer.
-          if (readProvenance === "live") {
+          if (readProvenance === "live" && generationIsCurrent) {
+            const currentGeneration = verifiedNodeDefCache.generation();
             objectInfoSnapshot.record(defs, {
               observedAtEpoch: backendReconnectEpoch,
               currentEpoch: backendReconnectEpoch,
+              observedAtGeneration: currentGeneration,
+              currentGeneration,
               whole: true,
             });
           }
@@ -15390,11 +15584,12 @@ const GRAPH_TOOL_EXECUTORS = {
         // looking in the wrong place (#982).
         const fallback = objectInfoSnapshot.authorize({
           epoch: backendReconnectEpoch,
+          generation: verifiedNodeDefCache.generation(),
           socketDown: comfyBackendIsDown(),
           outcomes: outcome?.outcomes,
         });
         // #1560 — the SAME evidence, read ONCE, in the same statement as the snapshot's.
-        scopedReadLicensed = noBackendAnswerEstablished(outcome?.outcomes);
+        scopedReadLicensed = schemaResponseIsCurrent && noBackendAnswerEstablished(outcome?.outcomes);
         if (fallback.defs) {
           // Held for the reply. The write is about to be reported as SUCCEEDED and VERIFIED,
           // and it was verified against a schema nobody could re-fetch — an agent that is
@@ -15480,6 +15675,13 @@ const GRAPH_TOOL_EXECUTORS = {
           fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
           deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
         });
+        if (Array.isArray(scoped.covered)) {
+          for (const classType of scoped.covered) {
+            if (typeof classType === "string" && classType) {
+              verifiedNodeDefCache.invalidate(classType);
+            }
+          }
+        }
         // Stamped for the #1126 blind-write ladder, which must NOT treat this as the server's
         // whole word: it is the server answering now about a handful of types.
         //
@@ -15740,6 +15942,8 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     let oracleFailures = [];
+    const observedAtGeneration = verifiedNodeDefCache.generation();
+    let liveSchemaGeneration = null;
     // #1126 — the cache's own verdict, exactly as graph_set_widget takes it. This route files
     // into the same snapshot, so it needs the same test: "did this call issue the request" is
     // NOT the question, because an `invalidate()` from a refresh/install/download retires a
@@ -15747,21 +15951,52 @@ const GRAPH_TOOL_EXECUTORS = {
     // would then file a schema the panel itself had just superseded.
     const { value: outcome, provenance: readProvenance } = await objectInfoCache.readWithProvenance(
       async () =>
-        fetchWholeObjectInfo({
-          getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
-          fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
-        }),
+        (() => {
+          liveSchemaGeneration = verifiedNodeDefCache.generation();
+          return fetchWholeObjectInfo({
+            getNodeDefs: typeof api?.getNodeDefs === "function" ? () => api.getNodeDefs() : null,
+            fetchApi: typeof api?.fetchApi === "function" ? (route) => api.fetchApi(route) : null,
+          });
+        })(),
       { stamp: () => backendReconnectEpoch },
     );
-    const defs = outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
-    oracleFailures = defs ? [] : (outcome?.failures ?? []);
+    const authoritativeEmpty =
+      outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true
+        ? outcome.authoritativeEmpty === true
+        : false;
+    const observedDefs =
+      outcome && typeof outcome === "object" && outcome[CACHE_OUTCOME] === true ? outcome.defs : outcome;
     // #1223 — this command already paid for a WHOLE /object_info; dropping it leaves the
     // next render-time widget edit refused for want of the map just read. Same argument the
     // history note below already makes for its own trust root.
-    if (defs && readProvenance === "live") {
+    const generationAtIssuance = liveSchemaGeneration ?? observedAtGeneration;
+    const generationIsCurrent = verifiedNodeDefCache.generation() === generationAtIssuance;
+    // A retired/reconnected payload is returned for diagnostics by the burst cache, not for
+    // authorization. A remove-widget call must not use the old declared-input set after the
+    // same refresh/reconnect fence that retired its request.
+    const schemaResponseIsCurrent =
+      generationIsCurrent && readProvenance !== "retired" && readProvenance !== "reconnected";
+    const defs = schemaResponseIsCurrent ? observedDefs : null;
+    oracleFailures = defs ? [] : (outcome?.failures ?? []);
+    if ((defs || authoritativeEmpty) && readProvenance === "live" && generationIsCurrent) {
+      if (authoritativeEmpty) {
+        // The cache deliberately keeps the prior usable payload when a fresh read is empty;
+        // this marker is the point at which that old payload and its snapshot stop being
+        // admissible evidence.
+        objectInfoCache.invalidate();
+        objectInfoSnapshot.clear();
+      }
+      if (typeof verifiedNodeDefCache !== "undefined") {
+        verifiedNodeDefCache.clear(); // #1709 — this whole live answer, including deny-all, supersedes per-class proofs.
+      }
+    }
+    if (defs && readProvenance === "live" && generationIsCurrent) {
+      const currentGeneration = verifiedNodeDefCache.generation();
       objectInfoSnapshot.record(defs, {
         observedAtEpoch: backendReconnectEpoch,
         currentEpoch: backendReconnectEpoch,
+        observedAtGeneration: currentGeneration,
+        currentGeneration,
         whole: true,
       });
     }
@@ -17692,12 +17927,21 @@ const GRAPH_TOOL_EXECUTORS = {
       if (scanBudgetMs > 0) {
         liveScan = await scanComboAvailability(
           nodes,
-          (cls, signal) =>
-            fetchSingleNodeInfo(
+          async (cls, signal) => {
+            const outcome = await fetchSingleNodeInfo(
               cls,
               (route, options) => api?.fetchApi?.(route, options),
               signal,
-            ),
+            );
+            // #1709 — get_errors' per-class reader is a live authority too. A definitive
+            // present answer may describe a changed schema, and `{}` is explicit absence;
+            // retire only that class's reusable add proof. Unknown/timeout outcomes remain
+            // non-authoritative and preserve the later silent-add fallback semantics.
+            if (outcome?.kind === "present" || outcome?.kind === "absent") {
+              verifiedNodeDefCache.invalidate(cls);
+            }
+            return outcome;
+          },
           {
             budgetMs: scanBudgetMs,
             now: monotonicNow,

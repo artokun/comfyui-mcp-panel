@@ -28,6 +28,7 @@ import {
 import { findNodeByScopedId, findVisibleNodeByScopedId } from "../../web/js/lib/asset-staleness.js";
 import { scanComboAvailability } from "../../web/js/lib/live-combo-availability.js";
 import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PANEL_SOURCE = readFileSync(
@@ -390,6 +391,7 @@ const GRAPH_GET_ERRORS_DEPS = [
   "getRefreshInFlight",
   "nodeDefRefreshInFlight",
   "getGraphCtx",
+  "verifiedNodeDefCache",
   "assertGraphBoundToActiveWorkflow",
   "graphCommandBindingBar",
   "collectMissingAssets",
@@ -476,6 +478,7 @@ async function runProductionGraphGetErrors({
   // retain their clean-note assertions.
   stepBudget = () => 1000,
   monotonicNow = () => 0,
+  verifiedNodeDefCache = createVerifiedNodeDefCache(),
 }) {
   const deps = {
     monotonicNow,
@@ -488,6 +491,7 @@ async function runProductionGraphGetErrors({
     getRefreshInFlight: () => null,
     nodeDefRefreshInFlight: null,
     getGraphCtx: () => ({ app: { lastNodeErrors: null }, graph, rootGraph }),
+    verifiedNodeDefCache,
     assertGraphBoundToActiveWorkflow: () => {},
     graphCommandBindingBar: () => ({}),
     collectMissingAssets: () => ({ models: [], media: [], nodeTypes: [], nodeCount: 0 }),
@@ -570,6 +574,69 @@ test("#1691 production graph_get_errors batches live class reads and keeps uncer
   assert.equal(result.unchecked_nodes[0].type, "InstalledButUnreachablePack");
   assert.match(result.unchecked_nodes[0].reason, /could not be looked up/);
   assert.equal(result.note, undefined, "an unchecked live scan must not emit a clean note");
+});
+
+test("#1709 production graph_get_errors retires add proof on definitive class presence and absence", async () => {
+  const node = {
+    id: 31,
+    type: "RemovedNode",
+    widgets: [{ name: "mode", type: "combo", value: "old" }],
+  };
+  const graph = { _nodes: [node], getNodeById: () => node };
+  const def = { input: { required: { mode: [["old"], {}] } } };
+  const cache = createVerifiedNodeDefCache();
+  const proofContext = {};
+  let generation = cache.generation();
+  cache.set("RemovedNode", def, { epoch: 0, context: proofContext, generation });
+  let present = true;
+  const fetchInfo = async () =>
+    present
+      ? { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "present", body: { RemovedNode: def } }
+      : { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "absent", body: {} };
+
+  await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.ok(cache.generation() > generation, "a definitive present class read retired old proof");
+
+  present = false;
+  generation = cache.generation();
+  cache.set("RemovedNode", def, { epoch: 0, context: proofContext, generation });
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.equal(result.unchecked_nodes.length, 1, "the explicit absent class remains unchecked, not falsely clean");
+  assert.ok(cache.generation() > generation, "a definitive absent class read retired old proof");
+  assert.equal(
+    cache.get("RemovedNode", { epoch: 0, context: proofContext, generation: cache.generation() }),
+    undefined,
+    "the absent class has no reusable proof after get_errors",
+  );
+
+  const afterAbsence = cache.generation();
+  const timeout = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: async () => ({ [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" }),
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.equal(cache.generation(), afterAbsence, "an unknown/timeout class read remains non-authoritative");
+  assert.equal(timeout.unchecked_nodes.length, 1);
 });
 
 test("#1691 production graph_get_errors keeps budget-cutoff scans non-clean and uses its monotonic clock", async () => {

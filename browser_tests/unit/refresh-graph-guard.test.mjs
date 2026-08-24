@@ -52,6 +52,7 @@ import {
 } from "./_panel-constants.mjs";
 
 import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 
 const NODE_DEFS_RETRY_DELAYS_MS = OBJECT_INFO_RETRY_DELAYS_MS;
 
@@ -246,8 +247,9 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "NODE_DEFS_RETRY_DELAYS_MS",
     "objectInfoCache",
     "objectInfoSnapshot",
-     "backendReconnectEpoch",
-     "comfyBackendSocketDown",
+    "verifiedNodeDefCache",
+    "backendReconnectEpoch",
+    "comfyBackendSocketDown",
     // #1275 — the guard's collaborators, REAL lib functions, so this harness proves
     // the shipped wiring and not a re-implementation of it.
     "liveGraphNodeInventory",
@@ -295,8 +297,9 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     NODE_DEFS_RETRY_DELAYS_MS,
     { invalidate: () => {}, read: async (f) => f() },
     { clear: () => {}, record: () => true },
-     7,
-     false,
+    createVerifiedNodeDefCache(),
+    7,
+    false,
     liveGraphNodeInventory,
     vanishedLiveNodes,
     missingInventoryIds,
