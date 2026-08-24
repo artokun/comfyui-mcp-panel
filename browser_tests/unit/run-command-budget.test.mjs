@@ -75,6 +75,9 @@ import {
   queuePromptChainDeps,
 } from "../../web/js/lib/queue-prompt-chain.js";
 import { MUTATION_BINDING_BAR } from "../../web/js/lib/graph-binding.js";
+import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
+import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
+import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -436,7 +439,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender }) {
   const seen = { dispatchArgs: null };
   const deps = {
     RUN_COMMAND_BUDGET_MS: budgetMs,
@@ -491,6 +494,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     queuePromptChainDeps,
     runCompletionRef: runCompletionRef ?? { onQueued() {} },
     armRunReconcileSweepRef: armRunReconcileSweepRef ?? (() => {}),
+    runReceiptSender: runReceiptSender ?? null,
   };
   const names = Object.keys(deps);
   const factory = new Function(
@@ -830,22 +834,45 @@ test("#1565 CALL SITE: graph_run answers inside its budget when the frontend que
   }
 });
 
-test("#1728 CALL SITE: a prompt_id captured after the scoped budget still enters completion recovery", async () => {
+test("#1728 CALL SITE: late capture crosses the bridge, arms the real sweep, and emits one completion", async () => {
   const stop = keepAlive();
+  let sweep;
   try {
     const apiTarget = { fetchApi: makeServer() };
     const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
     app.graph = { _nodes: [] };
-    const queued = [];
-    let sweepArms = 0;
+    const flushes = [];
+    const receiptFrames = [];
+    const timers = new Set();
+    const schedule = (fn, ms) => {
+      const timer = { fn, ms };
+      timers.add(timer);
+      return timer;
+    };
+    const cancel = (timer) => timers.delete(timer);
+    const tracker = createRunCompletionTracker({
+      onFlush: (payload) => flushes.push(payload),
+      now: () => 1000,
+      setTimer: schedule,
+      clearTimer: cancel,
+    });
+    sweep = createRunReconcileSweep({
+      hasPending: () => tracker.hasPending(),
+      reconcile: async () => {},
+      setTimer: schedule,
+      clearTimer: cancel,
+      intervalMs: 60000,
+    });
     let latePromptId;
     const built = realGraphRun({
       app,
       apiTarget,
       budgetMs: 800,
       serializeMs: 400,
-      runCompletionRef: { onQueued: (id) => queued.push(id) },
-      armRunReconcileSweepRef: () => sweepArms++,
+      runCompletionRef: tracker,
+      armRunReconcileSweepRef: () => sweep.arm(),
+      runReceiptSender: (rid, promptId) =>
+        receiptFrames.push({ type: "run_receipt", run_rid: rid, prompt_id: promptId }),
       dispatch: async (args) => {
         // The production guard can invoke this callback after dispatchScopedRun
         // has returned its bounded unverified result.
@@ -854,12 +881,39 @@ test("#1728 CALL SITE: a prompt_id captured after the scoped budget still enters
       },
     });
 
-    const result = await built.graph_run({ to_node_id: 327 });
+    const result = await built.graph_run({ to_node_id: 327, rid: "run-rid-1728" });
     assert.equal(result.queued_unknown, true, "the bounded call remains honest about its unknown receipt");
     latePromptId();
-    assert.deepEqual(queued, ["late-prompt-1728"], "the late receipt enters the completion ledger");
-    assert.equal(sweepArms, 1, "the late receipt arms reconciliation exactly once");
+    assert.deepEqual(receiptFrames, [
+      { type: "run_receipt", run_rid: "run-rid-1728", prompt_id: "late-prompt-1728" },
+    ], "the late prompt id crosses the bridge as a non-agent receipt");
+    assert.equal(sweep._hasTimer(), true, "the real safety sweep is armed by the late capture");
+
+    // The prompt can finish before the delayed /prompt response reaches the
+    // capture callback. The tracker must retain that media-less success and
+    // apply the panel_run promise when onQueued finally arrives.
+    tracker.onExecutionStart("late-prompt-1728");
+    tracker.onExecutionSuccess("late-prompt-1728");
+    assert.equal(flushes.length, 1, "the late capture produces one terminal completion");
+    assert.equal(flushes[0].noMedia, true);
+
+    const sent = [];
+    await composeRunCompletionFrame(flushes[0], {
+      sendFrame: (frame) => (sent.push(frame), true),
+      coerceMessageText: (value) => String(value ?? ""),
+      formatDuration: (ms) => `${(ms / 1000).toFixed(1)}s`,
+      formatClock: () => "12:00:00",
+      agentReceivesImages: () => true,
+      warn: () => {},
+    });
+    assert.equal(sent.length, 1, "the bridge receives exactly one completion frame");
+
+    latePromptId();
+    tracker.onExecutionSuccess("late-prompt-1728");
+    assert.equal(flushes.length, 1, "duplicate capture/lifecycle signals stay fenced");
+    assert.equal(sent.length, 1, "duplicate capture/lifecycle signals do not duplicate the frame");
   } finally {
+    sweep?.dispose();
     stop();
   }
 });

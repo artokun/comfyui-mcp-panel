@@ -139,6 +139,41 @@ test("#356 a media-less completion is delivered EXACTLY once", () => {
   assert.equal(h.flushes.length, 1);
 });
 
+test("#1728 a terminal media-less success is emitted once when its late panel receipt arrives", () => {
+  const h = makeTracker();
+  const P = "prompt-late-panel-receipt";
+
+  // execution_success wins the race: before #1728 this decided that the run was
+  // an ordinary user canvas run because onQueued had not arrived yet.
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecutionSuccess(P);
+  assert.equal(h.flushes.length, 0, "no promise existed before the late receipt");
+
+  h.tracker.onQueued(P);
+  assert.equal(h.flushes.length, 1, "the late receipt applies the panel_run promise");
+  assert.equal(h.flushes[0].noMedia, true);
+
+  // A duplicate /prompt capture and replayed lifecycle success cannot emit a
+  // second completion: the terminal fence and one-shot retained outcome both hold.
+  h.tracker.onQueued(P);
+  h.tracker.onExecutionSuccess(P);
+  assert.equal(h.flushes.length, 1, "late receipt reconciliation is idempotent");
+});
+
+test("#1728 a late panel receipt cannot turn a media completion into a second empty frame", () => {
+  const h = makeTracker();
+  const P = "prompt-late-panel-media";
+
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecuted(P, { images: [{ filename: "out.png" }] });
+  h.tracker.onExecutionSuccess(P);
+  assert.equal(h.flushes.length, 1);
+  assert.equal(h.flushes[0].images.length, 1);
+
+  h.tracker.onQueued(P);
+  assert.equal(h.flushes.length, 1, "late capture does not double-queue a media run");
+});
+
 test("#356 a FAILED panel-queued run still delivers no completion batch", () => {
   // execution_error has its own reporting path; a media-less success note must not
   // start speaking for failures, which would report a crash as a clean finish.

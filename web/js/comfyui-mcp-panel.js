@@ -803,6 +803,10 @@ let runCompletionRef = null;
 // prompt is queued so the sweep re-reconciles pending runs against /history until
 // they drain. Set in buildPanel; null while unmounted.
 let armRunReconcileSweepRef = null;
+// A late prompt receipt has to cross the bridge to the MCP consumer. Capture the
+// sender at mount time so an old graph_run cannot publish into a replacement tab
+// after teardown/reconnect.
+let runReceiptSender = null;
 // How often the safety sweep re-reconciles while any run is still pending delivery.
 // Only runs while `hasPending()` is true (self-disarming), so an idle panel carries
 // no perpetual timer; a redundant sweep is harmless (reconcile is idempotent — the
@@ -16910,6 +16914,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // below draws from this one deadline, so they compose instead of each starting a fresh
     // clock; see RUN_COMMAND_BUDGET_MS.
     const budget = makeCommandBudget(RUN_COMMAND_BUDGET_MS, monotonicNow);
+    // Keep the established destructuring signature (several shipped source-order
+    // guards key off it), while accepting the bridge's correlation id as metadata.
+    const requestedRid = arguments[0]?.rid;
+    const receiptRid = typeof requestedRid === "string" && requestedRid.trim() ? requestedRid.trim() : null;
+    // Freeze this mount's sender for the whole dispatch. A late /prompt response
+    // can outlive graph_run itself, but it must never use a newer mount's bridge.
+    const sendReceipt = runReceiptSender;
     const { app, graph, rootGraph } = getGraphCtx();
     // /run invokes this executor directly rather than through bridge dispatch.
     // Queueing a stale root would render the wrong workflow even though no graph
@@ -17196,6 +17207,14 @@ const GRAPH_TOOL_EXECUTORS = {
       try {
         armRunReconcileSweepRef?.();
       } catch {}
+      // #1728 — the local tracker cannot open the MCP server's prompt ticket by
+      // itself. Send an exact, rid-correlated receipt over the existing bridge
+      // event channel; this is metadata only, never an agent_event completion.
+      if (receiptRid && sendReceipt) {
+        try {
+          sendReceipt(receiptRid, id);
+        } catch {}
+      }
     };
     const capturePromptId = (pid) => {
       registerPromptId(pid);
@@ -36034,6 +36053,9 @@ function buildPanel() {
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
+  const panelRunReceiptSender = (rid, promptId) =>
+    client.sendFrame({ type: "run_receipt", run_rid: rid, prompt_id: promptId });
+  runReceiptSender = panelRunReceiptSender;
 
   // #758 — announce an update once the transcript exists to receive it. Deliberately
   // NOT awaited: a release note must never sit in front of the panel becoming usable.
@@ -40868,6 +40890,7 @@ function buildPanel() {
       stopRebootWatch();
       if (armRunReconcileSweepRef === armRunReconcileSweep) armRunReconcileSweepRef = null;
       if (runCompletionRef === runCompletion) runCompletionRef = null;
+      if (runReceiptSender === panelRunReceiptSender) runReceiptSender = null;
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).
       panelHooks.applyBackend = null;
