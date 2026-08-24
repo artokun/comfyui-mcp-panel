@@ -157,6 +157,36 @@ test("#716: a read after invalidation does not JOIN the retired request", async 
   assert.deepEqual(await cache.read(async () => ({ ShouldNotBeCalled: {} })), { NewType: {} });
 });
 
+test("#1709: replace retires old cache entries and late in-flight responses", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  await cache.read(async () => ({ OldType: {} }));
+  c.advance(OBJECT_INFO_CACHE_TTL_MS + 1);
+
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const stale = cache.read(async () => {
+    await gate;
+    return { OldType: {} };
+  });
+  assert.equal(cache.replace({ NewType: {} }), true, "a definitive non-empty map replaces the old authority");
+  release();
+  await stale;
+
+  let refetched = false;
+  assert.deepEqual(
+    await cache.read(async () => {
+      refetched = true;
+      return { Unexpected: {} };
+    }),
+    { NewType: {} },
+    "the late old response cannot overwrite the replacement",
+  );
+  assert.equal(refetched, false, "the replacement remains the current burst entry");
+  assert.equal(cache.replace({}), false, "an empty response is not an authority replacement");
+  assert.deepEqual(await cache.read(async () => ({ Unexpected: {} })), { NewType: {} });
+});
+
 test("#716: every joined caller sees a failing fetch fail", async () => {
   // codex noted this was untested. A coalesced failure that resolved for some callers and
   // rejected for others would be a fence that authorizes for one write and refuses another

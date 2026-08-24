@@ -295,7 +295,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
       nodeDefsBudgetLeft,
     monotonicNow,
     NODE_DEFS_RETRY_DELAYS_MS,
-    { invalidate: () => {}, read: async (f) => f() },
+    { invalidate: () => {}, replace: () => true, read: async (f) => f() },
     { clear: () => {}, record: () => true },
     createVerifiedNodeDefCache(),
     7,

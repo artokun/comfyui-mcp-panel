@@ -37,7 +37,11 @@ import {
   isRegisteredNodeType,
 } from "../../web/js/lib/node-resolve.js";
 import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
-import { fetchWholeObjectInfo, objectInfoOracleFailureNote } from "../../web/js/lib/object-info-oracle.js";
+import {
+  fetchWholeObjectInfo,
+  objectInfoOracleFailureNote,
+  TRANSPORT_OUTCOME,
+} from "../../web/js/lib/object-info-oracle.js";
 import {
   describeUnmaterializedRequiredWidgets,
   snapshotBackendDef,
@@ -304,6 +308,8 @@ function realGraphAddNode({
     inFlightStarted,
     verifiedNodeDefCache: deps.verifiedNodeDefCache,
     verifiedSchemaContext: context,
+    objectInfoCache: deps.objectInfoCache,
+    objectInfoSnapshot: deps.objectInfoSnapshot,
   };
 }
 
@@ -698,6 +704,49 @@ test("#1709: a direct schema response crossing refresh cannot authorize a later 
     ["/object_info/ExistingNode", "/object_info/ExistingNode", "/object_info"],
     "the stale direct response was discarded and the add reached the timeout fallback",
   );
+});
+
+test("#1709: graph_add_node replaces the old whole cache and snapshot on a changed response", async () => {
+  const comfy = makeComfy();
+  const oldDefs = { OldNode: { input: { required: {} } } };
+  const changedDefs = { NewNode: { input: { required: {} } } };
+  const objectInfoCache = createObjectInfoCache();
+  const objectInfoSnapshot = createObjectInfoSnapshot();
+  await objectInfoCache.read(async () => oldDefs);
+  assert.equal(
+    objectInfoSnapshot.record(oldDefs, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
+    true,
+    "the production precondition starts with an older whole authority",
+  );
+
+  const built = realGraphAddNode({
+    comfy,
+    getNodeDefs: async () => changedDefs,
+    overrides: {
+      objectInfoCache,
+      objectInfoSnapshot,
+    },
+  });
+  const result = await built.graph_add_node({ class_type: "NewNode" });
+  assert.equal(result.added.type, "NewNode", "the changed whole response still permits its current class");
+  assert.deepEqual(
+    await objectInfoCache.read(async () => ({ Unexpected: {} })),
+    changedDefs,
+    "the later burst reader cannot see the old whole map",
+  );
+  const fallback = objectInfoSnapshot.authorize({
+    epoch: 0,
+    outcomes: [{ kind: TRANSPORT_OUTCOME.NO_ANSWER }],
+  });
+  assert.ok(fallback.defs, "the changed response remains available as current snapshot authority");
+  assert.equal(Object.prototype.hasOwnProperty.call(fallback.defs, "OldNode"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(fallback.defs, "NewNode"), true);
 });
 
 test("#1709: a same-epoch refresh fences graph_add_node's late whole-schema snapshot write", async () => {

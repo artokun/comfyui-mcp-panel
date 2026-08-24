@@ -415,6 +415,49 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
     },
 
     /**
+     * Replace the stored whole schema with a known-current payload.
+     *
+     * Direct whole-schema readers do not come through `readWithProvenance`, but their
+     * definitive answer must still retire the burst entry and any request issued before
+     * that answer. This is an atomic replacement: the generation moves before the value is
+     * exposed, so a late old response cannot overwrite the new authority.
+     *
+     * Empty/unusable values are deliberately ignored. An unavailable or timed-out read is
+     * not authoritative and must not turn into an invalidation merely because a caller
+     * tried to publish it.
+     */
+    replace(next) {
+      if (!next || typeof next !== "object" || Array.isArray(next)) return false;
+      let keys;
+      try {
+        keys = Object.keys(next);
+      } catch {
+        return false;
+      }
+      if (keys.length === 0) return false;
+      let frozen;
+      try {
+        // Keep the caller's response mutable for downstream registration hooks. The
+        // ordinary loader may cache an outcome wrapper, while direct whole readers hand
+        // their map to graph registration after publishing it here; freezing that shared
+        // response would make this cache alter the registration contract.
+        frozen = Object.freeze({ ...next });
+      } catch {
+        return false;
+      }
+      generation += 1;
+      // Retire requests issued against the replaced map. They remain awaitable by their
+      // original callers, but cannot join or repopulate this cache after this point.
+      inflight = null;
+      inflightGeneration = -1;
+      inflightId = 0;
+      freshInflight = null;
+      value = frozen;
+      at = now();
+      return true;
+    },
+
+    /**
      * Drop the entry AND retire anything in flight — for anything that knows, or merely
      * suspects, that the schema may have changed.
      */

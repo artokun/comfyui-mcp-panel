@@ -1322,6 +1322,15 @@ function seedObjectInfoHistory() {
             const currentEpoch = backendReconnectEpoch;
             const currentGeneration = verifiedNodeDefCache.generation();
             if (currentEpoch !== observedAtEpoch || currentGeneration !== observedAtGeneration) continue;
+            // This startup response bypasses the burst cache, so install it as the new
+            // whole-schema authority and retire any request/entry from before it. A later
+            // timeout must not fall back to that older map.
+            if (!objectInfoCache.replace(defs)) objectInfoCache.invalidate();
+            objectInfoSnapshot.clear();
+            // The whole answer also supersedes per-class proofs established before this
+            // startup observation. Advance that fence before filing the replacement.
+            verifiedNodeDefCache.clear();
+            const acceptedGeneration = verifiedNodeDefCache.generation();
             recordObjectInfoTypes(defs);
             // A whole payload, and this is the only reader of it — nothing registers these
             // defs, so no beforeRegisterNodeDef hook can have mutated them yet. `record`
@@ -1329,8 +1338,8 @@ function seedObjectInfoHistory() {
             objectInfoSnapshot.record(defs, {
               observedAtEpoch,
               currentEpoch,
-              observedAtGeneration,
-              currentGeneration,
+              observedAtGeneration: acceptedGeneration,
+              currentGeneration: acceptedGeneration,
               whole: true,
             });
             markObjectInfoHistorySeeded();
@@ -1854,6 +1863,11 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       runStartedAtEpoch === backendReconnectEpoch &&
       runStartedAtGeneration === verifiedNodeDefCache.generation();
     if (!preloadedDefs && refreshResponseIsCurrent) {
+      // The refresh fetch is a direct whole-schema read, not an objectInfoCache read. Keep
+      // its current answer as the burst authority and retire the snapshot before recording
+      // the replacement, so a timeout cannot use the prior map or membership set.
+      if (!objectInfoCache.replace(defs)) objectInfoCache.invalidate();
+      objectInfoSnapshot.clear();
       objectInfoSnapshot.record(defs, {
         observedAtEpoch: runStartedAtEpoch,
         currentEpoch: runStartedAtEpoch,
@@ -12164,6 +12178,13 @@ const GRAPH_TOOL_EXECUTORS = {
         // a definition this live answer just proved absent.
         objectInfoCache.invalidate();
         objectInfoSnapshot.clear();
+      } else {
+        // This direct whole read bypasses the burst cache. A definitive non-empty answer
+        // therefore has to replace, rather than merely sit beside, the old cached map.
+        // Retiring the old generation also prevents an older in-flight cache read from
+        // restoring that map after this answer has become current.
+        if (!objectInfoCache.replace(defs)) objectInfoCache.invalidate();
+        objectInfoSnapshot.clear();
       }
       if (typeof verifiedNodeDefCache !== "undefined") {
         verifiedNodeDefCache.clear(); // #1709 — this whole live observation may contain changed or absent classes.
@@ -13846,6 +13867,19 @@ const GRAPH_TOOL_EXECUTORS = {
         ) {
           // A live whole-schema answer is authoritative for every class whether it is
           // present, absent, or changed. Retire all old proofs before downstream validation.
+          let hasWholeDefinitions = false;
+          try {
+            hasWholeDefinitions = Object.keys(whole).length > 0;
+          } catch {
+            /* the downstream resolver will fail closed on an unreadable schema */
+          }
+          if (hasWholeDefinitions) {
+            if (!objectInfoCache.replace(whole)) objectInfoCache.invalidate();
+          } else {
+            // `{}` is the direct route's authoritative deny-all answer, not a timeout.
+            objectInfoCache.invalidate();
+          }
+          objectInfoSnapshot.clear();
           verifiedNodeDefCache.clear();
           verifiedSchemaWriteGeneration = verifiedNodeDefCache.generation();
           verifiedSchemaWriteEpoch = issued.epoch;
@@ -15541,6 +15575,11 @@ const GRAPH_TOOL_EXECUTORS = {
             // after the backend has authoritatively said that no classes exist.
             objectInfoCache.invalidate();
             objectInfoSnapshot.clear();
+          } else {
+            // A live cache read has already stored this fresh whole answer. Clear the
+            // detached membership proof before replacing it so a failed record cannot
+            // leave the previous schema eligible for timeout fallback.
+            objectInfoSnapshot.clear();
           }
           if (typeof verifiedNodeDefCache !== "undefined") {
             verifiedNodeDefCache.clear(); // #1709 — a live whole deny-all answer retires per-class proofs too.
@@ -15992,6 +16031,10 @@ const GRAPH_TOOL_EXECUTORS = {
         // this marker is the point at which that old payload and its snapshot stop being
         // admissible evidence.
         objectInfoCache.invalidate();
+        objectInfoSnapshot.clear();
+      } else {
+        // The live cache read installed the definitive non-empty whole answer. Retire the
+        // detached membership proof before recording its replacement as well.
         objectInfoSnapshot.clear();
       }
       if (typeof verifiedNodeDefCache !== "undefined") {

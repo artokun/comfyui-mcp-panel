@@ -50,7 +50,11 @@ const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOU
 
 /** #716 — records invalidate() calls so a test can assert the refresh drops the cache. */
 let cacheInvalidations = 0;
-const cacheSpy = { invalidate: () => { cacheInvalidations += 1; }, read: async (f) => f() };
+const cacheSpy = {
+  invalidate: () => { cacheInvalidations += 1; },
+  replace: () => true,
+  read: async (f) => f(),
+};
 
 /** #1223 — the last-observed-schema snapshot the refresh run also clears and re-records. */
 let snapshotClears = 0;

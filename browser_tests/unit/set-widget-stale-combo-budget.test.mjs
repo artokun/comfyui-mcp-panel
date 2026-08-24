@@ -27,7 +27,11 @@ import assert from "node:assert/strict";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
-import { createObjectInfoCache, CACHE_OUTCOME } from "../../web/js/lib/object-info-cache.js";
+import {
+  createObjectInfoCache,
+  CACHE_OUTCOME,
+  OBJECT_INFO_CACHE_TTL_MS,
+} from "../../web/js/lib/object-info-cache.js";
 import {
   fetchWholeObjectInfo,
   objectInfoOracleFailureNote,
@@ -761,6 +765,75 @@ test("#1709: authoritative empty retires whole cache and snapshot before ordinar
     ["/object_info", "/object_info"],
     "the later ordinary read reached both live routes after the cache was retired",
   );
+});
+
+test("#1709: graph_get_object_info replaces changed whole authority before graph_set_widget timeout", async () => {
+  const widget = { name: "text", type: "text", value: "before" };
+  const oldDef = { input: { required: { text: ["STRING", {}] } } };
+  const oldDefs = { RemovedNode: oldDef };
+  const changedDefs = { OtherNode: { input: { required: {} } } };
+  const node = {
+    id: 215,
+    type: "RemovedNode",
+    widgets: [widget],
+    constructor: { nodeData: oldDef, comfyClass: "RemovedNode" },
+  };
+  let now = 0;
+  let liveDefs = oldDefs;
+  const objectInfoCache = createObjectInfoCache({ now: () => now });
+  const objectInfoSnapshot = createObjectInfoSnapshot();
+  const built = realGraphSetWidget({
+    node,
+    objectInfoCache,
+    objectInfoSnapshot,
+    getNodeDefsImpl: async () => liveDefs,
+    fetchApiImpl: async () =>
+      liveDefs
+        ? { status: 200, json: async () => liveDefs }
+        : { status: 504, json: async () => ({}) },
+    oracleDefs: oldDefs,
+    registeredNodeTypes: {
+      LoadImage: {},
+      Note: {},
+      RemovedNode: { nodeData: oldDef, comfyClass: "RemovedNode" },
+    },
+  });
+
+  const first = await built.graph_set_widget({
+    node_id: 215,
+    widget: "text",
+    value: "live-old",
+    workflow_uuid: "u",
+  });
+  assert.equal(first.set.value, "live-old", "the old whole schema establishes the initial authority");
+
+  liveDefs = changedDefs;
+  const get = realGraphGetObjectInfo({
+    api: built.api,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: built.verifiedNodeDefCache,
+  });
+  const fresh = await get({});
+  assert.equal(fresh.ok, true, "the changed non-empty whole response is authoritative");
+  assert.deepEqual(
+    await objectInfoCache.read(async () => ({ Unexpected: {} })),
+    changedDefs,
+    "a later burst read sees the changed whole map, not the old cached map",
+  );
+  assert.equal(objectInfoSnapshot.peek().held, true, "the replacement map is also the snapshot authority");
+
+  // Let the replacement expire, then make both live routes silent. The timeout path must
+  // consult the replacement snapshot and refuse RemovedNode; it must not resurrect the
+  // previous whole map that graph_get_object_info superseded.
+  now += OBJECT_INFO_CACHE_TTL_MS + 1;
+  liveDefs = null;
+  await assert.rejects(
+    () => built.graph_set_widget({ node_id: 215, widget: "text", value: "stale", workflow_uuid: "u" }),
+    /Cannot set widget|does not provide|object_info is unavailable|refused/i,
+    "the timeout fallback refuses the removed class",
+  );
+  assert.equal(widget.value, "live-old", "the stale timeout path did not mutate the widget");
 });
 
 test("#1709: a definitive per-class absence retires cached whole proof before graph_set_widget timeout fallback", async () => {

@@ -48,7 +48,7 @@ const COMBO_OK = Symbol("combo-refreshed");
 const COMBO_NO_ANSWER = Symbol("combo-timeout");
 const monotonicNow = () => performance.now();
 const nodeDefsBudgetLeft = (deadline, share = 1) => Math.max(1, Math.floor((deadline - monotonicNow()) * share));
-const cacheSpy = { invalidate: () => {}, read: async (f) => f() };
+const cacheSpy = { invalidate: () => {}, replace: () => true, read: async (f) => f() };
 const snapshotSpy = { clear: () => {}, record: () => true };
 const COMMAND_BUDGET = 2500;
 const RELAY = 3000;

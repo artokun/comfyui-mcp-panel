@@ -1069,7 +1069,11 @@ function extractExecutor(name) {
 }
 
 function buildExecutor(name, deps) {
-  const runtimeDeps = { verifiedNodeDefCache: createVerifiedNodeDefCache(), ...deps };
+  const runtimeDeps = {
+    objectInfoCache: createObjectInfoCache(),
+    verifiedNodeDefCache: createVerifiedNodeDefCache(),
+    ...deps,
+  };
   const names = Object.keys(runtimeDeps);
   const factory = new Function(...names, `const executors = { ${extractExecutor(name)} };\nreturn executors.${name};`);
   return factory(...names.map((n) => runtimeDeps[n]));
@@ -1218,7 +1222,7 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
   }
   assert.match(
     PANEL_SRC,
-    /if \(!preloadedDefs && refreshResponseIsCurrent\) \{\s*\n\s*objectInfoSnapshot\.record\(/,
+    /if \(!preloadedDefs && refreshResponseIsCurrent\) \{[\s\S]{0,420}objectInfoSnapshot\.record\(/,
     "the refresh run records only a payload it fetched itself — a caller-supplied one is not provably whole",
   );
 });
@@ -1234,6 +1238,7 @@ function buildShippedSeed({
   api,
   epoch = 2,
   snapshot,
+  objectInfoCache = createObjectInfoCache(),
   verifiedNodeDefCache = createVerifiedNodeDefCache(),
   epochDuringFetch = null,
   generationDuringFetch = false,
@@ -1261,6 +1266,7 @@ function buildShippedSeed({
   const factory = new Function(
     "api",
     "objectInfoSnapshot",
+    "objectInfoCache",
     "verifiedNodeDefCache",
     "initialEpoch",
     "epochDuringFetch",
@@ -1293,6 +1299,7 @@ function buildShippedSeed({
       },
      },
      snapshot,
+     objectInfoCache,
      verifiedNodeDefCache,
      epoch,
     epochDuringFetch,
