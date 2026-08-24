@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.70] - 2026-08-24
+
+### Fixed
+- deep-freeze all object info cache reads (#1709)
+- preserve refreshed whole schema after add (#1709)
+- replace stale whole schema authority (#1709)
+- retire whole schema authority on class reads (#1709)
+- reuse verified add-node schema (#1709)
+
+
 ## [0.15.69] - 2026-08-24
 
 ### Fixed
