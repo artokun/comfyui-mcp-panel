@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.72] - 2026-08-24
+
+### Fixed
+- Isolate storyboard posters per render to prevent stale same-filename results (#1718)
+
 ## [0.15.71] - 2026-08-24
 
 ### Added
