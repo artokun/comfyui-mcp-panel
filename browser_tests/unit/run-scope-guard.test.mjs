@@ -571,6 +571,67 @@ test("#2099 promptContentHash: VHS date-template substitution is stable, ordinar
 });
 
 // ---------------------------------------------------------------------------
+// #2130 — KJNodes' Ideogram4PromptBuilderKJ derives the executable
+// `elements_data` input from its editor state through a live serializeValue.
+// Only that exact node + field + mechanism is excluded; arbitrary serializers,
+// other widgets, and other node types remain drift-covered.
+// ---------------------------------------------------------------------------
+
+const ideogramBuilderNode = (id, { withSerializer = true, type = "Ideogram4PromptBuilderKJ" } = {}) => ({
+  id,
+  type,
+  widgets: [
+    { name: "elements_data", value: "old regions", ...(withSerializer ? { serializeValue: () => "new regions" } : {}) },
+    { name: "high_level_description", value: "same subject", serializeValue: () => "same subject" },
+  ],
+});
+
+test("#2130 collectVolatileInputs: only the live Ideogram derived elements_data serializer is volatile", () => {
+  const root = {
+    _nodes: [
+      ideogramBuilderNode(14),
+      ideogramBuilderNode(15, { withSerializer: false }),
+      ideogramBuilderNode(16, { type: "OtherPromptBuilder" }),
+      { id: 17, type: "Ideogram4PromptBuilderKJ", widgets: [{ name: "style_palette_data", serializeValue: () => "palette" }] },
+      { id: 18, type: "Ideogram4PromptBuilderKJ", widgets: [{ name: "elements_data", serializeValue: "not callable" }] },
+    ],
+  };
+  assert.deepEqual(
+    [...collectVolatileInputs(root)].sort(),
+    ["14 elements_data"],
+    "the exclusion is keyed by node type, exact field, and callable live serializer",
+  );
+});
+
+test("#2130 promptContentHash: the derived field may settle, but sibling inputs and other nodes still refuse drift", () => {
+  const volatileInputs = collectVolatileInputs({ _nodes: [ideogramBuilderNode(14)] });
+  const stamped = {
+    "14": { class_type: "Ideogram4PromptBuilderKJ", inputs: { elements_data: "old regions", high_level_description: "same subject" } },
+    "9": { class_type: "SaveImage", inputs: { filename_prefix: "same" } },
+  };
+  const atHash = promptContentHash(stamped, volatileInputs);
+  const body = (builderInputs, filenamePrefix = "same") => JSON.stringify({ prompt: {
+    "14": { class_type: "Ideogram4PromptBuilderKJ", inputs: builderInputs },
+    "9": { class_type: "SaveImage", inputs: { filename_prefix: filenamePrefix } },
+  } });
+  assert.equal(
+    promptContentHashFromBody(body({ elements_data: "new regions", high_level_description: "same subject" }), volatileInputs),
+    atHash,
+    "the known queue-time derived value no longer false-refuses the scoped run",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(body({ elements_data: "new regions", high_level_description: "changed subject" }), volatileInputs),
+    atHash,
+    "a sibling user input on the same node remains drift-covered",
+  );
+  assert.notEqual(
+    promptContentHashFromBody(body({ elements_data: "new regions", high_level_description: "same subject" }, "changed"), volatileInputs),
+    atHash,
+    "an input on another node remains drift-covered",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // #1331 — the FOURTH volatility mechanism: after reconnect, leftover values of
 // link-driven converted widgets (MiniMax H3 clip/vae/model/length, …) settle
 // between the pre-dispatch stamp and the POST body. The #1050 single retry
@@ -1160,6 +1221,48 @@ test("#572 integration: the scoped-run result SURFACES the drift-uncovered input
       ["3 control_after_generate", "3 seed"],
       "the run reports exactly which inputs were NOT drift-covered for this run",
     );
+  } finally {
+    stop();
+  }
+});
+
+test("#2130 integration: dispatchScopedRun accepts a queue-time Ideogram derived-widget rewrite", async () => {
+  const stop = keepAlive();
+  try {
+    const stampedOutput = {
+      ...OUR_OUTPUT,
+      "14": {
+        class_type: "Ideogram4PromptBuilderKJ",
+        inputs: { elements_data: "old regions", high_level_description: "same subject" },
+      },
+    };
+    const queuedOutput = {
+      ...OUR_OUTPUT,
+      "14": {
+        class_type: "Ideogram4PromptBuilderKJ",
+        inputs: { elements_data: "new regions", high_level_description: "same subject" },
+      },
+    };
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget, output: stampedOutput });
+    app.graph = { _nodes: [ideogramBuilderNode(14)] };
+    app.queuePrompt = async (number, batch, arg) => {
+      const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const body = frontendBody({ output: queuedOutput, number, targets: targets?.length ? targets : null });
+      app.posted.push(body);
+      await apiTarget.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return true;
+    };
+    const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(result.outcome, "dispatched", "the derived queue-time rewrite is not mistaken for graph drift");
+    assert.equal(server.calls.length, 1, "the verified scoped prompt reaches ComfyUI once");
+    assert.deepEqual(result.volatileInputs, ["14 elements_data"]);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
   } finally {
     stop();
   }
