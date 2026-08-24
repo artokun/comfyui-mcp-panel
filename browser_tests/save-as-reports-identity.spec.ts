@@ -17,6 +17,11 @@
  * pass with the reply still empty — which is the bug.
  */
 import { test, expect, deleteSavedWorkflow } from './fixtures/panelTest'
+import { routeWorktreeSource } from './fixtures/worktreeSource'
+
+test.beforeEach(async ({ context }) => {
+  await routeWorktreeSource(context)
+})
 
 test('a Save-As reply carries the new workflow instance identity', async ({
   page,
@@ -99,6 +104,63 @@ test('a Save-As reply carries the new workflow instance identity', async ({
         await deleteSavedWorkflow(page, name)
       } catch {
         // Best-effort: cleanup must never mask the assertion that failed.
+      }
+    }
+  }
+})
+
+test('Save-As repaints destination identity before a graph edit and no-name save', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  test.setTimeout(120_000)
+  const cleanup: string[] = []
+  try {
+    await panel.goto()
+    await panel.setBridgeUrl(mockBridge.url)
+    await panel.openSidebar()
+    await panel.connect()
+
+    const first = await mockBridge.command('workflow_save', {})
+    expect(first.ok, 'the setup save must succeed').toBe(true)
+    const original = String(first.result?.workflow || '')
+    expect(original).toBeTruthy()
+    cleanup.push(original)
+
+    const copyName = `e2e-939-${Date.now()}`
+    const saved = await mockBridge.command('workflow_save', { name: copyName })
+    expect(saved.ok, 'the Save-As must succeed').toBe(true)
+    cleanup.push(copyName)
+    expect(saved.result?.saved_as).toBe(true)
+    expect(saved.result?.canvas_repainted).toBe(true)
+    expect(saved.result?.canvas_repaint_not_requested).toBeUndefined()
+    expect(saved.result?.routing_key).toBe(`wf:workflows/${copyName}.json`)
+
+    // Re-read the active identity the same way a real orchestrator does after a Save-As,
+    // without using workflow_open (which would hide a missing Save-As repaint by repairing
+    // the canvas as a separate operation).
+    mockBridge.forgetWorkflowUuid()
+    const edited = await mockBridge.command('graph_add_node', { class_type: 'VAEDecode' })
+    expect(edited.ok, `the graph edit must reach the repainted copy: ${edited.error || ''}`).toBe(true)
+
+    const resaved = await mockBridge.command('workflow_save', {})
+    expect(resaved.ok, `the no-name save must remain on the destination: ${resaved.error || ''}`).toBe(true)
+    expect(resaved.result?.saved_as).toBeUndefined()
+
+    const onDisk = await page.evaluate(async (path) => {
+      const api = (window as any).comfyAPI?.api?.api
+      const response = await api.fetchApi(`/userdata/${encodeURIComponent(path)}`)
+      return response?.ok ? response.json() : { error: `HTTP ${response?.status}` }
+    }, `workflows/${copyName}.json`)
+    expect(onDisk.extra?.comfyui_mcp?.workflow_path).toBe(`workflows/${copyName}.json`)
+    expect((onDisk.nodes ?? []).length).toBeGreaterThan(0)
+  } finally {
+    for (const name of cleanup.reverse()) {
+      try {
+        await deleteSavedWorkflow(page, name)
+      } catch {
+        // Best-effort cleanup must not mask the production-path assertion.
       }
     }
   }

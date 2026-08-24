@@ -6687,6 +6687,56 @@ function carryIdentityAcrossSaveSwap({ svc, preWf, preSwapUuid, savedAs = false,
   }
 }
 
+/** Rebind a persisted Save-As copy onto the shared canvas before its first persist.
+ *
+ * The workflow store's `openWorkflow(copy)` changes the active record but does not call
+ * `loadGraphData`, so the root can still carry the source graph and its source
+ * `workflow_path`. Stamp the copy's own identity and destination path into a cloned
+ * payload, repaint through the production load path, then require all three observations
+ * (active record, root uuid, root path) to agree. The save adapter captures the copy only
+ * after this returns true; a failed or partial repaint is a pre-commit refusal. */
+async function repaintSaveAsCanvas(copy, targetPath) {
+  try {
+    const state = copy?.changeTracker?.activeState ?? copy?.activeState;
+    if (!state || !Array.isArray(state.nodes) || typeof app?.loadGraphData !== "function") return false;
+    const destinationPath = typeof copy?.path === "string" && copy.path ? copy.path : targetPath;
+    if (typeof destinationPath !== "string" || !destinationPath) return false;
+    const targetUuid = workflowStableUuid(copy, { embed: true });
+    if (typeof targetUuid !== "string" || !targetUuid) return false;
+    const saveAsPayload = JSON.parse(JSON.stringify(state));
+    const existingExtra =
+      saveAsPayload.extra && typeof saveAsPayload.extra === "object" && !Array.isArray(saveAsPayload.extra)
+        ? saveAsPayload.extra
+        : {};
+    const existingMeta =
+      existingExtra[WORKFLOW_META_NAMESPACE] &&
+      typeof existingExtra[WORKFLOW_META_NAMESPACE] === "object" &&
+      !Array.isArray(existingExtra[WORKFLOW_META_NAMESPACE])
+        ? existingExtra[WORKFLOW_META_NAMESPACE]
+        : {};
+    saveAsPayload.extra = {
+      ...existingExtra,
+      [WORKFLOW_META_NAMESPACE]: {
+        ...existingMeta,
+        [WORKFLOW_UUID_FIELD]: targetUuid,
+        [WORKFLOW_PATH_FIELD]: destinationPath,
+      },
+    };
+    await app.loadGraphData(saveAsPayload, true, true, copy, { __cmcpKeepInstance: true });
+    const rootGraph = app?.graph;
+    const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
+    const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
+    return (
+      sameWorkflowObject(activeWorkflowRef(), copy) &&
+      canvasIsRoot &&
+      rootMeta?.[WORKFLOW_UUID_FIELD] === targetUuid &&
+      normalizedWorkflowPath(rootMeta?.[WORKFLOW_PATH_FIELD]) === normalizedWorkflowPath(destinationPath)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Programmatically save the active workflow — NO Save/Rename dialog.
  *
  *  Delegates to the shared, unit-tested `saveActiveWorkflow` (web/js/lib/
@@ -6747,6 +6797,11 @@ async function programmaticSave(name) {
     // and refuses a first save whose canvas provably belongs to another workflow.
     canvasBinding: describeLiveCanvasBinding,
     details,
+    repaintCanvas: async (copy, targetPath) => {
+      const repainted = await repaintSaveAsCanvas(copy, targetPath);
+      if (repainted) details.canvasRepainted = true;
+      return repainted;
+    },
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
     // #771 — ComfyUI answers EVERY filesystem error on the userdata write with one
     // 400 that blames the FILENAME, and logs the real cause a line earlier. This
@@ -6822,7 +6877,12 @@ async function programmaticSave(name) {
   // Hand back the RECORD, and let the caller resolve identity from it. `activatedRecord` is
   // the Save-As copy the adapter PROVED active; `savedRecord` covers the first-save path.
   // Either way it is the save transaction's own output, never a later active-canvas read.
-  return { name: saved || getWorkflowTitle(), producedRecord: details?.activatedRecord || details?.savedRecord || null, ...outcome };
+  return {
+    name: saved || getWorkflowTitle(),
+    producedRecord: details?.activatedRecord || details?.savedRecord || null,
+    ...(details.canvasRepainted ? { canvas_repainted: true } : {}),
+    ...outcome,
+  };
 }
 
 /** #1434 — dirty/persisted snapshot for a save that did not settle in time. */
@@ -18495,7 +18555,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // `workflow_identity_unavailable` explicitly, so the caller is told rather than misled.
     // An in-place save does not change which workflow is active, so its pre-existing #747
     // fallback strands nobody and stays.
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(outcome.saved_as ? replyIdentity : replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
+    return {
+      saved: true,
+      workflow,
+      ...outcome,
+      ...saveReplyIdentity(
+        outcome.saved_as ? replyIdentity : replyIdentity ?? liveWorkflowListActive().activeIdentity,
+        { savedAs: !!outcome.saved_as, canvasRepainted: outcome.canvas_repainted === true },
+      ),
+    };
   },
 
   async workflow_save_as({ name, rid }) {
@@ -18525,7 +18593,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // pre-save uuid already IS the active workflow's and no fence is about to refuse.
     // Telling that caller to re-fence and to re-open the workflow would send them fixing
     // something that is not broken.
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity, { savedAs: !!outcome.saved_as }) };
+    return {
+      saved: true,
+      workflow,
+      ...outcome,
+      ...saveReplyIdentity(replyIdentity, {
+        savedAs: !!outcome.saved_as,
+        canvasRepainted: outcome.canvas_repainted === true,
+      }),
+    };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------

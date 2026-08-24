@@ -3138,3 +3138,73 @@ test('P2: a Windows DRIVE-RELATIVE source ("C:Foo.json", no separator) is extern
   assert.ok(svc.disk.has('C:Foo.json'), 'external original preserved')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the external original')
 })
+
+test('#939: Save-As repaints destination metadata before a graph edit and no-name save', async () => {
+  const sourcePath = 'workflows/Source.json'
+  const destinationPath = 'workflows/Destination.json'
+  const sourceState = graphState('source')
+  sourceState.extra.comfyui_mcp = {}
+  sourceState.extra.comfyui_mcp.workflow_path = sourcePath
+  const source = {
+    path: sourcePath,
+    filename: 'Source.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc } = makeStore147Service({ active: source, graph: sourceState })
+  const order = []
+  const saveAs = svc.saveAs.bind(svc)
+  svc.saveAs = (...args) => {
+    order.push('saveAs')
+    return saveAs(...args)
+  }
+  const openWorkflow = svc.openWorkflow.bind(svc)
+  svc.openWorkflow = async (...args) => {
+    order.push('openWorkflow')
+    return openWorkflow(...args)
+  }
+  const saveWorkflow = svc.saveWorkflow.bind(svc)
+  svc.saveWorkflow = async (...args) => {
+    order.push('saveWorkflow')
+    return saveWorkflow(...args)
+  }
+
+  const repaintCanvas = async (copy, targetPath) => {
+    order.push('repaint:start')
+    const rebound = JSON.parse(JSON.stringify(copy.changeTracker.activeState))
+    rebound.extra.comfyui_mcp.workflow_path = targetPath
+    copy.changeTracker.activeState = rebound
+    order.push('repaint:verified')
+    return true
+  }
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Destination', {
+    existsOnDisk: async (path) => svc.disk.has(path),
+    canvasBinding: () => 'bound',
+    repaintCanvas,
+    details,
+  })
+
+  const copy = svc.activeWorkflow
+  assert.equal(copy.path, destinationPath)
+  assert.equal(details.mode, 'save-as-copy')
+  assert.equal(JSON.parse(svc.disk.get(destinationPath)).extra.comfyui_mcp.workflow_path, destinationPath)
+  assert.deepEqual(
+    order,
+    ['saveAs', 'openWorkflow', 'repaint:start', 'repaint:verified', 'saveWorkflow'],
+    'the production save path must repaint before it persists the copy',
+  )
+
+  // A graph edit after Save-As mutates the live canvas, then a no-name save must keep
+  // the destination identity rather than reintroducing the source path.
+  copy.changeTracker.activeState.nodes.push({ id: 2, type: 'EditedAfterSaveAs' })
+  await saveActiveWorkflow(svc, undefined, {
+    existsOnDisk: async (path) => svc.disk.has(path),
+    canvasBinding: () => 'bound',
+  })
+  const edited = JSON.parse(svc.disk.get(destinationPath))
+  assert.equal(edited.extra.comfyui_mcp.workflow_path, destinationPath)
+  assert.equal(edited.nodes.some((node) => node.type === 'EditedAfterSaveAs'), true)
+})

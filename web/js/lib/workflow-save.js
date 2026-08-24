@@ -556,6 +556,9 @@ export async function saveActiveWorkflow(
     // this module keeps no opinion about how the log is reached, and so a caller that
     // cannot reach it simply omits it.
     readSaveFailureCause,
+    // Optional production hook used for persisted Save-As copies. It must return true
+    // only after the destination-stamped copy is proven live on the shared canvas.
+    repaintCanvas,
   } = {},
 ) {
   const wf = svc?.activeWorkflow;
@@ -779,7 +782,12 @@ export async function saveActiveWorkflow(
     // never references the source's on-disk file. If that copy API is unavailable,
     // REFUSE rather than risk moving the external original.
     if (isExternalWorkflowPath(sourcePath)) {
-      const copyToUserDir = resolveSaveAsCopy(svc, { reconcileSavedCopy, canvasBinding, assertCanvasNotForeign });
+      const copyToUserDir = resolveSaveAsCopy(svc, {
+        reconcileSavedCopy,
+        canvasBinding,
+        assertCanvasNotForeign,
+        repaintCanvas,
+      });
       if (!copyToUserDir) {
         throw new Error(
           "save-as (copy) is unavailable on this frontend for an externally-loaded workflow; " +
@@ -834,7 +842,16 @@ export async function saveActiveWorkflow(
     // (#566 codex P0 — "whatever is active after the await" is NOT succession
     // evidence; a mid-trio switch to a foreign tab must thread/consume NOTHING).
     const producedRecord = {};
-    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign });
+    const atomicCopy = resolveSaveAsCopy(svc, {
+      reconcileSavedCopy,
+      producedRecord,
+      canvasBinding,
+      assertCanvasNotForeign,
+      // First-save successors already inherit the source's live identity and retain
+      // their existing copy semantics. The repaint is specifically for persisted/unknown
+      // Save-As copies whose source path metadata must follow the new destination.
+      repaintCanvas: cls === "never-persisted" ? undefined : repaintCanvas,
+    });
 
     // #226 CLASSIFICATION GUARD, scoped to the hazard it actually names (#1066 defect 2).
     //
@@ -1256,8 +1273,17 @@ async function probeSourceOnDisk(existsOnDisk, normPath) {
  *  `canvasBinding` is the #708 live-canvas identity oracle (see
  *  normalizeCanvasBinding). It decides ONE thing here: whether the SOURCE tab's
  *  serialized state may be refreshed from the live canvas before the copy is taken.
- *  See the comment at that call. */
-function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign } = {}) {
+ *  See the comment at that call.
+ *
+ *  `repaintCanvas` is an optional post-open hook for a persisted Save-As. When supplied,
+ *  it must repaint the copy's state onto the live canvas and return `true` only after
+ *  verifying that the copy and its destination metadata are live. The production panel
+ *  supplies this because the store-level `openWorkflow` moves the active pointer without
+ *  repainting it; first-save callers omit it to preserve their existing copy semantics. */
+function resolveSaveAsCopy(
+  svc,
+  { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign, repaintCanvas } = {},
+) {
   // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
   // returns is UNLOADED (no changeTracker → activeState === null), and
   // ComfyWorkflow.save() serializes `activeState ?? null` — so persisting a copy
@@ -1403,11 +1429,54 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
       };
       try {
         await svc.openWorkflow(copy);
-        // NO capture on the copy — see the #708 note at the top of this adapter. The
-        // copy persists the state `saveAs` took from the source tab; asking the copy's
-        // tracker to "prepare" re-reads the shared global canvas, which is precisely the
-        // read that put a foreign workflow's graph into a brand-new tab's file.
-        //
+        // The store-level open moves the active pointer without repainting the shared
+        // canvas. For a persisted Save-As the production panel therefore supplies a
+        // verified rebind here. It loads a destination-stamped copy state, proves the
+        // active record and root metadata agree, and only then captures the live canvas
+        // into the copy's tracker. Without this ordering the copy keeps the source's
+        // workflow_path, so a visible graph edit is followed by a no-name save refusal.
+        let canvasRepainted = false;
+        if (typeof repaintCanvas === "function") {
+          let repainted = false;
+          try {
+            repainted = (await repaintCanvas(copy, finalTargetPath)) === true;
+          } catch (err) {
+            throw markPreCommit(
+              new Error(
+                `refusing to save "${effectiveName}": rebinding the Save-As copy onto the ` +
+                  `canvas failed (${describeThrown(err)}). Nothing was written; the original ` +
+                  `workflow is untouched. Retry the save (#939).`,
+              ),
+            );
+          }
+          if (!repainted) {
+            throw markPreCommit(
+              new Error(
+                `refusing to save "${effectiveName}": the Save-As copy could not be proven ` +
+                  `active on the canvas with destination metadata. Nothing was written; the ` +
+                  `original workflow is untouched. Retry the save (#939).`,
+              ),
+            );
+          }
+          canvasRepainted = true;
+        }
+        // NO capture on the copy when no repaint hook was supplied — see the #708 note at
+        // the top of this adapter. Once the production hook has positively rebound the
+        // copy, capture is safe and is required to carry the destination path through a
+        // later graph edit/no-name save.
+        if (canvasRepainted) {
+          try {
+            copy?.changeTracker?.prepareForSave?.();
+          } catch (err) {
+            throw markPreCommit(
+              new Error(
+                `refusing to save "${effectiveName}": capturing the rebound Save-As copy ` +
+                  `failed (${describeThrown(err)}), so the saved copy could omit the newest ` +
+                  `edits. Nothing was written — retry the save (#939).`,
+              ),
+            );
+          }
+        }
         // #1267 — OBSERVE THE CAPTURE, DO NOT INFER IT FROM THE CALL ABOVE.
         //
         // Until now the ONLY thing standing between this route and a saved-but-empty
