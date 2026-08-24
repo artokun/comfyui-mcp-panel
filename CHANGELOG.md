@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.73] - 2026-08-24
+
+### Fixed
+- Tolerate live Ideogram derived-widget serializer churn while preserving unrelated drift checks (#2130)
+
 ## [0.15.72] - 2026-08-24
 
 ### Fixed
