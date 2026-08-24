@@ -1372,10 +1372,11 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once they have
   // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
   // do that and the trust flag accepts either (#1193): `refreshComboInNodes()` answering,
-  // or this run's OWN reapply sweep finishing with nothing skipped. If refreshComboInNodes
-  // is absent or throws AND the sweep did not cover the graph, the combos are still
-  // whatever page-load left them — possibly stale — so we must stay in over-report-safe
-  // mode (finding #4).
+  // or this run's OWN reapply sweep finishing with nothing skipped. A timed-out frontend
+  // call remains pending under the coalescer fence, so neither path opens trust until all
+  // mutation work has settled. If refreshComboInNodes is absent or throws AND the sweep did
+  // not cover the graph, the combos are still whatever page-load left them — possibly stale —
+  // so we must stay in over-report-safe mode (finding #4).
   //
   // #635: the run's outcome is a VERDICT (lib/node-def-refresh.js), not a bare
   // boolean — {refreshed:false} alone was indistinguishable from a no-op, so the
@@ -1445,6 +1446,10 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // is refused if a reconnect lands while the fetch is in flight, so a pre-restart schema
   // can never be filed under post-restart provenance.
   const runStartedAtEpoch = backendReconnectEpoch;
+  // A refresh is not authoritative while any of its frontend mutation work is still
+  // outstanding. Consumers such as collectMissingAssets must fail closed during that
+  // window, even if an earlier run had established trust.
+  nodeDefsRefreshConfirmed = false;
   let thrown = null;
   // #608 — what EACH transport did in the fetch phase, in order, when none of them produced
   // a payload. The verdict appends it, so a refusal names the routes that were actually
@@ -1474,6 +1479,9 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // Declared here because `a` is block-scoped to the try: the guard needs the
   // app reference to survive into the post-verdict check.
   let graphGuard = null;
+  let comboCompletionPending = false;
+  let buildRefreshVerdict = null;
+  let initialRefreshVerdict = null;
   try {
     const a = typeof app !== "undefined" && app ? app : window.comfyAPI?.app?.app;
     if (!a) return describeNodeDefRefresh({ appAvailable: false, defsObtained: false, defsRegistered: false, comboApiPresent: false, comboRan: false });
@@ -1916,21 +1924,13 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       // as a stall by fabricating a "did not answer within 10000ms" message for a failure
       // that had landed instantly.
       //
-      // ABANDONING THIS ONE IS NOT LIKE ABANDONING A FETCH, and that is the cost of the
-      // bound rather than an argument against it. Read from the frontend build this ComfyUI
-      // serves: `refreshComboInNodes` -> `reloadNodeDefs`, whose only long await is its own
-      // `getNodeDefs()`. Everything after that — `registerNodeDef` for every id, then a
-      // walk of the whole graph rewriting each combo widget's options — runs whenever that
-      // fetch finally resolves. So a combo phase given up on does not stop: it mutates the
-      // graph later, after this run has already reported that combos are stale, and it does
-      // so outside `makeRefreshCoalescer`, which only serialises runs the panel starts.
-      //
-      // Accepted, because the alternative is the reported bug. The mutation it eventually
-      // performs is the CORRECT one — fresher defs than the verdict claimed — so the run's
-      // report is pessimistic rather than wrong. The unbounded version did the same
-      // mutation at the same moment; the only thing the bound changes is that the panel
-      // stops waiting for it. (What an abandoned call means for the SHARED trust flag is
-      // no longer "always false": see the #1193 note below and at the assignment.)
+      // ABANDONING OBSERVATION IS NOT ABANDONING THE MUTATION. Read from the frontend build
+      // this ComfyUI serves: `refreshComboInNodes` -> `reloadNodeDefs`, whose only long await
+      // is its own `getNodeDefs()`. Everything after that — `registerNodeDef` for every id,
+      // then a walk of the graph rewriting each combo widget's options — runs whenever that
+      // fetch finally resolves. The command may stop waiting at its relay budget, but the
+      // production run hands this promise to `makeRefreshCoalescer` as a completion fence.
+      // That keeps the successor and the shared trust flag behind the actual mutation.
       //
       // #1193 — the bound is READ INTO A VARIABLE rather than computed inline, because the
       // refusal has to be able to say how much time this phase was actually given. Without
@@ -1962,10 +1962,11 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       const comboBudgetLeft = nodeDefsBudgetLeft(runDeadline);
       comboWaitMs = Math.min(comboBudgetLeft, NODE_DEFS_RUN_BUDGET_MS);
       const comboWaitCapped = comboWaitMs < comboBudgetLeft;
+      const comboPromise = Promise.resolve()
+        .then(() => a.refreshComboInNodes())
+        .then(() => COMBO_OK, (err) => ({ err }));
       const comboSettled = await withTimeout(
-        Promise.resolve()
-          .then(() => a.refreshComboInNodes())
-          .then(() => COMBO_OK, (err) => ({ err })),
+        comboPromise,
         comboWaitMs,
         () => COMBO_NO_ANSWER,
       );
@@ -1988,10 +1989,62 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       // the budget to cover it would also break the property it is sized on: two serialized
       // runs must fit the bridge's 20s read default.
       //
-      // So this run stops waiting and says so, rather than reporting stale dropdowns it has
-      // already rebuilt. A THROW still fails: that is the frontend reporting something
-      // wrong, which is evidence, where a timeout is only the absence of an answer.
+      // So a bounded command can stop waiting and report a retryable status without claiming
+      // success. The production run itself remains the single-flight owner until the promise
+      // settles; a THROW still fails because that is frontend evidence, whereas a timeout is
+      // only the absence of an answer.
       const comboAbandoned = comboSettled === COMBO_NO_ANSWER;
+      if (comboAbandoned && typeof runControl?.deferCompletion === "function") {
+        // The command may stop waiting at its budget, but the refresh itself still owns the
+        // combo mutation. Keep the coalescer slot occupied and defer the authoritative result
+        // until the late frontend promise settles; otherwise a reconnect successor can race
+        // this mutation and collectMissingAssets can read a mixed-generation combo list.
+        comboCompletionPending = true;
+        runControl.deferCompletion(
+          comboPromise.then((lateSettled) => {
+            if (lateSettled === COMBO_OK) {
+              // Preserve #1193's local-rebuild disclosure when it was the observed fallback;
+              // otherwise the late frontend answer is the freshness proof.
+              if (!comboAbandonedAfterRebuild) comboRan = true;
+              comboFailed = false;
+              phase = "done";
+              thrown = null;
+            } else {
+              comboRan = false;
+              comboFailed = true;
+              comboAbandonedAfterRebuild = false;
+              phase = "combo";
+              thrown = lateSettled.err;
+              console.warn("[comfyui-mcp-panel] late combo refresh did not complete:", thrown);
+            }
+            comboCompletionPending = false;
+            const currentRun = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
+            nodeDefsRefreshConfirmed =
+              currentRun && !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
+            const lateVerdict = buildRefreshVerdict?.();
+            if (!lateVerdict || !initialRefreshVerdict) return initialRefreshVerdict;
+            // The late phase can revise only combo freshness. Preserve disclosures produced
+            // by the earlier graph/placeholder/empty-list checks, and never let a late combo
+            // success erase a graph-loss refusal.
+            if (initialRefreshVerdict.reason === NODE_DEF_REFRESH_REASONS.GRAPH_NODES_LOST) {
+              return initialRefreshVerdict;
+            }
+            const mergedVerdict = { ...lateVerdict };
+            for (const key of [
+              "requires_reload",
+              "stale_placeholders",
+              "stale_placeholders_note",
+              "empty_combo_lists",
+              "empty_combo_lists_note",
+              "restored_nodes",
+              "restored_nodes_note",
+            ]) {
+              if (key in initialRefreshVerdict) mergedVerdict[key] = initialRefreshVerdict[key];
+            }
+            return mergedVerdict;
+          }),
+        );
+      }
       if (comboAbandoned && comboRebuildCovered(comboRebuild)) {
         // The ONE state this disclosure covers, recorded as its own flag rather than
         // re-derived downstream from the sweep's stats. The combo phase reifies its
@@ -2005,7 +2058,10 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
           `[comfyui-mcp-panel] refreshComboInNodes() had not answered within ${comboWaitMs}ms; ` +
             `not waiting further — this run's own sweep rebuilt ${comboRebuild.combosRebuilt} combo ` +
             `option list(s) across ${comboRebuild.nodesSwept} node(s) from the payload it fetched, ` +
-            "skipping none.",
+            "skipping none." +
+            (comboCompletionPending
+              ? " The refresh remains in-flight until the frontend operation settles."
+              : ""),
         );
       } else if (!comboRan) {
         // A SEPARATE FLAG, for the third time on this path and the same reason each time:
@@ -2086,7 +2142,7 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     // combo trust while the post-reconnect successor is pending.
     const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
     nodeDefsRefreshConfirmed =
-      runIsCurrent && !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
+      runIsCurrent && !comboCompletionPending && !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
   // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
@@ -2094,8 +2150,9 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // coalescer forwards this through a forced trailing run, so get_errors' awaited
   // `force:true` refresh resolves to the freshness verdict of the fetch IT triggered
   // (codex round-6 P0).
-  const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
-  const verdict = runIsCurrent
+  buildRefreshVerdict = () => {
+    const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;
+    return runIsCurrent
     ? describeNodeDefRefresh({
         appAvailable,
         defsObtained: !!defs,
@@ -2127,6 +2184,8 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
           "The refresh was superseded by a ComfyUI reconnect. Retry after the post-reconnect " +
           "refresh settles; do not rely on this run's registry or combo lists.",
       };
+  };
+  const verdict = buildRefreshVerdict();
   // #1275 — VERIFY the refresh was ADDITIVE over the live graph.
   //
   // The snapshot above was taken immediately before the register phase, so this
@@ -2246,8 +2305,8 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     // path. Disclosure, not failure.
     //
     // Read from `defs`, which is already in hand, and NOT by re-reading widgets after
-    // `app.refreshComboInNodes()` resolves: #1193 stopped waiting on that call past its
-    // bound, and a disclosure that depended on it would report nothing when it is abandoned.
+    // `app.refreshComboInNodes()` resolves: the late-completion fence is about lifecycle
+    // ownership, while this disclosure remains a diagnosis of the payload already obtained.
     const empties = emptyComboListsOnGraph(getGraphCtx().rootGraph, defs);
     if (empties.length) {
       verdict.empty_combo_lists = empties;
@@ -2256,6 +2315,9 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   } catch {
     /* a diagnosis must never turn a successful refresh into a failure */
   }
+  // The deferred combo completion returns the same verdict after updating its authoritative
+  // phase state, including any graph-loss/placeholder disclosures added above.
+  initialRefreshVerdict = verdict;
   return verdict;
 }
 

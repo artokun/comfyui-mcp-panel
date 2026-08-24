@@ -620,6 +620,36 @@ test("#1680: a timed-out joined refresh is not cancelled and a later call can re
   assert.equal(built.runs.length, 2, "the later idle call starts exactly one new refresh");
 });
 
+test("#1695: repeated retries share one pending completion and eventually succeed", async () => {
+  const lateCompletion = deferred();
+  const built = realRefreshNodes({
+    budgetMs: 25,
+    runHook: async ({ control }) => {
+      control.deferCompletion(
+        lateCompletion.promise.then(() => ({ refreshed: true, reason: "refreshed" })),
+      );
+      return { refreshed: false, reason: "refresh_pending" };
+    },
+  });
+
+  const first = await withWatchdog(() => built.refresh_nodes(), 1500, "first refresh did not report its status");
+  assert.equal(first.value.reason, "refresh_still_running");
+  const second = await withWatchdog(() => built.refresh_nodes(), 1500, "second retry did not report its status");
+  assert.equal(second.value.reason, "refresh_still_running");
+  assert.equal(built.runs.length, 1, "retries remain attached to the same production refresh");
+  assert.notEqual(built.getInFlight(), null, "the deferred completion still owns the slot");
+
+  lateCompletion.resolve();
+  const settled = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "retry after the late completion did not receive success",
+  );
+  assert.equal(settled.value.refreshed, true, "the command eventually exposes the completed verdict");
+  assert.equal(built.runs.length, 1, "settlement does not start a competing refresh");
+  await built.inFlightStarted?.catch(() => {});
+});
+
 test("#1680: with no refresh in flight, refresh_nodes starts its own forced run", async () => {
   const built = realRefreshNodes({ startInFlight: false, budgetMs: 500 });
   const { value } = await withWatchdog(

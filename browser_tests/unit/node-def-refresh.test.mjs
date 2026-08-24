@@ -343,7 +343,7 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
   assert.match(body, /return describeNodeDefRefresh\(\{/, "the run verdict is returned");
   assert.match(
     body,
-    /nodeDefsRefreshConfirmed =\s*runIsCurrent && !didThrow && !!defs && \(comboRan \|\| comboAbandonedAfterRebuild\);/,
+    /nodeDefsRefreshConfirmed =\s*runIsCurrent && !comboCompletionPending && !didThrow && !!defs && \(comboRan \|\| comboAbandonedAfterRebuild\);/,
     "the shared global stays a strict boolean, and #1193 admits the panel's OWN completed " +
       "combo rebuild as the second way the live lists became current",
   );
@@ -876,8 +876,18 @@ test("#1180: the shipped combo phase is bounded, and its outcomes stay apart", (
   assert.ok(combo.length > 0, "could not locate the combo phase");
   assert.match(
     combo,
-    /withTimeout\(\s*Promise\.resolve\(\)\s*\.then\(\(\) => a\.refreshComboInNodes\(\)\)/,
-    "the combo refresh itself must be the bounded promise, not merely nearby",
+    /const comboPromise = Promise\.resolve\(\)\s*\.then\(\(\) => a\.refreshComboInNodes\(\)\)/,
+    "the combo refresh itself must be the promise handed to the bound",
+  );
+  assert.match(
+    combo,
+    /withTimeout\(\s*comboPromise\s*,/,
+    "the combo observation must bound the production promise",
+  );
+  assert.match(
+    combo,
+    /runControl\?\.deferCompletion|runControl\.deferCompletion/,
+    "a timed-out combo must remain owned by the production lifecycle",
   );
   assert.doesNotMatch(
     combo,
