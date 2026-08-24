@@ -971,6 +971,71 @@ test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on re
   }
 });
 
+test("#1728 production bridge wiring fences same-route re-advertisement before receipts", () => {
+  const sendHelloAt = panelSrc.indexOf("  function sendHello() {");
+  const sendHelloEnd = panelSrc.indexOf("\n\n  /** Returns a promise", sendHelloAt);
+  const sendHello = panelSrc.slice(sendHelloAt, sendHelloEnd);
+  const readyAt = panelSrc.indexOf("    isRouteReady() {");
+  const readyEnd = panelSrc.indexOf("\n    },", readyAt);
+  const ready = panelSrc.slice(readyAt, readyEnd);
+  const senderAt = panelSrc.indexOf("  const panelRunReceiptSender =");
+  const senderEnd = panelSrc.indexOf("\n  const panelRunReceiptTransport", senderAt);
+  const sender = panelSrc.slice(senderAt, senderEnd);
+
+  assert.match(sendHello, /nextRouteBindingGeneration/);
+  assert.match(sendHello, /pendingRouteBindingGeneration = bindingGeneration/);
+  assert.match(sendHello, /sent === true/);
+  assert.match(ready, /pendingRouteBindingGeneration !== null/);
+  assert.match(sender, /runReceiptOutbox\.enqueue\(rid, promptId, routeId\)/);
+  assert.doesNotMatch(sender, /routeId\s*\?\?/);
+});
+
+test("#1728 CALL SITE: a null dispatch route is refused rather than substituted from the remount", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const receiptFrames = [];
+    const outbox = createRunReceiptOutbox({ retryMs: 60000 });
+    outbox.setTransport({
+      routeId: () => "replacement-route-1728",
+      ready: () => true,
+      sendFrame: (frame) => {
+        receiptFrames.push(frame);
+        return true;
+      },
+    });
+    let capturedRoute = "unset";
+    let latePromptId;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      panelRunOwnerRef: { current: { generation: 1 } },
+      runReceiptRouteRef: () => null,
+      runReceiptSender: (rid, promptId, routeId) => {
+        capturedRoute = routeId;
+        return outbox.enqueue(rid, promptId, routeId);
+      },
+      dispatch: async (args) => {
+        latePromptId = () => args.onPromptId("null-route-prompt-1728");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    await built.graph_run({ to_node_id: 327, rid: "run-rid-null-route-1728" });
+    latePromptId();
+
+    assert.equal(capturedRoute, null, "the sender receives the dispatch's captured null route");
+    assert.equal(outbox.pendingSize(), 0, "a null route is not queued for a different mount");
+    assert.deepEqual(receiptFrames, [], "the receipt is not attributed to the replacement route");
+  } finally {
+    stop();
+  }
+});
+
 test("#1728 CALL SITE: a late callback after remount cannot touch the replacement tracker", async () => {
   const stop = keepAlive();
   try {

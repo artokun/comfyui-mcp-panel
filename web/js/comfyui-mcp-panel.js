@@ -24224,6 +24224,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // all, which is strictly worse than the race. Every other caller (#654's refused-route
   // retry included) is a re-advertise by definition and passes through the gate.
   let advertisedSock = null;
+  // A same-socket re-hello withdraws the old route binding before the replacement
+  // hello lands. Route equality alone cannot prove that the replacement binding is
+  // live, so stamped control frames stay fenced while this generation is pending.
+  let nextRouteBindingGeneration = 0;
+  let pendingRouteBindingGeneration = null;
   // #1095 — the route id the last LANDED hello actually carried. Compared against the live
   // `bridgeRouteId()` to tell whether the orchestrator's binding still names the workflow
   // the panel has already committed to; see routeIsStale in lib/rehello-gate.js for why
@@ -25436,6 +25441,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // Clearing also invalidates those marks, so when the retired socket's commands do
       // finish, their releases cannot discount the new connection's work.
       rehelloGate.cancel();
+      pendingRouteBindingGeneration = null;
       // The replacement socket has no mapping yet, so its first hello CREATES one and must
       // not be gated.
       advertisedSock = null;
@@ -25496,7 +25502,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // against a route that does not exist yet. `advertisedSock` is set only on the success
     // path below, so a hello that never landed does not arm the gate either.
     if (!sock || sock !== advertisedSock) return advertiseHello();
-    return rehelloGate.request();
+    const bindingGeneration = ++nextRouteBindingGeneration;
+    pendingRouteBindingGeneration = bindingGeneration;
+    const request = rehelloGate.request();
+    // A failed request leaves the old binding fenced. The active close/new-socket
+    // path clears it, and the receipt outbox TTL bounds retention if the socket stays
+    // open but the replacement hello never lands.
+    void Promise.resolve(request).then(
+      (sent) => {
+        if (sent === true && pendingRouteBindingGeneration === bindingGeneration) {
+          pendingRouteBindingGeneration = null;
+        }
+      },
+      () => {},
+    );
+    return request;
   }
 
   /** Returns a promise resolving to whether the hello actually REACHED THE WIRE.
@@ -26268,6 +26288,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // for, which is the corruption class #508 already refuses to risk. Dropped, not
       // flushed; the new socket's own open hello registers the tab.
       rehelloGate.cancel();
+      pendingRouteBindingGeneration = null;
       advertisedSock = null;
       connect();
     },
@@ -26285,6 +26306,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
      */
     isRouteReady() {
       if (!sock || sock.readyState !== WebSocket.OPEN || !handshakeDone) return false;
+      if (pendingRouteBindingGeneration !== null) return false;
       let routeId = null;
       try {
         routeId = bridgeRouteId();
@@ -26318,6 +26340,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       handshakenSock = null;
       // #1095 — see setUrl: a parked hello must never outlive the socket it was queued for.
       rehelloGate.cancel();
+      pendingRouteBindingGeneration = null;
       advertisedSock = null;
     },
     destroy() {
@@ -26335,6 +26358,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // #1095 — and a torn-down panel must not leave a timer armed to hello from a closure
       // nothing owns any more.
       rehelloGate.cancel();
+      pendingRouteBindingGeneration = null;
       advertisedSock = null;
     },
   };
@@ -36111,7 +36135,7 @@ function buildPanel() {
     }
   };
   const panelRunReceiptSender = (rid, promptId, routeId) =>
-    runReceiptOutbox.enqueue(rid, promptId, routeId ?? panelRunReceiptRouteRef());
+    runReceiptOutbox.enqueue(rid, promptId, routeId);
   const panelRunReceiptTransport = {
     routeId: panelRunReceiptRouteRef,
     ready: () => client.isRouteReady?.() === true,
