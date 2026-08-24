@@ -53,6 +53,25 @@ function setEnumerable(out, key, value) {
   });
 }
 
+function memoKey(redactScalars) {
+  return redactScalars ? "sensitive" : "ordinary";
+}
+
+function memoGet(seen, value, redactScalars) {
+  const entries = seen.get(value);
+  const key = memoKey(redactScalars);
+  return entries && Object.hasOwn(entries, key) ? entries[key] : undefined;
+}
+
+function memoSet(seen, value, redactScalars, result) {
+  let entries = seen.get(value);
+  if (!entries) {
+    entries = Object.create(null);
+    seen.set(value, entries);
+  }
+  entries[memoKey(redactScalars)] = result;
+}
+
 function redactNestedValue(value, seen, redactScalars = false) {
   if (typeof value === "string") {
     return redactScalars || SECRET_VALUE_RE.test(value) ? REDACTED_WIDGET_VALUE : value;
@@ -61,12 +80,16 @@ function redactNestedValue(value, seen, redactScalars = false) {
     return REDACTED_WIDGET_VALUE;
   }
   if (!Array.isArray(value) && !isPlainObject(value)) return value;
-  if (seen.has(value)) return seen.get(value);
+  const memoized = memoGet(seen, value, redactScalars);
+  if (memoized !== undefined) return memoized;
 
   const out = Array.isArray(value)
     ? new Array(value.length)
     : Object.create(Object.getPrototypeOf(value) === null ? null : Object.prototype);
-  seen.set(value, out);
+  // A shared object may be reached once through an ordinary key and once through
+  // a credential-like key. Keep a separate in-progress result for each context so
+  // the first traversal cannot satisfy the second with an unsanitized alias.
+  memoSet(seen, value, redactScalars, out);
 
   let changed = false;
   for (const key of Object.keys(value)) {
@@ -78,7 +101,7 @@ function redactNestedValue(value, seen, redactScalars = false) {
     setEnumerable(out, key, next);
   }
   if (!changed) {
-    seen.set(value, value);
+    memoSet(seen, value, redactScalars, value);
     return value;
   }
   return out;

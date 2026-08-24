@@ -92,11 +92,13 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
   assert.ok(start >= 0 && end > start, "graph_get_subgraph handler must remain extractable");
   const method = src.slice(start, end).replace(/,\s*$/, "");
   const graph = {};
+  const sharedParentValue = { value: "SECRET" };
   const parent = {
     id: 173,
     title: "Reusable secret node",
     widgets: [
-      { name: "apiKey", value: "live-parent-api-key" },
+      { name: "ordinarySettings", value: sharedParentValue },
+      { name: "apiKey", value: sharedParentValue },
       {
         name: "instanceSettings",
         value: {
@@ -133,7 +135,8 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
   const out = getSubgraph({ node_id: 173 });
   assert.deepEqual(out.subgraph_of, { node_id: 173, title: "Reusable secret node" });
   assert.deepEqual(out.instance_widgets, {
-    apiKey: REDACTED_WIDGET_VALUE,
+    ordinarySettings: { value: "SECRET" },
+    apiKey: { value: REDACTED_WIDGET_VALUE },
     instanceSettings: {
       visible: "keep this setting",
       api_key: REDACTED_WIDGET_VALUE,
@@ -141,7 +144,11 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     },
     prompt: "visible prompt",
   });
+  assert.notStrictEqual(
+    out.instance_widgets.ordinarySettings,
+    out.instance_widgets.apiKey,
+    "production provenance must split ordinary and sensitive alias contexts",
+  );
   assert.deepEqual(out.nodes, [{ id: 166, mode: 4, inputs: [], outputs: [] }]);
-  assert.ok(!JSON.stringify(out).includes("live-parent-api-key"));
   assert.ok(!JSON.stringify(out).includes("nested-private-key"));
 });

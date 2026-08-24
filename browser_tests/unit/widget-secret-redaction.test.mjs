@@ -83,3 +83,25 @@ test("#1729 recursively redacts nested credential keys and secret-shaped scalars
   });
   assert.equal(JSON.stringify(value), before, "redaction must not mutate the live widget value");
 });
+
+test("#1729 does not reuse an ordinary alias for a sensitive-key alias", () => {
+  // The ordinary traversal reaches this object first. The sensitive traversal must
+  // still get its own context, or shared.value crosses the api_key boundary raw.
+  const shared = { value: "SECRET" };
+  const safe = redactWidgetValue("config", { ordinary: shared, api_key: shared });
+
+  assert.equal(safe.ordinary.value, "SECRET", "ordinary visible values remain intact");
+  assert.equal(safe.api_key.value, REDACTED_WIDGET_VALUE, "the sensitive alias is redacted");
+  assert.notStrictEqual(safe.ordinary, safe.api_key, "different redaction contexts cannot share output");
+  assert.equal(shared.value, "SECRET", "the live aliased value is not mutated");
+});
+
+test("#1729 preserves aliases and cycles within one redaction context", () => {
+  const shared = { value: "visible" };
+  const cycle = { value: "visible" };
+  cycle.self = cycle;
+  const safe = redactWidgetValue("config", { left: shared, right: shared, cycle });
+
+  assert.strictEqual(safe.left, safe.right, "same-context aliases remain aliases");
+  assert.strictEqual(safe.cycle.self, safe.cycle, "same-context cycles remain finite and cyclic");
+});
