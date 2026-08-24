@@ -42,6 +42,8 @@ import {
   fetchTypeScopedObjectInfo,
   SCOPED_OBJECT_INFO_DEADLINE_MS,
 } from "../../web/js/lib/scoped-object-info.js";
+import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
+import { scanComboAvailability } from "../../web/js/lib/live-combo-availability.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "../../web/js/lib/rgthree-lora-row.js";
 import { inputAssetViewQuery } from "../../web/js/lib/input-asset.js";
 import {
@@ -50,6 +52,7 @@ import {
   SET_WIDGET_COMMAND_BUDGET_MS,
   SET_WIDGET_POST_REFRESH_RESERVE_MS,
 } from "./_panel-constants.mjs";
+import { runProductionGraphGetErrors } from "./_graph-get-errors-harness.mjs";
 
 const graphGetMatch = PANEL_SRC.match(
   /\n  async graph_get_object_info\(\{ if_none_match \} = \{\}\) \{[\s\S]*?\n  \},/,
@@ -295,7 +298,11 @@ function realGraphSetWidget({
   fetchApiImpl = null,
   getNodeDefsImpl = null,
   objectInfoCache = createObjectInfoCache(),
-  objectInfoSnapshot = { record: () => true, authorize: () => ({ defs: null, reason: "none recorded" }) },
+  objectInfoSnapshot = {
+    record: () => true,
+    authorize: () => ({ defs: null, reason: "none recorded" }),
+    clear: () => {},
+  },
   verifiedNodeDefCache = createVerifiedNodeDefCache(),
   registeredNodeTypes = { LoadImage: {}, Note: {} },
 } = {}) {
@@ -754,6 +761,117 @@ test("#1709: authoritative empty retires whole cache and snapshot before ordinar
     ["/object_info", "/object_info"],
     "the later ordinary read reached both live routes after the cache was retired",
   );
+});
+
+test("#1709: a definitive per-class absence retires cached whole proof before graph_set_widget timeout fallback", async () => {
+  const widget = { name: "text", type: "text", value: "before" };
+  const def = {
+    input: { required: { mode: [["old"], {}], text: ["STRING", {}] } },
+  };
+  const scanWidget = { name: "mode", type: "combo", options: { values: ["old"] }, value: "old" };
+  const node = {
+    id: 214,
+    type: "RemovedNode",
+    widgets: [widget, scanWidget],
+    constructor: { nodeData: def, comfyClass: "RemovedNode" },
+  };
+  const objectInfoCache = createObjectInfoCache();
+  const objectInfoSnapshot = createObjectInfoSnapshot();
+  let unavailable = false;
+  let holdWholeRead = false;
+  const wholeReadStarted = deferred();
+  const oldWholeResponse = deferred();
+  const wholeDefs = { RemovedNode: def };
+  const built = realGraphSetWidget({
+    node,
+    objectInfoCache,
+    objectInfoSnapshot,
+    oracleDefs: wholeDefs,
+    getNodeDefsImpl: async () => {
+      if (unavailable) return undefined;
+      if (holdWholeRead) {
+        wholeReadStarted.resolve();
+        await oldWholeResponse.promise;
+      }
+      return wholeDefs;
+    },
+    fetchApiImpl: async (route) =>
+      unavailable
+        ? { status: 504, json: async () => ({}) }
+        : { status: 200, json: async () => wholeDefs },
+    registeredNodeTypes: {
+      LoadImage: {},
+      Note: {},
+      RemovedNode: { nodeData: def, comfyClass: "RemovedNode" },
+    },
+  });
+
+  const first = await built.graph_set_widget({
+    node_id: 214,
+    widget: "text",
+    value: "after-first-write",
+    workflow_uuid: "u",
+  });
+  assert.equal(first.set.value, "after-first-write", "the initial live whole schema authorizes the write");
+  assert.equal(objectInfoCache.peek().cached, true, "the whole proof is cached before the class reader runs");
+  assert.equal(objectInfoSnapshot.peek().held, true, "the whole membership proof is held before the class reader runs");
+
+  objectInfoCache.invalidate();
+  objectInfoSnapshot.clear();
+  holdWholeRead = true;
+  const pendingWholeWrite = built.graph_set_widget({
+    node_id: 214,
+    widget: "text",
+    value: "stale-response-write",
+    workflow_uuid: "u",
+  });
+  // Attach the handler before the independent per-class command can retire the response.
+  // Node reports a rejected command as unhandled if the assertion waits until after that
+  // overlapping command has completed.
+  pendingWholeWrite.catch(() => {});
+  await wholeReadStarted.promise;
+
+  const graph = { _nodes: [node], getNodeById: () => node };
+  const absent = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: async () => ({
+      [SINGLE_NODE_INFO_OUTCOME]: true,
+      kind: "absent",
+      body: {},
+    }),
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: built.verifiedNodeDefCache,
+    stepBudget: () => 1000,
+  });
+  assert.equal(absent.unchecked_nodes.length, 1, "the definitive per-class absence is reported as unchecked");
+  assert.equal(objectInfoCache.peek().cached, false, "the per-class reader retires the whole burst cache");
+  assert.equal(objectInfoSnapshot.peek().held, false, "the per-class reader retires the whole membership snapshot");
+
+  oldWholeResponse.resolve();
+  await assert.rejects(
+    () => pendingWholeWrite,
+    /REFRESHED|possibly-stale|Refusing|refused/i,
+    "the in-flight whole response issued before per-class absence cannot authorize the write",
+  );
+  assert.equal(widget.value, "after-first-write", "the retired whole response did not mutate the widget");
+
+  unavailable = true;
+  await assert.rejects(
+    () =>
+      built.graph_set_widget({
+        node_id: 214,
+        widget: "mode",
+        value: "refused",
+        workflow_uuid: "u",
+      }),
+    /Cannot set widget|object_info is unavailable|refused/i,
+    "after definitive class absence, a later whole-schema timeout cannot reuse the old proof",
+  );
+  assert.equal(widget.value, "after-first-write", "the timeout fallback refuses before mutating the widget");
 });
 
 // ---------------------------------------------------------------------------

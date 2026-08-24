@@ -239,6 +239,7 @@ function realGraphAddNode({
     recordObjectInfoTypes: (defs) => defs,
     objectInfoHistory: { wasTypeEverDefined: () => false },
     objectInfoSnapshot: { record: () => true, clear: () => {} },
+    objectInfoCache: createObjectInfoCache(),
     verifiedNodeDefCache: createVerifiedNodeDefCache(),
     backendReconnectEpoch: 0,
     readPackImportFailures: async () => [],

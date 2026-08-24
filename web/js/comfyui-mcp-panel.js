@@ -13767,6 +13767,8 @@ const GRAPH_TOOL_EXECUTORS = {
             // A 200 `{}` is authoritative absence from the class-scoped route. Do not
             // let a later whole-schema timeout turn that answer into permission to use
             // an older verified proof.
+            objectInfoCache.invalidate();
+            objectInfoSnapshot.clear();
             verifiedNodeDefCache.invalidate(class_type);
             freshDefs = recordObjectInfoTypes({});
             freshDefsAreSingleClass = true;
@@ -13776,6 +13778,8 @@ const GRAPH_TOOL_EXECUTORS = {
           if (schemaProbeIsCurrent(issued) && one?.kind === "present") {
             // A live present answer can describe a changed schema. Retire the previous
             // proof before any later add failure can leave it available as a fallback.
+            objectInfoCache.invalidate();
+            objectInfoSnapshot.clear();
             verifiedNodeDefCache.invalidate(class_type);
             verifiedSchemaWriteGeneration = verifiedNodeDefCache.generation();
             verifiedSchemaWriteEpoch = issued.epoch;
@@ -15552,6 +15556,8 @@ const GRAPH_TOOL_EXECUTORS = {
             // Preserve the payload for the refusal diagnostic, but do not promote it into
             // backend history or snapshot authority. runSetWidget re-reads this provenance
             // before type authorization and turns retired/reconnected evidence into a refusal.
+            setWidgetSchemaProvenance = () =>
+              readProvenance === "reconnected" ? "reconnected" : "retired";
             return defs;
           }
           // A WHOLE map (this route never asks the per-class one — see the #716/#821 note
@@ -15678,6 +15684,8 @@ const GRAPH_TOOL_EXECUTORS = {
         if (Array.isArray(scoped.covered)) {
           for (const classType of scoped.covered) {
             if (typeof classType === "string" && classType) {
+              objectInfoCache.invalidate();
+              objectInfoSnapshot.clear();
               verifiedNodeDefCache.invalidate(classType);
             }
           }
@@ -17935,9 +17943,13 @@ const GRAPH_TOOL_EXECUTORS = {
             );
             // #1709 — get_errors' per-class reader is a live authority too. A definitive
             // present answer may describe a changed schema, and `{}` is explicit absence;
-            // retire only that class's reusable add proof. Unknown/timeout outcomes remain
-            // non-authoritative and preserve the later silent-add fallback semantics.
+            // retire every reusable schema authority: a per-class answer can establish that
+            // the old whole map is stale even though it cannot replace that map. Unknown/
+            // timeout outcomes remain non-authoritative and preserve the later silent-add
+            // fallback semantics.
             if (outcome?.kind === "present" || outcome?.kind === "absent") {
+              objectInfoCache.invalidate();
+              objectInfoSnapshot.clear();
               verifiedNodeDefCache.invalidate(cls);
             }
             return outcome;

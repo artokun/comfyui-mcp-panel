@@ -21,6 +21,7 @@ import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { OBJECT_INFO_DEADLINE_MS } from "../../web/js/lib/object-info-oracle.js";
 import { COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
+import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
 import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
 
@@ -223,6 +224,7 @@ export function addNodeCommandBudgetDeps() {
     REFRESH_JOIN_ABANDONED,
     fetchSingleNodeInfo,
     // #1709 — each extracted graph_add_node harness gets its own verified-schema session.
+    objectInfoCache: createObjectInfoCache(),
     verifiedNodeDefCache: createVerifiedNodeDefCache(),
     widenSocketProofBudget,
     // A STUB, and labelled as one. These three harnesses are about #821/#1223/#620, none of
