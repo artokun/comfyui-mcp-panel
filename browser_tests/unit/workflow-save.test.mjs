@@ -3311,6 +3311,60 @@ test('#939: a tab switch during failed repaint does not restore or repaint over 
   assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false)
 })
 
+test('#939: repeated tab switches that leave a newer tab stable cannot persist or carry Save-As identity', async () => {
+  const sourcePath = 'workflows/Source-repeated-switch.json'
+  const destinationPath = 'workflows/Destination-repeated-switch.json'
+  const source = {
+    path: sourcePath,
+    filename: 'Source-repeated-switch.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const newerOne = {
+    path: 'workflows/Newer-one.json',
+    filename: 'Newer-one.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const newerTwo = {
+    path: 'workflows/Newer-two.json',
+    filename: 'Newer-two.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source })
+  const details = {}
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, 'Destination-repeated-switch', {
+        existsOnDisk,
+        details,
+        // Model repaintSaveAsCanvas's bounded reconciliation reporting success
+        // for the newest stable tab. The adapter must still prove that the copy
+        // itself owns the active record before it calls saveWorkflow(copy).
+        canvasFence: () => true,
+        repaintCanvas: async () => {
+          svc.activeWorkflow = newerOne
+          await Promise.resolve()
+          svc.activeWorkflow = newerTwo
+          return true
+        },
+      }),
+    /original Save-As copy is no longer the current owned active tab/,
+  )
+
+  assert.equal(svc.activeWorkflow, newerTwo, 'the newest switched-to tab remained active')
+  assert.equal(svc.getWorkflowByPath(destinationPath), null, 'the stale copy was removed')
+  assert.equal(svc.disk.has(destinationPath), false, 'the stale copy was never persisted')
+  assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false, 'no stale copy write occurred')
+  assert.equal(details.activatedRecord, undefined, 'no Save-As identity was carried')
+  assert.equal(details.savedRecord, undefined, 'no succession identity was carried')
+})
+
 for (const [label, restoreCanvas, expected] of [
   ['false', async () => false, /source canvas restore returned false/],
   ['throws', async () => { throw new Error('restore exploded') }, /source canvas restore threw \(restore exploded\)/],

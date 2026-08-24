@@ -1660,6 +1660,25 @@ function resolveSaveAsCopy(
             ),
           );
         }
+        // #939 — FINAL OWNERSHIP PROOF immediately before the only persistence
+        // call. `repaintCanvas` may reconcile through several active records and
+        // return true once the newest one is stable; that is not proof that the
+        // ORIGINAL copy produced by this Save-As is still the owned active tab.
+        // Require both the copy token and the operation/generation fence here,
+        // synchronously, so a stale copy cannot be written or reported as the
+        // produced successor. This also covers a switch after repaint returned.
+        if (
+          canvasRepainted &&
+          (!isSameCopy(copy, svc.activeWorkflow) || !canvasFenceAllows("persist-before", copy))
+        ) {
+          throw markPreCommit(
+            new Error(
+              `refusing to save "${effectiveName}": the original Save-As copy is no longer ` +
+                `the current owned active tab. Nothing was written; no Save-As identity or ` +
+                `success was reported. Retry on the intended tab (#939).`,
+            ),
+          );
+        }
         await svc.saveWorkflow(copy);
       } catch (err) {
         // P2 — distinguish a CONFIRMED pre-commit failure (409 conflict, or the
