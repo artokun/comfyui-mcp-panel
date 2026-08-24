@@ -661,6 +661,9 @@ function buildShippedOracle({
   objectInfoCache = createObjectInfoCache(),
   epochDuringFetch = null,
   onFetch = null,
+  snapshotProbeDeadlineMs = 2000,
+  oracleDeadlineMs = 20,
+  realFetchWholeObjectInfo = fetchWholeObjectInfo,
 }) {
   const body = extractSetWidgetOracle();
   const factory = new Function(
@@ -683,6 +686,7 @@ function buildShippedOracle({
     // body closes over and the harness does not provide is a harness that models a panel
     // which does not exist.
     "noBackendAnswerEstablished",
+    "oracleDeadlineMs",
     // `backendReconnectEpoch` MUST be a live mutable binding in the same scope as the
     // extracted body, because the panel's is module state the body re-reads. An earlier
     // version passed it as a frozen value, which made `observedAtEpoch` and the record-time
@@ -705,7 +709,10 @@ function buildShippedOracle({
      // the read is issued — the panel's real hazard is a reconnect landing mid-fetch.
      const fetchWholeObjectInfo = (opts) => {
        onFetch?.(opts);
-       const pending = realFetchWholeObjectInfo({ ...opts, deadlineMs: 20 });
+       const pending = realFetchWholeObjectInfo({
+         ...opts,
+         deadlineMs: oracleDeadlineMs === null ? opts.deadlineMs : oracleDeadlineMs,
+       });
        if (epochDuringFetch !== null) backendReconnectEpoch = epochDuringFetch;
        return pending;
      };
@@ -725,14 +732,15 @@ function buildShippedOracle({
        readIneligibility: () => snapshotIneligibility,
        readFailures: () => oracleFailures,
        readScopedLicence: () => scopedReadLicensed,
+       readProvenance: () => setWidgetSchemaProvenance(),
        readHistory: () => historyRecorded,
      };`,
   );
   return factory(
     api,
     objectInfoCache,
-    fetchWholeObjectInfo,
-     CACHE_OUTCOME,
+    realFetchWholeObjectInfo,
+    CACHE_OUTCOME,
      snapshot,
      verifiedNodeDefCache,
      epoch,
@@ -740,14 +748,27 @@ function buildShippedOracle({
     socketDown,
     objectInfoOracleFailureNote,
     OBJECT_INFO_DEADLINE_MS,
-    2000,
+    snapshotProbeDeadlineMs,
     makeCommandBudget,
     onFetch,
     noBackendAnswerEstablished,
+    oracleDeadlineMs,
   );
 }
 
 const hungApi = { getNodeDefs: () => new Promise(() => {}), fetchApi: () => new Promise(() => {}) };
+
+function schemaOracleForLatency(minimumMs) {
+  return ({ deadlineMs }) =>
+    deadlineMs >= minimumMs
+      ? { [CACHE_OUTCOME]: true, defs: SCHEMA, failures: [], outcomes: [] }
+      : {
+          [CACHE_OUTCOME]: true,
+          defs: null,
+          failures: [`remote schema needs ${minimumMs}ms`],
+          outcomes: silence,
+        };
+}
 
 test("#1223 SHIPPED: a live answer is returned and snapshotted", async () => {
   const snapshot = createObjectInfoSnapshot();
@@ -859,6 +880,122 @@ test("#1582 SHIPPED: the reported case — a held snapshot shortens hung probes"
   assert.deepEqual(deadlines, [2000], "the reusable snapshot caps the serial oracle before the 15s stall");
   assert.match(o.readNote(), /did not answer/);
   assert.equal(o.readFailures().length, 2, "the fallback still discloses both silent routes");
+});
+
+test("#1734 SHIPPED set_widget: a remote high-latency schema gets the larger bounded probe", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  const deadlines = [];
+  const o = buildShippedOracle({
+    api: hungApi,
+    snapshot,
+    snapshotProbeDeadlineMs: 8000,
+    oracleDeadlineMs: null,
+    realFetchWholeObjectInfo: (opts) => {
+      deadlines.push(opts.deadlineMs);
+      return schemaOracleForLatency(3000)(opts);
+    },
+  });
+  const ctor = function NodeCtor() {};
+  ctor.nodeData = { input: { required: {} } };
+  const node = {
+    id: 1734,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    constructor: ctor,
+  };
+
+  const result = await runSetWidget(node, "steps", 30, {
+    registry: { KSampler: ctor },
+    getRegistry: () => ({ KSampler: ctor }),
+    getFreshObjectInfo: o.getFreshObjectInfo,
+    schemaProvenance: () => "live",
+    beforeChange() {},
+    afterChange() {},
+    setDirty() {},
+  });
+
+  assert.equal(result.set.value, 30, "the production write lands after the remote read");
+  assert.deepEqual(deadlines, [8000], "the remote first-silence probe stays bounded at 8s");
+});
+
+test("#1734 SHIPPED set_widget: loopback keeps the short local probe timing", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  const deadlines = [];
+  const o = buildShippedOracle({
+    api: hungApi,
+    snapshot,
+    snapshotProbeDeadlineMs: 2000,
+    oracleDeadlineMs: null,
+    realFetchWholeObjectInfo: (opts) => {
+      deadlines.push(opts.deadlineMs);
+      return schemaOracleForLatency(3000)(opts);
+    },
+  });
+
+  const result = await runSetWidget(
+    {
+      id: 1734,
+      type: "KSampler",
+      widgets: [{ name: "steps", type: "INT", value: 20 }],
+      constructor: { nodeData: { input: { required: {} } } },
+    },
+    "steps",
+    30,
+    {
+      registry: { KSampler: {} },
+      getRegistry: () => ({ KSampler: {} }),
+      getFreshObjectInfo: o.getFreshObjectInfo,
+      schemaProvenance: () => "snapshot",
+      beforeChange() {},
+      afterChange() {},
+      setDirty() {},
+    },
+  );
+
+  assert.equal(result.set.value, 30, "a silent local probe still uses the held snapshot");
+  assert.deepEqual(deadlines, [2000], "loopback keeps the original short discovery window");
+  assert.equal(o.readProvenance(), "snapshot", "the short silent probe falls back to the held snapshot");
+  assert.match(o.readNote(), /Tried one route/i);
+});
+
+test("#1734 SHIPPED: a concurrent refresh fences a late remote probe result", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  stored(snapshot, SCHEMA, 5);
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  let release;
+  const o = buildShippedOracle({
+    api: hungApi,
+    snapshot,
+    verifiedNodeDefCache,
+    snapshotProbeDeadlineMs: 8000,
+    oracleDeadlineMs: null,
+    onFetch: () => markStarted(),
+    realFetchWholeObjectInfo: (opts) => {
+      assert.equal(opts.deadlineMs, 8000);
+      return new Promise((resolve) => {
+        release = () => resolve({ [CACHE_OUTCOME]: true, defs: { ...SCHEMA, RemoteOnly: {} }, failures: [], outcomes: [] });
+      });
+    },
+  });
+
+  const pending = o.getFreshObjectInfo();
+  await started;
+  // This is the production refresh invalidation crossing the outstanding probe.
+  snapshot.clear();
+  verifiedNodeDefCache.clear();
+  release();
+
+  const result = await pending;
+  assert.ok(result.RemoteOnly, "the late response is still returned for diagnostics");
+  assert.equal(o.readProvenance(), "retired", "the response cannot authorize after refresh invalidation");
+  assert.deepEqual(o.readHistory(), [], "the late response is not recorded as current backend truth");
+  assert.equal(snapshot.peek().held, false, "the concurrent refresh keeps the old snapshot retired");
 });
 
 test("#1582 SHIPPED: a second ordinary read does not re-wait on probes that already went silent", async () => {
