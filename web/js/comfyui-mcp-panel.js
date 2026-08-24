@@ -77,6 +77,7 @@ import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMess
 // #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
 // it is how this repo keeps producing near-duplicate bugs, per that file's own header.
 import { withTimeout } from "./lib/bounded-step.js";
+import { createRunReceiptOutbox } from "./lib/run-receipt-outbox.js";
 import {
   arbitratePanelCopy,
   countExtensionsNamed,
@@ -807,6 +808,16 @@ let armRunReconcileSweepRef = null;
 // sender at mount time so an old graph_run cannot publish into a replacement tab
 // after teardown/reconnect.
 let runReceiptSender = null;
+// The dispatch captures the route it was sent to. The sender itself is allowed to
+// enqueue into a replacement mount, but the outbox will only flush when that same
+// route is live, so a remount cannot misattribute a receipt to another workflow.
+let runReceiptRouteRef = null;
+// A callback from an old mount must never register into a replacement tracker or
+// sweep. This owner is a stable object per mount rather than a mutable generation
+// number that an old callback could accidentally match after wrap/reuse.
+const panelRunOwnerRef = { current: null };
+let panelRunOwnerGeneration = 0;
+const runReceiptOutbox = createRunReceiptOutbox();
 // How often the safety sweep re-reconciles while any run is still pending delivery.
 // Only runs while `hasPending()` is true (self-disarming), so an idle panel carries
 // no perpetual timer; a redundant sweep is harmless (reconcile is idempotent — the
@@ -16921,6 +16932,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // Freeze this mount's sender for the whole dispatch. A late /prompt response
     // can outlive graph_run itself, but it must never use a newer mount's bridge.
     const sendReceipt = runReceiptSender;
+    let dispatchReceiptRoute = null;
+    try {
+      dispatchReceiptRoute = typeof runReceiptRouteRef === "function" ? runReceiptRouteRef() : null;
+    } catch {}
+    const dispatchOwner = panelRunOwnerRef.current;
+    const dispatchRunCompletion = runCompletionRef;
+    const dispatchArmRunReconcileSweep = armRunReconcileSweepRef;
     const { app, graph, rootGraph } = getGraphCtx();
     // /run invokes this executor directly rather than through bridge dispatch.
     // Queueing a stale root would render the wrong workflow even though no graph
@@ -17199,20 +17217,28 @@ const GRAPH_TOOL_EXECUTORS = {
       // #1728 — dispatchScopedRun may return its bounded queued_unknown result
       // while this request is still in flight. Register at capture time, not only
       // after dispatch returns, so a late prompt_id still opens the local recovery
-      // ledger and arms the sweep. The MCP consumer performs its own bounded
-      // reconciliation before opening the server-side completion ticket.
-      try {
-        runCompletionRef?.onQueued(id);
-      } catch {}
-      try {
-        armRunReconcileSweepRef?.();
-      } catch {}
+      // ledger and arms the sweep. The owner fence is separate from the receipt
+      // path: an old dispatch may still report its exact server receipt, but it
+      // must not touch a replacement mount's local completion state.
+      const ownsDispatch =
+        dispatchOwner !== null &&
+        panelRunOwnerRef.current === dispatchOwner &&
+        runCompletionRef === dispatchRunCompletion &&
+        armRunReconcileSweepRef === dispatchArmRunReconcileSweep;
+      if (ownsDispatch) {
+        try {
+          dispatchRunCompletion?.onQueued(id);
+        } catch {}
+        try {
+          dispatchArmRunReconcileSweep?.();
+        } catch {}
+      }
       // #1728 — the local tracker cannot open the MCP server's prompt ticket by
       // itself. Send an exact, rid-correlated receipt over the existing bridge
       // event channel; this is metadata only, never an agent_event completion.
       if (receiptRid && sendReceipt) {
         try {
-          sendReceipt(receiptRid, id);
+          sendReceipt(receiptRid, id, dispatchReceiptRoute);
         } catch {}
       }
     };
@@ -26251,6 +26277,22 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     isConnected() {
       return !!sock && sock.readyState === WebSocket.OPEN;
     },
+    /**
+     * True only when the live socket has completed its handshake and the
+     * orchestrator has advertised the current workflow route. Stamped control
+     * metadata such as run_receipt must wait through a parked re-advertise;
+     * socket-open plus a readable route is not sufficient.
+     */
+    isRouteReady() {
+      if (!sock || sock.readyState !== WebSocket.OPEN || !handshakeDone) return false;
+      let routeId = null;
+      try {
+        routeId = bridgeRouteId();
+      } catch {
+        routeId = null;
+      }
+      return !!routeId && !!lastAdvertisedRouteId && routeId === lastAdvertisedRouteId;
+    },
     /** #1095 — diagnostics only. The in-flight count is NOT exported for callers to gate
      *  on: an earlier cut had the workflow poll read it and decide for itself, and that is
      *  precisely the design review rejected — one caller gated while three others
@@ -28154,6 +28196,11 @@ function backendEnabled(id) { return !disabledBackends().has(id); }
 let lastMintedThreadId = null;
 
 function buildPanel() {
+  const mountOwner = { generation: ++panelRunOwnerGeneration };
+  panelRunOwnerRef.current = mountOwner;
+  // A remount retires the old route transport, but the module-scoped outbox
+  // remains intact for an old dispatch callback and will flush on this mount.
+  runReceiptOutbox.setTransport(null);
   ensureStyles();
 
   const root = document.createElement("div");
@@ -35130,6 +35177,9 @@ function buildPanel() {
       // release the soft-reload interlock: the (possibly slow) reload's orchestrator
       // handshook, so auto-respawn can guard the next drop normally.
       if (connected) {
+        // A receipt queued while the socket was closed/stale gets an immediate
+        // retry on the handshake edge; the outbox also has a bounded timer retry.
+        runReceiptOutbox.notifyRouteReady();
         // Bridge came back after a drop — the completion frame for a run that
         // finished while it was down was silently dropped by sendFrame, so
         // reconcile pending runs against /history to redeliver it (#370).
@@ -36053,8 +36103,22 @@ function buildPanel() {
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
-  const panelRunReceiptSender = (rid, promptId) =>
-    client.sendFrame({ type: "run_receipt", run_rid: rid, prompt_id: promptId });
+  const panelRunReceiptRouteRef = () => {
+    try {
+      return bridgeRouteId();
+    } catch {
+      return null;
+    }
+  };
+  const panelRunReceiptSender = (rid, promptId, routeId) =>
+    runReceiptOutbox.enqueue(rid, promptId, routeId ?? panelRunReceiptRouteRef());
+  const panelRunReceiptTransport = {
+    routeId: panelRunReceiptRouteRef,
+    ready: () => client.isRouteReady?.() === true,
+    sendFrame: (frame) => client.sendFrame(frame),
+  };
+  runReceiptOutbox.setTransport(panelRunReceiptTransport);
+  runReceiptRouteRef = panelRunReceiptRouteRef;
   runReceiptSender = panelRunReceiptSender;
 
   // #758 — announce an update once the transcript exists to receive it. Deliberately
@@ -40883,6 +40947,10 @@ function buildPanel() {
       // reconcile await (codex P1 unmount-resurrection leak). Only null the shared
       // refs if they still point at THIS instance — a newer mount may already own them.
       runReconcileSweep.dispose();
+      if (panelRunOwnerRef.current === mountOwner) {
+        panelRunOwnerRef.current = null;
+        runReceiptOutbox.setTransport(null);
+      }
       // #585: the restart-resume watch drives client.sendUserMessage — a torn-down
       // panel must not keep it alive. The marker itself SURVIVES on purpose: a
       // remount re-reads it and re-arms the watch, so unmounting never loses the
@@ -40890,6 +40958,7 @@ function buildPanel() {
       stopRebootWatch();
       if (armRunReconcileSweepRef === armRunReconcileSweep) armRunReconcileSweepRef = null;
       if (runCompletionRef === runCompletion) runCompletionRef = null;
+      if (runReceiptRouteRef === panelRunReceiptRouteRef) runReceiptRouteRef = null;
       if (runReceiptSender === panelRunReceiptSender) runReceiptSender = null;
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).

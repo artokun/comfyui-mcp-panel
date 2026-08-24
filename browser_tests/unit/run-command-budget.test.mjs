@@ -78,6 +78,7 @@ import { MUTATION_BINDING_BAR } from "../../web/js/lib/graph-binding.js";
 import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js";
+import { createRunReceiptOutbox } from "../../web/js/lib/run-receipt-outbox.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -439,7 +440,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, panelRunOwnerRef }) {
   const seen = { dispatchArgs: null };
   const deps = {
     RUN_COMMAND_BUDGET_MS: budgetMs,
@@ -495,6 +496,8 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     runCompletionRef: runCompletionRef ?? { onQueued() {} },
     armRunReconcileSweepRef: armRunReconcileSweepRef ?? (() => {}),
     runReceiptSender: runReceiptSender ?? null,
+    runReceiptRouteRef: runReceiptRouteRef ?? (() => null),
+    panelRunOwnerRef: panelRunOwnerRef ?? { current: {} },
   };
   const names = Object.keys(deps);
   const factory = new Function(
@@ -914,6 +917,102 @@ test("#1728 CALL SITE: late capture crosses the bridge, arms the real sweep, and
     assert.equal(sent.length, 1, "duplicate capture/lifecycle signals do not duplicate the frame");
   } finally {
     sweep?.dispose();
+    stop();
+  }
+});
+
+test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on reconnect", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const receiptFrames = [];
+    let routeReady = false;
+    const outbox = createRunReceiptOutbox({ retryMs: 60000 });
+    outbox.setTransport({
+      routeId: () => "panel-route-1728",
+      ready: () => routeReady,
+      sendFrame: (frame) => {
+        if (!routeReady) return false;
+        receiptFrames.push(frame);
+        return true;
+      },
+    });
+    let latePromptId;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      panelRunOwnerRef: { current: { generation: 1 } },
+      runReceiptRouteRef: () => "panel-route-1728",
+      runReceiptSender: (rid, promptId, routeId) => outbox.enqueue(rid, promptId, routeId),
+      dispatch: async (args) => {
+        latePromptId = () => args.onPromptId("late-reconnect-prompt-1728");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    const result = await built.graph_run({ to_node_id: 327, rid: "run-rid-reconnect-1728" });
+    assert.equal(result.queued_unknown, true);
+    latePromptId();
+    assert.equal(outbox.pendingSize(), 1, "sendFrame false keeps the exact receipt pending");
+    assert.deepEqual(receiptFrames, []);
+
+    routeReady = true;
+    outbox.notifyRouteReady();
+    assert.equal(outbox.pendingSize(), 0, "the reconnect flush retires the receipt only after sendFrame true");
+    assert.deepEqual(receiptFrames, [
+      { type: "run_receipt", run_rid: "run-rid-reconnect-1728", prompt_id: "late-reconnect-prompt-1728" },
+    ]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1728 CALL SITE: a late callback after remount cannot touch the replacement tracker", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const ownerRef = { current: { generation: 1 } };
+    const trackerEvents = { old: [], replacement: [] };
+    const trackerSlot = {
+      current: { onQueued: (id) => trackerEvents.old.push(id) },
+    };
+    const liveTracker = { onQueued: (id) => trackerSlot.current.onQueued(id) };
+    const sweepOwners = [];
+    const receiptFrames = [];
+    let latePromptId;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      panelRunOwnerRef: ownerRef,
+      runCompletionRef: liveTracker,
+      armRunReconcileSweepRef: () => sweepOwners.push(ownerRef.current),
+      runReceiptRouteRef: () => "panel-route-remount-1728",
+      runReceiptSender: (rid, promptId) => receiptFrames.push({ rid, promptId }),
+      dispatch: async (args) => {
+        latePromptId = () => args.onPromptId("stale-remount-prompt-1728");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    await built.graph_run({ to_node_id: 327, rid: "run-rid-remount-1728" });
+    ownerRef.current = { generation: 2 };
+    trackerSlot.current = { onQueued: (id) => trackerEvents.replacement.push(id) };
+    latePromptId();
+
+    assert.deepEqual(trackerEvents, { old: [], replacement: [] });
+    assert.deepEqual(sweepOwners, []);
+    assert.deepEqual(receiptFrames, [
+      { rid: "run-rid-remount-1728", promptId: "stale-remount-prompt-1728" },
+    ], "the stale callback may still deliver its exact server receipt");
+  } finally {
     stop();
   }
 });
