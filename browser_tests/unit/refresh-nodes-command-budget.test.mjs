@@ -450,6 +450,72 @@ test("#1682: graph_get_errors refresh seam scans with the completed trailing com
   await built.inFlightStarted;
 });
 
+test("#1733: a fresh combo clears an API-uploaded root input, while a true miss remains", async () => {
+  const node = {
+    id: 41,
+    widgets: [{ name: "image", value: "eyes_anchor_src.png", options: { values: [] } }],
+  };
+  const rootGraph = {
+    _nodes: [node],
+    getNodeById: (id) => node.id === id || String(node.id) === String(id) ? node : null,
+  };
+  const candidate = {
+    nodeId: 41,
+    name: "eyes_anchor_src.png",
+    widgetName: "image",
+    mediaType: "image",
+    isMissing: true,
+  };
+  const productionCollector = makeProductionMissingAssetCollector({
+    stores: {
+      missingModel: { missingModelCandidates: [] },
+      missingMedia: { missingMediaCandidates: [candidate] },
+      missingNodesError: { hasMissingNodes: false, missingNodeCount: 0, missingNodesError: [] },
+    },
+    rootGraph,
+  });
+  assert.equal(productionCollector.collectMissingAssets().media.length, 1, "the page-load snapshot starts as missing");
+
+  const built = realRefreshNodes({
+    budgetMs: 500,
+    runHook: async () => {
+      // This is the fresh /object_info + combo-rebuild result after the API upload.
+      node.widgets[0].options.values = [candidate.name];
+      return { refreshed: true, reason: "refreshed" };
+    },
+  });
+  const trusted = await refreshMissingAssetTrust({
+    refreshBudgetMs: 500,
+    refreshComfyNodeDefs: built.refreshComfyNodeDefs,
+    withRefreshTimeout: productionWithRefreshTimeout,
+    getRefreshInFlight: built.getInFlight,
+  });
+  assert.equal(trusted, true, "the banner may use only a completed authoritative refresh");
+  productionCollector.setRefreshConfirmed(trusted);
+  assert.equal(
+    productionCollector.collectMissingAssets().media.length,
+    0,
+    "the refreshed root-level API-uploaded input is no longer falsely missing",
+  );
+
+  // A successful refresh must not become blanket amnesty: if the value is still
+  // absent from the fresh combo, the original missing-media warning survives.
+  node.widgets[0].options.values = [];
+  assert.equal(productionCollector.collectMissingAssets().media.length, 1, "a true missing input remains reported");
+});
+
+test("#1733: validationBanner collects only after its awaited freshness verdict", () => {
+  const body = extractPanelFn("async function validationBanner() {");
+  const refreshAt = body.indexOf("await refreshMissingAssetTrust({");
+  const collectAt = body.indexOf("const missing = collectMissingAssets(comboTrustedForQuery);");
+  const refreshFenceAt = body.indexOf("let postRefreshRootGraph = null;");
+  assert.ok(refreshAt >= 0, "validationBanner must await the authoritative missing-asset refresh");
+  assert.ok(collectAt > refreshAt, "the load-time asset snapshot must be collected after refresh settles");
+  assert.ok(refreshFenceAt > refreshAt && refreshFenceAt < collectAt, "the banner must fence a tab switch before collecting");
+  assert.match(body, /getRefreshInFlight: \(\) => nodeDefRefreshInFlight/);
+  assert.match(body, /comboTrustedForQuery = false/);
+});
+
 for (const [label, runHook, release] of [
   [
     "timeout",

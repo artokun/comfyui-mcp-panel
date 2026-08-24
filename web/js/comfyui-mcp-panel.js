@@ -10530,14 +10530,15 @@ async function validationBanner() {
   // BOTH nodeErrors and execErr are null (nothing queued, nothing run) while the
   // canvas is already red. Bailing on those two alone left the agent blind
   // exactly when the user could see the problem — reported from the field.
-  const missing = collectMissingAssets();
-  // The probe below awaits SERVER state while everything above was captured from
-  // the PRE-await workflow. A workflow-tab switch during the await would join A's
-  // missing/validation banner onto B's turn and send it into B's session (#513
-  // review). Same correlation as graph_get_errors: snapshot the active-workflow
-  // instance and the bound root graph before the await, re-read after, discard on
-  // a provable change. The banner is best-effort, so a mismatch skips it SILENTLY
-  // (no recoverable-error retry) — B's next turn recomputes from B's own state.
+  // The banner is a best-effort surface, but its missing-asset store is a LOAD-TIME
+  // snapshot. An upload_image API call can put a file in input/ after that snapshot
+  // and before this turn. Await the same bounded authoritative refresh used by
+  // graph_get_errors before collecting, so a fresh root-level combo can clear that
+  // stale candidate (#1733). A failed or unfinished refresh leaves trust false and
+  // therefore preserves a genuine missing-asset warning.
+  const validationBudgetStart = monotonicNow();
+  const validationStepBudget = (capMs) =>
+    getErrorsStepBudgetMs(monotonicNow() - validationBudgetStart, capMs);
   let preProbeRootGraph = null;
   try {
     preProbeRootGraph = getGraphCtx().rootGraph ?? null;
@@ -10545,7 +10546,51 @@ async function validationBanner() {
     preProbeRootGraph = null; // unresolvable now → correlate on the workflow alone
   }
   const preProbeWorkflow = activeWorkflowRef();
-  missing.media = await filterServerConfirmedInputSubfolderMedia(missing.media);
+  let comboTrustedForQuery = false;
+  try {
+    const refreshBudgetMs = hasRawMissingAssetCandidates()
+      ? validationStepBudget(GET_ERRORS_REFRESH_CAP_MS)
+      : 0;
+    if (refreshBudgetMs > 0) {
+      // Revoke the shared trust while this refresh is pending. The local verdict
+      // below is the only trust this banner may use, so a concurrent older refresh
+      // cannot make this snapshot look fresh (#1733 / #1682).
+      nodeDefsRefreshConfirmed = false;
+      comboTrustedForQuery = await refreshMissingAssetTrust({
+        refreshBudgetMs,
+        refreshComfyNodeDefs,
+        withRefreshTimeout,
+        getRefreshInFlight: () => nodeDefRefreshInFlight,
+      });
+    }
+  } catch {
+    comboTrustedForQuery = false;
+  }
+  let postRefreshRootGraph = null;
+  try {
+    postRefreshRootGraph = getGraphCtx().rootGraph ?? null;
+  } catch {
+    postRefreshRootGraph = null; // binding gone mid-refresh → treated as changed below
+  }
+  if (
+    graphReadBindingChanged({
+      beforeWorkflow: preProbeWorkflow,
+      afterWorkflow: activeWorkflowRef(),
+      beforeRootGraph: preProbeRootGraph,
+      afterRootGraph: postRefreshRootGraph,
+    })
+  ) {
+    return "";
+  }
+  // Collect AFTER the refresh. Reading the store before it settles is the #1733
+  // false-positive path: the store still says "missing" even though the server
+  // now enumerates the API-uploaded input.
+  const missing = collectMissingAssets(comboTrustedForQuery);
+  if (validationStepBudget(GET_ERRORS_STEP_CAP_MS) > 0) {
+    missing.media = await filterServerConfirmedInputSubfolderMedia(missing.media, () =>
+      validationStepBudget(GET_ERRORS_STEP_CAP_MS),
+    );
+  }
   let postProbeRootGraph = null;
   try {
     postProbeRootGraph = getGraphCtx().rootGraph ?? null;
@@ -10591,30 +10636,6 @@ async function validationBanner() {
     missing.nodeCount ||
     bannerStalePlaceholders.length
   );
-  // #415: the ⚠️ MISSING ASSETS block reads as authoritative at turn start, but the
-  // stores are LOAD-TIME only and the live combo can drift BOTH ways — a since-uploaded
-  // asset the banner still calls missing, OR a since-deleted asset a prior-confirmed
-  // (now stale) combo still lists, which would make the banner falsely clean. This is a
-  // SYNCHRONOUS surface, so it cannot await a fetch; instead, whenever the STORE holds a
-  // raw candidate, kick a NON-BLOCKING FORCED authoritative refresh (single-flight,
-  // coalesced) so the combo is reconciled for the NEXT turn — no latency here. Keyed on
-  // raw candidates and NOT gated on nodeDefsRefreshConfirmed, so a delete-after-confirm
-  // is re-checked too (codex round-7 P0). graph_get_errors remains the AUTHORITATIVE,
-  // awaited surface; the banner is a best-effort proactive hint that self-heals.
-  try {
-    if (hasRawMissingAssetCandidates()) {
-      // REVOKE combo trust up front (this turn's `missing` was already computed above
-      // with the prior trust, so the revoke bites only on FUTURE reads): if this forced
-      // refresh STALLS and never settles, trust stays false and later banners DISTRUST
-      // the stale combo — keeping a genuinely-missing raw candidate reported instead of
-      // suppressing it indefinitely (codex round-8 P1). A completed refresh restores
-      // trust from its fresh fetch via registerComfyNodeDefs' finally.
-      nodeDefsRefreshConfirmed = false;
-      void refreshComfyNodeDefs(undefined, { force: true });
-    }
-  } catch {
-    /* best-effort */
-  }
   if (!nodeErrors && !execErr && !missing.any) {
     lastInjectedValidationSig = null; // clean → let a future re-appearance inject again
     return "";
