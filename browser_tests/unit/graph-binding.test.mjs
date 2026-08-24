@@ -2629,7 +2629,7 @@ test("#513 review wiring: validationBanner fences its server probe against a mid
     `workflow snapshot must precede the probe await (snap@${snapAt} vs probe@${probeAt})`,
   );
 
-  const fenceAt = body.indexOf("graphReadBindingChanged({");
+  const fenceAt = body.indexOf("graphReadBindingChanged({", probeAt);
   assert.notEqual(fenceAt, -1, "banner must re-check the binding after the probe");
   assert.ok(fenceAt > probeAt, "the binding re-check must follow the probe await");
   assert.match(
