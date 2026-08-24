@@ -15258,11 +15258,20 @@ const GRAPH_TOOL_EXECUTORS = {
       // same reason, with the same message. Report the rest instead of implying
       // there is no rest. One level only, like every other reader of this
       // helper: it does not descend into subgraph definitions.
+      //
+      // Split the same way subgraphConversionIntegrity splits it, and for the
+      // same reason: `certainly_reached` is the only subset the serializer
+      // PROVABLY resolves. An orphan on a bypassed/muted/virtual node is real
+      // corruption but its reachability is not modelled here, so it may not be
+      // narrated as "the graph is refused" — that would be the same overclaim
+      // one step down.
       const stillOrphaned = danglingInputLinks(graph);
-      const orphanRoll = stillOrphaned
-        .slice(0, 10)
-        .map((o) => `node ${o.node_id} input "${o.name ?? o.slot}" (link ${o.link_id})`)
-        .join(", ");
+      const certainOrphans = stillOrphaned.filter((o) => o.certainly_reached);
+      const roll = (list) =>
+        list
+          .slice(0, 10)
+          .map((o) => `node ${o.node_id} input "${o.name ?? o.slot}" (link ${o.link_id})`)
+          .join(", ") + (list.length > 10 ? ", …" : "");
       // Deliberately NOT reported as `disconnected`: no wire was removed, because
       // none existed. What changed is that the slot no longer names a link that
       // does not exist.
@@ -15274,6 +15283,7 @@ const GRAPH_TOOL_EXECUTORS = {
                 node_id: o.node_id,
                 input: o.name ?? o.slot,
                 link_id: o.link_id,
+                certainly_reached: o.certainly_reached,
               })),
             }
           : {}),
@@ -15282,11 +15292,17 @@ const GRAPH_TOOL_EXECUTORS = {
           `id ${clearedOrphan}, which the graph's link store has no record of, and that ` +
           `ORPHANED reference is what ComfyUI rejects with "No link found in parent graph" ` +
           `when the workflow is queued. The panel cleared it (#1750). ` +
-          (stillOrphaned.length
-            ? `${stillOrphaned.length} other input(s) in this graph still carry an orphaned ` +
-              `link id — ${orphanRoll}${stillOrphaned.length > 10 ? ", …" : ""} — so the graph ` +
-              `is STILL refused until each of those is cleared too (panel_disconnect on each). `
-            : `No other input in this graph carries an orphaned link id. `) +
+          (certainOrphans.length
+            ? `${certainOrphans.length} other input(s) in this graph still carry an orphaned ` +
+              `link id on a node the serializer resolves — ${roll(certainOrphans)} — so the ` +
+              `graph is STILL refused until each of those is cleared too (panel_disconnect ` +
+              `on each). `
+            : stillOrphaned.length
+              ? `${stillOrphaned.length} other input(s) in this graph carry an orphaned link ` +
+                `id — ${roll(stillOrphaned)} — but only on node(s) the serializer may skip ` +
+                `(bypassed, muted, or virtual), so whether the graph is refused depends on ` +
+                `whether those are reached. Clear them the same way if it is. `
+              : `No other input in this graph carries an orphaned link id. `) +
           (repairEnvelopeErr
             ? `The change landed, but the undo envelope did not close cleanly ` +
               `(${repairEnvelopeErr?.message ?? repairEnvelopeErr}), so Ctrl+Z may not revert ` +

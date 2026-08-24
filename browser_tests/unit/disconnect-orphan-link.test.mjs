@@ -369,9 +369,9 @@ test("#1750 the reply reports what is STILL orphaned, and never claims queueable
     link_id: 21,
   });
   assert.deepEqual(res.remaining_orphan_links, [
-    { node_id: 79, input: "source_image_b", link_id: 20 },
-    { node_id: 84, input: "image_b", link_id: 18 },
-    { node_id: 85, input: "image_b", link_id: 19 },
+    { node_id: 79, input: "source_image_b", link_id: 20, certainly_reached: true },
+    { node_id: 84, input: "image_b", link_id: 18, certainly_reached: true },
+    { node_id: 85, input: "image_b", link_id: 19, certainly_reached: true },
   ]);
   assert.match(res.warning, /3 other input\(s\) in this graph still carry an orphaned link id/);
   assert.match(res.warning, /STILL refused/);
@@ -428,4 +428,28 @@ test("#1750 a throwing clear is a REFUSAL, not a disclosed success", () => {
     () => disconnect({ node_id: 79, input: "source_latent_b" }),
     /could not clear it \(slot is read-only\)/,
   );
+});
+
+/**
+ * The same overclaim one step down: an orphan on a node the serializer may SKIP
+ * (bypassed / muted / virtual) is real corruption, but this module does not model
+ * whether it is reached — so it may not be narrated as "the graph is refused".
+ * `danglingInputLinks` already draws that line with `certainly_reached`; the reply
+ * has to respect it.
+ */
+test("#1750 an orphan on a BYPASSED node is reported without claiming the graph is refused", () => {
+  const graph = mkGraph();
+  addNode(graph, 79, [{ name: "source_latent_b", link: 21 }]);
+  const bypassed = addNode(graph, 84, [{ name: "image_b", link: 18 }]);
+  bypassed.mode = 4; // LGraphEventMode.BYPASS
+  const disconnect = buildDisconnect(graph);
+
+  const res = disconnect({ node_id: 79, input: "source_latent_b" });
+
+  assert.deepEqual(res.remaining_orphan_links, [
+    { node_id: 84, input: "image_b", link_id: 18, certainly_reached: false },
+  ]);
+  assert.match(res.warning, /only on node\(s\) the serializer may skip/);
+  assert.doesNotMatch(res.warning, /STILL refused/);
+  assert.doesNotMatch(res.warning, /No other input in this graph/);
 });
