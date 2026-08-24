@@ -79,9 +79,229 @@ import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js";
 import { createRunReceiptOutbox } from "../../web/js/lib/run-receipt-outbox.js";
+import { createRehelloGate, routeIsStale } from "../../web/js/lib/rehello-gate.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
-const panelSrc = readFileSync(panelPath, "utf8");
+const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
+
+function extractFunctionSource(source, marker, endMarker) {
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `could not locate ${marker}`);
+  if (endMarker) {
+    const end = source.indexOf(endMarker, start);
+    assert.notEqual(end, -1, `could not locate the end of ${marker}`);
+    return source.slice(start, end + 2);
+  }
+  const open = source.indexOf("{", start);
+  assert.notEqual(open, -1, `could not locate the body of ${marker}`);
+  let depth = 1;
+  let quote = null;
+  let lineComment = false;
+  let blockComment = false;
+  for (let i = open + 1; i < source.length; i++) {
+    const c = source[i];
+    const n = source[i + 1];
+    if (lineComment) {
+      if (c === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (c === "*" && n === "/") {
+        blockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (quote) {
+      if (c === "\\") {
+        i++;
+      } else if (c === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (c === "/" && n === "/") {
+      lineComment = true;
+      i++;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      blockComment = true;
+      i++;
+      continue;
+    }
+    if (c === "\"" || c === "'" || c === "`") {
+      quote = c;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return source.slice(start, i + 1);
+  }
+  assert.fail(`could not close ${marker}`);
+}
+
+const createBridgeClientSource = extractFunctionSource(
+  panelSrc,
+  "function createBridgeClient(",
+  "\n}\n\n// ---------------------------------------------------------------------------\n// Panel DOM",
+);
+
+class RuntimeBridgeSocket {
+  static OPEN = 1;
+  static CLOSED = 3;
+  static instances = [];
+
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.sent = [];
+    this.listeners = new Map();
+    RuntimeBridgeSocket.instances.push(this);
+  }
+
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
+  }
+
+  send(raw) {
+    if (this.readyState !== RuntimeBridgeSocket.OPEN) throw new Error("socket is not open");
+    this.sent.push(JSON.parse(raw));
+  }
+
+  open() {
+    this.readyState = RuntimeBridgeSocket.OPEN;
+    this.onopen?.();
+    this.listeners.get("open")?.();
+  }
+
+  receive(frame) {
+    const event = { data: JSON.stringify(frame) };
+    this.onmessage?.(event);
+    this.listeners.get("message")?.(event);
+  }
+
+  close() {
+    if (this.readyState === RuntimeBridgeSocket.CLOSED) return;
+    this.readyState = RuntimeBridgeSocket.CLOSED;
+    this.onclose?.();
+    this.listeners.get("close")?.();
+  }
+}
+
+function buildRuntimeBridgeClient({ routeRef, failNextSend = false } = {}) {
+  RuntimeBridgeSocket.instances = [];
+  const storage = new Map();
+  const bridgeState = { failNextSend };
+  const helloState = { block: false, release: null };
+  const noop = () => {};
+  const env = new Proxy(
+    {
+      WebSocket: RuntimeBridgeSocket,
+      DEFAULT_BRIDGE_URL: "ws://bridge.test",
+      STORAGE_KEY_BACKEND: "backend",
+      window: {
+        localStorage: {
+          getItem: (key) => storage.get(key) ?? null,
+          setItem: (key, value) => storage.set(key, String(value)),
+          removeItem: (key) => storage.delete(key),
+        },
+        location: { protocol: "http:", href: "http://panel.test/" },
+      },
+      location: { protocol: "http:", href: "http://panel.test/" },
+      document: { addEventListener: noop, removeEventListener: noop, querySelector: () => null },
+      loadBridgeUrl: () => "ws://bridge.test",
+      saveBridgeUrl: noop,
+      bridgeRouteId: () => routeRef.current,
+      tabRouteIdentity: { adopt: noop, settled: () => true },
+      describeRefusedRoute: () => "route unavailable",
+      routeIsStale,
+      createRehelloGate,
+      monotonicNow: () => performance.now(),
+      buildHelloPayload: () => ({ type: "hello", tab_id: routeRef.current, workflow_uuid: "wf-1728" }),
+      sendBridgeHello: async ({ socket, isCurrent, makePayload }) => {
+        if (!isCurrent()) return false;
+        if (helloState.block) await new Promise((resolve) => (helloState.release = resolve));
+        socket.send(JSON.stringify(makePayload()));
+        return true;
+      },
+      createRestartTabIdentity: () => ({ resolve: async () => "tab-1728" }),
+      bridgeOutage: { noteHandshake: noop, noteBridgeClosed: noop },
+      lostReplies: { list: () => [], size: () => 0, summaries: () => [], replace: noop },
+      pruneAttempts: (items) => items,
+      shouldReRegister: () => false,
+      reRegisterExhaustedHint: () => "re-register exhausted",
+      describeUndeliveredReply: () => "undelivered",
+      lsSet: noop,
+      lsGet: () => null,
+      SESSION_ORDERED_FRAMES: new Set(["resume_session", "new_session"]),
+      AGENT_SESSION_RESET_FRAMES: new Set(),
+      AGENT_MUTED: false,
+      AGENT_BLIND: false,
+      onStatus: noop,
+      onSay: noop,
+      onStream: noop,
+      onLog: noop,
+      onCommand: noop,
+      onCommandReceived: noop,
+      onAsk: noop,
+      onSecret: noop,
+      onSecretSaved: noop,
+      onReload: noop,
+      onTodo: noop,
+      onShowMedia: noop,
+      onOpenCivitai: noop,
+      onCivitaiCmd: noop,
+      onTrainingCmd: noop,
+      onUiRender: noop,
+      onUiUpdate: noop,
+      onDownloads: noop,
+      onThinking: noop,
+      onAgentStatus: noop,
+      onSession: noop,
+      onModels: noop,
+      onCommands: noop,
+      onBackends: noop,
+      onAck: noop,
+      onTurn: noop,
+      onAction: noop,
+      onTurnAnchor: noop,
+      getResume: () => null,
+      getBackend: () => "claude",
+      onHandshakeTimeout: noop,
+      onBridgeClosed: noop,
+      onPairUrl: noop,
+      onPairError: noop,
+      onRunpodStatus: noop,
+      onComfyuiTarget: noop,
+      onRunpodAlert: noop,
+    },
+    {
+      has: () => true,
+      get(target, key) {
+        if (key in target) return target[key];
+        if (key in globalThis) return globalThis[key];
+        return noop;
+      },
+    },
+  );
+  const client = new Function("env", `with (env) { return (${createBridgeClientSource}); }`)(env)({
+    onStatus: noop,
+    onSay: noop,
+    onStream: noop,
+    onLog: noop,
+    onModels: noop,
+    onBridgeClosed: noop,
+  });
+  const originalSend = RuntimeBridgeSocket.prototype.send;
+  RuntimeBridgeSocket.prototype.send = function (raw) {
+    if (bridgeState.failNextSend) {
+      bridgeState.failNextSend = false;
+      throw new Error("simulated send failure");
+    }
+    return originalSend.call(this, raw);
+  };
+  return { client, routeRef, bridgeState, helloState, socket: () => RuntimeBridgeSocket.instances.at(-1) };
+}
 
 const runMatch = panelSrc.match(/\n {2}async graph_run\(\{ batch_count, to_node_id \}\) \{[\s\S]*?\n {2}\},/);
 assert.ok(runMatch, "could not locate graph_run in panel source");
@@ -968,6 +1188,79 @@ test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on re
     ]);
   } finally {
     stop();
+  }
+});
+
+test("#1728 runtime bridge path fences receipt outbox across same-route re-advertisement and remount", async () => {
+  const routeRef = { current: "panel-route-runtime-1728" };
+  const built = buildRuntimeBridgeClient({ routeRef });
+  const outbox = createRunReceiptOutbox({ retryMs: 60000 });
+  const receiptFrames = [];
+  outbox.setTransport({
+    routeId: () => routeRef.current,
+    ready: () => built.client.isRouteReady() === true,
+    sendFrame: (frame) => built.client.sendFrame(frame),
+  });
+  try {
+    built.client.start();
+    const socket = built.socket();
+    socket.open();
+    await Promise.resolve();
+    assert.deepEqual(socket.sent[0], {
+      type: "hello",
+      tab_id: "panel-route-runtime-1728",
+      workflow_uuid: "wf-1728",
+    });
+    assert.equal(built.client.isRouteReady(), false, "socket-open is not a route handshake");
+
+    socket.receive({ type: "models", epoch: "epoch-runtime-1728", models: [] });
+    assert.equal(built.client.isRouteReady(), true, "the landed hello establishes the captured route");
+
+    built.bridgeState.failNextSend = true;
+    outbox.enqueue("run-failure-1728", "prompt-failure-1728", routeRef.current);
+    assert.equal(outbox.pendingSize(), 1, "sendFrame false retains the receipt for retry");
+    assert.deepEqual(receiptFrames, []);
+
+    built.helloState.block = true;
+    const rehello = built.client.rehello();
+    await Promise.resolve();
+    assert.equal(built.client.isRouteReady(), false, "a same-route replacement hello creates a new readiness fence");
+    outbox.enqueue("run-held-1728", "prompt-held-1728", routeRef.current);
+    assert.equal(outbox.pendingSize(), 2, "receipts remain held while the replacement hello is unresolved");
+
+    built.helloState.block = false;
+    built.helloState.release?.();
+    await rehello;
+    assert.equal(built.client.isRouteReady(), true, "the replacement hello restores readiness only after it lands");
+    outbox.notifyRouteReady();
+    assert.equal(outbox.pendingSize(), 0, "both at-least-once receipts flush after the same binding is live");
+
+    const sentBeforeReplacement = socket.sent.length;
+    routeRef.current = "replacement-route-runtime-1728";
+    assert.equal(built.client.isRouteReady(), false, "a remounted route is not equal to the advertised generation");
+    outbox.enqueue("run-old-route-1728", "prompt-old-route-1728", "panel-route-runtime-1728");
+    assert.equal(outbox.pendingSize(), 1, "an old dispatch is retained rather than attributed to the replacement");
+
+    await built.client.rehello();
+    assert.equal(built.client.isRouteReady(), true, "the replacement route has its own landed hello");
+    outbox.enqueue("run-new-route-1728", "prompt-new-route-1728", routeRef.current);
+    outbox.notifyRouteReady();
+    assert.equal(outbox.pendingSize(), 1, "the old route receipt remains fenced after the replacement hello");
+    assert.deepEqual(
+      socket.sent.slice(sentBeforeReplacement).filter((frame) => frame.type === "run_receipt"),
+      [{ type: "run_receipt", run_rid: "run-new-route-1728", prompt_id: "prompt-new-route-1728", tab_id: "replacement-route-runtime-1728" }],
+      "only the replacement dispatch can flush on the replacement binding",
+    );
+
+    routeRef.current = null;
+    assert.equal(built.client.isRouteReady(), false, "a null captured route is never substituted from the live mount");
+    assert.equal(
+      built.client.sendFrame({ type: "run_receipt", run_rid: "run-null-route-1728", prompt_id: "prompt-null-route-1728" }),
+      false,
+    );
+  } finally {
+    outbox.clearPending();
+    built.client.stop();
   }
 });
 
