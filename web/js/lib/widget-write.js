@@ -423,21 +423,18 @@ function modeTransactionFailure(node, detail) {
 
 function relayDispatchesMode(node, owner) {
   try {
-    const inputs = Array.isArray(node.inputs) ? node.inputs : [];
+    const inputs = node.inputs;
+    if (!Array.isArray(inputs)) {
+      throw modeTransactionFailure(owner, `relay ${node?.id ?? "?"}'s inputs are unreadable`);
+    }
     // rgthree's NodeModeRelay dispatches only when it has at most one input slot,
     // input 0 is unconnected, and an output is connected. A multi-input relay with
     // empty slots is not an input-less dispatcher.
     if (inputs.length > 1) return false;
-    const inputConnected =
-      typeof node.isInputConnected === "function"
-        ? node.isInputConnected(0)
-        : inputs[0]?.link != null;
-    const outputConnected =
-      typeof node.isAnyOutputConnected === "function"
-        ? node.isAnyOutputConnected()
-        : Array.isArray(node.outputs) &&
-          node.outputs.some((output) => Array.isArray(output?.links) && output.links.length > 0);
-    return !inputConnected && outputConnected;
+    if (typeof node.isInputConnected !== "function" || typeof node.isAnyOutputConnected !== "function") {
+      throw modeTransactionFailure(owner, `relay ${node?.id ?? "?"}'s runtime connection contract is unreadable`);
+    }
+    return !node.isInputConnected(0) && node.isAnyOutputConnected();
   } catch {
     throw modeTransactionFailure(owner, `relay ${node?.id ?? "?"}'s connection state is unreadable`);
   }
@@ -451,7 +448,7 @@ function relayDispatchesMode(node, owner) {
  *   - non-pass-through outputs of input-less rgthree relays.
  *
  * This intentionally does not walk or snapshot the graph generally. The returned journal is
- * used only after a write has already failed verification/refused after dispatch.
+ * used to verify the canonical action changed a reachable mode and to roll it back on failure.
  */
 function captureFastBypasserModeTransaction(node, writtenWidget) {
   if (
@@ -465,7 +462,9 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
     writtenWidget,
     ...(Array.isArray(node?.widgets) ? node.widgets : []),
   ].filter((candidate, index, all) => {
-    if (!candidate || widgetBaseName(candidate.name) !== FAST_GROUPS_TOGGLE_WIDGET) return false;
+    if (!candidate || normalizedWidgetBaseName(candidate.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()) {
+      return false;
+    }
     return all.indexOf(candidate) === index;
   });
   const groups = [];
@@ -649,6 +648,17 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
   };
 
   return {
+    changed() {
+      let unreadable = false;
+      for (const entry of entries) {
+        try {
+          if (!Object.is(entry.node.mode, entry.previous)) return true;
+        } catch {
+          unreadable = true;
+        }
+      }
+      return unreadable ? null : false;
+    },
     restore() {
       const restoreEntry = (entry) => {
         try {
@@ -677,6 +687,39 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
       }
       return failed;
     },
+  };
+}
+
+function resolveFastBypasserAction(node, widget, coerced, previous) {
+  if (
+    runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
+    normalizedWidgetBaseName(widget?.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
+  ) {
+    return null;
+  }
+  if (
+    coerced === null ||
+    typeof coerced !== "object" ||
+    Array.isArray(coerced) ||
+    typeof coerced.toggled !== "boolean"
+  ) {
+    throw modeTransactionFailure(node, "the toggle action value is unreadable");
+  }
+  let toggle;
+  let doModeChange;
+  try {
+    toggle = widget.toggle;
+    doModeChange = widget.doModeChange;
+  } catch {
+    throw modeTransactionFailure(node, "the toggle action is unreadable");
+  }
+  if (typeof toggle !== "function" || typeof doModeChange !== "function") {
+    throw modeTransactionFailure(node, "the live row has no canonical toggle action");
+  }
+  return {
+    toggle,
+    requested: coerced.toggled,
+    requiresModeChange: previous?.toggled !== coerced.toggled,
   };
 }
 
@@ -2019,9 +2062,13 @@ export function applyWidgetWrite(
   const prevOuterWidgetsIdentityStable = prevOuterWidgetsRef ? widgetsListHasStableIdentity(node) : false;
 
   // #2146 — capture the narrow Fast Bypasser mode boundary before the undo envelope opens.
-  // If the live row shape cannot be bounded, refuse before assigning the widget value rather
-  // than allowing a callback to mutate linked modes that this writer cannot restore.
+  // If the live row shape cannot be bounded, refuse before invoking the action rather than
+  // allowing it to mutate linked modes that this writer cannot restore.
   const fastBypasserModes = captureFastBypasserModeTransaction(targetNode, w);
+  // #2146 — Fast Bypasser rows do not expose a widget.callback. Their supported UI action is
+  // the row's own toggle(value), which assigns the row value and invokes doModeChange().
+  // Bridge that canonical action instead of assigning the value and falsely reporting success.
+  const fastBypasserAction = resolveFastBypasserAction(targetNode, w, coerced, previous);
 
   // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
   // so a throwing hook can never bypass our verification/rollback and leave a silent
@@ -2082,7 +2129,13 @@ export function applyWidgetWrite(
     // the rail's — otherwise a forwarding view would double-invoke the side effect.
     // The rail's value serializes directly from `parentWidget.value`, which we set
     // here, so it needs no callback of its own.
-    if (!instanceScoped) w.value = coerced;
+    if (!instanceScoped) {
+      if (fastBypasserAction) {
+        Reflect.apply(fastBypasserAction.toggle, valueWidget, [fastBypasserAction.requested]);
+      } else {
+        w.value = coerced;
+      }
+    }
     if (parentWidget) parentWidget.value = coerced;
     // #477: sync the parent-facing DISPLAY proxies too. They are VIEWS of the same
     // promoted value (no semantic callback of their own — the inner target's fires
@@ -2144,12 +2197,14 @@ export function applyWidgetWrite(
     // non-callable callback still throws a TypeError exactly as before, and it takes
     // the argument list without spreading — no `Symbol.iterator` to poison either.
     // `reflectApply` is captured at module load for the same reason.
-    widgetCallback = valueWidget.callback;
-    if (widgetCallback !== null && widgetCallback !== undefined) {
-      const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
-      threwFromCallback = true;
-      reflectApply(widgetCallback, valueWidget, callbackArgs);
-      threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
+    if (!fastBypasserAction) {
+      widgetCallback = valueWidget.callback;
+      if (widgetCallback !== null && widgetCallback !== undefined) {
+        const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
+        threwFromCallback = true;
+        reflectApply(widgetCallback, valueWidget, callbackArgs);
+        threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
+      }
     }
     // #1533 — AFTER the callback, still inside this envelope so afterChange
     // captures the restored number. A VHSINT missing-step snap stores NaN (and a
@@ -2359,6 +2414,21 @@ export function applyWidgetWrite(
           recheckThrew ? "; re-resolving the promotion threw" : ""
         }), so the rail that was synced is no longer the value that serializes at queue time. Rolled ` +
         `back to avoid a silently-stale render (#366).`;
+    }
+  }
+
+  // #2146 — a canonical Fast Bypasser action is not a successful widget write unless the
+  // action actually changed a reachable linked mode when the requested toggle changed. This
+  // catches the old false success path where only the composite row value was assigned.
+  if (!failure && fastBypasserAction?.requiresModeChange) {
+    const modeChanged = fastBypasserModes?.changed();
+    if (modeChanged !== true) {
+      failure =
+        modeChanged === null
+          ? `Fast Bypasser row action changed the toggle, but its linked node modes could not be ` +
+            `verified.`
+          : `Fast Bypasser row action did not change any linked node modes; refusing to report ` +
+            `the toggle as applied.`;
     }
   }
 

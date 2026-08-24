@@ -1,6 +1,6 @@
 /**
- * #2146 — Fast Groups Bypasser rows are valid actions whose real row action can propagate a
- * mode through an rgthree repeater. Failed widget verification must restore every mode touched.
+ * #2146 — Fast Groups Bypasser rows are valid actions whose production-shaped widget exposes
+ * toggle()/doModeChange(), not widget.callback. Failed MCP writes must restore every mode touched.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -27,7 +27,13 @@ function defineMode(node, initial, onChange) {
   });
 }
 
-function makeFixture({ forceVerificationFailure = false } = {}) {
+function makeFixture({
+  initialToggled = false,
+  initialModes = [4, 4],
+  repeaterMode = 4,
+  disableModeChange = false,
+  rowName = ROW,
+} = {}) {
   const loadAudio1 = { id: 11, type: "LoadAudio" };
   const loadAudio2 = { id: 12, type: "LoadAudio" };
   const repeater = {
@@ -36,12 +42,11 @@ function makeFixture({ forceVerificationFailure = false } = {}) {
     inputs: [{ link: 101 }, { link: 102 }],
   };
 
-  defineMode(loadAudio1, 0);
-  defineMode(loadAudio2, 2);
-  defineMode(repeater, 2, (value) => {
+  defineMode(loadAudio1, initialModes[0]);
+  defineMode(loadAudio2, initialModes[1]);
+  defineMode(repeater, repeaterMode, (value) => {
     // This is the repeater's actual mode side effect: changing its mode propagates to each
-    // connected input. The group order intentionally puts a linked node before the repeater,
-    // which exposes restoration strategies that rely on incidental Set iteration order.
+    // connected input. The group order intentionally puts a linked node before the repeater.
     loadAudio1.mode = value;
     loadAudio2.mode = value;
   });
@@ -62,65 +67,121 @@ function makeFixture({ forceVerificationFailure = false } = {}) {
   };
   for (const node of nodes.values()) node.graph = graph;
 
+  const bypasser = {
+    id: 10,
+    type: BYPASSER,
+    graph,
+    modeOn: 0,
+    modeOff: 4,
+    properties: {},
+    widgets: [],
+  };
   const group = {
     graph,
     _children: new Set([loadAudio1, repeater, loadAudio2]),
     recomputeInsideNodes() {},
   };
   const row = {
-    name: ROW,
-    value: { toggled: false },
+    name: rowName,
+    value: { toggled: initialToggled },
     group,
-    // This models the real Fast Groups row action: the writer has already assigned the
-    // requested composite value, then the row action applies its group mode change.
-    doModeChange(force) {
-      const newMode = force ? 4 : 2;
-      for (const groupNode of group._children) groupNode.mode = newMode;
-      group.rgthree_hasAnyActiveNode = !!force;
-      this.value = { toggled: !!force };
+    node: bypasser,
+    // These are the production row action methods: mouse handling calls toggle(), which
+    // updates the row value and then invokes doModeChange(). There is intentionally no callback.
+    doModeChange() {
+      if (disableModeChange) return;
+      group.recomputeInsideNodes();
+      const hasAnyActiveNodes = [...group._children].some((node) => node.mode === 0);
+      const newValue = !hasAnyActiveNodes;
+      for (const groupNode of group._children) {
+        groupNode.mode = newValue ? this.node.modeOn : this.node.modeOff;
+      }
+      group.rgthree_hasAnyActiveNode = newValue;
+      this.value = { toggled: newValue };
     },
-    callback(value) {
-      this.doModeChange(value.toggled);
-      if (forceVerificationFailure) this.value = { toggled: false };
+    toggle(value) {
+      value = value == null ? !this.value.toggled : value;
+      if (value !== this.value.toggled) {
+        this.value = { toggled: value };
+        this.doModeChange();
+      }
     },
   };
-  const unrelated = { id: 99, type: "KSampler", mode: 0 };
-  const bypasser = {
-    id: 10,
-    type: BYPASSER,
-    graph,
-    widgets: [row],
-  };
+  bypasser.widgets.push(row);
 
+  const unrelated = { id: 99, type: "KSampler", mode: 0 };
   return { bypasser, row, repeater, loadAudio1, loadAudio2, unrelated };
 }
 
-test("#2146: failed real row action restores propagation regardless of group order", () => {
-  const fixture = makeFixture({ forceVerificationFailure: true });
+test("#2146: a no-callback row action rolls back propagation regardless of group order", () => {
+  const fixture = makeFixture({ initialToggled: true, initialModes: [0, 2], repeaterMode: 0 });
   let failure;
 
+  assert.equal(fixture.row.callback, undefined);
   assert.throws(
-    () => applyWidgetWrite(fixture.bypasser, "rgthree_toggle_and_nav.toggled", true),
+    () =>
+      applyWidgetWrite(fixture.bypasser, "rgthree_toggle_and_nav.toggled", false, {
+        // Force the normal post-action verification failure after the real row action ran.
+        afterChange() {
+          fixture.row.value = { toggled: true };
+        },
+      }),
     (error) => {
       failure = error;
       return error instanceof WidgetWriteError && /did not retain the requested value/.test(error.message);
     },
   );
   assert.equal(failure.partialWrite, false);
-  assert.equal(fixture.row.value.toggled, false);
-  assert.equal(fixture.repeater.mode, 2, "the repeater mode is restored");
-  assert.equal(fixture.loadAudio1.mode, 0, "the first linked mode is restored after repeater propagation");
-  assert.equal(fixture.loadAudio2.mode, 2, "the second linked mode is restored after repeater propagation");
+  assert.deepEqual(fixture.row.value, { toggled: true });
+  assert.equal(fixture.repeater.mode, 0, "the repeater mode is restored");
+  assert.equal(fixture.loadAudio1.mode, 0, "the first linked mode is restored after propagation");
+  assert.equal(fixture.loadAudio2.mode, 2, "the second linked mode is restored after propagation");
   assert.equal(fixture.unrelated.mode, 0, "unrelated graph state is not part of the journal");
 });
 
-test("#2146: a valid Fast Bypasser row action keeps the toggle and propagated modes", () => {
+test("#2146: a no-callback row action performs a valid toggle and propagates its mode", () => {
   const fixture = makeFixture();
 
   const result = applyWidgetWrite(fixture.bypasser, ROW, { toggled: true });
 
+  assert.equal(fixture.row.callback, undefined);
   assert.deepEqual(result.value, { toggled: true });
   assert.deepEqual(fixture.row.value, { toggled: true });
+  assert.equal(fixture.repeater.mode, 0);
+  assert.equal(fixture.loadAudio1.mode, 0);
+  assert.equal(fixture.loadAudio2.mode, 0);
+});
+
+test("#2146: a case-insensitive row lookup still journals the canonical action", () => {
+  const fixture = makeFixture({ initialToggled: true, initialModes: [0, 2], repeaterMode: 0, rowName: ROW.toLowerCase() });
+
+  assert.throws(
+    () =>
+      applyWidgetWrite(fixture.bypasser, ROW.toUpperCase() + ".toggled", false, {
+        afterChange() {
+          fixture.row.value = { toggled: true };
+        },
+      }),
+    (error) => error instanceof WidgetWriteError && /did not retain the requested value/.test(error.message),
+  );
+  assert.equal(fixture.repeater.mode, 0);
+  assert.equal(fixture.loadAudio1.mode, 0);
+  assert.equal(fixture.loadAudio2.mode, 2);
+});
+
+test("#2146: a no-op canonical action cannot report a toggle without a mode change", () => {
+  const fixture = makeFixture({ disableModeChange: true });
+  let failure;
+
+  assert.throws(
+    () => applyWidgetWrite(fixture.bypasser, ROW, { toggled: true }),
+    (error) => {
+      failure = error;
+      return error instanceof WidgetWriteError && /did not change any linked node modes/.test(error.message);
+    },
+  );
+  assert.equal(failure.partialWrite, false);
+  assert.deepEqual(fixture.row.value, { toggled: false });
   assert.equal(fixture.repeater.mode, 4);
   assert.equal(fixture.loadAudio1.mode, 4);
   assert.equal(fixture.loadAudio2.mode, 4);
@@ -168,19 +229,33 @@ test("#2146: a multi-input relay is not treated as an input-less dispatcher", ()
   relay.graph = graph;
   relayTarget.graph = graph;
   const group = { graph, _children: new Set([relay]), recomputeInsideNodes() {} };
+  const bypasser = {
+    id: 20,
+    type: BYPASSER,
+    graph,
+    widgets: [],
+  };
   const row = {
     name: ROW,
     value: { toggled: false },
     group,
-    callback() {
-      this.value = { toggled: false };
+    doModeChange() {
       relay.mode = 4;
     },
+    toggle(value) {
+      this.value = { toggled: value };
+      this.doModeChange();
+    },
   };
-  const bypasser = { id: 20, type: BYPASSER, graph, widgets: [row] };
+  bypasser.widgets.push(row);
 
   assert.throws(
-    () => applyWidgetWrite(bypasser, ROW, { toggled: true }),
+    () =>
+      applyWidgetWrite(bypasser, ROW, { toggled: true }, {
+        afterChange() {
+          row.value = { toggled: false };
+        },
+      }),
     (error) => error instanceof WidgetWriteError && /did not retain the requested value/.test(error.message),
   );
   assert.equal(targetModeReads, 0, "a multi-input relay's output is outside the mode journal");
