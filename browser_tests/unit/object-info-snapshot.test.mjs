@@ -1222,8 +1222,8 @@ test("#1223 the snapshot is recorded ONLY where a WHOLE schema was fetched, and 
   }
   assert.match(
     PANEL_SRC,
-    /if \(!preloadedDefs && refreshResponseIsCurrent\) \{[\s\S]{0,420}objectInfoSnapshot\.record\(/,
-    "the refresh run records only a payload it fetched itself — a caller-supplied one is not provably whole",
+    /if \(\(!preloadedDefs \|\| preloadedWholeSchema\) && refreshResponseIsCurrent\) \{[\s\S]{0,1200}objectInfoSnapshot\.record\(/,
+    "the refresh run records fetched payloads or the graph_add caller's explicitly verified whole payload",
   );
 });
 

@@ -169,22 +169,28 @@ test("#1709: replace retires old cache entries and late in-flight responses", as
     await gate;
     return { OldType: {} };
   });
-  assert.equal(cache.replace({ NewType: {} }), true, "a definitive non-empty map replaces the old authority");
+  const replacement = {
+    NewType: { input: { required: { count: ["INT", { default: 1 }] } } },
+  };
+  assert.equal(cache.replace(replacement), true, "a definitive non-empty map replaces the old authority");
+  replacement.NewType.input.required.count[1].default = 999;
   release();
   await stale;
 
   let refetched = false;
-  assert.deepEqual(
-    await cache.read(async () => {
-      refetched = true;
-      return { Unexpected: {} };
-    }),
-    { NewType: {} },
-    "the late old response cannot overwrite the replacement",
-  );
+  const cachedReplacement = await cache.read(async () => {
+    refetched = true;
+    return { Unexpected: {} };
+  });
+  assert.equal(cachedReplacement.NewType.input.required.count[1].default, 1, "nested hook mutation is detached");
+  assert.equal(Object.isFrozen(cachedReplacement.NewType.input.required.count[1]), true, "nested data is frozen");
+  assert.equal(Object.isFrozen(cachedReplacement.NewType.input.required.count), true, "arrays are frozen");
   assert.equal(refetched, false, "the replacement remains the current burst entry");
   assert.equal(cache.replace({}), false, "an empty response is not an authority replacement");
-  assert.deepEqual(await cache.read(async () => ({ Unexpected: {} })), { NewType: {} });
+  assert.equal(
+    (await cache.read(async () => ({ Unexpected: {} }))).NewType.input.required.count[1].default,
+    1,
+  );
 });
 
 test("#716: every joined caller sees a failing fetch fail", async () => {

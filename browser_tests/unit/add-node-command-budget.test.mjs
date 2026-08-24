@@ -37,11 +37,14 @@ import {
   isRegisteredNodeType,
 } from "../../web/js/lib/node-resolve.js";
 import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
+import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import {
   fetchWholeObjectInfo,
   objectInfoOracleFailureNote,
   TRANSPORT_OUTCOME,
 } from "../../web/js/lib/object-info-oracle.js";
+import { describeNodeDefRefresh, NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
+import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
 import {
   describeUnmaterializedRequiredWidgets,
   snapshotBackendDef,
@@ -49,6 +52,10 @@ import {
 import {
   NODE_DEFS_FETCH_TIMEOUT_MS,
   NODE_DEFS_NO_ANSWER,
+  NODE_DEFS_FETCH_SHARE,
+  NODE_DEFS_RUN_BUDGET_MS,
+  COMBO_OK,
+  COMBO_NO_ANSWER,
   WIDEN_SOCKET_PROOF_TIMEOUT_MS,
   monotonicNow,
   widenSocketProofBudget,
@@ -82,6 +89,43 @@ assert.ok(placementMatch, "could not locate placementFor");
 
 const boundedMatch = panelSrc.match(/\nasync function boundedGetNodeDefs\([\s\S]*?\n\}/);
 assert.ok(boundedMatch, "could not locate boundedGetNodeDefs in panel source");
+
+function extractFunction(marker) {
+  const start = panelSrc.indexOf(marker);
+  assert.notEqual(start, -1, `${marker} not found`);
+  const open = panelSrc.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < panelSrc.length; i += 1) {
+    const ch = panelSrc[i];
+    if (ch === "/" && panelSrc[i + 1] === "/") {
+      i = panelSrc.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "/" && panelSrc[i + 1] === "*") {
+      i = panelSrc.indexOf("*/", i + 2);
+      if (i < 0) break;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < panelSrc.length; i += 1) {
+        if (panelSrc[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (panelSrc[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return panelSrc.slice(start, i + 1);
+  }
+  throw new Error(`unterminated function: ${marker}`);
+}
+
+const registerComfyNodeDefsBody = extractFunction("async function registerComfyNodeDefs(");
 
 // The SHIPPED refusal, built from source rather than restated. A hand-copied sentence here
 // would let the real one drift into naming a remedy that cannot work while this file stayed
@@ -163,6 +207,84 @@ function makeComfy() {
   return { app, LG, graph, widgets };
 }
 
+/** Build the SHIPPED refresh body so the graph-add regression crosses the real
+ * `registerComfyNodeDefs(preloadedDefs, runOpts)` invalidation boundary. */
+function realRegisterComfyNodeDefs({ app, api, objectInfoCache, objectInfoSnapshot, verifiedNodeDefCache, epoch = 0 }) {
+  const names = [
+    "app",
+    "api",
+    "recordObjectInfoTypes",
+    "reapplyDefsToLiveNodes",
+    "comboRebuildCovered",
+    "describeNodeDefRefresh",
+    "NODE_DEF_REFRESH_REASONS",
+    "fetchNodeDefsWithRetry",
+    "withTimeout",
+    "NODE_DEFS_NO_ANSWER",
+    "COMBO_OK",
+    "COMBO_NO_ANSWER",
+    "NODE_DEFS_FETCH_TIMEOUT_MS",
+    "NODE_DEFS_RUN_BUDGET_MS",
+    "NODE_DEFS_FETCH_SHARE",
+    "fetchWholeObjectInfo",
+    "nodeDefsBudgetLeft",
+    "monotonicNow",
+    "NODE_DEFS_RETRY_DELAYS_MS",
+    "objectInfoCache",
+    "objectInfoSnapshot",
+    "verifiedNodeDefCache",
+    "initialBackendReconnectEpoch",
+    "comfyBackendSocketDown",
+    "TRANSPORT_OUTCOME",
+  ];
+  const values = {
+    app,
+    api,
+    recordObjectInfoTypes: (defs) => defs,
+    reapplyDefsToLiveNodes: () => {},
+    comboRebuildCovered,
+    describeNodeDefRefresh,
+    NODE_DEF_REFRESH_REASONS,
+    fetchNodeDefsWithRetry: (getDefs, opts) => fetchNodeDefsWithRetry(getDefs, { ...opts, sleep: async () => {} }),
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    COMBO_OK,
+    COMBO_NO_ANSWER,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
+    NODE_DEFS_RUN_BUDGET_MS,
+    NODE_DEFS_FETCH_SHARE,
+    fetchWholeObjectInfo,
+    nodeDefsBudgetLeft: (deadline, share = 1) => Math.max(1, Math.floor((deadline - monotonicNow()) * share)),
+    monotonicNow,
+    NODE_DEFS_RETRY_DELAYS_MS: OBJECT_INFO_RETRY_DELAYS_MS,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache,
+    initialBackendReconnectEpoch: epoch,
+    comfyBackendSocketDown: false,
+    TRANSPORT_OUTCOME,
+  };
+  const factory = new Function(
+    ...names,
+    `const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
+      if (typeof api?.getNodeDefs !== "function") return null;
+      const settled = await withTimeout(
+        Promise.resolve().then(() => api.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
+        ms,
+        () => NODE_DEFS_NO_ANSWER,
+      );
+      if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+      if ("err" in settled) throw settled.err;
+      return settled.value;
+    };
+    let backendReconnectEpoch = initialBackendReconnectEpoch;
+    let nodeDefsRefreshConfirmed = false;
+    ${registerComfyNodeDefsBody}
+    return registerComfyNodeDefs;`,
+  );
+  return factory(...names.map((name) => values[name]));
+}
+
 /**
  * Build the SHIPPED `graph_add_node` with the REAL coalescer behind it.
  *
@@ -192,6 +314,7 @@ function realGraphAddNode({
   budgetMs = 400,
   reserveMs = 120,
   registrationMs = 200,
+  productionRegister = null,
   overrides = {},
 } = {}) {
   const c = comfy ?? makeComfy();
@@ -217,8 +340,9 @@ function realGraphAddNode({
     setInFlight: (p) => {
       inFlight = p;
     },
-    runRegister: async (defs) => {
+    runRegister: async (defs, runOpts, runControl) => {
       runs.push(defs);
+      if (productionRegister) return productionRegister(defs, runOpts, runControl);
       // The reconnect run — the one with no payload — is the one a test can hold open.
       if (defs == null && holdInFlight) await holdInFlight;
       // #1351 — this add's own registration, after any join. Distinct from holdInFlight:
@@ -709,9 +833,12 @@ test("#1709: a direct schema response crossing refresh cannot authorize a later 
 test("#1709: graph_add_node replaces the old whole cache and snapshot on a changed response", async () => {
   const comfy = makeComfy();
   const oldDefs = { OldNode: { input: { required: {} } } };
-  const changedDefs = { NewNode: { input: { required: {} } } };
+  const changedDefs = {
+    NewNode: { input: { required: { count: ["INT", { default: 1 }] } } },
+  };
   const objectInfoCache = createObjectInfoCache();
   const objectInfoSnapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
   await objectInfoCache.read(async () => oldDefs);
   assert.equal(
     objectInfoSnapshot.record(oldDefs, {
@@ -724,22 +851,40 @@ test("#1709: graph_add_node replaces the old whole cache and snapshot on a chang
     true,
     "the production precondition starts with an older whole authority",
   );
+  comfy.app.refreshComboInNodes = async () => {};
+  const originalRegister = comfy.app.registerNodesFromDefs;
+  comfy.app.registerNodesFromDefs = (defs) => {
+    defs.NewNode.input.required.count[1].default = 999;
+    originalRegister(defs);
+  };
+  const api = {
+    getNodeDefs: async () => changedDefs,
+    fetchApi: async () => ({ status: 503, json: async () => ({}) }),
+  };
+  const productionRegister = realRegisterComfyNodeDefs({
+    app: comfy.app,
+    api,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache,
+  });
 
   const built = realGraphAddNode({
     comfy,
     getNodeDefs: async () => changedDefs,
+    productionRegister,
     overrides: {
+      api,
       objectInfoCache,
       objectInfoSnapshot,
+      verifiedNodeDefCache,
     },
   });
   const result = await built.graph_add_node({ class_type: "NewNode" });
   assert.equal(result.added.type, "NewNode", "the changed whole response still permits its current class");
-  assert.deepEqual(
-    await objectInfoCache.read(async () => ({ Unexpected: {} })),
-    changedDefs,
-    "the later burst reader cannot see the old whole map",
-  );
+  const cached = await objectInfoCache.read(async () => ({ Unexpected: {} }));
+  assert.equal(cached.NewNode.input.required.count[1].default, 1, "the cache is isolated from registration-hook mutation");
+  assert.equal(Object.prototype.hasOwnProperty.call(cached, "OldNode"), false, "the old whole map was replaced");
   const fallback = objectInfoSnapshot.authorize({
     epoch: 0,
     outcomes: [{ kind: TRANSPORT_OUTCOME.NO_ANSWER }],
@@ -795,7 +940,7 @@ test("#1709: a same-epoch refresh fences graph_add_node's late whole-schema snap
 
   const first = await built.graph_add_node({ class_type: "NewNode" });
   assert.equal(first.added.type, "NewNode", "the refresh still registers and adds the requested class");
-  assert.equal(snapshot.peek().held, false, "the pre-refresh whole result was not filed after refresh cleared it");
+  assert.equal(snapshot.peek().held, true, "the authoritative whole result was re-filed against the post-refresh generation");
 
   unavailable = true;
   await assert.rejects(

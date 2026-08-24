@@ -75,6 +75,34 @@ export const CACHE_OUTCOME = Symbol.for("comfyui-mcp.objectInfoOutcome");
 export const OBJECT_INFO_CACHE_TTL_MS = 1500;
 
 /**
+ * Clone the JSON-shaped schema into a private graph and freeze every level. The panel hands
+ * direct whole responses to frontend registration hooks, which are allowed to mutate their
+ * input; the cache must never retain those mutations as backend authority.
+ */
+function cloneAndFreeze(value, seen = new WeakMap()) {
+  if (value === null || typeof value !== "object") return value;
+  const prior = seen.get(value);
+  if (prior) return prior;
+  const clone = Array.isArray(value) ? [] : {};
+  seen.set(value, clone);
+  let keys;
+  try {
+    keys = Object.keys(value);
+  } catch {
+    throw new TypeError("object_info schema is unreadable");
+  }
+  for (const key of keys) {
+    Object.defineProperty(clone, key, {
+      value: cloneAndFreeze(value[key], seen),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return Object.freeze(clone);
+}
+
+/**
  * @param {{ttlMs?: number, now?: () => number}} [opts] `now` is injectable so tests do not
  *   depend on wall-clock timing, which is how a cache test becomes a flaky test.
  */
@@ -439,9 +467,10 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
       try {
         // Keep the caller's response mutable for downstream registration hooks. The
         // ordinary loader may cache an outcome wrapper, while direct whole readers hand
-        // their map to graph registration after publishing it here; freezing that shared
-        // response would make this cache alter the registration contract.
-        frozen = Object.freeze({ ...next });
+        // their map to graph registration after publishing it here; cloning the complete
+        // graph prevents this cache from altering the registration contract or retaining
+        // nested hook mutations.
+        frozen = cloneAndFreeze(next);
       } catch {
         return false;
       }

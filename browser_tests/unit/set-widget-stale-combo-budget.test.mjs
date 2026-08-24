@@ -27,6 +27,7 @@ import assert from "node:assert/strict";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import {
   createObjectInfoCache,
   CACHE_OUTCOME,
@@ -48,6 +49,8 @@ import {
 } from "../../web/js/lib/scoped-object-info.js";
 import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
 import { scanComboAvailability } from "../../web/js/lib/live-combo-availability.js";
+import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
+import { describeNodeDefRefresh, NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "../../web/js/lib/rgthree-lora-row.js";
 import { inputAssetViewQuery } from "../../web/js/lib/input-asset.js";
 import {
@@ -55,6 +58,14 @@ import {
   setWidgetCommandBudgetDeps,
   SET_WIDGET_COMMAND_BUDGET_MS,
   SET_WIDGET_POST_REFRESH_RESERVE_MS,
+  COMBO_OK,
+  COMBO_NO_ANSWER,
+  NODE_DEFS_FETCH_TIMEOUT_MS,
+  NODE_DEFS_RUN_BUDGET_MS,
+  NODE_DEFS_FETCH_SHARE,
+  NODE_DEFS_NO_ANSWER,
+  monotonicNow,
+  nodeDefsBudgetLeft,
 } from "./_panel-constants.mjs";
 import { runProductionGraphGetErrors } from "./_graph-get-errors-harness.mjs";
 
@@ -62,6 +73,43 @@ const graphGetMatch = PANEL_SRC.match(
   /\n  async graph_get_object_info\(\{ if_none_match \} = \{\}\) \{[\s\S]*?\n  \},/,
 );
 assert.ok(graphGetMatch, "could not locate graph_get_object_info in the panel source");
+
+function extractFunction(marker) {
+  const start = PANEL_SRC.indexOf(marker);
+  assert.notEqual(start, -1, `${marker} not found`);
+  const open = PANEL_SRC.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < PANEL_SRC.length; i += 1) {
+    const ch = PANEL_SRC[i];
+    if (ch === "/" && PANEL_SRC[i + 1] === "/") {
+      i = PANEL_SRC.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "/" && PANEL_SRC[i + 1] === "*") {
+      i = PANEL_SRC.indexOf("*/", i + 2);
+      if (i < 0) break;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < PANEL_SRC.length; i += 1) {
+        if (PANEL_SRC[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (PANEL_SRC[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return PANEL_SRC.slice(start, i + 1);
+  }
+  throw new Error(`unterminated function: ${marker}`);
+}
+
+const REGISTER_COMFY_NODE_DEFS_SRC = extractFunction("async function registerComfyNodeDefs(");
 
 // ---------------------------------------------------------------------------
 // 1. The lib: an abandoned refresh is a worded, honest, retryable refusal.
@@ -424,6 +472,83 @@ function realGraphSetWidget({
     objectInfoCache,
     objectInfoSnapshot,
   };
+}
+
+/** The real refresh body used by graph_add_node when it supplies a whole preloaded payload. */
+function realPreloadedRefresh({ app, api, objectInfoCache, objectInfoSnapshot, verifiedNodeDefCache }) {
+  const names = [
+    "app",
+    "api",
+    "recordObjectInfoTypes",
+    "reapplyDefsToLiveNodes",
+    "comboRebuildCovered",
+    "describeNodeDefRefresh",
+    "NODE_DEF_REFRESH_REASONS",
+    "fetchNodeDefsWithRetry",
+    "withTimeout",
+    "NODE_DEFS_NO_ANSWER",
+    "COMBO_OK",
+    "COMBO_NO_ANSWER",
+    "NODE_DEFS_FETCH_TIMEOUT_MS",
+    "NODE_DEFS_RUN_BUDGET_MS",
+    "NODE_DEFS_FETCH_SHARE",
+    "fetchWholeObjectInfo",
+    "nodeDefsBudgetLeft",
+    "monotonicNow",
+    "NODE_DEFS_RETRY_DELAYS_MS",
+    "objectInfoCache",
+    "objectInfoSnapshot",
+    "verifiedNodeDefCache",
+    "initialBackendReconnectEpoch",
+    "comfyBackendSocketDown",
+    "TRANSPORT_OUTCOME",
+  ];
+  const values = {
+    app,
+    api,
+    recordObjectInfoTypes: (defs) => defs,
+    reapplyDefsToLiveNodes: () => {},
+    comboRebuildCovered,
+    describeNodeDefRefresh,
+    NODE_DEF_REFRESH_REASONS,
+    fetchNodeDefsWithRetry: (getDefs, opts) => fetchNodeDefsWithRetry(getDefs, { ...opts, sleep: async () => {} }),
+    withTimeout,
+    NODE_DEFS_NO_ANSWER,
+    COMBO_OK,
+    COMBO_NO_ANSWER,
+    NODE_DEFS_FETCH_TIMEOUT_MS,
+    NODE_DEFS_RUN_BUDGET_MS,
+    NODE_DEFS_FETCH_SHARE,
+    fetchWholeObjectInfo,
+    nodeDefsBudgetLeft,
+    monotonicNow,
+    NODE_DEFS_RETRY_DELAYS_MS: OBJECT_INFO_RETRY_DELAYS_MS,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache,
+    initialBackendReconnectEpoch: 0,
+    comfyBackendSocketDown: false,
+    TRANSPORT_OUTCOME,
+  };
+  const factory = new Function(
+    ...names,
+    `const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
+      if (typeof api?.getNodeDefs !== "function") return null;
+      const settled = await withTimeout(
+        Promise.resolve().then(() => api.getNodeDefs()).then((value) => ({ value }), (err) => ({ err })),
+        ms,
+        () => NODE_DEFS_NO_ANSWER,
+      );
+      if (settled === NODE_DEFS_NO_ANSWER) return NODE_DEFS_NO_ANSWER;
+      if ("err" in settled) throw settled.err;
+      return settled.value;
+    };
+    let backendReconnectEpoch = initialBackendReconnectEpoch;
+    let nodeDefsRefreshConfirmed = false;
+    ${REGISTER_COMFY_NODE_DEFS_SRC}
+    return registerComfyNodeDefs;`,
+  );
+  return factory(...names.map((name) => values[name]));
 }
 
 /** Build the shipped whole-schema reader with the same cache/snapshot trust roots. */
@@ -832,6 +957,77 @@ test("#1709: graph_get_object_info replaces changed whole authority before graph
     () => built.graph_set_widget({ node_id: 215, widget: "text", value: "stale", workflow_uuid: "u" }),
     /Cannot set widget|does not provide|object_info is unavailable|refused/i,
     "the timeout fallback refuses the removed class",
+  );
+  assert.equal(widget.value, "live-old", "the stale timeout path did not mutate the widget");
+});
+
+test("#1709: graph_add preloaded refresh replaces authority before graph_set_widget timeout", async () => {
+  const widget = { name: "text", type: "text", value: "before" };
+  const oldDef = { input: { required: { text: ["STRING", {}] } } };
+  const oldDefs = { RemovedNode: oldDef };
+  const changedDefs = { OtherNode: { input: { required: {} } } };
+  let now = 0;
+  let liveDefs = oldDefs;
+  const objectInfoCache = createObjectInfoCache({ now: () => now });
+  const objectInfoSnapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const node = {
+    id: 216,
+    type: "RemovedNode",
+    widgets: [widget],
+    constructor: { nodeData: oldDef, comfyClass: "RemovedNode" },
+  };
+  const built = realGraphSetWidget({
+    node,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache,
+    getNodeDefsImpl: async () => liveDefs,
+    fetchApiImpl: async () =>
+      liveDefs
+        ? { status: 200, json: async () => liveDefs }
+        : { status: 504, json: async () => ({}) },
+    oracleDefs: oldDefs,
+    registeredNodeTypes: {
+      LoadImage: {},
+      Note: {},
+      RemovedNode: { nodeData: oldDef, comfyClass: "RemovedNode" },
+    },
+  });
+  await built.graph_set_widget({ node_id: 216, widget: "text", value: "live-old", workflow_uuid: "u" });
+
+  const refreshApp = {
+    graph: null,
+    refreshComboInNodes: async () => {},
+    registerNodesFromDefs: async (payload) => {
+      payload.OtherNode.input.required.hook_added = ["STRING", {}];
+    },
+  };
+  const refresh = realPreloadedRefresh({
+    app: refreshApp,
+    api: { getNodeDefs: async () => ({ Unexpected: {} }) },
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache,
+  });
+  const verdict = await refresh(changedDefs, { preloadedWholeSchema: true });
+  assert.equal(verdict.refreshed, true, "the actual preloaded refresh completed");
+  assert.equal(Object.prototype.hasOwnProperty.call(changedDefs.OtherNode.input.required, "hook_added"), true);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      (await objectInfoCache.read(async () => ({ Unexpected: {} }))).OtherNode.input.required,
+      "hook_added",
+    ),
+    false,
+    "the cached authority is isolated from registration hooks",
+  );
+
+  now += OBJECT_INFO_CACHE_TTL_MS + 1;
+  liveDefs = null;
+  await assert.rejects(
+    () => built.graph_set_widget({ node_id: 216, widget: "text", value: "stale", workflow_uuid: "u" }),
+    /Cannot set widget|does not provide|object_info is unavailable|refused/i,
+    "the timeout fallback refuses the removed class after graph_add's real preloaded refresh",
   );
   assert.equal(widget.value, "live-old", "the stale timeout path did not mutate the widget");
 });

@@ -1405,6 +1405,10 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // actually failed instead of being bucketed as a generic failure.
   let appAvailable = false;
   let defs = preloadedDefs ?? null;
+  // A graph_add_node whole-schema response is authoritative even though it arrives as
+  // preloaded input. The explicit marker is narrowly supplied by that caller; arbitrary
+  // preloaded refresh payloads remain ineligible for whole-schema cache/snapshot authority.
+  const preloadedWholeSchema = runOpts?.preloadedWholeSchema === true;
   let defsRegistered = false;
   let comboApiPresent = false;
   let comboRan = false;
@@ -1862,10 +1866,12 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     const refreshResponseIsCurrent =
       runStartedAtEpoch === backendReconnectEpoch &&
       runStartedAtGeneration === verifiedNodeDefCache.generation();
-    if (!preloadedDefs && refreshResponseIsCurrent) {
-      // The refresh fetch is a direct whole-schema read, not an objectInfoCache read. Keep
-      // its current answer as the burst authority and retire the snapshot before recording
-      // the replacement, so a timeout cannot use the prior map or membership set.
+    if ((!preloadedDefs || preloadedWholeSchema) && refreshResponseIsCurrent) {
+      // A direct refresh fetch, or graph_add_node's explicitly verified whole payload, is
+      // not an objectInfoCache read. Keep its current answer as the burst authority and
+      // retire the snapshot before recording the replacement, so a timeout cannot use the
+      // prior map or membership set. The refresh invalidation above happens first, so this
+      // is the post-refresh generation rather than the add's pre-refresh fence.
       if (!objectInfoCache.replace(defs)) objectInfoCache.invalidate();
       objectInfoSnapshot.clear();
       objectInfoSnapshot.record(defs, {
@@ -13918,8 +13924,25 @@ const GRAPH_TOOL_EXECUTORS = {
       refresh: (defs) =>
         refreshComfyNodeDefs(defs, {
           joinMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS,
+          preloadedWholeSchema: !freshDefsAreSingleClass,
         }).then((outcome) => {
           if (outcome === REFRESH_JOIN_ABANDONED) refreshJoinAbandoned = true;
+          // The refresh intentionally advances the verified generation before registering
+          // this preloaded response. Once its current verdict settles, the response is now
+          // stamped against the post-refresh generation; retaining the old issuance stamp
+          // would make the later snapshot record fail closed even though this refresh just
+          // registered the same authoritative whole map.
+          const refreshIsCurrent =
+            outcome === true || (outcome && typeof outcome === "object" && outcome.refreshed === true);
+          if (
+            refreshIsCurrent &&
+            outcome !== REFRESH_JOIN_ABANDONED &&
+            !freshDefsAreSingleClass &&
+            addNodeObservedAtEpoch !== null &&
+            addNodeObservedAtEpoch === backendReconnectEpoch
+          ) {
+            addNodeObservedAtGeneration = verifiedNodeDefCache.generation();
+          }
           return outcome;
         }),
       // #458 OBSERVED-BACKEND-HISTORY trust root, identical to graph_set_widget's.
