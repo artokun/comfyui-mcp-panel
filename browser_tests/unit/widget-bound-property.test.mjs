@@ -260,6 +260,75 @@ test("a bound widget whose `value` is an ACCESSOR still verifies", () => {
   assert.equal(callbacks, 3);
 });
 
+test("#1735: an accessor-backed BooleanWidget copy-back deletion is recovered only after both stores retain", () => {
+  let stored = false;
+  let setterCalls = 0;
+  let callbacks = 0;
+  const widget = {
+    name: "resize_source",
+    type: "BOOLEAN",
+    options: { property: "resize_source" },
+    get value() {
+      return stored;
+    },
+    set value(next) {
+      stored = next;
+      setterCalls += 1;
+      if (setterCalls === 2) {
+        throw new TypeError("Cannot delete property 'value' of #<BooleanWidget>");
+      }
+    },
+    callback() {
+      callbacks += 1;
+    },
+  };
+  const node = {
+    id: 1735,
+    type: "ImageCompositeMasked",
+    properties: { resize_source: false },
+    widgets: [widget],
+    setProperty,
+  };
+
+  const set = applyWidgetWrite(node, "resize_source", true, {});
+
+  assert.equal(set.value, true);
+  assert.equal(widget.value, true, "the accessor-backed widget retains the write");
+  assert.equal(node.properties.resize_source, true, "the bound node property retains the write");
+  assert.equal(callbacks, 1, "the standard callback path still runs after recovery");
+  assert.equal(set.write_warning, undefined, "the verified Impact Pack setter quirk is not surfaced as a write warning");
+});
+
+test("#1735: an accessor-backed BooleanWidget that does not retain still fails closed", () => {
+  let stored = false;
+  const widget = {
+    name: "resize_source",
+    type: "BOOLEAN",
+    options: { property: "resize_source" },
+    get value() {
+      return stored;
+    },
+    set value(next) {
+      if (next === true) throw new TypeError("Cannot delete property 'value' of #<BooleanWidget>");
+      stored = next;
+    },
+  };
+  const node = {
+    id: 1735,
+    type: "ImageCompositeMasked",
+    properties: { resize_source: false },
+    widgets: [widget],
+    setProperty,
+  };
+
+  assert.throws(
+    () => applyWidgetWrite(node, "resize_source", true, {}),
+    /did not retain|thrown while applying the write/,
+  );
+  assert.equal(widget.value, false, "the failed write is rolled back or remains unchanged");
+  assert.equal(node.properties.resize_source, false, "the bound property is not falsely reported as changed");
+});
+
 test("an unrelated failure still rolls the bound property back", () => {
   // The widget's own callback reverts the value, so the write fails on the #240 check.
   // The property must not be left carrying the new value after that rollback.

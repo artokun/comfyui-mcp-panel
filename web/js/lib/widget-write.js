@@ -345,6 +345,55 @@ export function isBooleanWidget(widget) {
 }
 
 /**
+ * #1735 — whether `value` is supplied by an accessor somewhere on the widget's
+ * prototype chain. Impact Pack's migrated BooleanWidget uses a non-configurable
+ * value property; its setter can apply the value and then throw when the node's
+ * bound-property copy-back invokes that setter a second time.
+ *
+ * This is deliberately a descriptor check, not a class-name check: custom widgets
+ * are page code and may be minified or wrapped. Descriptor reads are best-effort;
+ * an unreadable prototype is not evidence that the write is recoverable.
+ */
+function hasValueAccessor(widget) {
+  let current = widget;
+  try {
+    while (current && (typeof current === "object" || typeof current === "function")) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, "value");
+      if (descriptor) return typeof descriptor.get === "function" || typeof descriptor.set === "function";
+      current = Object.getPrototypeOf(current);
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * #1735 — the one accessor failure that may be recovered after read-back.
+ *
+ * The initial assignment and the node's property assignment have already happened
+ * before this is called. The caller still runs the ordinary callback/update path, and
+ * the existing widget + bound-property verification remains authoritative. A setter
+ * that throws for any other reason stays a warning/refusal, so this cannot turn an
+ * arbitrary custom-node side-effect failure into a clean success.
+ */
+function isRecoverableBooleanAccessorDelete(widget, expected, err) {
+  if (!isBooleanWidget(widget) || !hasValueAccessor(widget)) return false;
+  let message;
+  try {
+    message = String(err?.message ?? err);
+  } catch {
+    return false;
+  }
+  if (!/^Cannot delete property ['"]value['"]/i.test(message)) return false;
+  try {
+    return Object.is(widget.value, expected);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True for a COMPOSITE widget whose value is a plain object rather than a scalar
  * — e.g. the rgthree Power Lora Loader's `lora_N` rows ({on, lora, strength,
  * strengthTwo, …}). Detected by the CURRENT value's shape (a non-null, non-array
@@ -2171,7 +2220,18 @@ export function applyWidgetWrite(
     // A throw from here is captured by the same catch as everything else in this envelope
     // and stays UNATTRIBUTED — `onPropertyChanged` is a node's own code and this is not
     // the widget-callback invocation #976 can name.
-    if (boundProperty?.reachable) valueNode.setProperty(boundProperty.property, coerced);
+    if (boundProperty?.reachable) {
+      try {
+        valueNode.setProperty(boundProperty.property, coerced);
+      } catch (err) {
+        // #1735: Impact Pack's accessor-backed BooleanWidget can throw after the
+        // property and widget already hold the requested value, when setProperty's
+        // normal copy-back invokes its setter a second time. Continue into the same
+        // callback path only for that exact, verified shape; the read-back below still
+        // fails closed if either store did not actually take the value.
+        if (!isRecoverableBooleanAccessorDelete(valueWidget, expected, err)) throw err;
+      }
+    }
     // Fire the WRITTEN widget's own callback so combo/number side effects run — the
     // same single invocation a manual UI edit of the promoted control performs.
     //
