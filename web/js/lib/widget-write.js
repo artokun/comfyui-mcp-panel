@@ -345,27 +345,29 @@ export function isBooleanWidget(widget) {
 }
 
 /**
- * #1735 — whether `value` is supplied by an accessor somewhere on the widget's
- * prototype chain. Impact Pack's migrated BooleanWidget uses a non-configurable
- * value property; its setter can apply the value and then throw when the node's
- * bound-property copy-back invokes that setter a second time.
+ * #1735 — whether `value` has the exact accessor shape installed by Impact Pack's
+ * comboBoolMigration. That migration defines an OWN accessor without setting
+ * configurable/enumerable, so the descriptor is non-configurable and non-enumerable;
+ * its setter can apply the value and then throw when the node's bound-property
+ * copy-back invokes that setter a second time.
  *
- * This is deliberately a descriptor check, not a class-name check: custom widgets
- * are page code and may be minified or wrapped. Descriptor reads are best-effort;
- * an unreadable prototype is not evidence that the write is recoverable.
+ * This deliberately does not walk the prototype chain: an ordinary custom accessor
+ * must remain on the existing exception-disclosure path. Descriptor reads are
+ * best-effort; an unreadable or differently shaped property is not evidence that the
+ * write is recoverable.
  */
-function hasValueAccessor(widget) {
-  let current = widget;
+function hasImpactBooleanAccessor(widget) {
   try {
-    while (current && (typeof current === "object" || typeof current === "function")) {
-      const descriptor = Object.getOwnPropertyDescriptor(current, "value");
-      if (descriptor) return typeof descriptor.get === "function" || typeof descriptor.set === "function";
-      current = Object.getPrototypeOf(current);
-    }
+    const descriptor = Object.getOwnPropertyDescriptor(widget, "value");
+    return (
+      descriptor?.configurable === false &&
+      descriptor.enumerable === false &&
+      typeof descriptor.get === "function" &&
+      typeof descriptor.set === "function"
+    );
   } catch {
     return false;
   }
-  return false;
 }
 
 /**
@@ -378,7 +380,7 @@ function hasValueAccessor(widget) {
  * arbitrary custom-node side-effect failure into a clean success.
  */
 function isRecoverableBooleanAccessorDelete(widget, expected, err) {
-  if (!isBooleanWidget(widget) || !hasValueAccessor(widget)) return false;
+  if (!isBooleanWidget(widget) || !hasImpactBooleanAccessor(widget)) return false;
   let message;
   try {
     message = String(err?.message ?? err);
