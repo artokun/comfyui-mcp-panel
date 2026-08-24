@@ -274,6 +274,25 @@ export function serverDeclaresEmptyComboOptions(defsByType, type, widgetName) {
 }
 
 /**
+ * TRUE when /object_info identifies a V2 COMBO whose options arrive from a separate remote
+ * source. That source is not an empty option list: the panel cannot know its valid values until
+ * the remote fetch lands, so this must never authorize #507's blind write.
+ */
+export function serverDeclaresRemoteComboOptions(defsByType, type, widgetName) {
+  try {
+    if (!defsByType || !type || !widgetName) return false;
+    const input = defsByType[type]?.input;
+    if (!input) return false;
+    const spec =
+      (input.required && input.required[widgetName]) ??
+      (input.optional && input.optional[widgetName]);
+    return Array.isArray(spec) && spec[0] === "COMBO" && !!spec[1]?.remote;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True when `value`'s file extension is a plausibly-LOADABLE asset for the upload
  * `config`'s kind (image/video/audio/model). This is the strictness gate on top of a
  * mere server-existence probe (#240): `/view?type=input` confirms the file is on disk

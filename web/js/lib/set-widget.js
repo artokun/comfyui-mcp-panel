@@ -46,6 +46,7 @@ import {
   uploadInputAccepts,
   addComboOption,
   serverDeclaresEmptyComboOptions,
+  serverDeclaresRemoteComboOptions,
 } from "./input-asset.js";
 
 /**
@@ -1494,6 +1495,29 @@ export async function runSetWidget(
             `read, or set a value the server's list contains.`,
         );
       }
+    }
+
+    // #1696 — a live remote combo can expose no local values while /object_info correctly says
+    // that its source is a separate fetch. The generic `latest.message` below was written for
+    // a stale local empty list and therefore tells the caller to refresh the same thing again,
+    // while also claiming a fact the remote schema never established. Preserve the refusal, but
+    // report the source and uncertainty that actually blocked validation.
+    if (
+      latest?.emptyOptions &&
+      serverDeclaresRemoteComboOptions(
+        freshDefs ?? undefined,
+        authTarget?.type,
+        concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
+      )
+    ) {
+      throw new Error(
+        `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type})` +
+          `${typeof refreshCombos === "function" ? " after refreshing combo options" : ""}: ` +
+          `[combo_source=remote; option_list=unavailable; verdict=unknown] The server schema ` +
+          `exposes a REMOTE option source for this input, so the valid option set is not ` +
+          `currently enumerable by the panel. The requested value was not validated. ` +
+          `NOTHING WAS WRITTEN. Make the remote model list available and retry.`,
+      );
     }
 
     // No recovery succeeded — refuse honestly with the freshest rejection. The rejection's

@@ -42,7 +42,10 @@ import { runSetWidget } from "../../web/js/lib/set-widget.js";
 // The PRODUCTION combo refresh + the authoritative "server says this combo is empty"
 // oracle that gates #507's last-resort acceptance.
 import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
-import { serverDeclaresEmptyComboOptions } from "../../web/js/lib/input-asset.js";
+import {
+  serverDeclaresEmptyComboOptions,
+  serverDeclaresRemoteComboOptions,
+} from "../../web/js/lib/input-asset.js";
 // #1223 — the REAL snapshot, so the #1126 fallback is driven against the DETACHED name-only
 // map production actually hands back, never a hand-rolled full schema.
 import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
@@ -1726,6 +1729,23 @@ function starObjectInfo(serverOptions = []) {
   info["StarOllamaPromptHelper"] = { input: { required: { model: [serverOptions, {}] } } };
   return info;
 }
+function remoteComboFixture(liveOptions = []) {
+  const reg = loadedRegistry(["LTXVAudioVAELoader"]);
+  const widget = { name: "ckpt_name", type: "combo", options: { values: liveOptions }, value: "" };
+  const node = { id: 1696, type: "LTXVAudioVAELoader", widgets: [widget], constructor: reg["LTXVAudioVAELoader"] };
+  return { reg, node, widget };
+}
+function remoteComboObjectInfo() {
+  const info = objectInfo();
+  info["LTXVAudioVAELoader"] = {
+    input: {
+      required: {
+        ckpt_name: ["COMBO", { remote: { route: "/internal/files/checkpoints" } }],
+      },
+    },
+  };
+  return info;
+}
 // The PRODUCTION combo refresh (the same function the panel injects as refreshCombos),
 // so these tests inherit its real semantics — notably that it deliberately NEVER clobbers
 // a dynamic (function) option source. A hand-rolled stand-in that overwrote functions
@@ -1850,6 +1870,43 @@ test("#507 SEVERE: a DYNAMIC (function) source returning [] while the SERVER pub
   ).then(() => {
     assert.equal(widget.value, "", "must not have mutated — the server list is real");
   });
+});
+
+test("#1696 e2e: a remote combo refusal names unavailable provenance, not an empty list", async () => {
+  const { reg, node, widget } = remoteComboFixture([]);
+  const remote = remoteComboObjectInfo();
+  assert.equal(
+    serverDeclaresRemoteComboOptions(remote, "LTXVAudioVAELoader", "ckpt_name"),
+    true,
+    "the fixture must identify the separate remote option source",
+  );
+  assert.equal(
+    serverDeclaresEmptyComboOptions(remote, "LTXVAudioVAELoader", "ckpt_name"),
+    false,
+    "a remote source is not a server-declared empty list",
+  );
+
+  await assert.rejects(
+    runSetWidget(node, "ckpt_name", "ltx-video.safetensors", {
+      registry: reg,
+      getRegistry: () => reg,
+      getFreshObjectInfo: async () => remote,
+      wasTypeEverDefined: () => true,
+      refreshCombos: refreshFromServer,
+      ...HOOKS,
+    }),
+    (err) => {
+      assert.match(err.message, /combo_source=remote/);
+      assert.match(err.message, /option_list=unavailable/);
+      assert.match(err.message, /verdict=unknown/);
+      assert.match(err.message, /requested value was not validated/);
+      assert.match(err.message, /NOTHING WAS WRITTEN/);
+      assert.doesNotMatch(err.message, /EMPTY option list/i);
+      assert.doesNotMatch(err.message, /may simply be stale|refreshing it before deciding/i);
+      return true;
+    },
+  );
+  assert.equal(widget.value, "", "the remote/unreadable path remains fail-closed");
 });
 
 test("#507: a dynamic source returning [] AND a server-declared empty list DOES write", () => {
