@@ -25,9 +25,12 @@ import {
   executionErrorMatchesCurrentGraph,
   applyRuntimeExecFailure,
 } from "../../web/js/lib/exec-error-bounds.js";
-import { findNodeByScopedId, findVisibleNodeByScopedId } from "../../web/js/lib/asset-staleness.js";
 import { scanComboAvailability } from "../../web/js/lib/live-combo-availability.js";
 import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
+import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
+import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
+import { runProductionGraphGetErrors } from "./_graph-get-errors-harness.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PANEL_SOURCE = readFileSync(
@@ -347,90 +350,8 @@ test("graph_get_errors correlates runtime failures through applyRuntimeExecFailu
 });
 
 // #1685: the regression is in the shipped graph_get_errors executor, not in the
-// standalone correlation helper. Run that executor against a root graph with a
-// native subgraph so a scoped execution_error must survive the complete scan.
-function extractExecutorMethod(source, signature) {
-  const start = source.indexOf(signature);
-  assert.notEqual(start, -1, `${signature} not found in panel source`);
-  const open = source.indexOf("{", start);
-  let depth = 0;
-  for (let i = open; i < source.length; i += 1) {
-    const ch = source[i];
-    if (ch === "/" && source[i + 1] === "/") {
-      i = source.indexOf("\n", i + 2);
-      continue;
-    }
-    if (ch === "/" && source[i + 1] === "*") {
-      i = source.indexOf("*/", i + 2) + 1;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === "`") {
-      const quote = ch;
-      for (i += 1; i < source.length; i += 1) {
-        if (source[i] === "\\") i += 1;
-        else if (source[i] === quote) break;
-      }
-      continue;
-    }
-    if (ch === "{") depth += 1;
-    if (ch === "}" && --depth === 0) return source.slice(start, i + 1);
-  }
-  throw new Error(`unterminated ${signature}`);
-}
-
-const GRAPH_GET_ERRORS_SOURCE = extractExecutorMethod(PANEL_SOURCE, "  async graph_get_errors() {");
-const GRAPH_GET_ERRORS_DEPS = [
-  "monotonicNow",
-  "getErrorsStepBudgetMs",
-  "hasRawMissingAssetCandidates",
-  "GET_ERRORS_REFRESH_CAP_MS",
-  "refreshMissingAssetTrust",
-  "refreshComfyNodeDefs",
-  "withRefreshTimeout",
-  "getRefreshInFlight",
-  "nodeDefRefreshInFlight",
-  "getGraphCtx",
-  "assertGraphBoundToActiveWorkflow",
-  "graphCommandBindingBar",
-  "collectMissingAssets",
-  "activeWorkflowRef",
-  "GET_ERRORS_STEP_CAP_MS",
-  "filterServerConfirmedInputSubfolderMedia",
-  "inputAssetServerUsesWindowsPaths",
-  "scanComboAvailability",
-  "fetchSingleNodeInfo",
-  "probeInputAssetPresence",
-  "graphReadBindingChanged",
-  "collectAllGraphs",
-  "adjudicateRecordedMissingNodeTypes",
-  "isRegisteredNodeType",
-  "LiteGraph",
-  "findVisibleNodeByScopedId",
-  "findNodeByScopedId",
-  "getPiniaStore",
-  "combineNodeErrorMaps",
-  "coerceMessageText",
-  "lastExecFailure",
-  "applyRuntimeExecFailure",
-  "collectUnexplainedRedOutlines",
-  "summarizeNode",
-  "tr",
-  "describeActiveGraph",
-  "MAX_STATE_NODES",
-  "fixedCapNote",
-  "missingAssetScanMayBeStale",
-  "missingAssetScopeNote",
-  "comboAvailabilityNote",
-  "uncheckedNodesNote",
-  "stalePlaceholderNote",
-  "boundExecFailurePayload",
-  "collectMissingNodeTypeReasons",
-];
-
-const makeGraphGetErrors = new Function(
-  ...GRAPH_GET_ERRORS_DEPS,
-  `return ({ ${GRAPH_GET_ERRORS_SOURCE} }).graph_get_errors;`,
-);
+// standalone correlation helper. The shared harness drives that executor against a
+// root graph with a native subgraph so a scoped execution_error survives the complete scan.
 
 function makeScopedErrorGraph() {
   const inner = { id: 125, type: "SamplerCustomAdvanced" };
@@ -463,69 +384,6 @@ function makeScopedErrorGraph() {
     collidingRootNode,
     rootGraph,
   };
-}
-
-async function runProductionGraphGetErrors({
-  graph,
-  rootGraph,
-  lastExecFailure,
-  scan = async () => null,
-  fetchSingleNodeInfo = () => {},
-  // The extracted executor's default scan is a no-op test double. Give it a
-  // usable budget so legacy tests that are not exercising live-scan exhaustion
-  // retain their clean-note assertions.
-  stepBudget = () => 1000,
-  monotonicNow = () => 0,
-}) {
-  const deps = {
-    monotonicNow,
-    getErrorsStepBudgetMs: stepBudget,
-    hasRawMissingAssetCandidates: () => false,
-    GET_ERRORS_REFRESH_CAP_MS: 18000,
-    refreshMissingAssetTrust: async () => false,
-    refreshComfyNodeDefs: () => {},
-    withRefreshTimeout: () => {},
-    getRefreshInFlight: () => null,
-    nodeDefRefreshInFlight: null,
-    getGraphCtx: () => ({ app: { lastNodeErrors: null }, graph, rootGraph }),
-    assertGraphBoundToActiveWorkflow: () => {},
-    graphCommandBindingBar: () => ({}),
-    collectMissingAssets: () => ({ models: [], media: [], nodeTypes: [], nodeCount: 0 }),
-    activeWorkflowRef: () => null,
-    GET_ERRORS_STEP_CAP_MS: 4000,
-    filterServerConfirmedInputSubfolderMedia: async (media) => media,
-    inputAssetServerUsesWindowsPaths: async () => false,
-    scanComboAvailability: scan,
-    fetchSingleNodeInfo,
-    probeInputAssetPresence: () => {},
-    graphReadBindingChanged: () => false,
-    collectAllGraphs: (value) => [value],
-    adjudicateRecordedMissingNodeTypes: (types) => ({ stillMissing: types, stalePlaceholders: [] }),
-    isRegisteredNodeType: () => false,
-    LiteGraph: {},
-    findVisibleNodeByScopedId,
-    findNodeByScopedId,
-    getPiniaStore: () => null,
-    combineNodeErrorMaps: () => null,
-    coerceMessageText: (value) => String(value ?? ""),
-    lastExecFailure,
-    applyRuntimeExecFailure,
-    collectUnexplainedRedOutlines: () => [],
-    summarizeNode: (node) => ({ id: node.id, type: node.type }),
-    tr: (_key, fallback) => fallback,
-    describeActiveGraph: () => ({ scope: "root" }),
-    MAX_STATE_NODES: 50,
-    fixedCapNote: () => "cap",
-    missingAssetScanMayBeStale: () => false,
-    missingAssetScopeNote: () => "stale",
-    comboAvailabilityNote: () => "combo",
-    uncheckedNodesNote: () => "unchecked",
-    stalePlaceholderNote: () => "placeholder",
-    boundExecFailurePayload,
-    collectMissingNodeTypeReasons: () => [],
-  };
-  const executor = makeGraphGetErrors(...GRAPH_GET_ERRORS_DEPS.map((name) => deps[name]));
-  return executor();
 }
 
 test("#1691 production graph_get_errors batches live class reads and keeps uncertain types unchecked", async () => {
@@ -570,6 +428,108 @@ test("#1691 production graph_get_errors batches live class reads and keeps uncer
   assert.equal(result.unchecked_nodes[0].type, "InstalledButUnreachablePack");
   assert.match(result.unchecked_nodes[0].reason, /could not be looked up/);
   assert.equal(result.note, undefined, "an unchecked live scan must not emit a clean note");
+});
+
+test("#1709 production graph_get_errors retires add proof on definitive class presence and absence", async () => {
+  const node = {
+    id: 31,
+    type: "RemovedNode",
+    widgets: [{ name: "mode", type: "combo", value: "old" }],
+  };
+  const graph = { _nodes: [node], getNodeById: () => node };
+  const def = { input: { required: { mode: [["old"], {}] } } };
+  const cache = createVerifiedNodeDefCache();
+  const objectInfoCache = createObjectInfoCache();
+  const objectInfoSnapshot = createObjectInfoSnapshot();
+  const wholeDefs = { RemovedNode: def, OtherNode: { input: { required: {} } } };
+  const proofContext = {};
+  let generation = cache.generation();
+  cache.set("RemovedNode", def, { epoch: 0, context: proofContext, generation });
+  await objectInfoCache.read(async () => wholeDefs);
+  assert.equal(objectInfoCache.peek().cached, true, "the whole payload starts cached");
+  assert.equal(
+    objectInfoSnapshot.record(wholeDefs, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: generation,
+      currentGeneration: generation,
+      whole: true,
+    }),
+    true,
+    "the whole membership snapshot starts held",
+  );
+  let present = true;
+  const fetchInfo = async () =>
+    present
+      ? { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "present", body: { RemovedNode: def } }
+      : { [SINGLE_NODE_INFO_OUTCOME]: true, kind: "absent", body: {} };
+
+  await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.ok(cache.generation() > generation, "a definitive present class read retired old proof");
+  assert.equal(objectInfoCache.peek().cached, false, "definitive class presence retires whole cache authority");
+  assert.equal(objectInfoSnapshot.peek().held, false, "definitive class presence retires whole snapshot authority");
+
+  present = false;
+  generation = cache.generation();
+  cache.set("RemovedNode", def, { epoch: 0, context: proofContext, generation });
+  await objectInfoCache.read(async () => wholeDefs);
+  assert.equal(objectInfoCache.peek().cached, true, "the whole payload is reseeded before absence");
+  assert.equal(
+    objectInfoSnapshot.record(wholeDefs, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: generation,
+      currentGeneration: generation,
+      whole: true,
+    }),
+    true,
+    "the whole membership snapshot is reseeded before absence",
+  );
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: fetchInfo,
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.equal(result.unchecked_nodes.length, 1, "the explicit absent class remains unchecked, not falsely clean");
+  assert.ok(cache.generation() > generation, "a definitive absent class read retired old proof");
+  assert.equal(objectInfoCache.peek().cached, false, "definitive class absence retires whole cache authority");
+  assert.equal(objectInfoSnapshot.peek().held, false, "definitive class absence retires whole snapshot authority");
+  assert.equal(
+    cache.get("RemovedNode", { epoch: 0, context: proofContext, generation: cache.generation() }),
+    undefined,
+    "the absent class has no reusable proof after get_errors",
+  );
+
+  const afterAbsence = cache.generation();
+  const timeout = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: async () => ({ [SINGLE_NODE_INFO_OUTCOME]: true, kind: "unknown" }),
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache: cache,
+    stepBudget: () => 1000,
+  });
+  assert.equal(cache.generation(), afterAbsence, "an unknown/timeout class read remains non-authoritative");
+  assert.equal(timeout.unchecked_nodes.length, 1);
 });
 
 test("#1691 production graph_get_errors keeps budget-cutoff scans non-clean and uses its monotonic clock", async () => {

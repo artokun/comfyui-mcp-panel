@@ -44,7 +44,7 @@ import {
   assertAddNodeResolvableRefreshing,
   isRegisteredNodeType,
 } from "../../web/js/lib/node-resolve.js";
-import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
+import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
 import {
   describeUnmaterializedRequiredWidgets,
   snapshotBackendDef,
@@ -225,7 +225,7 @@ function realGraphAddNode(comfy, overrides = {}) {
     unavailableRequiredWidgetMessage,
     snapshotBackendDef,
     isRegisteredNodeType,
-    fetchSingleNodeDef,
+    fetchSingleNodeInfo,
     describeUnmaterializedRequiredWidgets,
     NODE_DEFS_NO_ANSWER,
     WIDEN_SOCKET_PROOF_TIMEOUT_MS,

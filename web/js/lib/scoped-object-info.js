@@ -426,17 +426,27 @@ export async function fetchTypeScopedObjectInfo(
   }
   const results = settled.value;
   const present = [];
+  const covered = [];
   for (let i = 0; i < wanted.length; i += 1) {
     const r = results[i];
     if (!r?.definitive) {
       // ALL OR NOTHING. One type this write needs is unestablished, so the map cannot
       // authorize the write — and a map that answers some of the question is precisely what
       // #716/#821 were.
-      return { defs: null, covered: [], reason: r?.why || `GET /object_info/${wanted[i]} established nothing` };
+      return {
+        defs: null,
+        // The incomplete batch still established authority for every definitive class. The
+        // production caller uses this only to retire stale per-class add proofs; it never
+        // authorizes from a partial map. Unknown/timeout batches return before this loop and
+        // therefore keep covered empty.
+        covered,
+        reason: r?.why || `GET /object_info/${wanted[i]} established nothing`,
+      };
     }
+    covered.push(wanted[i]);
     if (r.present) present.push([wanted[i], r.def]);
   }
-  return { defs: scopedView(present, new Set(wanted)), covered: wanted, reason: "" };
+  return { defs: scopedView(present, new Set(wanted)), covered, reason: "" };
 }
 
 /**

@@ -50,7 +50,11 @@ const makeBoundedGetNodeDefs = (apiValue) => (timeoutMs = NODE_DEFS_FETCH_TIMEOU
 
 /** #716 — records invalidate() calls so a test can assert the refresh drops the cache. */
 let cacheInvalidations = 0;
-const cacheSpy = { invalidate: () => { cacheInvalidations += 1; }, read: async (f) => f() };
+const cacheSpy = {
+  invalidate: () => { cacheInvalidations += 1; },
+  replace: () => true,
+  read: async (f) => f(),
+};
 
 /** #1223 — the last-observed-schema snapshot the refresh run also clears and re-records. */
 let snapshotClears = 0;
@@ -65,6 +69,9 @@ import {
   NODE_DEF_REFRESH_REASONS,
 } from "../../web/js/lib/node-def-refresh.js";
 import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
+import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
+import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -347,7 +354,10 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
     "the shared global stays a strict boolean, and #1193 admits the panel's OWN completed " +
       "combo rebuild as the second way the live lists became current",
   );
-  assert.match(body, /const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;/);
+  assert.match(
+    body,
+    /const runIsCurrent =\s*!comfyBackendSocketDown &&\s*runStartedAtEpoch === backendReconnectEpoch &&\s*runStartedAtGeneration === verifiedNodeDefCache\.generation\(\);/,
+  );
   assert.match(body, /reason: NODE_DEF_REFRESH_REASONS\.REFRESH_SUPERSEDED/);
   // #1193 — the two inputs must stay SEPARATE all the way to the verdict. Merging them
   // into one flag would make an abandoned-but-locally-rebuilt run indistinguishable from
@@ -418,6 +428,9 @@ function buildRegisterComfyNodeDefs({
   socketDown = false,
   // #608 — defaults to the REAL oracle. Overridden only to OBSERVE what it is handed.
   fetchWholeObjectInfo: fetchWholeObjectInfoImpl = fetchWholeObjectInfo,
+  verifiedNodeDefCache = createVerifiedNodeDefCache(),
+  objectInfoCache = cacheSpy,
+  objectInfoSnapshot = snapshotSpy,
 }) {
   const body = extractFunction("async function registerComfyNodeDefs(");
   const factory = new Function(
@@ -452,6 +465,7 @@ function buildRegisterComfyNodeDefs({
     // recording is stamped with. Both are module state in the panel, so the extracted
     // body throws ReferenceError without them.
     "objectInfoSnapshot",
+    "verifiedNodeDefCache",
     "initialBackendReconnectEpoch",
     "comfyBackendSocketDown",
     // #1562 — the oracle's per-route OUTCOME vocabulary. The fetch phase reads route 2's
@@ -512,10 +526,11 @@ function buildRegisterComfyNodeDefs({
     NODE_DEFS_RETRY_DELAYS_MS,
     // #716 — the shipping function drops the widget-write burst cache after a successful
     // fetch. A spy, so the harness can prove that happens rather than merely tolerate it.
-    cacheSpy,
+    objectInfoCache,
     // #1223 — a spy, so a test can prove the run retires the last-observed schema and
     // re-records only a payload it fetched itself.
-    snapshotSpy,
+    objectInfoSnapshot,
+    verifiedNodeDefCache,
     7,
     socketDown,
     TRANSPORT_OUTCOME,
@@ -548,6 +563,49 @@ test("#635: the shipping register run end-to-end success reports refreshed", asy
   const verdict = await registerComfyNodeDefs(undefined);
   assert.deepEqual(verdict, { refreshed: true, reason: "refreshed" });
   assert.equal(getConfirmed(), true);
+});
+
+test("#1709: a graph_add whole payload survives the real preloaded refresh and hook mutation", async () => {
+  const objectInfoCache = createObjectInfoCache();
+  const objectInfoSnapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const defs = {
+    NewNode: {
+      input: { required: { count: ["INT", { default: 1 }] } },
+    },
+  };
+  const app = {
+    graph: null,
+    refreshComboInNodes: async () => {},
+    registerNodesFromDefs: async (payload) => {
+      // This is the production hook mutation that must not contaminate the cached backend
+      // response: ComfyUI's registration path can add frontend-only input metadata in place.
+      payload.NewNode.input.required.count[1].default = 999;
+    },
+  };
+  const built = buildRegisterComfyNodeDefs({
+    appValue: app,
+    apiValue: { getNodeDefs: async () => ({ Unexpected: {} }) },
+    objectInfoCache,
+    objectInfoSnapshot,
+    verifiedNodeDefCache,
+  });
+
+  const verdict = await built.registerComfyNodeDefs(defs, { preloadedWholeSchema: true });
+  assert.equal(verdict.refreshed, true, "the real preloaded refresh completes");
+  assert.equal(defs.NewNode.input.required.count[1].default, 999, "the registration hook mutated its input");
+  const cached = await objectInfoCache.read(async () => ({ Unexpected: {} }));
+  assert.equal(
+    cached.NewNode.input.required.count[1].default,
+    1,
+    "the cache keeps a detached pre-hook whole schema",
+  );
+  const fallback = objectInfoSnapshot.authorize({
+    epoch: 7,
+    generation: verifiedNodeDefCache.generation(),
+    outcomes: [{ kind: TRANSPORT_OUTCOME.NO_ANSWER }],
+  });
+  assert.ok(fallback.defs?.NewNode, "the post-refresh snapshot remains timeout-usable");
 });
 
 test("#1695: a run superseded by reconnect cannot report fresh or restore combo trust", async () => {

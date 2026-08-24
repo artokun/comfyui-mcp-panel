@@ -284,7 +284,13 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     const startedAt = joinMs === null ? 0 : Date.now();
     // #1562 — the caller's RUN allowance, forwarded to every `startRun` below. Built here,
     // once, so no branch can start a run under a different budget than its siblings.
-    const runOpts = opts && Number.isFinite(opts.runBudgetMs) ? { runBudgetMs: opts.runBudgetMs } : undefined;
+    const runOpts =
+      opts && (Number.isFinite(opts.runBudgetMs) || opts.preloadedWholeSchema === true)
+        ? {
+            ...(Number.isFinite(opts.runBudgetMs) ? { runBudgetMs: opts.runBudgetMs } : {}),
+            ...(opts.preloadedWholeSchema === true ? { preloadedWholeSchema: true } : {}),
+          }
+        : undefined;
     const abandonBeforeLocalWork = !!(opts && opts.abandonBeforeLocalWork);
     const remaining = () => (joinMs === null ? null : joinMs - (Date.now() - startedAt));
     const current = getInFlight();

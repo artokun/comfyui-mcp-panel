@@ -2492,7 +2492,13 @@ const snapshotOpts = (reg, extra = {}) => ({
 function detachedSnapshotDefs(fullMap) {
   const snap = createObjectInfoSnapshot();
   assert.equal(
-    snap.record(fullMap, { observedAtEpoch: 7, currentEpoch: 7, whole: true }),
+    snap.record(fullMap, {
+      observedAtEpoch: 7,
+      currentEpoch: 7,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
     true,
     "fixture precondition: the snapshot accepted the whole map",
   );

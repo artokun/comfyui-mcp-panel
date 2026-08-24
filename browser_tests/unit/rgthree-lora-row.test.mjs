@@ -1364,6 +1364,7 @@ const EXECUTOR_DEPS = [
   "OBJECT_INFO_DEADLINE_MS",
   "REFRESH_JOIN_ABANDONED",
   "COMBO_REFRESH_NEVER_RAN",
+  "verifiedNodeDefCache",
   // The coalescer's live slot. This harness's refreshCombos path is never exercised (the
   // runSetWidget double never calls it), so a fixed null is the truth here.
   "nodeDefRefreshInFlight",

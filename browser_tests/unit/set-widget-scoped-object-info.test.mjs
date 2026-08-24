@@ -186,6 +186,27 @@ test("#1560 A: a PROMOTED nested write asks about ALL THREE types (#716/#821's '
   );
 });
 
+test("#1709: a partial scoped batch reports only definitive classes for proof retirement", async () => {
+  const backend = largeInstall({
+    perClass: async (type) => {
+      if (type === "PresentNode") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ PresentNode: { input: { required: {} } } }),
+        };
+      }
+      if (type === "UnknownNode") throw new Error("timeout");
+      return undefined;
+    },
+  });
+  const result = await fetchTypeScopedObjectInfo(["PresentNode", "UnknownNode"], {
+    fetchApi: backend.fetchApi,
+  });
+  assert.equal(result.defs, null, "an incomplete batch remains unauthorized");
+  assert.deepEqual(result.covered, ["PresentNode"], "only the definitive class is reported for invalidation");
+});
+
 test("#1560 A: the scoped payload is NEVER recorded into the #1223 snapshot", async () => {
   // object-info-snapshot.js requires an explicit `whole: true` claim precisely so a
   // per-class payload cannot make every OTHER type read as a removed pack. This route must
@@ -531,8 +552,8 @@ test("#1560: the panel WIRES the scoped route, gated on the silence licence and 
   // `readObjectInfo` more than once (the #1126 live re-ask).
   assert.match(
     src,
-    /outcomes: outcome\?\.outcomes,\s*\}\);[\s\S]{0,400}?scopedReadLicensed = noBackendAnswerEstablished\(outcome\?\.outcomes\);/,
-    "decided in the same breath as objectInfoSnapshot.authorize, from the same evidence",
+    /outcomes: outcome\?\.outcomes,\s*\}\);[\s\S]{0,500}?scopedReadLicensed = schemaResponseIsCurrent && noBackendAnswerEstablished\(outcome\?\.outcomes\);/,
+    "decided in the same breath as objectInfoSnapshot.authorize, from the same evidence and current-generation fence",
   );
   assert.match(src, /if \(!scopedReadLicensed\) \{/, "a route that ANSWERED is never overruled");
   assert.match(src, /let scopedReadLicensed = false;/, "and it licenses nothing until a read establishes it");

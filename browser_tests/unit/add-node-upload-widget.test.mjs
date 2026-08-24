@@ -61,7 +61,7 @@ import {
 // ReferenceError that the resolver catches and reports as "object_info is
 // unavailable", which is how this harness caught the omission.
 import { isRegisteredNodeType } from "../../web/js/lib/node-resolve.js";
-import { fetchSingleNodeDef } from "../../web/js/lib/single-node-def.js";
+import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
 
 // #1180 — READ from the panel, never restated here. Shared, because this block existed
 // verbatim in both widen harnesses, and the whole point of reading a constant instead of
@@ -250,7 +250,7 @@ function realGraphAddNode(comfy, overrides = {}) {
     unavailableRequiredWidgetMessage,
     snapshotBackendDef,
     isRegisteredNodeType,
-    fetchSingleNodeDef,
+    fetchSingleNodeInfo,
     describeUnmaterializedRequiredWidgets,
     // #1180 — the panel's bounded api.getNodeDefs() and its sentinel. Module-scope in the
     // real file; this harness rebuilds the executor in a synthetic scope, so they are

@@ -63,9 +63,10 @@ export function singleDefConfirms(body, classType) {
 
 /**
  * The live error scan needs to distinguish a class the server answered as absent
- * from a per-class route that did not answer. The add-node fast path deliberately
- * collapses both to null so it can fall through to its whole-schema authority; the
- * read path cannot do that because null currently reads as "node type not found".
+ * from a per-class route that did not answer. The add-node fast path treats only
+ * `unknown` as no answer; an explicit `absent` result retires stale proof before
+ * node resolution. The read path cannot collapse absence to null because null
+ * currently reads as "node type not found".
  */
 export const SINGLE_NODE_INFO_OUTCOME = Symbol.for("comfyui-mcp.singleNodeInfoOutcome");
 

@@ -12,9 +12,9 @@
 // behind each other, and the 30 s reply deadline expired — after which the adds
 // landed anyway, which is where the report's "ghost" nodes came from.
 //
-// The rule this file exists to hold: the fast path may only ever CONFIRM. Every
-// other outcome falls through to the full fetch, so no refusal, removal verdict or
-// history check is ever decided on the smaller payload.
+// The rule this file exists to hold: the fast path may only ever CONFIRM or establish
+// authoritative absence. Unknown outcomes fall through to the full fetch, so no
+// refusal, removal verdict or history check is ever decided on a smaller uncertain payload.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -175,10 +175,10 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
   // #1180 bounded this call too — it runs FIRST, so an unbounded fast path hung the add
   // before the bounded fallback was ever reached. The gate assertion is about WHERE the
   // single-class fetch sits, which the wrapping does not change.
-  const call = body.indexOf("fetchSingleNodeDef(class_type");
+  const call = body.indexOf("fetchSingleNodeInfo(class_type");
   assert.match(
     body,
-    /withTimeout\(\s*[\r\n]?\s*fetchSingleNodeDef\(class_type/,
+    /withTimeout\(\s*[\r\n]?\s*fetchSingleNodeInfo\(class_type/,
     "the fast path must be bounded: it runs before the fallback and hangs the add on its own",
   );
   // …with the CONSTANT, not a literal. withTimeout treats a non-positive ms as NO bound, so
@@ -189,7 +189,7 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
   // whole-schema fetch, so the two are additive.
   assert.match(
     body,
-    /fetchSingleNodeDef\(class_type[\s\S]{0,400}?budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)/,
+    /fetchSingleNodeInfo\(class_type[\s\S]{0,400}?budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)/,
     "the fast path must be bounded by the named constant, capped by the command budget",
   );
   assert.ok(guard > 0, "the registered-type gate must be present");
@@ -690,7 +690,7 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   const wired = [
     [/await awaitObjectInfoHistorySeed\(budget\.bounded\(OBJECT_INFO_SEED_WAIT_MS\)\)/, "the baseline seed wait"],
     [
-      /fetchSingleNodeDef\(class_type[\s\S]{0,400}?budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)/,
+      /fetchSingleNodeInfo\(class_type[\s\S]{0,400}?budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)/,
       "the single-class fast path",
     ],
     [/await boundedGetNodeDefs\(budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)\)/, "the whole-schema fetch"],

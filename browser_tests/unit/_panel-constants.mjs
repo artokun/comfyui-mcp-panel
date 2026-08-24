@@ -21,6 +21,9 @@ import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { OBJECT_INFO_DEADLINE_MS } from "../../web/js/lib/object-info-oracle.js";
 import { COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
+import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
+import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
+import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
 
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -219,6 +222,10 @@ export function addNodeCommandBudgetDeps() {
     ADD_NODE_POST_REFRESH_RESERVE_MS: CUSTOM_WIDGET_REGISTRATION_TIMEOUT_MS,
     OBJECT_INFO_SEED_WAIT_MS,
     REFRESH_JOIN_ABANDONED,
+    fetchSingleNodeInfo,
+    // #1709 — each extracted graph_add_node harness gets its own verified-schema session.
+    objectInfoCache: createObjectInfoCache(),
+    verifiedNodeDefCache: createVerifiedNodeDefCache(),
     widenSocketProofBudget,
     // A STUB, and labelled as one. These three harnesses are about #821/#1223/#620, none of
     // which reaches this branch. The shipped wording is pinned in single-node-def.test.mjs
@@ -256,5 +263,7 @@ export function setWidgetCommandBudgetDeps() {
     OBJECT_INFO_DEADLINE_MS,
     REFRESH_JOIN_ABANDONED,
     COMBO_REFRESH_NEVER_RAN,
+    // #1709 — a live whole-schema widget read retires this shared add-node proof.
+    verifiedNodeDefCache: createVerifiedNodeDefCache(),
   };
 }

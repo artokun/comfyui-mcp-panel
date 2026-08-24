@@ -387,6 +387,32 @@ export async function runSetWidget(
   } catch {
     freshDefs = null;
   }
+  // The whole-schema reader may return a retired/reconnected payload to explain why the
+  // request was superseded. That payload is not current authority: refuse it before any
+  // type guard can mistake its old membership for a live backend answer. The explicit
+  // wording keeps the provenance diagnosis actionable, while the panel's scoped fallback
+  // remains unavailable because the superseded whole response did not establish current
+  // silence.
+  if (freshDefs && typeof schemaProvenance === "function") {
+    const provenance = readSchemaProvenance();
+    if (provenance === "reconnected") {
+      throw new Error(
+        `panel_set_widget refused "${widgetName}" on node ${node?.id}: the backend RECONNECTED ` +
+          `while that /object_info request was in flight, so the answer describes a process ` +
+          `that has since been replaced and did not come from the server answering now. ` +
+          `Refusing to write rather than trust a possibly-stale node schema (#1126).`,
+      );
+    }
+    if (provenance === "retired") {
+      throw new Error(
+        `panel_set_widget refused "${widgetName}" on node ${node?.id}: the panel REFRESHED ` +
+          `the node definitions while that /object_info request was in flight, so the answer ` +
+          `was superseded before it arrived and the refresh may be what filled this list. ` +
+          `It did not come from the server answering now; refusing to write rather than trust ` +
+          `a possibly-stale node schema (#1126).`,
+      );
+    }
+  }
 
   // Resolve the promoted inner target ONCE (PURE — no coercion/mutation). Threaded
   // into applyWidgetWrite so the write never re-resolves to a different node.

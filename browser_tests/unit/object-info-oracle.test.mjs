@@ -70,7 +70,7 @@ test("#982 (codex r2) an EMPTY map from the client is its ANSWER — the fallbac
   // route then would overrule it with a broader schema, which is the one direction this
   // fallback must never move. `{}` therefore fails closed WITHOUT a second attempt.
   let fetched = 0;
-  const { defs, failures } = await fetchWholeObjectInfo({
+  const { defs, authoritativeEmpty, failures } = await fetchWholeObjectInfo({
     getNodeDefs: async () => ({}),
     fetchApi: async () => {
       fetched += 1;
@@ -78,8 +78,19 @@ test("#982 (codex r2) an EMPTY map from the client is its ANSWER — the fallbac
     },
   });
   assert.equal(defs, null, "fail closed on the answer the client gave");
+  assert.equal(authoritativeEmpty, true, "the empty answer is distinguished from a timeout");
   assert.equal(fetched, 0, "the raw route is never asked to overrule it");
   assert.match(failures[0], /EMPTY schema — treated as its answer, not as an absence/);
+});
+
+test("#982 an EMPTY map from the HTTP route is also an authoritative deny-all answer", async () => {
+  const result = await fetchWholeObjectInfo({
+    getNodeDefs: async () => null,
+    fetchApi: async () => okResponse({}),
+  });
+  assert.equal(result.defs, null);
+  assert.equal(result.authoritativeEmpty, true);
+  assert.match(result.failures[1], /EMPTY schema — treated as its answer, not as an absence/);
 });
 
 test("#982 a client that returned NOTHING leaves the question open, and the fallback answers", async () => {
@@ -93,11 +104,12 @@ test("#982 a client that returned NOTHING leaves the question open, and the fall
   }
 });
 test("#982 both routes failing yields NO defs and names both", async () => {
-  const { defs, failures } = await fetchWholeObjectInfo({
+  const { defs, authoritativeEmpty, failures } = await fetchWholeObjectInfo({
     getNodeDefs: async () => null,
     fetchApi: async () => ({ ok: false, status: 503 }),
   });
   assert.equal(defs, null, "fail closed — the fence refuses on a null payload");
+  assert.equal(authoritativeEmpty, undefined, "a timeout/failure is not an authoritative deny-all");
   assert.equal(failures.length, 2);
   assert.match(failures[0], /api\.getNodeDefs\(\) returned no usable schema/);
   assert.match(failures[1], /GET \/object_info was not OK \(status 503\)/);

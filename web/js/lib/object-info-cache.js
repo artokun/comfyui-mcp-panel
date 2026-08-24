@@ -75,6 +75,51 @@ export const CACHE_OUTCOME = Symbol.for("comfyui-mcp.objectInfoOutcome");
 export const OBJECT_INFO_CACHE_TTL_MS = 1500;
 
 /**
+ * Clone the JSON-shaped schema into a private graph and freeze every level. The panel hands
+ * direct whole responses to frontend registration hooks, which are allowed to mutate their
+ * input; the cache must never retain those mutations as backend authority.
+ */
+function cloneAndFreeze(value, seen = new WeakMap()) {
+  if (value === null || typeof value !== "object") return value;
+  const prior = seen.get(value);
+  if (prior) return prior;
+  const clone = Array.isArray(value) ? [] : {};
+  seen.set(value, clone);
+  let keys;
+  try {
+    keys = Reflect.ownKeys(value);
+  } catch {
+    throw new TypeError("object_info schema is unreadable");
+  }
+  for (const key of keys) {
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      throw new TypeError("object_info schema is unreadable");
+    }
+    if (!descriptor?.enumerable) continue;
+    Object.defineProperty(clone, key, {
+      value: cloneAndFreeze(value[key], seen),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return Object.freeze(clone);
+}
+
+function cloneForCache(value) {
+  try {
+    return { ok: true, value: cloneAndFreeze(value) };
+  } catch {
+    // Preserve the loader's result for its current caller, but do not retain an unreadable
+    // graph as a cache authority. This keeps ordinary/readFresh failure semantics unchanged.
+    return { ok: false, value: null };
+  }
+}
+
+/**
  * @param {{ttlMs?: number, now?: () => number}} [opts] `now` is injectable so tests do not
  *   depend on wall-clock timing, which is how a cache test becomes a flaky test.
  */
@@ -195,16 +240,14 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
           typeof payload === "object" &&
           Object.keys(payload).length > 0
         ) {
-          // SHARED IDENTITY IS NEW (codex): every write used to get its own object, and
-          // now they share one. A consumer that mutated the map would contaminate every
-          // later authorization instead of only its own call. Freezing the TOP LEVEL —
-          // the level the fence's `hasOwnProperty(defs, type)` reads — makes adding or
-          // removing a type key throw here and now, in a test or a dev console, rather
-          // than silently authorizing a type nobody installed. Shallow on purpose: a
-          // deep freeze of a 5MB schema on every fetch would cost more than the fetch
-          // this exists to avoid, and per-class contents are not what the fence rules on.
-          value = Object.freeze(defs);
-          at = now();
+          // Store a private frozen graph, including the outcome wrapper and its enumerable
+          // symbol tag. The loader's mutable result still goes to this caller unchanged,
+          // while later cache readers cannot mutate nested schema authority through it.
+          const cached = cloneForCache(defs);
+          if (cached.ok) {
+            value = cached.value;
+            at = now();
+          }
         }
         return defs;
       } finally {
@@ -378,8 +421,11 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
               typeof payload === "object" &&
               Object.keys(payload).length > 0
             ) {
-              value = Object.freeze(defs);
-              at = now();
+              const cached = cloneForCache(defs);
+              if (cached.ok) {
+                value = cached.value;
+                at = now();
+              }
             }
             return defs;
           } finally {
@@ -412,6 +458,50 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
         return { value: resolved, ...notLive("unknown") };
       }
       return { value: resolved, ...verdict(record.issuedAt, record.issuedStamp, record.readStamp, record.stampUnreadable) };
+    },
+
+    /**
+     * Replace the stored whole schema with a known-current payload.
+     *
+     * Direct whole-schema readers do not come through `readWithProvenance`, but their
+     * definitive answer must still retire the burst entry and any request issued before
+     * that answer. This is an atomic replacement: the generation moves before the value is
+     * exposed, so a late old response cannot overwrite the new authority.
+     *
+     * Empty/unusable values are deliberately ignored. An unavailable or timed-out read is
+     * not authoritative and must not turn into an invalidation merely because a caller
+     * tried to publish it.
+     */
+    replace(next) {
+      if (!next || typeof next !== "object" || Array.isArray(next)) return false;
+      let keys;
+      try {
+        keys = Object.keys(next);
+      } catch {
+        return false;
+      }
+      if (keys.length === 0) return false;
+      let frozen;
+      try {
+        // Keep the caller's response mutable for downstream registration hooks. The
+        // ordinary loader may cache an outcome wrapper, while direct whole readers hand
+        // their map to graph registration after publishing it here; cloning the complete
+        // graph prevents this cache from altering the registration contract or retaining
+        // nested hook mutations.
+        frozen = cloneAndFreeze(next);
+      } catch {
+        return false;
+      }
+      generation += 1;
+      // Retire requests issued against the replaced map. They remain awaitable by their
+      // original callers, but cannot join or repopulate this cache after this point.
+      inflight = null;
+      inflightGeneration = -1;
+      inflightId = 0;
+      freshInflight = null;
+      value = frozen;
+      at = now();
+      return true;
     },
 
     /**

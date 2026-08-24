@@ -389,8 +389,8 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
   // retain a schema the panel itself had just superseded.
   assert.match(
     body,
-    /if \(readProvenance === "live"\) \{\s*objectInfoSnapshot\.record\(/,
-    "only a live answer may be filed as the last-observed schema",
+    /if \(readProvenance === "live" && generationIsCurrent\) \{[\s\S]{0,300}?objectInfoSnapshot\.record\(/,
+    "only a live answer may retire add proofs and be filed as the last-observed schema",
   );
   // …and the lib must be able to force a genuinely live re-read, or a cache hit could only
   // ever fail closed — refusing writes 2..N of an ordinary burst. Through `readFresh`, NOT a
@@ -402,8 +402,11 @@ test("#1223 × #1126 wiring: graph_set_widget THREADS the schema provenance into
     /refetchObjectInfoLive:[\s\S]{0,240}objectInfoCache\.readFresh\(/,
     "the executor must offer a coalescing, non-retiring forced reread",
   );
+  const forcedRecoveryStart = body.indexOf("refetchObjectInfoLive:");
+  assert.notEqual(forcedRecoveryStart, -1, "the forced recovery entry point must exist");
+  const forcedRecovery = body.slice(forcedRecoveryStart, body.indexOf("// #1560", forcedRecoveryStart));
   assert.doesNotMatch(
-    body,
+    forcedRecovery,
     /objectInfoCache\.invalidate\(\)/,
     "…and must NOT reach for the global invalidation on the recovery path",
   );
@@ -444,7 +447,7 @@ test("#1582 wiring: a reusable snapshot shortens only the ordinary schema probe"
   );
   assert.match(
     body,
-    /reuseSnapshot &&[\s\S]{0,260}objectInfoSnapshot\.isReusable\([\s\S]{0,180}OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS/,
+    /reuseSnapshot &&[\s\S]{0,500}objectInfoSnapshot\.isReusable\([\s\S]{0,260}OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS/,
     "a current-connection snapshot must cap the ordinary serial probe",
   );
   assert.match(

@@ -125,6 +125,13 @@ function usableDefs(value) {
   }
 }
 
+function authoritativeEmptyDefs(value) {
+  // Keep the existing answer classification: a non-array object response is an answer even
+  // when its keys cannot be inspected. The oracle already fails closed on that response; the
+  // marker only lets callers retire other verified proofs instead of treating it as silence.
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
 /** How much of a thrown value's own words may ride into a refusal message. */
 const MAX_DETAIL_CHARS = 200;
 
@@ -352,8 +359,9 @@ const GATEWAY_STATUSES = Object.freeze([504]);
  *
  * Returns `{ defs, failures, outcomes }` — `defs` is null unless one route returned a
  * usable payload, `failures` names every route that did not, in order, and `outcomes`
- * carries the same list as TRANSPORT_OUTCOME tags (#1223). An empty `failures` with a null
- * `defs` cannot happen: a route that answers nothing is itself a failure.
+ * carries the same list as TRANSPORT_OUTCOME tags (#1223). An empty authoritative response
+ * also carries `authoritativeEmpty: true`, so callers can distinguish deny-all from a timeout
+ * while preserving the fail-closed `defs: null` shape.
  */
 export async function fetchWholeObjectInfo({
   getNodeDefs,
@@ -599,13 +607,13 @@ export async function fetchWholeObjectInfo({
       // overrule it with a broader schema — the one direction this fallback must never
       // move. Only a client that returned NOTHING (null/undefined/non-object) or threw
       // leaves the question unanswered, and only that may be asked again elsewhere.
-      if (defs && typeof defs === "object" && !Array.isArray(defs)) {
+      if (authoritativeEmptyDefs(defs)) {
         record(
           "client",
           TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
           "api.getNodeDefs() returned an EMPTY schema — treated as its answer, not as an absence",
         );
-        return { [CACHE_OUTCOME]: true, defs: null, failures, outcomes };
+        return { [CACHE_OUTCOME]: true, defs: null, authoritativeEmpty: true, failures, outcomes };
       }
       record(
         "client",
@@ -733,6 +741,14 @@ export async function fetchWholeObjectInfo({
         } else {
           const defs = body.value;
           if (usableDefs(defs)) return { [CACHE_OUTCOME]: true, defs, failures, outcomes };
+          if (authoritativeEmptyDefs(defs)) {
+            record(
+              "http",
+              TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
+              "GET /object_info returned an EMPTY schema — treated as its answer, not as an absence",
+            );
+            return { [CACHE_OUTCOME]: true, defs: null, authoritativeEmpty: true, failures, outcomes };
+          }
           record(
             "http",
             TRANSPORT_OUTCOME.ANSWERED_UNUSABLE,
