@@ -70,6 +70,8 @@ test("#939 the production adapter repaints before it captures and persists the c
   );
   const panel = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(panel, /repaintSaveAsCanvas/);
+  assert.match(panel, /const canvasFence = \(\{ workflow \} = \{\}\)/);
+  assert.match(panel, /saveAsCanvasGeneration/);
   assert.match(panel, /restoreCanvas: async \(\{ workflow \}\)/);
   assert.match(panel, /\[WORKFLOW_PATH_FIELD\]: destinationPath/);
   assert.match(panel, /loadGraphDataWithCompletionProof\(\{/);

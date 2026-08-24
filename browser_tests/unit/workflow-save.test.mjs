@@ -3258,3 +3258,101 @@ test('#939: an incomplete Save-As repaint restores the shared canvas with the so
   assert.equal(svc.disk.has(destinationPath), false, 'the refusal did not persist a destination file')
   assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false, 'failure never reported or attempted success')
 })
+
+test('#939: a tab switch during failed repaint does not restore or repaint over the newer tab', async () => {
+  const sourcePath = 'workflows/Source-switch.json'
+  const destinationPath = 'workflows/Destination-switch.json'
+  const sourceState = { nodes: [{ id: 1, type: 'KSampler', widgets_values: ['source'] }], links: [], version: 1 }
+  const source = {
+    path: sourcePath,
+    filename: 'Source-switch.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const newer = {
+    path: 'workflows/Newer.json',
+    filename: 'Newer.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
+  let canvasState = structuredClone(sourceState)
+  let restoreCalls = 0
+  let generation = 1
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, 'Destination-switch', {
+        existsOnDisk,
+        canvasBinding: () => 'bound',
+        canvasFence: ({ workflow }) => generation === 1 && svc.activeWorkflow === workflow,
+        repaintCanvas: async () => {
+          canvasState = { nodes: [{ id: 2, type: 'NewerTab' }], links: [], version: 1 }
+          generation += 1
+          svc.activeWorkflow = newer
+          return false
+        },
+        restoreCanvas: async () => {
+          restoreCalls += 1
+          canvasState = structuredClone(sourceState)
+          return true
+        },
+      }),
+    /active tab or Save-As canvas generation changed|could not be proven active/,
+  )
+
+  assert.equal(svc.activeWorkflow, newer, 'the newer tab remained active')
+  assert.equal(restoreCalls, 0, 'stale cleanup did not invoke source repaint')
+  assert.deepEqual(canvasState, { nodes: [{ id: 2, type: 'NewerTab' }], links: [], version: 1 })
+  assert.equal(svc.getWorkflowByPath(destinationPath), null, 'the failed copy was removed')
+  assert.equal(svc.disk.has(destinationPath), false, 'the failed copy was never persisted')
+  assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false)
+})
+
+for (const [label, restoreCanvas, expected] of [
+  ['false', async () => false, /source canvas restore returned false/],
+  ['throws', async () => { throw new Error('restore exploded') }, /source canvas restore threw \(restore exploded\)/],
+]) {
+  test(`#939: restore ${label} fails closed without reporting Save-As success`, async () => {
+    const sourcePath = `workflows/Source-restore-${label}.json`
+    const destinationPath = `workflows/Destination-restore-${label}.json`
+    const sourceState = { nodes: [{ id: 1, type: 'KSampler', widgets_values: ['source'] }], links: [], version: 1 }
+    const source = {
+      path: sourcePath,
+      filename: `Source-restore-${label}.json`,
+      directory: 'workflows',
+      isPersisted: true,
+      isTemporary: false,
+    }
+    const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
+    let canvasState = structuredClone(sourceState)
+    let restoreCalls = 0
+
+    await assert.rejects(
+      () =>
+        saveActiveWorkflow(svc, `Destination-restore-${label}`, {
+          existsOnDisk,
+          canvasBinding: () => 'bound',
+          canvasFence: ({ workflow }) => svc.activeWorkflow === workflow,
+          repaintCanvas: async () => {
+            canvasState = { nodes: [{ id: 9, type: 'Partial' }], links: [], version: 1 }
+            return false
+          },
+          restoreCanvas: async () => {
+            restoreCalls += 1
+            return restoreCanvas()
+          },
+        }),
+      expected,
+    )
+
+    assert.equal(restoreCalls, 1)
+    assert.equal(svc.activeWorkflow, null, 'an unverified source canvas clears the active record')
+    assert.deepEqual(canvasState, { nodes: [{ id: 9, type: 'Partial' }], links: [], version: 1 })
+    assert.equal(svc.getWorkflowByPath(destinationPath), null, 'the failed copy was removed')
+    assert.equal(svc.disk.has(destinationPath), false, 'incomplete cleanup never persisted the destination')
+    assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false)
+  })
+}

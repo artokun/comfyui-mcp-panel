@@ -6688,6 +6688,11 @@ function carryIdentityAcrossSaveSwap({ svc, preWf, preSwapUuid, savedAs = false,
   }
 }
 
+// A stale Save-As callback must not outlive a newer Save-As operation. The active
+// workflow check below is the tab fence; this monotonic generation is the operation
+// fence for overlapping/re-mounted panel work.
+let saveAsCanvasGeneration = 0;
+
 /** Rebind a persisted Save-As copy onto the shared canvas before its first persist.
  *
  * The workflow store's `openWorkflow(copy)` changes the active record but does not call
@@ -6696,8 +6701,17 @@ function carryIdentityAcrossSaveSwap({ svc, preWf, preSwapUuid, savedAs = false,
  * payload, repaint through the production load path, then require all three observations
  * (active record, root uuid, root path) to agree. The save adapter captures the copy only
  * after this returns true; a failed or partial repaint is a pre-commit refusal. */
-async function repaintSaveAsCanvas(copy, targetPath) {
+async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
   try {
+    const ownsCanvas = () => {
+      if (typeof canvasFence !== "function") return true;
+      try {
+        return canvasFence(copy) === true;
+      } catch {
+        return false;
+      }
+    };
+    if (!ownsCanvas()) return false;
     const state = copy?.changeTracker?.activeState ?? copy?.activeState;
     if (!state || !Array.isArray(state.nodes) || typeof app?.loadGraphData !== "function") return false;
     const destinationPath = typeof copy?.path === "string" && copy.path ? copy.path : targetPath;
@@ -6730,6 +6744,10 @@ async function repaintSaveAsCanvas(copy, targetPath) {
       load: () => app.loadGraphData(saveAsPayload, true, true, copy, { __cmcpKeepInstance: true }),
     });
     if (restore.completed !== true) return false;
+    // loadGraphData is awaited and can settle after the user switched tabs. Do not
+    // accept that late load as proof and do not let cleanup repaint a predecessor
+    // over the newer tab.
+    if (!ownsCanvas()) return false;
     const rootGraph = app?.graph;
     const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
     const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
@@ -6770,6 +6788,11 @@ async function programmaticSave(name) {
   // workflow changed during our pre-probe — restoring the "capture A before the first
   // await" guarantee the pre-probe would otherwise have widened into a wrong-tab window.
   const expectWf = svc?.activeWorkflow;
+  const saveAsGeneration = ++saveAsCanvasGeneration;
+  const canvasFence = ({ workflow } = {}) =>
+    saveAsCanvasGeneration === saveAsGeneration &&
+    !!workflow &&
+    sameWorkflowObject(activeWorkflowRef(), workflow);
   // #557 r3 — capture the pre-save identity NOW so a save's object SWAP can be
   // threaded through the replacement event: the predecessor/successor pair is
   // only known for certain here. Static path equality cannot decide it — a
@@ -6805,7 +6828,9 @@ async function programmaticSave(name) {
     canvasBinding: describeLiveCanvasBinding,
     details,
     repaintCanvas: async (copy, targetPath) => {
-      const repainted = await repaintSaveAsCanvas(copy, targetPath);
+      const repainted = await repaintSaveAsCanvas(copy, targetPath, {
+        canvasFence: (workflow) => canvasFence({ workflow }),
+      });
       if (repainted) details.canvasRepainted = true;
       return repainted;
     },
@@ -6813,9 +6838,12 @@ async function programmaticSave(name) {
       // The adapter restores the record before calling this hook. Repaint only when
       // that record is still the active instance; a concurrent tab switch must not
       // load the source graph over the user's other canvas.
-      if (!workflow || !sameWorkflowObject(activeWorkflowRef(), workflow)) return false;
-      return repaintSaveAsCanvas(workflow, workflow.path);
+      if (!canvasFence(workflow)) return false;
+      return repaintSaveAsCanvas(workflow, workflow.path, {
+        canvasFence: (current) => canvasFence({ workflow: current }),
+      });
     },
+    canvasFence,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
     // #771 — ComfyUI answers EVERY filesystem error on the userdata write with one
     // 400 that blames the FILENAME, and logs the real cause a line earlier. This
