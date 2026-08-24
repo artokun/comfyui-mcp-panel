@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.67] - 2026-08-24
+
+### Fixed
+- panel_refresh_nodes now follows chained forced refresh successors and never reports premature success while a later refresh is still running (#1695)
+- late combo refresh mutations remain fenced and combo trust stays fail-closed across reconnect refreshes (#1695)
+
+
 ## [0.15.66] - 2026-08-23
 
 ### Fixed
