@@ -6708,10 +6708,10 @@ const MAX_SAVE_AS_CANVAS_RECONCILIATIONS = 3;
  * (active record, root uuid, root path) to agree. The save adapter captures the copy only
  * after this returns true; a failed or partial repaint is a pre-commit refusal. */
 async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
-  const ownsWorkflow = (workflow) => {
+  const ownsWorkflow = (workflow, phase = "repaint") => {
     if (typeof canvasFence !== "function") return true;
     try {
-      return canvasFence(workflow) === true;
+      return canvasFence(workflow, phase) === true;
     } catch {
       return false;
     }
@@ -6720,7 +6720,7 @@ async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
   // finite state machine so every awaited load has the same post-await fence and
   // can advance to the newly active record exactly once.
   const repaintOne = async (workflow, workflowPath) => {
-    if (!ownsWorkflow(workflow)) {
+    if (!ownsWorkflow(workflow, "repaint-before")) {
       return { ok: false, ownerChanged: true };
     }
     try {
@@ -6764,7 +6764,7 @@ async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
       });
       // This is the required post-await re-read. `canvasFence` includes both the
       // active workflow record and this Save-As operation's monotonic generation.
-      const ownerChanged = !ownsWorkflow(workflow);
+      const ownerChanged = !ownsWorkflow(workflow, "repaint-after");
       if (ownerChanged) return { ok: false, ownerChanged: true };
       if (restore.completed !== true) return { ok: false, ownerChanged: false };
       const rootGraph = app?.graph;
@@ -6772,6 +6772,7 @@ async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
       const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
       return {
         ok:
+          ownsWorkflow(workflow, "repaint-verify") &&
           sameWorkflowObject(activeWorkflowRef(), workflow) &&
           canvasIsRoot &&
           rootMeta?.[WORKFLOW_UUID_FIELD] === targetUuid &&
@@ -6788,7 +6789,66 @@ async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
     }
   };
 
-  if (!ownsWorkflow(copy)) return false;
+  // A failed reconciliation has already put some other workflow's payload on the
+  // shared canvas. Before refusing, repair the record that is active NOW. This is a
+  // separate bounded phase: it must never recurse back into repaintSaveAsCanvas, and
+  // it must never repaint an older predecessor over a newer tab.
+  const neutralizeCanvas = async () => {
+    const active = activeWorkflowRef();
+    if (!active || typeof app?.loadGraphData !== "function") return false;
+    if (!ownsWorkflow(active, "neutral-before")) return false;
+    const neutralState = { nodes: [], links: [], groups: [], extra: {} };
+    try {
+      const neutral = await loadGraphDataWithCompletionProof({
+        liteGraph: liteGraphGlobal(),
+        graph: app?.graph,
+        load: () =>
+          app.loadGraphData(neutralState, true, true, active, {
+            __cmcpKeepInstance: true,
+          }),
+      });
+      const rootGraph = app?.graph;
+      const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
+      const liveNodes = rootGraph?._nodes;
+      const serialized = typeof rootGraph?.serialize === "function" ? rootGraph.serialize() : null;
+      const noNodes =
+        Array.isArray(liveNodes) &&
+        liveNodes.length === 0 &&
+        (serialized == null || (Array.isArray(serialized.nodes) && serialized.nodes.length === 0));
+      const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
+      const noStalePath = rootMeta?.[WORKFLOW_PATH_FIELD] == null;
+      const current = activeWorkflowRef();
+      return (
+        neutral.completed === true &&
+        canvasIsRoot &&
+        noNodes &&
+        noStalePath &&
+        !!current &&
+        ownsWorkflow(current, "neutral-after")
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const repairActiveCanvas = async () => {
+    let repairWorkflow = activeWorkflowRef();
+    for (let repair = 0; repair <= MAX_SAVE_AS_CANVAS_RECONCILIATIONS; repair += 1) {
+      if (!repairWorkflow) break;
+      const repairPath = typeof repairWorkflow.path === "string" && repairWorkflow.path ? repairWorkflow.path : null;
+      if (repairPath) {
+        const repaired = await repaintOne(repairWorkflow, repairPath);
+        if (repaired.ok) return { ok: true, mode: "active" };
+      }
+      const current = activeWorkflowRef();
+      if (!current) break;
+      repairWorkflow = current;
+      if (repair >= MAX_SAVE_AS_CANVAS_RECONCILIATIONS) break;
+    }
+    return (await neutralizeCanvas()) ? { ok: true, mode: "neutral" } : { ok: false };
+  };
+
+  if (!ownsWorkflow(copy, "repaint-before")) return false;
   let workflow = copy;
   let workflowPath = targetPath;
   for (let reconciliation = 0; reconciliation <= MAX_SAVE_AS_CANVAS_RECONCILIATIONS; reconciliation += 1) {
@@ -6799,10 +6859,18 @@ async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
     const current = activeWorkflowRef();
     if (!current || sameWorkflowObject(current, workflow)) return false;
     if (reconciliation >= MAX_SAVE_AS_CANVAS_RECONCILIATIONS) {
+      const repair = await repairActiveCanvas();
+      if (!repair.ok) {
+        throw new Error(
+          `Save-As canvas reconciliation entered an unsafe state after ${
+            MAX_SAVE_AS_CANVAS_RECONCILIATIONS + 1
+          } bounded loads; the active canvas could not be safely repaired, so nothing was persisted (#939).`,
+        );
+      }
       throw new Error(
         `Save-As canvas reconciliation entered an unsafe state after ${
           MAX_SAVE_AS_CANVAS_RECONCILIATIONS + 1
-        } bounded loads; active workflow kept changing, so nothing was persisted (#939).`,
+        } bounded loads; the active canvas was safely repaired (${repair.mode}), so nothing was persisted (#939).`,
       );
     }
     const currentPath = typeof current.path === "string" && current.path ? current.path : null;
@@ -6882,7 +6950,7 @@ async function programmaticSave(name) {
     details,
     repaintCanvas: async (copy, targetPath) => {
       const repainted = await repaintSaveAsCanvas(copy, targetPath, {
-        canvasFence: (workflow) => canvasFence({ workflow }),
+        canvasFence: (workflow, phase) => canvasFence({ workflow, phase }),
       });
       if (repainted) details.canvasRepainted = true;
       return repainted;
@@ -6893,7 +6961,7 @@ async function programmaticSave(name) {
       // load the source graph over the user's other canvas.
       if (!canvasFence(workflow)) return false;
       return repaintSaveAsCanvas(workflow, workflow.path, {
-        canvasFence: (current) => canvasFence({ workflow: current }),
+        canvasFence: (current, phase) => canvasFence({ workflow: current, phase }),
       });
     },
     canvasFence,
