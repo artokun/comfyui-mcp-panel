@@ -13659,13 +13659,16 @@ const GRAPH_TOOL_EXECUTORS = {
     const sub = node.subgraph;
     if (!sub) throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
     const inner = [...(sub._nodes ?? sub.nodes ?? [])];
+    // #1729 — provenance is a second structured-read path: its raw instance_widgets
+    // map must follow the same recursive credential redaction as node summaries.
+    const safeProvenance = redactWidgetValue("", subgraphValueProvenance(node));
     return {
       viewing: describeActiveGraph(graph),
       subgraph_of: { node_id: node.id, title: node.title },
       // #636 — the inner nodes below are the DEFINITION's; the parent instance's
       // promoted widgets can override them. Carry both, labelled, so a legitimate
       // per-instance override cannot be misread as stale data.
-      ...subgraphValueProvenance(node),
+      ...safeProvenance,
       node_count: inner.length,
       truncated: inner.length > MAX_STATE_NODES,
       ...(inner.length > MAX_STATE_NODES

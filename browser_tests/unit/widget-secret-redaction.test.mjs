@@ -7,7 +7,21 @@ import {
 } from "../../web/js/lib/widget-secret-redaction.js";
 
 test("#1729 redacts conventional credential widget names", () => {
-  for (const name of ["api_key", "openaiApiKey", "access-token", "bearer", "token"]) {
+  for (const name of [
+    "credential",
+    "credentials",
+    "credentialValue",
+    "secret_key",
+    "secretKey",
+    "private_key",
+    "privateKey",
+    "api_key",
+    "apiKeys",
+    "openaiApiKey",
+    "access-token",
+    "bearer",
+    "token",
+  ]) {
     assert.equal(redactWidgetValue(name, "credential-value"), REDACTED_WIDGET_VALUE, name);
   }
   assert.equal(redactWidgetValue("api_key", ""), "", "an unconfigured key stays visibly empty");
@@ -29,5 +43,43 @@ test("#1729 preserves ordinary visible widget values and does not mutate them", 
   const value = "Use the phrase 'api_key' in the prompt; this is not a credential.";
   assert.equal(redactWidgetValue("prompt", value), value);
   const object = { toggled: true };
-  assert.equal(redactWidgetValue("toggle", object), object);
+  assert.deepEqual(redactWidgetValue("toggle", object), object);
+  assert.deepEqual(object, { toggled: true });
+});
+
+test("#1729 recursively redacts nested credential keys and secret-shaped scalars", () => {
+  const value = {
+    prompt: "visible prompt",
+    nested: {
+      credential: "credential-value",
+      secretKey: "secret-value",
+      private_key: "private-value",
+      apiKeys: ["api-key-value"],
+      token_count: 3,
+      request: [
+        { label: "visible label", api_key: "nested-api-key" },
+        { label: "visible provider", value: "sk-proj-1234567890123456" },
+        "Bearer abcdefghijklmnop",
+      ],
+    },
+  };
+  const before = JSON.stringify(value);
+  const safe = redactWidgetValue("config", value);
+
+  assert.deepEqual(safe, {
+    prompt: "visible prompt",
+    nested: {
+      credential: REDACTED_WIDGET_VALUE,
+      secretKey: REDACTED_WIDGET_VALUE,
+      private_key: REDACTED_WIDGET_VALUE,
+      apiKeys: [REDACTED_WIDGET_VALUE],
+      token_count: 3,
+      request: [
+        { label: "visible label", api_key: REDACTED_WIDGET_VALUE },
+        { label: "visible provider", value: REDACTED_WIDGET_VALUE },
+        REDACTED_WIDGET_VALUE,
+      ],
+    },
+  });
+  assert.equal(JSON.stringify(value), before, "redaction must not mutate the live widget value");
 });

@@ -15,6 +15,7 @@ import {
   clampDetailWidgetCap,
   capSummaryWidgets,
   clipCompactValue,
+  clipLine,
   compactClipNote,
   drivenTag,
   drivenWidgetsFor,
@@ -22,6 +23,7 @@ import {
   isLineProtected,
   truncationTail,
 } from "../../web/js/lib/graph-read.js";
+import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
 
 const PANEL_JS = join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js");
 const source = readFileSync(PANEL_JS, "utf8");
@@ -75,6 +77,25 @@ const graph = {
       inputs: [],
       outputs: [],
     },
+    {
+      id: 82,
+      type: "Credentialed Bypassed Node",
+      title: "Credentialed Bypassed Node",
+      mode: 4,
+      widgets: [
+        {
+          name: "settings",
+          value: {
+            visible: "visible setting",
+            api_key: "compact-api-key",
+            nested: [{ privateKey: "compact-private-key" }, "Bearer abcdefghijklmnop"],
+          },
+        },
+        { name: "prompt", value: "visible prompt" },
+      ],
+      inputs: [],
+      outputs: [],
+    },
   ],
 };
 
@@ -111,7 +132,9 @@ const dependencyNames = [
   "isLineProtected",
   "truncationTail",
   "clipCompactValue",
+  "clipLine",
   "compactClipNote",
+  "redactWidgetValue",
 ];
 const graphQuery = new Function(
   ...dependencyNames,
@@ -139,7 +162,9 @@ const graphQuery = new Function(
   isLineProtected,
   truncationTail,
   clipCompactValue,
+  clipLine,
   compactClipNote,
+  redactWidgetValue,
 );
 
 function detailRows(result) {
@@ -196,3 +221,18 @@ test("#1681 shipped graph_query preserves a fitting quote-heavy object at the op
   assert.deepEqual(row.widgets.text, graph._nodes[3].widgets[0].value);
   assert.equal(JSON.stringify(row.widgets.text), JSON.stringify(graph._nodes[3].widgets[0].value));
 });
+
+test("#1729 shipped graph_query compact redacts nested secrets and preserves bypass/ordinary values", () => {
+  const result = query({ ids: [82], fields: "compact" });
+  const line = result.text.split("\n").find((entry) => entry.startsWith("#82 "));
+  assert.ok(line, "the compact query must return the bypassed node");
+  assert.match(line, /#82 Credentialed Bypassed Node \[bypass\]/);
+  assert.match(line, /visible=|visible setting/);
+  assert.match(line, /prompt=visible prompt/);
+  assert.match(line, new RegExp(escapeRegex(REDACTED_WIDGET_VALUE)));
+  assert.doesNotMatch(line, /compact-api-key|compact-private-key|Bearer abcdefghijklmnop/);
+});
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
