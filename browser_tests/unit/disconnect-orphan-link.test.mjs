@@ -57,6 +57,7 @@ import {
   clearStrandedInputLinks,
   verifyDisconnect,
 } from "../../web/js/lib/disconnect-verify.js";
+import { danglingInputLinks } from "../../web/js/lib/subgraph-conversion-integrity.js";
 
 const panelSrc = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -106,6 +107,7 @@ function buildDisconnect(graph) {
     "clearOrphanedInputLink",
     "clearStrandedInputLinks",
     "verifyDisconnect",
+    "danglingInputLinks",
     `return ({
 ${disconnectSrc}
 }).graph_disconnect;`,
@@ -120,6 +122,7 @@ ${disconnectSrc}
     clearOrphanedInputLink,
     clearStrandedInputLinks,
     verifyDisconnect,
+    danglingInputLinks,
   );
 }
 
@@ -224,6 +227,9 @@ test("#1750 orphaned slot: panel_disconnect CLEARS the reference instead of refu
   assert.equal(res.removed_link, undefined);
   assert.match(res.warning, /nothing was disconnected/i);
   assert.match(res.warning, /No link found in parent graph/);
+  // The ONLY orphan in this graph was the one cleared, so say exactly that.
+  assert.equal(res.remaining_orphan_links, undefined);
+  assert.match(res.warning, /No other input in this graph carries an orphaned link id/);
   // Repaired inside ONE undo envelope, so the "Undoable with Ctrl+Z" contract holds.
   assert.equal(graph.envelopes, 1);
   assert.equal(graph.closedEnvelopes, 1);
@@ -332,4 +338,94 @@ test("#1750 post-condition never covers for a disconnect that did NOT land", () 
   );
   assert.equal(node.inputs[1].link, 15, "the live wire was left alone");
   assert.ok(graph._links.has(15));
+});
+
+// ---------------------------------------------------------------------------
+// codex gate round 1, both P1
+// ---------------------------------------------------------------------------
+
+/**
+ * P1: clearing ONE orphan does not make a graph queueable. #1750's own workflow
+ * carried four (79 source_latent_b/source_image_b, 84/85 image_b), and a reply
+ * that says "queueable again" after the first sends the caller straight back
+ * into the same serializer refusal, with the same message, on a different slot.
+ */
+test("#1750 the reply reports what is STILL orphaned, and never claims queueable", () => {
+  const graph = mkGraph();
+  addNode(graph, 90, [], [{ name: "IMAGE", links: [] }]);
+  addNode(graph, 79, [
+    { name: "source_latent_b", link: 21 },
+    { name: "source_image_b", link: 20 },
+  ]);
+  addNode(graph, 84, [{ name: "image_b", link: 18 }]);
+  addNode(graph, 85, [{ name: "image_b", link: 19 }]);
+  const disconnect = buildDisconnect(graph);
+
+  const res = disconnect({ node_id: 79, input: "source_latent_b" });
+
+  assert.deepEqual(res.cleared_orphan_link, {
+    node_id: 79,
+    input: "source_latent_b",
+    link_id: 21,
+  });
+  assert.deepEqual(res.remaining_orphan_links, [
+    { node_id: 79, input: "source_image_b", link_id: 20 },
+    { node_id: 84, input: "image_b", link_id: 18 },
+    { node_id: 85, input: "image_b", link_id: 19 },
+  ]);
+  assert.match(res.warning, /3 other input\(s\) in this graph still carry an orphaned link id/);
+  assert.match(res.warning, /STILL refused/);
+  assert.doesNotMatch(res.warning, /queueable/);
+
+  // …and clearing the last one says so, rather than staying silent about it.
+  disconnect({ node_id: 79, input: "source_image_b" });
+  disconnect({ node_id: 84, input: "image_b" });
+  const last = disconnect({ node_id: 85, input: "image_b" });
+  assert.equal(last.remaining_orphan_links, undefined);
+  assert.match(last.warning, /No other input in this graph carries an orphaned link id/);
+});
+
+/**
+ * P1: `afterChange()` closes the undo transaction. If it throws, the slot write
+ * still landed but the undo step may never have been recorded — so the reply may
+ * report the repair and may NOT promise Ctrl+Z.
+ */
+test("#1750 a throwing afterChange costs the Ctrl+Z promise, not the repair", () => {
+  const { graph } = orphanedGraph();
+  graph.afterChange = () => {
+    graph.closedEnvelopes += 1;
+    throw new Error("change tracker exploded");
+  };
+  const disconnect = buildDisconnect(graph);
+  const node = graph.getNodeById(79);
+
+  const res = disconnect({ node_id: 79, input: "source_latent_b" });
+
+  assert.equal(node.inputs[2].link, null, "the repair itself landed");
+  assert.deepEqual(res.cleared_orphan_link, {
+    node_id: 79,
+    input: "source_latent_b",
+    link_id: 21,
+  });
+  assert.match(res.warning, /undo envelope did not close cleanly/);
+  assert.match(res.warning, /change tracker exploded/);
+  assert.doesNotMatch(res.warning, /Undoable with Ctrl\+Z/);
+});
+
+test("#1750 a throwing clear is a REFUSAL, not a disclosed success", () => {
+  const { graph } = orphanedGraph();
+  const node = graph.getNodeById(79);
+  // A frozen/proxied slot: the write itself fails, so the orphan is still there.
+  Object.defineProperty(node.inputs[2], "link", {
+    get: () => 21,
+    set: () => {
+      throw new Error("slot is read-only");
+    },
+  });
+  const disconnect = buildDisconnect(graph);
+
+  assert.throws(
+    () => disconnect({ node_id: 79, input: "source_latent_b" }),
+    /could not clear it \(slot is read-only\)/,
+  );
 });

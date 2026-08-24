@@ -15219,43 +15219,79 @@ const GRAPH_TOOL_EXECUTORS = {
       }
       // Same undo envelope the real mutation uses, so one Ctrl+Z reverts the
       // repair — the panel's "Undoable with Ctrl+Z" contract does not get an
-      // exemption for a write the user did not know they needed.
-      let repairErr = null;
+      // exemption for a write the user did not know they needed. The two errors
+      // are kept APART because they mean different things: a clear that threw
+      // means the slot may still be broken, while an envelope that threw means
+      // the write landed but the undo step may not have been recorded, and the
+      // Ctrl+Z promise is the only thing that can no longer be made (the main
+      // mutation path below separates them for the same reason).
+      let clearErr = null;
+      let repairEnvelopeErr = null;
       let clearedOrphan = null;
       graph.beforeChange();
       try {
         clearedOrphan = clearOrphanedInputLink(graph, node, inIdx);
       } catch (err) {
-        repairErr = err;
+        clearErr = err;
       }
       try {
         graph.afterChange();
       } catch (err) {
-        repairErr ??= err;
+        repairEnvelopeErr = err;
       }
       graph.setDirtyCanvas(true, true);
       if (clearedOrphan == null || node.inputs?.[inIdx]?.link != null) {
+        const why = clearErr ?? repairEnvelopeErr;
         throw new Error(
           `panel_disconnect: node ${node.id} input "${inputName}" carries link id ` +
             `${orphanLinkId}, which the graph's link store has no record of, and the panel ` +
             `could not clear it` +
-            (repairErr ? ` (${repairErr?.message ?? repairErr})` : "") +
+            (why ? ` (${why?.message ?? why})` : "") +
             `. Nothing can be queued while that reference stands — ComfyUI refuses the ` +
             `graph with "No link found in parent graph". Reload the workflow from disk ` +
             `with panel_load_workflow and redo the edit (#1750).`,
         );
       }
+      // What is STILL broken. Clearing one slot does not make a graph queueable
+      // — #1750's own workflow carried four orphans — and saying it does would
+      // send the caller to queue a graph the serializer still refuses, for the
+      // same reason, with the same message. Report the rest instead of implying
+      // there is no rest. One level only, like every other reader of this
+      // helper: it does not descend into subgraph definitions.
+      const stillOrphaned = danglingInputLinks(graph);
+      const orphanRoll = stillOrphaned
+        .slice(0, 10)
+        .map((o) => `node ${o.node_id} input "${o.name ?? o.slot}" (link ${o.link_id})`)
+        .join(", ");
       // Deliberately NOT reported as `disconnected`: no wire was removed, because
       // none existed. What changed is that the slot no longer names a link that
       // does not exist.
       return {
         cleared_orphan_link: { node_id: node.id, input: inputName, link_id: clearedOrphan },
+        ...(stillOrphaned.length
+          ? {
+              remaining_orphan_links: stillOrphaned.slice(0, 10).map((o) => ({
+                node_id: o.node_id,
+                input: o.name ?? o.slot,
+                link_id: o.link_id,
+              })),
+            }
+          : {}),
         warning:
           `nothing was disconnected — the input was not wired to anything. It carried link ` +
           `id ${clearedOrphan}, which the graph's link store has no record of, and that ` +
           `ORPHANED reference is what ComfyUI rejects with "No link found in parent graph" ` +
-          `when the workflow is queued. The panel cleared it, so the graph is queueable ` +
-          `again (#1750). Undoable with Ctrl+Z.`,
+          `when the workflow is queued. The panel cleared it (#1750). ` +
+          (stillOrphaned.length
+            ? `${stillOrphaned.length} other input(s) in this graph still carry an orphaned ` +
+              `link id — ${orphanRoll}${stillOrphaned.length > 10 ? ", …" : ""} — so the graph ` +
+              `is STILL refused until each of those is cleared too (panel_disconnect on each). `
+            : `No other input in this graph carries an orphaned link id. `) +
+          (repairEnvelopeErr
+            ? `The change landed, but the undo envelope did not close cleanly ` +
+              `(${repairEnvelopeErr?.message ?? repairEnvelopeErr}), so Ctrl+Z may not revert ` +
+              `it — re-check the input with panel_graph_outline before relying on undo.`
+            : `Undoable with Ctrl+Z.`),
       };
     }
     const before = snapshotGraphState(graph);
@@ -15366,8 +15402,8 @@ const GRAPH_TOOL_EXECUTORS = {
         `the link was removed from the graph's link store but input ` +
           `${strandedSlots.map((s) => `"${s.name ?? s.slot}"`).join(", ")} still named it ` +
           `afterwards — an orphaned reference ComfyUI rejects with "No link found in parent ` +
-          `graph" when the workflow is queued. The panel cleared it as part of this ` +
-          `disconnect (#1750), so no separate repair is needed.`,
+          `graph" when the workflow is queued. The panel cleared THAT reference as part of ` +
+          `this disconnect (#1750); it says nothing about any other input in the graph.`,
       );
     }
     if (slotsShifted) {
