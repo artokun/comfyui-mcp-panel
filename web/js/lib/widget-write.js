@@ -379,6 +379,228 @@ function resolveWidgetByName(node, widgetName) {
   return matches[0] ?? null;
 }
 
+// #2146 — Fast Groups Bypasser rows are action controls. Their callback can set the mode of
+// every node in the selected group, and rgthree's Mute / Bypass Repeater can continue that
+// change through linked inputs. The ordinary widget rollback knows only about widget/property
+// projections, so keep a deliberately small mode journal for this one runtime shape.
+const FAST_GROUPS_BYPASSER_TYPE = "Fast Groups Bypasser (rgthree)";
+const FAST_GROUPS_TOGGLE_WIDGET = "RGTHREE_TOGGLE_AND_NAV";
+const NODE_MODE_REPEATER_TYPE = "Mute / Bypass Repeater (rgthree)";
+const NODE_MODE_RELAY_TYPE = "Mute / Bypass Relay (rgthree)";
+
+function runtimeNodeType(node) {
+  try {
+    if (typeof node?.type === "string") return node.type;
+    if (typeof node?.constructor?.type === "string") return node.constructor.type;
+  } catch {
+    // An unreadable third-party node is handled by the fail-closed transaction capture below.
+  }
+  return "";
+}
+
+function widgetBaseName(widgetName) {
+  if (typeof widgetName !== "string") return "";
+  const dot = widgetName.indexOf(".");
+  return dot === -1 ? widgetName : widgetName.slice(0, dot);
+}
+
+function isModePassThrough(node) {
+  const type = runtimeNodeType(node);
+  return type.includes("Reroute") || type.includes("Node Combiner") || type.includes("Node Collector");
+}
+
+function modeTransactionFailure(node, detail) {
+  return new WidgetWriteError(
+    `Cannot set widget on node ${node?.id} (${node?.type}): cannot establish the Fast Groups ` +
+      `Bypasser mode rollback boundary (${detail}); refusing before the callback can mutate ` +
+      `linked node modes (#2146).`,
+  );
+}
+
+/**
+ * Capture only the mode targets a Fast Groups Bypasser row can reach:
+ *   - members of each Fast Bypasser group row on this node;
+ *   - descendants of those members in a subgraph;
+ *   - non-pass-through inputs of rgthree repeaters; and
+ *   - non-pass-through outputs of input-less rgthree relays.
+ *
+ * This intentionally does not walk or snapshot the graph generally. The returned journal is
+ * used only after a write has already failed verification/refused after dispatch.
+ */
+function captureFastBypasserModeTransaction(node, widgetName, writtenWidget) {
+  if (
+    runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
+    widgetBaseName(widgetName) !== FAST_GROUPS_TOGGLE_WIDGET
+  ) {
+    return null;
+  }
+
+  const rows = [
+    writtenWidget,
+    ...(Array.isArray(node?.widgets) ? node.widgets : []),
+  ].filter((candidate, index, all) => {
+    if (!candidate || widgetBaseName(candidate.name) !== FAST_GROUPS_TOGGLE_WIDGET) return false;
+    return all.indexOf(candidate) === index;
+  });
+  const groups = [];
+  for (const row of rows) {
+    let group;
+    try {
+      group = row.group;
+    } catch {
+      throw modeTransactionFailure(node, "a toggle row's group is unreadable");
+    }
+    if (!group || (typeof group !== "object" && typeof group !== "function")) {
+      throw modeTransactionFailure(node, "a toggle row has no live group");
+    }
+    if (!groups.includes(group)) groups.push(group);
+  }
+  if (!groups.length) throw modeTransactionFailure(node, "no live toggle-row group was found");
+
+  const entries = [];
+  const seenNodes = new Set();
+  const propagationQueue = [];
+
+  const addNodeTree = (candidate) => {
+    if (!candidate || typeof candidate !== "object" || seenNodes.has(candidate)) return;
+    const type = runtimeNodeType(candidate);
+    let mode;
+    try {
+      mode = candidate.mode;
+    } catch {
+      throw modeTransactionFailure(node, `node ${candidate.id ?? "?"}'s mode is unreadable`);
+    }
+    seenNodes.add(candidate);
+    entries.push({ node: candidate, previous: mode });
+    if (type === NODE_MODE_REPEATER_TYPE || type === NODE_MODE_RELAY_TYPE) {
+      propagationQueue.push(candidate);
+    }
+
+    let subgraph = null;
+    try {
+      const isSubgraph =
+        typeof candidate.isSubgraphNode === "function"
+          ? candidate.isSubgraphNode()
+          : !!candidate.subgraph;
+      subgraph = isSubgraph ? candidate.subgraph : null;
+    } catch {
+      throw modeTransactionFailure(node, `node ${candidate.id ?? "?"}'s subgraph is unreadable`);
+    }
+    if (subgraph != null) {
+      if (!Array.isArray(subgraph.nodes)) {
+        throw modeTransactionFailure(node, `node ${candidate.id ?? "?"}'s subgraph nodes are unreadable`);
+      }
+      for (const child of subgraph.nodes) addNodeTree(child);
+    }
+  };
+
+  const graphFor = (candidate, group) => candidate?.graph ?? group?.graph ?? node?.graph;
+  const connectedRoots = (start, direction, group, skipRelays) => {
+    const queue = [start];
+    const walked = new Set();
+    while (queue.length) {
+      const current = queue.shift();
+      if (!current || walked.has(current)) continue;
+      walked.add(current);
+      const graph = graphFor(current, group);
+      const slots = direction === "input" ? current.inputs : current.outputs;
+      if (!graph || !Array.isArray(slots)) continue;
+      for (const slot of slots) {
+        let linkId;
+        try {
+          linkId = direction === "input" ? slot?.link : null;
+          if (direction === "output") {
+            for (const outputLinkId of Array.isArray(slot?.links) ? slot.links : []) {
+              const link = graph.links?.[outputLinkId];
+              const connected = graph.getNodeById?.(link?.target_id);
+              if (!connected) continue;
+              if (isModePassThrough(connected)) queue.push(connected);
+              else addNodeTree(connected);
+            }
+            continue;
+          }
+        } catch {
+          throw modeTransactionFailure(node, "a linked mode path is unreadable");
+        }
+        if (linkId == null) continue;
+        let link;
+        let connected;
+        try {
+          link = graph.links?.[linkId];
+          connected = graph.getNodeById?.(link?.origin_id);
+        } catch {
+          throw modeTransactionFailure(node, "a linked mode path is unreadable");
+        }
+        if (!connected) continue;
+        if (skipRelays && runtimeNodeType(connected) === NODE_MODE_RELAY_TYPE) continue;
+        if (isModePassThrough(connected)) queue.push(connected);
+        else addNodeTree(connected);
+      }
+    }
+  };
+
+  for (const group of groups) {
+    let members;
+    try {
+      group.recomputeInsideNodes?.();
+      members = group._children;
+    } catch {
+      throw modeTransactionFailure(node, "a toggle-row group is unreadable");
+    }
+    if (members == null) throw modeTransactionFailure(node, "a toggle-row group has no members");
+    let groupNodes;
+    try {
+      groupNodes = Array.from(members);
+    } catch {
+      throw modeTransactionFailure(node, "a toggle-row group member list is unreadable");
+    }
+    for (const groupNode of groupNodes) addNodeTree(groupNode);
+  }
+
+  while (propagationQueue.length) {
+    const current = propagationQueue.shift();
+    const type = runtimeNodeType(current);
+    if (type === NODE_MODE_REPEATER_TYPE) {
+      const group = groups.find((candidate) => candidate?.graph === current?.graph) ?? groups[0];
+      connectedRoots(current, "input", group, true);
+    } else if (type === NODE_MODE_RELAY_TYPE) {
+      let hasInput = false;
+      try {
+        hasInput = Array.isArray(current.inputs) && current.inputs.some((input) => input?.link != null);
+      } catch {
+        throw modeTransactionFailure(node, `relay ${current.id ?? "?"}'s inputs are unreadable`);
+      }
+      if (!hasInput) {
+        const group = groups.find((candidate) => candidate?.graph === current?.graph) ?? groups[0];
+        connectedRoots(current, "output", group, false);
+      }
+    }
+  }
+
+  return {
+    restore() {
+      for (const entry of entries) {
+        try {
+          if (!Object.is(entry.node.mode, entry.previous)) entry.node.mode = entry.previous;
+        } catch {
+          // Read-back below turns this into an honest partial-state error.
+        }
+      }
+    },
+    unrestored() {
+      const failed = [];
+      for (const entry of entries) {
+        try {
+          if (!Object.is(entry.node.mode, entry.previous)) failed.push(entry);
+        } catch {
+          failed.push(entry);
+        }
+      }
+      return failed;
+    },
+  };
+}
+
 // DECLARED field schema for known composite widgets. Types are enforced from THIS
 // schema, never inferred from the current value — a field whose current value is `null`
 // still enforces the correct type, so a scalar of the wrong type (e.g. a number into a
@@ -1717,6 +1939,11 @@ export function applyWidgetWrite(
   // to the other mid-write, which would otherwise slip past the identity compare.
   const prevOuterWidgetsIdentityStable = prevOuterWidgetsRef ? widgetsListHasStableIdentity(node) : false;
 
+  // #2146 — capture the narrow Fast Bypasser mode boundary before the undo envelope opens.
+  // If the live row shape cannot be bounded, refuse before assigning the widget value rather
+  // than allowing a callback to mutate linked modes that this writer cannot restore.
+  const fastBypasserModes = captureFastBypasserModeTransaction(node, widgetName, w);
+
   // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
   // so a throwing hook can never bypass our verification/rollback and leave a silent
   // partial write; a stateful hook that mutates values is still caught because ALL
@@ -2263,6 +2490,10 @@ export function applyWidgetWrite(
           /* restore best-effort; read-back below is authoritative */
         }
       }
+      // #2146 — restore the Fast Bypasser's group/repeater mode journal inside the same
+      // rollback envelope. Repeater setters may themselves propagate to linked nodes, so the
+      // journal restores the roots first and then verifies every captured primitive mode below.
+      fastBypasserModes?.restore();
     } finally {
       safeAfter();
     }
@@ -2297,6 +2528,11 @@ export function applyWidgetWrite(
         const label = `display "${displayWidgets[i].name}"`;
         rollbackFailed = rollbackFailed ? `${rollbackFailed} and ${label}` : label;
       }
+    }
+    const unrestoredFastModes = fastBypasserModes?.unrestored() ?? [];
+    if (unrestoredFastModes.length) {
+      const label = `Fast Bypasser linked node modes (${unrestoredFastModes.length} node(s))`;
+      rollbackFailed = rollbackFailed ? `${rollbackFailed} and ${label}` : label;
     }
     // The serialization binding must be back to its original store key, else queue
     // compilation still reads whatever entry a callback re-pointed it to.

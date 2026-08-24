@@ -15145,13 +15145,11 @@ const GRAPH_TOOL_EXECUTORS = {
         setDirty: () => graph.setDirtyCanvas(true, true),
       });
     }
-    // #983: rgthree's Fast Groups Muter/Bypasser toggle rows are DERIVED READOUTS of whether
-    // the matched group has an active node — the node re-reads each one from the group on
-    // every refresh and declares `serialize_widgets = false`, so a write is reverted and
-    // never reaches the workflow. The reported shape was a clean success followed immediately
-    // by the old value. Refused loudly, keyed to BOTH the node type and the widget name so
-    // nothing else on those nodes is affected. See the lib for the three source facts and for
-    // why this refuses rather than driving the node's own toggle().
+    // #983: rgthree's Fast Groups Muter toggle rows are DERIVED READOUTS of whether the matched
+    // group has an active node — the node re-reads each one from the group on every refresh and
+    // declares `serialize_widgets = false`, so a write is reverted and never reaches the
+    // workflow. Fast Groups Bypasser rows are action controls; their callback-driven mode
+    // mutation is kept on the normal transactional widget-write path (#2146).
     if (classifyRgthreeFastGroupsWrite(node, widget) === "derived") {
       throw new Error(rgthreeFastGroupsRefusal(widget, node.id, node.type));
     }
