@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.75] - 2026-08-24
+
+### Fixed
+- Keep Panel run receipts route-bound and exactly-once across reconnects, remounts, and late queue delivery (#1728)
+- Redact credential-like values through graph outlines and subgraph provenance, including shared aliases (#1729)
+- Refresh live asset membership before API-upload missing-asset validation (#1733)
+
 ## [0.15.74] - 2026-08-24
 
 ### Fixed
