@@ -165,3 +165,106 @@ test('Save-As repaints destination identity before a graph edit and no-name save
     }
   }
 })
+
+test('a tab switch during the real Save-As load reconciles the newer canvas and refuses the save', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  test.setTimeout(120_000)
+  const cleanup: string[] = []
+  try {
+    await panel.goto()
+    await panel.setBridgeUrl(mockBridge.url)
+    await panel.openSidebar()
+    await panel.connect()
+
+    const first = await mockBridge.command('workflow_save', {})
+    expect(first.ok, 'the setup save must succeed').toBe(true)
+    const original = String(first.result?.workflow || '')
+    expect(original).toBeTruthy()
+    cleanup.push(original)
+
+    // Give the source graph content that is visibly different from a newly-created
+    // blank tab. The production Save-As payload will therefore be detectable if it
+    // lands on the newer tab after that tab switch.
+    const edited = await mockBridge.command('graph_add_node', { class_type: 'VAEDecode' })
+    expect(edited.ok, `the source setup edit must succeed: ${edited.error || ''}`).toBe(true)
+
+    const copyName = `e2e-939-mid-load-${Date.now()}`
+    const copyPath = `workflows/${copyName}.json`
+    cleanup.push(copyName)
+
+    // Hold the actual production loadGraphData promise used by repaintSaveAsCanvas.
+    // The switch below happens while this promise is suspended, not merely before a
+    // test double returns from a repaint hook.
+    await page.evaluate((targetPath) => {
+      const w = window as any
+      const app = w.comfyAPI?.app?.app || w.app
+      if (typeof app?.loadGraphData !== 'function') throw new Error('loadGraphData unavailable')
+      const gate: any = { entered: false, released: false, release: null }
+      const originalLoad = app.loadGraphData.bind(app)
+      app.loadGraphData = async (...args: any[]) => {
+        const path = args[0]?.extra?.comfyui_mcp?.workflow_path
+        if (path === targetPath && !gate.entered) {
+          gate.entered = true
+          await new Promise<void>((resolve) => { gate.release = resolve })
+          gate.released = true
+        }
+        return originalLoad(...args)
+      }
+      w.__cmcp939MidLoadGate = gate
+    }, copyPath)
+
+    const saving = mockBridge.command('workflow_save', { name: copyName })
+    await page.waitForFunction(() => Boolean((window as any).__cmcp939MidLoadGate?.entered))
+
+    const switched = await mockBridge.command('workflow_new')
+    expect(switched.ok, `the concurrent tab switch must succeed: ${switched.error || ''}`).toBe(true)
+    expect(switched.result?.created).toBe(true)
+
+    await page.evaluate(() => {
+      const gate = (window as any).__cmcp939MidLoadGate
+      if (typeof gate?.release !== 'function') throw new Error('Save-As load gate was not releasable')
+      gate.release()
+    })
+    const saved = await saving
+
+    expect(saved.ok, 'a Save-As that lost canvas ownership must not report success').toBe(false)
+    expect(String(saved.error || '')).toMatch(/could not be proven active|canvas owner|reconciliation/i)
+
+    const listed = await mockBridge.command('workflow_list')
+    expect(listed.ok).toBe(true)
+    expect(listed.result?.active?.path).not.toBe(copyPath)
+    expect(listed.result?.active?.path).not.toBe(`workflows/${original}.json`)
+
+    const canvas = await page.evaluate(() => {
+      const w = window as any
+      const app = w.comfyAPI?.app?.app || w.app
+      const graph = app?.canvas?.graph ?? app?.graph
+      return {
+        nodeCount: graph?.nodes?.length ?? -1,
+        workflowUuid: graph?.extra?.comfyui_mcp?.workflow_uuid ?? null
+      }
+    })
+    expect(canvas.nodeCount, 'the newer blank tab must not retain the Save-As source graph').toBe(0)
+    expect(canvas.workflowUuid, 'the reconciled canvas must retain the newer active identity').toBe(
+      listed.result?.active?.workflow_uuid
+    )
+
+    const onDisk = await page.evaluate(async (path) => {
+      const api = (window as any).comfyAPI?.api?.api
+      const response = await api.fetchApi(`/userdata/${encodeURIComponent(path)}`)
+      return response?.status
+    }, copyPath)
+    expect(onDisk, 'fail-closed reconciliation must not persist the destination').toBe(404)
+  } finally {
+    for (const name of cleanup.reverse()) {
+      try {
+        await deleteSavedWorkflow(page, name)
+      } catch {
+        // Best-effort cleanup must never mask the production-path assertion.
+      }
+    }
+  }
+})
