@@ -269,6 +269,72 @@ test('a tab switch during the real Save-As load reconciles the newer canvas and 
   }
 })
 
+test('a failed Save-As does not publish the destination identity alias before persistence', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  test.setTimeout(120_000)
+  const cleanup: string[] = []
+  let copyPath: string | null = null
+  try {
+    await panel.goto()
+    await panel.setBridgeUrl(mockBridge.url)
+    await panel.openSidebar()
+    await panel.connect()
+
+    const first = await mockBridge.command('workflow_save', {})
+    expect(first.ok, 'the setup save must succeed').toBe(true)
+    const original = String(first.result?.workflow || '')
+    expect(original).toBeTruthy()
+    cleanup.push(original)
+
+    const copyName = `e2e-939-identity-failure-${Date.now()}`
+    copyPath = `workflows/${copyName}.json`
+
+    // Fail the production repaint after the destination UUID has been resolved. A failed
+    // copy may clean its in-memory tab, but must not leave the destination path reusable as
+    // an identity alias in localStorage/history (#939).
+    await page.evaluate((targetPath) => {
+      const w = window as any
+      const app = w.comfyAPI?.app?.app || w.app
+      if (typeof app?.loadGraphData !== 'function') throw new Error('loadGraphData unavailable')
+      const originalLoad = app.loadGraphData.bind(app)
+      app.loadGraphData = async (...args: any[]) => {
+        const path = args[0]?.extra?.comfyui_mcp?.workflow_path
+        if (path === targetPath) throw new Error('forced Save-As repaint failure')
+        return originalLoad(...args)
+      }
+    }, copyPath)
+
+    const failed = await mockBridge.command('workflow_save', { name: copyName })
+    expect(failed.ok, 'the forced repaint failure must refuse the Save-As').toBe(false)
+
+    const alias = await page.evaluate((path) => {
+      const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+      return aliases[path] || null
+    }, copyPath)
+    expect(alias, 'a failed Save-As must not leave a reusable destination alias').toBeNull()
+  } finally {
+    if (copyPath) {
+      await page.evaluate((path) => {
+        const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+        if (Object.hasOwn(aliases, path)) {
+          delete aliases[path]
+          localStorage.setItem('comfyui-mcp.panel.workflowUuidAliases', JSON.stringify(aliases))
+        }
+      }, copyPath).catch(() => {})
+    }
+    for (const name of cleanup.reverse()) {
+      try {
+        await deleteSavedWorkflow(page, name)
+      } catch {
+        // Best-effort cleanup must never mask the production-path assertion.
+      }
+    }
+  }
+})
+
 test('a second tab switch during reconciliation is re-read and remains bounded', async ({
   page,
   panel,

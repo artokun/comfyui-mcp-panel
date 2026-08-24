@@ -568,6 +568,7 @@ export async function saveActiveWorkflow(
     // return true only while this operation still owns the active canvas; false is
     // a stale-operation refusal, never permission to restore a predecessor.
     canvasFence,
+    operationFence,
   } = {},
 ) {
   const wf = svc?.activeWorkflow;
@@ -798,6 +799,7 @@ export async function saveActiveWorkflow(
         repaintCanvas,
         restoreCanvas,
         canvasFence,
+        operationFence,
       });
       if (!copyToUserDir) {
         throw new Error(
@@ -864,6 +866,7 @@ export async function saveActiveWorkflow(
       repaintCanvas: cls === "never-persisted" ? undefined : repaintCanvas,
       restoreCanvas,
       canvasFence,
+      operationFence,
     });
 
     // #226 CLASSIFICATION GUARD, scoped to the hazard it actually names (#1066 defect 2).
@@ -1297,7 +1300,8 @@ async function probeSourceOnDisk(existsOnDisk, normPath) {
  *  it receives `{ workflow: prevActive, copy, targetPath }` after record cleanup and
  *  must return `true` only after the previous workflow is proven live again. `canvasFence`
  *  is checked before and after every awaited repaint/restore and must reject stale
- *  generations or a different current tab. */
+ *  generations or a different current tab. `operationFence`, when supplied, is checked before
+ *  failed-copy cleanup and must reject cleanup from a superseded Save-As generation. */
 function resolveSaveAsCopy(
   svc,
   {
@@ -1308,6 +1312,7 @@ function resolveSaveAsCopy(
     repaintCanvas,
     restoreCanvas,
     canvasFence,
+    operationFence,
   } = {},
 ) {
   // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
@@ -1453,6 +1458,24 @@ function resolveSaveAsCopy(
         }
       };
       const cleanupFailedCopy = async () => {
+        // Once a successor Save-As advances the operation generation, this operation may no
+        // longer purge or close ANY copy. The old copy can already be inactive while still
+        // being the successor's source/predecessor, so an active-record check alone is too
+        // late (#939).
+        if (typeof operationFence === "function") {
+          let current = false;
+          try {
+            current = operationFence({ copy, targetPath: finalTargetPath }) === true;
+          } catch {
+            current = false;
+          }
+          if (!current) {
+            return {
+              ok: false,
+              reason: "a newer Save-As operation advanced before cleanup",
+            };
+          }
+        }
         // Capture ownership BEFORE removing the copy. ComfyUI's closeWorkflow may
         // auto-select the first remaining tab, so checking `activeWorkflow` after the
         // purge would mistake our own store cleanup for a user tab switch.

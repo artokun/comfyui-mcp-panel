@@ -4185,7 +4185,7 @@ function rememberWorkflowUuidOwner(id, owner) {
  *  latter is bridge routing, while this UUID follows a workflow across rename.
  *  Copies carrying the same embedded UUID get a fresh identity when opened as a
  *  different workflow object/path. */
-function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
+function workflowStableUuid(wf = activeWorkflowRef(), { embed = false, commit = true } = {}) {
   const identityObject = wf || app?.graph;
   if (!identityObject || typeof identityObject !== "object") return getTabId();
   const path = savedWorkflowPath(wf);
@@ -4223,7 +4223,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     });
     setWorkflowObjectUuid(identityObject, id);
     rememberWorkflowUuidOwner(id, identityObject);
-    if (embeddedId !== id) {
+    if (commit && embeddedId !== id) {
       // Persist the identity into extra (so a reload of the SAME content keeps it, AND a later
       // SAVE carries it into the saved file across the tmp:→wf: transition). Never dirties the
       // graph. Not a KEEP authority — the wrapper's live-object invalidation is.
@@ -4340,7 +4340,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   setWorkflowObjectUuid(identityObject, id);
   rememberWorkflowUuidOwner(id, identityObject);
   const aliasMutations = [];
-  if (objectUuid && path) {
+  if (commit && objectUuid && path) {
     // The same live workflow object moved to a new path (rename/Save-As). Keep
     // one canonical alias so the next cold start does not see its former path
     // as evidence that the current file is a clone.
@@ -4351,7 +4351,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       }
     }
   }
-  if (path && _workflowUuidAliases[path] !== id) {
+  if (commit && path && _workflowUuidAliases[path] !== id) {
     _workflowUuidAliases[path] = id;
     aliasMutations.push([path, id]);
   }
@@ -4359,7 +4359,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     persistWorkflowAliases();
     for (const [aliasPath, value] of aliasMutations) workflowAliasMutationSink?.(aliasPath, value);
   }
-  if (embed) {
+  if (embed && commit) {
     try {
       const extra = workflowOwnedExtra(wf);
       const previous = extra?.[WORKFLOW_META_NAMESPACE];
@@ -6733,7 +6733,10 @@ async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
       if (typeof destinationPath !== "string" || !destinationPath) {
         return { ok: false, ownerChanged: false };
       }
-      const targetUuid = workflowStableUuid(workflow, { embed: true });
+      // Resolve the UUID for the payload, but do not publish the destination path alias
+      // or mutate durable workflow metadata until the Save-As copy is proven persisted.
+      // The save result commits this identity after the successful write (#939).
+      const targetUuid = workflowStableUuid(workflow, { commit: false });
       if (typeof targetUuid !== "string" || !targetUuid) {
         return { ok: false, ownerChanged: false };
       }
@@ -6910,6 +6913,7 @@ async function programmaticSave(name) {
   // await" guarantee the pre-probe would otherwise have widened into a wrong-tab window.
   const expectWf = svc?.activeWorkflow;
   const saveAsGeneration = ++saveAsCanvasGeneration;
+  const operationFence = () => saveAsCanvasGeneration === saveAsGeneration;
   const canvasFence = ({ workflow } = {}) =>
     saveAsCanvasGeneration === saveAsGeneration &&
     !!workflow &&
@@ -6965,6 +6969,7 @@ async function programmaticSave(name) {
       });
     },
     canvasFence,
+    operationFence,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
     // #771 — ComfyUI answers EVERY filesystem error on the userdata write with one
     // 400 that blames the FILENAME, and logs the real cause a line earlier. This
@@ -6973,6 +6978,17 @@ async function programmaticSave(name) {
     // runs only once the 400 shape is already recognised.
     readSaveFailureCause: (path) => readSaveFailureCause(path, api),
   });
+  // The repaint path only previews the destination identity because a failed copy must
+  // not leave a reusable path alias behind. Commit it after saveActiveWorkflow has
+  // completed its persistence/read-back proof; the produced record is the copy this save
+  // actually activated, never a later active-canvas observation (#939).
+  if (details.mode === "save-as-copy" && details.activatedRecord) {
+    try {
+      workflowStableUuid(details.activatedRecord, { embed: true });
+    } catch {
+      // Identity bookkeeping must not turn an already-persisted Save-As into a failure.
+    }
+  }
   const outcome = describeSaveOutcome(details);
   // #557 r3/r4/r5/r7/r8/r10 — thread the identity across the swap ONLY with
   // CONTINUITY PROVEN FROM THE SAVE'S OWN REPLACEMENT EVENT. The carry and its

@@ -3380,6 +3380,7 @@ test('#939: overlapping Save-As keeps a newer operation\'s active source copy in
   const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
   let generation = 1
   let overlapCopy = null
+  let successorCopy = null
   let newerEnteredResolve
   const newerEntered = new Promise((resolve) => {
     newerEnteredResolve = resolve
@@ -3391,23 +3392,34 @@ test('#939: overlapping Save-As keeps a newer operation\'s active source copy in
   let newerSave
   let restoreCalls = 0
 
-  const probe = async (path) => {
-    if (path === newerTargetPath) {
+  const originalSaveAs = svc.saveAs.bind(svc)
+  svc.saveAs = (workflow, path) => {
+    const created = originalSaveAs(workflow, path)
+    if (path === newerTargetPath) successorCopy = created
+    return created
+  }
+  const originalOpenWorkflow = svc.openWorkflow.bind(svc)
+  svc.openWorkflow = async (workflow) => {
+    const opened = await originalOpenWorkflow(workflow)
+    if (workflow === successorCopy) {
+      // The successor is already ACTIVE while the older operation is still waiting to
+      // report its repaint failure. The old cleanup must not purge its predecessor.
       newerEnteredResolve()
       await releaseNewer
     }
-    return existsOnDisk(path)
+    return opened
   }
 
   const olderSave = saveActiveWorkflow(svc, 'Stale-overlap', {
     existsOnDisk,
     canvasBinding: () => 'bound',
+    operationFence: () => generation === 1,
     canvasFence: ({ workflow }) => generation === 1 && svc.activeWorkflow === workflow,
     repaintCanvas: async (copy) => {
       overlapCopy = copy
       generation = 2 // The newer panel Save-As advances the shared generation.
       newerSave = saveActiveWorkflow(svc, 'Newer-overlap', {
-        existsOnDisk: probe,
+        existsOnDisk,
       })
       await newerEntered // Newer Save-As is in its awaited probe with the same copy active.
       return false
@@ -3420,9 +3432,9 @@ test('#939: overlapping Save-As keeps a newer operation\'s active source copy in
 
   await assert.rejects(
     () => olderSave,
-    /active copy is owned by a newer Save-As operation/,
+    /newer Save-As operation advanced before cleanup/,
   )
-  assert.equal(svc.activeWorkflow, overlapCopy, 'the newer operation still has its source copy active')
+  assert.equal(svc.activeWorkflow, successorCopy, 'the newer operation already has its successor copy active')
   assert.equal(svc.getWorkflowByPath(staleCopyPath), overlapCopy, 'the stale copy remains indexed')
   assert.ok(svc.openWorkflows.includes(overlapCopy), 'the newer operation\'s unsaved source tab remains open')
   assert.equal(restoreCalls, 0, 'stale cleanup did not restore over the newer operation')
