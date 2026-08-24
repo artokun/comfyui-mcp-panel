@@ -1229,27 +1229,40 @@ test("#572 integration: the scoped-run result SURFACES the drift-uncovered input
 test("#2130 integration: dispatchScopedRun accepts a queue-time Ideogram derived-widget rewrite", async () => {
   const stop = keepAlive();
   try {
-    const stampedOutput = {
-      ...OUR_OUTPUT,
-      "14": {
-        class_type: "Ideogram4PromptBuilderKJ",
-        inputs: { elements_data: "old regions", high_level_description: "same subject" },
-      },
-    };
-    const queuedOutput = {
-      ...OUR_OUTPUT,
-      "14": {
-        class_type: "Ideogram4PromptBuilderKJ",
-        inputs: { elements_data: "new regions", high_level_description: "same subject" },
-      },
-    };
     const server = makeServer();
     const apiTarget = { fetchApi: server };
-    const app = makeFrontend({ shape: "shim", apiTarget, output: stampedOutput });
-    app.graph = { _nodes: [ideogramBuilderNode(14)] };
+    const node = ideogramBuilderNode(14);
+    const elementsWidget = node.widgets.find((widget) => widget.name === "elements_data");
+    const oldRegions = JSON.stringify([{ x: 0, y: 0, w: 0.2, h: 0.2, type: "old" }]);
+    const newRegions = JSON.stringify([{ x: 0.1, y: 0.1, w: 0.3, h: 0.3, type: "new" }]);
+    let serializeCalls = 0;
+    elementsWidget.serializeValue = () => {
+      serializeCalls++;
+      return serializeCalls === 1 ? oldRegions : newRegions;
+    };
+    const graph = { _nodes: [node] };
+    const serializeGraph = () => {
+      const inputs = Object.fromEntries(
+        node.widgets.map((widget) => [
+          widget.name,
+          typeof widget.serializeValue === "function" ? widget.serializeValue() : widget.value,
+        ]),
+      );
+      return {
+        ...OUR_OUTPUT,
+        "14": { class_type: node.type, inputs },
+      };
+    };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.graph = graph;
+    // This mirrors the production boundary: dispatchScopedRun fingerprints the
+    // live graph through graphToPrompt(), then queuePrompt builds the actual
+    // /prompt body from a second graphToPrompt() serialization.
+    app.graphToPrompt = async () => ({ output: serializeGraph(), workflow: {} });
     app.queuePrompt = async (number, batch, arg) => {
       const targets = Array.isArray(arg) ? arg : arg?.queueNodeIds;
-      const body = frontendBody({ output: queuedOutput, number, targets: targets?.length ? targets : null });
+      const queued = await app.graphToPrompt();
+      const body = frontendBody({ output: queued.output, number, targets: targets?.length ? targets : null });
       app.posted.push(body);
       await apiTarget.fetchApi("/prompt", {
         method: "POST",
@@ -1259,10 +1272,14 @@ test("#2130 integration: dispatchScopedRun accepts a queue-time Ideogram derived
       return true;
     };
     const result = await dispatchScopedRun({ app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14 });
+    assert.equal(serializeCalls, 2, "the stamp and queue-time prompt each invoke elements_data.serializeValue");
     assert.equal(result.outcome, "dispatched", "the derived queue-time rewrite is not mistaken for graph drift");
     assert.equal(server.calls.length, 1, "the verified scoped prompt reaches ComfyUI once");
     assert.deepEqual(result.volatileInputs, ["14 elements_data"]);
-    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+    const sent = JSON.parse(server.calls[0].options.body);
+    assert.equal(sent.prompt["14"].inputs.elements_data, newRegions, "the second serializer result reached /prompt");
+    assert.equal(sent.prompt["14"].inputs.high_level_description, "same subject", "ordinary widget input is serialized too");
+    assert.deepEqual(sent.partial_execution_targets, ["14"]);
   } finally {
     stop();
   }
