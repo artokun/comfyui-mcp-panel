@@ -166,7 +166,7 @@ test("#1610: video storyboard starts while a stills HEAD is still in flight", as
     "the still rides the mixed frame",
   );
   assert.ok(
-    frame.images.some((m) => m.filename === "storyboard_clip.png"),
+    frame.images.some((m) => /^storyboard_clip_.+\.png$/.test(m.filename)),
     "the sheet rides the mixed frame once the HEAD is released",
   );
 });

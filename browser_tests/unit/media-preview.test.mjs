@@ -139,7 +139,23 @@ test("an oversized local video yields a preview AND says it is a sample, not the
   // The source size, in the note, in human units.
   assert.match(reply.note, /72\.1 MB/);
   // A next step that actually shows the agent the sheet.
-  assert.match(reply.note, /call get_image with filename "storyboard_reference_clip\.png", type "temp"/);
+  assert.match(reply.note, /call get_image with filename "storyboard_reference_clip_[^"]+\.png", type "temp"/);
+});
+
+test("#1718: repeated panel_show_media renders use fresh source and storyboard identities", async () => {
+  const first = harness();
+  const second = harness();
+  await composeShowMediaReply([VIDEO_REF], first.deps);
+  await composeShowMediaReply([VIDEO_REF], second.deps);
+
+  assert.match(first.calls.storyboardsFor[0], /[?&]cmcp_storyboard=/);
+  assert.match(second.calls.storyboardsFor[0], /[?&]cmcp_storyboard=/);
+  assert.notEqual(first.calls.storyboardsFor[0], second.calls.storyboardsFor[0]);
+  assert.equal(first.calls.paintedVideos[0].url, first.calls.storyboardsFor[0], "the player and sampler use the fresh source URL");
+  assert.equal(second.calls.paintedVideos[0].url, second.calls.storyboardsFor[0], "the player and sampler use the fresh source URL");
+  assert.match(first.calls.uploads[0].name, /^storyboard_reference_clip_.+\.png$/);
+  assert.match(second.calls.uploads[0].name, /^storyboard_reference_clip_.+\.png$/);
+  assert.notEqual(first.calls.uploads[0].name, second.calls.uploads[0].name);
 });
 
 test("the batch headline states the agent was not sent the files at all", async () => {
@@ -890,7 +906,7 @@ test("a sheet painter that THROWS is disclosed and still leaves the agent its co
   const reply = await composeShowMediaReply([VIDEO_REF], h.deps);
   assert.equal(reply.previews.length, 1);
   assert.match(reply.note, /could not be shown\s+in the chat/);
-  assert.match(reply.note, /call get_image with filename "storyboard_reference_clip\.png"/);
+  assert.match(reply.note, /call get_image with filename "storyboard_reference_clip_[^"]+\.png"/);
 });
 
 test("a sheet that IS painted carries no visibility caveat", async () => {

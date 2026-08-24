@@ -16,9 +16,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import {
+  appendStoryboardCacheBust,
+  createStoryboardIdentity,
+} from "../../web/js/lib/storyboard-cache-identity.js";
 
-const panelSrc = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-const frameSrc = readFileSync(new URL("../../web/js/lib/run-completion-frame.js", import.meta.url), "utf8");
+const panelSrc = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const frameSrc = readFileSync(new URL("../../web/js/lib/run-completion-frame.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
 function slice(src, from, to) {
   const a = src.indexOf(from);
@@ -106,10 +110,89 @@ test("poster: the upload is best-effort and threaded as a dependency", () => {
     /if \(blob\.posterBlob && typeof applyVideoPoster === "function"\)/,
     "absent poster or absent dep must both degrade silently",
   );
-  assert.match(frameSrc, /poster_\$\{base\}\.png/, "the poster is uploaded beside the sheet");
+  assert.match(
+    frameSrc,
+    /storyboardPosterUploadName\(base, storyboardIdentity\)/,
+    "the poster uses the same per-attempt identity as the sheet",
+  );
   assert.match(frameSrc, /\{ type: "temp" \}/, "into the swept temp namespace, never input/");
+  assert.match(frameSrc, /applyVideoPoster\(sourceUrl, imageViewUrl\(posterRef\)\)/, "the late poster targets the painted card's URL");
   // Both composers paint video cards through the same painter, so both must
   // supply the back-fill or one surface silently keeps the old behaviour.
   const deps = panelSrc.split("applyVideoPoster,").length - 1;
   assert.ok(deps >= 2, `applyVideoPoster must be passed to both composers (found ${deps})`);
+});
+
+test("#1718 production boundary: late poster results stay with their render attempt", () => {
+  // Drive the SHIPPED onExecuted branch, not the cache-name helper. Before the
+  // fix both executions handed paintVideo the same stable /view URL, so the
+  // holder registry treated two cards as one and a late first poster broadcast
+  // into the second card.
+  const onExecutedStart = panelSrc.indexOf("  function onExecuted(ev) {");
+  const onExecutedEnd = panelSrc.indexOf("\n  function onExecError(ev)", onExecutedStart);
+  assert.ok(onExecutedStart >= 0 && onExecutedEnd > onExecutedStart, "could not isolate production onExecuted");
+  const onExecuted = new Function(
+    "imageViewUrl",
+    "isVideoOutput",
+    "isAudioOutput",
+    "paintVideo",
+    "paintAudio",
+    "paintImage",
+    "runCompletion",
+    "stripMisattachedExecutionPreviews",
+    "app",
+    "createStoryboardIdentity",
+    "appendStoryboardCacheBust",
+    `return (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()});`,
+  )(
+    (m) => `/view?filename=${m.filename}&type=${m.type || "output"}`,
+    () => true,
+    () => false,
+    (url) => painted.push(url),
+    () => {},
+    () => {},
+    { onExecuted: (_promptId, output) => buffered.push(output) },
+    () => {},
+    {},
+    createStoryboardIdentity,
+    appendStoryboardCacheBust,
+  );
+
+  const painted = [];
+  const buffered = [];
+  const video = { filename: "Minimax_00001.mp4", type: "temp" };
+  onExecuted({ detail: { prompt_id: "first", output: { videos: [video] } } });
+  onExecuted({ detail: { prompt_id: "second", output: { videos: [video] } } });
+  assert.equal(painted.length, 2);
+  assert.notEqual(painted[0], painted[1], "each onExecuted card must receive a distinct URL");
+  assert.match(painted[0], /[?&]cmcp_storyboard=/);
+  assert.match(painted[1], /[?&]cmcp_storyboard=/);
+  assert.equal(buffered[0].videos[0].videoUrl, painted[0]);
+  assert.equal(buffered[1].videos[0].videoUrl, painted[1]);
+
+  // Execute the production holder registry against those exact URLs. A late
+  // poster for the first completion must not reach the second holder.
+  const registryStart = panelSrc.indexOf("  const _videoPosters = new Map();");
+  const registerEnd = panelSrc.indexOf("  /** Put a known poster on one holder", registryStart);
+  const applyVideoStart = panelSrc.indexOf("  function applyVideoPoster", registerEnd);
+  const applyVideoEnd = panelSrc.indexOf("  function unmountHolderVideo", applyVideoStart);
+  assert.ok(
+    registryStart >= 0 && registerEnd > registryStart && applyVideoStart > registerEnd && applyVideoEnd > applyVideoStart,
+    "could not isolate production poster registry",
+  );
+  const applied = [];
+  const { registerVideoHolder, applyVideoPoster } = new Function(
+    "applyPosterToHolder",
+    `${panelSrc.slice(registryStart, registerEnd)}\n${panelSrc.slice(applyVideoStart, applyVideoEnd)}\nreturn { registerVideoHolder, applyVideoPoster };`,
+  )((holder, poster) => applied.push({ holder, poster }));
+  const firstHolder = { isConnected: true };
+  const secondHolder = { isConnected: true };
+  registerVideoHolder(painted[0], firstHolder);
+  registerVideoHolder(painted[1], secondHolder);
+  applyVideoPoster(painted[1], "poster-second.png");
+  applyVideoPoster(painted[0], "poster-first.png");
+  assert.deepEqual(applied, [
+    { holder: secondHolder, poster: "poster-second.png" },
+    { holder: firstHolder, poster: "poster-first.png" },
+  ]);
 });
