@@ -122,22 +122,26 @@ async function waitForRun(
   allowEarlyResult = false,
 ) {
   const run = runHandle.promise;
-  const earlyResult = allowEarlyResult ? runHandle.result : null;
+  // Use the run's own early result, not the completion-chain result. The latter is a
+  // one-shot promise that can resolve to this run before a reconnect attaches its forced
+  // successor; the synchronous successor check below then keeps that stale observation
+  // fail-closed.
+  const earlyResult = allowEarlyResult ? (runHandle.earlyResult ?? runHandle.result) : null;
   if (ms === null) return earlyResult ? Promise.race([run, earlyResult]) : run;
   // An abandoned wait is not a reason to turn the run's failure into an unhandled rejection.
   run.catch(() => {});
   earlyResult?.catch(() => {});
   if (!(ms > 0)) return REFRESH_JOIN_ABANDONED;
   const runOutcome = Promise.resolve(run).then(
-    (value) => ({ value }),
-    (err) => ({ err }),
+    (value) => ({ value, source: "run" }),
+    (err) => ({ err, source: "run" }),
   );
   const observedOutcome = earlyResult
     ? Promise.race([
         runOutcome,
         Promise.resolve(earlyResult).then(
-          (value) => ({ value }),
-          (err) => ({ err }),
+          (value) => ({ value, source: "early" }),
+          (err) => ({ err, source: "early" }),
         ),
       ])
     : runOutcome;
@@ -154,6 +158,12 @@ async function waitForRun(
   if (settled === null) return REFRESH_JOIN_ABANDONED;
   if (settled?.beforeLocalWork === true) return REFRESH_JOIN_ABANDONED;
   if ("err" in settled) throw settled.err;
+  // A forced reconnect successor may have been attached after the early promise resolved
+  // but before this bounded caller resumed. The old verdict is no longer authoritative;
+  // return the existing retryable status rather than reporting schema-ready over a queued
+  // post-reconnect run. If the successor settled first, `runOutcome` above already wins and
+  // forwards its result.
+  if (settled.source === "early" && runHandle.hasSuccessor?.()) return REFRESH_JOIN_ABANDONED;
   return settled.value;
 }
 
@@ -266,6 +276,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       yieldBeforeLocalWork = true;
       nextCompletion?.requestEarlyYield?.();
     };
+    const hasSuccessor = () => nextCompletion !== null;
     const attachNextCompletion = (next) => {
       nextCompletion = next;
       if (yieldBeforeLocalWork) next?.requestEarlyYield?.();
@@ -288,16 +299,27 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     // preserves the caller-visible rejection semantics for ordinary/coalesced paths.
     completion.catch(() => {});
     observedCompletion.catch(() => {});
-    const handle = { promise: p, result: earlyResult, beforeLocalWork, requestEarlyYield };
+    const handle = {
+      promise: p,
+      result: earlyResult,
+      earlyResult,
+      beforeLocalWork,
+      requestEarlyYield,
+      hasSuccessor,
+    };
     handle.completion = {
       promise: completion,
       result: observedCompletion,
+      earlyResult,
       requestEarlyYield,
+      hasSuccessor,
     };
     handle.attachNextCompletion = attachNextCompletion;
     p.beforeLocalWork = beforeLocalWork;
     p.requestEarlyYield = requestEarlyYield;
     p.result = earlyResult;
+    p.earlyResult = earlyResult;
+    p.hasSuccessor = hasSuccessor;
     p.completion = handle.completion;
     p.attachNextCompletion = attachNextCompletion;
     setInFlight(p);
@@ -407,6 +429,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       }
       if (!trailing) {
         let earlyYieldRequested = abandonBeforeLocalWork;
+        let queuedHandle = null;
         const queued = (async () => {
           try {
             await current;
@@ -414,7 +437,8 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
             /* the in-flight refresh failed — run our own anyway */
           }
           trailing = null;
-          return startRun(undefined, runOpts, earlyYieldRequested);
+          queuedHandle = startRun(undefined, runOpts, earlyYieldRequested);
+          return queuedHandle;
         })();
         trailing = {
           // Follow the successor's own completion chain. A forced refresh can queue another
@@ -422,6 +446,8 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
           // acknowledgement report success while that later run is still in flight.
           promise: queued.then((handle) => handle.completion?.promise ?? handle.promise),
           result: queued.then((handle) => handle.completion?.result ?? handle.result),
+          earlyResult: queued.then((handle) => handle.completion?.earlyResult ?? handle.result),
+          hasSuccessor: () => queuedHandle?.hasSuccessor?.() === true,
           beforeLocalWork: queued.then((handle) => handle.beforeLocalWork),
           requestEarlyYield: () => {
             earlyYieldRequested = true;

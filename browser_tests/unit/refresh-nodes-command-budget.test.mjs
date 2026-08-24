@@ -748,6 +748,51 @@ test("#1725: refresh_nodes returns the completed schema verdict while late combo
   assert.equal(built.runs.length, 2, "a retry after settlement starts one fresh forced refresh");
 });
 
+test("#1725: an early verdict cannot outrun a reconnect successor queued in the next turn", async () => {
+  const lateCompletion = deferred();
+  const terminal = {
+    refreshed: true,
+    reason: "refreshed",
+    combo_refresh_confirmed: false,
+    combo_refresh_note: "the frontend combo refresh is still settling",
+  };
+  let built;
+  let successorQueued = false;
+  let successorRefresh;
+  built = realRefreshNodes({
+    budgetMs: 25,
+    runHook: async ({ index, control }) => {
+      if (index > 0) return { refreshed: true, reason: "refreshed" };
+      control.publishEarlyResult?.(terminal);
+      // Model the ComfyUI reconnected listener arriving after publication but before the
+      // acknowledgement continuation composes its reply. The late combo mutation still
+      // owns the slot, so this force call queues a successor rather than starting run 2.
+      queueMicrotask(() => {
+        successorQueued = true;
+        successorRefresh = built.refreshComfyNodeDefs(undefined, { force: true });
+      });
+      control.deferCompletion(lateCompletion.promise);
+      return terminal;
+    },
+  });
+
+  const first = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes returned before the reconnect successor race settled",
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(successorQueued, true, "the reconnect successor was queued after publication");
+  assert.equal(built.runs.length, 1, "the successor remains behind the fenced late mutation");
+  assert.notEqual(built.getInFlight(), null, "the original late mutation still owns the slot");
+  assert.equal(first.value.reason, "refresh_still_running");
+  assert.equal(first.value.refreshed, false, "MCP must not receive an early schema-ready verdict");
+
+  lateCompletion.resolve();
+  await successorRefresh;
+  assert.equal(built.runs.length, 2, "the queued successor starts only after the fence releases");
+});
+
 test("#1680: with no refresh in flight, refresh_nodes starts its own forced run", async () => {
   const built = realRefreshNodes({ startInFlight: false, budgetMs: 500 });
   const { value } = await withWatchdog(
