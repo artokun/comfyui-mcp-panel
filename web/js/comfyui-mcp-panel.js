@@ -4339,6 +4339,12 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false, commit = 
 
   setWorkflowObjectUuid(identityObject, id);
   rememberWorkflowUuidOwner(id, identityObject);
+  // A Save-As preview is intentionally not a publication. The transaction records the
+  // destination UUID anyway so a later poll/recording write to the shared root can be
+  // recognized and repaired if persistence fails.
+  if (typeof noteSaveAsIdentityPreview === "function") {
+    noteSaveAsIdentityPreview(identityObject, path, id);
+  }
   const aliasMutations = [];
   if (commit && objectUuid && path) {
     // The same live workflow object moved to a new path (rename/Save-As). Keep
@@ -4357,7 +4363,12 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false, commit = 
   }
   if (aliasMutations.length) {
     persistWorkflowAliases();
-    for (const [aliasPath, value] of aliasMutations) workflowAliasMutationSink?.(aliasPath, value);
+    for (const [aliasPath, value] of aliasMutations) {
+      if (typeof noteSaveAsIdentityAliasPublication === "function") {
+        noteSaveAsIdentityAliasPublication(aliasPath, value);
+      }
+      workflowAliasMutationSink?.(aliasPath, value);
+    }
   }
   if (embed && commit) {
     try {
@@ -4365,6 +4376,9 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false, commit = 
       const previous = extra?.[WORKFLOW_META_NAMESPACE];
       const pathChanged = path && normalizedWorkflowPath(previous?.[WORKFLOW_PATH_FIELD]) !== normalizedWorkflowPath(path);
       if (extra && (previous?.[WORKFLOW_UUID_FIELD] !== id || pathChanged)) {
+        if (typeof noteSaveAsIdentityMetadataPublication === "function") {
+          noteSaveAsIdentityMetadataPublication(wf, path, id);
+        }
         // Transcript metadata silently rides the next save the user initiates.
         // It must never create a dirty asterisk or an undo/graph-change entry.
         extra[WORKFLOW_META_NAMESPACE] = {
@@ -6692,6 +6706,71 @@ function carryIdentityAcrossSaveSwap({ svc, preWf, preSwapUuid, savedAs = false,
 // workflow check below is the tab fence; this monotonic generation is the operation
 // fence for overlapping/re-mounted panel work.
 let saveAsCanvasGeneration = 0;
+let saveAsIdentityHistoryController = null;
+// Save-As identity publication is deliberately tracked separately from the canvas
+// repaint fence. The destination record becomes active before `saveWorkflow(copy)`
+// persists it, so the 600ms workflow poll (and workflow-scoped recording) can publish
+// a durable alias/metadata entry during that window. Every live transaction is kept here
+// so an older operation can observe its own destination even after a newer operation has
+// started; rollback still requires that its generation is current.
+const saveAsIdentityPublications = new Set();
+
+function noteSaveAsIdentityPreview(workflow, path, uuid) {
+  if (typeof path !== "string" || !path || typeof uuid !== "string" || !uuid) return;
+  for (const publication of saveAsIdentityPublications) {
+    if (normalizedWorkflowPath(publication.targetPath) !== normalizedWorkflowPath(path)) continue;
+    publication.previewUuids.add(uuid);
+    publication.previewWorkflows.add(workflow);
+  }
+}
+
+function noteSaveAsIdentityAliasPublication(path, value) {
+  if (typeof path !== "string" || !path) return;
+  for (const publication of saveAsIdentityPublications) {
+    if (normalizedWorkflowPath(publication.targetPath) !== normalizedWorkflowPath(path)) continue;
+    publication.aliasPublications.add(value ?? null);
+  }
+}
+
+function noteSaveAsIdentityMetadataPublication(workflow, path, uuid) {
+  if (typeof path !== "string" || !path || typeof uuid !== "string" || !uuid) return;
+  for (const publication of saveAsIdentityPublications) {
+    if (normalizedWorkflowPath(publication.targetPath) !== normalizedWorkflowPath(path)) continue;
+    publication.previewUuids.add(uuid);
+    publication.previewWorkflows.add(workflow);
+    if (!publication.metadataSnapshots.has(workflow)) {
+      try {
+        const extra = workflowOwnedExtra(workflow);
+        const metadata = extra?.[WORKFLOW_META_NAMESPACE];
+        publication.metadataSnapshots.set(workflow, {
+          extra,
+          hadMetadata: Object.hasOwn(extra || {}, WORKFLOW_META_NAMESPACE),
+          metadata: cloneSaveAsIdentityMetadata(metadata),
+        });
+      } catch {
+        // The live object may disappear during a concurrent workflow switch.
+      }
+    }
+  }
+}
+
+function cloneSaveAsIdentityMetadata(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value ?? null;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return null;
+  }
+}
+
+function identityMetadataMatchesSaveAs(publication, metadata) {
+  const path = metadata?.[WORKFLOW_PATH_FIELD];
+  const uuid = metadata?.[WORKFLOW_UUID_FIELD];
+  return (
+    normalizedWorkflowPath(path) === normalizedWorkflowPath(publication.targetPath) ||
+    (typeof uuid === "string" && publication.previewUuids.has(uuid))
+  );
+}
 // A tab can switch while each reconciliation load is suspended. Keep recovery
 // finite: an unstable canvas must refuse the Save-As rather than chase an
 // unbounded stream of active tabs or eventually report success for an unknown
@@ -6918,6 +6997,82 @@ async function programmaticSave(name) {
     saveAsCanvasGeneration === saveAsGeneration &&
     !!workflow &&
     sameWorkflowObject(activeWorkflowRef(), workflow);
+  const beginIdentityPublication = ({ targetPath, workflow } = {}) => {
+    if (typeof targetPath !== "string" || !targetPath) return null;
+    const rootExtra = app?.graph?.extra;
+    const rootMetadata = rootExtra?.[WORKFLOW_META_NAMESPACE];
+    const publication = {
+      generation: saveAsGeneration,
+      targetPath,
+      originalAlias: {
+        present: Object.hasOwn(_workflowUuidAliases, targetPath),
+        value: _workflowUuidAliases[targetPath],
+      },
+      originalHistoryAlias: {
+        ...(saveAsIdentityHistoryController?.snapshot?.(targetPath) || { present: false, value: undefined }),
+      },
+      originalRootMetadata: {
+        extra: rootExtra,
+        hadMetadata: Object.hasOwn(rootExtra || {}, WORKFLOW_META_NAMESPACE),
+        metadata: cloneSaveAsIdentityMetadata(rootMetadata),
+      },
+      previewUuids: new Set(),
+      previewWorkflows: new Set(workflow ? [workflow] : []),
+      aliasPublications: new Set(),
+      metadataSnapshots: new Map(),
+    };
+    saveAsIdentityPublications.add(publication);
+    return publication;
+  };
+  const commitIdentityPublication = (publication) => {
+    saveAsIdentityPublications.delete(publication);
+  };
+  const rollbackIdentityPublication = (publication) => {
+    saveAsIdentityPublications.delete(publication);
+    // A later Save-As owns the identity state now. Never restore an older snapshot over it.
+    if (!publication || saveAsCanvasGeneration !== publication.generation) return;
+
+    const currentAlias = Object.hasOwn(_workflowUuidAliases, publication.targetPath)
+      ? _workflowUuidAliases[publication.targetPath]
+      : null;
+    if (publication.aliasPublications.has(currentAlias)) {
+      if (publication.originalAlias.present) _workflowUuidAliases[publication.targetPath] = publication.originalAlias.value;
+      else delete _workflowUuidAliases[publication.targetPath];
+      persistWorkflowAliases();
+    }
+
+    saveAsIdentityHistoryController?.rollback?.(publication);
+
+    for (const [workflow, snapshot] of publication.metadataSnapshots) {
+      try {
+        const extra = snapshot.extra;
+        const current = extra?.[WORKFLOW_META_NAMESPACE];
+        if (!extra || !identityMetadataMatchesSaveAs(publication, current)) continue;
+        if (snapshot.hadMetadata) extra[WORKFLOW_META_NAMESPACE] = snapshot.metadata;
+        else delete extra[WORKFLOW_META_NAMESPACE];
+      } catch {
+        // A proxy or a torn-down workflow must not mask the failed Save-As.
+      }
+    }
+
+    // repaintSaveAsCanvas writes destination metadata directly into the shared root before
+    // persistence. Restore it only while it still proves to be this failed destination;
+    // a newer canvas/operation is left untouched.
+    try {
+      const currentExtra = app?.graph?.extra;
+      const current = app?.graph?.extra?.[WORKFLOW_META_NAMESPACE];
+      if (currentExtra && identityMetadataMatchesSaveAs(publication, current)) {
+        if (publication.originalRootMetadata.hadMetadata) {
+          currentExtra[WORKFLOW_META_NAMESPACE] =
+            publication.originalRootMetadata.metadata;
+        } else {
+          delete currentExtra[WORKFLOW_META_NAMESPACE];
+        }
+      }
+    } catch {
+      // Bounded cleanup/neutralization remains the final safety net.
+    }
+  };
   // #557 r3 — capture the pre-save identity NOW so a save's object SWAP can be
   // threaded through the replacement event: the predecessor/successor pair is
   // only known for certain here. Static path equality cannot decide it — a
@@ -6970,6 +7125,9 @@ async function programmaticSave(name) {
     },
     canvasFence,
     operationFence,
+    beginIdentityPublication,
+    commitIdentityPublication,
+    rollbackIdentityPublication,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
     // #771 — ComfyUI answers EVERY filesystem error on the userdata write with one
     // 400 that blames the FILENAME, and logs the real cause a line earlier. This
@@ -31592,6 +31750,27 @@ function buildPanel() {
     persistThreads({ syncAliases: false });
   };
   workflowAliasMutationSink = panelAliasMutationSink;
+  const panelIdentityHistoryController = {
+    snapshot: (path) => ({
+      present: Object.hasOwn(historyMeta?.workflowAliases || {}, path),
+      value: historyMeta?.workflowAliases?.[path],
+    }),
+    rollback: (publication) => {
+      const current = Object.hasOwn(historyMeta?.workflowAliases || {}, publication.targetPath)
+        ? historyMeta.workflowAliases[publication.targetPath]
+        : null;
+      if (!publication.aliasPublications.has(current)) return;
+      historyMeta = updateMetadataEntry(
+        historyMeta,
+        "workflowAliases",
+        publication.targetPath,
+        publication.originalHistoryAlias.present ? publication.originalHistoryAlias.value : null,
+        nextHistoryRevision(),
+      );
+      persistThreads({ syncAliases: false });
+    },
+  };
+  saveAsIdentityHistoryController = panelIdentityHistoryController;
 
   function detachInvalidCurrentThread({ scopeKey = null, rebind = false } = {}) {
     thread = null;
@@ -41238,6 +41417,7 @@ function buildPanel() {
       unsubscribeHistorySync();
       void historyStore.flush().finally(() => historyStore.close());
       if (workflowAliasMutationSink === panelAliasMutationSink) workflowAliasMutationSink = null;
+      if (saveAsIdentityHistoryController === panelIdentityHistoryController) saveAsIdentityHistoryController = null;
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_success", onExecutionSuccess);

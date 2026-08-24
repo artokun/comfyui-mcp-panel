@@ -335,6 +335,87 @@ test('a failed Save-As does not publish the destination identity alias before pe
   }
 })
 
+test('a poll publication during the pre-persist window is rolled back on Save-As failure', async ({
+  page,
+  panel,
+  mockBridge
+}) => {
+  test.setTimeout(120_000)
+  const cleanup: string[] = []
+  let copyPath: string | null = null
+  try {
+    await panel.goto()
+    await panel.setBridgeUrl(mockBridge.url)
+    await panel.openSidebar()
+    await panel.connect()
+
+    const first = await mockBridge.command('workflow_save', {})
+    expect(first.ok, 'the setup save must succeed').toBe(true)
+    const original = String(first.result?.workflow || '')
+    expect(original).toBeTruthy()
+    cleanup.push(original)
+
+    const copyName = `e2e-939-poll-publication-${Date.now()}`
+    copyPath = `workflows/${copyName}.json`
+
+    // Hold the actual persistence call after the copy is active. The normal 600ms workflow
+    // poll must get a chance to publish the destination alias/history while this copy is
+    // still unpersisted, then the write fails. This is the race the earlier commit:false
+    // repaint guard did not cover.
+    await page.evaluate((targetPath) => {
+      const w = window as any
+      const svc = w.comfyAPI?.app?.app?.extensionManager?.workflow
+      if (typeof svc?.saveWorkflow !== 'function') throw new Error('workflow save service unavailable')
+      const gate: any = { entered: false, release: null }
+      const originalSave = svc.saveWorkflow.bind(svc)
+      svc.saveWorkflow = async (workflow: any) => {
+        if (workflow?.path === targetPath && !gate.entered) {
+          gate.entered = true
+          await new Promise<void>((resolve) => { gate.release = resolve })
+          throw new Error('forced pre-persist Save-As failure')
+        }
+        return originalSave(workflow)
+      }
+      w.__cmcp939PrePersistGate = gate
+    }, copyPath!)
+
+    const saving = mockBridge.command('workflow_save', { name: copyName })
+    await page.waitForFunction(() => Boolean((window as any).__cmcp939PrePersistGate?.entered))
+
+    await expect.poll(async () => page.evaluate((path) => {
+      const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+      return aliases[path] || null
+    }, copyPath!), { timeout: 5_000 }).not.toBeNull()
+
+    await page.evaluate(() => {
+      const gate = (window as any).__cmcp939PrePersistGate
+      if (typeof gate?.release !== 'function') throw new Error('pre-persist gate was not releasable')
+      gate.release()
+    })
+    const failed = await saving
+    expect(failed.ok, 'the forced persistence failure must refuse the Save-As').toBe(false)
+
+    const identity = await page.evaluate((path) => {
+      const aliases = JSON.parse(localStorage.getItem('comfyui-mcp.panel.workflowUuidAliases') || '{}')
+      const history = JSON.parse(localStorage.getItem('comfyui-mcp.panel.historyMeta') || '{}')
+      return {
+        alias: aliases[path] || null,
+        historyAlias: history?.workflowAliases?.[path] || null
+      }
+    }, copyPath!)
+    expect(identity.alias, 'rollback must remove the poll-published destination alias').toBeNull()
+    expect(identity.historyAlias, 'rollback must remove the history alias too').toBeNull()
+  } finally {
+    for (const name of cleanup.reverse()) {
+      try {
+        await deleteSavedWorkflow(page, name)
+      } catch {
+        // Best-effort cleanup must never mask the race assertion.
+      }
+    }
+  }
+})
+
 test('a second tab switch during reconciliation is re-read and remains bounded', async ({
   page,
   panel,

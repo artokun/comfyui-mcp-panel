@@ -569,6 +569,11 @@ export async function saveActiveWorkflow(
     // a stale-operation refusal, never permission to restore a predecessor.
     canvasFence,
     operationFence,
+    // Save-As identity publication is deferred until the copy has persisted. These hooks
+    // snapshot/rollback durable alias state around the unpersisted active-copy window.
+    beginIdentityPublication,
+    commitIdentityPublication,
+    rollbackIdentityPublication,
   } = {},
 ) {
   const wf = svc?.activeWorkflow;
@@ -754,6 +759,47 @@ export async function saveActiveWorkflow(
 
   const relocates = finalTargetPath !== currentPath;
 
+  // A persisted Save-As is the only route whose destination can become the active workflow
+  // before its first durable write. The panel uses this transaction to fence alias/history
+  // publication from the poll and workflow-mode recorder. First-save successors retain
+  // their existing identity carry semantics and do not enter this hook.
+  const beginSaveAsIdentity = () => {
+    if (typeof beginIdentityPublication !== "function") return null;
+    try {
+      return beginIdentityPublication({
+        mode: "save-as-copy",
+        targetPath: finalTargetPath,
+        workflow: wf,
+      });
+    } catch {
+      return null;
+    }
+  };
+  const commitSaveAsIdentity = async (publication) => {
+    if (publication == null || typeof commitIdentityPublication !== "function") return;
+    try {
+      await commitIdentityPublication(publication, {
+        mode: "save-as-copy",
+        targetPath: finalTargetPath,
+        workflow: wf,
+      });
+    } catch {
+      // Identity bookkeeping must not turn a completed file write into a save failure.
+    }
+  };
+  const rollbackSaveAsIdentity = async (publication) => {
+    if (publication == null || typeof rollbackIdentityPublication !== "function") return;
+    try {
+      await rollbackIdentityPublication(publication, {
+        mode: "save-as-copy",
+        targetPath: finalTargetPath,
+        workflow: wf,
+      });
+    } catch {
+      // The save failure remains authoritative; rollback is bounded best effort.
+    }
+  };
+
   if (relocates) {
     // The invariant (issue #226): a relocating save must NEVER remove a file that
     // exists on disk. Classify the source by its ACTUAL persisted state as a
@@ -817,9 +863,17 @@ export async function saveActiveWorkflow(
         copiedFrom: currentName,
         sourceExternal: true, // absolute external path — not /userdata-verifiable
       });
-      return await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
-        copyToUserDir(wf, effectiveName, finalTargetPath),
-      );
+      const identityPublication = beginSaveAsIdentity();
+      try {
+        const result = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
+          copyToUserDir(wf, effectiveName, finalTargetPath),
+        );
+        await commitSaveAsIdentity(identityPublication);
+        return result;
+      } catch (err) {
+        await rollbackSaveAsIdentity(identityPublication);
+        throw err;
+      }
     }
 
     const cls = await classifySource(svc, wf, sourcePath, existsOnDisk);
@@ -924,17 +978,26 @@ export async function saveActiveWorkflow(
         targetPath: finalTargetPath,
         copiedFrom: cls === "never-persisted" ? undefined : currentName,
       });
+      const identityPublication = cls === "never-persisted" ? null : beginSaveAsIdentity();
       // Capture POSITIVE pre-copy DISK evidence of the source, so the post-copy
       // backstop can only fire on a CONFIRMED 200 → 404 (a genuine move). An in-memory
       // getWorkflowByPath()==null is NOT proof of on-disk loss (it can be transiently
       // stale after the copy activates), so the old in-memory backstop could throw
       // "save moved the original" on a file that is still on disk. Gate on disk only.
       const sourceNorm = normalizePath(sourcePath);
-      const sourceOnDiskBefore = await probeSourceOnDisk(existsOnDisk, sourceNorm);
-      assertExpect(); // #330: the extra pre-copy probe must not open a switch window
-      const activeName = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
-        atomicCopy(wf, effectiveName, finalTargetPath),
-      );
+      let sourceOnDiskBefore;
+      let activeName;
+      try {
+        sourceOnDiskBefore = await probeSourceOnDisk(existsOnDisk, sourceNorm);
+        assertExpect(); // #330: the extra pre-copy probe must not open a switch window
+        activeName = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
+          atomicCopy(wf, effectiveName, finalTargetPath),
+        );
+        await commitSaveAsIdentity(identityPublication);
+      } catch (err) {
+        await rollbackSaveAsIdentity(identityPublication);
+        throw err;
+      }
       // BACKSTOP: fail LOUDLY only if the copy actually REMOVED a source we CONFIRMED
       // (disk 200) was present and is now CONFIRMED absent (disk 404) — classifyOriginalOnDisk
       // "lost". Every indeterminate case (no oracle / unknown pre or post / in-memory-only
