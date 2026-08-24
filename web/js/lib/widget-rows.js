@@ -34,6 +34,7 @@
 // Extracted so the derivation is unit-tested against the SAME code summarizeNode runs.
 
 import { displayLabel } from "./slot-labels.js";
+import { redactWidgetValue } from "./widget-secret-redaction.js";
 
 /**
  * Map of widget NAME → every widget carrying that name, for names carried by MORE THAN
@@ -49,7 +50,8 @@ import { displayLabel } from "./slot-labels.js";
  *     of one name routinely carry DIFFERENT labels — the rgthree toggle rows are named
  *     alike and labelled per group — and the name-keyed `widget_labels` map can hold
  *     only one of them.
- *   * `value` — this occurrence's own value, unwrapped exactly as stored.
+ *   * `value` — this occurrence's own agent-facing value; credential-shaped values are
+ *     redacted, while ordinary values remain as stored.
  *
  * Occurrences are in canvas order, so the LAST entry for a name is the one the
  * name-keyed `widgets` map ended up holding; the earlier ones are what it dropped.
@@ -82,7 +84,7 @@ export function duplicateWidgetRows(node) {
     out.get(widget.name).push({
       index,
       ...(label != null ? { label } : {}),
-      value: widget.value,
+      value: redactWidgetValue(widget.name, widget.value),
     });
   }
   return Object.fromEntries(out);

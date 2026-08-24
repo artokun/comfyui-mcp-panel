@@ -26,6 +26,7 @@ import { duplicateWidgetRows } from "../../web/js/lib/widget-rows.js";
 import { virtualFedInputs } from "../../web/js/lib/virtual-source-promotion.js";
 import { controlAfterGenerateModes } from "../../web/js/lib/control-after-generate.js";
 import { drivenWidgetsFor } from "../../web/js/lib/graph-read.js";
+import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const TOGGLE = "RGTHREE_TOGGLE_AND_NAV";
@@ -56,6 +57,7 @@ const summarizeNode = (() => {
     "duplicateWidgetRows",
     "controlAfterGenerateModes",
     "drivenWidgetsFor",
+    "redactWidgetValue",
     `${fn}; return summarizeNode;`,
   )(
     virtualFedInputs,
@@ -65,6 +67,7 @@ const summarizeNode = (() => {
     duplicateWidgetRows,
     controlAfterGenerateModes,
     drivenWidgetsFor,
+    redactWidgetValue,
   );
 })();
 
@@ -155,4 +158,70 @@ test("#1402 a widget named __proto__ is reported, not thrown on", () => {
     assert.deepEqual(JSON.parse(JSON.stringify(summary.duplicate_widgets))[name].map((r) => r.value), [1, 2]);
   }
   assert.equal({}.polluted, undefined, "nothing leaked onto Object.prototype");
+});
+
+test("#1729 summarizeNode redacts a bypassed API-key widget while preserving graph shape", () => {
+  const secret = "sk-proj-should-never-reach-the-agent-1234567890";
+  const summary = summarizeNode({
+    id: 1729,
+    type: "GPT Image",
+    title: "GPT Image",
+    mode: 4,
+    widgets: [
+      { name: "api_key", value: secret },
+      { name: "prompt", value: "visible prompt" },
+    ],
+    inputs: [{ name: "image", type: "IMAGE", link: null }],
+    outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+  });
+
+  assert.equal(summary.mode, "bypass", "bypass remains visible");
+  assert.equal(summary.widgets.api_key, REDACTED_WIDGET_VALUE);
+  assert.equal(summary.widgets.prompt, "visible prompt", "ordinary visible values remain intact");
+  assert.deepEqual(summary.inputs, [{ slot: 0, name: "image", type: "IMAGE", connected_from: null }]);
+  assert.deepEqual(summary.outputs, [{ slot: 0, name: "IMAGE", type: "IMAGE", links: 0 }]);
+  assert.ok(!JSON.stringify(summary).includes(secret), "the credential is absent from the serialized read");
+});
+
+test("#1729 production structured summary and duplicate rows redact nested credentials", () => {
+  const first = "first-api-key";
+  const second = "second-api-key";
+  const summary = summarizeNode({
+    id: 1730,
+    type: "Credentialed Bypassed Node",
+    title: "Credentialed Bypassed Node",
+    mode: 4,
+    widgets: [
+      {
+        name: "settings",
+        value: {
+          visible: "visible setting",
+          credentialValue: "nested-credential",
+          values: [{ privateKey: "nested-private-key" }, "sk-proj-1234567890123456"],
+        },
+      },
+      { name: "api_key", value: first },
+      { name: "api_key", value: second },
+      { name: "prompt", value: "visible prompt" },
+    ],
+    inputs: [{ name: "image", type: "IMAGE", link: null }],
+    outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+  });
+
+  assert.deepEqual(summary.widgets.settings, {
+    visible: "visible setting",
+    credentialValue: REDACTED_WIDGET_VALUE,
+    values: [{ privateKey: REDACTED_WIDGET_VALUE }, REDACTED_WIDGET_VALUE],
+  });
+  assert.equal(summary.widgets.api_key, REDACTED_WIDGET_VALUE);
+  assert.deepEqual(
+    summary.duplicate_widgets.api_key.map((row) => row.value),
+    [REDACTED_WIDGET_VALUE, REDACTED_WIDGET_VALUE],
+  );
+  assert.equal(summary.widgets.prompt, "visible prompt");
+  assert.equal(summary.mode, "bypass");
+  assert.deepEqual(summary.inputs, [{ slot: 0, name: "image", type: "IMAGE", connected_from: null }]);
+  assert.deepEqual(summary.outputs, [{ slot: 0, name: "IMAGE", type: "IMAGE", links: 0 }]);
+  assert.ok(!JSON.stringify(summary).includes(first));
+  assert.ok(!JSON.stringify(summary).includes("nested-private-key"));
 });

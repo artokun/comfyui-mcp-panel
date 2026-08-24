@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { subgraphValueProvenance } from "../../web/js/lib/subgraph-value-provenance.js";
+import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
 
 /**
  * #636 (minor) — panel_get_subgraph(173) reported inner node 166 value "MiniMax_H3"
@@ -76,17 +77,78 @@ test("no promotion-to-inner-widget PAIRING is asserted", () => {
 });
 
 // ── WIRING ────────────────────────────────────────────────────────────────
-test("WIRING: graph_get_subgraph spreads the provenance block", async () => {
-  // graph_get_subgraph is a module-private handler needing a live graph, so the
-  // wiring is pinned at source. Without the spread, both values are still returned
-  // by the two tools with nothing explaining the difference — #636's minor item.
+test("WIRING: production graph_get_subgraph redacts instance provenance", async () => {
+  // Execute the module-private handler's source fragment. A source-only assertion
+  // would miss a sanitizer applied to the wrong object, while a helper-only test
+  // would miss this alternate structured-read path entirely.
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(src, /import \{ subgraphValueProvenance \} from "\.\/lib\/subgraph-value-provenance\.js";/);
-  const fn = src.slice(src.indexOf("graph_get_subgraph({ node_id }) {"));
-  const body = fn.slice(0, fn.indexOf("async graph_add_node("));
-  assert.ok(body.includes("...subgraphValueProvenance(node),"),
-    "the reply must carry the provenance block");
-  // It must describe the PARENT instance, not one of the inner nodes.
-  assert.ok(body.includes("subgraphValueProvenance(node)"), "must be passed the parent node");
+  assert.match(src, /const safeProvenance = redactWidgetValue\("", subgraphValueProvenance\(node\)\);/);
+  assert.match(src, /\.\.\.safeProvenance,/);
+
+  const start = src.indexOf("graph_get_subgraph({ node_id }) {");
+  const end = src.indexOf("async graph_add_node(", start);
+  assert.ok(start >= 0 && end > start, "graph_get_subgraph handler must remain extractable");
+  const method = src.slice(start, end).replace(/,\s*$/, "");
+  const graph = {};
+  const sharedParentValue = { value: "SECRET" };
+  const parent = {
+    id: 173,
+    title: "Reusable secret node",
+    widgets: [
+      { name: "ordinarySettings", value: sharedParentValue },
+      { name: "apiKey", value: sharedParentValue },
+      {
+        name: "instanceSettings",
+        value: {
+          visible: "keep this setting",
+          api_key: "nested-api-key",
+          values: [{ privateKey: "nested-private-key" }, "Bearer abcdefghijklmnop"],
+        },
+      },
+      { name: "prompt", value: "visible prompt" },
+    ],
+    subgraph: { _nodes: [{ id: 166, mode: 4, inputs: [], outputs: [] }] },
+  };
+  const getSubgraph = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "describeActiveGraph",
+    "subgraphValueProvenance",
+    "redactWidgetValue",
+    "MAX_STATE_NODES",
+    "fixedCapNote",
+    "summarizeNode",
+    `return ({${method}}).graph_get_subgraph;`,
+  )(
+    () => ({ graph }),
+    () => parent,
+    () => ({ graph: "root" }),
+    subgraphValueProvenance,
+    redactWidgetValue,
+    50,
+    () => "truncation note",
+    (node) => ({ id: node.id, mode: node.mode, inputs: node.inputs, outputs: node.outputs }),
+  );
+
+  const out = getSubgraph({ node_id: 173 });
+  assert.deepEqual(out.subgraph_of, { node_id: 173, title: "Reusable secret node" });
+  assert.deepEqual(out.instance_widgets, {
+    ordinarySettings: { value: "SECRET" },
+    apiKey: { value: REDACTED_WIDGET_VALUE },
+    instanceSettings: {
+      visible: "keep this setting",
+      api_key: REDACTED_WIDGET_VALUE,
+      values: [{ privateKey: REDACTED_WIDGET_VALUE }, REDACTED_WIDGET_VALUE],
+    },
+    prompt: "visible prompt",
+  });
+  assert.notStrictEqual(
+    out.instance_widgets.ordinarySettings,
+    out.instance_widgets.apiKey,
+    "production provenance must split ordinary and sensitive alias contexts",
+  );
+  assert.deepEqual(out.nodes, [{ id: 166, mode: 4, inputs: [], outputs: [] }]);
+  assert.ok(!JSON.stringify(out).includes("nested-private-key"));
 });
