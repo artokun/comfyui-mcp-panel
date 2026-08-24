@@ -29,6 +29,17 @@ test("#983: the Fast Groups Muter write is classified derived", () => {
   assert.equal(classifyRgthreeFastGroupsWrite({ type: MUTER }, RGTHREE_TOGGLE_WIDGET), "derived");
 });
 
+test("#983: the Muter refusal survives case-insensitive widget resolution", () => {
+  assert.equal(
+    classifyRgthreeFastGroupsWrite({ type: MUTER }, "rgthree_toggle_and_nav.toggled"),
+    "derived",
+  );
+  assert.equal(
+    classifyRgthreeFastGroupsWrite({ type: BYPASSER }, "rgthree_toggle_and_nav.toggled"),
+    null,
+  );
+});
+
 test("#2146: a Fast Groups Bypasser row remains a writable action control", () => {
   // Bypasser callbacks change linked node modes. They are transactional at the widget-write
   // boundary, so this existing refusal must not broaden to them.

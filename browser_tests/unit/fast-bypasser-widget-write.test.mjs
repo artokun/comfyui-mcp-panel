@@ -97,12 +97,12 @@ function makeFixture({
         groupNode.mode = newValue ? this.node.modeOn : this.node.modeOff;
       }
       group.rgthree_hasAnyActiveNode = newValue;
-      this.value = { toggled: newValue };
+      this.value.toggled = newValue;
     },
     toggle(value) {
       value = value == null ? !this.value.toggled : value;
       if (value !== this.value.toggled) {
-        this.value = { toggled: value };
+        this.value.toggled = value;
         this.doModeChange();
       }
     },
@@ -115,6 +115,8 @@ function makeFixture({
 
 test("#2146: a no-callback row action rolls back propagation regardless of group order", () => {
   const fixture = makeFixture({ initialToggled: true, initialModes: [0, 2], repeaterMode: 0 });
+  fixture.row.value.label = "production-row";
+  let afterChangeCalls = 0;
   let failure;
 
   assert.equal(fixture.row.callback, undefined);
@@ -123,7 +125,7 @@ test("#2146: a no-callback row action rolls back propagation regardless of group
       applyWidgetWrite(fixture.bypasser, "rgthree_toggle_and_nav.toggled", false, {
         // Force the normal post-action verification failure after the real row action ran.
         afterChange() {
-          fixture.row.value = { toggled: true };
+          if (afterChangeCalls++ === 0) fixture.row.value = { toggled: true };
         },
       }),
     (error) => {
@@ -132,7 +134,7 @@ test("#2146: a no-callback row action rolls back propagation regardless of group
     },
   );
   assert.equal(failure.partialWrite, false);
-  assert.deepEqual(fixture.row.value, { toggled: true });
+  assert.deepEqual(fixture.row.value, { toggled: true, label: "production-row" });
   assert.equal(fixture.repeater.mode, 0, "the repeater mode is restored");
   assert.equal(fixture.loadAudio1.mode, 0, "the first linked mode is restored after propagation");
   assert.equal(fixture.loadAudio2.mode, 2, "the second linked mode is restored after propagation");

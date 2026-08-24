@@ -54,10 +54,11 @@
 
 /** The rgthree node types whose toggle rows are derived readouts. `addRgthree()` in the pack's
  *  constants.ts appends " (rgthree)" to every name, which is what reaches `node.type`. */
-const FAST_GROUPS_TYPES = new Set(["Fast Groups Muter (rgthree)"]);
+const FAST_GROUPS_TYPES = new Set(["Fast Groups Muter (rgthree)".toLowerCase()]);
 
 /** The widget name the pack gives every toggle row. */
 export const RGTHREE_TOGGLE_WIDGET = "RGTHREE_TOGGLE_AND_NAV";
+const NORMALIZED_RGTHREE_TOGGLE_WIDGET = RGTHREE_TOGGLE_WIDGET.toLowerCase();
 
 /** The base widget name a request addresses, with any composite sub-field removed:
  *  `"RGTHREE_TOGGLE_AND_NAV.toggled"` and `"RGTHREE_TOGGLE_AND_NAV"` both name the same widget. */
@@ -81,8 +82,8 @@ function baseWidgetName(widgetName) {
  */
 export function classifyRgthreeFastGroupsWrite(node, widgetName) {
   const type = node && typeof node === "object" ? node.type : undefined;
-  if (typeof type !== "string" || !FAST_GROUPS_TYPES.has(type)) return null;
-  return baseWidgetName(widgetName) === RGTHREE_TOGGLE_WIDGET ? "derived" : null;
+  if (typeof type !== "string" || !FAST_GROUPS_TYPES.has(type.toLowerCase())) return null;
+  return baseWidgetName(widgetName).toLowerCase() === NORMALIZED_RGTHREE_TOGGLE_WIDGET ? "derived" : null;
 }
 
 /**

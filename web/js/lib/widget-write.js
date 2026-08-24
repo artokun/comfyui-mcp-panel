@@ -1948,6 +1948,11 @@ export function applyWidgetWrite(
   const objectWrite = coerced !== null && typeof coerced === "object";
   const expected = objectWrite ? JSON.parse(JSON.stringify(coerced)) : coerced;
 
+  // #2146 — the live Fast Bypasser row's supported action mutates `value.toggled` in place.
+  // Resolve it before taking the prior-value snapshot so rollback can isolate the complete
+  // row object from that mutation without changing generic widget-write identity semantics.
+  const fastBypasserAction = resolveFastBypasserAction(targetNode, w, coerced, w.value);
+
   const matchesExpected = (actual) =>
     objectWrite
       ? actual !== null &&
@@ -1966,13 +1971,17 @@ export function applyWidgetWrite(
   // outer rail, not the (potentially divergent) inner widget's prior value (#583).
   // Keep the latter separately for diagnostics; it is not the API-level
   // `previous` for a promoted request.
-  const previous = w.value;
   const previousParent = parentWidget ? parentWidget.value : undefined;
   const deepClone = (v) => (v !== null && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : v);
   const structurallyEqual = (a, b) =>
     (a !== null && typeof a === "object") || (b !== null && typeof b === "object")
       ? JSON.stringify(a) === JSON.stringify(b)
       : Object.is(a, b);
+  // #2146 — toggle(value) mutates the live row's value object in place. Keep a complete
+  // structural snapshot for this action path so `w.value = previous` cannot reattach the
+  // already-mutated object and leave a false partial-write result. Generic widgets retain
+  // their historical prior-reference behavior; only this known action shape needs isolation.
+  const previous = fastBypasserAction ? deepClone(w.value) : w.value;
   const previousClone = deepClone(previous);
   const previousParentClone = parentWidget ? deepClone(previousParent) : undefined;
   // #477: prior values (+ deep clones) of the secondary display proxies, so rollback
@@ -2066,10 +2075,8 @@ export function applyWidgetWrite(
   // allowing it to mutate linked modes that this writer cannot restore.
   const fastBypasserModes = captureFastBypasserModeTransaction(targetNode, w);
   // #2146 — Fast Bypasser rows do not expose a widget.callback. Their supported UI action is
-  // the row's own toggle(value), which assigns the row value and invokes doModeChange().
+  // the row's own toggle(value), which mutates the row value and invokes doModeChange().
   // Bridge that canonical action instead of assigning the value and falsely reporting success.
-  const fastBypasserAction = resolveFastBypasserAction(targetNode, w, coerced, previous);
-
   // The undo hooks are BOOKKEEPING (litegraph history). Invoke them exception-SAFE
   // so a throwing hook can never bypass our verification/rollback and leave a silent
   // partial write; a stateful hook that mutates values is still caught because ALL
