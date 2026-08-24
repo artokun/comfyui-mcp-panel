@@ -623,3 +623,25 @@ export function loadRestoreCompleted({ nodeIsolation, graphWatch, recoveredFailu
     },
   );
 }
+
+/** Run one production graph load under the completion proof.
+ *
+ * `loadGraphData` may catch a configure throw and resolve while the graph is only
+ * partly restored. Install both observations before calling it, remove them before
+ * the caller reads the graph, and expose only the proof result needed by callers.
+ * A thrown loader error still propagates; the helper is an observer, not a control
+ * flow change. `completed` is deliberately tri-state: only `true` licenses success. */
+export async function loadGraphDataWithCompletionProof({ liteGraph, graph = null, load } = {}) {
+  const nodeIsolation = installNodeConfigureIsolation(liteGraph, graph);
+  const graphWatch = installGraphConfigureWatch(liteGraph);
+  try {
+    const value = await load();
+    return {
+      value,
+      completed: loadRestoreCompleted({ nodeIsolation, graphWatch }),
+    };
+  } finally {
+    nodeIsolation?.restore();
+    graphWatch?.restore();
+  }
+}

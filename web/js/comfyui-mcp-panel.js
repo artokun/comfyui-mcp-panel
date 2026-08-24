@@ -94,6 +94,7 @@ import {
   retryNodeRestores,
   installGraphConfigureWatch,
   loadRestoreCompleted,
+  loadGraphDataWithCompletionProof,
 } from "./lib/load-restore-isolation.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
@@ -6722,7 +6723,13 @@ async function repaintSaveAsCanvas(copy, targetPath) {
         [WORKFLOW_PATH_FIELD]: destinationPath,
       },
     };
-    await app.loadGraphData(saveAsPayload, true, true, copy, { __cmcpKeepInstance: true });
+    const LGForSaveAs = liteGraphGlobal();
+    const restore = await loadGraphDataWithCompletionProof({
+      liteGraph: LGForSaveAs,
+      graph: app?.graph,
+      load: () => app.loadGraphData(saveAsPayload, true, true, copy, { __cmcpKeepInstance: true }),
+    });
+    if (restore.completed !== true) return false;
     const rootGraph = app?.graph;
     const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
     const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;

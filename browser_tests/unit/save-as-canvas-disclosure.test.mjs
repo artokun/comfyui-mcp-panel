@@ -71,6 +71,11 @@ test("#939 the production adapter repaints before it captures and persists the c
   const panel = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(panel, /repaintSaveAsCanvas/);
   assert.match(panel, /\[WORKFLOW_PATH_FIELD\]: destinationPath/);
+  assert.match(panel, /loadGraphDataWithCompletionProof\(\{/);
+  assert.ok(
+    panel.indexOf("loadGraphDataWithCompletionProof({") < panel.indexOf("const rootGraph = app?.graph;"),
+    "Save-As must prove the restore completed before trusting root identity",
+  );
 });
 
 test("#978 the unsound root stamp is NOT in the panel", () => {
