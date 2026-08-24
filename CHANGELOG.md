@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.68] - 2026-08-24
+
+### Fixed
+- roll back Fast Bypasser linked modes (#2146)
+
+
 ## [0.15.67] - 2026-08-24
 
 ### Fixed
