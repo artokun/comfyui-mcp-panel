@@ -301,6 +301,7 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
+import { objectInfoSnapshotProbeDeadline } from "./lib/object-info-probe-budget.js";
 import {
   fetchWholeObjectInfo,
   objectInfoOracleFailureNote,
@@ -1093,16 +1094,24 @@ function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
 const NODE_DEFS_FETCH_TIMEOUT_MS = 10000;
 
 /**
- * #1582 — when a same-connection whole-schema snapshot is already held, the FIRST silent
- * call still has to discover that the live routes will not answer. Do not spend the full
- * serial 10s client share plus 5s raw-route share on that discovery. Two seconds still
- * leaves roughly four times the measured warm whole-schema read while keeping the existing
- * fail-closed outcome distinction: an answered bad response refuses, and only actual
- * silence licenses the last-observed snapshot. Once that silence is recorded, later
- * ordinary writes skip the probes entirely (`shouldSkipProbe`) rather than paying this
- * budget again on every widget edit.
+ * #1582/#1734 — when a same-connection whole-schema snapshot is already held, the FIRST
+ * silent call still has to discover that the live routes will not answer. Loopback keeps
+ * the original 2s discovery window. A non-loopback page origin gets 8s because a whole
+ * `/object_info` body is network-bound there; the reported 6MB remote read took ~1.7s
+ * before the oracle split its allowance across the two routes.
+ *
+ * This is still only the oracle's allowance: graph_set_widget passes it through
+ * `budget.bounded(...)`, so the 25s command deadline remains the outer cap. The
+ * fail-closed distinction is unchanged — an answered bad response refuses, and only
+ * actual silence licenses the last-observed snapshot. Once that silence is recorded,
+ * later ordinary writes skip the probes entirely (`shouldSkipProbe`) rather than paying
+ * this budget again on every widget edit.
+ *
+ * Use the page origin, not the optional Remote-URL setting: this is the origin the page's
+ * own `api` client actually reads. Unknown origins take the remote allowance so an
+ * unclassified target cannot be falsely treated as a fast loopback.
  */
-const OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS = 2000;
+const OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS = objectInfoSnapshotProbeDeadline(pageComfyOrigin());
 
 /**
  * #1180 — ONE budget for a whole `registerComfyNodeDefs` run, shared by its phases.
