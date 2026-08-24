@@ -629,7 +629,8 @@ test("#1529 wiring: the reply is serialized WHOLE, not projected to a field list
 test("#663 wiring: the 'reconnected' listener kicks the settle watch for the NEW epoch", () => {
   const start = SRC.indexOf('api.addEventListener("reconnected"');
   assert.notEqual(start, -1);
-  const block = SRC.slice(start, start + 1600);
+  const next = SRC.indexOf("api.addEventListener(", start + 1);
+  const block = SRC.slice(start, next === -1 ? SRC.length : next);
   assert.match(block, /backendReconnectEpoch \+= 1/, "the epoch bump is intact (#433)");
   assert.match(
     block,

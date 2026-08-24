@@ -164,7 +164,10 @@ async function waitForRun(runHandle, ms, withTimeout, abandonBeforeLocalWork = f
 //                                registration; its own cleanup must NOT clear the slot —
 //                                the coalescer owns the slot lifecycle. `runOpts` is the
 //                                caller's `{ runBudgetMs }`, forwarded verbatim. `runControl`
-//                                carries the pre-local-work handoff used by a bounded caller.
+//                                carries the pre-local-work handoff used by a bounded caller,
+//                                plus `deferCompletion(promise)` for work that may outlive
+//                                the register function's observation budget but still owns
+//                                shared refresh state.
 //   withTimeout                : the repo's ONE bounding primitive (bounded-step.js),
 //                                injected rather than imported so this module stays a
 //                                pure coordinator and a test can drive the clock. Omit it
@@ -178,6 +181,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
   const startRun = (preloadedDefs, runOpts, abandonBeforeLocalWork) => {
     let yieldBeforeLocalWork = !!abandonBeforeLocalWork;
     let nextCompletion = null;
+    let deferredCompletion = null;
     let announceBeforeLocalWork;
     const beforeLocalWork = new Promise((resolve) => {
       announceBeforeLocalWork = resolve;
@@ -197,10 +201,25 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
           ? new Promise((resolve) => setTimeout(resolve, 0))
           : undefined;
       },
+      // A bounded phase may stop observing an operation that still mutates shared frontend
+      // state. Keep this run's slot occupied until that operation settles; otherwise a
+      // successor can overlap the late mutation and make its verdict/trust non-authoritative.
+      deferCompletion: (completionPromise) => {
+        const next = Promise.resolve(completionPromise);
+        deferredCompletion = deferredCompletion ? deferredCompletion.then(() => next) : next;
+        return next;
+      },
     };
     const p = (async () => {
       try {
-        return await runRegister(preloadedDefs, runOpts, runControl);
+        let result = await runRegister(preloadedDefs, runOpts, runControl);
+        if (deferredCompletion) {
+          const deferredResult = await deferredCompletion;
+          // A deferred completion may provide the authoritative post-mutation verdict. Keep
+          // the ordinary register result only for the legacy no-result form.
+          if (deferredResult !== undefined) result = deferredResult;
+        }
+        return result;
       } finally {
         // Clear the slot only if it still points at THIS run (a later run may have
         // already replaced it).
@@ -344,7 +363,10 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
           return startRun(undefined, runOpts, earlyYieldRequested);
         })();
         trailing = {
-          promise: queued.then((handle) => handle.promise),
+          // Follow the successor's own completion chain. A forced refresh can queue another
+          // successor after this one starts; exposing only the raw promise would let an older
+          // acknowledgement report success while that later run is still in flight.
+          promise: queued.then((handle) => handle.completion?.promise ?? handle.promise),
           beforeLocalWork: queued.then((handle) => handle.beforeLocalWork),
           requestEarlyYield: () => {
             earlyYieldRequested = true;

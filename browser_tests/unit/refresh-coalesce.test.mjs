@@ -115,6 +115,33 @@ test("#1680: a forced payload-less caller can explicitly join an in-flight refre
   assert.equal(registered.length, 1, "the opt-in joins the existing run without a trailing pass");
 });
 
+test("#1695: deferred completion fences the slot and forwards its final verdict", async () => {
+  const late = deferred();
+  let inFlight = null;
+  let runs = 0;
+  const coalescer = makeRefreshCoalescer({
+    getInFlight: () => inFlight,
+    setInFlight: (p) => { inFlight = p; },
+    runRegister: async (_defs, _opts, control) => {
+      runs += 1;
+      control.deferCompletion(late.promise.then(() => ({ refreshed: true })));
+      return { refreshed: false };
+    },
+    withTimeout,
+  });
+
+  const first = coalescer(undefined, { force: true, joinMs: 25 });
+  const retry = coalescer(undefined, { force: true, joinInFlight: true, joinMs: 25 });
+  assert.equal(await first, REFRESH_JOIN_ABANDONED, "the bounded caller reports pending status");
+  assert.equal(await retry, REFRESH_JOIN_ABANDONED, "a repeated retry observes the same pending run");
+  assert.equal(runs, 1, "the late mutation fence prevents an overlapping successor");
+  assert.notEqual(inFlight, null, "the fenced run remains in-flight");
+
+  late.resolve();
+  assert.deepEqual(await coalescer(undefined, { force: true, joinInFlight: true, joinMs: 500 }), { refreshed: true });
+  assert.equal(inFlight, null, "the slot returns idle only after the deferred completion");
+});
+
 test("#1682: an acknowledgement join observes an already-queued fresh trailing run", async () => {
   const firstGate = deferred();
   let run = 0;

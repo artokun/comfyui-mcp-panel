@@ -343,10 +343,12 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
   assert.match(body, /return describeNodeDefRefresh\(\{/, "the run verdict is returned");
   assert.match(
     body,
-    /nodeDefsRefreshConfirmed = !didThrow && !!defs && \(comboRan \|\| comboAbandonedAfterRebuild\);/,
+    /nodeDefsRefreshConfirmed =\s*runIsCurrent && !comboCompletionPending && !didThrow && !!defs && \(comboRan \|\| comboAbandonedAfterRebuild\);/,
     "the shared global stays a strict boolean, and #1193 admits the panel's OWN completed " +
       "combo rebuild as the second way the live lists became current",
   );
+  assert.match(body, /const runIsCurrent = !comfyBackendSocketDown && runStartedAtEpoch === backendReconnectEpoch;/);
+  assert.match(body, /reason: NODE_DEF_REFRESH_REASONS\.REFRESH_SUPERSEDED/);
   // #1193 — the two inputs must stay SEPARATE all the way to the verdict. Merging them
   // into one flag would make an abandoned-but-locally-rebuilt run indistinguishable from
   // a confirmed one, which is the distinction the disclosure exists to carry.
@@ -413,6 +415,7 @@ function buildRegisterComfyNodeDefs({
   now,
   recordObjectInfoTypes = () => ({}),
   reapplyDefsToLiveNodes = () => {},
+  socketDown = false,
   // #608 — defaults to the REAL oracle. Overridden only to OBSERVE what it is handed.
   fetchWholeObjectInfo: fetchWholeObjectInfoImpl = fetchWholeObjectInfo,
 }) {
@@ -424,6 +427,7 @@ function buildRegisterComfyNodeDefs({
     "reapplyDefsToLiveNodes",
     "comboRebuildCovered",
     "describeNodeDefRefresh",
+    "NODE_DEF_REFRESH_REASONS",
     // #954 — the REAL retry, not a stub. The shipping function now fetches through it, and
     // a harness that substituted a pass-through would stop proving what this file exists to
     // prove: that the shipped code produces these verdicts.
@@ -448,7 +452,8 @@ function buildRegisterComfyNodeDefs({
     // recording is stamped with. Both are module state in the panel, so the extracted
     // body throws ReferenceError without them.
     "objectInfoSnapshot",
-    "backendReconnectEpoch",
+    "initialBackendReconnectEpoch",
+    "comfyBackendSocketDown",
     // #1562 — the oracle's per-route OUTCOME vocabulary. The fetch phase reads route 2's
     // ending from the TAG rather than from its sentence (#1223), so the extracted body
     // throws ReferenceError without it.
@@ -466,9 +471,14 @@ function buildRegisterComfyNodeDefs({
        if ("err" in settled) throw settled.err;
        return settled.value;
      };
+     let backendReconnectEpoch = initialBackendReconnectEpoch;
      let nodeDefsRefreshConfirmed = false;
      ${body}
-     return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`,
+     return {
+       registerComfyNodeDefs,
+       getConfirmed: () => nodeDefsRefreshConfirmed,
+       setEpoch: (value) => { backendReconnectEpoch = value; },
+     };`,
   );
   return factory(
     appValue,
@@ -477,6 +487,7 @@ function buildRegisterComfyNodeDefs({
     reapplyDefsToLiveNodes,
     comboRebuildCovered,
     describeNodeDefRefresh,
+    NODE_DEF_REFRESH_REASONS,
     // No real waiting: the delays are the shipped ones, the sleep is not.
     // #1180 — the SHIPPED options, not just the shipped helper. Omitting `delays` let the
     // helper fall back to its own default, so every test here ran a schedule the refresh
@@ -492,7 +503,7 @@ function buildRegisterComfyNodeDefs({
     NODE_DEFS_RUN_BUDGET_MS,
     NODE_DEFS_FETCH_SHARE,
     fetchWholeObjectInfoImpl,
-      // #1193 — ONE clock for the deadline and the arithmetic that reads it. The shared
+    // #1193 — ONE clock for the deadline and the arithmetic that reads it. The shared
     // helper reads the REAL monotonicNow; a fake-clock deadline measured against it is a
     // different bound than the one the panel arms (its own nodeDefsBudgetLeft shares the
     // panel's clock). Without the override the shared helper is passed through unchanged.
@@ -506,6 +517,7 @@ function buildRegisterComfyNodeDefs({
     // re-records only a payload it fetched itself.
     snapshotSpy,
     7,
+    socketDown,
     TRANSPORT_OUTCOME,
   );
 }
@@ -536,6 +548,35 @@ test("#635: the shipping register run end-to-end success reports refreshed", asy
   const verdict = await registerComfyNodeDefs(undefined);
   assert.deepEqual(verdict, { refreshed: true, reason: "refreshed" });
   assert.equal(getConfirmed(), true);
+});
+
+test("#1695: a run superseded by reconnect cannot report fresh or restore combo trust", async () => {
+  let built;
+  let reconnectEpochApplied = false;
+  const api = {
+    getNodeDefs: async () => {
+      built.setEpoch(8);
+      reconnectEpochApplied = true;
+      return { SomeNode: {} };
+    },
+  };
+  built = buildRegisterComfyNodeDefs({ appValue: FULL_APP, apiValue: api });
+
+  const verdict = await built.registerComfyNodeDefs(undefined);
+
+  assert.equal(reconnectEpochApplied, true, "the simulated reconnect landed during the production run");
+  assert.equal(verdict.refreshed, false);
+  assert.equal(verdict.reason, NODE_DEF_REFRESH_REASONS.REFRESH_SUPERSEDED);
+  assert.equal(built.getConfirmed(), false, "the stale run cannot restore combo trust");
+
+  const downBuilt = buildRegisterComfyNodeDefs({
+    appValue: FULL_APP,
+    apiValue: { getNodeDefs: async () => ({ SomeNode: {} }) },
+    socketDown: true,
+  });
+  const downVerdict = await downBuilt.registerComfyNodeDefs(undefined);
+  assert.equal(downVerdict.reason, NODE_DEF_REFRESH_REASONS.REFRESH_SUPERSEDED);
+  assert.equal(downBuilt.getConfirmed(), false, "a run started during the down window stays untrusted");
 });
 
 test("#635: the shipping run on a combo-API-absent frontend claims registration only because it RAN", async () => {
@@ -835,8 +876,18 @@ test("#1180: the shipped combo phase is bounded, and its outcomes stay apart", (
   assert.ok(combo.length > 0, "could not locate the combo phase");
   assert.match(
     combo,
-    /withTimeout\(\s*Promise\.resolve\(\)\s*\.then\(\(\) => a\.refreshComboInNodes\(\)\)/,
-    "the combo refresh itself must be the bounded promise, not merely nearby",
+    /const comboPromise = Promise\.resolve\(\)\s*\.then\(\(\) => a\.refreshComboInNodes\(\)\)/,
+    "the combo refresh itself must be the promise handed to the bound",
+  );
+  assert.match(
+    combo,
+    /withTimeout\(\s*comboPromise\s*,/,
+    "the combo observation must bound the production promise",
+  );
+  assert.match(
+    combo,
+    /runControl\?\.deferCompletion|runControl\.deferCompletion/,
+    "a timed-out combo must remain owned by the production lifecycle",
   );
   assert.doesNotMatch(
     combo,

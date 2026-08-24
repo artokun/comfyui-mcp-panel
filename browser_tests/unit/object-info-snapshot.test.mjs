@@ -1169,9 +1169,9 @@ test("#1223 SHIPPED STARTUP: a reconnect during the seed's fetch is not filed", 
 });
 
 test("#1223 the socket handlers clear the snapshot DIRECTLY, not by way of a refresh", () => {
-  // The `reconnected` handler's refreshComfyNodeDefs() carries no payload and no force,
-  // which makeRefreshCoalescer resolves by joining an in-flight run and returning — so
-  // registerComfyNodeDefs, and the clear inside it, may never run for that reconnect.
+  // The socket handlers clear the snapshot before any refresh is scheduled. The reconnected
+  // handler now forces a trailing run (#1695), but that run may still join an older refresh;
+  // registerComfyNodeDefs must not be the only place that retires restart-sensitive state.
   // Each handler is bounded at the NEXT listener registration. A fixed-width slice ran past
   // the end of `reconnecting` into `status` — which also clears — so deleting the clear from
   // `reconnecting` left this test green. Found by mutation, not by reading.

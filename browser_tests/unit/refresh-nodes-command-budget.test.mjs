@@ -70,6 +70,13 @@ function extractPanelFn(sig) {
   throw new Error(`unterminated: ${sig}`);
 }
 
+function extractPanelEvent(event) {
+  const start = PANEL_SRC.indexOf(`api.addEventListener("${event}"`);
+  assert.notEqual(start, -1, `${event} listener not found in the panel source`);
+  const next = PANEL_SRC.indexOf("api.addEventListener(", start + 1);
+  return PANEL_SRC.slice(start, next === -1 ? PANEL_SRC.length : next);
+}
+
 // Execute the shipped local wrapper and collector together. This keeps the regression at
 // the production consumer boundary: a refresh verdict changes the trust supplied to the
 // same `collectMissingAssets` body graph_get_errors and validationBanner use.
@@ -197,9 +204,116 @@ async function withWatchdog(run, ms, what) {
   }
 }
 
+async function waitForRunCount(built, count) {
+  for (let attempts = 0; attempts < 100; attempts += 1) {
+    if (built.runs.length >= count) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`refresh did not start run ${count}`);
+}
+
 // ---------------------------------------------------------------------------
 // 1. The reported shape: a run already in flight, and the tool call subscribed to it.
 // ---------------------------------------------------------------------------
+
+test("#1695: reconnect queues a successor and refresh_nodes refuses while that successor runs", async () => {
+  const reconnected = extractPanelEvent("reconnected");
+  assert.match(
+    reconnected,
+    /refreshComfyNodeDefs\(undefined,\s*\{\s*force:\s*true\s*\}\)\.catch/,
+    "the production reconnect path must force a trailing refresh",
+  );
+
+  const staleGate = deferred();
+  const successorGate = deferred();
+  const built = realRefreshNodes({
+    holdFirstRun: staleGate.promise,
+    budgetMs: 25,
+    runHook: async ({ index }) => {
+      if (index === 1) await successorGate.promise;
+      return { refreshed: true, reason: "refreshed" };
+    },
+  });
+
+  // This is the exact coalescer call the shipped reconnected listener makes. It must queue
+  // one post-reconnect run behind the stale pre-restart promise.
+  const reconnectRefresh = built.refreshComfyNodeDefs(undefined, { force: true });
+  staleGate.resolve();
+  await waitForRunCount(built, 2);
+
+  const { value } = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes did not return while the post-reconnect successor was held",
+  );
+  assert.equal(value.ok, true);
+  assert.equal(value.refreshed, false);
+  assert.equal(value.reason, NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING);
+  assert.notEqual(built.getInFlight(), null, "the successor remains the live refresh promise");
+
+  successorGate.resolve();
+  await reconnectRefresh;
+  const retry = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "refresh_nodes retry did not observe the settled post-reconnect refresh",
+  );
+  assert.deepEqual(retry.value, { ok: true, refreshed: true });
+  assert.equal(built.runs.length, 3, "the retry starts only after the successor has settled");
+  await built.inFlightStarted?.catch(() => {});
+});
+
+test("#1695: refresh_nodes follows multiple forced successors before reporting success", async () => {
+  const run0Gate = deferred();
+  const run1Gate = deferred();
+  const run2Gate = deferred();
+  let lastCompletedRun = -1;
+  const built = realRefreshNodes({
+    holdFirstRun: run0Gate.promise,
+    budgetMs: 150,
+    runHook: async ({ index }) => {
+      if (index === 1) await run1Gate.promise;
+      if (index === 2) await run2Gate.promise;
+      lastCompletedRun = index;
+      return { refreshed: true, reason: "refreshed" };
+    },
+  });
+
+  // Reproduce the restart lifecycle exactly: run1 is queued behind run0, the acknowledgement
+  // starts while that successor is pending, and run2 is queued after run1 becomes current.
+  const run1 = built.refreshComfyNodeDefs(undefined, { force: true });
+  const acknowledgement = built.refresh_nodes();
+  run0Gate.resolve();
+  await waitForRunCount(built, 2);
+  const run2 = built.refreshComfyNodeDefs(undefined, { force: true });
+  run1Gate.resolve();
+  await waitForRunCount(built, 3);
+
+  const first = await withWatchdog(
+    () => acknowledgement,
+    1500,
+    "refresh_nodes reported neither the chained in-flight status nor success",
+  );
+  assert.equal(first.value.reason, NODE_DEF_REFRESH_REASONS.REFRESH_STILL_RUNNING);
+  assert.equal(lastCompletedRun, 1, "run2 is still held when the bounded acknowledgement returns");
+  assert.notEqual(built.getInFlight(), null, "the second forced successor still owns the slot");
+
+  // The prescribed retry joins run2 while it is still live. Releasing run2 must complete that
+  // same chain, rather than making the retry falsely refuse or start a fourth run.
+  const retry = built.refresh_nodes();
+  run2Gate.resolve();
+  const second = await withWatchdog(
+    () => retry,
+    1500,
+    "refresh_nodes retry did not observe the settled second successor",
+  );
+  assert.deepEqual(second.value, { ok: true, refreshed: true });
+  assert.equal(lastCompletedRun, 2);
+  assert.equal(built.runs.length, 3, "the retry completes the existing successor chain");
+  await run1;
+  await run2;
+  await built.inFlightStarted?.catch(() => {});
+});
 
 test("#1680: refresh_nodes returns the completed verdict from an already-running refresh", async () => {
   const gate = deferred();
@@ -556,6 +670,36 @@ test("#1680: a timed-out joined refresh is not cancelled and a later call can re
   );
   assert.deepEqual(second.value, { ok: true, refreshed: true });
   assert.equal(built.runs.length, 2, "the later idle call starts exactly one new refresh");
+});
+
+test("#1695: repeated retries share one pending completion and eventually succeed", async () => {
+  const lateCompletion = deferred();
+  const built = realRefreshNodes({
+    budgetMs: 25,
+    runHook: async ({ control }) => {
+      control.deferCompletion(
+        lateCompletion.promise.then(() => ({ refreshed: true, reason: "refreshed" })),
+      );
+      return { refreshed: false, reason: "refresh_pending" };
+    },
+  });
+
+  const first = await withWatchdog(() => built.refresh_nodes(), 1500, "first refresh did not report its status");
+  assert.equal(first.value.reason, "refresh_still_running");
+  const second = await withWatchdog(() => built.refresh_nodes(), 1500, "second retry did not report its status");
+  assert.equal(second.value.reason, "refresh_still_running");
+  assert.equal(built.runs.length, 1, "retries remain attached to the same production refresh");
+  assert.notEqual(built.getInFlight(), null, "the deferred completion still owns the slot");
+
+  lateCompletion.resolve();
+  const settled = await withWatchdog(
+    () => built.refresh_nodes(),
+    1500,
+    "retry after the late completion did not receive success",
+  );
+  assert.equal(settled.value.refreshed, true, "the command eventually exposes the completed verdict");
+  assert.equal(built.runs.length, 1, "settlement does not start a competing refresh");
+  await built.inFlightStarted?.catch(() => {});
 });
 
 test("#1680: with no refresh in flight, refresh_nodes starts its own forced run", async () => {

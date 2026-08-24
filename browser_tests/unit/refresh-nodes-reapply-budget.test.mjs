@@ -12,7 +12,13 @@ import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { fetchWholeObjectInfo, TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
 import { describeNodeDefRefresh, NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
-import { comboRebuildCovered } from "../../web/js/lib/asset-staleness.js";
+import {
+  collectAllGraphs,
+  comboRebuildCovered,
+  isStaleAssetCandidate as isStaleAssetCandidateLib,
+  resolveMissingModelDirectory,
+} from "../../web/js/lib/asset-staleness.js";
+import { withoutFrontendVirtualTypes } from "../../web/js/lib/frontend-virtual-nodes.js";
 
 const SRC = readFileSync(fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)), "utf8");
 
@@ -48,14 +54,15 @@ const RELAY = 3000;
 const FETCH_MS = 2080;
 const BLOCK_MS = 1500;
 
-function buildRun({ appValue, apiValue }) {
+function buildRun({ appValue, apiValue, withTimeoutImpl = withTimeout, runBudgetMs = 9000 }) {
   const body = extractFunction("async function registerComfyNodeDefs(");
   const names = [
     "app", "api", "recordObjectInfoTypes", "reapplyDefsToLiveNodes", "comboRebuildCovered",
-    "describeNodeDefRefresh", "fetchNodeDefsWithRetry", "withTimeout", "NODE_DEFS_NO_ANSWER",
+    "describeNodeDefRefresh", "NODE_DEF_REFRESH_REASONS", "fetchNodeDefsWithRetry", "withTimeout", "NODE_DEFS_NO_ANSWER",
     "COMBO_OK", "COMBO_NO_ANSWER", "NODE_DEFS_FETCH_TIMEOUT_MS", "NODE_DEFS_RUN_BUDGET_MS",
     "NODE_DEFS_FETCH_SHARE", "fetchWholeObjectInfo", "nodeDefsBudgetLeft", "monotonicNow",
     "NODE_DEFS_RETRY_DELAYS_MS", "objectInfoCache", "objectInfoSnapshot", "backendReconnectEpoch",
+    "comfyBackendSocketDown",
     "TRANSPORT_OUTCOME",
   ];
   const vals = {
@@ -64,11 +71,12 @@ function buildRun({ appValue, apiValue }) {
     reapplyDefsToLiveNodes: () => {},
     comboRebuildCovered,
     describeNodeDefRefresh,
+    NODE_DEF_REFRESH_REASONS,
     fetchNodeDefsWithRetry: (g, o) => fetchNodeDefsWithRetry(g, { ...o, sleep: async () => {} }),
-    withTimeout,
+    withTimeout: withTimeoutImpl,
     NODE_DEFS_NO_ANSWER, COMBO_OK, COMBO_NO_ANSWER,
     NODE_DEFS_FETCH_TIMEOUT_MS: 10000,
-    NODE_DEFS_RUN_BUDGET_MS: 9000,
+    NODE_DEFS_RUN_BUDGET_MS: runBudgetMs,
     NODE_DEFS_FETCH_SHARE: 2 / 3,
     fetchWholeObjectInfo,
     nodeDefsBudgetLeft, monotonicNow,
@@ -76,6 +84,7 @@ function buildRun({ appValue, apiValue }) {
     objectInfoCache: cacheSpy,
     objectInfoSnapshot: snapshotSpy,
     backendReconnectEpoch: 7,
+    comfyBackendSocketDown: false,
     TRANSPORT_OUTCOME,
   };
   const factory = new Function(...names, `
@@ -91,24 +100,55 @@ function buildRun({ appValue, apiValue }) {
     };
     let nodeDefsRefreshConfirmed = false;
     ${body}
-    return registerComfyNodeDefs;`);
+    return { registerComfyNodeDefs, getConfirmed: () => nodeDefsRefreshConfirmed };`);
   return factory(...names.map((n) => vals[n]));
 }
 
 const refreshNodesMatch = SRC.match(/\n {2}async refresh_nodes\(\) \{[\s\S]*?\n {2}\},/);
 assert.ok(refreshNodesMatch, "refresh_nodes not found");
 
-function buildRefreshNodes({ refreshComfyNodeDefs }) {
+function buildRefreshNodes({ refreshComfyNodeDefs, commandBudget = COMMAND_BUDGET }) {
   const deps = {
     refreshComfyNodeDefs,
     REFRESH_JOIN_ABANDONED,
     NODE_DEF_REFRESH_REASONS,
-    REFRESH_NODES_COMMAND_BUDGET_MS: COMMAND_BUDGET,
-    REFRESH_NODES_RUN_BUDGET_MS: Math.ceil(COMMAND_BUDGET / (2 / 3)),
+    REFRESH_NODES_COMMAND_BUDGET_MS: commandBudget,
+    REFRESH_NODES_RUN_BUDGET_MS: Math.ceil(commandBudget / (2 / 3)),
   };
   const names = Object.keys(deps);
   const factory = new Function(...names, `const executors = {${refreshNodesMatch[0]}}; return executors.refresh_nodes;`);
   return factory(...names.map((n) => deps[n]));
+}
+
+// The late-mutation regression drives the same production collector that consumes the shared
+// trust bit. Keeping this extraction beside the real register/coalescer harness prevents a
+// helper-only assertion from missing a stale combo read at the consumer boundary.
+const STALE_ASSET_BODY = extractFunction("function isStaleAssetCandidate(c, trustComboOverride) {");
+const COLLECTOR_BODY = extractFunction("function collectMissingAssets(trustComboOverride) {");
+function buildProductionCollector({ stores, rootGraph }) {
+  const factory = new Function(
+    "getPiniaStore",
+    "isStaleAssetCandidateLib",
+    "resolveMissingModelDirectory",
+    "withoutFrontendVirtualTypes",
+    "collectAllGraphs",
+    "getGraphCtx",
+    `let nodeDefsRefreshConfirmed = false;
+     ${STALE_ASSET_BODY}
+     ${COLLECTOR_BODY}
+     return {
+       collectMissingAssets,
+       setRefreshConfirmed: (value) => { nodeDefsRefreshConfirmed = value === true; },
+     };`,
+  );
+  return factory(
+    (name) => stores[name],
+    isStaleAssetCandidateLib,
+    resolveMissingModelDirectory,
+    withoutFrontendVirtualTypes,
+    collectAllGraphs,
+    () => ({ rootGraph }),
+  );
 }
 
 function busyBlock(ms) {
@@ -154,7 +194,7 @@ test("#1562: refresh_nodes answers before synchronous reapply and keeps registra
   };
 
   let inFlight = null;
-  const run = buildRun({ appValue, apiValue });
+  const { registerComfyNodeDefs: run } = buildRun({ appValue, apiValue });
   const coalescer = makeRefreshCoalescer({
     getInFlight: () => inFlight,
     setInFlight: (p) => { inFlight = p; },
@@ -189,6 +229,112 @@ test("#1562: refresh_nodes answers before synchronous reapply and keeps registra
   }
   assert.equal(registrationCalls, 1, "the retry joined the first run instead of queueing another");
   assert.equal(maxConcurrentRegistrations, 1, "registration passes must remain single-flight");
+});
+
+test("#1695: late combo work is fenced before reconnect successor and collector trust", async () => {
+  const firstCombo = deferred();
+  const secondCombo = deferred();
+  const firstComboStarted = deferred();
+  const secondComboStarted = deferred();
+  const comboWidget = {
+    name: "model",
+    value: "fresh.safetensors",
+    options: { values: [] },
+  };
+  let comboRuns = 0;
+  let valuesAtSecondStart = null;
+  const appValue = {
+    graph: null,
+    registerNodesFromDefs: async () => {},
+    refreshComboInNodes: () => {
+      comboRuns += 1;
+      if (comboRuns === 1) {
+        firstComboStarted.resolve();
+        return firstCombo.promise.then(() => {
+          comboWidget.options.values = ["late-old.safetensors"];
+        });
+      }
+      valuesAtSecondStart = [...comboWidget.options.values];
+      secondComboStarted.resolve();
+      return secondCombo.promise.then(() => {
+        comboWidget.options.values = ["fresh.safetensors"];
+      });
+    },
+  };
+  const apiValue = { getNodeDefs: async () => ({ SomeNode: {} }) };
+  // The first timeout call is the bounded /object_info read; the second is the combo
+  // observation. Make only the latter time out immediately so the real production function
+  // registers a deferred completion while its frontend promise remains live.
+  let boundedCalls = 0;
+  const productionTimeout = (promise, ms, onTimeout) => {
+    boundedCalls += 1;
+    return boundedCalls % 2 === 0 ? Promise.resolve(onTimeout()) : withTimeout(promise, ms, onTimeout);
+  };
+  const built = buildRun({
+    appValue,
+    apiValue,
+    withTimeoutImpl: productionTimeout,
+    runBudgetMs: 100,
+  });
+  let inFlight = null;
+  const coalescer = makeRefreshCoalescer({
+    getInFlight: () => inFlight,
+    setInFlight: (p) => { inFlight = p; },
+    runRegister: built.registerComfyNodeDefs,
+    withTimeout,
+  });
+  const refresh_nodes = buildRefreshNodes({ refreshComfyNodeDefs: coalescer, commandBudget: 25 });
+  const candidate = {
+    nodeId: 7,
+    name: "fresh.safetensors",
+    widgetName: "model",
+    directory: "checkpoints",
+    isMissing: true,
+  };
+  const rootGraph = {
+    _nodes: [{ id: 7, widgets: [comboWidget] }],
+    getNodeById: (id) => (id === 7 || String(id) === "7" ? { id: 7, widgets: [comboWidget] } : null),
+  };
+  const collector = buildProductionCollector({
+    stores: {
+      missingModel: { missingModelCandidates: [candidate] },
+      missingMedia: { missingMediaCandidates: [] },
+      missingNodesError: { hasMissingNodes: false, missingNodeCount: 0, missingNodesError: [] },
+    },
+    rootGraph,
+  });
+
+  const firstReplyPromise = refresh_nodes();
+  await firstComboStarted.promise;
+  const reconnect = coalescer(undefined, { force: true });
+  const firstReply = await firstReplyPromise;
+  assert.equal(firstReply.reason, "refresh_still_running", "the command reports status, not false success");
+  assert.equal(comboRuns, 1, "the first combo operation owns the refresh");
+  assert.equal(inFlight !== null, true, "the late combo keeps the coalescer slot occupied");
+  collector.setRefreshConfirmed(built.getConfirmed());
+  assert.equal(collector.collectMissingAssets().models.length, 1, "pending combo trust stays fail-closed");
+
+  const retry = refresh_nodes();
+  firstCombo.resolve();
+  await secondComboStarted.promise;
+  assert.deepEqual(
+    valuesAtSecondStart,
+    ["late-old.safetensors"],
+    "the successor starts only after the predecessor's late mutation settles",
+  );
+  assert.equal(comboRuns, 2, "reconnect coalesces to one successor, not an overlapping retry");
+  collector.setRefreshConfirmed(built.getConfirmed());
+  assert.equal(collector.collectMissingAssets().models.length, 1, "successor pending state stays untrusted");
+
+  secondCombo.resolve();
+  const retryReply = await retry;
+  await reconnect;
+  assert.equal(retryReply.refreshed, true, "a retry after settlement receives the stable completion verdict");
+  assert.equal(built.getConfirmed(), true, "shared combo trust opens only after the successor settles");
+  assert.deepEqual(comboWidget.options.values, ["fresh.safetensors"]);
+  collector.setRefreshConfirmed(built.getConfirmed());
+  assert.equal(collector.collectMissingAssets().models.length, 0, "collectMissingAssets sees only the settled successor");
+  assert.equal(inFlight, null, "the fenced lifecycle returns to idle");
 });
 
 test("#1562: a later bounded caller upgrades an already-queued trailing run", async () => {
