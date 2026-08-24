@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.71] - 2026-08-24
+
+### Added
+- add authenticated fetch_image bridge command (#1730)
+
+
 ## [0.15.70] - 2026-08-24
 
 ### Fixed
