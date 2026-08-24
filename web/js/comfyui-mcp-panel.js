@@ -94,6 +94,7 @@ import {
   retryNodeRestores,
   installGraphConfigureWatch,
   loadRestoreCompleted,
+  loadGraphDataWithCompletionProof,
 } from "./lib/load-restore-isolation.js";
 import { readPackImportFailures } from "./lib/pack-import-failures.js";
 import { pairDurabilityView } from "./lib/pair-durability-view.js";
@@ -4184,7 +4185,7 @@ function rememberWorkflowUuidOwner(id, owner) {
  *  latter is bridge routing, while this UUID follows a workflow across rename.
  *  Copies carrying the same embedded UUID get a fresh identity when opened as a
  *  different workflow object/path. */
-function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
+function workflowStableUuid(wf = activeWorkflowRef(), { embed = false, commit = true } = {}) {
   const identityObject = wf || app?.graph;
   if (!identityObject || typeof identityObject !== "object") return getTabId();
   const path = savedWorkflowPath(wf);
@@ -4222,7 +4223,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     });
     setWorkflowObjectUuid(identityObject, id);
     rememberWorkflowUuidOwner(id, identityObject);
-    if (embeddedId !== id) {
+    if (commit && embeddedId !== id) {
       // Persist the identity into extra (so a reload of the SAME content keeps it, AND a later
       // SAVE carries it into the saved file across the tmp:→wf: transition). Never dirties the
       // graph. Not a KEEP authority — the wrapper's live-object invalidation is.
@@ -4339,7 +4340,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   setWorkflowObjectUuid(identityObject, id);
   rememberWorkflowUuidOwner(id, identityObject);
   const aliasMutations = [];
-  if (objectUuid && path) {
+  if (commit && objectUuid && path) {
     // The same live workflow object moved to a new path (rename/Save-As). Keep
     // one canonical alias so the next cold start does not see its former path
     // as evidence that the current file is a clone.
@@ -4350,7 +4351,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
       }
     }
   }
-  if (path && _workflowUuidAliases[path] !== id) {
+  if (commit && path && _workflowUuidAliases[path] !== id) {
     _workflowUuidAliases[path] = id;
     aliasMutations.push([path, id]);
   }
@@ -4358,7 +4359,7 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
     persistWorkflowAliases();
     for (const [aliasPath, value] of aliasMutations) workflowAliasMutationSink?.(aliasPath, value);
   }
-  if (embed) {
+  if (embed && commit) {
     try {
       const extra = workflowOwnedExtra(wf);
       const previous = extra?.[WORKFLOW_META_NAMESPACE];
@@ -6687,6 +6688,204 @@ function carryIdentityAcrossSaveSwap({ svc, preWf, preSwapUuid, savedAs = false,
   }
 }
 
+// A stale Save-As callback must not outlive a newer Save-As operation. The active
+// workflow check below is the tab fence; this monotonic generation is the operation
+// fence for overlapping/re-mounted panel work.
+let saveAsCanvasGeneration = 0;
+// A tab can switch while each reconciliation load is suspended. Keep recovery
+// finite: an unstable canvas must refuse the Save-As rather than chase an
+// unbounded stream of active tabs or eventually report success for an unknown
+// canvas. The initial Save-As load plus these bounded retries is the complete
+// reconciliation budget for one operation.
+const MAX_SAVE_AS_CANVAS_RECONCILIATIONS = 3;
+
+/** Rebind a persisted Save-As copy onto the shared canvas before its first persist.
+ *
+ * The workflow store's `openWorkflow(copy)` changes the active record but does not call
+ * `loadGraphData`, so the root can still carry the source graph and its source
+ * `workflow_path`. Stamp the copy's own identity and destination path into a cloned
+ * payload, repaint through the production load path, then require all three observations
+ * (active record, root uuid, root path) to agree. The save adapter captures the copy only
+ * after this returns true; a failed or partial repaint is a pre-commit refusal. */
+async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
+  const ownsWorkflow = (workflow, phase = "repaint") => {
+    if (typeof canvasFence !== "function") return true;
+    try {
+      return canvasFence(workflow, phase) === true;
+    } catch {
+      return false;
+    }
+  };
+  // One load attempt is deliberately non-recursive. The caller below owns the
+  // finite state machine so every awaited load has the same post-await fence and
+  // can advance to the newly active record exactly once.
+  const repaintOne = async (workflow, workflowPath) => {
+    if (!ownsWorkflow(workflow, "repaint-before")) {
+      return { ok: false, ownerChanged: true };
+    }
+    try {
+      const state = workflow?.changeTracker?.activeState ?? workflow?.activeState;
+      if (!state || !Array.isArray(state.nodes) || typeof app?.loadGraphData !== "function") {
+        return { ok: false, ownerChanged: false };
+      }
+      const destinationPath =
+        typeof workflow?.path === "string" && workflow.path ? workflow.path : workflowPath;
+      if (typeof destinationPath !== "string" || !destinationPath) {
+        return { ok: false, ownerChanged: false };
+      }
+      // Resolve the UUID for the payload, but do not publish the destination path alias
+      // or mutate durable workflow metadata until the Save-As copy is proven persisted.
+      // The save result commits this identity after the successful write (#939).
+      const targetUuid = workflowStableUuid(workflow, { commit: false });
+      if (typeof targetUuid !== "string" || !targetUuid) {
+        return { ok: false, ownerChanged: false };
+      }
+      const saveAsPayload = JSON.parse(JSON.stringify(state));
+      const existingExtra =
+        saveAsPayload.extra && typeof saveAsPayload.extra === "object" && !Array.isArray(saveAsPayload.extra)
+          ? saveAsPayload.extra
+          : {};
+      const existingMeta =
+        existingExtra[WORKFLOW_META_NAMESPACE] &&
+        typeof existingExtra[WORKFLOW_META_NAMESPACE] === "object" &&
+        !Array.isArray(existingExtra[WORKFLOW_META_NAMESPACE])
+          ? existingExtra[WORKFLOW_META_NAMESPACE]
+          : {};
+      saveAsPayload.extra = {
+        ...existingExtra,
+        [WORKFLOW_META_NAMESPACE]: {
+          ...existingMeta,
+          [WORKFLOW_UUID_FIELD]: targetUuid,
+          [WORKFLOW_PATH_FIELD]: destinationPath,
+        },
+      };
+      const LGForSaveAs = liteGraphGlobal();
+      const restore = await loadGraphDataWithCompletionProof({
+        liteGraph: LGForSaveAs,
+        graph: app?.graph,
+        load: () => app.loadGraphData(saveAsPayload, true, true, workflow, { __cmcpKeepInstance: true }),
+      });
+      // This is the required post-await re-read. `canvasFence` includes both the
+      // active workflow record and this Save-As operation's monotonic generation.
+      const ownerChanged = !ownsWorkflow(workflow, "repaint-after");
+      if (ownerChanged) return { ok: false, ownerChanged: true };
+      if (restore.completed !== true) return { ok: false, ownerChanged: false };
+      const rootGraph = app?.graph;
+      const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
+      const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
+      return {
+        ok:
+          ownsWorkflow(workflow, "repaint-verify") &&
+          sameWorkflowObject(activeWorkflowRef(), workflow) &&
+          canvasIsRoot &&
+          rootMeta?.[WORKFLOW_UUID_FIELD] === targetUuid &&
+          normalizedWorkflowPath(rootMeta?.[WORKFLOW_PATH_FIELD]) === normalizedWorkflowPath(destinationPath),
+        ownerChanged: false,
+      };
+    } catch {
+      // A throw is recoverable only when the awaited load also lost ownership. If
+      // the same owner remains active, preserve the existing fail-closed refusal.
+      return {
+        ok: false,
+        ownerChanged: !ownsWorkflow(workflow),
+      };
+    }
+  };
+
+  // A failed reconciliation has already put some other workflow's payload on the
+  // shared canvas. Before refusing, repair the record that is active NOW. This is a
+  // separate bounded phase: it must never recurse back into repaintSaveAsCanvas, and
+  // it must never repaint an older predecessor over a newer tab.
+  const neutralizeCanvas = async () => {
+    const active = activeWorkflowRef();
+    if (!active || typeof app?.loadGraphData !== "function") return false;
+    if (!ownsWorkflow(active, "neutral-before")) return false;
+    const neutralState = { nodes: [], links: [], groups: [], extra: {} };
+    try {
+      const neutral = await loadGraphDataWithCompletionProof({
+        liteGraph: liteGraphGlobal(),
+        graph: app?.graph,
+        load: () =>
+          app.loadGraphData(neutralState, true, true, active, {
+            __cmcpKeepInstance: true,
+          }),
+      });
+      const rootGraph = app?.graph;
+      const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
+      const liveNodes = rootGraph?._nodes;
+      const serialized = typeof rootGraph?.serialize === "function" ? rootGraph.serialize() : null;
+      const noNodes =
+        Array.isArray(liveNodes) &&
+        liveNodes.length === 0 &&
+        (serialized == null || (Array.isArray(serialized.nodes) && serialized.nodes.length === 0));
+      const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
+      const noStalePath = rootMeta?.[WORKFLOW_PATH_FIELD] == null;
+      const current = activeWorkflowRef();
+      return (
+        neutral.completed === true &&
+        canvasIsRoot &&
+        noNodes &&
+        noStalePath &&
+        !!current &&
+        ownsWorkflow(current, "neutral-after")
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const repairActiveCanvas = async () => {
+    let repairWorkflow = activeWorkflowRef();
+    for (let repair = 0; repair <= MAX_SAVE_AS_CANVAS_RECONCILIATIONS; repair += 1) {
+      if (!repairWorkflow) break;
+      const repairPath = typeof repairWorkflow.path === "string" && repairWorkflow.path ? repairWorkflow.path : null;
+      if (repairPath) {
+        const repaired = await repaintOne(repairWorkflow, repairPath);
+        if (repaired.ok) return { ok: true, mode: "active" };
+      }
+      const current = activeWorkflowRef();
+      if (!current) break;
+      repairWorkflow = current;
+      if (repair >= MAX_SAVE_AS_CANVAS_RECONCILIATIONS) break;
+    }
+    return (await neutralizeCanvas()) ? { ok: true, mode: "neutral" } : { ok: false };
+  };
+
+  if (!ownsWorkflow(copy, "repaint-before")) return false;
+  let workflow = copy;
+  let workflowPath = targetPath;
+  for (let reconciliation = 0; reconciliation <= MAX_SAVE_AS_CANVAS_RECONCILIATIONS; reconciliation += 1) {
+    const result = await repaintOne(workflow, workflowPath);
+    if (result.ok) return true;
+    if (!result.ownerChanged) return false;
+
+    const current = activeWorkflowRef();
+    if (!current || sameWorkflowObject(current, workflow)) return false;
+    if (reconciliation >= MAX_SAVE_AS_CANVAS_RECONCILIATIONS) {
+      const repair = await repairActiveCanvas();
+      if (!repair.ok) {
+        throw new Error(
+          `Save-As canvas reconciliation entered an unsafe state after ${
+            MAX_SAVE_AS_CANVAS_RECONCILIATIONS + 1
+          } bounded loads; the active canvas could not be safely repaired, so nothing was persisted (#939).`,
+        );
+      }
+      throw new Error(
+        `Save-As canvas reconciliation entered an unsafe state after ${
+          MAX_SAVE_AS_CANVAS_RECONCILIATIONS + 1
+        } bounded loads; the active canvas was safely repaired (${repair.mode}), so nothing was persisted (#939).`,
+      );
+    }
+    const currentPath = typeof current.path === "string" && current.path ? current.path : null;
+    if (!currentPath) return false;
+    // Advance the state machine to the record that is active NOW. Do not call
+    // repaintSaveAsCanvas here: that recursive shape was the unbounded-race bug.
+    workflow = current;
+    workflowPath = currentPath;
+  }
+  return false;
+}
+
 /** Programmatically save the active workflow — NO Save/Rename dialog.
  *
  *  Delegates to the shared, unit-tested `saveActiveWorkflow` (web/js/lib/
@@ -6713,6 +6912,12 @@ async function programmaticSave(name) {
   // workflow changed during our pre-probe — restoring the "capture A before the first
   // await" guarantee the pre-probe would otherwise have widened into a wrong-tab window.
   const expectWf = svc?.activeWorkflow;
+  const saveAsGeneration = ++saveAsCanvasGeneration;
+  const operationFence = () => saveAsCanvasGeneration === saveAsGeneration;
+  const canvasFence = ({ workflow } = {}) =>
+    saveAsCanvasGeneration === saveAsGeneration &&
+    !!workflow &&
+    sameWorkflowObject(activeWorkflowRef(), workflow);
   // #557 r3 — capture the pre-save identity NOW so a save's object SWAP can be
   // threaded through the replacement event: the predecessor/successor pair is
   // only known for certain here. Static path equality cannot decide it — a
@@ -6747,6 +6952,24 @@ async function programmaticSave(name) {
     // and refuses a first save whose canvas provably belongs to another workflow.
     canvasBinding: describeLiveCanvasBinding,
     details,
+    repaintCanvas: async (copy, targetPath) => {
+      const repainted = await repaintSaveAsCanvas(copy, targetPath, {
+        canvasFence: (workflow, phase) => canvasFence({ workflow, phase }),
+      });
+      if (repainted) details.canvasRepainted = true;
+      return repainted;
+    },
+    restoreCanvas: async ({ workflow }) => {
+      // The adapter restores the record before calling this hook. Repaint only when
+      // that record is still the active instance; a concurrent tab switch must not
+      // load the source graph over the user's other canvas.
+      if (!canvasFence(workflow)) return false;
+      return repaintSaveAsCanvas(workflow, workflow.path, {
+        canvasFence: (current, phase) => canvasFence({ workflow: current, phase }),
+      });
+    },
+    canvasFence,
+    operationFence,
     expect: expectWf, // #330: refuse if the user switched tabs during our pre-save HEAD
     // #771 — ComfyUI answers EVERY filesystem error on the userdata write with one
     // 400 that blames the FILENAME, and logs the real cause a line earlier. This
@@ -6755,6 +6978,17 @@ async function programmaticSave(name) {
     // runs only once the 400 shape is already recognised.
     readSaveFailureCause: (path) => readSaveFailureCause(path, api),
   });
+  // The repaint path only previews the destination identity because a failed copy must
+  // not leave a reusable path alias behind. Commit it after saveActiveWorkflow has
+  // completed its persistence/read-back proof; the produced record is the copy this save
+  // actually activated, never a later active-canvas observation (#939).
+  if (details.mode === "save-as-copy" && details.activatedRecord) {
+    try {
+      workflowStableUuid(details.activatedRecord, { embed: true });
+    } catch {
+      // Identity bookkeeping must not turn an already-persisted Save-As into a failure.
+    }
+  }
   const outcome = describeSaveOutcome(details);
   // #557 r3/r4/r5/r7/r8/r10 — thread the identity across the swap ONLY with
   // CONTINUITY PROVEN FROM THE SAVE'S OWN REPLACEMENT EVENT. The carry and its
@@ -6822,7 +7056,12 @@ async function programmaticSave(name) {
   // Hand back the RECORD, and let the caller resolve identity from it. `activatedRecord` is
   // the Save-As copy the adapter PROVED active; `savedRecord` covers the first-save path.
   // Either way it is the save transaction's own output, never a later active-canvas read.
-  return { name: saved || getWorkflowTitle(), producedRecord: details?.activatedRecord || details?.savedRecord || null, ...outcome };
+  return {
+    name: saved || getWorkflowTitle(),
+    producedRecord: details?.activatedRecord || details?.savedRecord || null,
+    ...(details.canvasRepainted ? { canvas_repainted: true } : {}),
+    ...outcome,
+  };
 }
 
 /** #1434 — dirty/persisted snapshot for a save that did not settle in time. */
@@ -18495,7 +18734,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // `workflow_identity_unavailable` explicitly, so the caller is told rather than misled.
     // An in-place save does not change which workflow is active, so its pre-existing #747
     // fallback strands nobody and stays.
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(outcome.saved_as ? replyIdentity : replyIdentity ?? liveWorkflowListActive().activeIdentity, { savedAs: !!outcome.saved_as }) };
+    return {
+      saved: true,
+      workflow,
+      ...outcome,
+      ...saveReplyIdentity(
+        outcome.saved_as ? replyIdentity : replyIdentity ?? liveWorkflowListActive().activeIdentity,
+        { savedAs: !!outcome.saved_as, canvasRepainted: outcome.canvas_repainted === true },
+      ),
+    };
   },
 
   async workflow_save_as({ name, rid }) {
@@ -18525,7 +18772,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // pre-save uuid already IS the active workflow's and no fence is about to refuse.
     // Telling that caller to re-fence and to re-open the workflow would send them fixing
     // something that is not broken.
-    return { saved: true, workflow, ...outcome, ...saveReplyIdentity(replyIdentity, { savedAs: !!outcome.saved_as }) };
+    return {
+      saved: true,
+      workflow,
+      ...outcome,
+      ...saveReplyIdentity(replyIdentity, {
+        savedAs: !!outcome.saved_as,
+        canvasRepainted: outcome.canvas_repainted === true,
+      }),
+    };
   },
 
   // --- Workflow tabs: new / list / open / switch / rename / close ----------

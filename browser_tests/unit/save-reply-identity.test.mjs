@@ -91,14 +91,16 @@ test("#747 WIRING: BOTH save handlers report the identity, and the FLAG follows 
   const saveAsBlock = src.slice(saveAsIdx, saveAsIdx + 2200);
 
   // workflow_save is only a Save-As when the outcome says so…
-  assert.match(saveBlock, /saveReplyIdentity\(outcome\.saved_as \? replyIdentity : replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
+  assert.match(saveBlock, /saveReplyIdentity\([\s\S]*outcome\.saved_as \? replyIdentity : replyIdentity \?\? liveWorkflowListActive\(\)\.activeIdentity/);
+  assert.match(saveBlock, /savedAs:\s*!!outcome\.saved_as,\s*canvasRepainted:\s*outcome\.canvas_repainted === true/);
   // …and #978 — so does workflow_save_as, whose NAME is not the fact. Asked to save an
   // unsaved tab, the adapter classifies it `first_save`: the successor is
   // identity-CONTINUOUS with the temporary predecessor, so nothing about which workflow
   // is active changed and the Save-As disclosure would send that caller re-fencing and
   // re-opening for a problem they do not have. The IDENTITY is still always established
   // from the produced record (asserted below); only the disclosure follows the outcome.
-  assert.match(saveAsBlock, /saveReplyIdentity\(replyIdentity, \{ savedAs: !!outcome\.saved_as \}\)/);
+  assert.match(saveAsBlock, /saveReplyIdentity\([\s\S]*replyIdentity/);
+  assert.match(saveAsBlock, /savedAs:\s*!!outcome\.saved_as,\s*canvasRepainted:\s*outcome\.canvas_repainted === true/);
   // #941 — and a Save-As must NOT fall back to the live active canvas. Absence stays
   // absence; substituting whatever is active can name a foreign canvas (codex).
   assert.doesNotMatch(saveAsBlock, /savedAs: true[\s\S]{0,80}liveWorkflowListActive/);

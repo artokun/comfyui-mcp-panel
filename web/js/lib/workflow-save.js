@@ -556,6 +556,19 @@ export async function saveActiveWorkflow(
     // this module keeps no opinion about how the log is reached, and so a caller that
     // cannot reach it simply omits it.
     readSaveFailureCause,
+    // Optional production hook used for persisted Save-As copies. It must return true
+    // only after the destination-stamped copy is proven live on the shared canvas.
+    repaintCanvas,
+    // Optional production hook used to restore the source onto the shared canvas when
+    // a Save-As repaint started but did not complete. It runs after the copy is removed
+    // and the previous active record is restored, and must return true only after that
+    // source binding is proven live again.
+    restoreCanvas,
+    // Optional operation fence for Save-As canvas ownership. When supplied it must
+    // return true only while this operation still owns the active canvas; false is
+    // a stale-operation refusal, never permission to restore a predecessor.
+    canvasFence,
+    operationFence,
   } = {},
 ) {
   const wf = svc?.activeWorkflow;
@@ -779,7 +792,15 @@ export async function saveActiveWorkflow(
     // never references the source's on-disk file. If that copy API is unavailable,
     // REFUSE rather than risk moving the external original.
     if (isExternalWorkflowPath(sourcePath)) {
-      const copyToUserDir = resolveSaveAsCopy(svc, { reconcileSavedCopy, canvasBinding, assertCanvasNotForeign });
+      const copyToUserDir = resolveSaveAsCopy(svc, {
+        reconcileSavedCopy,
+        canvasBinding,
+        assertCanvasNotForeign,
+        repaintCanvas,
+        restoreCanvas,
+        canvasFence,
+        operationFence,
+      });
       if (!copyToUserDir) {
         throw new Error(
           "save-as (copy) is unavailable on this frontend for an externally-loaded workflow; " +
@@ -834,7 +855,19 @@ export async function saveActiveWorkflow(
     // (#566 codex P0 — "whatever is active after the await" is NOT succession
     // evidence; a mid-trio switch to a foreign tab must thread/consume NOTHING).
     const producedRecord = {};
-    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign });
+    const atomicCopy = resolveSaveAsCopy(svc, {
+      reconcileSavedCopy,
+      producedRecord,
+      canvasBinding,
+      assertCanvasNotForeign,
+      // First-save successors already inherit the source's live identity and retain
+      // their existing copy semantics. The repaint is specifically for persisted/unknown
+      // Save-As copies whose source path metadata must follow the new destination.
+      repaintCanvas: cls === "never-persisted" ? undefined : repaintCanvas,
+      restoreCanvas,
+      canvasFence,
+      operationFence,
+    });
 
     // #226 CLASSIFICATION GUARD, scoped to the hazard it actually names (#1066 defect 2).
     //
@@ -1256,8 +1289,32 @@ async function probeSourceOnDisk(existsOnDisk, normPath) {
  *  `canvasBinding` is the #708 live-canvas identity oracle (see
  *  normalizeCanvasBinding). It decides ONE thing here: whether the SOURCE tab's
  *  serialized state may be refreshed from the live canvas before the copy is taken.
- *  See the comment at that call. */
-function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign } = {}) {
+ *  See the comment at that call.
+ *
+ *  `repaintCanvas` is an optional post-open hook for a persisted Save-As. When supplied,
+ *  it must repaint the copy's state onto the live canvas and return `true` only after
+ *  verifying that the copy and its destination metadata are live. The production panel
+ *  supplies this because the store-level `openWorkflow` moves the active pointer without
+ *  repainting it; first-save callers omit it to preserve their existing copy semantics.
+ *  `restoreCanvas` is the matching optional hook for a repaint that started but failed;
+ *  it receives `{ workflow: prevActive, copy, targetPath }` after record cleanup and
+ *  must return `true` only after the previous workflow is proven live again. `canvasFence`
+ *  is checked before and after every awaited repaint/restore and must reject stale
+ *  generations or a different current tab. `operationFence`, when supplied, is checked before
+ *  failed-copy cleanup and must reject cleanup from a superseded Save-As generation. */
+function resolveSaveAsCopy(
+  svc,
+  {
+    reconcileSavedCopy,
+    producedRecord,
+    canvasBinding,
+    assertCanvasNotForeign,
+    repaintCanvas,
+    restoreCanvas,
+    canvasFence,
+    operationFence,
+  } = {},
+) {
   // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
   // returns is UNLOADED (no changeTracker → activeState === null), and
   // ComfyWorkflow.save() serializes `activeState ?? null` — so persisting a copy
@@ -1377,8 +1434,123 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
       // persist — so save() writes the real graph, not null. A throw here aborts
       // BEFORE any saveWorkflow, so a failed open never persists null.
       const prevActive = svc.activeWorkflow;
+      let repaintAttempted = false;
       const resolvedName = () =>
         baseName(svc.activeWorkflow?.filename) || baseName(copy.filename) || effectiveName;
+      const canvasFenceAllows = (phase, workflow) => {
+        if (typeof canvasFence !== "function") return true;
+        try {
+          return canvasFence({ phase, workflow, copy, targetPath: finalTargetPath }) === true;
+        } catch {
+          return false;
+        }
+      };
+      const failClosedAfterRestoreFailure = () => {
+        // Clearing only OUR restored predecessor is a safe terminal state. If the user
+        // switched to a newer tab while cleanup was in flight, leave that tab selected;
+        // clearing it would be the same clobber in another form.
+        try {
+          if (prevActive !== undefined && sameWorkflowRecord(prevActive, svc.activeWorkflow)) {
+            svc.activeWorkflow = null;
+          }
+        } catch {
+          /* best effort; the caller still receives an explicit cleanup failure */
+        }
+      };
+      const cleanupFailedCopy = async () => {
+        // Once a successor Save-As advances the operation generation, this operation may no
+        // longer purge or close ANY copy. The old copy can already be inactive while still
+        // being the successor's source/predecessor, so an active-record check alone is too
+        // late (#939).
+        if (typeof operationFence === "function") {
+          let current = false;
+          try {
+            current = operationFence({ copy, targetPath: finalTargetPath }) === true;
+          } catch {
+            current = false;
+          }
+          if (!current) {
+            return {
+              ok: false,
+              reason: "a newer Save-As operation advanced before cleanup",
+            };
+          }
+        }
+        // Capture ownership BEFORE removing the copy. ComfyUI's closeWorkflow may
+        // auto-select the first remaining tab, so checking `activeWorkflow` after the
+        // purge would mistake our own store cleanup for a user tab switch.
+        const copyIsActive = isSameCopy(copy, svc.activeWorkflow);
+        const ownedBeforeRemoval = copyIsActive && canvasFenceAllows("restore-owner", copy);
+        // A newer Save-As can start while this copy is still active. Its generation
+        // fence makes this operation stale, but the copy is now the newer operation's
+        // source/current record. Do not close or coerce it: that destroys the newer
+        // operation's unsaved state (#939). A copy that is no longer active remains
+        // eligible for the identity-safe orphan purge below.
+        if (copyIsActive && !ownedBeforeRemoval) {
+          return {
+            ok: false,
+            reason: "the active copy is owned by a newer Save-As operation",
+          };
+        }
+        removeInMemoryWorkflow(svc, copy);
+        // The copy is the only active record this operation may replace. A tab switch,
+        // a newer Save-As generation, or an unreadable fence means ownership is gone:
+        // purge OUR copy but never point the store back at an older tab.
+        if (!ownedBeforeRemoval) {
+          return {
+            ok: false,
+            reason: "the active tab or Save-As canvas generation changed before cleanup",
+          };
+        }
+        if (
+          !isSameCopy(copy, svc.activeWorkflow) &&
+          !sameWorkflowRecord(svc.activeWorkflow, prevActive)
+        ) {
+          return {
+            ok: false,
+            reason: "the active tab changed while removing the failed Save-As copy",
+          };
+        }
+        if (prevActive !== undefined && !sameWorkflowRecord(svc.activeWorkflow, prevActive)) {
+          svc.activeWorkflow = prevActive;
+        }
+        if (!repaintAttempted) return { ok: true };
+        if (typeof restoreCanvas !== "function") {
+          failClosedAfterRestoreFailure();
+          return { ok: false, reason: "no verified canvas restore hook was available" };
+        }
+        if (!canvasFenceAllows("restore-before", prevActive)) {
+          failClosedAfterRestoreFailure();
+          return { ok: false, reason: "the Save-As canvas generation changed before source restore" };
+        }
+        try {
+          const restored = (await restoreCanvas({ workflow: prevActive, copy, targetPath: finalTargetPath })) === true;
+          if (!restored || !canvasFenceAllows("restore-after", prevActive)) {
+            failClosedAfterRestoreFailure();
+            return {
+              ok: false,
+              reason: restored
+                ? "source restore completed but its canvas ownership could not be verified"
+                : "source canvas restore returned false",
+            };
+          }
+          return { ok: true };
+        } catch (restoreError) {
+          failClosedAfterRestoreFailure();
+          return { ok: false, reason: `source canvas restore threw (${describeThrown(restoreError)})` };
+        }
+      };
+      const throwAfterCleanup = async (err) => {
+        const cleanup = await cleanupFailedCopy();
+        if (!cleanup.ok) {
+          const original = describeThrown(err);
+          throw new Error(
+            `${original}; Save-As cleanup was fail-closed because ${cleanup.reason}. ` +
+              `No Save-As success was reported and nothing further may be persisted (#939).`,
+          );
+        }
+        throw err;
+      };
       // #566 codex P0 — success exit: thread the trio's PRODUCED record into the
       // caller's out-param ONLY with PROOF the post-trio active tab IS the copy
       // this trio just wrote (its proxy-safe token reflects through the store's
@@ -1403,11 +1575,71 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
       };
       try {
         await svc.openWorkflow(copy);
-        // NO capture on the copy — see the #708 note at the top of this adapter. The
-        // copy persists the state `saveAs` took from the source tab; asking the copy's
-        // tracker to "prepare" re-reads the shared global canvas, which is precisely the
-        // read that put a foreign workflow's graph into a brand-new tab's file.
-        //
+        // The store-level open moves the active pointer without repainting the shared
+        // canvas. For a persisted Save-As the production panel therefore supplies a
+        // verified rebind here. It loads a destination-stamped copy state, proves the
+        // active record and root metadata agree, and only then captures the live canvas
+        // into the copy's tracker. Without this ordering the copy keeps the source's
+        // workflow_path, so a visible graph edit is followed by a no-name save refusal.
+        let canvasRepainted = false;
+        if (typeof repaintCanvas === "function") {
+          repaintAttempted = true;
+          if (!canvasFenceAllows("repaint-before", copy)) {
+            throw markPreCommit(
+              new Error(
+                `refusing to save "${effectiveName}": the Save-As canvas owner changed before ` +
+                  `repaint. Nothing was written; retry on the intended tab (#939).`,
+              ),
+            );
+          }
+          let repainted = false;
+          try {
+            repainted = (await repaintCanvas(copy, finalTargetPath)) === true;
+          } catch (err) {
+            throw markPreCommit(
+              new Error(
+                `refusing to save "${effectiveName}": rebinding the Save-As copy onto the ` +
+                  `canvas failed (${describeThrown(err)}). Nothing was written; the original ` +
+                  `workflow is untouched. Retry the save (#939).`,
+              ),
+            );
+          }
+          if (repainted && !canvasFenceAllows("repaint-after", copy)) {
+            throw markPreCommit(
+              new Error(
+                `refusing to save "${effectiveName}": the active tab or Save-As canvas ` +
+                  `generation changed during repaint. Nothing was written; retry (#939).`,
+              ),
+            );
+          }
+          if (!repainted) {
+            throw markPreCommit(
+              new Error(
+                `refusing to save "${effectiveName}": the Save-As copy could not be proven ` +
+                  `active on the canvas with destination metadata. Nothing was written; the ` +
+                  `original workflow is untouched. Retry the save (#939).`,
+              ),
+            );
+          }
+          canvasRepainted = true;
+        }
+        // NO capture on the copy when no repaint hook was supplied — see the #708 note at
+        // the top of this adapter. Once the production hook has positively rebound the
+        // copy, capture is safe and is required to carry the destination path through a
+        // later graph edit/no-name save.
+        if (canvasRepainted) {
+          try {
+            copy?.changeTracker?.prepareForSave?.();
+          } catch (err) {
+            throw markPreCommit(
+              new Error(
+                `refusing to save "${effectiveName}": capturing the rebound Save-As copy ` +
+                  `failed (${describeThrown(err)}), so the saved copy could omit the newest ` +
+                  `edits. Nothing was written — retry the save (#939).`,
+              ),
+            );
+          }
+        }
         // #1267 — OBSERVE THE CAPTURE, DO NOT INFER IT FROM THE CALL ABOVE.
         //
         // Until now the ONLY thing standing between this route and a saved-but-empty
@@ -1462,6 +1694,25 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
             ),
           );
         }
+        // #939 — FINAL OWNERSHIP PROOF immediately before the only persistence
+        // call. `repaintCanvas` may reconcile through several active records and
+        // return true once the newest one is stable; that is not proof that the
+        // ORIGINAL copy produced by this Save-As is still the owned active tab.
+        // Require both the copy token and the operation/generation fence here,
+        // synchronously, so a stale copy cannot be written or reported as the
+        // produced successor. This also covers a switch after repaint returned.
+        if (
+          canvasRepainted &&
+          (!isSameCopy(copy, svc.activeWorkflow) || !canvasFenceAllows("persist-before", copy))
+        ) {
+          throw markPreCommit(
+            new Error(
+              `refusing to save "${effectiveName}": the original Save-As copy is no longer ` +
+                `the current owned active tab. Nothing was written; no Save-As identity or ` +
+                `success was reported. Retry on the intended tab (#939).`,
+            ),
+          );
+        }
         await svc.saveWorkflow(copy);
       } catch (err) {
         // P2 — distinguish a CONFIRMED pre-commit failure (409 conflict, or the
@@ -1502,19 +1753,15 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
             // The target holds SOMEONE ELSE's content — our write was clobbered or
             // never landed. Remove our orphan, restore active, and surface a
             // clobber-aware error (never a false success).
-            removeInMemoryWorkflow(svc, copy);
-            if (prevActive !== undefined) svc.activeWorkflow = prevActive;
-            throw new Error(
+            await throwAfterCleanup(new Error(
               `save-as could not save "${finalTargetPath}": the target now holds a DIFFERENT ` +
                 `workflow (a concurrent save clobbered it). Retry with a new name (#226).`,
-            );
+            ));
           }
           // "absent"/"unknown" ⇒ the write did not land (or can't be confirmed) ⇒
           // fall through to the safe removal below.
         }
-        removeInMemoryWorkflow(svc, copy);
-        if (prevActive !== undefined) svc.activeWorkflow = prevActive;
-        throw err;
+        await throwAfterCleanup(err);
       }
       // #1267 — POST-WRITE: report the BYTES, not the call. `ComfyWorkflow.save()`'s
       // first statement is `this.content = JSON.stringify(this.activeState)`, so after a
@@ -1534,14 +1781,12 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
       // is its own hazard, and the source was never touched.
       const writtenCapture = classifyGraphCapture(copy?.content);
       if (writtenCapture === "uncaptured") {
-        removeInMemoryWorkflow(svc, copy);
-        if (prevActive !== undefined) svc.activeWorkflow = prevActive;
-        throw new Error(
+        await throwAfterCleanup(new Error(
           `save-as wrote "${finalTargetPath}" but the bytes it sent contain no graph — the copy's ` +
             `state was lost between opening it and the write, so the file is EMPTY. Reporting the ` +
             `failure rather than a phantom success: the original workflow was NOT modified and the ` +
             `previous tab has been restored. Delete "${finalTargetPath}" and retry (#1267).`,
-        );
+        ));
       }
       // SUCCESS-PATH BOOKKEEPING (#309 P1, mirror of the adoption branch). ComfyUI's own
       // saveWorkflow(copy) captures copy.content, awaits the write, THEN calls
@@ -1578,13 +1823,11 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
           // So IDENTITY-SAFELY remove our copy and restore the previously-active
           // workflow BEFORE surfacing the error — never retain ownership of a target
           // we just proved isn't ours (#226).
-          removeInMemoryWorkflow(svc, copy);
-          if (prevActive !== undefined) svc.activeWorkflow = prevActive;
-          throw new Error(
+          await throwAfterCleanup(new Error(
             `save-as reported success but "${finalTargetPath}" does not contain the saved ` +
               `workflow — a concurrent save clobbered it (ComfyUI's /userdata write is not ` +
               `exclusive-create). Retry with a new name (#226).`,
-          );
+          ));
         }
       }
       return finish();
@@ -2166,4 +2409,27 @@ function isSameCopy(wf, candidate) {
     }
   }
   return candidate === wf; // fallback: un-stamped copy
+}
+
+/** Proxy-safe identity for the predecessor record during failed-copy cleanup. This is
+ * deliberately weaker than `isSameCopy`: unlike the copy, the predecessor has no
+ * Save-As token, so raw identity or its shared ChangeTracker are the only available
+ * carriers; path equality is not evidence of the same tab. */
+function sameWorkflowRecord(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  try {
+    if (a.__v_raw && a.__v_raw === b) return true;
+    if (b.__v_raw && b.__v_raw === a) return true;
+    if (a.__v_raw && b.__v_raw && a.__v_raw === b.__v_raw) return true;
+  } catch {
+    /* fall through to tracker identity */
+  }
+  try {
+    const trackerA = a.changeTracker;
+    const trackerB = b.changeTracker;
+    return Boolean(trackerA) && trackerA === trackerB;
+  } catch {
+    return false;
+  }
 }

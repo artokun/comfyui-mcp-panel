@@ -3138,3 +3138,359 @@ test('P2: a Windows DRIVE-RELATIVE source ("C:Foo.json", no separator) is extern
   assert.ok(svc.disk.has('C:Foo.json'), 'external original preserved')
   assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'never moved the external original')
 })
+
+test('#939: Save-As repaints destination metadata before a graph edit and no-name save', async () => {
+  const sourcePath = 'workflows/Source.json'
+  const destinationPath = 'workflows/Destination.json'
+  const sourceState = graphState('source')
+  sourceState.extra.comfyui_mcp = {}
+  sourceState.extra.comfyui_mcp.workflow_path = sourcePath
+  const source = {
+    path: sourcePath,
+    filename: 'Source.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc } = makeStore147Service({ active: source, graph: sourceState })
+  const order = []
+  const saveAs = svc.saveAs.bind(svc)
+  svc.saveAs = (...args) => {
+    order.push('saveAs')
+    return saveAs(...args)
+  }
+  const openWorkflow = svc.openWorkflow.bind(svc)
+  svc.openWorkflow = async (...args) => {
+    order.push('openWorkflow')
+    return openWorkflow(...args)
+  }
+  const saveWorkflow = svc.saveWorkflow.bind(svc)
+  svc.saveWorkflow = async (...args) => {
+    order.push('saveWorkflow')
+    return saveWorkflow(...args)
+  }
+
+  const repaintCanvas = async (copy, targetPath) => {
+    order.push('repaint:start')
+    const rebound = JSON.parse(JSON.stringify(copy.changeTracker.activeState))
+    rebound.extra.comfyui_mcp.workflow_path = targetPath
+    copy.changeTracker.activeState = rebound
+    order.push('repaint:verified')
+    return true
+  }
+
+  const details = {}
+  await saveActiveWorkflow(svc, 'Destination', {
+    existsOnDisk: async (path) => svc.disk.has(path),
+    canvasBinding: () => 'bound',
+    repaintCanvas,
+    details,
+  })
+
+  const copy = svc.activeWorkflow
+  assert.equal(copy.path, destinationPath)
+  assert.equal(details.mode, 'save-as-copy')
+  assert.equal(JSON.parse(svc.disk.get(destinationPath)).extra.comfyui_mcp.workflow_path, destinationPath)
+  assert.deepEqual(
+    order,
+    ['saveAs', 'openWorkflow', 'repaint:start', 'repaint:verified', 'saveWorkflow'],
+    'the production save path must repaint before it persists the copy',
+  )
+
+  // A graph edit after Save-As mutates the live canvas, then a no-name save must keep
+  // the destination identity rather than reintroducing the source path.
+  copy.changeTracker.activeState.nodes.push({ id: 2, type: 'EditedAfterSaveAs' })
+  await saveActiveWorkflow(svc, undefined, {
+    existsOnDisk: async (path) => svc.disk.has(path),
+    canvasBinding: () => 'bound',
+  })
+  const edited = JSON.parse(svc.disk.get(destinationPath))
+  assert.equal(edited.extra.comfyui_mcp.workflow_path, destinationPath)
+  assert.equal(edited.nodes.some((node) => node.type === 'EditedAfterSaveAs'), true)
+})
+
+test('#939: an incomplete Save-As repaint restores the shared canvas with the source record', async () => {
+  const sourcePath = 'workflows/Source.json'
+  const destinationPath = 'workflows/Destination.json'
+  const sourceState = {
+    nodes: [{ id: 1, type: 'KSampler', widgets_values: ['source'] }],
+    links: [],
+    version: 1,
+  }
+  const source = {
+    path: sourcePath,
+    filename: 'Source.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
+  let canvasState = structuredClone(sourceState)
+  let restoreActive = null
+  let restoreCalls = 0
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, 'Destination', {
+        existsOnDisk,
+        canvasBinding: () => 'bound',
+        // Model the production repaint's real failure shape: the shared canvas is
+        // changed before completion proof rejects the load.
+        repaintCanvas: async () => {
+          canvasState = { nodes: [{ id: 1, type: 'KSampler', widgets_values: ['partial'] }], links: [], version: 1 }
+          return false
+        },
+        restoreCanvas: async ({ workflow }) => {
+          restoreCalls += 1
+          restoreActive = workflow
+          canvasState = structuredClone(workflow.changeTracker.activeState)
+          return true
+        },
+      }),
+    /could not be proven active/,
+  )
+
+  assert.equal(restoreCalls, 1, 'cleanup reconciled the shared canvas once')
+  assert.equal(restoreActive, source, 'cleanup restored the source record before repainting')
+  assert.equal(svc.activeWorkflow, source, 'active record returned to the source')
+  assert.deepEqual(canvasState, sourceState, 'the partially repainted canvas returned to source content')
+  assert.equal(svc.getWorkflowByPath(destinationPath), null, 'temporary copy was removed from the store')
+  assert.equal(svc.disk.has(destinationPath), false, 'the refusal did not persist a destination file')
+  assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false, 'failure never reported or attempted success')
+})
+
+test('#939: a tab switch during failed repaint does not restore or repaint over the newer tab', async () => {
+  const sourcePath = 'workflows/Source-switch.json'
+  const destinationPath = 'workflows/Destination-switch.json'
+  const sourceState = { nodes: [{ id: 1, type: 'KSampler', widgets_values: ['source'] }], links: [], version: 1 }
+  const source = {
+    path: sourcePath,
+    filename: 'Source-switch.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const newer = {
+    path: 'workflows/Newer.json',
+    filename: 'Newer.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
+  let canvasState = structuredClone(sourceState)
+  let restoreCalls = 0
+  let generation = 1
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, 'Destination-switch', {
+        existsOnDisk,
+        canvasBinding: () => 'bound',
+        canvasFence: ({ workflow }) => generation === 1 && svc.activeWorkflow === workflow,
+        repaintCanvas: async () => {
+          canvasState = { nodes: [{ id: 2, type: 'NewerTab' }], links: [], version: 1 }
+          generation += 1
+          svc.activeWorkflow = newer
+          return false
+        },
+        restoreCanvas: async () => {
+          restoreCalls += 1
+          canvasState = structuredClone(sourceState)
+          return true
+        },
+      }),
+    /active tab or Save-As canvas generation changed|could not be proven active/,
+  )
+
+  assert.equal(svc.activeWorkflow, newer, 'the newer tab remained active')
+  assert.equal(restoreCalls, 0, 'stale cleanup did not invoke source repaint')
+  assert.deepEqual(canvasState, { nodes: [{ id: 2, type: 'NewerTab' }], links: [], version: 1 })
+  assert.equal(svc.getWorkflowByPath(destinationPath), null, 'the failed copy was removed')
+  assert.equal(svc.disk.has(destinationPath), false, 'the failed copy was never persisted')
+  assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false)
+})
+
+test('#939: repeated tab switches that leave a newer tab stable cannot persist or carry Save-As identity', async () => {
+  const sourcePath = 'workflows/Source-repeated-switch.json'
+  const destinationPath = 'workflows/Destination-repeated-switch.json'
+  const source = {
+    path: sourcePath,
+    filename: 'Source-repeated-switch.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const newerOne = {
+    path: 'workflows/Newer-one.json',
+    filename: 'Newer-one.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const newerTwo = {
+    path: 'workflows/Newer-two.json',
+    filename: 'Newer-two.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source })
+  const details = {}
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, 'Destination-repeated-switch', {
+        existsOnDisk,
+        details,
+        // Model repaintSaveAsCanvas's bounded reconciliation reporting success
+        // for the newest stable tab. The adapter must still prove that the copy
+        // itself owns the active record before it calls saveWorkflow(copy).
+        canvasFence: () => true,
+        repaintCanvas: async () => {
+          svc.activeWorkflow = newerOne
+          await Promise.resolve()
+          svc.activeWorkflow = newerTwo
+          return true
+        },
+      }),
+    /original Save-As copy is no longer the current owned active tab/,
+  )
+
+  assert.equal(svc.activeWorkflow, newerTwo, 'the newest switched-to tab remained active')
+  assert.equal(svc.getWorkflowByPath(destinationPath), null, 'the stale copy was removed')
+  assert.equal(svc.disk.has(destinationPath), false, 'the stale copy was never persisted')
+  assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false, 'no stale copy write occurred')
+  assert.equal(details.activatedRecord, undefined, 'no Save-As identity was carried')
+  assert.equal(details.savedRecord, undefined, 'no succession identity was carried')
+})
+
+test('#939: overlapping Save-As keeps a newer operation\'s active source copy intact', async () => {
+  const sourcePath = 'workflows/Source-overlap.json'
+  const staleCopyPath = 'workflows/Stale-overlap.json'
+  const newerTargetPath = 'workflows/Newer-overlap.json'
+  const sourceState = graphState('overlap-source')
+  const source = {
+    path: sourcePath,
+    filename: 'Source-overlap.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
+  let generation = 1
+  let overlapCopy = null
+  let successorCopy = null
+  let newerEnteredResolve
+  const newerEntered = new Promise((resolve) => {
+    newerEnteredResolve = resolve
+  })
+  let releaseNewerResolve
+  const releaseNewer = new Promise((resolve) => {
+    releaseNewerResolve = resolve
+  })
+  let newerSave
+  let restoreCalls = 0
+
+  const originalSaveAs = svc.saveAs.bind(svc)
+  svc.saveAs = (workflow, path) => {
+    const created = originalSaveAs(workflow, path)
+    if (path === newerTargetPath) successorCopy = created
+    return created
+  }
+  const originalOpenWorkflow = svc.openWorkflow.bind(svc)
+  svc.openWorkflow = async (workflow) => {
+    const opened = await originalOpenWorkflow(workflow)
+    if (workflow === successorCopy) {
+      // The successor is already ACTIVE while the older operation is still waiting to
+      // report its repaint failure. The old cleanup must not purge its predecessor.
+      newerEnteredResolve()
+      await releaseNewer
+    }
+    return opened
+  }
+
+  const olderSave = saveActiveWorkflow(svc, 'Stale-overlap', {
+    existsOnDisk,
+    canvasBinding: () => 'bound',
+    operationFence: () => generation === 1,
+    canvasFence: ({ workflow }) => generation === 1 && svc.activeWorkflow === workflow,
+    repaintCanvas: async (copy) => {
+      overlapCopy = copy
+      generation = 2 // The newer panel Save-As advances the shared generation.
+      newerSave = saveActiveWorkflow(svc, 'Newer-overlap', {
+        existsOnDisk,
+      })
+      await newerEntered // Newer Save-As is in its awaited probe with the same copy active.
+      return false
+    },
+    restoreCanvas: async () => {
+      restoreCalls += 1
+      return true
+    },
+  })
+
+  await assert.rejects(
+    () => olderSave,
+    /newer Save-As operation advanced before cleanup/,
+  )
+  assert.equal(svc.activeWorkflow, successorCopy, 'the newer operation already has its successor copy active')
+  assert.equal(svc.getWorkflowByPath(staleCopyPath), overlapCopy, 'the stale copy remains indexed')
+  assert.ok(svc.openWorkflows.includes(overlapCopy), 'the newer operation\'s unsaved source tab remains open')
+  assert.equal(restoreCalls, 0, 'stale cleanup did not restore over the newer operation')
+
+  releaseNewerResolve()
+  await newerSave
+  assert.equal(svc.disk.has(newerTargetPath), true, 'the newer Save-As completed')
+  assert.deepEqual(
+    JSON.parse(svc.disk.get(newerTargetPath)),
+    sourceState,
+    'the newer Save-As persisted the active source copy\'s unsaved graph',
+  )
+})
+
+for (const [label, restoreCanvas, expected] of [
+  ['false', async () => false, /source canvas restore returned false/],
+  ['throws', async () => { throw new Error('restore exploded') }, /source canvas restore threw \(restore exploded\)/],
+]) {
+  test(`#939: restore ${label} fails closed without reporting Save-As success`, async () => {
+    const sourcePath = `workflows/Source-restore-${label}.json`
+    const destinationPath = `workflows/Destination-restore-${label}.json`
+    const sourceState = { nodes: [{ id: 1, type: 'KSampler', widgets_values: ['source'] }], links: [], version: 1 }
+    const source = {
+      path: sourcePath,
+      filename: `Source-restore-${label}.json`,
+      directory: 'workflows',
+      isPersisted: true,
+      isTemporary: false,
+    }
+    const { svc, existsOnDisk } = makeStore147Service({ files: [sourcePath], active: source, graph: sourceState })
+    let canvasState = structuredClone(sourceState)
+    let restoreCalls = 0
+
+    await assert.rejects(
+      () =>
+        saveActiveWorkflow(svc, `Destination-restore-${label}`, {
+          existsOnDisk,
+          canvasBinding: () => 'bound',
+          canvasFence: ({ workflow }) => svc.activeWorkflow === workflow,
+          repaintCanvas: async () => {
+            canvasState = { nodes: [{ id: 9, type: 'Partial' }], links: [], version: 1 }
+            return false
+          },
+          restoreCanvas: async () => {
+            restoreCalls += 1
+            return restoreCanvas()
+          },
+        }),
+      expected,
+    )
+
+    assert.equal(restoreCalls, 1)
+    assert.equal(svc.activeWorkflow, null, 'an unverified source canvas clears the active record')
+    assert.deepEqual(canvasState, { nodes: [{ id: 9, type: 'Partial' }], links: [], version: 1 })
+    assert.equal(svc.getWorkflowByPath(destinationPath), null, 'the failed copy was removed')
+    assert.equal(svc.disk.has(destinationPath), false, 'incomplete cleanup never persisted the destination')
+    assert.equal(svc.calls.some((call) => call[0] === 'saveWorkflow'), false)
+  })
+}
