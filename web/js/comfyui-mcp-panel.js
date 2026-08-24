@@ -288,6 +288,7 @@ import { recordSkillFromGraph, persistRecordedSkill } from "./lib/record-skill.j
 // was individually correct and their sum was not, and a sum cannot be asserted against the
 // 1.7MB panel IIFE.
 import { makeCommandBudget } from "./lib/command-budget.js";
+import { fetchImageForMcp } from "./lib/fetch-image.js";
 // #1184 — the ORDER a backend switch commits in. A module because the defect is an
 // ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
 import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
@@ -11968,6 +11969,11 @@ function lateWorkflowSaveReceipts() {
 }
 
 const GRAPH_TOOL_EXECUTORS = {
+  // Read-only MCP get_image relay. It accepts only a ComfyUI file reference,
+  // fetches same-origin /view bytes, and never paints into the panel chat.
+  fetch_image(args = {}) {
+    return fetchImageForMcp(args, { api });
+  },
   // #608: force a fresh /object_info re-register + combo refresh so an asset that
   // appeared server-side AFTER page-load — an upload_image action:"stage" input, a freshly
   // downloaded model/LoRA/VAE, a newly installed node pack — becomes selectable in
@@ -25172,7 +25178,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // commands get the normal activity card.
         const SILENT_CMDS = new Set([
           "ask_user", "request_secret", "set_todo", "show_media", "open_civitai",
-          "ui_render", "ui_update",
+          "ui_render", "ui_update", "fetch_image",
           "civitai_results", "civitai_highlight", "civitai_clear_highlight",
           "civitai_switch_tab", "civitai_search", "civitai_open_lightbox",
           "open_training", "training_get_state", "training_set_field",

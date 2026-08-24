@@ -396,6 +396,7 @@ const CANVAS_INDEPENDENT_COMMANDS = new Set([
   'nodes_queue_status',
   'graph_update_node',
   'graph_get_virtual_types',
+  'fetch_image',
   'comfy_reboot',
   'free_vram',
 ]);
