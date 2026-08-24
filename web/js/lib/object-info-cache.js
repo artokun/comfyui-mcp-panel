@@ -87,11 +87,18 @@ function cloneAndFreeze(value, seen = new WeakMap()) {
   seen.set(value, clone);
   let keys;
   try {
-    keys = Object.keys(value);
+    keys = Reflect.ownKeys(value);
   } catch {
     throw new TypeError("object_info schema is unreadable");
   }
   for (const key of keys) {
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      throw new TypeError("object_info schema is unreadable");
+    }
+    if (!descriptor?.enumerable) continue;
     Object.defineProperty(clone, key, {
       value: cloneAndFreeze(value[key], seen),
       enumerable: true,
@@ -100,6 +107,16 @@ function cloneAndFreeze(value, seen = new WeakMap()) {
     });
   }
   return Object.freeze(clone);
+}
+
+function cloneForCache(value) {
+  try {
+    return { ok: true, value: cloneAndFreeze(value) };
+  } catch {
+    // Preserve the loader's result for its current caller, but do not retain an unreadable
+    // graph as a cache authority. This keeps ordinary/readFresh failure semantics unchanged.
+    return { ok: false, value: null };
+  }
 }
 
 /**
@@ -223,16 +240,14 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
           typeof payload === "object" &&
           Object.keys(payload).length > 0
         ) {
-          // SHARED IDENTITY IS NEW (codex): every write used to get its own object, and
-          // now they share one. A consumer that mutated the map would contaminate every
-          // later authorization instead of only its own call. Freezing the TOP LEVEL —
-          // the level the fence's `hasOwnProperty(defs, type)` reads — makes adding or
-          // removing a type key throw here and now, in a test or a dev console, rather
-          // than silently authorizing a type nobody installed. Shallow on purpose: a
-          // deep freeze of a 5MB schema on every fetch would cost more than the fetch
-          // this exists to avoid, and per-class contents are not what the fence rules on.
-          value = Object.freeze(defs);
-          at = now();
+          // Store a private frozen graph, including the outcome wrapper and its enumerable
+          // symbol tag. The loader's mutable result still goes to this caller unchanged,
+          // while later cache readers cannot mutate nested schema authority through it.
+          const cached = cloneForCache(defs);
+          if (cached.ok) {
+            value = cached.value;
+            at = now();
+          }
         }
         return defs;
       } finally {
@@ -406,8 +421,11 @@ export function createObjectInfoCache({ ttlMs = OBJECT_INFO_CACHE_TTL_MS, now = 
               typeof payload === "object" &&
               Object.keys(payload).length > 0
             ) {
-              value = Object.freeze(defs);
-              at = now();
+              const cached = cloneForCache(defs);
+              if (cached.ok) {
+                value = cached.value;
+                at = now();
+              }
             }
             return defs;
           } finally {

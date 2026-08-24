@@ -8,7 +8,7 @@
 // real clock is a slow test that eventually becomes a flaky one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { OBJECT_INFO_CACHE_TTL_MS, createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
+import { CACHE_OUTCOME, OBJECT_INFO_CACHE_TTL_MS, createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
 import { fetchWholeObjectInfo } from "../../web/js/lib/object-info-oracle.js";
 import { noBackendAnswerEstablished } from "../../web/js/lib/object-info-snapshot.js";
 
@@ -26,7 +26,7 @@ test("#716: a burst of reads costs ONE fetch", async () => {
     fetches += 1;
     return DEFS;
   };
-  for (let i = 0; i < 29; i++) assert.equal(await cache.read(fetchDefs), DEFS);
+  for (let i = 0; i < 29; i++) assert.deepEqual(await cache.read(fetchDefs), DEFS);
   assert.equal(fetches, 1, "29 widget writes, one download — the whole point of the issue");
 });
 
@@ -193,6 +193,58 @@ test("#1709: replace retires old cache entries and late in-flight responses", as
   );
 });
 
+test("#1709: ordinary read deep-detaches nested outcome schemas", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  const source = {
+    KSampler: { input: { required: { count: ["INT", { default: 1 }] } } },
+  };
+  const outcome = {
+    [CACHE_OUTCOME]: true,
+    defs: source,
+    failures: ["fallback unavailable"],
+    outcomes: [{ route: "client" }],
+  };
+
+  const returned = await cache.read(async () => outcome);
+  returned.defs.KSampler.input.required.count[1].default = 999;
+  const cached = await cache.read(async () => ({ Unexpected: {} }));
+
+  assert.equal(cached[CACHE_OUTCOME], true, "the cache keeps the outcome wrapper tag");
+  assert.deepEqual(cached.failures, ["fallback unavailable"], "diagnostics survive the detached copy");
+  assert.equal(cached.defs.KSampler.input.required.count[1].default, 1);
+  assert.equal(Object.isFrozen(cached.defs.KSampler.input.required.count[1]), true);
+  assert.equal(Object.isFrozen(cached.defs.KSampler.input.required.count), true);
+});
+
+test("#1709: readFresh deep-detaches nested schemas and does not cache an empty answer", async () => {
+  const c = clock();
+  const cache = createObjectInfoCache({ now: c.now });
+  const source = {
+    KSampler: { input: { required: { count: ["INT", { default: 1 }] } } },
+  };
+  const returned = await cache.readFresh(async () => source);
+  returned.value.KSampler.input.required.count[1].default = 999;
+
+  let ordinaryFetches = 0;
+  const cached = await cache.read(async () => {
+    ordinaryFetches += 1;
+    return { Unexpected: {} };
+  });
+  assert.equal(ordinaryFetches, 0, "the fresh non-empty response remains the cache entry");
+  assert.equal(cached.KSampler.input.required.count[1].default, 1);
+  assert.equal(Object.isFrozen(cached.KSampler.input.required.count[1]), true);
+  assert.equal(Object.isFrozen(cached.KSampler.input.required.count), true);
+
+  cache.invalidate();
+  assert.equal(
+    (await cache.readFresh(async () => null)).value,
+    null,
+    "an unavailable forced read reaches its caller",
+  );
+  assert.equal(cache.peek().cached, false, "an unavailable forced read is not cached");
+});
+
 test("#716: every joined caller sees a failing fetch fail", async () => {
   // codex noted this was untested. A coalesced failure that resolved for some callers and
   // rejected for others would be a fence that authorizes for one write and refuses another
@@ -219,7 +271,8 @@ test("#716: the shared payload cannot have type keys added or removed", async ()
   // direction is adding a key — authorizing a type nobody installed.
   const c = clock();
   const cache = createObjectInfoCache({ now: c.now });
-  const defs = await cache.read(async () => ({ KSampler: {} }));
+  await cache.read(async () => ({ KSampler: {} }));
+  const defs = await cache.read(async () => ({ Unexpected: {} }));
   assert.throws(() => {
     "use strict";
     defs.ForgedType = {};
@@ -556,7 +609,7 @@ test("#1126: readFresh actually re-fetches — the stored entry never satisfies 
   const forced = await cache.readFresh(async () => DEFS, { stamp: () => 1 });
   assert.equal(forced.value, DEFS, "the forced read goes to the server anyway");
   // …and the fresher payload replaces the stored one, so later ordinary readers benefit.
-  assert.equal(await cache.read(async () => ({ MustNotBeFetched: {} })), DEFS);
+  assert.deepEqual(await cache.read(async () => ({ MustNotBeFetched: {} })), DEFS);
 });
 
 test("#1126: an invalidate() retires a forced reread too — it must not be joined afterwards", async () => {

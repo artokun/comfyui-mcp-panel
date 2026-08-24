@@ -822,7 +822,7 @@ test("#1223 SHIPPED: a CACHE HIT is never filed as evidence — it can predate a
 
   snapshot.clear(); // what a reconnect does
   o.setEpoch(6); // ...and the epoch it bumps
-  assert.equal(await o.getFreshObjectInfo(), SCHEMA, "the cache still answers its waiter");
+  assert.deepEqual(await o.getFreshObjectInfo(), SCHEMA, "the cache still answers its waiter");
   assert.equal(
     snapshot.peek().held,
     false,
