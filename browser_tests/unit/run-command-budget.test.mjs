@@ -75,9 +75,233 @@ import {
   queuePromptChainDeps,
 } from "../../web/js/lib/queue-prompt-chain.js";
 import { MUTATION_BINDING_BAR } from "../../web/js/lib/graph-binding.js";
+import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
+import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
+import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js";
+import { createRunReceiptOutbox } from "../../web/js/lib/run-receipt-outbox.js";
+import { createRehelloGate, routeIsStale } from "../../web/js/lib/rehello-gate.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
-const panelSrc = readFileSync(panelPath, "utf8");
+const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
+
+function extractFunctionSource(source, marker, endMarker) {
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `could not locate ${marker}`);
+  if (endMarker) {
+    const end = source.indexOf(endMarker, start);
+    assert.notEqual(end, -1, `could not locate the end of ${marker}`);
+    return source.slice(start, end + 2);
+  }
+  const open = source.indexOf("{", start);
+  assert.notEqual(open, -1, `could not locate the body of ${marker}`);
+  let depth = 1;
+  let quote = null;
+  let lineComment = false;
+  let blockComment = false;
+  for (let i = open + 1; i < source.length; i++) {
+    const c = source[i];
+    const n = source[i + 1];
+    if (lineComment) {
+      if (c === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (c === "*" && n === "/") {
+        blockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (quote) {
+      if (c === "\\") {
+        i++;
+      } else if (c === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (c === "/" && n === "/") {
+      lineComment = true;
+      i++;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      blockComment = true;
+      i++;
+      continue;
+    }
+    if (c === "\"" || c === "'" || c === "`") {
+      quote = c;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return source.slice(start, i + 1);
+  }
+  assert.fail(`could not close ${marker}`);
+}
+
+const createBridgeClientSource = extractFunctionSource(
+  panelSrc,
+  "function createBridgeClient(",
+  "\n}\n\n// ---------------------------------------------------------------------------\n// Panel DOM",
+);
+
+class RuntimeBridgeSocket {
+  static OPEN = 1;
+  static CLOSED = 3;
+  static instances = [];
+
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.sent = [];
+    this.listeners = new Map();
+    RuntimeBridgeSocket.instances.push(this);
+  }
+
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
+  }
+
+  send(raw) {
+    if (this.readyState !== RuntimeBridgeSocket.OPEN) throw new Error("socket is not open");
+    this.sent.push(JSON.parse(raw));
+  }
+
+  open() {
+    this.readyState = RuntimeBridgeSocket.OPEN;
+    this.onopen?.();
+    this.listeners.get("open")?.();
+  }
+
+  receive(frame) {
+    const event = { data: JSON.stringify(frame) };
+    this.onmessage?.(event);
+    this.listeners.get("message")?.(event);
+  }
+
+  close() {
+    if (this.readyState === RuntimeBridgeSocket.CLOSED) return;
+    this.readyState = RuntimeBridgeSocket.CLOSED;
+    this.onclose?.();
+    this.listeners.get("close")?.();
+  }
+}
+
+function buildRuntimeBridgeClient({ routeRef, failNextSend = false } = {}) {
+  RuntimeBridgeSocket.instances = [];
+  const storage = new Map();
+  const bridgeState = { failNextSend };
+  const helloState = { block: false, release: null };
+  const noop = () => {};
+  const env = new Proxy(
+    {
+      WebSocket: RuntimeBridgeSocket,
+      DEFAULT_BRIDGE_URL: "ws://bridge.test",
+      STORAGE_KEY_BACKEND: "backend",
+      window: {
+        localStorage: {
+          getItem: (key) => storage.get(key) ?? null,
+          setItem: (key, value) => storage.set(key, String(value)),
+          removeItem: (key) => storage.delete(key),
+        },
+        location: { protocol: "http:", href: "http://panel.test/" },
+      },
+      location: { protocol: "http:", href: "http://panel.test/" },
+      document: { addEventListener: noop, removeEventListener: noop, querySelector: () => null },
+      loadBridgeUrl: () => "ws://bridge.test",
+      saveBridgeUrl: noop,
+      bridgeRouteId: () => routeRef.current,
+      tabRouteIdentity: { adopt: noop, settled: () => true },
+      describeRefusedRoute: () => "route unavailable",
+      routeIsStale,
+      createRehelloGate,
+      monotonicNow: () => performance.now(),
+      buildHelloPayload: () => ({ type: "hello", tab_id: routeRef.current, workflow_uuid: "wf-1728" }),
+      sendBridgeHello: async ({ socket, isCurrent, makePayload }) => {
+        if (!isCurrent()) return false;
+        if (helloState.block) await new Promise((resolve) => (helloState.release = resolve));
+        socket.send(JSON.stringify(makePayload()));
+        return true;
+      },
+      createRestartTabIdentity: () => ({ resolve: async () => "tab-1728" }),
+      bridgeOutage: { noteHandshake: noop, noteBridgeClosed: noop },
+      lostReplies: { list: () => [], size: () => 0, summaries: () => [], replace: noop },
+      pruneAttempts: (items) => items,
+      shouldReRegister: () => false,
+      reRegisterExhaustedHint: () => "re-register exhausted",
+      describeUndeliveredReply: () => "undelivered",
+      lsSet: noop,
+      lsGet: () => null,
+      SESSION_ORDERED_FRAMES: new Set(["resume_session", "new_session"]),
+      AGENT_SESSION_RESET_FRAMES: new Set(),
+      AGENT_MUTED: false,
+      AGENT_BLIND: false,
+      onStatus: noop,
+      onSay: noop,
+      onStream: noop,
+      onLog: noop,
+      onCommand: noop,
+      onCommandReceived: noop,
+      onAsk: noop,
+      onSecret: noop,
+      onSecretSaved: noop,
+      onReload: noop,
+      onTodo: noop,
+      onShowMedia: noop,
+      onOpenCivitai: noop,
+      onCivitaiCmd: noop,
+      onTrainingCmd: noop,
+      onUiRender: noop,
+      onUiUpdate: noop,
+      onDownloads: noop,
+      onThinking: noop,
+      onAgentStatus: noop,
+      onSession: noop,
+      onModels: noop,
+      onCommands: noop,
+      onBackends: noop,
+      onAck: noop,
+      onTurn: noop,
+      onAction: noop,
+      onTurnAnchor: noop,
+      getResume: () => null,
+      getBackend: () => "claude",
+      onHandshakeTimeout: noop,
+      onBridgeClosed: noop,
+      onPairUrl: noop,
+      onPairError: noop,
+      onRunpodStatus: noop,
+      onComfyuiTarget: noop,
+      onRunpodAlert: noop,
+    },
+    {
+      has: () => true,
+      get(target, key) {
+        if (key in target) return target[key];
+        if (key in globalThis) return globalThis[key];
+        return noop;
+      },
+    },
+  );
+  const client = new Function("env", `with (env) { return (${createBridgeClientSource}); }`)(env)({
+    onStatus: noop,
+    onSay: noop,
+    onStream: noop,
+    onLog: noop,
+    onModels: noop,
+    onBridgeClosed: noop,
+  });
+  const originalSend = RuntimeBridgeSocket.prototype.send;
+  RuntimeBridgeSocket.prototype.send = function (raw) {
+    if (bridgeState.failNextSend) {
+      bridgeState.failNextSend = false;
+      throw new Error("simulated send failure");
+    }
+    return originalSend.call(this, raw);
+  };
+  return { client, routeRef, bridgeState, helloState, socket: () => RuntimeBridgeSocket.instances.at(-1) };
+}
 
 const runMatch = panelSrc.match(/\n {2}async graph_run\(\{ batch_count, to_node_id \}\) \{[\s\S]*?\n {2}\},/);
 assert.ok(runMatch, "could not locate graph_run in panel source");
@@ -436,7 +660,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, panelRunOwnerRef }) {
   const seen = { dispatchArgs: null };
   const deps = {
     RUN_COMMAND_BUDGET_MS: budgetMs,
@@ -489,8 +713,11 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch }) {
     describeQueuePromptChain,
     describeQueuePromptChainForReport,
     queuePromptChainDeps,
-    runCompletionRef: { onQueued() {} },
-    armRunReconcileSweepRef: () => {},
+    runCompletionRef: runCompletionRef ?? { onQueued() {} },
+    armRunReconcileSweepRef: armRunReconcileSweepRef ?? (() => {}),
+    runReceiptSender: runReceiptSender ?? null,
+    runReceiptRouteRef: runReceiptRouteRef ?? (() => null),
+    panelRunOwnerRef: panelRunOwnerRef ?? { current: {} },
   };
   const names = Object.keys(deps);
   const factory = new Function(
@@ -825,6 +1052,324 @@ test("#1565 CALL SITE: graph_run answers inside its budget when the frontend que
       typeof answer.replied.error === "string" && answer.replied.error.length > 0,
       "with words, not a bare relay timeout that blames a tab which is answering reads fine",
     );
+  } finally {
+    stop();
+  }
+});
+
+test("#1728 CALL SITE: late capture crosses the bridge, arms the real sweep, and emits one completion", async () => {
+  const stop = keepAlive();
+  let sweep;
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const flushes = [];
+    const receiptFrames = [];
+    const timers = new Set();
+    const schedule = (fn, ms) => {
+      const timer = { fn, ms };
+      timers.add(timer);
+      return timer;
+    };
+    const cancel = (timer) => timers.delete(timer);
+    const tracker = createRunCompletionTracker({
+      onFlush: (payload) => flushes.push(payload),
+      now: () => 1000,
+      setTimer: schedule,
+      clearTimer: cancel,
+    });
+    sweep = createRunReconcileSweep({
+      hasPending: () => tracker.hasPending(),
+      reconcile: async () => {},
+      setTimer: schedule,
+      clearTimer: cancel,
+      intervalMs: 60000,
+    });
+    let latePromptId;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      runCompletionRef: tracker,
+      armRunReconcileSweepRef: () => sweep.arm(),
+      runReceiptSender: (rid, promptId) =>
+        receiptFrames.push({ type: "run_receipt", run_rid: rid, prompt_id: promptId }),
+      dispatch: async (args) => {
+        // The production guard can invoke this callback after dispatchScopedRun
+        // has returned its bounded unverified result.
+        latePromptId = () => args.onPromptId("late-prompt-1728");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    const result = await built.graph_run({ to_node_id: 327, rid: "run-rid-1728" });
+    assert.equal(result.queued_unknown, true, "the bounded call remains honest about its unknown receipt");
+    latePromptId();
+    assert.deepEqual(receiptFrames, [
+      { type: "run_receipt", run_rid: "run-rid-1728", prompt_id: "late-prompt-1728" },
+    ], "the late prompt id crosses the bridge as a non-agent receipt");
+    assert.equal(sweep._hasTimer(), true, "the real safety sweep is armed by the late capture");
+
+    // The prompt can finish before the delayed /prompt response reaches the
+    // capture callback. The tracker must retain that media-less success and
+    // apply the panel_run promise when onQueued finally arrives.
+    tracker.onExecutionStart("late-prompt-1728");
+    tracker.onExecutionSuccess("late-prompt-1728");
+    assert.equal(flushes.length, 1, "the late capture produces one terminal completion");
+    assert.equal(flushes[0].noMedia, true);
+
+    const sent = [];
+    await composeRunCompletionFrame(flushes[0], {
+      sendFrame: (frame) => (sent.push(frame), true),
+      coerceMessageText: (value) => String(value ?? ""),
+      formatDuration: (ms) => `${(ms / 1000).toFixed(1)}s`,
+      formatClock: () => "12:00:00",
+      agentReceivesImages: () => true,
+      warn: () => {},
+    });
+    assert.equal(sent.length, 1, "the bridge receives exactly one completion frame");
+
+    latePromptId();
+    tracker.onExecutionSuccess("late-prompt-1728");
+    assert.equal(flushes.length, 1, "duplicate capture/lifecycle signals stay fenced");
+    assert.equal(sent.length, 1, "duplicate capture/lifecycle signals do not duplicate the frame");
+  } finally {
+    sweep?.dispose();
+    stop();
+  }
+});
+
+test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on reconnect", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const receiptFrames = [];
+    let routeReady = false;
+    const outbox = createRunReceiptOutbox({ retryMs: 60000 });
+    outbox.setTransport({
+      routeId: () => "panel-route-1728",
+      ready: () => routeReady,
+      sendFrame: (frame) => {
+        if (!routeReady) return false;
+        receiptFrames.push(frame);
+        return true;
+      },
+    });
+    let latePromptId;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      panelRunOwnerRef: { current: { generation: 1 } },
+      runReceiptRouteRef: () => "panel-route-1728",
+      runReceiptSender: (rid, promptId, routeId) => outbox.enqueue(rid, promptId, routeId),
+      dispatch: async (args) => {
+        latePromptId = () => args.onPromptId("late-reconnect-prompt-1728");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    const result = await built.graph_run({ to_node_id: 327, rid: "run-rid-reconnect-1728" });
+    assert.equal(result.queued_unknown, true);
+    latePromptId();
+    assert.equal(outbox.pendingSize(), 1, "sendFrame false keeps the exact receipt pending");
+    assert.deepEqual(receiptFrames, []);
+
+    routeReady = true;
+    outbox.notifyRouteReady();
+    assert.equal(outbox.pendingSize(), 0, "the reconnect flush retires the receipt only after sendFrame true");
+    assert.deepEqual(receiptFrames, [
+      { type: "run_receipt", run_rid: "run-rid-reconnect-1728", prompt_id: "late-reconnect-prompt-1728" },
+    ]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1728 runtime bridge path fences receipt outbox across same-route re-advertisement and remount", async () => {
+  const routeRef = { current: "panel-route-runtime-1728" };
+  const built = buildRuntimeBridgeClient({ routeRef });
+  const outbox = createRunReceiptOutbox({ retryMs: 60000 });
+  const receiptFrames = [];
+  outbox.setTransport({
+    routeId: () => routeRef.current,
+    ready: () => built.client.isRouteReady() === true,
+    sendFrame: (frame) => built.client.sendFrame(frame),
+  });
+  try {
+    built.client.start();
+    const socket = built.socket();
+    socket.open();
+    await Promise.resolve();
+    assert.deepEqual(socket.sent[0], {
+      type: "hello",
+      tab_id: "panel-route-runtime-1728",
+      workflow_uuid: "wf-1728",
+    });
+    assert.equal(built.client.isRouteReady(), false, "socket-open is not a route handshake");
+
+    socket.receive({ type: "models", epoch: "epoch-runtime-1728", models: [] });
+    assert.equal(built.client.isRouteReady(), true, "the landed hello establishes the captured route");
+
+    built.bridgeState.failNextSend = true;
+    outbox.enqueue("run-failure-1728", "prompt-failure-1728", routeRef.current);
+    assert.equal(outbox.pendingSize(), 1, "sendFrame false retains the receipt for retry");
+    assert.deepEqual(receiptFrames, []);
+
+    built.helloState.block = true;
+    const rehello = built.client.rehello();
+    await Promise.resolve();
+    assert.equal(built.client.isRouteReady(), false, "a same-route replacement hello creates a new readiness fence");
+    outbox.enqueue("run-held-1728", "prompt-held-1728", routeRef.current);
+    assert.equal(outbox.pendingSize(), 2, "receipts remain held while the replacement hello is unresolved");
+
+    built.helloState.block = false;
+    built.helloState.release?.();
+    await rehello;
+    assert.equal(built.client.isRouteReady(), true, "the replacement hello restores readiness only after it lands");
+    outbox.notifyRouteReady();
+    assert.equal(outbox.pendingSize(), 0, "both at-least-once receipts flush after the same binding is live");
+
+    const sentBeforeReplacement = socket.sent.length;
+    routeRef.current = "replacement-route-runtime-1728";
+    assert.equal(built.client.isRouteReady(), false, "a remounted route is not equal to the advertised generation");
+    outbox.enqueue("run-old-route-1728", "prompt-old-route-1728", "panel-route-runtime-1728");
+    assert.equal(outbox.pendingSize(), 1, "an old dispatch is retained rather than attributed to the replacement");
+
+    await built.client.rehello();
+    assert.equal(built.client.isRouteReady(), true, "the replacement route has its own landed hello");
+    outbox.enqueue("run-new-route-1728", "prompt-new-route-1728", routeRef.current);
+    outbox.notifyRouteReady();
+    assert.equal(outbox.pendingSize(), 1, "the old route receipt remains fenced after the replacement hello");
+    assert.deepEqual(
+      socket.sent.slice(sentBeforeReplacement).filter((frame) => frame.type === "run_receipt"),
+      [{ type: "run_receipt", run_rid: "run-new-route-1728", prompt_id: "prompt-new-route-1728", tab_id: "replacement-route-runtime-1728" }],
+      "only the replacement dispatch can flush on the replacement binding",
+    );
+
+    routeRef.current = null;
+    assert.equal(built.client.isRouteReady(), false, "a null captured route is never substituted from the live mount");
+    assert.equal(
+      built.client.sendFrame({ type: "run_receipt", run_rid: "run-null-route-1728", prompt_id: "prompt-null-route-1728" }),
+      false,
+    );
+  } finally {
+    outbox.clearPending();
+    built.client.stop();
+  }
+});
+
+test("#1728 production bridge wiring fences same-route re-advertisement before receipts", () => {
+  const sendHelloAt = panelSrc.indexOf("  function sendHello() {");
+  const sendHelloEnd = panelSrc.indexOf("\n\n  /** Returns a promise", sendHelloAt);
+  const sendHello = panelSrc.slice(sendHelloAt, sendHelloEnd);
+  const readyAt = panelSrc.indexOf("    isRouteReady() {");
+  const readyEnd = panelSrc.indexOf("\n    },", readyAt);
+  const ready = panelSrc.slice(readyAt, readyEnd);
+  const senderAt = panelSrc.indexOf("  const panelRunReceiptSender =");
+  const senderEnd = panelSrc.indexOf("\n  const panelRunReceiptTransport", senderAt);
+  const sender = panelSrc.slice(senderAt, senderEnd);
+
+  assert.match(sendHello, /nextRouteBindingGeneration/);
+  assert.match(sendHello, /pendingRouteBindingGeneration = bindingGeneration/);
+  assert.match(sendHello, /sent === true/);
+  assert.match(ready, /pendingRouteBindingGeneration !== null/);
+  assert.match(sender, /runReceiptOutbox\.enqueue\(rid, promptId, routeId\)/);
+  assert.doesNotMatch(sender, /routeId\s*\?\?/);
+});
+
+test("#1728 CALL SITE: a null dispatch route is refused rather than substituted from the remount", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const receiptFrames = [];
+    const outbox = createRunReceiptOutbox({ retryMs: 60000 });
+    outbox.setTransport({
+      routeId: () => "replacement-route-1728",
+      ready: () => true,
+      sendFrame: (frame) => {
+        receiptFrames.push(frame);
+        return true;
+      },
+    });
+    let capturedRoute = "unset";
+    let latePromptId;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      panelRunOwnerRef: { current: { generation: 1 } },
+      runReceiptRouteRef: () => null,
+      runReceiptSender: (rid, promptId, routeId) => {
+        capturedRoute = routeId;
+        return outbox.enqueue(rid, promptId, routeId);
+      },
+      dispatch: async (args) => {
+        latePromptId = () => args.onPromptId("null-route-prompt-1728");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    await built.graph_run({ to_node_id: 327, rid: "run-rid-null-route-1728" });
+    latePromptId();
+
+    assert.equal(capturedRoute, null, "the sender receives the dispatch's captured null route");
+    assert.equal(outbox.pendingSize(), 0, "a null route is not queued for a different mount");
+    assert.deepEqual(receiptFrames, [], "the receipt is not attributed to the replacement route");
+  } finally {
+    stop();
+  }
+});
+
+test("#1728 CALL SITE: a late callback after remount cannot touch the replacement tracker", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const ownerRef = { current: { generation: 1 } };
+    const trackerEvents = { old: [], replacement: [] };
+    const trackerSlot = {
+      current: { onQueued: (id) => trackerEvents.old.push(id) },
+    };
+    const liveTracker = { onQueued: (id) => trackerSlot.current.onQueued(id) };
+    const sweepOwners = [];
+    const receiptFrames = [];
+    let latePromptId;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      panelRunOwnerRef: ownerRef,
+      runCompletionRef: liveTracker,
+      armRunReconcileSweepRef: () => sweepOwners.push(ownerRef.current),
+      runReceiptRouteRef: () => "panel-route-remount-1728",
+      runReceiptSender: (rid, promptId) => receiptFrames.push({ rid, promptId }),
+      dispatch: async (args) => {
+        latePromptId = () => args.onPromptId("stale-remount-prompt-1728");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    await built.graph_run({ to_node_id: 327, rid: "run-rid-remount-1728" });
+    ownerRef.current = { generation: 2 };
+    trackerSlot.current = { onQueued: (id) => trackerEvents.replacement.push(id) };
+    latePromptId();
+
+    assert.deepEqual(trackerEvents, { old: [], replacement: [] });
+    assert.deepEqual(sweepOwners, []);
+    assert.deepEqual(receiptFrames, [
+      { rid: "run-rid-remount-1728", promptId: "stale-remount-prompt-1728" },
+    ], "the stale callback may still deliver its exact server receipt");
   } finally {
     stop();
   }

@@ -77,6 +77,7 @@ import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMess
 // #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
 // it is how this repo keeps producing near-duplicate bugs, per that file's own header.
 import { withTimeout } from "./lib/bounded-step.js";
+import { createRunReceiptOutbox } from "./lib/run-receipt-outbox.js";
 import {
   arbitratePanelCopy,
   countExtensionsNamed,
@@ -804,6 +805,20 @@ let runCompletionRef = null;
 // prompt is queued so the sweep re-reconciles pending runs against /history until
 // they drain. Set in buildPanel; null while unmounted.
 let armRunReconcileSweepRef = null;
+// A late prompt receipt has to cross the bridge to the MCP consumer. Capture the
+// sender at mount time so an old graph_run cannot publish into a replacement tab
+// after teardown/reconnect.
+let runReceiptSender = null;
+// The dispatch captures the route it was sent to. The sender itself is allowed to
+// enqueue into a replacement mount, but the outbox will only flush when that same
+// route is live, so a remount cannot misattribute a receipt to another workflow.
+let runReceiptRouteRef = null;
+// A callback from an old mount must never register into a replacement tracker or
+// sweep. This owner is a stable object per mount rather than a mutable generation
+// number that an old callback could accidentally match after wrap/reuse.
+const panelRunOwnerRef = { current: null };
+let panelRunOwnerGeneration = 0;
+const runReceiptOutbox = createRunReceiptOutbox();
 // How often the safety sweep re-reconciles while any run is still pending delivery.
 // Only runs while `hasPending()` is true (self-disarming), so an idle panel carries
 // no perpetual timer; a redundant sweep is harmless (reconcile is idempotent — the
@@ -16939,6 +16954,20 @@ const GRAPH_TOOL_EXECUTORS = {
     // below draws from this one deadline, so they compose instead of each starting a fresh
     // clock; see RUN_COMMAND_BUDGET_MS.
     const budget = makeCommandBudget(RUN_COMMAND_BUDGET_MS, monotonicNow);
+    // Keep the established destructuring signature (several shipped source-order
+    // guards key off it), while accepting the bridge's correlation id as metadata.
+    const requestedRid = arguments[0]?.rid;
+    const receiptRid = typeof requestedRid === "string" && requestedRid.trim() ? requestedRid.trim() : null;
+    // Freeze this mount's sender for the whole dispatch. A late /prompt response
+    // can outlive graph_run itself, but it must never use a newer mount's bridge.
+    const sendReceipt = runReceiptSender;
+    let dispatchReceiptRoute = null;
+    try {
+      dispatchReceiptRoute = typeof runReceiptRouteRef === "function" ? runReceiptRouteRef() : null;
+    } catch {}
+    const dispatchOwner = panelRunOwnerRef.current;
+    const dispatchRunCompletion = runCompletionRef;
+    const dispatchArmRunReconcileSweep = armRunReconcileSweepRef;
     const { app, graph, rootGraph } = getGraphCtx();
     // /run invokes this executor directly rather than through bridge dispatch.
     // Queueing a stale root would render the wrong workflow even though no graph
@@ -17208,12 +17237,42 @@ const GRAPH_TOOL_EXECUTORS = {
       // Capture the FIRST top-level rejection only (see above).
       if (promptRejection == null) promptRejection = r;
     };
-    const capturePromptId = (pid) => {
+    const registerPromptId = (pid) => {
       // EVERY accepted prompt_id, string-normalized at capture (0 and "0"
       // are the same run) so #370 reconcile stays string-vs-string.
       const id = String(pid).trim();
-      if (!id) return;
-      if (!queuedPromptIds.includes(id)) queuedPromptIds.push(id);
+      if (!id || queuedPromptIds.includes(id)) return;
+      queuedPromptIds.push(id);
+      // #1728 — dispatchScopedRun may return its bounded queued_unknown result
+      // while this request is still in flight. Register at capture time, not only
+      // after dispatch returns, so a late prompt_id still opens the local recovery
+      // ledger and arms the sweep. The owner fence is separate from the receipt
+      // path: an old dispatch may still report its exact server receipt, but it
+      // must not touch a replacement mount's local completion state.
+      const ownsDispatch =
+        dispatchOwner !== null &&
+        panelRunOwnerRef.current === dispatchOwner &&
+        runCompletionRef === dispatchRunCompletion &&
+        armRunReconcileSweepRef === dispatchArmRunReconcileSweep;
+      if (ownsDispatch) {
+        try {
+          dispatchRunCompletion?.onQueued(id);
+        } catch {}
+        try {
+          dispatchArmRunReconcileSweep?.();
+        } catch {}
+      }
+      // #1728 — the local tracker cannot open the MCP server's prompt ticket by
+      // itself. Send an exact, rid-correlated receipt over the existing bridge
+      // event channel; this is metadata only, never an agent_event completion.
+      if (receiptRid && sendReceipt) {
+        try {
+          sendReceipt(receiptRid, id, dispatchReceiptRoute);
+        } catch {}
+      }
+    };
+    const capturePromptId = (pid) => {
+      registerPromptId(pid);
     };
     // #1504 — node_errors that arrived on an ACCEPTED (200) reply: the outputs
     // ComfyUI dropped from a prompt it queued anyway ("Output will be ignored").
@@ -17447,26 +17506,10 @@ const GRAPH_TOOL_EXECUTORS = {
         /* keep the unfiltered scan - over-warning is the safe direction here */
       }
     }
-    // Register EVERY accepted prompt_id for reconnect reconciliation (#370) —
-    // BEFORE the rejection check. With batch>1, app.queuePrompt breaks its loop on
-    // the first rejection, so an EARLIER repetition can be accepted (already
-    // queued + running) while a LATER one rejects. That accepted run still needs a
-    // recovery-ledger entry, or a disconnect that swallows its whole lifecycle
-    // would leave it unreconcilable even though we return a rejection here.
-    for (const pid of queuedPromptIds) {
-      try {
-        runCompletionRef?.onQueued(pid);
-      } catch {}
-    }
-    // panel#356 Bug 2: kick the periodic safety-sweep reconcile now that a run is
-    // pending, so a completion landing during an UNOBSERVED WS reconnect (idle gap,
-    // no `reconnected` edge) is still recovered. No-op if the sweep is already armed
-    // or the ledger is empty; self-disarms when every pending run drains.
-    if (queuedPromptIds.length) {
-      try {
-        armRunReconcileSweepRef?.();
-      } catch {}
-    }
+    // #1728: capturePromptId registers accepted ids immediately, including ids
+    // delivered after this bounded dispatch has returned. Keep the result-local
+    // list for the synchronous response and for the existing idempotent return
+    // shaping below.
     // A scoped run that did NOT fully verify (r5: refused / unverified /
     // unverifiable) carries a truthful error naming what couldn't be resolved —
     // and guarantees no scopeless full-graph dispatch left the tab. The return
@@ -24210,6 +24253,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // all, which is strictly worse than the race. Every other caller (#654's refused-route
   // retry included) is a re-advertise by definition and passes through the gate.
   let advertisedSock = null;
+  // A same-socket re-hello withdraws the old route binding before the replacement
+  // hello lands. Route equality alone cannot prove that the replacement binding is
+  // live, so stamped control frames stay fenced while this generation is pending.
+  let nextRouteBindingGeneration = 0;
+  let pendingRouteBindingGeneration = null;
   // #1095 — the route id the last LANDED hello actually carried. Compared against the live
   // `bridgeRouteId()` to tell whether the orchestrator's binding still names the workflow
   // the panel has already committed to; see routeIsStale in lib/rehello-gate.js for why
@@ -25422,6 +25470,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // Clearing also invalidates those marks, so when the retired socket's commands do
       // finish, their releases cannot discount the new connection's work.
       rehelloGate.cancel();
+      pendingRouteBindingGeneration = null;
       // The replacement socket has no mapping yet, so its first hello CREATES one and must
       // not be gated.
       advertisedSock = null;
@@ -25482,7 +25531,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // against a route that does not exist yet. `advertisedSock` is set only on the success
     // path below, so a hello that never landed does not arm the gate either.
     if (!sock || sock !== advertisedSock) return advertiseHello();
-    return rehelloGate.request();
+    const bindingGeneration = ++nextRouteBindingGeneration;
+    pendingRouteBindingGeneration = bindingGeneration;
+    const request = rehelloGate.request();
+    // A failed request leaves the old binding fenced. The active close/new-socket
+    // path clears it, and the receipt outbox TTL bounds retention if the socket stays
+    // open but the replacement hello never lands.
+    void Promise.resolve(request).then(
+      (sent) => {
+        if (sent === true && pendingRouteBindingGeneration === bindingGeneration) {
+          pendingRouteBindingGeneration = null;
+        }
+      },
+      () => {},
+    );
+    return request;
   }
 
   /** Returns a promise resolving to whether the hello actually REACHED THE WIRE.
@@ -26254,6 +26317,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // for, which is the corruption class #508 already refuses to risk. Dropped, not
       // flushed; the new socket's own open hello registers the tab.
       rehelloGate.cancel();
+      pendingRouteBindingGeneration = null;
       advertisedSock = null;
       connect();
     },
@@ -26262,6 +26326,23 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     },
     isConnected() {
       return !!sock && sock.readyState === WebSocket.OPEN;
+    },
+    /**
+     * True only when the live socket has completed its handshake and the
+     * orchestrator has advertised the current workflow route. Stamped control
+     * metadata such as run_receipt must wait through a parked re-advertise;
+     * socket-open plus a readable route is not sufficient.
+     */
+    isRouteReady() {
+      if (!sock || sock.readyState !== WebSocket.OPEN || !handshakeDone) return false;
+      if (pendingRouteBindingGeneration !== null) return false;
+      let routeId = null;
+      try {
+        routeId = bridgeRouteId();
+      } catch {
+        routeId = null;
+      }
+      return !!routeId && !!lastAdvertisedRouteId && routeId === lastAdvertisedRouteId;
     },
     /** #1095 — diagnostics only. The in-flight count is NOT exported for callers to gate
      *  on: an earlier cut had the workflow poll read it and decide for itself, and that is
@@ -26288,6 +26369,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       handshakenSock = null;
       // #1095 — see setUrl: a parked hello must never outlive the socket it was queued for.
       rehelloGate.cancel();
+      pendingRouteBindingGeneration = null;
       advertisedSock = null;
     },
     destroy() {
@@ -26305,6 +26387,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // #1095 — and a torn-down panel must not leave a timer armed to hello from a closure
       // nothing owns any more.
       rehelloGate.cancel();
+      pendingRouteBindingGeneration = null;
       advertisedSock = null;
     },
   };
@@ -28166,6 +28249,11 @@ function backendEnabled(id) { return !disabledBackends().has(id); }
 let lastMintedThreadId = null;
 
 function buildPanel() {
+  const mountOwner = { generation: ++panelRunOwnerGeneration };
+  panelRunOwnerRef.current = mountOwner;
+  // A remount retires the old route transport, but the module-scoped outbox
+  // remains intact for an old dispatch callback and will flush on this mount.
+  runReceiptOutbox.setTransport(null);
   ensureStyles();
 
   const root = document.createElement("div");
@@ -35142,6 +35230,9 @@ function buildPanel() {
       // release the soft-reload interlock: the (possibly slow) reload's orchestrator
       // handshook, so auto-respawn can guard the next drop normally.
       if (connected) {
+        // A receipt queued while the socket was closed/stale gets an immediate
+        // retry on the handshake edge; the outbox also has a bounded timer retry.
+        runReceiptOutbox.notifyRouteReady();
         // Bridge came back after a drop — the completion frame for a run that
         // finished while it was down was silently dropped by sendFrame, so
         // reconcile pending runs against /history to redeliver it (#370).
@@ -36065,6 +36156,23 @@ function buildPanel() {
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
+  const panelRunReceiptRouteRef = () => {
+    try {
+      return bridgeRouteId();
+    } catch {
+      return null;
+    }
+  };
+  const panelRunReceiptSender = (rid, promptId, routeId) =>
+    runReceiptOutbox.enqueue(rid, promptId, routeId);
+  const panelRunReceiptTransport = {
+    routeId: panelRunReceiptRouteRef,
+    ready: () => client.isRouteReady?.() === true,
+    sendFrame: (frame) => client.sendFrame(frame),
+  };
+  runReceiptOutbox.setTransport(panelRunReceiptTransport);
+  runReceiptRouteRef = panelRunReceiptRouteRef;
+  runReceiptSender = panelRunReceiptSender;
 
   // #758 — announce an update once the transcript exists to receive it. Deliberately
   // NOT awaited: a release note must never sit in front of the panel becoming usable.
@@ -40892,6 +41000,10 @@ function buildPanel() {
       // reconcile await (codex P1 unmount-resurrection leak). Only null the shared
       // refs if they still point at THIS instance — a newer mount may already own them.
       runReconcileSweep.dispose();
+      if (panelRunOwnerRef.current === mountOwner) {
+        panelRunOwnerRef.current = null;
+        runReceiptOutbox.setTransport(null);
+      }
       // #585: the restart-resume watch drives client.sendUserMessage — a torn-down
       // panel must not keep it alive. The marker itself SURVIVES on purpose: a
       // remount re-reads it and re-arms the watch, so unmounting never loses the
@@ -40899,6 +41011,8 @@ function buildPanel() {
       stopRebootWatch();
       if (armRunReconcileSweepRef === armRunReconcileSweep) armRunReconcileSweepRef = null;
       if (runCompletionRef === runCompletion) runCompletionRef = null;
+      if (runReceiptRouteRef === panelRunReceiptRouteRef) runReceiptRouteRef = null;
+      if (runReceiptSender === panelRunReceiptSender) runReceiptSender = null;
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).
       panelHooks.applyBackend = null;

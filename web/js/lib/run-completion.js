@@ -155,6 +155,10 @@ export function createRunCompletionTracker({
   // doing its job) to bound memory.
   const terminal = new Map();
   const delivered = new Map();
+  // A success can arrive before the panel's delayed /prompt response registers
+  // this run as panel-queued. Keep only the media-less success that still needs
+  // the panel_run promise applied; onQueued consumes it exactly once.
+  const terminalNoMediaSuccess = new Map(); // key -> { promptId, durationMs, finishedAt, at }
   // Far beyond any realistic WS-replay-after-reconnect delay, so pruning an entry
   // older than this can never re-open the double-delivery window it guards.
   const deliveredTtlMs = 10 * 60 * 1000;
@@ -211,6 +215,9 @@ export function createRunCompletionTracker({
     // normally; a `delivered` entry is never in `pending`, so it needs no guard.
     pruneFence(terminal, cutoff, (k) => pending.has(k));
     pruneFence(delivered, cutoff);
+    for (const [k, entry] of terminalNoMediaSuccess) {
+      if (entry.at < cutoff) terminalNoMediaSuccess.delete(k);
+    }
     // `unconfirmedDelivery` is deliberately NOT pruned here — see its declaration:
     // ageing the flag out would turn "we don't know whether the agent was told"
     // back into a claim that it was. It is size-capped instead.
@@ -835,7 +842,11 @@ export function createRunCompletionTracker({
       //
       // Both reads happen BEFORE flush(): a flush that delivers calls markDelivered
       // (removing the key from `pending`) and retires the duration start.
-      const mediaLess = !hasBufferedMedia(k) && panelQueued.has(k);
+      // Snapshot this before flush(): flush() consumes the media buffers, so
+      // checking hasBufferedMedia(k) afterwards would misclassify a media run
+      // as a late media-less success.
+      const hasMedia = hasBufferedMedia(k);
+      const mediaLess = !hasMedia && panelQueued.has(k);
       const mediaLessStart = mediaLess ? starts.get(k) : null;
       flush(k);
       if (mediaLess) {
@@ -852,6 +863,18 @@ export function createRunCompletionTracker({
           durationMs: mediaLessStart != null ? now() - mediaLessStart : null,
           finishedAt: now(),
           noMedia: true,
+        });
+        terminalNoMediaSuccess.delete(k);
+      } else if (!hasMedia) {
+        // The success was terminal, but onQueued may still be waiting for the
+        // delayed /prompt response. Do not emit for an ordinary canvas run;
+        // retain the success so a late panel receipt can apply the promise.
+        const finishedAt = now();
+        terminalNoMediaSuccess.set(k, {
+          promptId: promptIdOf(k),
+          durationMs: starts.has(k) ? finishedAt - starts.get(k) : null,
+          finishedAt,
+          at: finishedAt,
         });
       }
       // Retire start for runs that buffered nothing (flush early-returns then).
@@ -870,6 +893,7 @@ export function createRunCompletionTracker({
       const buf = buffers.get(k);
       if (buf?.timer) clearTimer(buf.timer);
       buffers.delete(k);
+      terminalNoMediaSuccess.delete(k);
       starts.delete(k);
     startObserved.delete(k);
       // If already terminal (reconcile surfaced this run's outcome), don't re-mark
@@ -928,9 +952,29 @@ export function createRunCompletionTracker({
      * against /history because we recorded its prompt_id at queue time.
      */
     onQueued(id) {
+      const k = key(id);
       trackPending(id);
       // #356 Bug 2 — records that THIS run carried panel_run's wait-for-it promise.
-      if (id != null) panelQueued.add(key(id));
+      if (id != null) panelQueued.add(k);
+      // #1728 P2 — execution_success can win the race with the delayed /prompt
+      // response. The terminal fence correctly blocks re-pending, but before this
+      // handoff the media-less decision had already observed panelQueued=false.
+      // Consume the retained terminal success once, then use the same onFlush /
+      // delivery-fence path as an on-time panel queue.
+      const lateSuccess = id != null ? terminalNoMediaSuccess.get(k) : null;
+      if (lateSuccess) {
+        terminalNoMediaSuccess.delete(k);
+        markDispatched(k);
+        onFlush({
+          key: k,
+          promptId: lateSuccess.promptId,
+          images: [],
+          videos: [],
+          durationMs: lateSuccess.durationMs,
+          finishedAt: lateSuccess.finishedAt,
+          noMedia: true,
+        });
+      }
     },
 
     /**
