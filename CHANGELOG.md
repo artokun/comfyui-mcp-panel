@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.76] - 2026-08-24
+
+### Fixed
+- Preserve Save-As canvas identity through partial restores, tab switches, overlap, and failure cleanup (#939)
+- Scale object-info schema probes for remote ComfyUI origins while preserving bounded fail-closed writes (#1734)
+- Recover accessor-backed Impact BooleanWidget writes without masking same-message setter failures (#1735)
+
 ## [0.15.75] - 2026-08-24
 
 ### Fixed
