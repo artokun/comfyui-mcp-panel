@@ -270,7 +270,7 @@ test("#1485: the poster still reaches the card when its upload resolves", async 
   resolvePoster();
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(calls.posters.length, 1, "and the card is back-filled by video URL");
-  assert.equal(calls.posters[0].videoUrl, "/view?filename=clip_00001_.mp4");
+  assert.match(calls.posters[0].videoUrl, /^\/view\?filename=clip_00001_\.mp4&cmcp_storyboard=.+$/);
   assert.match(calls.posters[0].posterUrl, /^\/view\?filename=poster_clip_00001__.+\.png$/);
 });
 

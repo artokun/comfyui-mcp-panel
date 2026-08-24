@@ -601,8 +601,9 @@ async function buildVideoSegment(v, deps) {
       // Give the source fetch and every derived artifact one attempt identity so
       // neither the browser nor ComfyUI's filename-based temp ref can return the
       // previous run's pixels.
-      const storyboardIdentity = createStoryboardIdentity();
-      const sourceUrl = appendStoryboardCacheBust(imageViewUrl(m), storyboardIdentity);
+      const storyboardIdentity = v?.storyboardIdentity || createStoryboardIdentity();
+      const sourceUrl =
+        v?.videoUrl || appendStoryboardCacheBust(imageViewUrl(m), storyboardIdentity);
       // The video's own byte size is wanted only for the note's metadata line.
       // Start its HEAD (bounded at 8 s inside fetchImageBytes) BEFORE the
       // sampling pass so the round trip overlaps the decode instead of being
@@ -724,7 +725,7 @@ async function buildVideoSegment(v, deps) {
               storyboardPosterUploadName(base, storyboardIdentity),
               { type: "temp" },
             );
-            if (posterRef) applyVideoPoster(imageViewUrl(m), imageViewUrl(posterRef));
+            if (posterRef) applyVideoPoster(sourceUrl, imageViewUrl(posterRef));
           })
           .catch((err) => {
             warn("[cmcp] storyboard: poster upload failed:", err);

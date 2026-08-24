@@ -683,6 +683,7 @@ import {
 } from "./lib/execution-preview-attach.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { composeShowMediaReply } from "./lib/media-preview.js";
+import { appendStoryboardCacheBust, createStoryboardIdentity } from "./lib/storyboard-cache-identity.js";
 import {
   bindSourcePlayback,
   sourceMediaDuration,
@@ -37121,9 +37122,15 @@ function buildPanel() {
       if (!m || !m.filename) continue;
       const url = imageViewUrl(m);
       if (isVideoOutput(m)) {
-        paintVideo(url, m.filename);
-        // Carry the node id so the deferred storyboard event can name its node.
-        videos.push({ m, nodeId });
+        // #1718 — ComfyUI may overwrite a temp video under the same filename.
+        // The identity must be minted BEFORE paintVideo so the holder registry,
+        // source decode, and late poster callback all address this render only.
+        const storyboardIdentity = createStoryboardIdentity();
+        const videoUrl = appendStoryboardCacheBust(url, storyboardIdentity);
+        paintVideo(videoUrl, m.filename);
+        // Carry the node id so the deferred storyboard event can name its node,
+        // plus the exact URL/identity used by the already-painted card.
+        videos.push({ m, nodeId, videoUrl, storyboardIdentity });
       } else if (isAudioOutput(m)) {
         // Played, never painted as an image — and deliberately NOT added to
         // inlineImages: that list is delivered to the agent as inline image
