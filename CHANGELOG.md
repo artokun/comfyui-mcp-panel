@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.74] - 2026-08-24
+
+### Fixed
+- Preserve refresh successor verdicts after reconnect so early results cannot report stale success (#1725)
+
 ## [0.15.73] - 2026-08-24
 
 ### Fixed
