@@ -15285,6 +15285,11 @@ const GRAPH_TOOL_EXECUTORS = {
                 link_id: o.link_id,
                 certainly_reached: o.certainly_reached,
               })),
+              // The COUNT is never truncated, only the list is. A ten-entry array
+              // with nothing saying how many were dropped reads as "that is all of
+              // them", which is the whole class of claim this reply is careful not
+              // to make.
+              remaining_orphan_link_count: stillOrphaned.length,
             }
           : {}),
         warning:

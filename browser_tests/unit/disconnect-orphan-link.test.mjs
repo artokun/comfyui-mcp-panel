@@ -373,6 +373,7 @@ test("#1750 the reply reports what is STILL orphaned, and never claims queueable
     { node_id: 84, input: "image_b", link_id: 18, certainly_reached: true },
     { node_id: 85, input: "image_b", link_id: 19, certainly_reached: true },
   ]);
+  assert.equal(res.remaining_orphan_link_count, 3);
   assert.match(res.warning, /3 other input\(s\) in this graph still carry an orphaned link id/);
   assert.match(res.warning, /STILL refused/);
   assert.doesNotMatch(res.warning, /queueable/);
@@ -452,4 +453,22 @@ test("#1750 an orphan on a BYPASSED node is reported without claiming the graph 
   assert.match(res.warning, /only on node\(s\) the serializer may skip/);
   assert.doesNotMatch(res.warning, /STILL refused/);
   assert.doesNotMatch(res.warning, /No other input in this graph/);
+});
+
+test("#1750 the remaining-orphan list is capped, but the COUNT never is", () => {
+  const graph = mkGraph();
+  // 1 target + 25 more orphans. A ten-entry array with no total reads as "that
+  // is all of them" — a silent cap is the same overclaim in a structured field.
+  addNode(graph, 79, [{ name: "source_latent_b", link: 21 }]);
+  for (let i = 0; i < 25; i += 1) {
+    addNode(graph, 100 + i, [{ name: `in_${i}`, link: 500 + i }]);
+  }
+  const disconnect = buildDisconnect(graph);
+
+  const res = disconnect({ node_id: 79, input: "source_latent_b" });
+
+  assert.equal(res.remaining_orphan_links.length, 10);
+  assert.equal(res.remaining_orphan_link_count, 25);
+  assert.match(res.warning, /25 other input\(s\)/);
+  assert.match(res.warning, /, … —/, "the truncated roll says it was truncated");
 });
