@@ -4,12 +4,24 @@ import { readFileSync } from "node:fs";
 import { fetchImageForMcp, validateFetchImageRef } from "../../web/js/lib/fetch-image.js";
 import { commandIsCanvasIndependent, commandIsCanvasTargetless } from "../../web/js/lib/workflow-chat-identity.js";
 
-function response({ status = 200, mime = "image/png", bytes = [], contentLength, body = true } = {}) {
+function response({
+  status = 200,
+  mime = "image/png",
+  bytes = [],
+  contentLength,
+  body = true,
+  url,
+  type,
+  redirected = false,
+} = {}) {
   const data = Uint8Array.from(bytes);
   let consumed = false;
   return {
     status,
     ok: status >= 200 && status < 300,
+    ...(url === undefined ? {} : { url }),
+    ...(type === undefined ? {} : { type }),
+    redirected,
     headers: {
       get(name) {
         const key = name.toLowerCase();
@@ -62,6 +74,7 @@ test("#2149: valid refs use the API/base-path URL and return bounded media bytes
   assert.equal(calls[0].init.credentials, "include");
   assert.equal(calls[0].init.method, "GET");
   assert.equal(calls[0].init.cache, "no-store");
+  assert.equal(calls[0].init.redirect, "manual");
   assert.ok(calls[0].init.signal instanceof AbortSignal);
 });
 
@@ -83,6 +96,7 @@ test("#2149: the normal panel API helper receives the same relative route and cr
   assert.equal(result.ok, true);
   assert.equal(calls[0].path, "/view?filename=cat.png&subfolder=&type=output");
   assert.equal(calls[0].init.credentials, "include");
+  assert.equal(calls[0].init.redirect, "manual");
 });
 
 test("#2149: file refs reject separators, traversal, invalid subfolders, types, URLs, and extra fields", async () => {
@@ -146,6 +160,50 @@ test("#2149: HTTP failures preserve status classification", async () => {
   assert.equal(error?.code, "http_error");
   assert.equal(error?.status, 404);
   assert.match(error?.message ?? "", /HTTP 404/);
+});
+
+test("#2149: redirects and cross-origin final response URLs are typed refusals", async () => {
+  const options = {
+    api: { apiURL: (path) => path },
+    expectedOrigin: "https://panel.test",
+  };
+
+  await rejection(
+    fetchImageForMcp(
+      { filename: "redirect.png" },
+      { ...options, fetchImpl: async () => response({ status: 302, url: "https://panel.test/login", body: false }) },
+    ),
+    "redirect_error",
+  );
+  await rejection(
+    fetchImageForMcp(
+      { filename: "opaque-redirect.png" },
+      { ...options, fetchImpl: async () => response({ status: 0, type: "opaqueredirect", body: false }) },
+    ),
+    "redirect_error",
+  );
+  await rejection(
+    fetchImageForMcp(
+      { filename: "cross-origin.png" },
+      { ...options, fetchImpl: async () => response({ url: "https://evil.test/image.png", bytes: [1] }) },
+    ),
+    "invalid_origin",
+  );
+});
+
+test("#2149: a same-origin final response URL remains valid", async () => {
+  const result = await fetchImageForMcp(
+    { filename: "same-origin.png" },
+    {
+      api: { apiURL: (path) => `https://panel.test/base${path}` },
+      expectedOrigin: "https://panel.test",
+      fetchImpl: async (url, init) => {
+        assert.equal(init.redirect, "manual");
+        return response({ url, bytes: [1, 2, 3] });
+      },
+    },
+  );
+  assert.equal(result.bytes, 3);
 });
 
 test("#2149: non-media MIME types are refused", async () => {

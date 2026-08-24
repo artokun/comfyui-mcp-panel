@@ -159,6 +159,41 @@ function responseHeader(response, name) {
   }
 }
 
+function validateResponseOrigin(response, expectedOrigin) {
+  const rawUrl = response?.url;
+  if (rawUrl == null || rawUrl === "") return;
+  if (typeof rawUrl !== "string") {
+    throw fetchImageError("invalid_origin", "fetch_image received a response with an invalid URL");
+  }
+  try {
+    const parsed = new URL(rawUrl, expectedOrigin || "http://comfyui-panel.invalid");
+    if (
+      (!expectedOrigin && parsed.origin !== "http://comfyui-panel.invalid") ||
+      (expectedOrigin && parsed.origin !== expectedOrigin)
+    ) {
+      throw fetchImageError("invalid_origin", "fetch_image received a non-same-origin response URL");
+    }
+  } catch (error) {
+    if (error?.code) throw error;
+    throw fetchImageError("invalid_origin", "fetch_image received an invalid response URL");
+  }
+}
+
+function rejectRedirectResponse(response) {
+  const status = Number(response?.status);
+  if (
+    response?.type === "opaqueredirect" ||
+    response?.redirected === true ||
+    (Number.isFinite(status) && status >= 300 && status < 400)
+  ) {
+    throw fetchImageError(
+      "redirect_error",
+      `fetch_image rejected a redirect response${Number.isFinite(status) ? ` (HTTP ${status})` : ""}`,
+      { status: Number.isFinite(status) ? status : null },
+    );
+  }
+}
+
 function mediaMimeType(response) {
   const raw = responseHeader(response, "content-type") || "";
   const mimeType = raw.split(";", 1)[0].trim().toLowerCase();
@@ -288,12 +323,14 @@ export async function fetchImageForMcp(
   }
   const ref = validateRefFields(args, { allowCommandFields: true });
   const path = viewPath(ref);
-  const url = resolveSameOriginUrl(api, path, expectedOrigin ?? pageOrigin());
+  const origin = expectedOrigin ?? pageOrigin();
+  const url = resolveSameOriginUrl(api, path, origin);
   const timeout = timeoutState(timeoutMs);
   const request = {
     method: "GET",
     cache: "no-store",
     credentials: "include",
+    redirect: "manual",
     signal: timeout.controller.signal,
   };
   try {
@@ -311,6 +348,8 @@ export async function fetchImageForMcp(
       throw fetchImageError("network_error", `fetch_image could not reach /view: ${error?.message ?? error}`);
     }
 
+    validateResponseOrigin(response, origin);
+    rejectRedirectResponse(response);
     const status = Number(response?.status);
     const ok = response?.ok === true || (Number.isFinite(status) && status >= 200 && status < 300);
     if (!ok) {
