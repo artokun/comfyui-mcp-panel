@@ -24,6 +24,12 @@
 // leaving the segment pending forever.
 import { duplicateCompletionNote } from "./completion-dedupe.js";
 import { withTimeout } from "./bounded-step.js";
+import {
+  appendStoryboardCacheBust,
+  createStoryboardIdentity,
+  storyboardPosterUploadName,
+  storyboardUploadName,
+} from "./storyboard-cache-identity.js";
 
 // #1610 — stills metadata (HEAD /view for size + Image() decode for pixels) is
 // best-effort decoration on the completion note. It is NOT needed to attach the
@@ -591,6 +597,12 @@ async function buildVideoSegment(v, deps) {
   // that can overlap the decode does.
   const produce = async () => {
     try {
+      // #1718 — a rerender can overwrite a temp video under the same filename.
+      // Give the source fetch and every derived artifact one attempt identity so
+      // neither the browser nor ComfyUI's filename-based temp ref can return the
+      // previous run's pixels.
+      const storyboardIdentity = createStoryboardIdentity();
+      const sourceUrl = appendStoryboardCacheBust(imageViewUrl(m), storyboardIdentity);
       // The video's own byte size is wanted only for the note's metadata line.
       // Start its HEAD (bounded at 8 s inside fetchImageBytes) BEFORE the
       // sampling pass so the round trip overlaps the decode instead of being
@@ -605,11 +617,11 @@ async function buildVideoSegment(v, deps) {
       // rejection fell into the segment's catch and cost the agent the sheet.
       let sizeBytes;
       try {
-        sizeBytes = Promise.resolve(fetchImageBytes(imageViewUrl(m))).catch(() => null);
+        sizeBytes = Promise.resolve(fetchImageBytes(sourceUrl)).catch(() => null);
       } catch {
         sizeBytes = Promise.resolve(null);
       }
-      const produced = await buildVideoStoryboard(imageViewUrl(m));
+      const produced = await buildVideoStoryboard(sourceUrl);
       // #1493 — the builder hands back `storyboardFailure({reason})` when it
       // could not sample the video, and that object is TRUTHY: a bare `!blob`
       // test sails straight past it and hands a plain object to
@@ -646,7 +658,7 @@ async function buildVideoSegment(v, deps) {
       // input/) so it never accumulates as permanent input litter. imageViewUrl
       // reads ref.type through to the /view request, so the chat preview still
       // resolves correctly.
-      const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`, { type: "temp" });
+      const ref = await uploadBlobToInput(blob, storyboardUploadName(base, storyboardIdentity), { type: "temp" });
       if (!ref) {
         warn("[cmcp] storyboard: upload failed for", m?.filename);
         return { ref: null, note: noteOnly("couldn't upload its storyboard") };
@@ -707,7 +719,11 @@ async function buildVideoSegment(v, deps) {
       if (blob.posterBlob && typeof applyVideoPoster === "function") {
         void Promise.resolve()
           .then(async () => {
-            const posterRef = await uploadBlobToInput(blob.posterBlob, `poster_${base}.png`, { type: "temp" });
+            const posterRef = await uploadBlobToInput(
+              blob.posterBlob,
+              storyboardPosterUploadName(base, storyboardIdentity),
+              { type: "temp" },
+            );
             if (posterRef) applyVideoPoster(imageViewUrl(m), imageViewUrl(posterRef));
           })
           .catch((err) => {

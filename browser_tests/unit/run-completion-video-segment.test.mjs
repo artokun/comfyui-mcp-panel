@@ -269,9 +269,29 @@ test("#1485: the poster still reaches the card when its upload resolves", async 
   assert.equal(calls.posters.length, 0, "the frame did not wait for it");
   resolvePoster();
   await new Promise((r) => setTimeout(r, 0));
-  assert.deepEqual(calls.posters, [
-    { videoUrl: "/view?filename=clip_00001_.mp4", posterUrl: "/view?filename=poster_clip_00001_.png" },
-  ], "and the card is back-filled by video URL exactly as before");
+  assert.equal(calls.posters.length, 1, "and the card is back-filled by video URL");
+  assert.equal(calls.posters[0].videoUrl, "/view?filename=clip_00001_.mp4");
+  assert.match(calls.posters[0].posterUrl, /^\/view\?filename=poster_clip_00001__.+\.png$/);
+});
+
+test("#1718: repeated renders with one source filename sample fresh bytes and upload fresh sheets", async () => {
+  const attempts = [];
+  for (let i = 0; i < 2; i += 1) {
+    const { deps, calls } = makeDeps({
+      buildVideoStoryboard: async (url) => {
+        attempts.push({ url });
+        return sheetBlob({ paintedFrames: 20 });
+      },
+    });
+    await composeRunCompletionFrame(videoPayload(), deps);
+    attempts[i].name = calls.uploads[0]?.name ?? null;
+  }
+  assert.match(attempts[0].url, /[?&]cmcp_storyboard=/);
+  assert.match(attempts[1].url, /[?&]cmcp_storyboard=/);
+  assert.notEqual(attempts[0].url, attempts[1].url, "the source /view cache key must change per render");
+  assert.match(attempts[0].name, /^storyboard_clip_00001__.+\.png$/);
+  assert.match(attempts[1].name, /^storyboard_clip_00001__.+\.png$/);
+  assert.notEqual(attempts[0].name, attempts[1].name, "the temp storyboard ref must change per render");
 });
 
 test("#1485: the video's size HEAD overlaps the sampling instead of following the upload", async () => {

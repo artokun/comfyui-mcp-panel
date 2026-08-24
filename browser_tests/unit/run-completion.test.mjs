@@ -357,11 +357,10 @@ test("#269/#468 presentation: a MIXED run (stills + 2 videos) emits EXACTLY ONE 
   assert.equal(frames[0].prompt_id, P, "attributed to the finishing prompt");
   // All outputs ride in the single frame: the still + both storyboard refs.
   const names = frames[0].images.map((m) => m.filename);
-  assert.deepEqual(
-    names,
-    ["final.png", "storyboard_v1.png", "storyboard_v2.png"],
-    "one still + BOTH video storyboards consolidated into the single images array",
-  );
+  assert.equal(names[0], "final.png");
+  assert.match(names[1], /^storyboard_v1_.+\.png$/);
+  assert.match(names[2], /^storyboard_v2_.+\.png$/);
+  assert.equal(names.length, 3, "one still + BOTH video storyboards consolidated into the single images array");
   // The note mentions the still result and both videos in one turn.
   assert.match(frames[0].note, /final\.png/, "note names the still output");
   assert.match(frames[0].note, /v1\.mp4/, "note names the first video");
@@ -404,11 +403,10 @@ test("presentation: a video-only run (2 videos) is still ONE frame", async () =>
     deps,
   );
   assert.equal(frames.length, 1, "two videos, one completion frame");
-  assert.deepEqual(
-    frames[0].images.map((m) => m.filename),
-    ["storyboard_x.png", "storyboard_y.png"],
-    "both storyboards in the single frame",
-  );
+  const names = frames[0].images.map((m) => m.filename);
+  assert.equal(names.length, 2, "both storyboards in the single frame");
+  assert.match(names[0], /^storyboard_x_.+\.png$/);
+  assert.match(names[1], /^storyboard_y_.+\.png$/);
 });
 
 // #209 — the storyboard contact sheet is a panel-generated PREVIEW, never a
@@ -429,14 +427,14 @@ test("#209 storyboard upload requests ComfyUI's temp namespace, never input/", a
     deps,
   );
   assert.equal(uploadCalls.length, 1, "one storyboard upload for the one video");
-  assert.equal(uploadCalls[0].name, "storyboard_clip.png");
+  assert.match(uploadCalls[0].name, /^storyboard_clip_.+\.png$/);
   assert.equal(uploadCalls[0].opts?.type, "temp", "must request the temp namespace, not input/");
 
   // The resulting ImageRef must carry type:"temp" all the way into the sent
   // frame, so the chat preview resolves via /view?...&type=temp — never silently
   // falls back to type:"input" (which would defeat the fix even if the upload
   // call itself requested temp).
-  const storyboardImg = frames[0].images.find((m) => m.filename === "storyboard_clip.png");
+  const storyboardImg = frames[0].images.find((m) => /^storyboard_clip_.+\.png$/.test(m.filename));
   assert.ok(storyboardImg, "storyboard ref must be present in the sent frame");
   assert.equal(storyboardImg.type, "temp");
 });
@@ -515,7 +513,7 @@ test("#609: blind mode (images withheld) — no review request, an explicit proh
   // The storyboard is still produced for the USER (blind blinds the agent, not
   // the panel) — the ref rides the frame; the sendFrame gate strips it.
   assert.ok(
-    frame.images.some((m) => m.filename === "storyboard_clip.png"),
+    frame.images.some((m) => /^storyboard_clip_.+\.png$/.test(m.filename)),
     "the storyboard is still built for the user; only the agent-facing pixels are gated",
   );
 });

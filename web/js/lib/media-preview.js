@@ -45,6 +45,11 @@
 // names it. That is what makes the remedy actionable rather than decorative.
 
 import { withTimeout } from "./bounded-step.js";
+import {
+  appendStoryboardCacheBust,
+  createStoryboardIdentity,
+  storyboardUploadName,
+} from "./storyboard-cache-identity.js";
 
 /**
  * Whole wall-clock bound for ONE video's preview (size probe + sample + upload).
@@ -432,6 +437,7 @@ export async function composeShowMediaReply(items, deps = {}) {
     const caption = text(item?.caption) || text(item?.filename) || "";
     const { kind, ext } = classifyShowMediaItem(item, text);
     const isVideo = kind === "video";
+    const storyboardIdentity = isVideo ? createStoryboardIdentity() : null;
     let url = null;
     let ref = null;
     let why = null;
@@ -451,6 +457,9 @@ export async function composeShowMediaReply(items, deps = {}) {
       // reference is right there, and the caller would be told to re-send
       // something it already sent correctly.
       if (!url) why = "the panel could not build a view URL for its ComfyUI reference";
+      // #1718 — a temp video can be rerendered in place. The stable /view URL
+      // otherwise lets the browser sample the previous video's bytes.
+      if (isVideo && url) url = appendStoryboardCacheBust(url, storyboardIdentity);
     } else if (typeof item?.dataUrl === "string" && item.dataUrl) {
       url = item.dataUrl;
     }
@@ -589,6 +598,7 @@ export async function composeShowMediaReply(items, deps = {}) {
         url,
         name: name || "video",
         ref,
+        storyboardIdentity,
         // Whether the USER got a player. The no-preview remedy leans on "ask
         // the user"; telling the agent to ask about something the user cannot
         // see is a remedy that does not work from where the caller is.
@@ -958,7 +968,8 @@ async function produceSheet(job, deps) {
     const base = job.name.replace(/\.[^.]+$/, "") || "video";
     // #209 — a panel-generated sheet is not a user input: it goes to ComfyUI's
     // swept temp/ namespace so it cannot accumulate as permanent input litter.
-    const ref = await uploadBlobToInput(blob, `storyboard_${base}.png`, { type: "temp" });
+    const identity = job.storyboardIdentity || createStoryboardIdentity();
+    const ref = await uploadBlobToInput(blob, storyboardUploadName(base, identity), { type: "temp" });
     if (!ref) {
       warn("[cmcp] show_media: storyboard upload failed for", job.name);
       return {
