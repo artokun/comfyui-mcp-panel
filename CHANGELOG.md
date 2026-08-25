@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.88] - 2026-08-25
+
+### Fixed
+- recover graph tools after restart reconnect without a hard refresh (#1790)
+
 ## [0.15.87] - 2026-08-25
 
 ### Fixed
