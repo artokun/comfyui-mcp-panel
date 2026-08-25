@@ -1,9 +1,6 @@
-// mcp#884/#897: the conversation is ALWAYS panel-owned. The orchestrator keys and
-// persists ONE agent session per backend across every panel, tab and workflow, so a
-// per-workflow chat is a bug, not a mode — a user left in `workflow` or `ask` scope
-// gets several panel transcripts all mapping onto the single session the
-// orchestrator actually runs, and the transcripts silently diverge from the agent's
-// real context.
+// mcp#884/#897: user-selectable scope settings are retired. Panel-owned scope is
+// still the default, while the real Grok provider/session state selects the
+// production per-workflow branch.
 //
 // WHY THIS FILE EXISTS. The retirement was previously pinned only by Playwright
 // specs, which are NOT in CI (they need a live ComfyUI on :8188). A mutation test
@@ -33,7 +30,7 @@ const SRC = readFileSync(join(HERE, "../../web/js/comfyui-mcp-panel.js"), "utf8"
  *  is evaluated — a truncated slice would otherwise be a syntax error or, worse, a
  *  half-function that happens to parse. */
 function loadChatScopeMode(getSetting) {
-  const start = SRC.indexOf("function chatScopeMode() {");
+  const start = SRC.indexOf("function chatScopeMode(backend) {");
   assert.notEqual(start, -1, "chatScopeMode() must exist in the panel source");
   const end = SRC.indexOf("\n}\n", start);
   assert.notEqual(end, -1, "chatScopeMode() must be closed at a column-0 brace");
@@ -64,7 +61,7 @@ const STORED_VALUES = [
   ["workflow"],
 ];
 
-test("chatScopeMode() is panel-owned for EVERY stored value a retired scope could have left", () => {
+test("chatScopeMode() ignores EVERY stored value a retired scope could have left", () => {
   for (const stored of STORED_VALUES) {
     const reads = [];
     const chatScopeMode = loadChatScopeMode((id) => {
@@ -77,6 +74,15 @@ test("chatScopeMode() is panel-owned for EVERY stored value a retired scope coul
       `a stored scope of ${JSON.stringify(stored) ?? String(stored)} must be ignored, not honored`,
     );
   }
+});
+
+test("chatScopeMode() reaches the dedicated branch from the real provider state", () => {
+  const chatScopeMode = loadChatScopeMode(() => {
+    throw new Error("provider scope must not read a retired setting");
+  });
+  assert.equal(chatScopeMode("grok"), "workflow");
+  assert.equal(chatScopeMode("claude"), "panel");
+  assert.equal(chatScopeMode("codex"), "panel");
 });
 
 test("chatScopeMode() does not consult the settings store at all", () => {

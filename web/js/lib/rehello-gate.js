@@ -146,7 +146,7 @@ export function deferBudgetMs(cmd) {
 
 /**
  * @param {{
- *   advertise: () => any,          the real re-advertise (the panel's hello send)
+ *   advertise: (context?: any) => any, the real re-advertise (the panel's hello send)
  *   now?: () => number,            MONOTONIC clock; defaults to performance.now()
  *   setTimer?: Function,
  *   clearTimer?: Function,
@@ -253,21 +253,22 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
   /** Send now — or JOIN the advertisement already on its way — and hand the SAME outcome to
    *  every coalesced caller. Never rejects: a caller that cannot tell "did not land" from
    *  "threw" would spend a retry budget on neither. */
-  function flush() {
+  function flush(contextOverride) {
     const pending = waiters;
     waiters = null;
     disarmTimer();
+    const context = contextOverride === undefined ? pending?.[0]?.context : contextOverride;
     // Joining is correct rather than merely cheaper: `makePayload` reads the tab identity
     // AFTER the lease resolves, so an advertisement started a microtask ago has not yet
     // decided what it carries and will carry whatever is live when it gets there — which is
     // the identity a later caller is asking it to advertise.
     if (inFlight) {
-      if (pending) for (const resolve of pending) inFlight.then(resolve);
+      if (pending) for (const { resolve } of pending) inFlight.then(resolve);
       return inFlight;
     }
     let result;
     try {
-      result = send();
+      result = send(context);
     } catch {
       result = false;
     }
@@ -281,7 +282,7 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
     void settled.then(() => {
       if (inFlight === settled) inFlight = null;
     });
-    if (pending) for (const resolve of pending) settled.then(resolve);
+    if (pending) for (const { resolve } of pending) settled.then(resolve);
     return settled;
   }
 
@@ -357,15 +358,16 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
    *  a held frame waits for the hello the deferral will produce, and must not be able to
    *  force one (see that method for the whole argument).
    *  @returns {Promise<boolean>} whether the hello reached the wire. */
-  function request() {
-    if (live.size === 0) return flush();
+  function request(context) {
+    if (live.size === 0) return flush(context);
     const left = drainDeadline - clock();
     // Budget already spent (a command that will not report back). Proceed — an unbounded
     // wait here is the wedge described in the header.
-    if (!(left > 0)) return flush();
+    if (!(left > 0)) return flush(context);
     const promise = new Promise((resolve) => {
-      if (waiters) waiters.push(resolve);
-      else waiters = [resolve];
+      const waiter = { resolve, context };
+      if (waiters) waiters.push(waiter);
+      else waiters = [waiter];
     });
     // Arm only for the FIRST waiter; a later join must not restart the clock, or a steady
     // trickle of re-advertise requests would push the deadline forward forever.
@@ -456,7 +458,7 @@ export function createRehelloGate({ advertise, now, setTimer, clearTimer } = {})
       // on the REPLACEMENT socket must not join it and conclude the new route is published
       // because the old socket's hello landed.
       inFlight = null;
-      if (pending) for (const resolve of pending) resolve(false);
+      if (pending) for (const { resolve } of pending) resolve(false);
     },
 
     /**

@@ -39,7 +39,7 @@ export interface MockBridgeOptions {
   port?: number
   /** Model catalog sent on the handshake. */
   models?: MockModel[]
-  /** Backend id reported on the handshake ("claude" | "codex"). */
+  /** Backend id reported on the handshake (for example "claude", "codex", or "grok"). */
   backend?: string
   /** Slash-command catalog sent on the handshake. */
   commands?: unknown[]

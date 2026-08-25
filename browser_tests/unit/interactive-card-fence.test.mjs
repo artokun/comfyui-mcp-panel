@@ -576,6 +576,7 @@ function buildLifecycle() {
     let pendingSecretRequest = null;
     let lastAgentGraph = null, lastAgentGraphKey = null, lastAgentGraphEpoch = null, sessionEpoch = 0;
     const completeDedicatedWorkflowSessionSwap = () => {};
+    const settlePendingDedicatedWorkflowSwapAfterCancellation = () => {};
     const Date = { now };
     ${endTurnLocallyMatch[0]}
     ${fenceMatch[0]}

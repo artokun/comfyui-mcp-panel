@@ -27,9 +27,26 @@ function methodSource(signature) {
 
 const WORKFLOW_CHANGED = methodSource("function onWorkflowMaybeChanged() {");
 const COMPLETE_DEDICATED_SWAP = methodSource("function completeDedicatedWorkflowSessionSwap(");
+const SETTLE_CANCELLED_SWAP = methodSource("function settlePendingDedicatedWorkflowSwapAfterCancellation() {");
+const NOTE_DEDICATED_HELLO = methodSource("function noteDedicatedWorkflowHello(context) {");
 const ON_ACK = methodSource("onAck(ack) {");
+const END_TURN_LOCALLY = methodSource("function endTurnLocally() {");
+const THINKING_SAFETY = methodSource("function onThinkingSafety() {");
 
-function buildWorkflowChanged({ working, followsPanel = false } = {}) {
+const CHAT_SCOPE_MODE = methodSource("function chatScopeMode(backend) {");
+const HISTORY_SCOPE = methodSource("function historyScopeFollowsPanel() {");
+
+function productionHistoryScopeFor(backend) {
+  const chatScopeMode = new Function(`${CHAT_SCOPE_MODE}\nreturn chatScopeMode;`)();
+  return new Function(
+    "chatScopeMode",
+    "connectedBackend",
+    "selectedBackend",
+    `${HISTORY_SCOPE}\nreturn historyScopeFollowsPanel;`,
+  )(chatScopeMode, backend, backend);
+}
+
+function buildWorkflowChanged({ working, backend = "grok" } = {}) {
   const deferred = [];
   const wf = { key: "new-workflow.json", filename: "new-workflow.json" };
   const onWorkflowMaybeChanged = new Function(
@@ -44,7 +61,7 @@ function buildWorkflowChanged({ working, followsPanel = false } = {}) {
     () => wf,
     () => "wf:new-workflow.json",
     "wf:old-workflow.json",
-    () => followsPanel,
+    productionHistoryScopeFor(backend),
     working,
     (...args) => deferred.push(args),
   );
@@ -52,7 +69,9 @@ function buildWorkflowChanged({ working, followsPanel = false } = {}) {
 }
 
 test("#1810 production workflow poll defers a dedicated session swap during the calling turn", () => {
-  const { onWorkflowMaybeChanged, deferred, wf } = buildWorkflowChanged({ working: true });
+  assert.equal(productionHistoryScopeFor("grok")(), false);
+  assert.equal(productionHistoryScopeFor("claude")(), true);
+  const { onWorkflowMaybeChanged, deferred, wf } = buildWorkflowChanged({ working: true, backend: "grok" });
 
   onWorkflowMaybeChanged();
 
@@ -61,9 +80,13 @@ test("#1810 production workflow poll defers a dedicated session swap during the 
   // block. The injected defer callback is the only operation it is allowed to make.
 });
 
+test("#1810 production scope state keeps non-Grok providers panel-owned", () => {
+  assert.equal(productionHistoryScopeFor("claude")(), true);
+});
+
 function buildDedicatedSwap({ pending = true, working = false, existing = true } = {}) {
   const events = [];
-  const state = { pending, ackPending: true, thread: existing ? { id: "new-chat", sessionId: "session-new" } : null };
+  const state = { pending, ackPending: { token: "swap-1", landed: true }, thread: existing ? { id: "new-chat", sessionId: "session-new" } : null };
   const complete = new Function(
     "historyScopeFollowsPanel",
     "agentWorking",
@@ -83,7 +106,7 @@ function buildDedicatedSwap({ pending = true, working = false, existing = true }
     "appendSystem",
     "tr",
     "refreshContextRingForScope",
-    `${COMPLETE_DEDICATED_SWAP}\nreturn { completeDedicatedWorkflowSessionSwap, state: () => ({ pendingDedicatedWorkflowSwap, dedicatedWorkflowSwapAckPending, thread }) };`,
+    `${COMPLETE_DEDICATED_SWAP}\n${SETTLE_CANCELLED_SWAP}\nreturn { completeDedicatedWorkflowSessionSwap, settlePendingDedicatedWorkflowSwapAfterCancellation, state: () => ({ pendingDedicatedWorkflowSwap, dedicatedWorkflowSwapAckPending, thread }) };`,
   )(
     () => false,
     working,
@@ -104,14 +127,14 @@ function buildDedicatedSwap({ pending = true, working = false, existing = true }
     (_key, fallback) => fallback,
     () => events.push(["refresh"]),
   );
-  return { complete, events };
+  return { complete: complete.completeDedicatedWorkflowSessionSwap, settle: complete.settlePendingDedicatedWorkflowSwapAfterCancellation, state: complete.state, events };
 }
 
 test("#1810 terminal production swap binds the dedicated session only after the turn ends", () => {
-  const { complete, events } = buildDedicatedSwap();
+  const { complete, state, events } = buildDedicatedSwap();
 
-  assert.equal(complete.completeDedicatedWorkflowSessionSwap({ announce: true }), true);
-  assert.deepEqual(complete.state(), { pendingDedicatedWorkflowSwap: false, dedicatedWorkflowSwapAckPending: false, thread: { id: "new-chat", sessionId: "session-new" } });
+  assert.equal(complete({ announce: true }), true);
+  assert.deepEqual(state(), { pendingDedicatedWorkflowSwap: false, dedicatedWorkflowSwapAckPending: null, thread: { id: "new-chat", sessionId: "session-new" } });
   assert.deepEqual(events, [
     ["storage", "comfyui-mcp.panel.sessionId", "session-new"],
     ["rehello", "session-new"],
@@ -124,11 +147,29 @@ test("#1810 terminal production swap binds the dedicated session only after the 
 test("#1810 does not complete the dedicated swap while the turn is still working", () => {
   const { complete, events } = buildDedicatedSwap({ working: true });
 
-  assert.equal(complete.completeDedicatedWorkflowSessionSwap(), false);
+  assert.equal(complete(), false);
   assert.deepEqual(events, []);
 });
 
-function buildAck({ outageMs = 0, rebootPending = false } = {}) {
+function buildHelloCorrelation() {
+  const pending = { token: "swap-1", landed: false };
+  return new Function(
+    "dedicatedWorkflowSwapAckPending",
+    `${NOTE_DEDICATED_HELLO}\nreturn { noteDedicatedWorkflowHello, state: () => dedicatedWorkflowSwapAckPending };`,
+  )(pending);
+}
+
+test("#1810 only the deliberate hello can arm the dedicated ready-ack guard", () => {
+  const hello = buildHelloCorrelation();
+  hello.noteDedicatedWorkflowHello({ dedicatedWorkflowSwap: "other-swap" });
+  assert.equal(hello.state(), null, "an unrelated hello invalidates the pending correlation");
+
+  const deliberate = buildHelloCorrelation();
+  deliberate.noteDedicatedWorkflowHello({ dedicatedWorkflowSwap: "swap-1" });
+  assert.deepEqual(deliberate.state(), { token: "swap-1", landed: true });
+});
+
+function buildAck({ outageMs = 0, rebootPending = false, swapLanded = true } = {}) {
   const mids = new Map([
     ["mid", "1"],
     ["reboot", rebootPending ? "1" : null],
@@ -136,7 +177,7 @@ function buildAck({ outageMs = 0, rebootPending = false } = {}) {
     ["pending-reset", null],
   ]);
   const sent = [];
-  let swapAckPending = true;
+  let swapAckPending = { token: "swap-1", landed: swapLanded };
   let rebootHandlerCalls = 0;
   const onAck = new Function(
     "cmcpOauthOnAck",
@@ -225,6 +266,13 @@ test("#1810 real bridge outage still reaches the existing mid-turn recovery nudg
   assert.doesNotMatch(ack.sent[0][1], /ComfyUI was restarted/);
 });
 
+test("#1810 an unlanded deliberate hello cannot suppress real outage recovery", () => {
+  const ack = buildAck({ outageMs: 7000, swapLanded: false });
+  ack.onAck({ kind: "ready" });
+  assert.equal(ack.sent.length, 1);
+  assert.equal(ack.sent[0][0], "user");
+});
+
 test("#1810 explicit REBOOT_KEY recovery remains authoritative over the swap guard", () => {
   const ack = buildAck({ rebootPending: true });
   ack.onAck({ kind: "ready" });
@@ -244,4 +292,105 @@ test("#1810 real ComfyUI saw_down/up evidence remains distinct from a live rebin
   const benign = createComfyBackendOutageTracker({ now: () => now });
   benign.noteUp();
   assert.equal(benign.outageMs(), 0, "an up event without saw_down is not a restart cycle");
+});
+
+function buildCancellationSettlement() {
+  const built = buildDedicatedSwap({ existing: false });
+  return {
+    settle: built.settle,
+    state: () => {
+      const current = built.state();
+      return {
+        pendingDedicatedWorkflowSwap: current.pendingDedicatedWorkflowSwap,
+        dedicatedWorkflowSwapAckPending: current.dedicatedWorkflowSwapAckPending,
+      };
+    },
+  };
+}
+
+function buildEndTurnForCancellation(settle) {
+  const events = [];
+  const endTurnLocally = new Function(
+    "agentWorking",
+    "localEndAt",
+    "Date",
+    "ssSet",
+    "MID_TASK_KEY",
+    "settlePendingDedicatedWorkflowSwapAfterCancellation",
+    "hideThinking",
+    `${END_TURN_LOCALLY}\nreturn endTurnLocally;`,
+  )(
+    true,
+    null,
+    { now: () => 1234 },
+    (key, value) => events.push(["storage", key, value]),
+    "mid",
+    () => {
+      events.push(["settle"]);
+      settle();
+    },
+    () => events.push(["hide"]),
+  );
+  return { endTurnLocally, events };
+}
+
+for (const input of ["Escape", "Ctrl+C"]) {
+  test(`#1810 ${input} cancellation settles the pending dedicated swap`, () => {
+    const settlement = buildCancellationSettlement();
+    const { endTurnLocally, events } = buildEndTurnForCancellation(settlement.settle);
+    endTurnLocally();
+    assert.deepEqual(events, [["storage", "mid", null], ["settle"], ["hide"]]);
+    assert.deepEqual(settlement.state(), { pendingDedicatedWorkflowSwap: false, dedicatedWorkflowSwapAckPending: null });
+  });
+}
+
+test("#1810 safety-timeout cancellation settles the pending dedicated swap", () => {
+  const settlement = buildCancellationSettlement();
+  const events = [];
+  const onThinkingSafety = new Function(
+    "thinkingSafety",
+    "Date",
+    "lastActivityAt",
+    "MAX_SILENT_TURN_MS",
+    "agentWorking",
+    "thinkingEl",
+    "showThinking",
+    "THINKING_SAFETY_MS",
+    "setTimeout",
+    "ssSet",
+    "MID_TASK_KEY",
+    "settlePendingDedicatedWorkflowSwapAfterCancellation",
+    "hideThinking",
+    `${THINKING_SAFETY}\nreturn onThinkingSafety;`,
+  )(
+    "timer",
+    { now: () => 10_000 },
+    0,
+    100,
+    true,
+    {},
+    () => {},
+    120_000,
+    () => "timer",
+    (key, value) => events.push(["storage", key, value]),
+    "mid",
+    () => {
+      events.push(["settle"]);
+      settlement.settle();
+    },
+    () => events.push(["hide"]),
+  );
+  onThinkingSafety();
+  assert.deepEqual(events, [["storage", "mid", null], ["settle"], ["hide"]]);
+  assert.deepEqual(settlement.state(), { pendingDedicatedWorkflowSwap: false, dedicatedWorkflowSwapAckPending: null });
+});
+
+test("#1810 production interrupt wiring routes Esc and Ctrl+C through endTurnLocally", () => {
+  const start = PANEL.indexOf("function onInterruptKeydown(ev) {");
+  const end = PANEL.indexOf("\n  }\n  document.addEventListener(\"keydown\", onInterruptKeydown", start);
+  assert.ok(start >= 0 && end > start);
+  const body = PANEL.slice(start, end);
+  assert.match(body, /const isCopy = .*ev\.key === \"c\"/s);
+  assert.match(body, /const isEsc = ev\.key === \"Escape\"/);
+  assert.match(body, /endTurnLocally\(\);/);
 });

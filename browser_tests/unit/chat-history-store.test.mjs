@@ -2657,13 +2657,9 @@ test('#1171 a capped open reports failure exactly past the local shadow boundary
 // ---------------------------------------------------------------------------
 // mcp#884 — THE INVARIANT, pinned as a gate rather than left to inspection.
 //
-// "Sessions are ORCHESTRATOR-scoped, never workflow-scoped or tab-scoped" is a
-// project invariant, and this branch is what makes the panel honour it. The
-// retired workflow/ask machinery is still PRESENT in the panel source as
-// deliberately unreachable defence-in-depth (see historyScopeFollowsPanel()),
-// which is a reasonable choice and also a standing hazard: the whole of it wakes
-// up again the moment chatScopeMode() stops being a constant. Reading the source
-// once proved it is unreachable today; these assertions are what keep it so.
+// User-selectable workflow/ask scope is retired, but Grok's real provider state
+// intentionally reaches the existing dedicated branch. These assertions keep
+// that decision independent from persisted scope settings.
 // ---------------------------------------------------------------------------
 
 const PANEL_SRC = readFileSync(
@@ -2680,13 +2676,13 @@ function topLevelFunction(name) {
   return PANEL_SRC.slice(start, end)
 }
 
-test('mcp#884 chatScopeMode is a CONSTANT — no setting can reintroduce workflow scope', () => {
+test('mcp#884 chatScopeMode follows the real provider, never a stored scope setting', () => {
   const body = topLevelFunction('chatScopeMode')
-  // Exactly one return, and it is the literal. A `getSetting(...)` read here is
-  // the single edit that would revive every workflow-scoped path below it.
-  const returns = [...body.matchAll(/return\s+([^;]*);/g)].map((m) => m[1].trim())
-  assert.deepEqual(returns, ['"panel"'], 'chatScopeMode() returns the literal "panel" and nothing else')
+  assert.match(body, /backend\s*===\s*['"]grok['"]/, 'Grok must reach the dedicated provider branch')
   assert.ok(!/getSetting|localStorage|sessionStorage/.test(body), 'it reads no stored value')
+  const chatScopeMode = new Function(`${body}\n}\nreturn chatScopeMode;`)()
+  assert.equal(chatScopeMode('grok'), 'workflow')
+  assert.equal(chatScopeMode('claude'), 'panel')
 })
 
 test('mcp#884 no chat-scope setting is registered any more', () => {
