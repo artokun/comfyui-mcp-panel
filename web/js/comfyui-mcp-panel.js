@@ -19357,7 +19357,6 @@ const GRAPH_TOOL_EXECUTORS = {
     // The proof is evaluated against the CURRENT epoch on every poll, and the
     // service/active pair is read only after the wait, so a replacement during
     // the wait cannot be paired with pre-reconnect identity.
-    const workflowListEpochAtStart = backendReconnectEpoch;
     const reconnectReadinessRequired =
       comfyBackendIsDown() ||
       postReconnectSettleWindow() ||
@@ -19366,19 +19365,13 @@ const GRAPH_TOOL_EXECUTORS = {
       if (comfyBackendIsDown() || nodeDefRefreshInFlight != null) return false;
       const { active, activeIdentity } = liveWorkflowListActive();
       if (!active || !activeIdentity?.routingKey || !activeIdentity?.uuid) return false;
-      // A post-reconnect active pointer is not enough. The same binding proof
-      // used by the settle watch must have landed for this epoch before the
-      // current tab can be used as a targeting identity.
+      // A post-reconnect active pointer is not enough. If this call entered
+      // during any reconnect-readiness condition, keep requiring the same
+      // binding proof even after the 30s staleness window expires: expiry is
+      // not proof, and the waiter must not turn its pending=false result into
+      // a false ready answer.
       if (
-        postReconnectSettleWindow() &&
-        postReconnectBindingProofEpoch < backendReconnectEpoch
-      ) {
-        return false;
-      }
-      // Keep the epoch comparison explicit: a newer reconnect must be observed
-      // by the live proof before this response can name a target.
-      if (
-        backendReconnectEpoch !== workflowListEpochAtStart &&
+        reconnectReadinessRequired &&
         postReconnectBindingProofEpoch < backendReconnectEpoch
       ) {
         return false;

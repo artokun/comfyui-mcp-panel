@@ -11,6 +11,10 @@ import {
   OPEN_RECONNECT_HANDSHAKE_STEPS_MS,
   waitForReconnectHandshakeBeforeOpen,
 } from "../../web/js/lib/reconnect-recovery.js";
+import {
+  ACTIVE_STALE_WINDOW_MS,
+  activeWorkflowPossiblyStale,
+} from "../../web/js/lib/reconnect-staleness.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
@@ -44,6 +48,40 @@ test("#1785 a workflow-list readiness miss times out on the shipped bounded wait
   assert.deepEqual(slept, [...OPEN_RECONNECT_HANDSHAKE_STEPS_MS]);
 });
 
+test("#1785 expiry boundary: stale proof refuses after 30s, current proof may succeed", async () => {
+  const reconnectedAt = 1_000;
+  const reconnectEpoch = 1;
+  const readinessRequired = true;
+  let now = reconnectedAt + ACTIVE_STALE_WINDOW_MS - 1;
+  let proofEpoch = 0;
+  const settleWindowActive = () =>
+    activeWorkflowPossiblyStale({
+      reconnectEpoch,
+      resyncEpoch: 0,
+      reconnectedAt,
+      now,
+    });
+  const bindingProofCurrent = () =>
+    !readinessRequired || proofEpoch >= reconnectEpoch;
+  const waitForListReadiness = () =>
+    waitForReconnectHandshakeBeforeOpen({
+      needsWait: () => settleWindowActive() || !bindingProofCurrent(),
+      isReady: bindingProofCurrent,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      stepsMs: [1],
+    });
+
+  assert.equal(await waitForListReadiness(), "timeout");
+  assert.equal(now, reconnectedAt + ACTIVE_STALE_WINDOW_MS);
+  assert.equal(settleWindowActive(), false, "the 30s window has expired");
+  assert.equal(proofEpoch, 0, "the binding proof is still stale at expiry");
+
+  proofEpoch = reconnectEpoch;
+  assert.equal(await waitForListReadiness(), "ready", "a current proof may proceed after expiry");
+});
+
 test("#1785 wiring: workflow_list waits before reading the service and refuses uncertainty", () => {
   const waitAt = LIST_BODY.indexOf("await waitForReconnectHandshakeBeforeOpen({");
   const serviceAt = LIST_BODY.indexOf("const s = app?.extensionManager?.workflow;");
@@ -68,8 +106,8 @@ test("#1785 wiring: readiness requires live identity plus the current binding pr
   assert.match(LIST_BODY, /activeIdentity\?\.uuid/, "workflow UUID must be established");
   assert.match(
     LIST_BODY,
-    /postReconnectBindingProofEpoch < backendReconnectEpoch/,
-    "a restored active pointer is not enough without the current binding proof",
+    /if \(\s*reconnectReadinessRequired\s*&&\s*postReconnectBindingProofEpoch < backendReconnectEpoch\s*\)/,
+    "proof remains required when this call entered reconnect readiness, even after expiry",
   );
   assert.match(LIST_BODY, /postReconnectSettleWindow\(\)/, "the reconnect window must be epoch-aware");
 });
