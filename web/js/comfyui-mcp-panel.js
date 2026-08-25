@@ -27704,6 +27704,17 @@ const PANEL_CSS = `
   flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0.75rem;
   display: flex; flex-direction: column; gap: 0.5rem;
 }
+/* #1801 — keep the long-lived transcript out of canvas-adjacent reflow/paint.
+   The feed's direct children are one message each (bubbles, tool/question cards,
+   A2UI cards, status notices, and the live thinking row). Contain the message,
+   not the scroll surface: the browser can skip off-screen content while the log
+   keeps its scroll geometry. The auto mode remembers the real height after a message
+   has been laid out; 120px is only the first-pass placeholder for an unseen
+   message, and is replaced as soon as that message enters the view. */
+.cmcp-log > :not(.cmcp-empty) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
+}
 .cmcp-empty {
   margin: auto; text-align: center; max-width: 230px;
   color: var(--p-text-muted-color, #a1a1aa);
