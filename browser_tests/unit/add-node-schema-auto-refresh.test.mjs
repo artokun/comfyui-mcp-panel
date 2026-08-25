@@ -99,7 +99,27 @@ function backendObjectInfo() {
           format: [["auto", "mp4"], { default: "auto" }],
           codec: [
             "COMFY_DYNAMICCOMBO_V3",
-            { options: [{ key: "auto", inputs: {} }, { key: "h264", inputs: {} }] },
+            {
+              options: [
+                { key: "auto", inputs: {} },
+                {
+                  key: "h264",
+                  inputs: {
+                    required: {
+                      encoding: [
+                        "COMFY_DYNAMICCOMBO_V3",
+                        {
+                          options: [
+                            { key: "auto", inputs: {} },
+                            { key: "re-encode", inputs: { required: { crf: ["FLOAT", { default: 23 }] } } },
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
           ],
         },
       },
@@ -117,22 +137,40 @@ function staleLoadImageNodeData() {
   };
 }
 
-function makeComfy({ stale = true } = {}) {
-  function installRebuildAccessor(node, widget) {
+function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
+  const widgetValueStore = new Map();
+  function widgetStoreKey(node, widget) {
+    return `${node.id}:${widget.name}`;
+  }
+
+  function installNativeDynamicCombo(node, widget) {
     let value = widget.value;
     Object.defineProperty(widget, "value", {
       configurable: true,
       get() {
-        return value;
+        return widgetValueStore.get(widget.widgetId)?.value ?? value;
       },
       set(next) {
+        const state = widgetValueStore.get(widget.widgetId);
+        if (state) state.value = next;
         value = next;
         node.dynamicRebuilds.push(widget.name);
-        node.widgets = node.widgets.filter(
-          (candidate) => !candidate.name.startsWith(`${widget.name}.`),
-        );
+        if (dynamicSetterThrows && node.graph && widget.name === "codec") {
+          throw new Error("native codec rebuild failed");
+        }
+        for (let index = node.widgets.length - 1; index >= 0; index--) {
+          const candidate = node.widgets[index];
+          if (candidate !== widget && candidate.name.startsWith(`${widget.name}.`)) {
+            candidate.onRemove?.();
+            node.widgets.splice(index, 1);
+          }
+        }
+        for (let index = node.inputs.length - 1; index >= 0; index--) {
+          if (node.inputs[index].name.startsWith(`${widget.name}.`)) node.inputs.splice(index, 1);
+        }
       },
     });
+    widget.value = value;
   }
 
   const widgets = {
@@ -141,8 +179,6 @@ function makeComfy({ stale = true } = {}) {
     },
     COMBO(node, name, spec) {
       const widget = node.addWidget("combo", name, spec[0][0], null, { values: spec[0] });
-      // The fixture represents the stale SaveVideo format dynamic root reported by #2254.
-      if (node.type === "SaveVideo" && name === "format") installRebuildAccessor(node, widget);
       return { widget };
     },
     COMFY_DYNAMICCOMBO_V3(node, name, spec) {
@@ -153,7 +189,7 @@ function makeComfy({ stale = true } = {}) {
         null,
         {},
       );
-      installRebuildAccessor(node, widget);
+      installNativeDynamicCombo(node, widget);
       return { widget };
     },
   };
@@ -177,7 +213,17 @@ function makeComfy({ stale = true } = {}) {
         outputs: [],
         dynamicRebuilds: [],
         addWidget(kind, name, value, callback, options) {
-          const widget = { type: kind, name, value, callback, options: options ?? {} };
+          const widget = {
+            type: kind,
+            name,
+            value,
+            callback,
+            options: options ?? {},
+            widgetId: null,
+            onRemove() {
+              if (widget.widgetId) widgetValueStore.delete(widget.widgetId);
+            },
+          };
           node.widgets.push(widget);
           return widget;
         },
@@ -189,15 +235,14 @@ function makeComfy({ stale = true } = {}) {
         else node.inputs.push({ name, type: declared });
       }
       if (type === "SaveVideo") {
-        // A stale nested row can survive the constructor's detached initial pass. The
-        // shipped repair must make the native `format` and `codec` setters clean it up
-        // after graph.add registers the node.
-        node.widgets.push({
-          type: "combo",
-          name: "format.codec",
-          value: "auto",
-          options: {},
-        });
+        // Current SaveVideo has ordinary `format` plus DynamicCombo `codec`. This is
+        // the stale row left by the old dynamic-format construction, before the node
+        // is registered and its current codec store exists.
+        const stale = node.addWidget("combo", "format.codec", "auto", null, {});
+        node.inputs.push({ name: "format.codec", type: "COMFY_DYNAMICCOMBO_V3", link: null });
+        stale.onRemove = () => {
+          if (stale.widgetId) widgetValueStore.delete(stale.widgetId);
+        };
       }
       return node;
     },
@@ -228,13 +273,47 @@ function makeComfy({ stale = true } = {}) {
     add(node) {
       node.graph = graph;
       graph._nodes.push(node);
+      for (const widget of node.widgets) {
+        widget.widgetId = widgetStoreKey(node, widget);
+        widgetValueStore.set(widget.widgetId, { value: widget.value });
+      }
+    },
+    remove(node) {
+      for (const widget of node.widgets) widget.onRemove?.();
+      graph._nodes = graph._nodes.filter((candidate) => candidate !== node);
+      node.graph = null;
     },
     beforeChange() {},
     afterChange() {},
     setDirtyCanvas() {},
   };
 
-  return { app, LG, graph, registry };
+  app.graphToPrompt = async () => {
+    const node = graph._nodes.find((candidate) => candidate.type === "SaveVideo");
+    if (!node) return { output: {} };
+    if (node.widgets.some((widget) => widget.name === "format.codec")) {
+      throw new Error("Dynamic widget doesn't exist on node");
+    }
+    const codec = node.widgets.find((widget) => widget.name === "codec");
+    if (!codec || !widgetValueStore.has(codec.widgetId)) {
+      throw new Error("codec widget store state is missing");
+    }
+    return {
+      output: {
+        [node.id]: {
+          class_type: "SaveVideo",
+          inputs: {
+            video: ["source", 0],
+            filename_prefix: node.widgets.find((widget) => widget.name === "filename_prefix")?.value,
+            format: node.widgets.find((widget) => widget.name === "format")?.value,
+            codec: codec.value,
+          },
+        },
+      },
+    };
+  };
+
+  return { app, LG, graph, registry, widgetValueStore };
 }
 
 /** Build the SHIPPED graph_add_node with its collaborators injected. */
@@ -455,7 +534,7 @@ test("#1242: an add with no drift never calls the refresh", async () => {
   assert.equal(res.added.schema_refreshed, undefined, "nothing to disclose when nothing happened");
 });
 
-test("#2254: a freshly added SaveVideo rebuilds stale format and codec dynamic state", async () => {
+test("#2254: a freshly added SaveVideo uses the native codec widget/store and is queueable", async () => {
   const comfy = makeComfy({ stale: false });
   const { graph_add_node } = realGraphAddNode(comfy);
 
@@ -468,6 +547,37 @@ test("#2254: a freshly added SaveVideo rebuilds stale format and codec dynamic s
     ["filename_prefix", "format", "codec"],
     "the stale format.codec row is removed while the current codec root remains",
   );
-  assert.deepEqual(node.dynamicRebuilds, ["format", "codec"]);
+  assert.equal(Object.getOwnPropertyDescriptor(node.widgets[1], "value")?.set, undefined);
+  assert.deepEqual(node.dynamicRebuilds, ["codec", "codec"], "only the native codec root is replayed");
+  assert.equal(
+    node.inputs.some((input) => input.name === "format.codec"),
+    false,
+    "native stale-input cleanup also removes the stale dotted input",
+  );
+  assert.equal(
+    [...comfy.widgetValueStore.keys()].some((key) => key.endsWith(":format.codec")),
+    false,
+    "native stale-widget cleanup also removes the stale store entry",
+  );
+  const prompt = await comfy.app.graphToPrompt();
+  assert.equal(prompt.output[node.id].inputs.format, "auto");
+  assert.equal(prompt.output[node.id].inputs.codec, "auto");
   assert.ok(node.graph, "the replay runs after graph.add registers the node");
+});
+
+test("#2254: a native dynamic setter throw refuses the add and leaves a retryable canvas", async () => {
+  const comfy = makeComfy({ stale: false, dynamicSetterThrows: true });
+  const { graph_add_node } = realGraphAddNode(comfy);
+
+  await assert.rejects(
+    () => graph_add_node({ class_type: "SaveVideo" }),
+    (err) => {
+      assert.match(err.message, /native dynamic-widget reconciliation failed/i);
+      assert.match(err.message, /codec/);
+      assert.match(err.message, /RETRY panel_add_node/i);
+      return true;
+    },
+  );
+  assert.equal(comfy.graph._nodes.length, 0, "a failed reconciliation must not leave a partial node");
+  assert.equal(comfy.widgetValueStore.size, 0, "rollback removes the registered widget-store state");
 });
