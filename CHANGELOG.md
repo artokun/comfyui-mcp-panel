@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.79] - 2026-08-25
+
+### Fixed
+- Render orphan-link repairs with a meaningful activity warning instead of an undefined disconnect summary (#1750)
+
 ## [0.15.78] - 2026-08-24
 
 ### Fixed
