@@ -1175,6 +1175,32 @@ test("#654: a benign WS blip is NOT a restart", () => {
   assert.equal(shouldReadvertiseAfterComfyRestart({ bridgeConnected: true, outageMs: 6000 }), true);
 });
 
+test("#1785: a confirmed fast restart re-advertises the live route", () => {
+  assert.equal(
+    shouldReadvertiseAfterComfyRestart({
+      bridgeConnected: true,
+      outageMs: 800,
+      restartConfirmed: true,
+    }),
+    true,
+    "an accepted restart marker overrides the duration heuristic",
+  );
+});
+
+test("#1785: a stale restart marker cannot authorize a re-hello without a measured outage", () => {
+  for (const outageMs of [0, undefined, NaN, Infinity, "800"]) {
+    assert.equal(
+      shouldReadvertiseAfterComfyRestart({
+        bridgeConnected: true,
+        outageMs,
+        restartConfirmed: true,
+      }),
+      false,
+      `unmeasured outage ${String(outageMs)} must fail closed`,
+    );
+  }
+});
+
 test("#654: an unmeasured outage is not evidence of a restart", () => {
   // Absent, zero, negative and unreadable all mean "no outage was measured" —
   // never "a long one". A missed re-advertise leaves the tab exactly as it is
@@ -1378,6 +1404,10 @@ test("#654 wiring: the panel measures, feeds and consults the outage — every s
     [
       "the one-shot claim is stamped from the tracker's own outage identity",
       "      comfyRestartReadvertisedSeq = comfyBackendOutage.seq();",
+    ],
+    [
+      "a panel-confirmed restart reaches the duration gate",
+      "        restartConfirmed: Boolean(ssGet(REBOOT_KEY)),",
     ],
   ]) {
     assert.ok(src.includes(snippet), site);

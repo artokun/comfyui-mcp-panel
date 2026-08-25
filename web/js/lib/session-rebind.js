@@ -69,10 +69,17 @@ export function shouldResumeAfterComfyReconnect({
 //     re-registered. Measured from hellos that provably landed, never from ones
 //     the panel meant to send.
 //   - `alreadyReadvertised` → one-shot per outage; `reconnected` can repeat.
-//   - `outageMs` → the elapsed interval is the ONLY thing separating a real
-//     restart from a WS blip (asset view, image check, tab refocus). Same
-//     reasoning and same default threshold as `shouldNudgeAfterMidTaskReconnect`
-//     below; deliberately one number, not a second one to keep in sync.
+//   - `outageMs` → the elapsed interval is the ONLY thing separating an
+//     UNCONFIRMED reconnect from a WS blip (asset view, image check, tab
+//     refocus). Same reasoning and same default threshold as
+//     `shouldNudgeAfterMidTaskReconnect` below; deliberately one number, not a
+//     second one to keep in sync.
+//   - `restartConfirmed` → the panel's own accepted `comfy_reboot` marker is
+//     stronger evidence than the duration heuristic. A restart that returns
+//     inside six seconds is still a restart, and its live bridge route still
+//     needs the same re-advertise. This does not authorize a re-hello without a
+//     measured down/up interval: a stale marker must not turn an unrelated
+//     `reconnected` event into a greeting.
 //
 // A duration, not a timestamp to subtract from `now`, for #1145's reason: the
 // caller measures the interval once and a duration cannot be silently reread as
@@ -85,6 +92,7 @@ export function shouldReadvertiseAfterComfyRestart({
   outageMs = 0,
   helloLandedSinceOutage = false,
   alreadyReadvertised = false,
+  restartConfirmed = false,
   minOutageMs = 6000,
 } = {}) {
   if (!bridgeConnected) return false;
@@ -92,6 +100,7 @@ export function shouldReadvertiseAfterComfyRestart({
   if (alreadyReadvertised) return false;
   if (typeof outageMs !== "number" || !Number.isFinite(outageMs)) return false;
   if (outageMs <= 0) return false;
+  if (restartConfirmed === true) return true;
   if (typeof minOutageMs !== "number" || !Number.isFinite(minOutageMs)) return false;
   return outageMs >= minOutageMs;
 }
