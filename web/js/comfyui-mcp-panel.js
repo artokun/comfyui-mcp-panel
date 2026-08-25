@@ -698,7 +698,7 @@ import {
   workflowSaveTimeoutObservation,
 } from "./lib/workflow-save-budget.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
-import { classifyCompletionDelivery } from "./lib/completion-delivery-diagnostics.js";
+import { createRunCompletionFlushHandler } from "./lib/run-completion-delivery.js";
 import {
   clearInheritedExecutionPreview,
   clearStoredExecutionOutputs,
@@ -37532,138 +37532,30 @@ function buildPanel() {
     // or a fast re-render it is cannot be proven, and losing a render the user waited
     // for would be worse than an extra message. The console line makes the annotation
     // visible without the agent having to infer it.
-    // #1199 — `finishedAt` and `reconciled` MUST be destructured here. The tracker
-    // has always passed a finish time, and this closure has always dropped it on the
-    // floor, so the composer stamped its own clock — which is why a completion
-    // recovered from /history days later announced itself as having finished in the
-    // second it was delivered. Fixing the tracker alone changes nothing observable;
-    // the value has to be forwarded to reach the agent.
-    onFlush: ({
-      promptId,
-      images: flImages,
-      videos: flVideos,
-      durationMs,
-      noMedia,
-      duplicateOf,
-      looksCached,
-      finishedAt,
-      reconciled,
-    }) => {
-      // #370: track whether the composed completion frame actually reached the
-      // agent. sendFrame returns false when the bridge socket is down — in that
-      // case the completion is LOST, so we re-pend the prompt (markUndelivered) so
-      // the next reconnect recovers it via /history. A confirmed send (or an empty
-      // batch that emits no frame) retires it from pending.
-      let framePushed = false;
-      let sendAttempted = false;
-      const compositionStartedAt = Date.now();
-      // A completed prompt delivers its FULL batch here, exactly once. Compose
-      // ONE consolidated agent_event for the whole run — stills AND every video's
-      // storyboard folded into a single images+note+metadata turn — so a mixed /
-      // multi-video run resumes the agent with EXACTLY ONE completion frame, never
-      // a stills frame plus one frame per video (#269/#468). The composer awaits
-      // ALL storyboards for this prompt before its single send. Fire-and-forget:
-      // it's async (metadata HEADs / frame sampling), but the batch is already
-      // captured — a failure inside must never wedge the lifecycle.
-      composeRunCompletionFrame(
-        // #356 Bug 2 — `noMedia` marks a panel-queued run that finished producing
-        // no image or video. Without it the composer returns null, the call site
-        // below reads that as "empty batch ⇒ already delivered", and the agent that
-        // panel_run told to end its turn and wait is never told anything.
-        {
-          promptId,
-          images: flImages,
-          videos: flVideos,
-          durationMs,
-          noMedia,
-          duplicateOf,
-          looksCached,
-          finishedAt,
-          reconciled,
-        },
-        {
-          sendFrame: (frame) => {
-            sendAttempted = true;
-            const ok = client.sendFrame(frame);
-            if (ok) framePushed = true;
-            return ok;
-          },
-          coerceMessageText,
-          formatDuration,
-          formatClock,
-          imageViewUrl,
-          fetchImageBytes,
-          fetchImageDimensions,
-          humanizeBytes,
-          buildVideoStoryboard,
-          uploadBlobToInput,
-          storyboardFrameCount,
-          paintImage,
-          // The card is already in the log by the time the storyboard resolves,
-          // so the poster it produced is handed back by video URL rather than
-          // passed down at paint time.
-          applyVideoPoster,
-          videoStoryboardEnabled: prefs.videoStoryboard !== false,
-          // #609 — Blind mode strips images at the sendFrame gate below; the
-          // storyboard note must not ask for a visual review of pixels the
-          // agent never received. A function, so the composer makes its single
-          // per-frame decision after the storyboards resolve, near send time.
-          agentReceivesImages: () => !AGENT_BLIND,
-          warn: (...a) => console.warn(...a),
-        },
-      )
-        .then((frame) => {
-          const deliveryStage = classifyCompletionDelivery({
-            sendAttempted,
-            transportAccepted: framePushed,
-            frameEmitted: frame != null,
-            compositionMs: Date.now() - compositionStartedAt,
-          });
-          if (
-            deliveryStage !== "transport-accepted" &&
-            deliveryStage !== "empty-no-frame" &&
-            !AGENT_MUTED
-          ) {
-            console.warn("[cmcp] completion delivery diagnostic", {
-              prompt_id: promptId,
-              stage: deliveryStage,
-            });
-          }
-          // frame===null ⇒ empty batch (nothing to deliver) ⇒ delivered. A frame
-          // that was pushed ⇒ delivered. A frame that FAILED to push ⇒ re-pend —
-          // UNLESS it failed because agents are MUTED, which is intentional,
-          // permanent suppression (sendFrame returns false for both a down socket
-          // AND AGENT_MUTED): a muted completion must NOT be recovered/replayed on
-          // a later unmute+reconnect, so treat it as delivered (codex P1).
-          if (frame == null || framePushed) runCompletion.markDelivered(promptId);
-          else if (AGENT_MUTED) runCompletion.markDelivered(promptId);
-          else runCompletion.markUndelivered(promptId);
-          // #585: this is the moment "the agent was told" becomes true (or is
-          // re-pended). Refresh the persisted reboot marker now so a reload in the
-          // gap before the next watch tick can't re-adopt an already-delivered run
-          // and have /history deliver its completion a second time.
-          pruneRebootMarker();
-        })
-        .catch((err) => {
-          if (!AGENT_MUTED) {
-            console.warn("[cmcp] completion delivery diagnostic", {
-              prompt_id: promptId,
-              stage: classifyCompletionDelivery({
-                sendAttempted,
-                transportAccepted: framePushed,
-                compositionMs: Date.now() - compositionStartedAt,
-              }),
-            });
-          }
-          console.warn("[cmcp] composeRunCompletionFrame failed:", err);
-          // Composition threw before/around the send — treat as undelivered so a
-          // reconnect can recover the outcome from /history rather than lose it
-          // (but respect an intentional mute, as above).
-          if (framePushed || AGENT_MUTED) runCompletion.markDelivered(promptId);
-          else runCompletion.markUndelivered(promptId);
-          pruneRebootMarker(); // #585 — see the .then branch above
-        });
-    },
+    // #1199 — `finishedAt` and `reconciled` are forwarded by the production
+    // delivery seam so recovered completions retain their real finish time.
+    onFlush: createRunCompletionFlushHandler({
+      sendFrame: (frame) => client.sendFrame(frame),
+      markDelivered: (promptId) => runCompletion.markDelivered(promptId),
+      markUndelivered: (promptId) => runCompletion.markUndelivered(promptId),
+      pruneRebootMarker,
+      coerceMessageText,
+      formatDuration,
+      formatClock,
+      imageViewUrl,
+      fetchImageBytes,
+      fetchImageDimensions,
+      humanizeBytes,
+      buildVideoStoryboard,
+      uploadBlobToInput,
+      storyboardFrameCount,
+      paintImage,
+      applyVideoPoster,
+      videoStoryboardEnabled: () => prefs.videoStoryboard !== false,
+      agentReceivesImages: () => !AGENT_BLIND,
+      isAgentMuted: () => AGENT_MUTED,
+      warn: (...a) => console.warn(...a),
+    }),
     // #370: deliver a reconcile-discovered terminal ERROR. Routed through the
     // tracker (not the reconcile summary) so it fires whether the error is found
     // by the reconnect reconcile loop OR by a later /history RETRY — otherwise a

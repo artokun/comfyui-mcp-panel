@@ -19,6 +19,7 @@ import {
   createRunCompletionTracker,
   NO_PROMPT_KEY,
 } from "../../web/js/lib/run-completion.js";
+import { createRunCompletionFlushHandler } from "../../web/js/lib/run-completion-delivery.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 
 /** Deterministic scheduler: timers are held until tick() fires the due ones. */
@@ -502,24 +503,34 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
   );
 
   let now = 0;
-  const flushes = [];
   const frameDeps = makeFrameDeps({
     formatDuration: (durationMs) => `${(durationMs / 1000).toFixed(1)}s`,
   });
   let resolveFrame;
-  let rejectFrame;
-  const frameReady = new Promise((resolve, reject) => {
+  const frameReady = new Promise((resolve) => {
     resolveFrame = resolve;
-    rejectFrame = reject;
   });
-  const runCompletion = createRunCompletionTracker({
-    onFlush: (payload) => {
-      flushes.push(payload);
-      void composeRunCompletionFrame(payload, frameDeps.deps).then(
-        resolveFrame,
-        rejectFrame,
-      );
+  let runCompletion;
+  let sentFrame = null;
+  let pruneCount = 0;
+  const productionOnFlush = createRunCompletionFlushHandler({
+    ...frameDeps.deps,
+    sendFrame: (frame) => {
+      const ok = frameDeps.deps.sendFrame(frame);
+      if (ok) sentFrame = frame;
+      return ok;
     },
+    markDelivered: (promptId) => runCompletion.markDelivered(promptId),
+    markUndelivered: (promptId) => runCompletion.markUndelivered(promptId),
+    pruneRebootMarker: () => {
+      pruneCount += 1;
+      if (sentFrame) resolveFrame(sentFrame);
+    },
+    isAgentMuted: () => false,
+    now: () => Date.now(),
+  });
+  runCompletion = createRunCompletionTracker({
+    onFlush: productionOnFlush,
     now: () => now,
     setTimer: () => 0,
     clearTimer: () => {},
@@ -573,14 +584,14 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
 
   const frame = await frameReady;
   assert.equal(cachedSignalSeen, true);
-  assert.equal(flushes.length, 1);
-  assert.equal(flushes[0].promptId, promptId);
-  assert.equal(flushes[0].durationMs, 5800);
   assert.equal(frameDeps.frames.length, 1);
   assert.equal(frame.type, "agent_event");
   assert.equal(frame.kind, "executed");
   assert.match(frame.note, /workflow completed in 5\.8s/);
   assert.doesNotMatch(frame.note, /rendered in/);
+  assert.equal(pruneCount, 1);
+  assert.equal(runCompletion.isSettled(promptId), true);
+  assert.equal(runCompletion._delivered.has(promptId), true);
 });
 
 test("presentation: a still-storyboard fallback (no blob) still yields ONE frame with the note", async () => {
@@ -836,19 +847,19 @@ test("#609: ONE decision per frame — parallel segments can never disagree with
 });
 
 // #609 wiring: the behavioral tests above inject `agentReceivesImages` by hand,
-// so they cannot catch the panel's REAL call site dropping the dep (the composer
-// then defaults to always-sighted while the sendFrame gate still strips the
-// pixels — the exact #609 hole). Pin the wiring by source inspection, the
+// so they cannot catch the panel's REAL delivery seam dropping the dep (the
+// composer then defaults to always-sighted while the sendFrame gate still strips
+// the pixels — the exact #609 hole). Pin the wiring by source inspection, the
 // panel's established pattern for the giant module (cf. bridge-disconnect).
-test("#609 wiring: the panel call site feeds the composer the gate's own blind predicate", () => {
+test("#609 wiring: the panel delivery seam feeds the gate's own blind predicate", () => {
   const src = readFileSync(
     fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
     "utf8",
   ).replace(/\r\n/g, "\n");
-  const start = src.indexOf("composeRunCompletionFrame(");
-  assert.notEqual(start, -1, "could not locate the composeRunCompletionFrame call site");
-  const end = src.indexOf(".then((frame)", start);
-  assert.notEqual(end, -1, "could not locate the end of the call site");
+  const start = src.indexOf("createRunCompletionFlushHandler({");
+  assert.notEqual(start, -1, "could not locate the run-completion delivery seam");
+  const end = src.indexOf("\n    }),\n    // #370: deliver a reconcile-discovered terminal ERROR", start);
+  assert.notEqual(end, -1, "could not locate the end of the delivery seam");
   const callSite = src.slice(start, end);
   assert.match(
     callSite,
