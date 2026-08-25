@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.90] - 2026-08-25
+
+### Fixed
+- contain long chat transcripts without losing scroll-to-bottom behavior (#1801)
+- retry guarded root-identity healing after workflow switches (#1854)
+
 ## [0.15.89] - 2026-08-25
 
 ### Fixed
