@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.91] - 2026-08-25
+
+### Fixed
+- label cache-assisted completion durations as workflow time, not render time (#1805)
+
 ## [0.15.90] - 2026-08-25
 
 ### Fixed
