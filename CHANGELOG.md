@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.85] - 2026-08-25
+
+### Fixed
+- fence scoped schema evidence (#2249)
+- retain usable schema across refresh failures (#2249)
+
+
 ## [0.15.84] - 2026-08-25
 
 ### Fixed
