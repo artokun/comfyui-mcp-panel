@@ -119,6 +119,7 @@ assert.ok(refreshNodesMatch, "refresh_nodes not found");
 function buildRefreshNodes({ refreshComfyNodeDefs, commandBudget = COMMAND_BUDGET }) {
   const deps = {
     refreshComfyNodeDefs,
+    awaitActiveRouteRegistration: async () => {},
     REFRESH_JOIN_ABANDONED,
     NODE_DEF_REFRESH_REASONS,
     REFRESH_NODES_COMMAND_BUDGET_MS: commandBudget,

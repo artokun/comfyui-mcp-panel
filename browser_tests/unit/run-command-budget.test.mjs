@@ -198,6 +198,8 @@ function buildRuntimeBridgeClient({ routeRef, failNextSend = false } = {}) {
     {
       WebSocket: RuntimeBridgeSocket,
       DEFAULT_BRIDGE_URL: "ws://bridge.test",
+      RECONNECT_BASE_MS: 1000,
+      RECONNECT_MAX_MS: 15000,
       STORAGE_KEY_BACKEND: "backend",
       window: {
         localStorage: {
@@ -217,7 +219,11 @@ function buildRuntimeBridgeClient({ routeRef, failNextSend = false } = {}) {
       routeIsStale,
       createRehelloGate,
       monotonicNow: () => performance.now(),
-      buildHelloPayload: () => ({ type: "hello", tab_id: routeRef.current, workflow_uuid: "wf-1728" }),
+      buildHelloPayload: ({ tabId } = {}) => ({
+        type: "hello",
+        tab_id: tabId ?? routeRef.current,
+        workflow_uuid: "wf-1728",
+      }),
       sendBridgeHello: async ({ socket, isCurrent, makePayload }) => {
         if (!isCurrent()) return false;
         if (helloState.block) await new Promise((resolve) => (helloState.release = resolve));
@@ -1268,8 +1274,8 @@ test("#1728 production bridge wiring fences same-route re-advertisement before r
   const sendHelloAt = panelSrc.indexOf("  function sendHello() {");
   const sendHelloEnd = panelSrc.indexOf("\n\n  /** Returns a promise", sendHelloAt);
   const sendHello = panelSrc.slice(sendHelloAt, sendHelloEnd);
-  const readyAt = panelSrc.indexOf("    isRouteReady() {");
-  const readyEnd = panelSrc.indexOf("\n    },", readyAt);
+  const readyAt = panelSrc.indexOf("  function routeReady() {");
+  const readyEnd = panelSrc.indexOf("\n\n  return {", readyAt);
   const ready = panelSrc.slice(readyAt, readyEnd);
   const senderAt = panelSrc.indexOf("  const panelRunReceiptSender =");
   const senderEnd = panelSrc.indexOf("\n  const panelRunReceiptTransport", senderAt);
@@ -1281,6 +1287,45 @@ test("#1728 production bridge wiring fences same-route re-advertisement before r
   assert.match(ready, /pendingRouteBindingGeneration !== null/);
   assert.match(sender, /runReceiptOutbox\.enqueue\(rid, promptId, routeId\)/);
   assert.doesNotMatch(sender, /routeId\s*\?\?/);
+});
+
+test("#1787 replacement-socket handoff keeps the stale route reachable until the live route lands", async () => {
+  const routeRef = { current: "panel-route-stale-1787" };
+  const built = buildRuntimeBridgeClient({ routeRef });
+  try {
+    built.client.start();
+    const firstSocket = built.socket();
+    firstSocket.open();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(firstSocket.sent[0]?.tab_id, "panel-route-stale-1787");
+    firstSocket.receive({ type: "models", epoch: "epoch-stale-1787", models: [] });
+    assert.equal(built.client.isRouteReady(), true);
+
+    routeRef.current = "panel-route-live-1787";
+    firstSocket.close();
+    for (let attempts = 0; attempts < 80 && built.socket() === firstSocket; attempts += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const replacementSocket = built.socket();
+    assert.notEqual(replacementSocket, firstSocket, "the reconnect loop must create a replacement socket");
+    replacementSocket.open();
+    for (let attempts = 0; attempts < 20 && replacementSocket.sent.length < 2; attempts += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    assert.deepEqual(
+      replacementSocket.sent.map((frame) => frame.tab_id),
+      ["panel-route-stale-1787", "panel-route-live-1787"],
+      "the replacement socket first accepts the stale explicit target, then migrates to the live route",
+    );
+    assert.equal(built.client.isRouteReady(), false, "a replacement socket is not ready before its models handshake");
+    const routeReady = built.client.waitForRouteReady({ stepsMs: [0, 50, 100] });
+    replacementSocket.receive({ type: "models", epoch: "epoch-live-1787", models: [] });
+    assert.equal(await routeReady, true, "refresh callers can await the handoff's completed route registration");
+    assert.equal(built.client.isRouteReady(), true, "the current route is ready only after the handoff hello lands");
+  } finally {
+    built.client.stop();
+  }
 });
 
 test("#1728 CALL SITE: a null dispatch route is refused rather than substituted from the remount", async () => {
