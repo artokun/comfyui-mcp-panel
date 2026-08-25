@@ -356,6 +356,12 @@ import {
   releaseReconnectScopePin,
 } from "./lib/reconnect-scope-fence.js";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
+import {
+  createDeferredWidgetEditQueue,
+  deferredWidgetQueueCounts,
+  isSafeDeferredWidgetValue,
+  sameDeferredWidgetValue,
+} from "./lib/deferred-widget-edit.js";
 import { declaredInputNames, runRemoveWidget } from "./lib/remove-widget.js";
 import {
   filterServerConfirmedInputSubfolderCandidates,
@@ -797,6 +803,30 @@ import {
 
 let app = null;
 let api = null;
+// #1716 — created lazily so an old panel mount carries no timer. The queue is
+// explicitly opt-in; ordinary graph_set_widget calls remain behind the MCP
+// pre-dispatch mutation fence.
+let deferredWidgetEditQueue = null;
+
+async function readQueueForDeferredWidgetEdit() {
+  if (!api?.fetchApi) throw new Error("ComfyUI queue is not reachable");
+  const response = await api.fetchApi("/queue");
+  if (response?.ok === false) throw new Error("ComfyUI queue did not answer");
+  return response?.json ? response.json() : null;
+}
+
+function getDeferredWidgetEditQueue() {
+  if (deferredWidgetEditQueue) return deferredWidgetEditQueue;
+  deferredWidgetEditQueue = createDeferredWidgetEditQueue({
+    readQueue: readQueueForDeferredWidgetEdit,
+  });
+  return deferredWidgetEditQueue;
+}
+
+function retireDeferredWidgetEditQueue(reason) {
+  deferredWidgetEditQueue?.close(reason);
+  deferredWidgetEditQueue = null;
+}
 // #1585 — setup() is invoked by ComfyUI after registerExtension, AND by us
 // when the tab API is already live (a poller that missed the setup wave).
 // First successful entry wins; a second call is a no-op so the tab cannot
@@ -2507,6 +2537,9 @@ function setupListeners() {
     // while the backend is away can be applied and then wiped by the incoming
     // restore.
     api.addEventListener("reconnecting", () => {
+      retireDeferredWidgetEditQueue(
+        "the backend reconnected while the widget edit was deferred; nothing was applied",
+      );
       nodeDefsRefreshConfirmed = false;
       comfyBackendSocketDown = true;
       comfyBackendOutage.noteDown(landedHelloCount); // #654 — open the outage clock on the FIRST down signal.
@@ -12356,6 +12389,74 @@ function lateWorkflowSaveReceipts() {
   return Array.from(lateSaveReceipts.values()).map((receipt) => ({ ...receipt }));
 }
 
+/**
+ * #1716 — classify the only widget writes that may be replayed after a queue
+ * drain. This is intentionally narrower than the normal widget writer:
+ * callback/queue-hook/composite widgets can have side effects beyond assigning
+ * one absolute scalar, so a deferred request must refuse them before it is
+ * parked. The expected value is the optimistic-concurrency check for the time
+ * spent waiting; without it a deferred edit could overwrite a user's change.
+ */
+function deferredWidgetSafetyReason(node, widgetName, value, expectedValue) {
+  if (!node || typeof node !== "object") return "the target node is unavailable";
+  if (typeof widgetName !== "string" || !widgetName || widgetName.includes(".")) {
+    return "the deferred path requires one concrete widget name";
+  }
+  if (!isSafeDeferredWidgetValue(value) || !isSafeDeferredWidgetValue(expectedValue)) {
+    return "the deferred path accepts only scalar widget values";
+  }
+  const target = Array.isArray(node.widgets)
+    ? node.widgets.find((candidate) => candidate?.name === widgetName)
+    : null;
+  if (!target) return `widget "${widgetName}" is not present on the target node`;
+  if (!isSafeDeferredWidgetValue(target.value) || target.value === null) {
+    return `widget "${widgetName}" does not hold a replay-safe scalar value`;
+  }
+  if (!sameDeferredWidgetValue(target.value, expectedValue)) {
+    return `widget "${widgetName}" changed before it could be deferred; re-read it and retry`;
+  }
+  if (value === null) return "the deferred path cannot replay a null widget value";
+  if (typeof target.callback === "function") {
+    return `widget "${widgetName}" has a callback-driven mutation and cannot be deferred safely`;
+  }
+  if (
+    typeof target.beforeQueued === "function" ||
+    typeof target.serializeValue === "function" ||
+    Array.isArray(target.linkedWidgets) && target.linkedWidgets.length > 0 ||
+    typeof target.options?.values === "function"
+  ) {
+    return `widget "${widgetName}" has queue-time or composite behavior and cannot be deferred safely`;
+  }
+  const linkedInput = (node.inputs ?? []).find(
+    (input) => input?.name === widgetName && input.link != null,
+  );
+  if (linkedInput) return `widget "${widgetName}" is driven by a link and cannot be deferred safely`;
+
+  // These routes deliberately do more than assign one widget. Replaying one
+  // field later would either omit its companion state or drive a custom editor
+  // from the wrong source of truth.
+  const specialClassifiers = [
+    ["MiniMaxH3Director", () => classifyMiniMaxH3DirectorWrite(node, widgetName)],
+    ["LTXDirector", () => classifyLtxTimelineWrite(node, widgetName)],
+    ["PromptRelayEncodeTimeline", () => classifyPromptRelayTimelineWrite(node, widgetName)],
+    ["rgthree Fast Groups", () => classifyRgthreeFastGroupsWrite(node, widgetName)],
+    ["Ideogram4PromptBuilderKJ", () => classifyIdeogram4PromptBuilderWrite(node, widgetName)],
+    ["MiniMaxH3PromptBuilder", () => classifyMiniMaxH3PromptBuilderWrite(node, widgetName)],
+  ];
+  for (const [label, classify] of specialClassifiers) {
+    let kind = null;
+    try {
+      kind = classify();
+    } catch {
+      return `${label} classification was unreadable; the deferred path fails closed`;
+    }
+    if (kind !== null && kind !== undefined) {
+      return `${label} uses a composite or derived widget route and cannot be deferred safely`;
+    }
+  }
+  return null;
+}
+
 const GRAPH_TOOL_EXECUTORS = {
   // Read-only MCP get_image relay. It accepts only a ComfyUI file reference,
   // fetches same-origin /view bytes, and never paints into the panel chat.
@@ -15814,6 +15915,10 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async graph_set_widget({ node_id, widget, value, workflow_uuid, builder_state, expected_node_type }) {
+    // Keep the established handler signature stable for the source-level
+    // wiring checks; these fields are an explicit protocol extension, not new
+    // positional arguments.
+    const { defer_until_idle, expected_value, defer_replay } = arguments[0] ?? {};
     // #1413 — ONE deadline for the whole command, taken BEFORE anything awaits, so the
     // bounded steps inside it compose instead of adding (#1192, #671). The step this
     // exists for is the stale-combo recovery's refresh join below: reached only after
@@ -15822,12 +15927,105 @@ const GRAPH_TOOL_EXECUTORS = {
     const budget = makeCommandBudget(SET_WIDGET_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
-    // #1679: MiniMaxH3Director's prompt is regenerated from its in-memory builderState.
-    // Refuse this exact derived widget immediately after synchronous target resolution,
-    // before the generic authorization/refresh awaits or any graph mutation can begin.
+    // #1679 — keep derived MiniMax prompt writes refused before the first
+    // await, including when a caller asks for deferral. Deferral must never
+    // become a side door around an existing production safety refusal.
     if (classifyMiniMaxH3DirectorWrite(node, widget) === "derived") {
       throw new Error(miniMaxH3DirectorPromptRefusal(widget, node.id));
     }
+    if (defer_until_idle !== undefined && typeof defer_until_idle !== "boolean") {
+      throw new Error("graph_set_widget defer_until_idle must be a boolean");
+    }
+    if (defer_replay === true && defer_until_idle === true) {
+      throw new Error("graph_set_widget cannot combine defer_until_idle with an internal replay");
+    }
+    if (defer_until_idle === true) {
+      const safetyReason = deferredWidgetSafetyReason(node, widget, value, expected_value);
+      if (safetyReason) {
+        throw new Error(
+          `graph_set_widget cannot defer "${String(widget)}" on node ${node?.id ?? node_id}: ${safetyReason}`,
+        );
+      }
+      if (sameDeferredWidgetValue(node.widgets.find((candidate) => candidate?.name === widget)?.value, value)) {
+        return {
+          deferred: false,
+          applied: false,
+          unchanged: true,
+          node_id: node.id,
+          widget,
+          value,
+        };
+      }
+      let queueCounts;
+      try {
+        queueCounts = deferredWidgetQueueCounts(await readQueueForDeferredWidgetEdit());
+      } catch {
+        queueCounts = null;
+      }
+      if (!queueCounts) {
+        throw new Error(
+          `graph_set_widget could not confirm ComfyUI's queue state; nothing was deferred or applied. ` +
+            `Retry with defer_until_idle:true when the queue can be read.`,
+        );
+      }
+      if (queueCounts.running === 0 && queueCounts.pending === 0) {
+        // There is no queue to wait for. Still use the replay expectation at
+        // runSetWidget's final synchronous boundary, because a new render or
+        // user edit may begin during the schema preflight.
+        return GRAPH_TOOL_EXECUTORS.graph_set_widget({
+          node_id,
+          widget,
+          value,
+          workflow_uuid,
+          builder_state,
+          expected_node_type: node.type,
+          expected_value,
+          defer_replay: true,
+        });
+      }
+      const deferredGraph = graph;
+      const deferredRootGraph = rootGraph;
+      const deferredNode = node;
+      return getDeferredWidgetEditQueue().enqueue({
+        node_id: node.id,
+        widget,
+        expected_value,
+        value,
+        readCurrent: () => {
+          let current;
+          try {
+            current = getGraphCtx();
+          } catch {
+            return { ok: false, error: "the active canvas is no longer readable" };
+          }
+          if (current.graph !== deferredGraph || current.rootGraph !== deferredRootGraph) {
+            return { ok: false, error: "the viewed workflow or graph scope changed while the edit was deferred" };
+          }
+          const liveNode = resolveNode(current.graph, node_id);
+          const liveWidget = liveNode?.widgets?.find((candidate) => candidate?.name === widget);
+          if (!liveNode || liveNode !== deferredNode || liveNode.type !== deferredNode.type || !liveWidget) {
+            return { ok: false, error: "the target node changed or disappeared while the edit was deferred" };
+          }
+          const safetyReason = deferredWidgetSafetyReason(liveNode, widget, value, expected_value);
+          if (safetyReason) {
+            return { ok: false, error: `the widget is no longer replay-safe: ${safetyReason}` };
+          }
+          return { ok: true, value: liveWidget.value };
+        },
+        apply: () =>
+          GRAPH_TOOL_EXECUTORS.graph_set_widget({
+            node_id,
+            widget,
+            value,
+            workflow_uuid,
+            builder_state,
+            expected_node_type: deferredNode.type,
+            expected_value,
+            defer_replay: true,
+          }),
+      });
+    }
+    const enforceDeferredExpected = defer_replay === true;
     // #982 — PER-REQUEST, not module state (codex). A concurrent refresh or a second
     // widget write would otherwise overwrite this between one request's failed fetch and
     // its refusal, so the message would name routes another call tried. Declared in the
@@ -16388,17 +16586,37 @@ const GRAPH_TOOL_EXECUTORS = {
           cmd: "graph_set_widget",
           [WORKFLOW_UUID_FIELD]: workflow_uuid,
         });
-        if (expected_node_type === undefined) return;
-        if (typeof expected_node_type !== "string" || !expected_node_type) {
-          throw new Error("graph_set_widget expected_node_type must be a non-empty string");
-        }
+        if (expected_node_type === undefined && !enforceDeferredExpected) return;
         const current = getGraphCtx();
         const liveTarget = resolveNode(current.graph, node_id);
-        if (!liveTarget || liveTarget !== node || liveTarget.type !== expected_node_type) {
+        if (
+          expected_node_type !== undefined &&
+          (typeof expected_node_type !== "string" || !expected_node_type)
+        ) {
+          throw new Error("graph_set_widget expected_node_type must be a non-empty string");
+        }
+        if (
+          expected_node_type !== undefined &&
+          (!liveTarget || liveTarget !== node || liveTarget.type !== expected_node_type)
+        ) {
           throw new Error(
             `panel_set_widget target changed before dispatch: expected ${expected_node_type}, ` +
               `found ${liveTarget?.type ?? "missing"}`,
           );
+        }
+        if (enforceDeferredExpected) {
+          const liveWidget = liveTarget?.widgets?.find((candidate) => candidate?.name === widget);
+          if (
+            !liveTarget ||
+            liveTarget !== node ||
+            !liveWidget ||
+            !sameDeferredWidgetValue(liveWidget.value, expected_value)
+          ) {
+            throw new Error(
+              `panel_set_widget deferred replay refused "${widget}" on node ${node_id}: ` +
+                "the widget changed before the write boundary; nothing was applied",
+            );
+          }
         }
       },
       // Stale-combo retry: reuse the /object_info already fetched for authorization
