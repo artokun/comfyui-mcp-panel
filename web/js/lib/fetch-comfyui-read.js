@@ -12,6 +12,7 @@ const READ_OPERATIONS = new Map([
   ["system_stats", "/system_stats"],
   ["logs", "/internal/logs"],
 ]);
+const LOGS_TRANSPORT_PATH = "/internal/logs/raw";
 
 // These are bridge transport/routing fields, not read arguments. The
 // dispatcher may stamp them onto every command frame before it reaches us.
@@ -68,16 +69,23 @@ function pageOrigin() {
 }
 
 function resolveSameOriginUrl(api, path, expectedOrigin = pageOrigin()) {
-  if (typeof api?.apiURL !== "function") {
-    throw readError("api_unavailable", "fetch_comfyui_read requires the panel API URL helper");
+  const useFileUrl = path === "/internal/logs";
+  const resolverName = useFileUrl ? "fileURL" : "apiURL";
+  const resolver = api?.[resolverName];
+  if (typeof resolver !== "function") {
+    throw readError(
+      "api_unavailable",
+      `fetch_comfyui_read requires the panel ${resolverName} helper`,
+    );
   }
+  const transportPath = useFileUrl ? LOGS_TRANSPORT_PATH : path;
   let rawUrl;
   try {
-    rawUrl = api.apiURL(path);
+    rawUrl = resolver(transportPath);
   } catch (error) {
     throw readError(
       "api_unavailable",
-      `fetch_comfyui_read could not resolve ${path}: ${error?.message ?? error}`,
+      `fetch_comfyui_read could not resolve ${transportPath}: ${error?.message ?? error}`,
     );
   }
   if (typeof rawUrl !== "string" || rawUrl === "") {

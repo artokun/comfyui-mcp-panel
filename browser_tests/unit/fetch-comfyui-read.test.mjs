@@ -71,6 +71,8 @@ async function rejection(promise, code) {
 }
 
 test("#2283: the three allowed operations use only their fixed same-origin routes", async () => {
+  const apiURLCalls = [];
+  const fileURLCalls = [];
   const apiCalls = [];
   const rawCalls = [];
   const bodies = {
@@ -84,7 +86,14 @@ test("#2283: the three allowed operations use only their fixed same-origin route
       {
         expectedOrigin: "https://panel.test",
         api: {
-          apiURL: (path) => `https://panel.test/comfy${path}`,
+          apiURL: (path) => {
+            apiURLCalls.push(path);
+            return `https://panel.test/comfy/api${path}`;
+          },
+          fileURL: (path) => {
+            fileURLCalls.push(path);
+            return `https://panel.test/comfy${path}`;
+          },
           fetchApi: async (path, init) => {
             apiCalls.push({ path, init });
             return response({ body: bodies[operation] });
@@ -105,8 +114,10 @@ test("#2283: the three allowed operations use only their fixed same-origin route
     });
   }
 
+  assert.deepEqual(apiURLCalls, ["/history", "/system_stats"]);
+  assert.deepEqual(fileURLCalls, ["/internal/logs/raw"]);
   assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats"]);
-  assert.deepEqual(rawCalls.map(({ url }) => url), ["https://panel.test/comfy/internal/logs"]);
+  assert.deepEqual(rawCalls.map(({ url }) => url), ["https://panel.test/comfy/internal/logs/raw"]);
   for (const { init } of [...apiCalls, ...rawCalls]) {
     assert.equal(init.method, "GET");
     assert.equal(init.cache, "no-store");
@@ -120,7 +131,8 @@ test("#2283: logs raw transport retains origin, redirect, and body-size fences",
   const options = {
     expectedOrigin: "https://panel.test",
     api: {
-      apiURL: (path) => `https://panel.test/comfy${path}`,
+      apiURL: () => { throw new Error("logs must not use apiURL"); },
+      fileURL: (path) => `https://panel.test/comfy${path}`,
       fetchApi: async () => { throw new Error("logs must not use fetchApi"); },
     },
   };
@@ -200,7 +212,10 @@ test("#2283: the resolved and final response origins stay fenced", async () => {
 test("#2283: redirects and oversized bodies are refused", async () => {
   const options = {
     expectedOrigin: "https://panel.test",
-    api: { apiURL: (path) => path },
+    api: {
+      apiURL: (path) => path,
+      fileURL: (path) => `https://panel.test${path}`,
+    },
   };
   await rejection(
     fetchComfyUIReadForMcp(
