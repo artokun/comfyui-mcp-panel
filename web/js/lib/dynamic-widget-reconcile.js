@@ -8,6 +8,23 @@ function hasValueSetter(widget) {
   }
 }
 
+function readWidgetId(widget) {
+  try {
+    const widgetId = widget?.widgetId;
+    return typeof widgetId === "string" && widgetId ? widgetId : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeCleanupAlias(dynamicRoot, widgetId, index) {
+  return {
+    name: `${dynamicRoot}.__cmcp_store_cleanup_${index}`,
+    widgetId,
+    onRemove() {},
+  };
+}
+
 function staleDynamicGroup(name, required, dynamicNames) {
   if (typeof name !== "string") return null;
   const parts = name.split(".");
@@ -37,12 +54,17 @@ function staleDynamicGroup(name, required, dynamicNames) {
  *
  * @param {object} node
  * @param {object} currentDef
- * @returns {{replayed: string[], relocated: string[], failures: Array<{name: string, phase: string, error: unknown}>}}
+ * @returns {{replayed: string[], relocated: string[], failures: Array<{name: string, phase: string, error: unknown}>, cleanupStore: () => {cleaned: boolean, error?: unknown}}}
  */
 export function reconcileFreshDynamicWidgets(node, currentDef) {
   const required = currentDef?.input?.required;
   const widgets = Array.isArray(node?.widgets) ? node.widgets.slice() : [];
-  const empty = { replayed: [], relocated: [], failures: [] };
+  const empty = {
+    replayed: [],
+    relocated: [],
+    failures: [],
+    cleanupStore: () => ({ cleaned: true }),
+  };
   if (!required || typeof required !== "object" || !widgets.length) return empty;
 
   const dynamicNames = new Set(
@@ -71,6 +93,7 @@ export function reconcileFreshDynamicWidgets(node, currentDef) {
     const dynamicRoot = staleDynamicGroup(widget?.name, required, dynamicNames);
     if (!dynamicRoot) continue;
     const oldName = widget.name;
+    const oldWidgetId = readWidgetId(widget);
     let replacement = relocationByName.get(oldName);
     if (!replacement) {
       replacement = `${dynamicRoot}.__cmcp_stale_${relocationIndex++}`;
@@ -78,6 +101,17 @@ export function reconcileFreshDynamicWidgets(node, currentDef) {
     }
     try {
       widget.name = replacement;
+      // Current LiteGraph widgets derive widgetId from name. graph.add() already
+      // registered the old `format.codec` key, so renaming alone leaves that key
+      // behind and the native setter would delete only the newly-derived key.
+      // Re-register the renamed widget, then give native cleanup an alias carrying
+      // the original key so both registrations are deleted by deleteWidget().
+      if (oldWidgetId) {
+        node.widgets.push(storeCleanupAlias(dynamicRoot, oldWidgetId, relocationIndex++));
+      }
+      if (typeof widget.setNodeId === "function" && node?.id != null) {
+        widget.setNodeId(node.id);
+      }
       relocated.push(oldName);
     } catch (error) {
       failures.push({ name: oldName, phase: "relocate", error });
@@ -117,5 +151,36 @@ export function reconcileFreshDynamicWidgets(node, currentDef) {
       failures.push({ name: widget.name, phase: "setter", error });
     }
   }
-  return { replayed, relocated, failures };
+
+  const cleanupStore = () => {
+    const root = roots.values().next().value;
+    if (!root) {
+      return { cleaned: false, error: new Error("no verified dynamic root can clean widget-store entries") };
+    }
+
+    const widgetIds = new Set();
+    for (const widget of node.widgets ?? []) {
+      const widgetId = readWidgetId(widget);
+      if (widgetId) widgetIds.add(widgetId);
+    }
+    const aliases = [];
+    let aliasIndex = 0;
+    for (const widgetId of widgetIds) {
+      const alias = storeCleanupAlias(root.name, widgetId, `rollback_${aliasIndex++}`);
+      aliases.push(alias);
+      node.widgets.push(alias);
+    }
+    try {
+      const value = root.value;
+      root.value = value;
+      const remaining = aliases.filter((alias) => node.widgets.includes(alias));
+      return remaining.length
+        ? { cleaned: false, error: new Error("native dynamic cleanup left widget-store aliases attached") }
+        : { cleaned: true };
+    } catch (error) {
+      return { cleaned: false, error };
+    }
+  };
+
+  return { replayed, relocated, failures, cleanupStore };
 }
