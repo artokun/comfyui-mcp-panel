@@ -3283,6 +3283,39 @@ const _priorTempWorkflowIds = new WeakMap();
 
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
+// `graph_load` replaces the graph while intentionally keeping the active workflow object
+// and its path/fence identity. The object therefore remains the save destination, but its
+// filename is no longer proof of the loaded graph's source. Keep that provenance state on
+// the bound object, not in the mutable active pointer, so a later Save-As cannot repeat the
+// stale filename as `copied_from` (#1762).
+const _workflowGraphProvenanceUnknown = new WeakSet();
+
+function markWorkflowGraphProvenanceUnknown(wf) {
+  try {
+    const raw = rawWorkflowObject(wf);
+    if (raw && typeof raw === "object") _workflowGraphProvenanceUnknown.add(raw);
+  } catch {
+    // Provenance bookkeeping must never fail a graph load.
+  }
+}
+
+function workflowGraphProvenanceIsUnknown(wf) {
+  try {
+    const raw = rawWorkflowObject(wf);
+    return Boolean(raw && typeof raw === "object" && _workflowGraphProvenanceUnknown.has(raw));
+  } catch {
+    return false;
+  }
+}
+
+function clearWorkflowGraphProvenanceUnknown(wf) {
+  try {
+    const raw = rawWorkflowObject(wf);
+    if (raw && typeof raw === "object") _workflowGraphProvenanceUnknown.delete(raw);
+  } catch {
+    // Provenance bookkeeping must never fail an otherwise successful operation.
+  }
+}
 
 // r11 P0 — every access to the per-object identity store keys on the RAW
 // workflow object. Service lists and reads hand out Vue proxies, and a WeakMap
@@ -6964,6 +6997,12 @@ async function programmaticSave(name) {
   // existed (a never-persisted tab whose classification was inconclusive), and throwing
   // would be a false data-loss error on a legitimate first save.
   const preSourcePath = expectWf?.path ?? null;
+  // Some focused contract tests extract this function without the module-scope
+  // provenance registry. In that harness the only safe answer is the existing
+  // filename; production always has the helper bound.
+  const graphProvenanceUnknown =
+    typeof workflowGraphProvenanceIsUnknown === "function" &&
+    workflowGraphProvenanceIsUnknown(expectWf);
   let preExisted = null; // true = confirmed 200, false = confirmed 404, null = unknown
   if (preSourcePath) {
     try {
@@ -6986,6 +7025,11 @@ async function programmaticSave(name) {
     // and refuses a first save whose canvas provably belongs to another workflow.
     canvasBinding: describeLiveCanvasBinding,
     details,
+    // #1762 — graph_load keeps the active workflow object/path for save-in-place, but
+    // replaces the graph without a trustworthy source filename. Do not let the old tab
+    // name leak into copied_from; a later successful in-place save re-establishes it.
+    copySourceName: ({ workflow, currentName }) =>
+      graphProvenanceUnknown && sameWorkflowObject(workflow, expectWf) ? null : currentName,
     repaintCanvas: async (copy, targetPath) => {
       const repainted = await repaintSaveAsCanvas(copy, targetPath, {
         canvasFence: (workflow, phase) => canvasFence({ workflow, phase }),
@@ -7012,6 +7056,9 @@ async function programmaticSave(name) {
     // runs only once the 400 shape is already recognised.
     readSaveFailureCause: (path) => readSaveFailureCause(path, api),
   });
+  if (details.mode === "in-place" && typeof clearWorkflowGraphProvenanceUnknown === "function") {
+    clearWorkflowGraphProvenanceUnknown(expectWf);
+  }
   // The repaint path only previews the destination identity because a failed copy must
   // not leave a reusable path alias behind. Commit it after saveActiveWorkflow has
   // completed its persistence/read-back proof; the produced record is the copy this save
@@ -14886,6 +14933,9 @@ const GRAPH_TOOL_EXECUTORS = {
         // canvas too, and must be as undoable as any other graph edit this turn.
         captureGraphSnapshot(null, "before loading an API-format workflow");
         await app.loadApiJson(apiClone, "graph_load.json");
+        if (typeof markWorkflowGraphProvenanceUnknown === "function") {
+          markWorkflowGraphProvenanceUnknown(apiTargetWorkflow);
+        }
         // COMPARE WHAT ARRIVED. A missing node type is an uninstalled pack, and a
         // load that quietly drops nodes and reports success is the exact failure
         // this codebase keeps fixing — the graph then fails at QUEUE time, with a
@@ -14989,6 +15039,9 @@ const GRAPH_TOOL_EXECUTORS = {
       }
     } finally {
       isolation?.restore();
+    }
+    if (typeof markWorkflowGraphProvenanceUnknown === "function") {
+      markWorkflowGraphProvenanceUnknown(activeWorkflow);
     }
     // A blank-canvas load has no workflow object before the call. The frontend
     // may create one as part of loadGraphData, but a tab switch during that await
@@ -20587,6 +20640,15 @@ const GRAPH_TOOL_EXECUTORS = {
         );
       }
       throw failOpenRebindUnknown(rebindFailed);
+    }
+    // A first open loads the named file, and an explicit stale reload re-read it from
+    // disk; either operation re-establishes graph provenance for a workflow previously
+    // replaced by graph_load. Merely switching to an already-open in-memory tab does not.
+    if (
+      (!wasOpen || reloaded) &&
+      typeof clearWorkflowGraphProvenanceUnknown === "function"
+    ) {
+      clearWorkflowGraphProvenanceUnknown(target);
     }
     const receipt = noteOpenAttempt({
       cmd: "workflow_open",

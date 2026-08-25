@@ -569,6 +569,9 @@ export async function saveActiveWorkflow(
     // a stale-operation refusal, never permission to restore a predecessor.
     canvasFence,
     operationFence,
+    // Optional Save-As disclosure hook. It receives `{ workflow, currentName }` and
+    // returns the source name to report; `null` means the graph provenance is unknown.
+    copySourceName,
   } = {},
 ) {
   const wf = svc?.activeWorkflow;
@@ -663,6 +666,17 @@ export async function saveActiveWorkflow(
 
   const wasUnsaved = wf.isTemporary === true || wf.isPersisted === false;
   const currentName = baseName(wf.filename);
+  // An in-place graph replacement can leave the workflow object bound to its old path.
+  // Keep that path for the safe copy route, but do not disclose the old filename as the
+  // graph's source unless the caller can still prove that provenance.
+  let reportedCopySource = currentName;
+  if (typeof copySourceName === "function") {
+    try {
+      reportedCopySource = copySourceName({ workflow: wf, currentName });
+    } catch {
+      reportedCopySource = null;
+    }
+  }
   // Only mint a fresh auto-name for a genuinely placeholder ("Unsaved Workflow"
   // / "Untitled …") workflow. A named-but-unsaved workflow saves under its name.
   const needsAutoName = wasUnsaved && isDefaultWorkflowName(currentName);
@@ -814,7 +828,7 @@ export async function saveActiveWorkflow(
       recordOutcome(details, "save-as-copy", {
         sourcePath,
         targetPath: finalTargetPath,
-        copiedFrom: currentName,
+        copiedFrom: reportedCopySource,
         sourceExternal: true, // absolute external path — not /userdata-verifiable
       });
       return await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
@@ -922,7 +936,7 @@ export async function saveActiveWorkflow(
       recordOutcome(details, cls === "never-persisted" ? "first-save" : "save-as-copy", {
         sourcePath,
         targetPath: finalTargetPath,
-        copiedFrom: cls === "never-persisted" ? undefined : currentName,
+        copiedFrom: cls === "never-persisted" ? undefined : reportedCopySource,
       });
       // Capture POSITIVE pre-copy DISK evidence of the source, so the post-copy
       // backstop can only fire on a CONFIRMED 200 → 404 (a genuine move). An in-memory
