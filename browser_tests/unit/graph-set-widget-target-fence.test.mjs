@@ -36,7 +36,8 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
   const original = { id: 7, type: "OtherLoraLoader" };
   let liveTarget = original;
   let resolvedId;
-  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, node) {
+  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, node, defer_replay) {
+      const enforceDeferredExpected = defer_replay === true;
       return ({ ${fenceProperty} }).assertTargetStillCurrent;
     };`;
   let makeFence;
@@ -59,7 +60,7 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
     },
     () => {},
     "workflow_uuid",
-  )("7:subgraph", "OtherLoraLoader", undefined, original);
+  )("7:subgraph", "OtherLoraLoader", undefined, original, undefined);
 
   fence();
   assert.equal(resolvedId, "7:subgraph");
