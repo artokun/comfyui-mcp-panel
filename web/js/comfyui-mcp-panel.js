@@ -77,6 +77,7 @@ import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMess
 // #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
 // it is how this repo keeps producing near-duplicate bugs, per that file's own header.
 import { withTimeout } from "./lib/bounded-step.js";
+import { createChatScrollStabilizer } from "./lib/chat-scroll-stabilizer.js";
 import { createRunReceiptOutbox } from "./lib/run-receipt-outbox.js";
 import {
   arbitratePanelCopy,
@@ -27714,6 +27715,17 @@ const PANEL_CSS = `
   flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0.75rem;
   display: flex; flex-direction: column; gap: 0.5rem;
 }
+/* #1801 — keep the long-lived transcript out of canvas-adjacent reflow/paint.
+   The feed's direct children are one message each (bubbles, tool/question cards,
+   A2UI cards, status notices, and the live thinking row). Contain the message,
+   not the scroll surface: the browser can skip off-screen content while the log
+   keeps its scroll geometry. The auto mode remembers the real height after a message
+   has been laid out; 120px is only the first-pass placeholder for an unseen
+   message, and is replaced as soon as that message enters the view. */
+.cmcp-log > :not(.cmcp-empty) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
+}
 .cmcp-empty {
   margin: auto; text-align: center; max-width: 230px;
   color: var(--p-text-muted-color, #a1a1aa);
@@ -30491,11 +30503,16 @@ function buildPanel() {
     stickToBottom = true;
     newMsgBtn.hidden = true;
     log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
+    chatScrollStabilizer.schedule();
   });
   // Track the user's scroll position; re-stick (and hide the pill) at the bottom.
   log.addEventListener("scroll", () => {
     stickToBottom = atBottom();
     if (stickToBottom) newMsgBtn.hidden = true;
+  });
+  const chatScrollStabilizer = createChatScrollStabilizer({
+    log,
+    shouldStick: () => stickToBottom,
   });
   body.appendChild(newMsgBtn);
   root.appendChild(body);
@@ -32856,11 +32873,10 @@ function buildPanel() {
       newMsgBtn.hidden = false;
       return;
     }
-    // Defer to after layout so tall content (code blocks, images) still lands
-    // at the true bottom.
-    requestAnimationFrame(() => {
-      log.scrollTop = log.scrollHeight;
-    });
+    // The stabilizer waits for the normal layout frame AND follows later
+    // ResizeObserver deliveries when containment replaces an intrinsic-size
+    // estimate with a replayed message's real height.
+    chatScrollStabilizer.schedule();
   }
 
   // Build an inline, expandable chip (+ hidden preview) for one [Pasted text #N]
@@ -35227,6 +35243,10 @@ function buildPanel() {
     // repainted messages — re-pin it to the bottom so it trails the newest one.
     if (agentWorking) bumpThinking();
     renderTodo(t.todos || [], { persist: false });
+    // A resolved/inert A2UI replay appends directly rather than through a normal
+    // painter. Seed the same post-replay stabilizer after every history pass so
+    // variable-height contained roots cannot leave the log above its true bottom.
+    scrollLog();
   }
 
   function resumableSessionId(t) {
@@ -42199,6 +42219,7 @@ function buildPanel() {
       // running (a remount would otherwise stack a second word cycler / backstop).
       if (workWordTimer) { clearInterval(workWordTimer); workWordTimer = null; }
       if (thinkingSafety) { clearTimeout(thinkingSafety); thinkingSafety = null; }
+      chatScrollStabilizer.dispose();
       document.removeEventListener("keydown", onInterruptKeydown, true);
       // Stop any chat audio before the panel's DOM goes away — a detached
       // <audio> keeps playing, and after an unmount there is no card left to
