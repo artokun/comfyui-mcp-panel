@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.80] - 2026-08-25
+
+### Fixed
+- preserve VideoTileLivePlanner ROI on copy (#1761)
+- reset Save-As source after workflow load (#1762)
+- preserve restart confirmation answers (#1764)
+- resolve panel_set_widget against live node list (#1759)
+- explain workflow save transport failures (#1757)
+
+
 ## [0.15.79] - 2026-08-25
 
 ### Fixed
