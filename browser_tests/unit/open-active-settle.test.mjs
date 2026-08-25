@@ -44,6 +44,69 @@ function realReloadGuard({ now, reconnectEpoch = 4 } = {}) {
   );
 }
 
+function balancedFrom(src, marker, openAt = null) {
+  const start = src.indexOf(marker);
+  assert.notEqual(start, -1, `missing marker: ${marker}`);
+  const open = openAt ?? src.indexOf("{", start + marker.length);
+  let depth = 0;
+  for (let i = open; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "/" && src[i + 1] === "/") {
+      i = src.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "/" && src[i + 1] === "*") {
+      i = src.indexOf("*/", i + 2);
+      if (i < 0) break;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < src.length; i += 1) {
+        if (src[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (src[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return src.slice(start, i + 1);
+  }
+  throw new Error(`unterminated block: ${marker}`);
+}
+
+// Execute a shipped executor body with the shipped reload guard and proof helper.
+// The frontend-facing services are supplied by each lifecycle test, but the operation
+// and its ownership/generation implementation are not re-created in the test.
+function productionExecutor(methodName, environment) {
+  const signature = `async ${methodName}({`;
+  const sigStart = SRC.indexOf(signature);
+  assert.notEqual(sigStart, -1, `${methodName} not found`);
+  const bodyBrace = SRC.indexOf(") {", sigStart) + 1;
+  const methodSource = balancedFrom(SRC, signature, bodyBrace).replace(
+    new RegExp(`^async ${methodName}\\(`),
+    `async function ${methodName}(`,
+  );
+  const factory = new Function(
+    "sandbox",
+    `with (sandbox) {\n${RELOAD_GUARD_SOURCE[0]}\n${methodSource}\n` +
+      `return { method: ${methodName}, guard: () => activeWorkflowReloadGuard(), ` +
+      `proofs: () => ({ active: activeWorkflowResyncEpoch, post: postReconnectBindingProofEpoch }) };\n}`,
+  );
+  const scope = new Proxy(environment, {
+    has: () => true,
+    get(target, key) {
+      if (key === Symbol.unscopables) return undefined;
+      return Object.prototype.hasOwnProperty.call(target, key) ? target[key] : globalThis[key];
+    },
+  });
+  return factory(scope);
+}
+
 function fakeClock() {
   let time = 0;
   return {
@@ -231,6 +294,109 @@ test("#887 production lifecycle fences workflow_open/new supersession before imm
   );
 });
 
+test("#887 production workflow_open native failure retires proof before its negative reply", async () => {
+  const previous = { path: "workflows/previous.json" };
+  const target = { path: "workflows/target.json", filename: "target.json", isModified: false };
+  const nativeError = new Error("native switch rejected after partial work");
+  const journal = [];
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app: {
+      canvas: {},
+      extensionManager: {
+        workflow: {
+          openWorkflows: [target],
+          workflows: [],
+          getWorkflowByPath: () => target,
+          openWorkflow: async () => {
+            throw nativeError;
+          },
+        },
+      },
+    },
+    activeWorkflowRef: () => previous,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    workflowStableUuid: () => "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95",
+    noteOpenAttempt: (entry) => {
+      journal.push(entry);
+      return { seq: journal.length };
+    },
+    coerceMessageText: (value) => String(value),
+    getWorkflowTitle: () => "Previous",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => ({ token: 1 }),
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+  });
+
+  await assert.rejects(panel.method({ path: target.path, rid: "native-failure" }), nativeError);
+  assert.deepEqual(panel.proofs(), {
+    active: 3,
+    post: 3,
+  });
+  assert.equal(panel.guard(), null, "native failure must release the production reload guard");
+  assert.equal(journal.at(-1)?.applied, false, "the native failure remains a clean negative reply");
+  assert.match(journal.at(-1)?.error ?? "", /native switch rejected/);
+});
+
+test("#887 production workflow_new unknown result retires proof before returning", async () => {
+  const root = {
+    _nodes: [],
+    extra: {},
+    serialize: () => ({ nodes: [], links: [], groups: [], last_node_id: 0 }),
+  };
+  const workflow = {
+    isPersisted: false,
+    isModified: false,
+    changeTracker: { activeState: { nodes: [] } },
+  };
+  const journal = [];
+  let stamps = 0;
+  const panel = productionExecutor("workflow_new", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app: {
+      rootGraph: root,
+      graph: root,
+      extensionManager: { command: { execute: async () => {} } },
+    },
+    activeWorkflowRef: () => workflow,
+    workflowTabId: () => "tmp:new-tab",
+    workflowStableUuid: () => "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95",
+    noteOpenAttempt: (entry) => {
+      journal.push(entry);
+      return { seq: journal.length };
+    },
+    coerceMessageText: (value) => String(value),
+    getWorkflowTitle: () => "Unsaved Workflow",
+    graphRootProvenEmpty: () => true,
+    activeWorkflowProvenEmpty: () => false,
+    stampGraphRootWorkflowUuid: () => {
+      stamps += 1;
+    },
+    isCanonicalWorkflowInstanceUuid: (value) => typeof value === "string" && value.length === 36,
+  });
+
+  const result = await panel.method({ rid: "unknown-new" });
+  assert.equal(result.created, "unknown");
+  assert.equal(result.empty, "unknown");
+  assert.deepEqual(panel.proofs(), {
+    active: 3,
+    post: 3,
+  });
+  assert.equal(stamps, 0, "an unproven blank state must not stamp the root");
+  assert.equal(panel.guard(), null, "unknown workflow_new must release the production reload guard");
+  assert.equal(journal.at(-1)?.applied, true, "the tab creation receipt remains factual");
+});
+
 test("#887 failed open proof gates the immediate list, pin, and current-mode mutation", () => {
   const reconnectEpoch = 4;
   const reconnectedAt = 100;
@@ -298,8 +464,8 @@ test("#887 workflow_open wires the settle probe before releasing its guards", ()
   );
   assert.match(
     SRC.slice(probeAt, releaseAt),
-    /if \(rebindFailed\) \{[\s\S]*invalidateWorkflowBindingProof\(openGeneration\)/,
-    "a failed open retires proof through the shared generation fence",
+    /if \(openFailed \|\| rebindFailed\) \{[\s\S]*invalidateWorkflowBindingProof\(openGeneration\)/,
+    "a failed or unknown open retires proof through the shared generation fence",
   );
   assert.match(
     SRC.slice(probeAt, releaseAt),

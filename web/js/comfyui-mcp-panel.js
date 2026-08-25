@@ -19864,25 +19864,6 @@ const GRAPH_TOOL_EXECUTORS = {
       });
       throw new Error(error);
     }
-    // #433: an explicit new-tab authoritatively re-points `active` — record it
-    // against the epoch we STARTED on, but only if no reconnect intervened during
-    // the async work (else its tab-restore may have overridden us — leave armed).
-    if (
-      ownsWorkflowReloadGuard(reloadGuardToken) &&
-      workflowBindingGeneration === bindingGeneration &&
-      backendReconnectEpoch === openedForEpoch
-    ) {
-      activeWorkflowResyncEpoch = openedForEpoch;
-    }
-    // #663/#646: a created tab's binding is proven by creation — stamp the binding
-    // proof too so the post-reconnect mutation gate opens for this epoch.
-    if (
-      ownsWorkflowReloadGuard(reloadGuardToken) &&
-      workflowBindingGeneration === bindingGeneration &&
-      backendReconnectEpoch === openedForEpoch
-    ) {
-      postReconnectBindingProofEpoch = openedForEpoch;
-    }
     // #402 — workflow_new ALSO authoritatively re-points `active`, so it gets a receipt
     // too: a lost reply here leaves the caller unable to tell whether a blank tab was
     // created (and re-issuing would create a SECOND one, unlike the idempotent open).
@@ -19934,6 +19915,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // note carries the two facts an agent needs to act correctly: VERIFY before building,
     // and do NOT retry (workflow_new is not idempotent — a retry adds a second blank tab).
     if (!provenEmpty) {
+      // The tab exists, but this operation did not prove the state that would make
+      // either binding epoch trustworthy. Retire both before returning UNKNOWN so an
+      // immediate list or mutation cannot consume proof left by an earlier operation.
+      invalidateWorkflowBindingProof(bindingGeneration);
       return {
         created: "unknown",
         empty: "unknown",
@@ -19947,6 +19932,27 @@ const GRAPH_TOOL_EXECUTORS = {
           "Do NOT call panel_new_workflow again — it is not idempotent, and a second call leaves a " +
           "SECOND blank tab behind.",
       };
+    }
+    // #433: an explicit new-tab authoritatively re-points `active` — record it
+    // against the epoch we STARTED on, but only if no reconnect intervened during
+    // the async work (else its tab-restore may have overridden us — leave armed).
+    // This is deliberately after the proven-empty decision: an UNKNOWN creation
+    // must not open either downstream trust gate.
+    if (
+      ownsWorkflowReloadGuard(reloadGuardToken) &&
+      workflowBindingGeneration === bindingGeneration &&
+      backendReconnectEpoch === openedForEpoch
+    ) {
+      activeWorkflowResyncEpoch = openedForEpoch;
+    }
+    // #663/#646: a created tab's binding is proven by creation — stamp the binding
+    // proof too so the post-reconnect mutation gate opens for this epoch.
+    if (
+      ownsWorkflowReloadGuard(reloadGuardToken) &&
+      workflowBindingGeneration === bindingGeneration &&
+      backendReconnectEpoch === openedForEpoch
+    ) {
+      postReconnectBindingProofEpoch = openedForEpoch;
     }
     return { created: true, empty: true, ...identity };
     } finally {
@@ -21231,9 +21237,10 @@ const GRAPH_TOOL_EXECUTORS = {
       }
       }
       }
-      if (rebindFailed) {
+      if (openFailed || rebindFailed) {
         // The attempted open may have changed the frontend binding before its final
-        // proof failed. The shared generation helper retires any earlier proof only
+        // proof failed, including a native switch rejection that may have applied
+        // partially. The shared generation helper retires any earlier proof only
         // while this operation is still current. A newer/superseding open or
         // workflow_new therefore cannot be clobbered by this failure; an operation
         // that never acquired the section has no proof to invalidate.
