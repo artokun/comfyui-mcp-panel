@@ -152,7 +152,11 @@ export const QUEUE_ITEM_TAG = Symbol("cmcp-scoped-run-tag");
  * The ordered list of 3rd-argument shapes to try for app.queuePrompt when a
  * run-to-node scope is requested. The positional array comes first (native on
  * positional builds, normalized by the Array.isArray shim on options builds);
- * the QueuePromptOptions object is next for builds that dropped the shim.
+ * the QueuePromptOptions object is next for builds that dropped the shim. The
+ * object carries both the store-layer `queueNodeIds` key and the API-layer
+ * `partialExecutionTargets` key: ComfyApp 1.49.6 reads the former and translates
+ * it to the latter, while a wrapper that forwards the options directly to the
+ * API can read the latter without needing a separate attempt.
  * `[undefined]` when no scope was requested — a plain full run, exactly the
  * historical call shape.
  *
@@ -179,13 +183,13 @@ export const QUEUE_ITEM_TAG = Symbol("cmcp-scoped-run-tag");
  * a build that does not read it.
  *
  * @param {string[]|undefined} partialTargets
- * @returns {(string[]|{queueNodeIds:string[]}|undefined)[]}
+ * @returns {(string[]|{queueNodeIds:string[],partialExecutionTargets:string[]}|undefined)[]}
  */
 export function queuePromptScopeArgs(partialTargets) {
   if (!Array.isArray(partialTargets) || !partialTargets.length) return [undefined];
   return [
     partialTargets,
-    { queueNodeIds: partialTargets },
+    { queueNodeIds: partialTargets, partialExecutionTargets: partialTargets },
     { partialExecutionTargets: partialTargets },
   ];
 }
@@ -193,7 +197,10 @@ export function queuePromptScopeArgs(partialTargets) {
 /**
  * The ordered DELIVERY ATTEMPTS for a run-to-node scope. The first two hand the
  * scope to `app.queuePrompt` in each of its two documented third-argument
- * shapes. The LAST one hands over the positional array again but also licenses
+ * shapes. The options object carries both the store and API option keys so the
+ * same call works through the 1.49.6 ComfyApp layer and an API-forwarding
+ * wrapper. The remaining API-level compatibility attempt is retained for
+ * wrappers that allow only that key. The LAST one hands over the positional array but also licenses
  * the guard to write `partial_execution_targets` straight into this run's own
  * /prompt body (repairScopeInBody) if it still has not arrived.
  *
@@ -206,16 +213,17 @@ export function queuePromptScopeArgs(partialTargets) {
  * the panel only reaches for the body when the supported routes have failed.
  *
  * @param {string[]|undefined} partialTargets
- * @returns {{arg: string[]|{queueNodeIds:string[]}|undefined, repair: boolean}[]}
+ * @returns {{arg: string[]|{queueNodeIds:string[],partialExecutionTargets:string[]}|{partialExecutionTargets:string[]}|undefined, repair: boolean}[]}
  */
 export function queuePromptScopeAttempts(partialTargets) {
   if (!Array.isArray(partialTargets) || !partialTargets.length) {
     return [{ arg: undefined, repair: false }];
   }
+  const [, optionsArg, apiArg] = queuePromptScopeArgs(partialTargets);
   return [
     { arg: partialTargets, repair: false },
-    { arg: { queueNodeIds: partialTargets }, repair: false },
-    { arg: { partialExecutionTargets: partialTargets }, repair: false },
+    { arg: optionsArg, repair: false },
+    { arg: apiArg, repair: false },
     { arg: partialTargets, repair: true },
   ];
 }
