@@ -172,6 +172,92 @@ export function snapshotCopyLayout(graph, selection) {
   };
 }
 
+/**
+ * Snapshot live values for widgets that LiteGraph deliberately omits from its
+ * node serialization. DOM-backed custom widgets commonly set
+ * `serialize:false`; their values otherwise fall back to the widget default on
+ * a clipboard clone/configure cycle.
+ */
+export function snapshotCopyWidgetState(selection) {
+  const nodes = [];
+  for (const node of selection?.nodes ?? []) {
+    const widgets = [];
+    for (const widget of node?.widgets ?? []) {
+      if (!widget || widget.serialize !== false || typeof widget.name !== "string") continue;
+      try {
+        widgets.push({ name: widget.name, value: cloneWidgetValue(widget.value) });
+      } catch {
+        // A widget with an unreadable value is not safe to replay onto a new node.
+      }
+    }
+    if (widgets.length) {
+      nodes.push({
+        id: node?.id,
+        type: typeof node?.type === "string" ? node.type : null,
+        widgets,
+      });
+    }
+  }
+  return { nodes };
+}
+
+function cloneWidgetValue(value) {
+  if (value == null || typeof value !== "object") return value;
+  if (typeof structuredClone === "function") return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+let _widgetStateSnapshot = { nodes: [] };
+let _widgetStateFingerprint = null;
+
+/** Record omitted live widget values alongside the copied clipboard bytes. */
+export function recordCopiedWidgetState(state, fingerprint = null) {
+  _widgetStateSnapshot = {
+    nodes: [...(state?.nodes ?? [])],
+  };
+  _widgetStateFingerprint = fingerprint;
+  return _widgetStateSnapshot;
+}
+
+/** Test hook / explicit clear. */
+export function clearCopiedWidgetState() {
+  _widgetStateSnapshot = { nodes: [] };
+  _widgetStateFingerprint = null;
+}
+
+/** Return omitted widget values only while the clipboard is byte-identical. */
+export function getVerifiedWidgetState(currentFingerprint) {
+  if (
+    _widgetStateFingerprint != null &&
+    currentFingerprint != null &&
+    currentFingerprint === _widgetStateFingerprint
+  ) {
+    return _widgetStateSnapshot;
+  }
+  return null;
+}
+
+/** Restore omitted widget values onto the freshly pasted nodes. */
+export function applyCopiedWidgetState(pastedNodes, state) {
+  if (!state?.nodes?.length) return 0;
+  const pairs = pairCopiedToPasted(state.nodes, pastedNodes);
+  let restored = 0;
+  for (const { copied, pasted } of pairs) {
+    for (const saved of copied.widgets ?? []) {
+      const widget = (pasted?.widgets ?? []).find((w) => w?.name === saved.name);
+      if (!widget || widget.serialize !== false) continue;
+      try {
+        widget.value = cloneWidgetValue(saved.value);
+        restored++;
+      } catch {
+        // Do not make a successful paste fail because one custom widget rejects
+        // a value that its own setter cannot accept.
+      }
+    }
+  }
+  return restored;
+}
+
 // Live layout recorded at copy time, paired with the same fingerprint
 // paste-report uses. Trusted only while the clipboard still holds our payload —
 // a native Ctrl+C in between replaces the bytes and invalidates this snapshot.

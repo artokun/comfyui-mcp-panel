@@ -574,10 +574,14 @@ import {
 import {
   collectCopySelection,
   snapshotCopyLayout,
+  snapshotCopyWidgetState,
   patchClipboardLayout,
   parseClipboardLayout,
   recordCopiedLayout,
   getVerifiedLayout,
+  recordCopiedWidgetState,
+  getVerifiedWidgetState,
+  applyCopiedWidgetState,
   applyPastedLayout,
   resolvePasteDest,
 } from "./lib/copy-paste-layout.js";
@@ -21706,6 +21710,7 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     if (typeof canvas.selectItems === "function") canvas.selectItems(selection.items);
     const layout = snapshotCopyLayout(graph, selection);
+    const widgetState = snapshotCopyWidgetState(selection);
     // panel#500: copyToClipboard persists the payload in localStorage, which
     // throws QuotaExceededError ("The quota has been exceeded.") once a large
     // multi-node selection overflows the ~5–10 MB quota — the copy then failed
@@ -21736,6 +21741,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const fingerprint = getInMemoryClipboard();
     recordCopiedNodes(selection.nodes, fingerprint);
     recordCopiedLayout(layout, fingerprint);
+    recordCopiedWidgetState(widgetState, fingerprint);
     // #286: never report a clean copy that can't round-trip. Any copied node
     // whose type is unregistered on THIS frontend (uninstalled custom-node pack)
     // will be silently dropped by a later paste — the destination is the same
@@ -21788,6 +21794,7 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       withInMemoryClipboard(storage, () => canvas.pasteFromClipboard(options));
       const pastedNodes = (graph._nodes ?? []).filter((n) => !before.has(n.id));
+      applyCopiedWidgetState(pastedNodes, getVerifiedWidgetState(rawClipboard));
       // #1411 — LiteGraph's paste configures properties VERBATIM from the
       // clipboard payload, so a copied node (e.g. one cut from an older,
       // unsanitized workflow, or a native Ctrl+C of an externally-authored
