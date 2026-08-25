@@ -33397,29 +33397,40 @@ function buildPanel() {
       // late click must not resolve a promise whose reply was already sent.
       if (done || abandoned) return;
       done = true;
+      // Resolve the command before doing any presentation or history work. The
+      // promise is the transport handoff back to the exact ask_user rid that
+      // panel_restart_comfyui is waiting on; a storage/DOM failure must not turn
+      // a real user answer into a confirmation timeout.
+      resolveFn(answer);
+
       // Collapse the interactive card into a STATIC result — remove every button
       // and input so it no longer looks clickable / awaiting an answer.
-      card.replaceChildren();
-      card.classList.remove("cmcp-question");
-      card.style.cssText = "border-left:3px solid var(--p-primary-color,#3a7bd5);opacity:0.9;";
-      // Coerce question/answer — a structured question must not render (or record)
-      // as "[object Object]"; answer is already a coerced label / free text (#276).
-      const questionText = coerceMessageText(msg.question);
-      const answerText = coerceMessageText(answer);
-      if (questionText) {
-        const q = document.createElement("div");
-        q.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);opacity:0.65;";
-        q.textContent = questionText;
-        card.appendChild(q);
+      try {
+        card.replaceChildren();
+        card.classList.remove("cmcp-question");
+        card.style.cssText = "border-left:3px solid var(--p-primary-color,#3a7bd5);opacity:0.9;";
+        // Coerce question/answer — a structured question must not render (or record)
+        // as "[object Object]"; answer is already a coerced label / free text (#276).
+        const questionText = coerceMessageText(msg.question);
+        const answerText = coerceMessageText(answer);
+        if (questionText) {
+          const q = document.createElement("div");
+          q.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8862);opacity:0.65;";
+          q.textContent = questionText;
+          card.appendChild(q);
+        }
+        const a = document.createElement("div");
+        a.style.cssText = "font-weight:600;margin-top:0.15rem;color:var(--p-primary-color,#6ea8fe);";
+        a.textContent = `✓ ${answerText}`;
+        card.appendChild(a);
+        // Record as a plain card so a reload restores it as static text, not a widget.
+        record({ role: "card", icon: "pi-check", text: questionText || tr("panel.choice", "Choice"), detail: answerText });
+        scrollLog();
+      } catch (error) {
+        // The answer has already been handed to the waiting command. Transcript
+        // persistence and repainting are best-effort follow-up presentation.
+        console.warn("[comfyui-mcp-panel] couldn't present answered question card:", error?.message ?? error);
       }
-      const a = document.createElement("div");
-      a.style.cssText = "font-weight:600;margin-top:0.15rem;color:var(--p-primary-color,#6ea8fe);";
-      a.textContent = `✓ ${answerText}`;
-      card.appendChild(a);
-      // Record as a plain card so a reload restores it as static text, not a widget.
-      record({ role: "card", icon: "pi-check", text: questionText || tr("panel.choice", "Choice"), detail: answerText });
-      scrollLog();
-      resolveFn(answer);
     };
 
     const btnRow = document.createElement("div");
