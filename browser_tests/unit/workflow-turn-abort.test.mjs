@@ -6,7 +6,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { createComfyBackendOutageTracker } from "../../web/js/lib/session-rebind.js";
+import {
+  createBridgeOutageTracker,
+  createComfyBackendOutageTracker,
+} from "../../web/js/lib/session-rebind.js";
 
 const PANEL_PATH = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const PANEL = readFileSync(PANEL_PATH, "utf8").replace(/\r\n/g, "\n");
@@ -151,8 +154,7 @@ test("#1810 does not complete the dedicated swap while the turn is still working
   assert.deepEqual(events, []);
 });
 
-function buildHelloCorrelation() {
-  const pending = { token: "swap-1", landed: false };
+function buildHelloCorrelation(pending = { token: "swap-1", landed: false }) {
   return new Function(
     "dedicatedWorkflowSwapAckPending",
     `${NOTE_DEDICATED_HELLO}\nreturn { noteDedicatedWorkflowHello, state: () => dedicatedWorkflowSwapAckPending };`,
@@ -167,9 +169,17 @@ test("#1810 only the deliberate hello can arm the dedicated ready-ack guard", ()
   const deliberate = buildHelloCorrelation();
   deliberate.noteDedicatedWorkflowHello({ dedicatedWorkflowSwap: "swap-1" });
   assert.deepEqual(deliberate.state(), { token: "swap-1", landed: true });
+
+  const afterReady = buildHelloCorrelation({ token: "swap-1", landed: true, ready: true });
+  afterReady.noteDedicatedWorkflowHello();
+  assert.deepEqual(
+    afterReady.state(),
+    { token: "swap-1", landed: true, ready: true },
+    "an unrelated re-hello after the tagged ready must not consume the recovery guard",
+  );
 });
 
-function buildAck({ outageMs = 0, rebootPending = false, swapLanded = true } = {}) {
+function buildAck({ outageMs = 0, rebootPending = false, swapLanded = true, swapPending = true } = {}) {
   const mids = new Map([
     ["mid", "1"],
     ["reboot", rebootPending ? "1" : null],
@@ -177,7 +187,18 @@ function buildAck({ outageMs = 0, rebootPending = false, swapLanded = true } = {
     ["pending-reset", null],
   ]);
   const sent = [];
-  let swapAckPending = { token: "swap-1", landed: swapLanded };
+  const clock = { value: 1000 };
+  const bridgeOutage = createBridgeOutageTracker({ now: () => clock.value });
+  const startBridgeOutage = (durationMs) => {
+    bridgeOutage.noteBridgeClosed();
+    clock.value = 1000 + durationMs;
+  };
+  const finishBridgeReconnect = () => bridgeOutage.noteHandshake();
+  if (outageMs > 0) {
+    startBridgeOutage(outageMs);
+    finishBridgeReconnect();
+  }
+  let swapAckPending = swapPending ? { token: "swap-1", landed: swapLanded } : null;
   let rebootHandlerCalls = 0;
   const onAck = new Function(
     "cmcpOauthOnAck",
@@ -242,12 +263,20 @@ function buildAck({ outageMs = 0, rebootPending = false, swapLanded = true } = {
     () => {},
     (_key, fallback) => fallback,
     swapAckPending,
-    { outageMs: () => outageMs },
+    bridgeOutage,
     ({ outageMs: measured }) => measured >= 6000,
     () => {},
     () => {},
   );
-  return { onAck, sent, mids, get swapAckPending() { return swapAckPending; }, rebootHandlerCalls: () => rebootHandlerCalls };
+  return {
+    onAck,
+    sent,
+    mids,
+    startBridgeOutage,
+    finishBridgeReconnect,
+    get swapAckPending() { return swapAckPending; },
+    rebootHandlerCalls: () => rebootHandlerCalls,
+  };
 }
 
 test("#1810 ready from the deliberate session rebind does not inject a false resume turn", () => {
@@ -255,6 +284,35 @@ test("#1810 ready from the deliberate session rebind does not inject a false res
   ack.onAck({ kind: "ready" });
   assert.deepEqual(ack.sent, []);
   assert.equal(ack.mids.get("mid"), "1", "the live turn marker remains armed until turn:done");
+});
+
+test("#1810 tagged ready then unrelated ready preserves recovery until a real outage reconnect", () => {
+  const ack = buildAck();
+
+  // The first ready is the deliberately tagged dedicated-session rebind.
+  ack.onAck({ kind: "ready" });
+  // A later live-socket re-hello (the free_vram/self-heal shape) is unrelated.
+  ack.onAck({ kind: "ready" });
+  assert.deepEqual(ack.sent, []);
+  assert.equal(ack.mids.get("mid"), "1", "an unrelated healthy ready cannot consume MID_TASK_KEY");
+  assert.deepEqual(ack.swapAckPending, { token: "swap-1", landed: true, ready: true });
+
+  // Only the ready that closes a measured outage may enter the existing recovery path.
+  ack.startBridgeOutage(7000);
+  ack.finishBridgeReconnect();
+  ack.onAck({ kind: "ready" });
+  assert.equal(ack.mids.get("mid"), null);
+  assert.equal(ack.sent.length, 1);
+  assert.equal(ack.sent[0][0], "user");
+  assert.match(ack.sent[0][1], /agent connection dropped mid-task/);
+  assert.doesNotMatch(ack.sent[0][1], /ComfyUI was restarted/);
+});
+
+test("#1810 a normal uncorrelated live re-hello preserves an in-flight recovery marker", () => {
+  const ack = buildAck({ swapPending: false });
+  ack.onAck({ kind: "ready" });
+  assert.deepEqual(ack.sent, [], "a normal re-hello must not inject a resume turn");
+  assert.equal(ack.mids.get("mid"), "1", "the marker remains for a later real outage");
 });
 
 test("#1810 real bridge outage still reaches the existing mid-turn recovery nudge", () => {

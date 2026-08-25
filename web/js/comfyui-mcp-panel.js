@@ -35352,15 +35352,19 @@ function buildPanel() {
   let dedicatedWorkflowSwapSequence = 0;
 
   // A ready ack is evidence for this workflow swap only when the hello that
-  // deliberately initiated it actually landed. Any other hello (including a
-  // reconnect or a generic self-heal) invalidates the association instead of
-  // consuming a future real ComfyUI outage recovery.
+  // deliberately initiated it actually landed. An unrelated hello before that
+  // ready invalidates the association; after the tagged ready, later healthy
+  // re-hellos stay outside the swap's recovery decision and must not consume a
+  // future real ComfyUI outage recovery.
   function noteDedicatedWorkflowHello(context) {
     const pending = dedicatedWorkflowSwapAckPending;
     if (!pending) return;
     if (context?.dedicatedWorkflowSwap === pending.token) {
       pending.landed = true;
-    } else {
+    } else if (!pending.ready) {
+      // Before the deliberate ready, an unrelated hello means this request
+      // cannot be correlated to the swap. Once the tagged ready was consumed,
+      // retain the recovery guard across later healthy re-hellos instead.
       dedicatedWorkflowSwapAckPending = null;
     }
   }
@@ -37420,13 +37424,30 @@ function buildPanel() {
         !ssGet(SOFT_RELOAD_KEY) &&
         dedicatedWorkflowSwapAckPending?.landed
       ) {
-        dedicatedWorkflowSwapAckPending = null;
+        // Keep the correlation alive after the deliberate ready: a later
+        // untagged ready on the same socket is a normal re-hello (free_vram,
+        // self-heal, or another tab rebinding), not proof that this turn was
+        // recovered. It must not consume MID_TASK_KEY.
+        dedicatedWorkflowSwapAckPending.ready = true;
+      }
+      if (
+        ack?.kind === "ready" &&
+        !ssGet(REBOOT_KEY) &&
+        !ssGet(SOFT_RELOAD_KEY) &&
+        dedicatedWorkflowSwapAckPending?.ready
+      ) {
+        // A measured bridge outage outranks the healthy-socket guard and lets
+        // the normal recovery path clear the marker and nudge the agent.
         if (bridgeOutage.outageMs() <= 0) return;
+        dedicatedWorkflowSwapAckPending = null;
       }
       // Unexpected bounce while mid-task — a DIFFERENT agent restarting ComfyUI
       // (to load nodes), a crash, or an SDK self-heal. The session resumed with
       // full context but has no pending turn, so it would sit idle. Nudge it.
       if (ack?.kind === "ready" && ssGet(MID_TASK_KEY)) {
+        // A healthy ready is only a re-hello. Keep the marker for the actual
+        // turn:done or a later handshake that proves a real outage.
+        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
         ssSet(MID_TASK_KEY, null);
         // Only nudge for a REAL restart. A fast reconnect (a panel remount from a
         // sidebar swap, or a brief WS blip) means the orchestrator never died —
@@ -37466,7 +37487,6 @@ function buildPanel() {
         // duration and let it outrank the guard; review showed that nudges a live agent
         // whenever the panel's conclusion is wrong — a socket that went stale under a
         // sleep or a NAT idle-kill is indistinguishable from a death here.
-        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         if (client.sendUserMessage(
