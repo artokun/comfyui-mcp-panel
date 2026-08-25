@@ -5717,16 +5717,12 @@ async function applyPanelLocale(explicit) {
     return null;
   }
 }
-/** Conversation ownership (mcp#884 — owner-stated invariant): the conversation
- *  ALWAYS belongs to the panel. One agent session spans every workflow and every
- *  tab; the orchestrator keys and persists it (in ~/.comfyui-mcp/sessions, since
- *  mcp#897), so a workflow-scoped chat is a bug, never a mode. The old
- *  "workflow"/"ask" scopes are retired — their stored setting values are ignored
- *  (not migrated), and per-workflow threads created under them remain in
- *  history, reachable through the history picker like any archived
- *  conversation. */
-function chatScopeMode() {
-  return "panel";
+/** Conversation ownership (mcp#884): most providers use the panel-owned
+ *  conversation, while Grok retains its production per-workflow chat/session
+ *  behavior. The old user-selectable "workflow"/"ask" settings remain retired;
+ *  provider state, not persisted scope settings, selects the real behavior. */
+function chatScopeMode(backend) {
+  return backend === "grok" ? "workflow" : "panel";
 }
 function setSetting(id, value) {
   try {
@@ -6335,10 +6331,10 @@ function panelSettingsList() {
         panelHooks.applyBackend?.(v, previous);
       },
     },
-    // mcp#884 — the "Chat conversation scope" combo is retired: the conversation
-    // is ALWAYS panel-owned (one session across every workflow and tab, keyed and
-    // persisted by the orchestrator). chatScopeMode() is hard-wired to "panel";
-    // a stored "workflow"/"ask" value from an older build is simply ignored.
+    // mcp#884 — the user-selectable "Chat conversation scope" combo is retired:
+    // provider state owns the behavior. A stored "workflow"/"ask" value from an
+    // older build is simply ignored; Grok's dedicated workflow sessions are not
+    // user-selectable scope settings.
     {
       id: SETTING_AUTOSTART_MCP,
       name: "Autostart MCP",
@@ -25186,7 +25182,7 @@ function noteActiveWorkflowMove() {
   }
 }
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert, onHelloLanded }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -25332,7 +25328,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // `advertiseHello` is a hoisted declaration below; the arrow defers the read until the
   // gate actually fires, so this cannot capture it before it exists.
   const rehelloGate = createRehelloGate({
-    advertise: () => advertiseHello(),
+    advertise: (context) => advertiseHello(context),
     now: monotonicNow,
   });
   // #1095 — the socket a hello has actually LANDED on. Only a hello that REPLACES an
@@ -26633,15 +26629,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
    *  deferred hello resolves when it eventually goes out (or false if the client was torn
    *  down first), so the #607 budget still counts only what the orchestrator received. */
   function sendHello() {
+    const context = arguments[0];
     // A hello that REPLACES this socket's mapping is the only one that can strand a
     // command. The first hello on a socket creates the mapping — there is nothing to
     // withdraw, and deferring it would leave the tab unregistered while commands pile up
     // against a route that does not exist yet. `advertisedSock` is set only on the success
     // path below, so a hello that never landed does not arm the gate either.
-    if (!sock || sock !== advertisedSock) return advertiseHello();
+    if (!sock || sock !== advertisedSock) return advertiseHello(context);
     const bindingGeneration = ++nextRouteBindingGeneration;
     pendingRouteBindingGeneration = bindingGeneration;
-    const request = rehelloGate.request();
+    const request = context === undefined ? rehelloGate.request() : rehelloGate.request(context);
     // A failed request leaves the old binding fenced. The active close/new-socket
     // path clears it, and the receipt outbox TTL bounds retention if the socket stays
     // open but the replacement hello never lands.
@@ -26664,6 +26661,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
    *  #1095 — call `sendHello()`, not this, unless you can show the send must not wait for
    *  in-flight commands. This is the ungated send the gate drives. */
   function advertiseHello() {
+    const context = arguments[0];
     if (!sock || sock.readyState !== WebSocket.OPEN) return Promise.resolve(false);
     // #291 — a hello BINDS this socket to an agent session, and not always the one
     // it was bound to a moment ago. Besides the socket-open hello, the panel
@@ -26815,6 +26813,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // frames it routes by binding are compared against it (advertisedRouteIsStale).
           lastAdvertisedRouteId = advertisedRouteId;
           if (reconnectRouteHandoff === handoffCandidate) reconnectRouteHandoff = null;
+          try {
+            onHelloLanded?.(context);
+          } catch {
+            // A lifecycle observer must never turn a landed hello into a false failure.
+          }
           // #1095 — release exactly the held frames composed FOR this route, and discard any
           // composed for a workflow the panel has since moved past. Driven from the landed
           // path, so "advertised" means the orchestrator was told, never that we meant to.
@@ -32373,10 +32376,9 @@ function buildPanel() {
   applyWorkflowAliasesFromHistory();
 
   function historyScopeFollowsPanel() {
-    // Constant since mcp#884 (chatScopeMode() is hard-wired to "panel"). Kept as
-    // the named seam the remaining scope guards read, so they stay honest
-    // defense-in-depth instead of silently deleted invariants.
-    return chatScopeMode() === "panel";
+    // Scope follows the real provider/session state. Grok's orchestrator owns
+    // dedicated per-workflow sessions; the other providers remain panel-owned.
+    return chatScopeMode(connectedBackend || selectedBackend) === "panel";
   }
 
   function currentHistoryScopeKey({ embed = false } = {}) {
@@ -35339,6 +35341,116 @@ function buildPanel() {
       /* reconnect path retries the hello */
     }
   }
+
+  // A dedicated workflow switch normally rebinds the socket and loads the
+  // target workflow's session immediately. During an agent turn that ordering
+  // is unsafe: the session rebind is interpreted by the orchestrator as a
+  // replacement of the calling turn. Keep the current session until the turn
+  // is terminal, then perform the normal dedicated-chat swap once.
+  let pendingDedicatedWorkflowSwap = false;
+  let dedicatedWorkflowSwapAckPending = null;
+  let dedicatedWorkflowSwapSequence = 0;
+
+  // A ready ack is evidence for this workflow swap only when the hello that
+  // deliberately initiated it actually landed. An unrelated hello before that
+  // ready invalidates the association; after the tagged ready, later healthy
+  // re-hellos stay outside the swap's recovery decision and must not consume a
+  // future real ComfyUI outage recovery.
+  function noteDedicatedWorkflowHello(context) {
+    const pending = dedicatedWorkflowSwapAckPending;
+    if (!pending) return;
+    if (context?.dedicatedWorkflowSwap === pending.token) {
+      pending.landed = true;
+    } else if (!pending.ready) {
+      // Before the deliberate ready, an unrelated hello means this request
+      // cannot be correlated to the swap. Once the tagged ready was consumed,
+      // retain the recovery guard across later healthy re-hellos instead.
+      dedicatedWorkflowSwapAckPending = null;
+    }
+  }
+
+  function completeDedicatedWorkflowSessionSwap({ announce = false } = {}) {
+    if (!pendingDedicatedWorkflowSwap || historyScopeFollowsPanel() || agentWorking) return false;
+
+    pendingDedicatedWorkflowSwap = false;
+    dedicatedWorkflowSwapAckPending = null;
+    const historyKey = workflowStorageKey();
+    const existing = threadForWorkflow(historyKey);
+    // Bind THIS workflow's session BEFORE the re-hello. sendHello() reads
+    // SESSION_KEY at hello time for its spawn-time `resume`.
+    ssSet(SESSION_KEY, existing?.sessionId || null);
+    rehelloForWorkflow(existing?.sessionId || null);
+    if (existing) {
+      loadThread(existing); // resets feed + repaints + resumes
+    } else {
+      thread = null; // fresh empty view; the thread is minted on first message
+      ssSet(CURRENT_THREAD_KEY, null);
+      resetFeed();
+      try {
+        client?.armContext?.(
+          `[Workspace context: this chat is dedicated to the ComfyUI workflow "${getWorkflowTitle()}". ` +
+          `Each workflow has its own separate agent conversation — other workflows are NOT in your context.]`,
+        );
+      } catch { /* armContext unavailable — awareness rides the title instead */ }
+    }
+    if (announce) {
+      appendSystem(
+        tr(
+          "panel.workflow_chat_switch_after_turn",
+          "Switched workflow tab — this chat is dedicated to the new workflow after the previous turn finished.",
+        ),
+      );
+    }
+    refreshContextRingForScope();
+    return true;
+  }
+
+  function deferDedicatedWorkflowSwitch(wf, wfid, wfkey) {
+    currentWorkflowId = wfid;
+    currentWorkflowKey = wfkey;
+    currentWorkflowRef = wf;
+    pendingDedicatedWorkflowSwap = true;
+    const token = `dedicated-workflow-swap-${++dedicatedWorkflowSwapSequence}`;
+    const ackPending = { token, landed: false };
+    dedicatedWorkflowSwapAckPending = ackPending;
+    // Re-target this socket, but deliberately keep SESSION_KEY and the current
+    // thread. The calling turn therefore remains owned by its original chat.
+    let hello;
+    try {
+      hello = client?.rehello?.({ dedicatedWorkflowSwap: token });
+    } catch {
+      /* reconnect path retries the hello */
+    }
+    // A failed, coalesced, or superseded hello must not leave a stale ack guard
+    // armed for a later unrelated ready frame. The landed callback above is the
+    // positive proof; the promise only confirms that the request settled.
+    void Promise.resolve(hello).then((sent) => {
+      if (dedicatedWorkflowSwapAckPending !== ackPending) return;
+      if (sent !== true || !ackPending.landed) dedicatedWorkflowSwapAckPending = null;
+    }, () => {
+      if (dedicatedWorkflowSwapAckPending === ackPending) dedicatedWorkflowSwapAckPending = null;
+    });
+    const name = wf?.filename || wfkey || wfid;
+    client?.armContext?.(
+      `[panel] The user switched the open workflow on the canvas to "${name}" while an agent turn was in flight. ` +
+      `Keep using the current conversation until this turn finishes; the dedicated chat swap is deferred.`,
+    );
+    refreshContextRingForScope();
+  }
+
+  function settlePendingDedicatedWorkflowSwapAfterCancellation() {
+    if (!pendingDedicatedWorkflowSwap && !dedicatedWorkflowSwapAckPending) return false;
+    // If provider scope changed back to panel ownership while cancellation was
+    // in progress, there is no dedicated session to bind. Clear the stale
+    // commitment anyway so a later poll cannot return early on its target.
+    if (historyScopeFollowsPanel()) {
+      pendingDedicatedWorkflowSwap = false;
+      dedicatedWorkflowSwapAckPending = null;
+      return false;
+    }
+    return completeDedicatedWorkflowSessionSwap({ announce: true });
+  }
+
   // #1095 — THIS POLL DOES NOT GATE ANYTHING, AND THAT IS THE FIX.
   //
   // The first cut deferred the whole function while a command was in flight, so that the
@@ -35393,6 +35505,16 @@ function buildPanel() {
 
     const initial = currentWorkflowId == null;
     const followsPanel = historyScopeFollowsPanel();
+
+    // Legacy dedicated-chat mode must not use its normal session swap while the
+    // calling turn is live. A `resume_session`/hello handover here cancels the
+    // turn that just called panel_new_workflow and leaves MID_TASK_KEY armed for
+    // the new chat's ready ack. Re-target the socket only, then finish the chat
+    // swap from the terminal turn callback.
+    if (!followsPanel && agentWorking) {
+      deferDedicatedWorkflowSwitch(wf, wfid, wfkey);
+      return;
+    }
 
     // PANEL-OWNED SESSION (default): the conversation is the unit of continuity
     // and the workflow is just the canvas target — switching, saving, renaming,
@@ -35599,41 +35721,7 @@ function buildPanel() {
       return;
     }
 
-    currentWorkflowId = wfid;
-    currentWorkflowKey = wfkey;
-    currentWorkflowRef = wf;
-    const existing = threadForWorkflow(historyKey);
-    // Bind THIS workflow's session BEFORE the re-hello. sendHello() reads
-    // SESSION_KEY at hello time for its spawn-time `resume` — re-helloing first
-    // carried the PREVIOUS workflow's session id, so a fresh workspace's agent
-    // spawned as a resume-FORK of the other conversation (verbatim memory bleed
-    // across workspaces). Order is the whole fix.
-    ssSet(SESSION_KEY, existing?.sessionId || null);
-    rehelloForWorkflow(existing?.sessionId || null);
-    if (existing) {
-      loadThread(existing); // resets feed + repaints + resumes
-    } else {
-      thread = null; // fresh empty view; the thread is minted (tagged) on first message
-      ssSet(CURRENT_THREAD_KEY, null);
-      resetFeed();
-      // NOTE: no `new_session` frame here — SESSION_KEY was bound BEFORE the
-      // re-hello, so the hello already spawns a clean agent for this tab. Sending
-      // new_session too caused a rapid double-spawn (double greeting, and two
-      // concurrent Claude session starts that can race token refresh → 401s).
-      // Workspace awareness: ride a one-shot context on the FIRST message so the
-      // fresh agent knows exactly which workflow it serves (and that other
-      // workflows have their own separate conversations).
-      try {
-        client?.armContext?.(
-          `[Workspace context: this chat is dedicated to the ComfyUI workflow "${getWorkflowTitle()}". ` +
-          `Each workflow has its own separate agent conversation — other workflows are NOT in your context.]`,
-        );
-      } catch { /* armContext unavailable — awareness rides the title instead */ }
-    }
-    // #381: a genuine switch changed the conversation scope — repaint the ring
-    // from the newly-active scope's own last-known fill (or blank it) so it never
-    // keeps showing the previous workflow's value.
-    refreshContextRingForScope();
+    completeDedicatedWorkflowSessionSwap();
   }
 
   function renderHistory() {
@@ -36128,6 +36216,7 @@ function buildPanel() {
       agentWorking = false;
       ssSet(MID_TASK_KEY, null);
     }
+    settlePendingDedicatedWorkflowSwapAfterCancellation();
     hideThinking();
   }
 
@@ -36214,6 +36303,7 @@ function buildPanel() {
     agentWorking = false;
     localEndAt = Date.now(); // briefly ignore a straggler turn:working from this turn
     ssSet(MID_TASK_KEY, null); // turn stopped — nothing to resume
+    settlePendingDedicatedWorkflowSwapAfterCancellation();
     hideThinking();
   }
 
@@ -36869,6 +36959,7 @@ function buildPanel() {
           // since (sessionEpoch unchanged).
           lastAgentGraphEpoch = sessionEpoch;
         } catch {}
+        completeDedicatedWorkflowSessionSwap({ announce: true });
       }
     },
     onLog(text) {
@@ -37217,6 +37308,7 @@ function buildPanel() {
       // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).
       cmcpOauthOnBackendsPush?.();
     },
+    onHelloLanded: noteDedicatedWorkflowHello,
     onAck(ack) {
       // In-panel OAuth acks (oauth_begin/oauth_status/oauth_signout) are routed
       // to whichever credentials card is currently open — see
@@ -37322,10 +37414,40 @@ function buildPanel() {
         }
         return;
       }
+      // A deliberate dedicated-chat rebind also produces a ready ack. It is
+      // not evidence that the calling turn dropped. Consume only that ack when
+      // the bridge stayed up; a real bridge outage still reaches the normal
+      // recovery path below.
+      if (
+        ack?.kind === "ready" &&
+        !ssGet(REBOOT_KEY) &&
+        !ssGet(SOFT_RELOAD_KEY) &&
+        dedicatedWorkflowSwapAckPending?.landed
+      ) {
+        // Keep the correlation alive after the deliberate ready: a later
+        // untagged ready on the same socket is a normal re-hello (free_vram,
+        // self-heal, or another tab rebinding), not proof that this turn was
+        // recovered. It must not consume MID_TASK_KEY.
+        dedicatedWorkflowSwapAckPending.ready = true;
+      }
+      if (
+        ack?.kind === "ready" &&
+        !ssGet(REBOOT_KEY) &&
+        !ssGet(SOFT_RELOAD_KEY) &&
+        dedicatedWorkflowSwapAckPending?.ready
+      ) {
+        // A measured bridge outage outranks the healthy-socket guard and lets
+        // the normal recovery path clear the marker and nudge the agent.
+        if (bridgeOutage.outageMs() <= 0) return;
+        dedicatedWorkflowSwapAckPending = null;
+      }
       // Unexpected bounce while mid-task — a DIFFERENT agent restarting ComfyUI
       // (to load nodes), a crash, or an SDK self-heal. The session resumed with
       // full context but has no pending turn, so it would sit idle. Nudge it.
       if (ack?.kind === "ready" && ssGet(MID_TASK_KEY)) {
+        // A healthy ready is only a re-hello. Keep the marker for the actual
+        // turn:done or a later handshake that proves a real outage.
+        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
         ssSet(MID_TASK_KEY, null);
         // Only nudge for a REAL restart. A fast reconnect (a panel remount from a
         // sidebar swap, or a brief WS blip) means the orchestrator never died —
@@ -37365,11 +37487,10 @@ function buildPanel() {
         // duration and let it outrank the guard; review showed that nudges a live agent
         // whenever the panel's conclusion is wrong — a socket that went stale under a
         // sleep or a NAT idle-kill is indistinguishable from a death here.
-        if (!shouldNudgeAfterMidTaskReconnect({ outageMs: bridgeOutage.outageMs() })) return;
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         if (client.sendUserMessage(
-          "✅ Your connection dropped mid-task (e.g. ComfyUI was restarted, possibly by another agent installing nodes). The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
+          "✅ Your agent connection dropped mid-task. The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
         )) pinTurnOwnerAtDispatch();
       }
     },

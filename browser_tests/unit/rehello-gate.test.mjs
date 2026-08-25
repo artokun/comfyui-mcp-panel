@@ -210,6 +210,22 @@ test("#1095: several deferred re-advertises coalesce into ONE hello, all told th
   assert.deepEqual(await Promise.all([a, b, c]), [true, true, true]);
 });
 
+test("#1810: a deferred hello carries its deliberate swap context to the real advertiser", async () => {
+  const contexts = [];
+  const { gate } = harness({
+    advertise: (context) => {
+      contexts.push(context);
+      return Promise.resolve(true);
+    },
+  });
+  const mark = gate.began("graph_set_widget");
+  const landed = gate.request({ dedicatedWorkflowSwap: "swap-1" });
+  gate.request({ dedicatedWorkflowSwap: "swap-2" });
+  gate.ended(mark);
+  assert.equal(await landed, true);
+  assert.deepEqual(contexts, [{ dedicatedWorkflowSwap: "swap-1" }]);
+});
+
 test("#1095: a DOUBLE release of one mark cannot discount another command", () => {
   // deliverReply releases the mark, and a double-delivery (a retry, a future refactor) must
   // not free work that is still running. A counter could not tell the two apart; an id can.

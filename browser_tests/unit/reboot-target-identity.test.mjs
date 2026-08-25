@@ -110,7 +110,7 @@ test("resolving the target cannot throw — one branch runs inside a catch", () 
     PANEL.indexOf("function externalOrchestratorMode() {"),
   );
   assert.ok(setting.includes('typeof v === "string" ? v.trim() : ""'), "a non-string setting must not blow up");
-  const get = PANEL.slice(PANEL.indexOf("\nfunction getSetting(id) {"), PANEL.indexOf("function chatScopeMode() {"));
+  const get = PANEL.slice(PANEL.indexOf("\nfunction getSetting(id) {"), PANEL.indexOf("function chatScopeMode(backend) {"));
   assert.ok(get.includes("} catch {"), "the settings read must be guarded");
 });
 
