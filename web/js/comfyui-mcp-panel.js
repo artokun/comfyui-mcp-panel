@@ -28757,6 +28757,15 @@ function describeCommand(cmd, msg, reply) {
       return { icon: "pi-save", text: tr("panel.workflow_saved", "Saved “{workflow}”", { workflow: r.workflow }) };
     case "workflow_save_as":
       return { icon: "pi-save", text: tr("panel.workflow_saved_as", "Saved as “{workflow}”", { workflow: r.workflow }) };
+    case "graph_get_virtual_types":
+      return {
+        icon: "pi-eye",
+        text: tr(
+          "panel.read_virtual_types",
+          { one: "Checked UI-only node types — {count} type", other: "Checked UI-only node types — {count} types" },
+          { count: r.virtual_type_count },
+        ),
+      };
     default:
       // `cmd` is the raw tool name (an identifier). #1310 — do NOT dump the raw
       // reply payload: that is how graph_query's budget_overrun / groups_omitted

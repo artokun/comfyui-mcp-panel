@@ -725,6 +725,8 @@
       "read_subgraph_nodes_one": "Read subgraph “{title}” — {count} node",
       "read_subgraph_nodes_other": "Read subgraph “{title}” — {count} nodes",
       "read_the_docs": "📖 Read the docs",
+      "read_virtual_types_one": "Checked UI-only node types — {count} type",
+      "read_virtual_types_other": "Checked UI-only node types — {count} types",
       "reasoning_effort_set_to_effort_for_model": "Reasoning effort set to {effort} for {model} (nearest level this model supports).",
       "recently_used": "Recently used",
       "recommended": "Recommended",
