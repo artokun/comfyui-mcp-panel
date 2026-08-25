@@ -115,3 +115,48 @@ export async function settleOpenedWorkflowActive({
     ? lastObservation
     : { status: "unknown", reason: lastObservation.reason ?? "active workflow did not settle" };
 }
+
+/**
+ * Run the active-binding probe as one owned reload-guard step.
+ *
+ * A superseding open may replace the guard while the timer-backed probe is
+ * waiting. In that case the result is not allowed to authorize this open,
+ * even if its last active read happened to name the target.
+ */
+export async function settleOwnedOpenedWorkflowActive({
+  beginStep,
+  ownsStep,
+  endStep,
+  ...probeOptions
+} = {}) {
+  let started = false;
+  try {
+    started = typeof beginStep === "function" && beginStep() === true;
+  } catch {
+    started = false;
+  }
+  if (!started) {
+    return { status: "superseded", reason: "active binding step was not owned" };
+  }
+
+  try {
+    const result = await settleOpenedWorkflowActive(probeOptions);
+    let stillOwns = false;
+    try {
+      stillOwns = typeof ownsStep === "function" && ownsStep() === true;
+    } catch {
+      stillOwns = false;
+    }
+    return stillOwns
+      ? result
+      : { status: "superseded", reason: "active binding step lost ownership" };
+  } catch {
+    return { status: "unknown", reason: "active binding probe failed" };
+  } finally {
+    try {
+      endStep?.();
+    } catch {
+      // Guard cleanup is best-effort; the production token remains owner-checked.
+    }
+  }
+}

@@ -671,10 +671,15 @@ test("#646 wiring: the dispatch fence gates MUTATING graph commands through the 
 test("#663 wiring: BOTH resync sites (open + new) stamp the binding proof, TOCTOU-guarded", () => {
   const stamps =
     SRC.match(/if \(backendReconnectEpoch === openedForEpoch\) postReconnectBindingProofEpoch = openedForEpoch;/g) ?? [];
-  // #1641 added a third stamp: the open's pre-load handshake wait, when it
-  // proves the restored canvas is already bound. Still TOCTOU-guarded; still
-  // only these two executors.
-  assert.equal(stamps.length, 3, "workflow_new, workflow_open success, and the #1641 handshake wait");
+  // #1641's pre-load handshake wait and workflow_new retain the compact form. The
+  // final workflow_open stamp is deliberately conditional on its post-load active
+  // settle, so a failed settle cannot leave reconnect proof trusted.
+  assert.equal(stamps.length, 2, "workflow_new and the #1641 handshake wait");
+  assert.match(
+    SRC,
+    /if \(!rebindFailed && backendReconnectEpoch === openedForEpoch\) \{[\s\S]*?postReconnectBindingProofEpoch = openedForEpoch;/,
+    "workflow_open stamps only after its complete active-binding proof",
+  );
 });
 
 test("#663/#646 wiring: the binding gate consults the #433 window AND the proof epoch, one invariant", () => {

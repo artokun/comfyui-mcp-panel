@@ -539,7 +539,7 @@ import {
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
-import { settleOpenedWorkflowActive } from "./lib/settle-open-active.js";
+import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import {
   applyCurrentDefWidgetValues,
@@ -1035,6 +1035,7 @@ const lostReplies = createLostReplyJournal();
 // switch/reload genuinely runs — see begin/endWorkflowReloadStep below.
 let workflowReloadGuard = null;
 let workflowReloadGuardSeq = 0;
+let workflowOpenGeneration = 0;
 // Defensive ceiling: a guard can only ever be cleared by workflow_open's finally, so if
 // some pathological path ever failed to run it, an un-expiring guard would wedge every
 // command in the tab. Age it out instead — but ONLY while no step of the section is in
@@ -19864,6 +19865,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // #433 TOCTOU: snapshot the reconnect epoch BEFORE the async open (see
     // workflow_new) so a reconnect landing mid-operation is not masked by our stamp.
     const openedForEpoch = backendReconnectEpoch;
+    const openGeneration = ++workflowOpenGeneration;
     // #402 — journal the FAILURE side too. Every early throw below is a real "this open
     // did NOT apply" fact, and a caller whose reply was lost mid-command needs that
     // negative just as much as the positive: without it the only remaining evidence is
@@ -20887,14 +20889,6 @@ const GRAPH_TOOL_EXECUTORS = {
             endWorkflowReloadStep(reloadGuardToken);
           }
         }
-        // #433: an explicit open authoritatively re-points `active` — record it against
-        // the epoch we STARTED on, but only if no reconnect intervened during the async
-        // open (else its tab-restore may have overridden us — leave the window armed).
-        if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
-        // #663/#646: this open only reaches here with a PROVEN rebind receipt, which is
-        // stronger proof than the settle watch's — stamp the binding proof so the
-        // post-reconnect mutation gate opens for this epoch.
-        if (backendReconnectEpoch === openedForEpoch) postReconnectBindingProofEpoch = openedForEpoch;
       // #442 — read the on-disk bytes AS LATE AS POSSIBLE (after openWorkflow + repaint),
       // so an external write during those awaits is still detected. wasOpen was captured
       // before openWorkflow; the baseline (originalContent) is unchanged by an already-open
@@ -21078,23 +21072,43 @@ const GRAPH_TOOL_EXECUTORS = {
       // open is proving its final binding, and an unstable/read-unreadable result follows
       // the existing unknown-rebind failure path rather than becoming false success.
       if (!rebindFailed) {
-        beginWorkflowReloadStep(reloadGuardToken);
-        try {
-          const activeSettle = await settleOpenedWorkflowActive({
-            target,
-            readActive: activeWorkflowRef,
-            sameWorkflowObject,
-          });
-          if (activeSettle.status !== "settled") {
-            rebindFailed = new Error(
-              activeSettle.status === "different"
-                ? "workflow_open did not leave the requested workflow as the stable active canvas"
+        const activeSettle = await settleOwnedOpenedWorkflowActive({
+          target,
+          readActive: activeWorkflowRef,
+          sameWorkflowObject,
+          beginStep: () => beginWorkflowReloadStep(reloadGuardToken),
+          ownsStep: () => ownsWorkflowReloadGuard(reloadGuardToken),
+          endStep: () => endWorkflowReloadStep(reloadGuardToken),
+        });
+        if (activeSettle.status !== "settled") {
+          rebindFailed = new Error(
+            activeSettle.status === "different"
+              ? "workflow_open did not leave the requested workflow as the stable active canvas"
+              : activeSettle.status === "superseded"
+                ? "workflow_open lost ownership of its reload window while the active canvas was settling"
                 : "workflow_open could not prove that the requested workflow remained the stable active canvas",
-            );
-          }
-        } finally {
-          endWorkflowReloadStep(reloadGuardToken);
+          );
         }
+        // #433: only an active binding that survived the complete open, including the
+        // asynchronous settle probe, may clear the reconnect staleness window.
+        // #663/#646: the same proven binding is the only receipt that opens the mutation
+        // gate for this reconnect epoch. Failed/unknown/superseded opens leave both
+        // proofs invalidated below instead of allowing an immediate list or mutation to
+        // trust a prior open's proof.
+        if (!rebindFailed && backendReconnectEpoch === openedForEpoch) {
+          activeWorkflowResyncEpoch = openedForEpoch;
+          postReconnectBindingProofEpoch = openedForEpoch;
+        }
+      }
+      if (rebindFailed && workflowOpenGeneration <= openGeneration) {
+        // The attempted open may have changed the frontend binding before its final
+        // proof failed. Retire any earlier proof for this reconnect epoch while this
+        // operation is the latest open generation. A newer/superseding open owns the
+        // later generation and must not be clobbered by this failure; unrelated guard
+        // users such as graph-revert do not establish active-workflow proof.
+        const invalidEpoch = backendReconnectEpoch - 1;
+        activeWorkflowResyncEpoch = invalidEpoch;
+        postReconnectBindingProofEpoch = invalidEpoch;
       }
       }
     } catch (err) {
