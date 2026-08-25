@@ -539,6 +539,7 @@ import {
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
+import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import {
   applyCurrentDefWidgetValues,
@@ -1034,6 +1035,13 @@ const lostReplies = createLostReplyJournal();
 // switch/reload genuinely runs — see begin/endWorkflowReloadStep below.
 let workflowReloadGuard = null;
 let workflowReloadGuardSeq = 0;
+// One generation covers every operation that can repoint the active workflow or
+// publish binding proof. Keeping workflow_new in this same domain prevents an
+// older open failure from retiring a proof a newer new-tab operation established.
+let workflowBindingGeneration = 0;
+function nextWorkflowBindingGeneration() {
+  return ++workflowBindingGeneration;
+}
 // Defensive ceiling: a guard can only ever be cleared by workflow_open's finally, so if
 // some pathological path ever failed to run it, an un-expiring guard would wedge every
 // command in the tab. Age it out instead — but ONLY while no step of the section is in
@@ -1043,8 +1051,11 @@ let workflowReloadGuardSeq = 0;
 const WORKFLOW_RELOAD_GUARD_MAX_MS = 30000;
 /** Take the section and return an OWNERSHIP TOKEN. Sections are token-scoped (codex): an
  *  expired-then-superseded holder must never release a NEWER holder's section, and a holder
- *  that has lost the section must not go on mutating as though it still had it. */
+ *  that has lost the section must not go on mutating as though it still had it. A live
+ *  awaited step is single-flight: refusing a second section prevents an already-started
+ *  load from settling after the newer operation and clobbering its canvas. */
 function acquireWorkflowReloadGuard(key) {
+  if (workflowReloadGuard?.pending > 0) return null;
   const token = ++workflowReloadGuardSeq;
   workflowReloadGuard = { token, key, since: Date.now(), pending: 0 };
   return token;
@@ -1091,6 +1102,17 @@ function endWorkflowReloadStep(token) {
 function ownsWorkflowReloadGuard(token) {
   const held = activeWorkflowReloadGuard();
   return !!held && held.token === token;
+}
+/** Retire reconnect binding proof only for the operation that still owns the
+ *  current binding generation. An older operation must not invalidate a newer
+ *  workflow_new/open proof, while the current failed operation must not leave
+ *  stale proof trusted. */
+function invalidateWorkflowBindingProof(generation) {
+  if (generation === null || workflowBindingGeneration !== generation) return false;
+  const invalidEpoch = backendReconnectEpoch - 1;
+  activeWorkflowResyncEpoch = invalidEpoch;
+  postReconnectBindingProofEpoch = invalidEpoch;
+  return true;
 }
 /** The guard, or null when none is held (expiring a stuck one on the way). A guard with a
  *  step in flight (pending > 0) is NEVER expired here — it is tied to that step's settle,
@@ -19648,6 +19670,29 @@ const GRAPH_TOOL_EXECUTORS = {
       });
       throw new Error("command service unavailable");
     }
+    // `workflow_new` repoints the active tab just as workflow_open does. It must
+    // participate in the same single-flight section: otherwise an open can keep
+    // repainting after this command has made a newer tab active, and its late
+    // failure can retire this command's proof.
+    const reloadGuardToken = acquireWorkflowReloadGuard("workflow_new");
+    if (reloadGuardToken === null || !beginWorkflowReloadStep(reloadGuardToken)) {
+      releaseWorkflowReloadGuard(reloadGuardToken);
+      const error = new Error(
+        "workflow_new could not take the workflow switch/reload section because another " +
+          "workflow operation is still in flight. Retry in a moment.",
+      );
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: null,
+        applied: false,
+        error: error.message,
+      });
+      throw error;
+    }
+    const bindingGeneration = nextWorkflowBindingGeneration();
+    try {
     // Comfy.NewBlankWorkflow opens a fresh TAB — the current workflow is untouched.
     try {
       // #968 r2 — NOT claimed here. #606/#708 reconstruct workflow_new from source and
@@ -19659,6 +19704,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // The creation command itself threw. It may have got partway, and workflow_new is
       // NOT idempotent — a blind retry can leave a second blank tab. Journal it as
       // UNKNOWN, never as a clean failure (#402 / codex).
+      invalidateWorkflowBindingProof(bindingGeneration);
       noteOpenAttempt({
         cmd: "workflow_new",
         rid,
@@ -19668,6 +19714,21 @@ const GRAPH_TOOL_EXECUTORS = {
         error: coerceMessageText(err?.message ?? err),
       });
       throw err instanceof Error ? err : new Error(coerceMessageText(err));
+    }
+    if (!ownsWorkflowReloadGuard(reloadGuardToken)) {
+      invalidateWorkflowBindingProof(bindingGeneration);
+      const error =
+        "workflow_new created a tab but lost ownership. Do NOT retry blindly; inspect " +
+        "panel_list_workflows first; its binding could not be proven.";
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: null,
+        applied: "unknown",
+        error,
+      });
+      throw new Error(error);
     }
     // Bind a UNIQUE, stable routing identity to the just-created tab NOW, at
     // creation, so a session pinned to this key routes subsequent graph_* edits to
@@ -19688,6 +19749,7 @@ const GRAPH_TOOL_EXECUTORS = {
         "active workflow — cannot establish a unique routing target. Do NOT retry — " +
         "workflow_new is not idempotent, so a retry would create a SECOND blank tab. Check " +
         "workflow_list / the canvas state first, then select the new tab before editing.";
+      invalidateWorkflowBindingProof(bindingGeneration);
       noteOpenAttempt({
         cmd: "workflow_new",
         rid,
@@ -19777,20 +19839,31 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       provenEmpty = false; // an unreadable proof is not a proof
     }
-    if (provenEmpty) {
+    if (provenEmpty && ownsWorkflowReloadGuard(reloadGuardToken)) {
       try {
         stampGraphRootWorkflowUuid(app?.rootGraph ?? app?.graph, newWorkflowUuid, wf);
       } catch {
         // Identity bookkeeping must never break workflow creation.
       }
     }
-    // #433: an explicit new-tab authoritatively re-points `active` — record it
-    // against the epoch we STARTED on, but only if no reconnect intervened during
-    // the async work (else its tab-restore may have overridden us — leave armed).
-    if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
-    // #663/#646: a created tab's binding is proven by creation — stamp the binding
-    // proof too so the post-reconnect mutation gate opens for this epoch.
-    if (backendReconnectEpoch === openedForEpoch) postReconnectBindingProofEpoch = openedForEpoch;
+    if (
+      !ownsWorkflowReloadGuard(reloadGuardToken) ||
+      workflowBindingGeneration !== bindingGeneration
+    ) {
+      invalidateWorkflowBindingProof(bindingGeneration);
+      const error =
+        "workflow_new created a tab but lost ownership before its binding proof could be " +
+        "recorded. Inspect panel_list_workflows before retrying.";
+      noteOpenAttempt({
+        cmd: "workflow_new",
+        rid,
+        requested: null,
+        resolved: { path: wf.path ?? null, filename: wf.filename ?? null, routing_key: key },
+        applied: "unknown",
+        error,
+      });
+      throw new Error(error);
+    }
     // #402 — workflow_new ALSO authoritatively re-points `active`, so it gets a receipt
     // too: a lost reply here leaves the caller unable to tell whether a blank tab was
     // created (and re-issuing would create a SECOND one, unlike the idempotent open).
@@ -19842,6 +19915,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // note carries the two facts an agent needs to act correctly: VERIFY before building,
     // and do NOT retry (workflow_new is not idempotent — a retry adds a second blank tab).
     if (!provenEmpty) {
+      // The tab exists, but this operation did not prove the state that would make
+      // either binding epoch trustworthy. Retire both before returning UNKNOWN so an
+      // immediate list or mutation cannot consume proof left by an earlier operation.
+      invalidateWorkflowBindingProof(bindingGeneration);
       return {
         created: "unknown",
         empty: "unknown",
@@ -19856,7 +19933,32 @@ const GRAPH_TOOL_EXECUTORS = {
           "SECOND blank tab behind.",
       };
     }
+    // #433: an explicit new-tab authoritatively re-points `active` — record it
+    // against the epoch we STARTED on, but only if no reconnect intervened during
+    // the async work (else its tab-restore may have overridden us — leave armed).
+    // This is deliberately after the proven-empty decision: an UNKNOWN creation
+    // must not open either downstream trust gate.
+    if (
+      ownsWorkflowReloadGuard(reloadGuardToken) &&
+      workflowBindingGeneration === bindingGeneration &&
+      backendReconnectEpoch === openedForEpoch
+    ) {
+      activeWorkflowResyncEpoch = openedForEpoch;
+    }
+    // #663/#646: a created tab's binding is proven by creation — stamp the binding
+    // proof too so the post-reconnect mutation gate opens for this epoch.
+    if (
+      ownsWorkflowReloadGuard(reloadGuardToken) &&
+      workflowBindingGeneration === bindingGeneration &&
+      backendReconnectEpoch === openedForEpoch
+    ) {
+      postReconnectBindingProofEpoch = openedForEpoch;
+    }
     return { created: true, empty: true, ...identity };
+    } finally {
+      endWorkflowReloadStep(reloadGuardToken);
+      releaseWorkflowReloadGuard(reloadGuardToken);
+    }
   },
 
   async workflow_open({ path, rid }) {
@@ -20186,10 +20288,19 @@ const GRAPH_TOOL_EXECUTORS = {
     const reloadGuardToken = acquireWorkflowReloadGuard(
       workflowTabId(target) || target.path || "the active workflow",
     );
+    // Advance the shared generation only once this validated open has actually
+    // taken ownership. A failed lookup/refresh must not supersede an older
+    // operation's failure invalidation without doing any binding work itself.
+    const openGeneration =
+      reloadGuardToken === null ? null : nextWorkflowBindingGeneration();
     try {
       // Hold the fence across the switch await itself: a slow switch must not let the
       // guard age out mid-flight (see begin/endWorkflowReloadStep).
-      beginWorkflowReloadStep(reloadGuardToken);
+      if (!beginWorkflowReloadStep(reloadGuardToken)) {
+        rebindFailed = new Error(
+          "workflow_open could not take ownership of the workflow switch/reload section; retry in a moment",
+        );
+      } else {
       try {
         // #1295 — FLUSH THE SOURCE, not the target, while SOURCE is still active.
         // Inverse of the #1215 capture gate below. A node added through the bridge
@@ -20222,7 +20333,9 @@ const GRAPH_TOOL_EXECUTORS = {
       } finally {
         endWorkflowReloadStep(reloadGuardToken);
       }
-      if (!openFailed) {
+      }
+      if (!openFailed && !rebindFailed) {
+      workflowOpenSteps: {
         // #1575 — `s.openWorkflow(target)` RESOLVING is not proof it loaded anything.
         //
         // `app.extensionManager.workflow` is the workflow STORE (workspaceStore binds it
@@ -20248,7 +20361,12 @@ const GRAPH_TOOL_EXECUTORS = {
         // graph_* command through and acknowledge it, and the repaint below would then
         // overwrite it from the disk state — the data-loss shape the guard exists to
         // prevent. A step keeps `pending > 0`, which is never expired.
-        beginWorkflowReloadStep(reloadGuardToken);
+        if (!beginWorkflowReloadStep(reloadGuardToken)) {
+          rebindFailed = new Error(
+            "workflow_open lost ownership before it could settle the opened workflow; retry in a moment",
+          );
+          break workflowOpenSteps;
+        }
         try {
           openSettled = await settleOpenedWorkflowTarget({
             wasOpen,
@@ -20310,7 +20428,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
       // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
       // LiteGraph canvas flag, not a workflow-service member.
-        beginWorkflowReloadStep(reloadGuardToken);
+        if (!beginWorkflowReloadStep(reloadGuardToken)) {
+          rebindFailed = new Error(
+            "workflow_open lost ownership before it could repaint the active canvas; retry in a moment",
+          );
+          break workflowOpenSteps;
+        }
         try {
           // #874 — CAPTURE THE LIVE CANVAS, not the last thing a user touched.
           //
@@ -20877,7 +21000,12 @@ const GRAPH_TOOL_EXECUTORS = {
         ) {
           // The helper awaits a frame before re-baselining — hold the fence across that
           // frame too, so the guard cannot age out inside it and let a command through.
-          beginWorkflowReloadStep(reloadGuardToken);
+          if (!beginWorkflowReloadStep(reloadGuardToken)) {
+            rebindFailed = new Error(
+              "workflow_open lost ownership before it could re-baseline the opened workflow; retry in a moment",
+            );
+            break workflowOpenSteps;
+          }
           try {
             await clearSpuriousOpenModified(target, {
               stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
@@ -20886,14 +21014,6 @@ const GRAPH_TOOL_EXECUTORS = {
             endWorkflowReloadStep(reloadGuardToken);
           }
         }
-        // #433: an explicit open authoritatively re-points `active` — record it against
-        // the epoch we STARTED on, but only if no reconnect intervened during the async
-        // open (else its tab-restore may have overridden us — leave the window armed).
-        if (backendReconnectEpoch === openedForEpoch) activeWorkflowResyncEpoch = openedForEpoch;
-        // #663/#646: this open only reaches here with a PROVEN rebind receipt, which is
-        // stronger proof than the settle watch's — stamp the binding proof so the
-        // post-reconnect mutation gate opens for this epoch.
-        if (backendReconnectEpoch === openedForEpoch) postReconnectBindingProofEpoch = openedForEpoch;
       // #442 — read the on-disk bytes AS LATE AS POSSIBLE (after openWorkflow + repaint),
       // so an external write during those awaits is still detected. wasOpen was captured
       // before openWorkflow; the baseline (originalContent) is unchanged by an already-open
@@ -21025,7 +21145,12 @@ const GRAPH_TOOL_EXECUTORS = {
           // overwrites that edit. With the step held the fence cannot drop mid-load, so
           // no edit can be acknowledged after the reload started — and the ownership
           // re-check below still guards the re-baseline against every other loss path.
-          beginWorkflowReloadStep(reloadGuardToken);
+          if (!beginWorkflowReloadStep(reloadGuardToken)) {
+            rebindFailed = new Error(
+              "workflow_open lost ownership before its on-disk reload could start; retry in a moment",
+            );
+            break workflowOpenSteps;
+          }
           try {
             await app.loadGraphData(diskGraph, true, true, target, { __cmcpKeepInstance: true });
             try {
@@ -21052,7 +21177,12 @@ const GRAPH_TOOL_EXECUTORS = {
             // A programmatic load dirties the change tracker; clear that so the re-read does
             // not leave the tab looking edited (which would block an unforced close). Still
             // inside the freeze, and ownership-aware across its own frame.
-            beginWorkflowReloadStep(reloadGuardToken);
+            if (!beginWorkflowReloadStep(reloadGuardToken)) {
+              rebindFailed = new Error(
+                "workflow_open lost ownership before it could re-baseline the reloaded workflow; retry in a moment",
+              );
+              break workflowOpenSteps;
+            }
             try {
               await clearSpuriousOpenModified(target, {
                 stillOwns: () => ownsWorkflowReloadGuard(reloadGuardToken),
@@ -21069,6 +21199,52 @@ const GRAPH_TOOL_EXECUTORS = {
           }
         }
         }
+      // #887 — the workflow store can publish the requested tab as active before the
+      // frontend's asynchronous tab/canvas transition has settled. The synchronous
+      // reply check below then reports a transient `active_matches_target:true`, while
+      // the next workflow_list sees the previous canvas and pinning refuses. Keep this
+      // bounded probe INSIDE the reload step: graph commands cannot interleave while the
+      // open is proving its final binding, and an unstable/read-unreadable result follows
+      // the existing unknown-rebind failure path rather than becoming false success.
+      if (!rebindFailed) {
+        const activeSettle = await settleOwnedOpenedWorkflowActive({
+          target,
+          readActive: activeWorkflowRef,
+          sameWorkflowObject,
+          beginStep: () => beginWorkflowReloadStep(reloadGuardToken),
+          ownsStep: () => ownsWorkflowReloadGuard(reloadGuardToken),
+          endStep: () => endWorkflowReloadStep(reloadGuardToken),
+        });
+        if (activeSettle.status !== "settled") {
+          rebindFailed = new Error(
+            activeSettle.status === "different"
+              ? "workflow_open did not leave the requested workflow as the stable active canvas"
+              : activeSettle.status === "superseded"
+                ? "workflow_open lost ownership of its reload window while the active canvas was settling"
+                : "workflow_open could not prove that the requested workflow remained the stable active canvas",
+          );
+        }
+        // #433: only an active binding that survived the complete open, including the
+        // asynchronous settle probe, may clear the reconnect staleness window.
+        // #663/#646: the same proven binding is the only receipt that opens the mutation
+        // gate for this reconnect epoch. Failed/unknown/superseded opens leave both
+        // proofs invalidated below instead of allowing an immediate list or mutation to
+        // trust a prior open's proof.
+        if (!rebindFailed && backendReconnectEpoch === openedForEpoch) {
+          activeWorkflowResyncEpoch = openedForEpoch;
+          postReconnectBindingProofEpoch = openedForEpoch;
+        }
+      }
+      }
+      }
+      if (openFailed || rebindFailed) {
+        // The attempted open may have changed the frontend binding before its final
+        // proof failed, including a native switch rejection that may have applied
+        // partially. The shared generation helper retires any earlier proof only
+        // while this operation is still current. A newer/superseding open or
+        // workflow_new therefore cannot be clobbered by this failure; an operation
+        // that never acquired the section has no proof to invalidate.
+        invalidateWorkflowBindingProof(openGeneration);
       }
     } catch (err) {
       // NEVER claim a reload we did not complete — report the failure and leave the caller

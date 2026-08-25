@@ -171,11 +171,19 @@ test("#433 wiring: reconnect bumps the epoch on a MONOTONIC clock; open/new/read
     assert.ok(body, `${sig} must exist`);
     const snapAt = body.indexOf("const openedForEpoch = backendReconnectEpoch;");
     assert.notEqual(snapAt, -1, `${sig} must snapshot the epoch`);
-    assert.match(
-      body,
-      /if \(backendReconnectEpoch === openedForEpoch\) activeWorkflowResyncEpoch = openedForEpoch;/,
-      `${sig} must stamp the resync epoch ONLY if unchanged (TOCTOU guard)`,
-    );
+    if (sig === "async workflow_open({") {
+      assert.match(
+        body,
+        /if \(!rebindFailed && backendReconnectEpoch === openedForEpoch\) \{[\s\S]*?activeWorkflowResyncEpoch = openedForEpoch;/,
+        `${sig} must stamp only after the complete rebind proof and unchanged-epoch check`,
+      );
+    } else {
+      assert.match(
+        body,
+        /ownsWorkflowReloadGuard\(reloadGuardToken\)[\s\S]*workflowBindingGeneration === bindingGeneration[\s\S]*backendReconnectEpoch === openedForEpoch[\s\S]*activeWorkflowResyncEpoch = openedForEpoch;/,
+        `${sig} must stamp the resync epoch ONLY if unchanged (TOCTOU guard)`,
+      );
+    }
     // The snapshot MUST precede the first `await` — otherwise a reconnect during the
     // native work would advance the epoch before we capture it, reintroducing the
     // TOCTOU P1 with the guard still "present". Ordering, not mere presence.
