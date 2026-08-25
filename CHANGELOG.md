@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.82] - 2026-08-25
+
+### Fixed
+- describe graph_get_virtual_types activity results (#1776)
+
 ## [0.15.81] - 2026-08-25
 
 ### Fixed
