@@ -254,7 +254,11 @@ export async function fetchComfyUIReadForMcp(
   try {
     let response;
     try {
-      if (typeof api?.fetchApi === "function") {
+      // ComfyUI's internal logs route is not under the API wrapper's /api
+      // namespace. Keep history/system_stats on fetchApi (which preserves the
+      // frontend's base-path behavior), but send logs through the already
+      // origin-validated absolute URL.
+      if (operation !== "logs" && typeof api?.fetchApi === "function") {
         response = await Promise.race([api.fetchApi(path, request), timeout.timeoutPromise]);
       } else {
         if (typeof fetchImpl !== "function") {

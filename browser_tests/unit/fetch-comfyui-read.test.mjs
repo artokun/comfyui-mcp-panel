@@ -71,7 +71,8 @@ async function rejection(promise, code) {
 }
 
 test("#2283: the three allowed operations use only their fixed same-origin routes", async () => {
-  const calls = [];
+  const apiCalls = [];
+  const rawCalls = [];
   const bodies = {
     history: '{"prompt-1":{"status":{"status_str":"success"}}}',
     system_stats: '{"system":{"os":"windows"},"devices":[]}',
@@ -83,11 +84,15 @@ test("#2283: the three allowed operations use only their fixed same-origin route
       {
         expectedOrigin: "https://panel.test",
         api: {
-          apiURL: (path) => `/comfy${path}`,
+          apiURL: (path) => `https://panel.test/comfy${path}`,
           fetchApi: async (path, init) => {
-            calls.push({ path, init });
+            apiCalls.push({ path, init });
             return response({ body: bodies[operation] });
           },
+        },
+        fetchImpl: async (url, init) => {
+          rawCalls.push({ url, init });
+          return response({ body: bodies[operation], url });
         },
       },
     );
@@ -100,14 +105,47 @@ test("#2283: the three allowed operations use only their fixed same-origin route
     });
   }
 
-  assert.deepEqual(calls.map(({ path }) => path), ["/history", "/system_stats", "/internal/logs"]);
-  for (const { init } of calls) {
+  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats"]);
+  assert.deepEqual(rawCalls.map(({ url }) => url), ["https://panel.test/comfy/internal/logs"]);
+  for (const { init } of [...apiCalls, ...rawCalls]) {
     assert.equal(init.method, "GET");
     assert.equal(init.cache, "no-store");
     assert.equal(init.credentials, "include");
     assert.equal(init.redirect, "manual");
     assert.ok(init.signal instanceof AbortSignal);
   }
+});
+
+test("#2283: logs raw transport retains origin, redirect, and body-size fences", async () => {
+  const options = {
+    expectedOrigin: "https://panel.test",
+    api: {
+      apiURL: (path) => `https://panel.test/comfy${path}`,
+      fetchApi: async () => { throw new Error("logs must not use fetchApi"); },
+    },
+  };
+
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "logs" },
+      { ...options, fetchImpl: async (url) => response({ url: "https://evil.test/internal/logs" }) },
+    ),
+    "invalid_origin",
+  );
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "logs" },
+      { ...options, fetchImpl: async (url) => response({ status: 302, url, stream: false }) },
+    ),
+    "redirect_error",
+  );
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "logs" },
+      { ...options, maxBytes: 4, fetchImpl: async (url) => response({ body: "12345", url }) },
+    ),
+    "too_large",
+  );
 });
 
 test("#2283: arbitrary paths, URLs, origins, targets, and operation names are refused before fetch", async () => {
