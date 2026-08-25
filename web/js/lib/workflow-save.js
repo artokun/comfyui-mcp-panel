@@ -71,13 +71,61 @@ export function pathSeparatorNameError(name, verb) {
   );
 }
 
+/**
+ * Validate and normalize the optional destination folder for a workflow save.
+ * The caller-supplied workflow name remains a bare filename; this is the only
+ * input that may select a subdirectory, and it is always rooted under
+ * `workflows/` before the target path is built.
+ */
+export function validateWorkflowSubfolder(subfolder) {
+  if (subfolder === undefined) return undefined;
+  if (typeof subfolder !== "string") {
+    throw new Error("subfolder must be a relative string under workflows/ — nothing was written.");
+  }
+  if (!subfolder) {
+    throw new Error("subfolder must not be empty — omit it for the workflows root. Nothing was written.");
+  }
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(subfolder)) {
+    throw new Error("refusing to save: subfolder contains a NUL or control character. Nothing was written.");
+  }
+  if (/^[\\/]/u.test(subfolder) || /^[A-Za-z]:/u.test(subfolder)) {
+    throw new Error(
+      `refusing to save: subfolder ${JSON.stringify(subfolder)} must be a relative path under ` +
+        `workflows/ (absolute, UNC, and drive paths are refused). Nothing was written.`,
+    );
+  }
+
+  const segments = subfolder.split(/[\\/]/u);
+  if (
+    segments.some(
+      (segment) =>
+        !segment ||
+        segment === "." ||
+        segment === ".." ||
+        segment.trim() === "" ||
+        /[<>:"|?*]/u.test(segment) ||
+        /[. ]$/u.test(segment) ||
+        /^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(?:\..*)?$/iu.test(segment),
+    )
+  ) {
+    throw new Error(
+      `refusing to save: subfolder ${JSON.stringify(subfolder)} is not a safe relative ` +
+        `directory under workflows/. Empty, dot, traversal, and unsafe segments are refused. ` +
+        `Nothing was written.`,
+    );
+  }
+  return segments.join("/");
+}
+
 /** The path ComfyUI would actually persist `base` to for this workflow — its own
  *  directory + the mode-correct extension (mirrors appendWorkflowJsonExt +
  *  workflow.directory). Used to classify a save as in-place vs Save-As by the
  *  REAL target path, not a name, so an extension/mode difference never gets
  *  misread as "same file" and turned into a destructive rename. */
-function targetPath(wf, base) {
-  return normalizePath(`${directoryOf(wf)}${base}${workflowExt(wf)}`);
+function targetPath(wf, base, subfolder) {
+  const directory =
+    subfolder === undefined ? directoryOf(wf) : `${WORKFLOWS_ROOT}/${subfolder}/`;
+  return normalizePath(`${directory}${base}${workflowExt(wf)}`);
 }
 
 /** #1535 — TRUE when this workflow's own file already sits at the ".app.json" sibling of
@@ -589,6 +637,9 @@ export async function saveActiveWorkflow(
     // Optional Save-As disclosure hook. It receives `{ workflow, currentName }` and
     // returns the source name to report; `null` means the graph provenance is unknown.
     copySourceName,
+    // Optional validated destination under the managed workflows root. Undefined keeps
+    // the existing source-directory behavior for saves that omit it.
+    subfolder,
   } = {},
 ) {
   const wf = svc?.activeWorkflow;
@@ -680,6 +731,7 @@ export async function saveActiveWorkflow(
   if (explicit && nameContainsPathSeparator(name)) {
     throw pathSeparatorNameError(name, "save");
   }
+  const validatedSubfolder = validateWorkflowSubfolder(subfolder);
 
   const wasUnsaved = wf.isTemporary === true || wf.isPersisted === false;
   const currentName = baseName(wf.filename);
@@ -760,10 +812,10 @@ export async function saveActiveWorkflow(
   // external/URL-derived source cannot match, because directoryOf() redirects those to
   // the workflows root so the equality below can never hold for them.
   const finalTargetPath =
-    !desired && !wasUnsaved && pathIsAppSuffixedSiblingOf(wf, currentName)
+    validatedSubfolder === undefined && !desired && !wasUnsaved && pathIsAppSuffixedSiblingOf(wf, currentName)
       ? currentPath
       : effectiveName
-        ? targetPath(wf, effectiveName)
+        ? targetPath(wf, effectiveName, validatedSubfolder)
         : "";
 
   // A safe save requires a RESOLVED, non-empty target path. Without one — e.g. a

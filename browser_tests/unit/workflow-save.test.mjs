@@ -8,7 +8,8 @@ import {
   classifyOriginalOnDisk,
   diskExistenceFromStatus,
   nameContainsPathSeparator,
-  pathSeparatorNameError
+  pathSeparatorNameError,
+  validateWorkflowSubfolder
 } from '../../web/js/lib/workflow-save.js'
 
 // A minimal ComfyUI workflow-STORE double (`app.extensionManager.workflow`) that
@@ -326,6 +327,90 @@ test('a never-saved placeholder tab is grounded safely via the FAITHFUL frontend
   assert.ok(svc.disk.has('workflows/Untitled 2026-07-24.json'), 'temp grounded to a file')
   assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'delegated to the atomic low-level saveAs copy')
   assert.equal(saved, 'Untitled 2026-07-24')
+})
+
+test('#1794 first-save places a new workflow in a nested workflows subfolder', async () => {
+  assert.equal(validateWorkflowSubfolder('exports\\seed'), 'exports/seed')
+  const active = {
+    path: 'workflows/Unsaved Workflow.json',
+    filename: 'Unsaved Workflow.json',
+    directory: 'workflows',
+    isPersisted: false,
+    isTemporary: true
+  }
+  const svc = makeFaithfulService({ active })
+
+  const saved = await saveActiveWorkflow(svc, 'Nested First', { subfolder: 'exports/seed' })
+
+  assert.equal(saved, 'Nested First')
+  assert.ok(svc.disk.has('workflows/exports/seed/Nested First.json'), 'nested first-save created')
+  assert.ok(!svc.disk.has('workflows/Nested First.json'), 'root fallback was not used')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'first-save did not move a source')
+})
+
+test('#1794 Save-As places a copy in the requested nested subfolder and preserves the source', async () => {
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false
+  }
+  const svc = makeService({ files: [active.path], active })
+
+  const saved = await saveActiveWorkflow(svc, 'Bar', { subfolder: 'exports/seed' })
+
+  assert.equal(saved, 'Bar')
+  assert.ok(svc.disk.has('workflows/Foo.json'), 'source preserved')
+  assert.ok(svc.disk.has('workflows/exports/seed/Bar.json'), 'nested Save-As created')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'source was never renamed')
+})
+
+test('#1794 refuses unsafe subfolders before probes or writes', async () => {
+  const unsafe = [
+    null,
+    42,
+    [],
+    '',
+    '.',
+    '..',
+    '../escape',
+    'nested/../escape',
+    '/absolute',
+    '\\server\\share',
+    'C:\\workflows',
+    'nested//empty',
+    'nested/./dot',
+    'nested\u0000control',
+    'nested\u001fcontrol',
+    'nested?unsafe'
+  ]
+  for (const subfolder of unsafe) {
+    const active = {
+      path: 'workflows/Foo.json',
+      filename: 'Foo.json',
+      directory: 'workflows',
+      isPersisted: true,
+      isTemporary: false
+    }
+    const svc = makeService({ files: [active.path], active })
+    let probes = 0
+
+    await assert.rejects(
+      () => saveActiveWorkflow(svc, 'Bar', {
+        subfolder,
+        existsOnDisk: async () => {
+          probes += 1
+          return false
+        }
+      }),
+      /subfolder|relative|unsafe|control|empty|dot|traversal/i,
+      `unsafe subfolder should be refused: ${String(subfolder)}`
+    )
+    assert.equal(probes, 0, `no async probe for unsafe subfolder: ${String(subfolder)}`)
+    assert.deepEqual(svc.calls, [], `no writes for unsafe subfolder: ${String(subfolder)}`)
+    assert.deepEqual([...svc.disk], [active.path])
+  }
 })
 
 test('rejects an explicit whitespace-only name and leaves the source untouched (#226)', async () => {

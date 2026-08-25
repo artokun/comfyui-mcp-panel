@@ -692,6 +692,7 @@ import {
   normalizePath,
   nameContainsPathSeparator,
   pathSeparatorNameError,
+  validateWorkflowSubfolder,
 } from "./lib/workflow-save.js";
 import { describeSaveBackendSocket } from "./lib/save-transport-failure.js";
 import {
@@ -7131,6 +7132,10 @@ async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
  *  same name overwrites in place, as before. Returns the saved name, or a title
  *  fallback. */
 async function programmaticSave(name) {
+  // `subfolder` is validated synchronously by both command handlers before this
+  // function starts its pre-save HEAD. The shared adapter validates it again for
+  // direct callers and unit-level use.
+  const subfolder = arguments[1];
   const svc = app?.extensionManager?.workflow;
   // Report what the save actually DID (in-place / first-save / Save-As copy) instead
   // of the old opaque {saved:true} — the silent, unrecoverable move is what made
@@ -7180,6 +7185,7 @@ async function programmaticSave(name) {
   }
   const details = {};
   const saved = await saveActiveWorkflow(svc, name, {
+    subfolder,
     autoWorkflowName,
     existsOnDisk: workflowExistsOnDisk,
     // #442 — RAW-BYTE oracle for the in-place-overwrite gate: authorize a forced
@@ -19375,6 +19381,12 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   async workflow_save({ name, rid } = {}) {
+    // Keep the public handler shape stable for source-level production harnesses;
+    // the optional field is still read and validated before runBoundedWorkflowSave
+    // can invoke the async pre-save probe.
+    const rawSubfolder = arguments[0]?.subfolder;
+    const validatedSubfolder =
+      rawSubfolder === undefined ? undefined : validateWorkflowSubfolder(rawSubfolder);
     // Fully programmatic — no Save/Rename dialog. Auto-names a never-saved
     // workflow; saves in place otherwise.
     // #1434 — userdata HEAD/GET/PUT on this path can hang while the tab stays
@@ -19382,7 +19394,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // tab inside the orchestrator's 15 s window instead of a bare
     // `did not reply to "workflow_save"` that claims the tab is frozen.
     const { name: workflow, producedRecord, ...outcome } = await runBoundedWorkflowSave(
-      () => programmaticSave(name),
+      () => programmaticSave(name, validatedSubfolder),
       {
         budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
         withTimeout,
@@ -19430,10 +19442,13 @@ const GRAPH_TOOL_EXECUTORS = {
 
   async workflow_save_as({ name, rid }) {
     if (!name || typeof name !== "string") throw new Error("name (string) is required");
+    const rawSubfolder = arguments[0]?.subfolder;
+    const validatedSubfolder =
+      rawSubfolder === undefined ? undefined : validateWorkflowSubfolder(rawSubfolder);
     // #1434 — same bound as workflow_save: both go through programmaticSave, both
     // are relayed at 15 s, and a hung copy trio is the same silence.
     const { name: workflow, producedRecord, ...outcome } = await runBoundedWorkflowSave(
-      () => programmaticSave(name),
+      () => programmaticSave(name, validatedSubfolder),
       {
         budgetMs: WORKFLOW_SAVE_COMMAND_BUDGET_MS,
         withTimeout,
