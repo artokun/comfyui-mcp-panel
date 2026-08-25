@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.86] - 2026-08-25
+
+### Fixed
+- gate workflow targeting on current reconnect binding proof (#1785)
+
 ## [0.15.85] - 2026-08-25
 
 ### Fixed
