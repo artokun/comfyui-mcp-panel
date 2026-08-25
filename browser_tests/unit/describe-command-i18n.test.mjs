@@ -67,6 +67,18 @@ test("English is unchanged by being keyed — same words, both plural forms", ()
   assert.equal(say("graph_auto_layout", { node_count: 1, columns: 4 }), "Auto-arranged 1 node (4 columns)");
 });
 
+test("#1776 graph_get_virtual_types renders a user-facing counted activity card", () => {
+  __setCatalogForTest("en", {});
+  assert.equal(
+    describeCommand("graph_get_virtual_types", {}, { ok: true, result: { virtual_type_count: 1 } }).text,
+    "Checked UI-only node types — 1 type",
+  );
+  const many = describeCommand("graph_get_virtual_types", {}, { ok: true, result: { virtual_type_count: 4 } });
+  assert.equal(many.icon, "pi-eye");
+  assert.equal(many.text, "Checked UI-only node types — 4 types");
+  assert.doesNotMatch(many.text, /graph_get_virtual_types/);
+});
+
 test("a number that is not a count never selects a plural form", () => {
   // `{n}` on the batch multiplier, not `{count}` — a numeric `count` is what switches `tr`
   // into plural lookup, so a stray rename here would start silently picking forms.
