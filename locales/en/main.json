@@ -396,6 +396,7 @@
       "clear_failed": "clear failed",
       "cleared_canvas_nodes_one": "Cleared canvas — removed {count} node (one Ctrl+Z restores all)",
       "cleared_canvas_nodes_other": "Cleared canvas — removed {count} nodes (one Ctrl+Z restores all)",
+      "cleared_orphan_link": "Cleared orphaned link {slot}",
       "clearing": "Clearing…",
       "click_to_copy": "Click to copy",
       "click_to_preview": "Click to preview",
