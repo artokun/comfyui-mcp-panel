@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.77] - 2026-08-25
+
+### Fixed
+- Recover panel refreshes after concurrent download completions and coalesced trailing refreshes (#1736)
+
 ## [0.15.76] - 2026-08-24
 
 ### Fixed
