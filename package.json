@@ -1,6 +1,6 @@
 {
   "name": "comfyui-agent-panel-e2e",
-  "version": "0.15.84",
+  "version": "0.15.85",
   "private": true,
   "description": "Dev-only Playwright e2e harness for the ComfyUI Agent Panel. NOT shipped with the pack (see .comfyignore).",
   "scripts": {
