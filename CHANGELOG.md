@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.92] - 2026-08-25
+
+### Fixed
+- preserve the live Grok turn across dedicated workflow-tab creation and distinguish tab swaps from real ComfyUI restarts (#1810)
+
 ## [0.15.91] - 2026-08-25
 
 ### Fixed
