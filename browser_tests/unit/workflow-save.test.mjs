@@ -156,6 +156,31 @@ test('Save-As with a new name COPIES and leaves the original file on disk (#226)
   assert.equal(saved, 'Bar')
 })
 
+test('#1762 a Save-As can suppress an unproven source filename after an in-place graph replacement', async () => {
+  const active = {
+    path: 'workflows/OldGraph.json',
+    filename: 'OldGraph.json',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+  }
+  const svc = makeService({ files: [active.path], active })
+  const details = {}
+
+  await saveActiveWorkflow(svc, 'LoadedGraph', {
+    details,
+    copySourceName: () => null,
+  })
+
+  assert.equal(details.mode, 'save-as-copy')
+  assert.equal(details.copiedFrom, null)
+  assert.deepEqual(describeSaveOutcome(details), {
+    saved_as: true,
+    copied_from: null,
+  })
+  assert.ok(svc.disk.has(active.path), 'the stale workflow path remains preserved by the copy route')
+})
+
 test('save-in-place (same name) overwrites the same file, no copy', async () => {
   const active = {
     path: 'workflows/Foo.json',
