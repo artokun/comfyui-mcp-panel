@@ -609,12 +609,12 @@ test("#1680: refresh_nodes replies at its budget instead of waiting for the join
   assert.equal(built.runs.length, 1, "a timed-out join must not create a trailing refresh");
 });
 
-test("#1680: a joined acknowledgement yields before delayed synchronous registration", async () => {
+test("#1758: a joined acknowledgement waits through synchronous registration", async () => {
   const gate = deferred();
   const localWorkMs = 100;
   const built = realRefreshNodes({
     holdFirstRun: gate.promise,
-    budgetMs: 1,
+    budgetMs: 500,
     runHook: async ({ control }) => {
       const handoff = control.beforeLocalWork?.();
       if (handoff) await handoff;
@@ -633,12 +633,12 @@ test("#1680: a joined acknowledgement yields before delayed synchronous registra
   const { value, elapsed } = await withWatchdog(
     () => pending,
     500,
-    "refresh_nodes waited through the joined refresh's synchronous work",
+    "refresh_nodes did not join through the shared refresh's synchronous work",
   );
-  assert.equal(value.reason, "refresh_still_running");
+  assert.deepEqual(value, { ok: true, refreshed: true });
   assert.ok(
-    elapsed < localWorkMs,
-    `replied in ${elapsed}ms instead of blocking through ${localWorkMs}ms of local work`,
+    elapsed >= localWorkMs,
+    `replied in ${elapsed}ms instead of joining through ${localWorkMs}ms of local work`,
   );
 
   await built.inFlightStarted?.catch(() => {});
@@ -984,5 +984,10 @@ test("#1404: the shipped call site passes the budget — the helper alone cannot
     refreshNodesMatch[0],
     /refreshComfyNodeDefs\(undefined, \{[\s\S]*?force: true,[\s\S]*?joinInFlight: true,[\s\S]*?joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,[\s\S]*?runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS,\s*\}\)/,
     "refresh_nodes must join an existing run, bound its wait, and state the run's allowance",
+  );
+  assert.match(
+    refreshNodesMatch[0],
+    /joinInFlight: true,[\s\S]*?abandonBeforeLocalWork: true,/,
+    "refresh_nodes must give the coalescer its acknowledgement handoff contract (#1758)",
   );
 });

@@ -115,6 +115,42 @@ test("#1680: a forced payload-less caller can explicitly join an in-flight refre
   assert.equal(registered.length, 1, "the opt-in joins the existing run without a trailing pass");
 });
 
+test("#1758: an acknowledgement owner waits through its own local-work handoff", async () => {
+  const handoff = deferred();
+  const release = deferred();
+  let inFlight = null;
+  let runs = 0;
+  const coalescer = makeRefreshCoalescer({
+    getInFlight: () => inFlight,
+    setInFlight: (value) => { inFlight = value; },
+    runRegister: async (_defs, _opts, control) => {
+      runs += 1;
+      control.beforeLocalWork?.();
+      handoff.resolve();
+      await release.promise;
+      return { refreshed: true };
+    },
+    withTimeout,
+  });
+
+  const acknowledgement = coalescer(undefined, {
+    force: true,
+    joinInFlight: true,
+    abandonBeforeLocalWork: true,
+    joinMs: 500,
+  });
+  await handoff.promise;
+  let settled = false;
+  void acknowledgement.then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "the acknowledgement must not abandon its own shared refresh at handoff");
+
+  release.resolve();
+  assert.deepEqual(await acknowledgement, { refreshed: true });
+  assert.equal(runs, 1, "the acknowledgement owns one refresh, with no competing registration");
+  assert.equal(inFlight, null, "the joined lifecycle returns to idle after completion");
+});
+
 test("#1695: deferred completion fences the slot and forwards its final verdict", async () => {
   const late = deferred();
   let inFlight = null;
