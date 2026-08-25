@@ -560,6 +560,48 @@ test("#1223 a good snapshot is not displaced by a later failed fetch", () => {
   assert.ok(snap.authorize({ epoch: 2, socketDown: false, outcomes: silence }).defs);
 });
 
+test("#2249 a failed same-epoch replacement rebinds the last snapshot after fencing it", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, SCHEMA, 7, 11);
+
+  snap.beginReplacement();
+  assert.equal(snap.isReplacementPending(), true);
+  assert.equal(
+    snap.authorize({ epoch: 7, generation: 12, socketDown: false, outcomes: silence }).defs,
+    null,
+    "the old map cannot authorize while the replacement is unresolved",
+  );
+
+  assert.equal(
+    snap.retainAfterReplacementFailure({ epoch: 7, generation: 12, socketDown: false }),
+    true,
+    "a failed refresh rebinds the held map to the retired-proof generation",
+  );
+  const fallback = snap.authorize({ epoch: 7, generation: 12, socketDown: false, outcomes: silence });
+  assert.ok(fallback.defs, "the prior whole observation remains usable after replacement failure");
+  assert.equal(snap.isReplacementPending(), false);
+});
+
+test("#2249 a successful replacement supersedes the retained snapshot", () => {
+  const snap = createObjectInfoSnapshot();
+  stored(snap, { OldNode: {} }, 7, 11);
+  snap.beginReplacement();
+  assert.equal(
+    snap.record({ NewNode: {} }, {
+      observedAtEpoch: 7,
+      currentEpoch: 7,
+      observedAtGeneration: 12,
+      currentGeneration: 12,
+      whole: true,
+    }),
+    true,
+  );
+  const current = snap.authorize({ epoch: 7, generation: 12, socketDown: false, outcomes: silence });
+  assert.equal(Object.prototype.hasOwnProperty.call(current.defs, "OldNode"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(current.defs, "NewNode"), true);
+  assert.equal(snap.isReplacementPending(), false);
+});
+
 test("#1223 clear() retires it — a suspicion of change outranks a stored schema", () => {
   const snap = createObjectInfoSnapshot();
   stored(snap, SCHEMA, 2);
@@ -1579,6 +1621,42 @@ test("#1560 SHIPPED: a route that THREW licenses nothing either — something an
   });
   assert.equal(await o.getFreshObjectInfo(), null);
   assert.equal(o.readScopedLicence(), false, "a refused connection is a process that is GONE, not one that is busy");
+});
+
+test("#2249 SHIPPED: a gateway timeout leaves room for exact type-scoped authority", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: undefined,
+      fetchApi: async () => ({ ok: false, status: 504, json: async () => ({}) }),
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.getFreshObjectInfo(), null);
+  assert.equal(
+    o.readScopedLicence(),
+    true,
+    "a proxy gateway timeout did not establish absence of the requested class, so a live type-scoped answer may decide it",
+  );
+});
+
+test("#2249 SHIPPED: mixed nothing-returned plus answered-unusable evidence licenses nothing", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: async () => undefined,
+      fetchApi: async () => ({ ok: false, status: 500, json: async () => ({}) }),
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.getFreshObjectInfo(), null);
+  assert.equal(
+    o.readScopedLicence(),
+    false,
+    "a returned unusable response is an answer/refusal even when another route returned nothing",
+  );
 });
 
 test("#1560 SHIPPED: a LIVE answer leaves the licence false — there is nothing to license", async () => {

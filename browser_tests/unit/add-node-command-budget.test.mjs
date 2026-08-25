@@ -830,6 +830,90 @@ test("#1709: a direct schema response crossing refresh cannot authorize a later 
   );
 });
 
+test("#2249: the shipped refresh keeps last-known membership after whole-schema replacement fails", async () => {
+  const comfy = makeComfy();
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  assert.equal(
+    snapshot.record({ ImageScale: {} }, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
+    true,
+  );
+  const register = realRegisterComfyNodeDefs({
+    app: comfy.app,
+    api: {
+      async getNodeDefs() {
+        return NODE_DEFS_NO_ANSWER;
+      },
+      async fetchApi() {
+        return { ok: false, status: 503, json: async () => ({}) };
+      },
+    },
+    objectInfoCache: createObjectInfoCache(),
+    objectInfoSnapshot: snapshot,
+    verifiedNodeDefCache,
+  });
+
+  const verdict = await register(undefined, { runBudgetMs: 100 });
+  assert.equal(verdict.refreshed, false, "the failed replacement does not claim freshness");
+  assert.equal(snapshot.isReplacementPending(), false, "the pending fence settles after failure");
+  const fallback = snapshot.authorize({
+    epoch: 0,
+    generation: verifiedNodeDefCache.generation(),
+    socketDown: false,
+    outcomes: [
+      { route: "client", kind: TRANSPORT_OUTCOME.NO_ANSWER },
+      { route: "http", kind: TRANSPORT_OUTCOME.NO_ANSWER },
+    ],
+  });
+  assert.ok(fallback.defs?.ImageScale, "the old whole map remains usable for an existing node");
+});
+
+test("#2249: an empty refresh response retires the old whole snapshot instead of rebinding it", async () => {
+  const comfy = makeComfy();
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  snapshot.record(
+    { ImageScale: {} },
+    {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    },
+  );
+  const register = realRegisterComfyNodeDefs({
+    app: comfy.app,
+    api: {
+      async getNodeDefs() {
+        return {};
+      },
+    },
+    objectInfoCache: createObjectInfoCache(),
+    objectInfoSnapshot: snapshot,
+    verifiedNodeDefCache,
+  });
+
+  await register(undefined, { runBudgetMs: 100 });
+  assert.equal(snapshot.peek().held, false, "an authoritative empty replacement leaves no old membership proof");
+  assert.equal(
+    snapshot.authorize({
+      epoch: 0,
+      generation: verifiedNodeDefCache.generation(),
+      socketDown: false,
+      outcomes: [{ route: "client", kind: TRANSPORT_OUTCOME.NO_ANSWER }],
+    }).defs,
+    null,
+    "a later silent probe cannot resurrect a type absent from the empty replacement",
+  );
+});
+
 test("#1709: graph_add_node replaces the old whole cache and snapshot on a changed response", async () => {
   const comfy = makeComfy();
   const oldDefs = { OldNode: { input: { required: {} } } };
