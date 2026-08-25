@@ -567,6 +567,7 @@ import {
 import { planComposerPaste, orphanAttachmentTokens } from "./lib/composer-paste.js";
 import {
   withInMemoryClipboard,
+  withClipboardCopyProvenance,
   getInMemoryClipboard,
   getEffectiveClipboard,
   CLIPBOARD_KEY,
@@ -581,6 +582,7 @@ import {
   getVerifiedLayout,
   recordCopiedWidgetState,
   getVerifiedWidgetState,
+  clearCopiedWidgetState,
   applyCopiedWidgetState,
   applyPastedLayout,
   resolvePasteDest,
@@ -21725,12 +21727,14 @@ const GRAPH_TOOL_EXECUTORS = {
       storage = null;
     }
     withInMemoryClipboard(storage, () => {
-      canvas.copyToClipboard(selection.items);
-      const raw = storage && typeof storage.getItem === "function" ? storage.getItem(CLIPBOARD_KEY) : getInMemoryClipboard();
-      const patched = patchClipboardLayout(raw, layout);
-      if (patched && patched !== raw && storage && typeof storage.setItem === "function") {
-        storage.setItem(CLIPBOARD_KEY, patched);
-      }
+      withClipboardCopyProvenance(canvas, clearCopiedWidgetState, () => {
+        canvas.copyToClipboard(selection.items);
+        const raw = storage && typeof storage.getItem === "function" ? storage.getItem(CLIPBOARD_KEY) : getInMemoryClipboard();
+        const patched = patchClipboardLayout(raw, layout);
+        if (patched && patched !== raw && storage && typeof storage.setItem === "function") {
+          storage.setItem(CLIPBOARD_KEY, patched);
+        }
+      });
     });
     // Snapshot the copied node types (plus a fingerprint of the clipboard
     // payload AFTER the copy) so the next graph_paste_nodes can detect any node
@@ -41407,6 +41411,7 @@ function buildPanel() {
     setChatSurface: cmcpSetChatSurface, // A2UI seam: widen/restore the chat surface
     destroy() {
       launcherStartGeneration += 1;
+      clearCopiedWidgetState();
       try {
         recognition?.stop();
       } catch {

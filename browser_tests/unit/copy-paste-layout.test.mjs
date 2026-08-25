@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import {
   CLIPBOARD_KEY,
   withInMemoryClipboard,
+  withClipboardCopyProvenance,
   getInMemoryClipboard,
   getEffectiveClipboard,
   clearInMemoryClipboard,
@@ -324,12 +325,14 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
     "snapshotCopyLayout",
     "snapshotCopyWidgetState",
     "withInMemoryClipboard",
+    "withClipboardCopyProvenance",
     "getInMemoryClipboard",
     "patchClipboardLayout",
     "CLIPBOARD_KEY",
     "recordCopiedNodes",
     "recordCopiedLayout",
     "recordCopiedWidgetState",
+    "clearCopiedWidgetState",
     "registryTypePredicate",
     "unregisteredCopiedTypes",
     "formatUnpasteableCopyWarning",
@@ -341,12 +344,14 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
     snapshotCopyLayout,
     snapshotCopyWidgetState,
     withInMemoryClipboard,
+    withClipboardCopyProvenance,
     getInMemoryClipboard,
     patchClipboardLayout,
     CLIPBOARD_KEY,
     recordCopiedNodes,
     recordCopiedLayout,
     recordCopiedWidgetState,
+    clearCopiedWidgetState,
     registryTypePredicate,
     unregisteredCopiedTypes,
     formatUnpasteableCopyWarning,
@@ -612,6 +617,31 @@ test("#1761 shipped copy+paste preserves VideoTileLivePlanner roi_enabled", () =
     pasted.widgets.find((w) => w.name === "planner_state").value,
     source.widgets.find((w) => w.name === "planner_state").value,
   );
+  clearCopiedWidgetState();
+});
+
+test("#1761 a same-byte native copy invalidates the panel widget snapshot", () => {
+  clearInMemoryClipboard();
+  clearCopiedLayout();
+  clearCopiedWidgetState();
+  const src = makeFrontend();
+  const source = addVideoTile(src.graph, { roiEnabled: true });
+  const { copy, makePaster, storage } = shippedCopyPaste(src.graph, src.canvas, src.LG);
+
+  copy({ node_ids: [source.id] });
+  const panelClipboard = getInMemoryClipboard();
+  source.widgets.find((w) => w.name === "roi_enabled").value = false;
+
+  // Native Ctrl+C uses the same canvas API, but is outside the panel-owned
+  // provenance scope. The omitted roi_enabled keeps the serialized bytes equal.
+  src.canvas.copyToClipboard([source]);
+  assert.equal(storage.getItem(CLIPBOARD_KEY), panelClipboard, "native copy reproduced identical bytes");
+  assert.equal(getVerifiedWidgetState(panelClipboard), null, "native copy invalidated stale panel state");
+
+  const dst = makeFrontend();
+  const paste = makePaster(dst.graph, dst.canvas, dst.LG);
+  paste({ pos: [500, 500], connect_inputs: false });
+  assert.equal(dst.graph._nodes[0].widgets.find((w) => w.name === "roi_enabled").value, false);
   clearCopiedWidgetState();
 });
 
