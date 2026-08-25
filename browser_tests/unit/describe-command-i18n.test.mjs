@@ -75,6 +75,36 @@ test("a number that is not a count never selects a plural form", () => {
   assert.equal(say("graph_screenshot", { width: 1024, height: 768 }), "Captured workflow image (1024×768)");
 });
 
+test("#1750 orphan repair renders a repair card and preserves its warning", () => {
+  __setCatalogForTest("en", {});
+  const warning =
+    'nothing was disconnected — the input carried link id 21, which the graph link store did not have. The panel cleared it.';
+  const card = describeCommand(
+    "graph_disconnect",
+    {},
+    {
+      ok: true,
+      result: {
+        cleared_orphan_link: { node_id: 79, input: "source_latent_b", link_id: 21 },
+        warning,
+      },
+    },
+  );
+
+  assert.equal(card.icon, "pi-exclamation-triangle");
+  assert.equal(card.text, "Cleared orphaned link 79.source_latent_b");
+  assert.equal(card.detail, warning);
+  assert.doesNotMatch(card.text, /undefined/);
+
+  const normal = describeCommand(
+    "graph_disconnect",
+    {},
+    { ok: true, result: { disconnected: { node_id: 79, input: "source_latent" } } },
+  );
+  assert.equal(normal.text, "Disconnected 79.source_latent");
+  assert.equal(normal.detail, undefined);
+});
+
 test("#1690: queued_unknown activity is uncertain, not blocked or duplicate-retry messaging", () => {
   __setCatalogForTest("en", {});
   const card = describeCommand("graph_run", {}, { ok: true, result: {

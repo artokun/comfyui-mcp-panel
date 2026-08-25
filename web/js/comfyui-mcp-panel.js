@@ -27545,6 +27545,15 @@ function describeCommand(cmd, msg, reply) {
           }) + (r.connected?.auto_matched ? tr("panel.connected_auto_matched", " (auto-matched)") : ""),
       };
     case "graph_disconnect":
+      if (r.cleared_orphan_link && !r.disconnected) {
+        return {
+          icon: "pi-exclamation-triangle",
+          text: tr("panel.cleared_orphan_link", "Cleared orphaned link {slot}", {
+            slot: `${r.cleared_orphan_link.node_id}.${r.cleared_orphan_link.input}`,
+          }),
+          detail: r.warning,
+        };
+      }
       return {
         icon: "pi-times-circle",
         text: tr("panel.disconnected_slot", "Disconnected {slot}", {
