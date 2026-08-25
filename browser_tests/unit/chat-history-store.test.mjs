@@ -2763,5 +2763,17 @@ test('mcp#884 the workflow-keyed session bind is unreachable while the chat is p
     'the panel-owned branch RETURNS — this is the only thing keeping the workflow-scoped tail dead'
   )
   const tail = body.slice(guardAt + guardEnd)
-  assert.match(tail, /ssSet\(SESSION_KEY, existing\?\.sessionId/, 'the workflow-keyed bind lives in the dead tail')
+  assert.match(
+    tail,
+    /completeDedicatedWorkflowSessionSwap\(\)/,
+    'the panel-owned branch returns before the deferred dedicated switch call',
+  )
+  const helperAt = PANEL_SRC.indexOf('function completeDedicatedWorkflowSessionSwap(')
+  assert.ok(helperAt > -1, 'the dedicated session bind helper exists')
+  const helper = PANEL_SRC.slice(helperAt, PANEL_SRC.indexOf('\n  }\n', helperAt) + 5)
+  assert.match(
+    helper,
+    /ssSet\(SESSION_KEY, existing\?\.sessionId/,
+    'the workflow-keyed bind remains inside the dedicated helper',
+  )
 })

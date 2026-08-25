@@ -35339,6 +35339,72 @@ function buildPanel() {
       /* reconnect path retries the hello */
     }
   }
+
+  // A dedicated workflow switch normally rebinds the socket and loads the
+  // target workflow's session immediately. During an agent turn that ordering
+  // is unsafe: the session rebind is interpreted by the orchestrator as a
+  // replacement of the calling turn. Keep the current session until the turn
+  // is terminal, then perform the normal dedicated-chat swap once.
+  let pendingDedicatedWorkflowSwap = false;
+  let dedicatedWorkflowSwapAckPending = false;
+
+  function completeDedicatedWorkflowSessionSwap({ announce = false } = {}) {
+    if (!pendingDedicatedWorkflowSwap || historyScopeFollowsPanel() || agentWorking) return false;
+
+    pendingDedicatedWorkflowSwap = false;
+    dedicatedWorkflowSwapAckPending = false;
+    const historyKey = workflowStorageKey();
+    const existing = threadForWorkflow(historyKey);
+    // Bind THIS workflow's session BEFORE the re-hello. sendHello() reads
+    // SESSION_KEY at hello time for its spawn-time `resume`.
+    ssSet(SESSION_KEY, existing?.sessionId || null);
+    rehelloForWorkflow(existing?.sessionId || null);
+    if (existing) {
+      loadThread(existing); // resets feed + repaints + resumes
+    } else {
+      thread = null; // fresh empty view; the thread is minted on first message
+      ssSet(CURRENT_THREAD_KEY, null);
+      resetFeed();
+      try {
+        client?.armContext?.(
+          `[Workspace context: this chat is dedicated to the ComfyUI workflow "${getWorkflowTitle()}". ` +
+          `Each workflow has its own separate agent conversation — other workflows are NOT in your context.]`,
+        );
+      } catch { /* armContext unavailable — awareness rides the title instead */ }
+    }
+    if (announce) {
+      appendSystem(
+        tr(
+          "panel.workflow_chat_switch_after_turn",
+          "Switched workflow tab — this chat is dedicated to the new workflow after the previous turn finished.",
+        ),
+      );
+    }
+    refreshContextRingForScope();
+    return true;
+  }
+
+  function deferDedicatedWorkflowSwitch(wf, wfid, wfkey) {
+    currentWorkflowId = wfid;
+    currentWorkflowKey = wfkey;
+    currentWorkflowRef = wf;
+    pendingDedicatedWorkflowSwap = true;
+    dedicatedWorkflowSwapAckPending = true;
+    // Re-target this socket, but deliberately keep SESSION_KEY and the current
+    // thread. The calling turn therefore remains owned by its original chat.
+    try {
+      client?.rehello?.();
+    } catch {
+      /* reconnect path retries the hello */
+    }
+    const name = wf?.filename || wfkey || wfid;
+    client?.armContext?.(
+      `[panel] The user switched the open workflow on the canvas to "${name}" while an agent turn was in flight. ` +
+      `Keep using the current conversation until this turn finishes; the dedicated chat swap is deferred.`,
+    );
+    refreshContextRingForScope();
+  }
+
   // #1095 — THIS POLL DOES NOT GATE ANYTHING, AND THAT IS THE FIX.
   //
   // The first cut deferred the whole function while a command was in flight, so that the
@@ -35393,6 +35459,16 @@ function buildPanel() {
 
     const initial = currentWorkflowId == null;
     const followsPanel = historyScopeFollowsPanel();
+
+    // Legacy dedicated-chat mode must not use its normal session swap while the
+    // calling turn is live. A `resume_session`/hello handover here cancels the
+    // turn that just called panel_new_workflow and leaves MID_TASK_KEY armed for
+    // the new chat's ready ack. Re-target the socket only, then finish the chat
+    // swap from the terminal turn callback.
+    if (!followsPanel && agentWorking) {
+      deferDedicatedWorkflowSwitch(wf, wfid, wfkey);
+      return;
+    }
 
     // PANEL-OWNED SESSION (default): the conversation is the unit of continuity
     // and the workflow is just the canvas target — switching, saving, renaming,
@@ -35599,41 +35675,7 @@ function buildPanel() {
       return;
     }
 
-    currentWorkflowId = wfid;
-    currentWorkflowKey = wfkey;
-    currentWorkflowRef = wf;
-    const existing = threadForWorkflow(historyKey);
-    // Bind THIS workflow's session BEFORE the re-hello. sendHello() reads
-    // SESSION_KEY at hello time for its spawn-time `resume` — re-helloing first
-    // carried the PREVIOUS workflow's session id, so a fresh workspace's agent
-    // spawned as a resume-FORK of the other conversation (verbatim memory bleed
-    // across workspaces). Order is the whole fix.
-    ssSet(SESSION_KEY, existing?.sessionId || null);
-    rehelloForWorkflow(existing?.sessionId || null);
-    if (existing) {
-      loadThread(existing); // resets feed + repaints + resumes
-    } else {
-      thread = null; // fresh empty view; the thread is minted (tagged) on first message
-      ssSet(CURRENT_THREAD_KEY, null);
-      resetFeed();
-      // NOTE: no `new_session` frame here — SESSION_KEY was bound BEFORE the
-      // re-hello, so the hello already spawns a clean agent for this tab. Sending
-      // new_session too caused a rapid double-spawn (double greeting, and two
-      // concurrent Claude session starts that can race token refresh → 401s).
-      // Workspace awareness: ride a one-shot context on the FIRST message so the
-      // fresh agent knows exactly which workflow it serves (and that other
-      // workflows have their own separate conversations).
-      try {
-        client?.armContext?.(
-          `[Workspace context: this chat is dedicated to the ComfyUI workflow "${getWorkflowTitle()}". ` +
-          `Each workflow has its own separate agent conversation — other workflows are NOT in your context.]`,
-        );
-      } catch { /* armContext unavailable — awareness rides the title instead */ }
-    }
-    // #381: a genuine switch changed the conversation scope — repaint the ring
-    // from the newly-active scope's own last-known fill (or blank it) so it never
-    // keeps showing the previous workflow's value.
-    refreshContextRingForScope();
+    completeDedicatedWorkflowSessionSwap();
   }
 
   function renderHistory() {
@@ -36869,6 +36911,7 @@ function buildPanel() {
           // since (sessionEpoch unchanged).
           lastAgentGraphEpoch = sessionEpoch;
         } catch {}
+        completeDedicatedWorkflowSessionSwap({ announce: true });
       }
     },
     onLog(text) {
@@ -37322,6 +37365,14 @@ function buildPanel() {
         }
         return;
       }
+      // A deliberate dedicated-chat rebind also produces a ready ack. It is
+      // not evidence that the calling turn dropped. Consume only that ack when
+      // the bridge stayed up; a real bridge outage still reaches the normal
+      // recovery path below.
+      if (ack?.kind === "ready" && dedicatedWorkflowSwapAckPending) {
+        dedicatedWorkflowSwapAckPending = false;
+        if (bridgeOutage.outageMs() <= 0) return;
+      }
       // Unexpected bounce while mid-task — a DIFFERENT agent restarting ComfyUI
       // (to load nodes), a crash, or an SDK self-heal. The session resumed with
       // full context but has no pending turn, so it would sit idle. Nudge it.
@@ -37369,7 +37420,7 @@ function buildPanel() {
         appendSystem(tr("panel.reconnected_picking_up_where_we_left_off", "Reconnected — picking up where we left off."));
         showThinking();
         if (client.sendUserMessage(
-          "✅ Your connection dropped mid-task (e.g. ComfyUI was restarted, possibly by another agent installing nodes). The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
+          "✅ Your agent connection dropped mid-task. The session resumed with full context — continue exactly what you were doing before the drop; if you were mid-build or mid-edit, pick it right back up.",
         )) pinTurnOwnerAtDispatch();
       }
     },

@@ -915,6 +915,7 @@
       "workflow_saved": "Saved “{workflow}”",
       "workflow_saved_as": "Saved as “{workflow}”",
       "workflow_snapshot": "Workflow snapshot",
+      "workflow_chat_switch_after_turn": "Switched workflow tab — this chat is dedicated to the new workflow after the previous turn finished.",
       "working": "Working…",
       "your_agent_inline": "your agent",
       "your_agent_is_at_your_canvas": "Your agent is at your canvas"
