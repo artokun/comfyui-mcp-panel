@@ -260,7 +260,7 @@ test("#1434: the shipped budget leaves the 15 s relay window room to carry the r
 test("#1434: BOTH save handlers wrap programmaticSave in the bound — the helper alone cannot prove this", () => {
   assert.match(
     workflowSaveMatch[0],
-    /runBoundedWorkflowSave\(\s*\(\) => programmaticSave\(name\),/,
+    /runBoundedWorkflowSave\(\s*\(\) => programmaticSave\(name(?:, validatedSubfolder)?\),/,
     "workflow_save must bound programmaticSave",
   );
   assert.match(
@@ -270,7 +270,7 @@ test("#1434: BOTH save handlers wrap programmaticSave in the bound — the helpe
   );
   assert.match(
     workflowSaveAsMatch[0],
-    /runBoundedWorkflowSave\(\s*\(\) => programmaticSave\(name\),/,
+    /runBoundedWorkflowSave\(\s*\(\) => programmaticSave\(name(?:, validatedSubfolder)?\),/,
     "workflow_save_as must bound programmaticSave",
   );
   assert.match(
