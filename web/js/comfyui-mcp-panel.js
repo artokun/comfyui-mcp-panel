@@ -672,6 +672,7 @@ import {
   nameContainsPathSeparator,
   pathSeparatorNameError,
 } from "./lib/workflow-save.js";
+import { describeSaveBackendSocket } from "./lib/save-transport-failure.js";
 import {
   WORKFLOW_SAVE_COMMAND_BUDGET_MS,
   runBoundedWorkflowSave,
@@ -6754,6 +6755,19 @@ async function programmaticSave(name) {
     // being sent to audit a filename that was never the problem. Read-only, and it
     // runs only once the 400 shape is already recognised.
     readSaveFailureCause: (path) => readSaveFailureCause(path, api),
+    // #1757 — a save write that gets NO HTTP response has no status and no body to
+    // explain itself, so the one extra fact worth carrying is the one only the panel
+    // holds: whether ComfyUI's own websocket is up at that moment. It separates "the
+    // server is gone" from "the server is there and this request did not complete",
+    // which are different problems with different next steps. Read through the SAME
+    // predicate the graph-mutation gate uses (backendSocketIsDown), so the two can
+    // never disagree about a socket, and evaluated lazily so it describes the failure
+    // and not the entry.
+    describeBackendSocket: () =>
+      describeSaveBackendSocket({
+        flaggedDown: comfyBackendSocketDown,
+        socketReadyState: comfyBackendSocketReadyState(),
+      }),
   });
   const outcome = describeSaveOutcome(details);
   // #557 r3/r4/r5/r7/r8/r10 — thread the identity across the swap ONLY with

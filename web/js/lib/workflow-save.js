@@ -1,4 +1,15 @@
 import { describeSaveFailureCause } from "./userdata-failure-cause.js";
+// #1757 — a save write whose request never COMPLETED has no status and no body to
+// explain it, and used to leave the tool with the browser's bare "Failed to fetch".
+// Applied at the two WRITE sites and nowhere else: only there is "the file may or may
+// not have been written" a true statement. Every pre-probe in this module already
+// swallows its own transport errors and fails safe, so decorating them would attach a
+// mutation's uncertainty to a read that never mutated anything.
+import {
+  decorateSaveTransportFailure,
+  isSaveTransportFailure,
+  readBackendSocket,
+} from "./save-transport-failure.js";
 
 // Programmatic workflow saving — shared by the panel and unit tests.
 //
@@ -556,6 +567,12 @@ export async function saveActiveWorkflow(
     // this module keeps no opinion about how the log is reached, and so a caller that
     // cannot reach it simply omits it.
     readSaveFailureCause,
+    // #1757 — what the panel knows about ComfyUI's websocket, read at the moment a
+    // write fails. Injected as a FUNCTION, not a value: it is only meaningful after
+    // the failed write, and a value sampled at entry would describe a different
+    // moment. Omitted by a caller that cannot observe it ⇒ the message says nothing
+    // about the socket, which is the honest answer.
+    describeBackendSocket,
   } = {},
 ) {
   const wf = svc?.activeWorkflow;
@@ -779,7 +796,7 @@ export async function saveActiveWorkflow(
     // never references the source's on-disk file. If that copy API is unavailable,
     // REFUSE rather than risk moving the external original.
     if (isExternalWorkflowPath(sourcePath)) {
-      const copyToUserDir = resolveSaveAsCopy(svc, { reconcileSavedCopy, canvasBinding, assertCanvasNotForeign });
+      const copyToUserDir = resolveSaveAsCopy(svc, { reconcileSavedCopy, canvasBinding, assertCanvasNotForeign, describeBackendSocket });
       if (!copyToUserDir) {
         throw new Error(
           "save-as (copy) is unavailable on this frontend for an externally-loaded workflow; " +
@@ -834,7 +851,7 @@ export async function saveActiveWorkflow(
     // (#566 codex P0 — "whatever is active after the await" is NOT succession
     // evidence; a mid-trio switch to a foreign tab must thread/consume NOTHING).
     const producedRecord = {};
-    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign });
+    const atomicCopy = resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign, describeBackendSocket });
 
     // #226 CLASSIFICATION GUARD, scoped to the hazard it actually names (#1066 defect 2).
     //
@@ -1128,7 +1145,7 @@ export async function saveActiveWorkflow(
   }
   if (inPlace === "authorize") markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
-  const savedRecord = await saveInPlace(svc, wf, { readSaveFailureCause, path: finalTargetPath });
+  const savedRecord = await saveInPlace(svc, wf, { readSaveFailureCause, path: finalTargetPath, describeBackendSocket });
   // r10 — thread the save API's own produced record (when it returns one) through
   // details, so the identity carry can prove succession from the replacement
   // EVENT. An empty/non-object return simply carries no thread (fail safe).
@@ -1257,7 +1274,7 @@ async function probeSourceOnDisk(existsOnDisk, normPath) {
  *  normalizeCanvasBinding). It decides ONE thing here: whether the SOURCE tab's
  *  serialized state may be refreshed from the live canvas before the copy is taken.
  *  See the comment at that call. */
-function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign } = {}) {
+function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBinding, assertCanvasNotForeign, describeBackendSocket } = {}) {
   // `openWorkflow` is MANDATORY for this path, not optional. The object saveAs
   // returns is UNLOADED (no changeTracker → activeState === null), and
   // ComfyWorkflow.save() serializes `activeState ?? null` — so persisting a copy
@@ -1514,6 +1531,19 @@ function resolveSaveAsCopy(svc, { reconcileSavedCopy, producedRecord, canvasBind
         }
         removeInMemoryWorkflow(svc, copy);
         if (prevActive !== undefined) svc.activeWorkflow = prevActive;
+        // #1757 — the same bare "Failed to fetch" the in-place route surfaced, on the
+        // copy route. It lands here on a transport failure specifically BECAUSE the
+        // reconcile above could not settle anything: reading the target back is itself
+        // an HTTP round-trip, so a server that answers nothing yields "unknown" and this
+        // is the fall-through. Decorating AFTER the rollback keeps the message's claims
+        // true — the in-memory copy is gone and the previous tab is restored by the time
+        // anyone reads it. Only the transport shape is touched; the "foreign"/"absent"
+        // branches above already throw their own explained errors and never reach here.
+        decorateSaveTransportFailure(err, {
+          operation: "save-as",
+          path: finalTargetPath,
+          backendSocket: readBackendSocket(describeBackendSocket),
+        });
         throw err;
       }
       // #1267 — POST-WRITE: report the BYTES, not the call. `ComfyWorkflow.save()`'s
@@ -1822,7 +1852,7 @@ export function explainUserDataStoreFailure(message) {
   );
 }
 
-async function saveInPlace(svc, wf, { readSaveFailureCause, path } = {}) {
+async function saveInPlace(svc, wf, { readSaveFailureCause, path, describeBackendSocket } = {}) {
   // Return the save API's own result: when it yields the workflow record it
   // PRODUCED (a re-registered successor object), that is the one unambiguous
   // replacement-event thread the identity carry can use (r10) — path occupancy
@@ -1831,6 +1861,19 @@ async function saveInPlace(svc, wf, { readSaveFailureCause, path } = {}) {
     if (typeof svc.saveWorkflow === "function") return await svc.saveWorkflow(wf);
     if (typeof wf.save === "function") return await wf.save();
   } catch (err) {
+    // #1757 — FIRST, because it is the shape that carries no status at all. A
+    // transport failure never produced an HTTP response, so `explainUserDataStoreFailure`
+    // (which recognises a 400 body) has nothing to recognise and the error reached the
+    // tool as the browser's bare "Failed to fetch". Decorating is a no-op for every other
+    // shape, so the #771 branch below is unchanged for the errors it owns.
+    const decorated = decorateSaveTransportFailure(err, {
+      operation: "in-place",
+      path,
+      // Read HERE, not at entry: the socket state that matters is the one at the moment
+      // the write failed, and the write is what we just awaited.
+      backendSocket: readBackendSocket(describeBackendSocket),
+    });
+    if (decorated) throw err;
     // #771 — augment ONLY the userdata-400 shape; every other failure is
     // rethrown byte-identical so no existing message or matcher changes.
     const raw = err instanceof Error ? err.message : String(err);
@@ -1855,6 +1898,13 @@ async function saveInPlace(svc, wf, { readSaveFailureCause, path } = {}) {
  *  status field or the conflict wording ComfyUI's /userdata surfaces. */
 function isConflictError(err) {
   if (!err) return false;
+  // #1757 — a TRANSPORT failure produced no HTTP response at all, so it cannot be a
+  // 409. Checked before the substring test below, which matches "409"/"conflict"/
+  // "already exists" ANYWHERE in a message: the transport explanation is long prose
+  // that may legitimately mention a name collision when advising about a retry, and
+  // without this the rollback wrapper reclassified it and replaced the real failure
+  // with a filename-conflict error.
+  if (isSaveTransportFailure(err)) return false;
   const status = err.status ?? err.statusCode ?? err.response?.status;
   if (status === 409) return true;
   const msg = String(err?.message ?? err).toLowerCase();
