@@ -357,7 +357,13 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
             ...(opts.skipDuplicateComboRefresh === true ? { skipDuplicateComboRefresh: true } : {}),
           }
         : undefined;
-    const abandonBeforeLocalWork = !!(opts && opts.abandonBeforeLocalWork);
+    // #1758 — `joinInFlight` is the acknowledgement contract used by
+    // panel_refresh_nodes. If the slot is empty at the exact call boundary, this invocation
+    // becomes the refresh owner; it must still wait through its own registration/reapply
+    // handoff rather than returning refresh_still_running merely because it was asked to
+    // join when possible. Other bounded callers retain the explicit early-handoff behavior.
+    const abandonBeforeLocalWork =
+      !!(opts && opts.abandonBeforeLocalWork) && !joinInFlight;
     const remaining = () => (joinMs === null ? null : joinMs - (Date.now() - startedAt));
     const current = getInFlight();
     if (current) {

@@ -12304,10 +12304,10 @@ const GRAPH_TOOL_EXECUTORS = {
   // #635: a non-fresh verdict now says WHY (reason) and what to do about it
   // (remedy) — a bare {ok:true, refreshed:false} was indistinguishable from a
   // no-op and left the caller guessing whether the call did anything.
-  // #1404: BOUNDED. This one await is the whole command, and unbounded it is the
-  // composition `graph_add_node`'s budget note describes — a forced call pays an in-flight
-  // run AND its own, serially, which does not fit the 30,000 ms window this command is
-  // relayed in. See REFRESH_NODES_COMMAND_BUDGET_MS.
+  // #1404: BOUNDED. This one await is the whole command. When a refresh is already in
+  // flight, #1680 joins that completion; when idle, the forced run is bounded directly, so
+  // this command never creates a serial in-flight-plus-trailing wait beyond the relay window.
+  // See REFRESH_NODES_COMMAND_BUDGET_MS.
   // #1680 — when a refresh already owns the single-flight slot, this command is an
   // acknowledgement of that work: subscribe to it instead of queueing a second
   // trailing run. When the slot is empty, force:true still starts a fresh refresh.
@@ -12320,9 +12320,11 @@ const GRAPH_TOOL_EXECUTORS = {
       // the shared refresh slot or allowing a competing successor.
       allowEarlyResult: true,
       joinMs: REFRESH_NODES_COMMAND_BUDGET_MS,
-      // #1562 — the run announces this handoff after /object_info and yields one turn
-      // before registration, so this caller can return its structured retryable verdict
-      // before synchronous schema work blocks the relay timer.
+      // #1758 — panel_refresh_nodes is itself the acknowledgement for this refresh. The
+      // coalescer lets this acknowledgement join an existing run, and when the slot is
+      // empty it suppresses this early-handoff escape for the run it starts itself. The
+      // command budget still bounds the wait, and the slot remains single-flight if it is
+      // reached.
       abandonBeforeLocalWork: true,
       // #1562 — and the RUN this command starts gets an allowance that outlasts that wait,
       // so the JOIN is what ends the command. Without this line the run gives up first and
