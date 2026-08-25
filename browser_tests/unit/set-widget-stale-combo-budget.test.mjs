@@ -821,6 +821,54 @@ test("#1709: scoped graph_set_widget reads retire proof on definitive presence a
   );
 });
 
+test("#2249: a schema invalidation during a scoped read refuses stale scoped evidence", async () => {
+  const def = { input: { required: { text: ["STRING", {}] } } };
+  const widget = { name: "text", type: "text", value: "before" };
+  const node = {
+    id: 2249,
+    type: "LoadImage",
+    widgets: [widget],
+    constructor: { nodeData: def, comfyClass: "LoadImage" },
+  };
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const scopedStarted = deferred();
+  const scopedResponse = deferred();
+  const built = realGraphSetWidget({
+    node,
+    verifiedNodeDefCache,
+    registeredNodeTypes: { LoadImage: { nodeData: def, comfyClass: "LoadImage" }, Note: {} },
+    getNodeDefsImpl: async () => undefined,
+    fetchApiImpl: async (route) => {
+      if (route === "/object_info") return { ok: false, status: 504, json: async () => ({}) };
+      if (route === "/object_info/LoadImage") {
+        scopedStarted.resolve();
+        const defs = await scopedResponse.promise;
+        return { ok: true, status: 200, json: async () => defs };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    },
+  });
+
+  const pendingWrite = built.graph_set_widget({
+    node_id: 2249,
+    widget: "text",
+    value: "stale-answer-must-not-land",
+    workflow_uuid: "u",
+  });
+  await scopedStarted.promise;
+  const generationBeforeInvalidation = verifiedNodeDefCache.generation();
+  verifiedNodeDefCache.clear(); // same epoch, equivalent to panel_refresh_nodes invalidation
+  assert.ok(verifiedNodeDefCache.generation() > generationBeforeInvalidation);
+  scopedResponse.resolve({ LoadImage: def });
+
+  await assert.rejects(
+    () => pendingWrite,
+    /Cannot set widget|object_info|refused/i,
+    "a scoped answer crossing schema invalidation cannot authorize the write",
+  );
+  assert.equal(widget.value, "before", "the stale scoped answer did not mutate the widget");
+});
+
 test("#1709: authoritative empty retires whole cache and snapshot before ordinary timeout refusal", async () => {
   const widget = { name: "text", type: "text", value: "old" };
   const node = { id: 212, type: "LoadImage", widgets: [widget] };
@@ -887,8 +935,8 @@ test("#1709: authoritative empty retires whole cache and snapshot before ordinar
   assert.equal(widget.value, "new", "the timeout refusal did not write");
   assert.deepEqual(
     calls.slice(-2),
-    ["/object_info", "/object_info/LoadImage"],
-    "the later non-definitive whole failure allowed the exact scoped route before refusal",
+    ["/object_info", "/object_info"],
+    "the later answered-unusable whole failure refused without trying the scoped route",
   );
 });
 

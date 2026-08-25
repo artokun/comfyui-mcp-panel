@@ -313,6 +313,7 @@ import {
 import {
   createObjectInfoSnapshot,
   snapshotAuthorizationNote,
+  noBackendAnswerEstablished,
 } from "./lib/object-info-snapshot.js";
 import { fetchTypeScopedObjectInfo, SCOPED_OBJECT_INFO_DEADLINE_MS } from "./lib/scoped-object-info.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
@@ -16066,12 +16067,11 @@ const GRAPH_TOOL_EXECUTORS = {
     let oracleFailures = [];
     // #1560/#2249 — may the TYPE-SCOPED last resort be consulted at all?
     //
-    // A whole-map failure does not establish the requested class is absent. Once a
-    // non-throwing route has been contacted, an exact successful `/object_info/<class>`
-    // response can be authoritative for this write when the whole route timed out,
-    // returned nothing, or returned an unusable response. The one answer it must never
-    // overrule is an authoritative whole empty map (`{}`), which explicitly says deny-all;
-    // a thrown route remains a refusal because it does not provide safe evidence either way.
+    // A whole-map failure does not establish the requested class is absent. When every
+    // contacted route only timed out or returned nothing, an exact successful
+    // `/object_info/<class>` response can be authoritative for this write. An
+    // answered-unusable route is an answer/refusal, not silence; a thrown route and an
+    // authoritative whole empty map (`{}`) likewise cannot be overruled.
     //
     // CAPTURED WHERE THE SNAPSHOT MAKES THE SAME JUDGEMENT, from the SAME `outcome.outcomes`
     // in the same statement — never re-read from a variable later. Storing the tag list and
@@ -16446,19 +16446,11 @@ const GRAPH_TOOL_EXECUTORS = {
           outcomes: outcome?.outcomes,
         });
         // #1560/#2249 — the SAME evidence, read ONCE, in the same statement as the
-        // snapshot's. A contacted but unusable whole route leaves the requested class
-        // unanswered; the type-scoped response below can answer that narrower question.
-        // An authoritative empty whole map is the explicit deny-all exception. A list with
-        // only NOT_ATTEMPTED routes licenses nothing, and a retired/reconnected response
-        // cannot be promoted into either route.
-        const wholeProbeCanBeNarrowed =
-          Array.isArray(outcome?.outcomes) &&
-          outcome.outcomes.some((entry) =>
-            ["no-answer", "nothing-returned", "answered-unusable"].includes(entry?.kind),
-          ) &&
-          !outcome.outcomes.some((entry) => entry?.kind === "threw");
+        // snapshot's. The shared predicate is deliberately stricter than "some route was
+        // quiet": an answered-unusable route is an answer/refusal, so a mixed
+        // nothing-returned + answered-unusable result cannot license a narrower read.
         scopedReadLicensed =
-          schemaResponseIsCurrent && authoritativeEmpty !== true && wholeProbeCanBeNarrowed;
+          schemaResponseIsCurrent && authoritativeEmpty !== true && noBackendAnswerEstablished(outcome?.outcomes);
         if (fallback.defs) {
           // Held for the reply. The write is about to be reported as SUCCEEDED and VERIFIED,
           // and it was verified against a schema nobody could re-fetch — an agent that is
@@ -16508,9 +16500,9 @@ const GRAPH_TOOL_EXECUTORS = {
       //   1. THE NARROW-QUESTION LICENCE, decided beside the snapshot's own verdict on the
       //      SAME `outcome.outcomes` and merely READ here. A client that returned an empty
       //      schema has expressed deny-all, and a broader per-class read must never overrule
-      //      it. A contacted route that timed out, returned an unusable response, or
-      //      returned NOTHING leaves the requested class unanswered; the exact type-scoped
-      //      route may establish it. A thrown route remains refused, and an unwired or
+      //      it. Contacted routes that timed out or returned NOTHING leave the requested
+      //      class unanswered; the exact type-scoped route may establish it. An
+      //      answered-unusable or thrown route remains refused, and an unwired or
       //      never-attempted oracle licenses nothing.
       //   2. WHAT THE COMMAND HAS LEFT. The whole-map attempt has already spent most of the
       //      budget by the time this runs (measured on the reported shape: 15,015 ms of a 20s
@@ -16537,20 +16529,25 @@ const GRAPH_TOOL_EXECUTORS = {
           };
         }
         const scopedEpoch = backendReconnectEpoch;
+        const scopedGeneration = verifiedNodeDefCache.generation();
         const scoped = await fetchTypeScopedObjectInfo(types, {
           fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
           deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
         });
         // The per-class route is authoritative only for the backend connection that
-        // answered it. A reconnect or a down socket during this await makes that response
-        // as stale as a whole-map response spanning the same event; do not use it to
-        // authorize, retire proofs, or diagnose a removed type.
-        if (scopedEpoch !== backendReconnectEpoch || comfyBackendIsDown()) {
+        // answered it. A reconnect, schema invalidation, or a down socket during this await
+        // makes that response as stale as a whole-map response spanning the same event; do
+        // not use it to authorize, retire proofs, or diagnose a removed type.
+        if (
+          scopedEpoch !== backendReconnectEpoch ||
+          scopedGeneration !== verifiedNodeDefCache.generation() ||
+          comfyBackendIsDown()
+        ) {
           return {
             defs: null,
             covered: [],
             reason:
-              "the backend reconnected or went down while the type-scoped /object_info " +
+              "the backend schema changed or went down while the type-scoped /object_info " +
               "read was in flight, so its answer cannot authorize this write",
           };
         }

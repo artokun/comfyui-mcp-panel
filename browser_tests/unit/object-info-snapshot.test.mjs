@@ -1623,12 +1623,12 @@ test("#1560 SHIPPED: a route that THREW licenses nothing either — something an
   assert.equal(o.readScopedLicence(), false, "a refused connection is a process that is GONE, not one that is busy");
 });
 
-test("#2249 SHIPPED: a contacted unusable whole route leaves room for exact type-scoped authority", async () => {
+test("#2249 SHIPPED: a gateway timeout leaves room for exact type-scoped authority", async () => {
   const snapshot = createObjectInfoSnapshot();
   const o = buildShippedOracle({
     api: {
       getNodeDefs: undefined,
-      fetchApi: async () => ({ ok: false, status: 503, json: async () => ({}) }),
+      fetchApi: async () => ({ ok: false, status: 504, json: async () => ({}) }),
     },
     snapshot,
     epoch: 5,
@@ -1637,7 +1637,25 @@ test("#2249 SHIPPED: a contacted unusable whole route leaves room for exact type
   assert.equal(
     o.readScopedLicence(),
     true,
-    "a 503 did not establish absence of the requested class, so a live type-scoped answer may decide it",
+    "a proxy gateway timeout did not establish absence of the requested class, so a live type-scoped answer may decide it",
+  );
+});
+
+test("#2249 SHIPPED: mixed nothing-returned plus answered-unusable evidence licenses nothing", async () => {
+  const snapshot = createObjectInfoSnapshot();
+  const o = buildShippedOracle({
+    api: {
+      getNodeDefs: async () => undefined,
+      fetchApi: async () => ({ ok: false, status: 500, json: async () => ({}) }),
+    },
+    snapshot,
+    epoch: 5,
+  });
+  assert.equal(await o.getFreshObjectInfo(), null);
+  assert.equal(
+    o.readScopedLicence(),
+    false,
+    "a returned unusable response is an answer/refusal even when another route returned nothing",
   );
 });
 

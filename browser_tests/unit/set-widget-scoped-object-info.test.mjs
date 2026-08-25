@@ -573,16 +573,17 @@ test("#1560/#2249: the panel wires scoped authority after a non-definitive whole
   // `readObjectInfo` more than once (the #1126 live re-ask).
   const oracle = src.slice(src.indexOf("const fallback = objectInfoSnapshot.authorize"));
   assert.match(oracle, /outcomes: outcome\?\.outcomes,\s*\}\);/, "uses the oracle's outcome list");
-  assert.match(oracle, /const wholeProbeCanBeNarrowed =/, "classifies the whole outcome before licensing");
   assert.match(
     oracle,
-    /schemaResponseIsCurrent && authoritativeEmpty !== true && wholeProbeCanBeNarrowed/,
-    "uses the current-generation fence and rejects authoritative whole emptiness",
+    /schemaResponseIsCurrent && authoritativeEmpty !== true && noBackendAnswerEstablished\(outcome\?\.outcomes\)/,
+    "uses the shared fail-closed silence predicate and rejects authoritative answers",
   );
   assert.match(src, /if \(!scopedReadLicensed\) \{/, "an authoritative whole answer is never overruled");
   assert.match(src, /let scopedReadLicensed = false;/, "and it licenses nothing until a read establishes it");
   assert.match(src, /fetchTypeScopedObjectInfo\(types, \{/, "the panel calls the type-scoped reader");
   assert.match(src, /deadlineMs: budget\.bounded\(SCOPED_OBJECT_INFO_DEADLINE_MS\)/, "bounded by what the command has left");
+  assert.match(src, /const scopedGeneration = verifiedNodeDefCache\.generation\(\)/, "fences the scoped request at issuance");
+  assert.match(src, /scopedGeneration !== verifiedNodeDefCache\.generation\(\)/, "rejects a scoped answer after schema invalidation");
   assert.match(src, /setWidgetSchemaProvenance = \(\) => "scoped"/, "the reply is told which route answered");
   // The scoped payload must never be filed as a whole observation, in either store.
   const wiring = src.slice(src.indexOf("fetchScopedObjectInfo: async (types)"), src.indexOf("fetchScopedObjectInfo: async (types)") + 1800);
