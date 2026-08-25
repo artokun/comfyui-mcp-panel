@@ -1,4 +1,15 @@
 import { describeSaveFailureCause } from "./userdata-failure-cause.js";
+// #1757 — a save write whose request never COMPLETED has no status and no body to
+// explain it, and used to leave the tool with the browser's bare "Failed to fetch".
+// Applied at the two WRITE sites and nowhere else: only there is "the file may or may
+// not have been written" a true statement. Every pre-probe in this module already
+// swallows its own transport errors and fails safe, so decorating them would attach a
+// mutation's uncertainty to a read that never mutated anything.
+import {
+  decorateSaveTransportFailure,
+  isSaveTransportFailure,
+  readBackendSocket,
+} from "./save-transport-failure.js";
 
 // Programmatic workflow saving — shared by the panel and unit tests.
 //
@@ -556,6 +567,12 @@ export async function saveActiveWorkflow(
     // this module keeps no opinion about how the log is reached, and so a caller that
     // cannot reach it simply omits it.
     readSaveFailureCause,
+    // #1757 — what the panel knows about ComfyUI's websocket, read at the moment a
+    // write fails. Injected as a FUNCTION, not a value: it is only meaningful after
+    // the failed write, and a value sampled at entry would describe a different
+    // moment. Omitted by a caller that cannot observe it ⇒ the message says nothing
+    // about the socket, which is the honest answer.
+    describeBackendSocket,
     // Optional production hook used for persisted Save-As copies. It must return true
     // only after the destination-stamped copy is proven live on the shared canvas.
     repaintCanvas,
@@ -796,6 +813,7 @@ export async function saveActiveWorkflow(
         reconcileSavedCopy,
         canvasBinding,
         assertCanvasNotForeign,
+        describeBackendSocket,
         repaintCanvas,
         restoreCanvas,
         canvasFence,
@@ -860,6 +878,7 @@ export async function saveActiveWorkflow(
       producedRecord,
       canvasBinding,
       assertCanvasNotForeign,
+      describeBackendSocket,
       // First-save successors already inherit the source's live identity and retain
       // their existing copy semantics. The repaint is specifically for persisted/unknown
       // Save-As copies whose source path metadata must follow the new destination.
@@ -1161,7 +1180,7 @@ export async function saveActiveWorkflow(
   }
   if (inPlace === "authorize") markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
-  const savedRecord = await saveInPlace(svc, wf, { readSaveFailureCause, path: finalTargetPath });
+  const savedRecord = await saveInPlace(svc, wf, { readSaveFailureCause, path: finalTargetPath, describeBackendSocket });
   // r10 — thread the save API's own produced record (when it returns one) through
   // details, so the identity carry can prove succession from the replacement
   // EVENT. An empty/non-object return simply carries no thread (fail safe).
@@ -1309,6 +1328,7 @@ function resolveSaveAsCopy(
     producedRecord,
     canvasBinding,
     assertCanvasNotForeign,
+    describeBackendSocket,
     repaintCanvas,
     restoreCanvas,
     canvasFence,
@@ -1540,7 +1560,7 @@ function resolveSaveAsCopy(
           return { ok: false, reason: `source canvas restore threw (${describeThrown(restoreError)})` };
         }
       };
-      const throwAfterCleanup = async (err) => {
+      const throwAfterCleanup = async (err, afterCleanup) => {
         const cleanup = await cleanupFailedCopy();
         if (!cleanup.ok) {
           const original = describeThrown(err);
@@ -1549,6 +1569,7 @@ function resolveSaveAsCopy(
               `No Save-As success was reported and nothing further may be persisted (#939).`,
           );
         }
+        afterCleanup?.();
         throw err;
       };
       // #566 codex P0 — success exit: thread the trio's PRODUCED record into the
@@ -1761,7 +1782,16 @@ function resolveSaveAsCopy(
           // "absent"/"unknown" ⇒ the write did not land (or can't be confirmed) ⇒
           // fall through to the safe removal below.
         }
-        await throwAfterCleanup(err);
+        // #1757 — decorate only after the main cleanup has succeeded. The message
+        // explicitly describes the restored source/copy state, so it must not be
+        // exposed when cleanup itself failed closed.
+        await throwAfterCleanup(err, () => {
+          decorateSaveTransportFailure(err, {
+            operation: "save-as",
+            path: finalTargetPath,
+            backendSocket: readBackendSocket(describeBackendSocket),
+          });
+        });
       }
       // #1267 — POST-WRITE: report the BYTES, not the call. `ComfyWorkflow.save()`'s
       // first statement is `this.content = JSON.stringify(this.activeState)`, so after a
@@ -2065,7 +2095,7 @@ export function explainUserDataStoreFailure(message) {
   );
 }
 
-async function saveInPlace(svc, wf, { readSaveFailureCause, path } = {}) {
+async function saveInPlace(svc, wf, { readSaveFailureCause, path, describeBackendSocket } = {}) {
   // Return the save API's own result: when it yields the workflow record it
   // PRODUCED (a re-registered successor object), that is the one unambiguous
   // replacement-event thread the identity carry can use (r10) — path occupancy
@@ -2074,6 +2104,19 @@ async function saveInPlace(svc, wf, { readSaveFailureCause, path } = {}) {
     if (typeof svc.saveWorkflow === "function") return await svc.saveWorkflow(wf);
     if (typeof wf.save === "function") return await wf.save();
   } catch (err) {
+    // #1757 — FIRST, because it is the shape that carries no status at all. A
+    // transport failure never produced an HTTP response, so `explainUserDataStoreFailure`
+    // (which recognises a 400 body) has nothing to recognise and the error reached the
+    // tool as the browser's bare "Failed to fetch". Decorating is a no-op for every other
+    // shape, so the #771 branch below is unchanged for the errors it owns.
+    const decorated = decorateSaveTransportFailure(err, {
+      operation: "in-place",
+      path,
+      // Read HERE, not at entry: the socket state that matters is the one at the moment
+      // the write failed, and the write is what we just awaited.
+      backendSocket: readBackendSocket(describeBackendSocket),
+    });
+    if (decorated) throw err;
     // #771 — augment ONLY the userdata-400 shape; every other failure is
     // rethrown byte-identical so no existing message or matcher changes.
     const raw = err instanceof Error ? err.message : String(err);
@@ -2098,6 +2141,13 @@ async function saveInPlace(svc, wf, { readSaveFailureCause, path } = {}) {
  *  status field or the conflict wording ComfyUI's /userdata surfaces. */
 function isConflictError(err) {
   if (!err) return false;
+  // #1757 — a TRANSPORT failure produced no HTTP response at all, so it cannot be a
+  // 409. Checked before the substring test below, which matches "409"/"conflict"/
+  // "already exists" ANYWHERE in a message: the transport explanation is long prose
+  // that may legitimately mention a name collision when advising about a retry, and
+  // without this the rollback wrapper reclassified it and replaced the real failure
+  // with a filename-conflict error.
+  if (isSaveTransportFailure(err)) return false;
   const status = err.status ?? err.statusCode ?? err.response?.status;
   if (status === 409) return true;
   const msg = String(err?.message ?? err).toLowerCase();
