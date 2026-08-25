@@ -19,6 +19,7 @@ import {
   createRunCompletionTracker,
   NO_PROMPT_KEY,
 } from "../../web/js/lib/run-completion.js";
+import { createRunCompletionFlushHandler } from "../../web/js/lib/run-completion-delivery.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 
 /** Deterministic scheduler: timers are held until tick() fires the due ones. */
@@ -367,6 +368,232 @@ test("#269/#468 presentation: a MIXED run (stills + 2 videos) emits EXACTLY ONE 
   assert.match(frames[0].note, /v2\.mp4/, "note names the second video");
 });
 
+test("#1805: cache-assisted and real completion spans are labelled as workflow time", async () => {
+  const formatDuration = (ms) => `${(ms / 1000).toFixed(1)}s`;
+
+  // A cache-assisted prompt still has a real lifecycle span, but the panel does
+  // not observe ComfyUI's execution_cached events and must not call that span a
+  // render benchmark.
+  const cached = makeHarness();
+  cached.tracker.onExecutionStart("cached-prompt");
+  cached.advance(5800);
+  cached.tracker.onExecuted("cached-prompt", {
+    videos: [{ m: { filename: "cached.mp4", type: "output" }, nodeId: "save" }],
+  });
+  cached.tracker.onExecutionSuccess("cached-prompt");
+  assert.equal(cached.flushes[0].durationMs, 5800, "keep the measured workflow span");
+  const cachedDeps = makeFrameDeps({ formatDuration });
+  const cachedFrame = await composeRunCompletionFrame(cached.flushes[0], cachedDeps.deps);
+  assert.match(cachedFrame.note, /workflow completed in 5\.8s/);
+  assert.doesNotMatch(cachedFrame.note, /rendered in/);
+
+  // The same wording applies when still metadata is unavailable and the
+  // completion falls back to the batch-level duration line.
+  const fallbackDeps = makeFrameDeps({
+    formatDuration,
+    fetchImageBytes: () => new Promise(() => {}),
+    fetchImageDimensions: () => new Promise(() => {}),
+    stillsMetadataTimeoutMs: 1,
+  });
+  const fallbackFrame = await composeRunCompletionFrame(
+    { promptId: "cached-stills", images: [{ filename: "cached.png", type: "output" }], durationMs: 5800 },
+    fallbackDeps.deps,
+  );
+  assert.match(fallbackFrame.note, /workflow completed in 5\.8s/);
+  assert.doesNotMatch(fallbackFrame.note, /rendered in/);
+
+  // A genuine long render keeps its full measured duration; only the misleading
+  // render-time label changes.
+  const rendered = makeHarness();
+  rendered.tracker.onExecutionStart("rendered-prompt");
+  rendered.advance(940000);
+  rendered.tracker.onExecuted("rendered-prompt", {
+    images: [{ filename: "rendered.png", type: "output" }],
+  });
+  rendered.tracker.onExecutionSuccess("rendered-prompt");
+  assert.equal(rendered.flushes[0].durationMs, 940000, "preserve true render duration data");
+  const renderedDeps = makeFrameDeps({ formatDuration });
+  const renderedFrame = await composeRunCompletionFrame(rendered.flushes[0], renderedDeps.deps);
+  assert.match(renderedFrame.note, /workflow completed in 940\.0s/);
+  assert.doesNotMatch(renderedFrame.note, /rendered in/);
+  assert.equal(renderedFrame.metadata[0].durationMs, 940000);
+});
+
+test("#1805 production event wiring: a cached completion reaches the agent frame as workflow time", async () => {
+  const panelSrc = readFileSync(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const onExecutedStart = panelSrc.indexOf("  function onExecuted(ev) {");
+  const onExecutedEnd = panelSrc.indexOf("\n  function onExecError(ev)", onExecutedStart);
+  const onExecutionSuccessStart = panelSrc.indexOf(
+    "  function onExecutionSuccess(ev) {",
+  );
+  const onExecutionSuccessEnd = panelSrc.indexOf(
+    "\n  // Primary render-duration start signal",
+    onExecutionSuccessStart,
+  );
+  const onExecutionStart = panelSrc.indexOf(
+    "  function onExecutionStart(ev) {",
+  );
+  const onExecutionStartEnd = panelSrc.indexOf(
+    "\n  // Legacy/secondary run-end",
+    onExecutionStart,
+  );
+  assert.ok(onExecutedStart >= 0 && onExecutedEnd > onExecutedStart);
+  assert.ok(
+    onExecutionSuccessStart >= 0 &&
+      onExecutionSuccessEnd > onExecutionSuccessStart,
+  );
+  assert.ok(onExecutionStart >= 0 && onExecutionStartEnd > onExecutionStart);
+
+  const createProductionHandlers = new Function(
+    "imageViewUrl",
+    "isVideoOutput",
+    "isAudioOutput",
+    "paintVideo",
+    "paintAudio",
+    "paintImage",
+    "stripMisattachedExecutionPreviews",
+    "app",
+    "createStoryboardIdentity",
+    "appendStoryboardCacheBust",
+    `return (runCompletion) => [
+      (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()}),
+      (${panelSrc.slice(
+        onExecutionSuccessStart,
+        onExecutionSuccessEnd,
+      ).trim()}),
+      (${panelSrc.slice(onExecutionStart, onExecutionStartEnd).trim()}),
+    ];`,
+  )(
+    (media) => `view://${media.filename}`,
+    () => false,
+    () => false,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    { graph: {}, nodeOutputs: {}, nodePreviewImages: {} },
+    () => "storyboard",
+    (url) => url,
+  );
+
+  const registrationStart = panelSrc.indexOf(
+    '    api.addEventListener("executed", onExecuted);',
+  );
+  const registrationEnd = panelSrc.indexOf("\n  } catch {", registrationStart);
+  assert.ok(registrationStart >= 0 && registrationEnd > registrationStart);
+  const listenerLines = panelSrc
+    .slice(registrationStart, registrationEnd)
+    .match(/    api\.addEventListener\("[^"]+", \w+\);/g);
+  assert.ok(listenerLines);
+  assert.ok(
+    listenerLines.includes('    api.addEventListener("executed", onExecuted);'),
+  );
+  assert.ok(
+    listenerLines.includes(
+      '    api.addEventListener("execution_success", onExecutionSuccess);',
+    ),
+  );
+  assert.ok(
+    listenerLines.includes(
+      '    api.addEventListener("execution_start", onExecutionStart);',
+    ),
+  );
+
+  let now = 0;
+  const frameDeps = makeFrameDeps({
+    formatDuration: (durationMs) => `${(durationMs / 1000).toFixed(1)}s`,
+  });
+  let resolveFrame;
+  const frameReady = new Promise((resolve) => {
+    resolveFrame = resolve;
+  });
+  let runCompletion;
+  let sentFrame = null;
+  let pruneCount = 0;
+  const productionOnFlush = createRunCompletionFlushHandler({
+    ...frameDeps.deps,
+    sendFrame: (frame) => {
+      const ok = frameDeps.deps.sendFrame(frame);
+      if (ok) sentFrame = frame;
+      return ok;
+    },
+    markDelivered: (promptId) => runCompletion.markDelivered(promptId),
+    markUndelivered: (promptId) => runCompletion.markUndelivered(promptId),
+    pruneRebootMarker: () => {
+      pruneCount += 1;
+      if (sentFrame) resolveFrame(sentFrame);
+    },
+    isAgentMuted: () => false,
+    now: () => Date.now(),
+  });
+  runCompletion = createRunCompletionTracker({
+    onFlush: productionOnFlush,
+    now: () => now,
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  const [onExecuted, onExecutionSuccess, onStart] =
+    createProductionHandlers(runCompletion);
+
+  const api = new EventTarget();
+  let cachedSignalSeen = false;
+  api.addEventListener("execution_cached", () => {
+    cachedSignalSeen = true;
+  });
+  new Function(
+    "api",
+    "onExecuted",
+    "onExecutionSuccess",
+    "onExecutionStart",
+    "onExecuting",
+    "onExecError",
+    "onComfyReconnecting",
+    "onComfyReconnected",
+    listenerLines.join("\n"),
+  )(
+    api,
+    onExecuted,
+    onExecutionSuccess,
+    onStart,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+  );
+
+  const dispatch = (type, detail) => {
+    const event = new Event(type);
+    Object.defineProperty(event, "detail", { value: detail });
+    api.dispatchEvent(event);
+  };
+  const promptId = "cached-production-path";
+  dispatch("execution_start", { prompt_id: promptId });
+  // The shipped wiring does not consume this provenance-only signal; it is
+  // still delivered on the same API target before the normal completion events.
+  dispatch("execution_cached", { prompt_id: promptId, nodes: ["sampler"] });
+  now = 5800;
+  dispatch("executed", {
+    prompt_id: promptId,
+    node: "save",
+    output: { images: [{ filename: "cached.png", type: "output" }] },
+  });
+  dispatch("execution_success", { prompt_id: promptId });
+
+  const frame = await frameReady;
+  assert.equal(cachedSignalSeen, true);
+  assert.equal(frameDeps.frames.length, 1);
+  assert.equal(frame.type, "agent_event");
+  assert.equal(frame.kind, "executed");
+  assert.match(frame.note, /workflow completed in 5\.8s/);
+  assert.doesNotMatch(frame.note, /rendered in/);
+  assert.equal(pruneCount, 1);
+  assert.equal(runCompletion.isSettled(promptId), true);
+  assert.equal(runCompletion._delivered.has(promptId), true);
+});
+
 test("presentation: a still-storyboard fallback (no blob) still yields ONE frame with the note", async () => {
   const { deps, frames } = makeFrameDeps({ buildVideoStoryboard: async () => null });
   const frame = await composeRunCompletionFrame(
@@ -620,19 +847,19 @@ test("#609: ONE decision per frame — parallel segments can never disagree with
 });
 
 // #609 wiring: the behavioral tests above inject `agentReceivesImages` by hand,
-// so they cannot catch the panel's REAL call site dropping the dep (the composer
-// then defaults to always-sighted while the sendFrame gate still strips the
-// pixels — the exact #609 hole). Pin the wiring by source inspection, the
+// so they cannot catch the panel's REAL delivery seam dropping the dep (the
+// composer then defaults to always-sighted while the sendFrame gate still strips
+// the pixels — the exact #609 hole). Pin the wiring by source inspection, the
 // panel's established pattern for the giant module (cf. bridge-disconnect).
-test("#609 wiring: the panel call site feeds the composer the gate's own blind predicate", () => {
+test("#609 wiring: the panel delivery seam feeds the gate's own blind predicate", () => {
   const src = readFileSync(
     fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
     "utf8",
   ).replace(/\r\n/g, "\n");
-  const start = src.indexOf("composeRunCompletionFrame(");
-  assert.notEqual(start, -1, "could not locate the composeRunCompletionFrame call site");
-  const end = src.indexOf(".then((frame)", start);
-  assert.notEqual(end, -1, "could not locate the end of the call site");
+  const start = src.indexOf("createRunCompletionFlushHandler({");
+  assert.notEqual(start, -1, "could not locate the run-completion delivery seam");
+  const end = src.indexOf("\n    }),\n    // #370: deliver a reconcile-discovered terminal ERROR", start);
+  assert.notEqual(end, -1, "could not locate the end of the delivery seam");
   const callSite = src.slice(start, end);
   assert.match(
     callSite,

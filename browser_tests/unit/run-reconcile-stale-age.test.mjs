@@ -419,31 +419,27 @@ test("#1199 presentation: ages read at the right magnitude", async () => {
 // 4. Wiring — the seam that made the reported fix inert
 // ─────────────────────────────────────────────────────────────────────────────
 
-test("#1199 wiring: the panel call site forwards finishedAt AND reconciled to the composer", () => {
-  // The tracker has ALWAYS passed a finishedAt; this closure dropped it, so the
-  // composer stamped its own clock. Every behavioural test above hands the
-  // composer a payload by hand and therefore cannot see the real call site
-  // omitting the field — the same source-inspection pattern #609 uses.
+test("#1199 wiring: the panel uses the delivery seam that forwards finishedAt AND reconciled", () => {
+  // The tracker has ALWAYS passed a finishedAt; the old inline callback dropped
+  // it, so the composer stamped its own clock. The production callback now lives
+  // in a focused module seam, so pin both the panel wiring and that seam's payload.
   const src = readFileSync(
     fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
     "utf8",
   ).replace(/\r\n/g, "\n");
+  const deliverySrc = readFileSync(
+    fileURLToPath(new URL("../../web/js/lib/run-completion-delivery.js", import.meta.url)),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
 
-  const flushStart = src.indexOf("onFlush: ({");
-  assert.notEqual(flushStart, -1, "could not locate the tracker's onFlush handler");
-  const composeStart = src.indexOf("composeRunCompletionFrame(", flushStart);
-  assert.notEqual(composeStart, -1, "could not locate the composeRunCompletionFrame call site");
-  const composeEnd = src.indexOf(".then((frame)", composeStart);
-  assert.notEqual(composeEnd, -1, "could not locate the end of the call site");
-
-  // The handler must DESTRUCTURE both fields off the flush payload…
-  const handlerSignature = src.slice(flushStart, composeStart);
-  assert.match(handlerSignature, /\bfinishedAt\b/, "onFlush must destructure finishedAt");
-  assert.match(handlerSignature, /\breconciled\b/, "onFlush must destructure reconciled");
-
-  // …and PASS both into the composer's payload. Destructuring without forwarding
-  // is the exact half-fix that leaves the defect intact.
-  const payload = src.slice(composeStart, composeEnd);
-  assert.match(payload, /\bfinishedAt\b/, "the composer payload must carry finishedAt");
-  assert.match(payload, /\breconciled\b/, "the composer payload must carry reconciled");
+  assert.notEqual(
+    src.indexOf("onFlush: createRunCompletionFlushHandler({"),
+    -1,
+    "the panel must use the production delivery seam",
+  );
+  const composeStart = deliverySrc.indexOf("composeRunCompletionFrame(");
+  assert.notEqual(composeStart, -1, "could not locate the delivery seam's composer call");
+  const payload = deliverySrc.slice(composeStart);
+  assert.match(payload, /\bfinishedAt\b/, "the production composer payload must carry finishedAt");
+  assert.match(payload, /\breconciled\b/, "the production composer payload must carry reconciled");
 });
