@@ -103,6 +103,49 @@ function methodOwner(obj, name) {
   return null;
 }
 
+// A content fingerprint cannot distinguish a native copy that happens to
+// produce the same bytes. Keep provenance on the copy method itself instead:
+// panel copies run under _panelCopyDepth, while any later unmarked copy clears
+// the caller's panel-owned snapshot through onNativeCopy.
+const _copyGuards = new WeakMap();
+let _panelCopyDepth = 0;
+
+/**
+ * Run a panel-owned copy and arm the canvas method to invalidate panel-owned
+ * clipboard metadata when a later native copy uses the same canvas/prototype.
+ * The wrapper deliberately stays installed for the clipboard's lifetime so a
+ * byte-identical native rewrite cannot be mistaken for the old panel copy.
+ */
+export function withClipboardCopyProvenance(canvas, onNativeCopy, fn) {
+  if (!canvas || typeof canvas.copyToClipboard !== "function") return fn();
+  const owner = methodOwner(canvas, "copyToClipboard");
+  if (!owner || typeof owner.copyToClipboard !== "function") return fn();
+
+  const existing = _copyGuards.get(owner);
+  if (!existing || existing.wrapper !== owner.copyToClipboard) {
+    const original = owner.copyToClipboard;
+    const wrapper = function (...args) {
+      if (_panelCopyDepth === 0) {
+        try {
+          onNativeCopy?.();
+        } catch {
+          // Snapshot invalidation is advisory; never break native copy.
+        }
+      }
+      return original.apply(this, args);
+    };
+    owner.copyToClipboard = wrapper;
+    _copyGuards.set(owner, { wrapper });
+  }
+
+  _panelCopyDepth++;
+  try {
+    return fn();
+  } finally {
+    _panelCopyDepth--;
+  }
+}
+
 /**
  * Run `fn` (a synchronous LiteGraph copy or paste) with the clipboard key of
  * `storage` backed by the in-memory store. Returns `fn()`'s result. If

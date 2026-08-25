@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import {
   CLIPBOARD_KEY,
   withInMemoryClipboard,
+  withClipboardCopyProvenance,
   getInMemoryClipboard,
   getEffectiveClipboard,
   clearInMemoryClipboard,
@@ -46,10 +47,15 @@ import {
   snapshotGroupLayout,
   collectCopySelection,
   snapshotCopyLayout,
+  snapshotCopyWidgetState,
   patchClipboardLayout,
   parseClipboardLayout,
   recordCopiedLayout,
   getVerifiedLayout,
+  recordCopiedWidgetState,
+  getVerifiedWidgetState,
+  clearCopiedWidgetState,
+  applyCopiedWidgetState,
   clearCopiedLayout,
   pairCopiedToPasted,
   layoutOrigin,
@@ -60,6 +66,7 @@ import {
 import { groupMemberNodes, groupBoundsOf } from "../../web/js/lib/group-geometry.js";
 
 const LORA = "Power Lora Loader (rgthree)";
+const VIDEO_TILE = "VideoTileLivePlanner";
 const BRANCH_YS = [-20, 640, 1300, 1960, 2620];
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -116,7 +123,7 @@ function LGraphGroup(title) {
   this.flags = {};
 }
 
-/** Frontend double that reproduces both #1294 bugs. */
+/** Frontend double that reproduces the clipboard bugs in the production path. */
 function makeFrontend({ loseLoraPos = true, pasteGroups = true } = {}) {
   let nextNodeId = 1;
   let nextGroupId = 1;
@@ -156,7 +163,20 @@ function makeFrontend({ loseLoraPos = true, pasteGroups = true } = {}) {
         if (it && typeof it.type === "string") {
           // BUG: clone/serialize loses unique pos on Power Lora Loader.
           const pos = loseLoraPos && it.type === LORA ? [0, 0] : [...it.pos];
-          nodes.push({ id: it.id, type: it.type, pos, flags: { ...(it.flags || {}) } });
+          const serialized = {
+            id: it.id,
+            type: it.type,
+            pos,
+            flags: { ...(it.flags || {}) },
+          };
+          if (it.widgets?.length) {
+            serialized.widgets_values = [];
+            for (const [i, widget] of it.widgets.entries()) {
+              if (widget.serialize === false) continue;
+              serialized.widgets_values[i] = widget.value;
+            }
+          }
+          nodes.push(serialized);
         } else if (it && (it._bounding || it.bounding)) {
           const b = it._bounding || it.bounding;
           groups.push({
@@ -200,6 +220,18 @@ function makeFrontend({ loseLoraPos = true, pasteGroups = true } = {}) {
           size: [200, 80],
           flags: { ...(info.flags || {}) },
         };
+        if (info.type === VIDEO_TILE) {
+          node.widgets = [
+            {
+              name: "planner_state",
+              serialize: true,
+              value: info.widgets_values?.[0] ?? "{}",
+            },
+            // LiteGraph's configure skips serialize:false widgets, so the
+            // clone's default remains false until the panel restores it.
+            { name: "roi_enabled", serialize: false, value: false },
+          ];
+        }
         // BUG: configure ignores pos on Power Lora Loader — they keep the
         // createNode default, then the same translation stacks them.
         if (loseLoraPos && info.type === LORA) node.pos = [0, 0];
@@ -223,7 +255,32 @@ function makeFrontend({ loseLoraPos = true, pasteGroups = true } = {}) {
       }
     },
   };
-  return { graph, canvas, LG: { LGraphGroup, registered_node_types: { [LORA]: {}, KSampler: {} } } };
+  return {
+    graph,
+    canvas,
+    LG: { LGraphGroup, registered_node_types: { [LORA]: {}, KSampler: {}, [VIDEO_TILE]: {} } },
+  };
+}
+
+function addVideoTile(graph, { id = 1, roiEnabled = true } = {}) {
+  const node = {
+    id,
+    type: VIDEO_TILE,
+    pos: [100, 100],
+    size: [300, 120],
+    flags: {},
+    widgets: [
+      {
+        name: "planner_state",
+        serialize: true,
+        value: JSON.stringify({ roi_enabled: roiEnabled, tiles: [{ x: 1, y: 2 }] }),
+      },
+      // This is the DOM-backed state that the native clone/configure path omits.
+      { name: "roi_enabled", serialize: false, value: roiEnabled },
+    ],
+  };
+  graph._nodes.push(node);
+  return node;
 }
 
 function addBranch(graph, index, y) {
@@ -266,12 +323,16 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
     "getGraphCtx",
     "collectCopySelection",
     "snapshotCopyLayout",
+    "snapshotCopyWidgetState",
     "withInMemoryClipboard",
+    "withClipboardCopyProvenance",
     "getInMemoryClipboard",
     "patchClipboardLayout",
     "CLIPBOARD_KEY",
     "recordCopiedNodes",
     "recordCopiedLayout",
+    "recordCopiedWidgetState",
+    "clearCopiedWidgetState",
     "registryTypePredicate",
     "unregisteredCopiedTypes",
     "formatUnpasteableCopyWarning",
@@ -281,12 +342,16 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
     () => ({ graph: srcGraph, canvas: srcCanvas, LG: srcLG }),
     collectCopySelection,
     snapshotCopyLayout,
+    snapshotCopyWidgetState,
     withInMemoryClipboard,
+    withClipboardCopyProvenance,
     getInMemoryClipboard,
     patchClipboardLayout,
     CLIPBOARD_KEY,
     recordCopiedNodes,
     recordCopiedLayout,
+    recordCopiedWidgetState,
+    clearCopiedWidgetState,
     registryTypePredicate,
     unregisteredCopiedTypes,
     formatUnpasteableCopyWarning,
@@ -299,6 +364,8 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
       "getGraphCtx",
       "getEffectiveClipboard",
       "getVerifiedLayout",
+      "getVerifiedWidgetState",
+      "applyCopiedWidgetState",
       "parseClipboardLayout",
       "withInMemoryClipboard",
       "resolvePasteDest",
@@ -318,6 +385,8 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
       () => ({ graph: dstGraph, canvas: dstCanvas, LG: dstLG }),
       getEffectiveClipboard,
       getVerifiedLayout,
+      getVerifiedWidgetState,
+      applyCopiedWidgetState,
       parseClipboardLayout,
       withInMemoryClipboard,
       resolvePasteDest,
@@ -444,6 +513,28 @@ test("getVerifiedLayout is fingerprint-guarded like the node snapshot", () => {
   clearCopiedLayout();
 });
 
+test("#1761 omitted widget state is fingerprint-guarded and restores false verbatim", () => {
+  clearCopiedWidgetState();
+  const state = snapshotCopyWidgetState({
+    nodes: [
+      {
+        id: 1,
+        type: VIDEO_TILE,
+        widgets: [{ name: "roi_enabled", serialize: false, value: false }],
+      },
+    ],
+  });
+  recordCopiedWidgetState(state, "fp-a");
+  assert.equal(getVerifiedWidgetState("fp-b"), null);
+  const target = {
+    type: VIDEO_TILE,
+    widgets: [{ name: "roi_enabled", serialize: false, value: true }],
+  };
+  assert.equal(applyCopiedWidgetState([target], getVerifiedWidgetState("fp-a")), 1);
+  assert.equal(target.widgets[0].value, false);
+  clearCopiedWidgetState();
+});
+
 test("layoutOrigin is the top-left of nodes and groups", () => {
   assert.deepEqual(
     layoutOrigin(
@@ -500,6 +591,58 @@ test("#1294 shipped copy+paste keeps groups and distinct branch y-positions", ()
   const deltas = loraYs.slice(1).map((y, i) => y - loraYs[i]);
   const expected = BRANCH_YS.slice(1).map((y, i) => y - BRANCH_YS[i]);
   assert.deepEqual(deltas, expected, "one consistent translation — relative branch spacing held");
+});
+
+test("#1761 shipped copy+paste preserves VideoTileLivePlanner roi_enabled", () => {
+  clearInMemoryClipboard();
+  clearCopiedLayout();
+  clearCopiedWidgetState();
+  const src = makeFrontend();
+  const source = addVideoTile(src.graph, { roiEnabled: true });
+  const { copy, makePaster } = shippedCopyPaste(src.graph, src.canvas, src.LG);
+
+  const copied = copy({ node_ids: [source.id] });
+  assert.equal(copied.copied, 1);
+  const clipboard = JSON.parse(getInMemoryClipboard());
+  assert.equal(clipboard.nodes[0].widgets_values[0], source.widgets[0].value);
+  assert.equal(clipboard.nodes[0].widgets_values.length, 1, "native clone omitted roi_enabled");
+
+  const dst = makeFrontend();
+  const paste = makePaster(dst.graph, dst.canvas, dst.LG);
+  const result = paste({ pos: [500, 500], connect_inputs: false });
+  assert.equal(result.pasted_count, 1);
+  const pasted = dst.graph._nodes[0];
+  assert.equal(pasted.widgets.find((w) => w.name === "roi_enabled").value, true);
+  assert.equal(
+    pasted.widgets.find((w) => w.name === "planner_state").value,
+    source.widgets.find((w) => w.name === "planner_state").value,
+  );
+  clearCopiedWidgetState();
+});
+
+test("#1761 a same-byte native copy invalidates the panel widget snapshot", () => {
+  clearInMemoryClipboard();
+  clearCopiedLayout();
+  clearCopiedWidgetState();
+  const src = makeFrontend();
+  const source = addVideoTile(src.graph, { roiEnabled: true });
+  const { copy, makePaster, storage } = shippedCopyPaste(src.graph, src.canvas, src.LG);
+
+  copy({ node_ids: [source.id] });
+  const panelClipboard = getInMemoryClipboard();
+  source.widgets.find((w) => w.name === "roi_enabled").value = false;
+
+  // Native Ctrl+C uses the same canvas API, but is outside the panel-owned
+  // provenance scope. The omitted roi_enabled keeps the serialized bytes equal.
+  src.canvas.copyToClipboard([source]);
+  assert.equal(storage.getItem(CLIPBOARD_KEY), panelClipboard, "native copy reproduced identical bytes");
+  assert.equal(getVerifiedWidgetState(panelClipboard), null, "native copy invalidated stale panel state");
+
+  const dst = makeFrontend();
+  const paste = makePaster(dst.graph, dst.canvas, dst.LG);
+  paste({ pos: [500, 500], connect_inputs: false });
+  assert.equal(dst.graph._nodes[0].widgets.find((w) => w.name === "roi_enabled").value, false);
+  clearCopiedWidgetState();
 });
 
 test("#1294 still recreates groups when LiteGraph paste drops them", () => {

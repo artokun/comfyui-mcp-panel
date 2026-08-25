@@ -567,6 +567,7 @@ import {
 import { planComposerPaste, orphanAttachmentTokens } from "./lib/composer-paste.js";
 import {
   withInMemoryClipboard,
+  withClipboardCopyProvenance,
   getInMemoryClipboard,
   getEffectiveClipboard,
   CLIPBOARD_KEY,
@@ -574,10 +575,15 @@ import {
 import {
   collectCopySelection,
   snapshotCopyLayout,
+  snapshotCopyWidgetState,
   patchClipboardLayout,
   parseClipboardLayout,
   recordCopiedLayout,
   getVerifiedLayout,
+  recordCopiedWidgetState,
+  getVerifiedWidgetState,
+  clearCopiedWidgetState,
+  applyCopiedWidgetState,
   applyPastedLayout,
   resolvePasteDest,
 } from "./lib/copy-paste-layout.js";
@@ -21785,6 +21791,7 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     if (typeof canvas.selectItems === "function") canvas.selectItems(selection.items);
     const layout = snapshotCopyLayout(graph, selection);
+    const widgetState = snapshotCopyWidgetState(selection);
     // panel#500: copyToClipboard persists the payload in localStorage, which
     // throws QuotaExceededError ("The quota has been exceeded.") once a large
     // multi-node selection overflows the ~5–10 MB quota — the copy then failed
@@ -21799,12 +21806,14 @@ const GRAPH_TOOL_EXECUTORS = {
       storage = null;
     }
     withInMemoryClipboard(storage, () => {
-      canvas.copyToClipboard(selection.items);
-      const raw = storage && typeof storage.getItem === "function" ? storage.getItem(CLIPBOARD_KEY) : getInMemoryClipboard();
-      const patched = patchClipboardLayout(raw, layout);
-      if (patched && patched !== raw && storage && typeof storage.setItem === "function") {
-        storage.setItem(CLIPBOARD_KEY, patched);
-      }
+      withClipboardCopyProvenance(canvas, clearCopiedWidgetState, () => {
+        canvas.copyToClipboard(selection.items);
+        const raw = storage && typeof storage.getItem === "function" ? storage.getItem(CLIPBOARD_KEY) : getInMemoryClipboard();
+        const patched = patchClipboardLayout(raw, layout);
+        if (patched && patched !== raw && storage && typeof storage.setItem === "function") {
+          storage.setItem(CLIPBOARD_KEY, patched);
+        }
+      });
     });
     // Snapshot the copied node types (plus a fingerprint of the clipboard
     // payload AFTER the copy) so the next graph_paste_nodes can detect any node
@@ -21815,6 +21824,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const fingerprint = getInMemoryClipboard();
     recordCopiedNodes(selection.nodes, fingerprint);
     recordCopiedLayout(layout, fingerprint);
+    recordCopiedWidgetState(widgetState, fingerprint);
     // #286: never report a clean copy that can't round-trip. Any copied node
     // whose type is unregistered on THIS frontend (uninstalled custom-node pack)
     // will be silently dropped by a later paste — the destination is the same
@@ -21867,6 +21877,7 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       withInMemoryClipboard(storage, () => canvas.pasteFromClipboard(options));
       const pastedNodes = (graph._nodes ?? []).filter((n) => !before.has(n.id));
+      applyCopiedWidgetState(pastedNodes, getVerifiedWidgetState(rawClipboard));
       // #1411 — LiteGraph's paste configures properties VERBATIM from the
       // clipboard payload, so a copied node (e.g. one cut from an older,
       // unsanitized workflow, or a native Ctrl+C of an externally-authored
@@ -41490,6 +41501,7 @@ function buildPanel() {
     setChatSurface: cmcpSetChatSurface, // A2UI seam: widen/restore the chat surface
     destroy() {
       launcherStartGeneration += 1;
+      clearCopiedWidgetState();
       try {
         recognition?.stop();
       } catch {
