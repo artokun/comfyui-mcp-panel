@@ -16,6 +16,7 @@ import {
   collectAllGraphs,
   comboRebuildCovered,
   isStaleAssetCandidate as isStaleAssetCandidateLib,
+  reapplyDefsToLiveNodes,
   resolveMissingModelDirectory,
 } from "../../web/js/lib/asset-staleness.js";
 import { withoutFrontendVirtualTypes } from "../../web/js/lib/frontend-virtual-nodes.js";
@@ -55,7 +56,13 @@ const RELAY = 3000;
 const FETCH_MS = 2080;
 const BLOCK_MS = 1500;
 
-function buildRun({ appValue, apiValue, withTimeoutImpl = withTimeout, runBudgetMs = 9000 }) {
+function buildRun({
+  appValue,
+  apiValue,
+  reapplyDefsToLiveNodesImpl = () => {},
+  withTimeoutImpl = withTimeout,
+  runBudgetMs = 9000,
+}) {
   const body = extractFunction("async function registerComfyNodeDefs(");
   const names = [
     "app", "api", "recordObjectInfoTypes", "reapplyDefsToLiveNodes", "comboRebuildCovered",
@@ -69,7 +76,7 @@ function buildRun({ appValue, apiValue, withTimeoutImpl = withTimeout, runBudget
   const vals = {
     app: appValue, api: apiValue,
     recordObjectInfoTypes: () => ({}),
-    reapplyDefsToLiveNodes: () => {},
+    reapplyDefsToLiveNodes: reapplyDefsToLiveNodesImpl,
     comboRebuildCovered,
     describeNodeDefRefresh,
     NODE_DEF_REFRESH_REASONS,
@@ -163,6 +170,20 @@ function deferred() {
   let resolve;
   const promise = new Promise((r) => { resolve = r; });
   return { promise, resolve };
+}
+
+async function withWatchdog(promise, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label)), 1500);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 test("#1562: refresh_nodes answers before synchronous reapply and keeps registration single-flight", async () => {
@@ -337,6 +358,90 @@ test("#1695: late combo work is fenced before reconnect successor and collector 
   collector.setRefreshConfirmed(built.getConfirmed());
   assert.equal(collector.collectMissingAssets().models.length, 0, "collectMissingAssets sees only the settled successor");
   assert.equal(inFlight, null, "the fenced lifecycle returns to idle");
+});
+
+test("#1736: covered local combo rebuild avoids a stuck duplicate and recovers after concurrent completion", async () => {
+  const firstFetch = deferred();
+  const recoveryFetch = deferred();
+  const defs = {
+    TestLoader: {
+      input: { required: { model: [["fresh.safetensors"], {}] } },
+    },
+  };
+  const comboWidget = { name: "model", options: { values: ["stale.safetensors"] } };
+  const rootGraph = {
+    _nodes: [{ type: "TestLoader", widgets: [comboWidget], constructor: {} }],
+  };
+  let fetches = 0;
+  let comboCalls = 0;
+  let backgroundPhase = true;
+  const appValue = {
+    graph: rootGraph,
+    registerNodesFromDefs: async () => {},
+    refreshComboInNodes: () => {
+      comboCalls += 1;
+      return backgroundPhase ? new Promise(() => {}) : Promise.resolve();
+    },
+  };
+  const apiValue = {
+    getNodeDefs: async () => {
+      fetches += 1;
+      if (fetches === 1) await firstFetch.promise;
+      if (fetches === 3) await recoveryFetch.promise;
+      return defs;
+    },
+  };
+  const built = buildRun({
+    appValue,
+    apiValue,
+    reapplyDefsToLiveNodesImpl: reapplyDefsToLiveNodes,
+    runBudgetMs: 100,
+  });
+  let inFlight = null;
+  const refreshComfyNodeDefs = makeRefreshCoalescer({
+    getInFlight: () => inFlight,
+    setInFlight: (value) => { inFlight = value; },
+    runRegister: built.registerComfyNodeDefs,
+    withTimeout,
+  });
+  const refresh_nodes = buildRefreshNodes({ refreshComfyNodeDefs, commandBudget: 150 });
+
+  const background = refreshComfyNodeDefs(undefined, {
+    force: true,
+    skipDuplicateComboRefresh: true,
+  });
+  const acknowledgement = refresh_nodes();
+  const completion = refreshComfyNodeDefs(undefined, {
+    force: true,
+    skipDuplicateComboRefresh: true,
+  });
+  firstFetch.resolve();
+
+  const reply = await withWatchdog(acknowledgement, "panel_refresh_nodes stayed stuck");
+  await withWatchdog(Promise.all([background, completion]), "concurrent refresh completion stayed stuck");
+  backgroundPhase = false;
+  assert.deepEqual(reply, {
+    ok: true,
+    refreshed: true,
+    combo_refresh_confirmed: false,
+    combo_refresh_note:
+      "Node definitions WERE re-registered from a fresh /object_info, and the panel rebuilt every " +
+      "combo widget's option list on the live graph from that same payload. The frontend's duplicate " +
+      "refreshComboInNodes() call was skipped because those lists are already current.",
+  });
+  assert.equal(comboCalls, 0, "a covered local rebuild does not start the duplicate frontend refresh");
+  assert.deepEqual(comboWidget.options.values, ["fresh.safetensors"]);
+  assert.equal(inFlight, null, "the concurrent completion releases the shared slot");
+
+  const recoveryRun = refreshComfyNodeDefs(undefined, { force: true });
+  const recoveredPromise = refresh_nodes();
+  recoveryFetch.resolve();
+  const recovered = await withWatchdog(recoveredPromise, "refresh_nodes did not recover after completion");
+  await withWatchdog(recoveryRun, "the recovery refresh did not complete");
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.refreshed, true);
+  assert.equal(comboCalls, 1, "recovery may use the normal frontend confirmation path");
+  assert.equal(inFlight, null, "the recovery run also returns the slot to idle");
 });
 
 test("#1562: a later bounded caller upgrades an already-queued trailing run", async () => {

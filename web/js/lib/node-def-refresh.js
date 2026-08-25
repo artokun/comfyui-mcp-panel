@@ -71,6 +71,8 @@ function detailSuffix(thrown) {
  *                              // this panel did and counted. Both false is "stale";
  *                              // collapsing them into one flag is what made an abandoned
  *                              // frontend call read as stale combos it had already fixed.
+ *   comboRefreshSkipped?: boolean, // #1736 — the panel skipped the duplicate frontend call
+ *                              // because that local rebuild already covered every live combo.
  *   comboWaitMs?: number|null, // the bound the combo phase was actually given, so an
  *                              // abandoned phase can say whether it was STARVED by a slow
  *                              // fetch or given its whole allowance and still hung
@@ -101,6 +103,7 @@ export function describeNodeDefRefresh({
   comboApiPresent,
   comboRan,
   comboRebuiltLocally = false,
+  comboRefreshSkipped = false,
   comboWaitMs = null,
   phase = "done",
   didThrow,
@@ -282,11 +285,14 @@ export function describeNodeDefRefresh({
         combo_refresh_confirmed: false,
         combo_refresh_note:
           `${registrationClause}, and the panel rebuilt every combo widget's option list ` +
-          "on the live graph from that same payload. The frontend's own refreshComboInNodes() " +
-          "had not answered when this run stopped waiting for it" +
-          (comboWaitMs ? ` (it was given ${comboWaitMs}ms)` : "") +
-          " — it is still running and will re-apply the same definitions when it finishes. " +
-          "The dropdown lists are current; only that call's completion is unconfirmed.",
+          (comboRefreshSkipped
+            ? "on the live graph from that same payload. The frontend's duplicate " +
+              "refreshComboInNodes() call was skipped because those lists are already current."
+            : "on the live graph from that same payload. The frontend's own refreshComboInNodes() " +
+              "had not answered when this run stopped waiting for it" +
+              (comboWaitMs ? ` (it was given ${comboWaitMs}ms)` : "") +
+              " — it is still running and will re-apply the same definitions when it finishes. " +
+              "The dropdown lists are current; only that call's completion is unconfirmed."),
       };
     }
     // Nothing rebuilt the lists — neither the frontend's call nor this panel's sweep

@@ -190,7 +190,8 @@ async function waitForRun(
 //   runRegister(preloadedDefs, runOpts, runControl) : performs the actual (idempotent)
 //                                registration; its own cleanup must NOT clear the slot —
 //                                the coalescer owns the slot lifecycle. `runOpts` is the
-//                                caller's `{ runBudgetMs }`, forwarded verbatim. `runControl`
+//                                caller's `{ runBudgetMs, preloadedWholeSchema,
+//                                skipDuplicateComboRefresh }`, forwarded verbatim. `runControl`
 //                                carries the pre-local-work handoff used by a bounded caller,
 //                                plus `deferCompletion(promise)` for work that may outlive
 //                                the register function's observation budget but still owns
@@ -346,10 +347,14 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     // #1562 — the caller's RUN allowance, forwarded to every `startRun` below. Built here,
     // once, so no branch can start a run under a different budget than its siblings.
     const runOpts =
-      opts && (Number.isFinite(opts.runBudgetMs) || opts.preloadedWholeSchema === true)
+      opts &&
+      (Number.isFinite(opts.runBudgetMs) ||
+        opts.preloadedWholeSchema === true ||
+        opts.skipDuplicateComboRefresh === true)
         ? {
             ...(Number.isFinite(opts.runBudgetMs) ? { runBudgetMs: opts.runBudgetMs } : {}),
             ...(opts.preloadedWholeSchema === true ? { preloadedWholeSchema: true } : {}),
+            ...(opts.skipDuplicateComboRefresh === true ? { skipDuplicateComboRefresh: true } : {}),
           }
         : undefined;
     const abandonBeforeLocalWork = !!(opts && opts.abandonBeforeLocalWork);

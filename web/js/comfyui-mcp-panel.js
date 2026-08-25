@@ -1457,6 +1457,11 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // sweep had already rebuilt the lists. Narrower than `comboRebuild.completed`, and
   // deliberately so: see the note where it is set.
   let comboAbandonedAfterRebuild = false;
+  // #1736 — when the panel's own sweep covered every live combo, the frontend's
+  // refreshComboInNodes() would only repeat the same work with another /object_info
+  // request. Keep that duplicate operation out of the single-flight lifecycle: a
+  // frontend promise that never settles must not strand every later refresh_nodes call.
+  let comboRebuiltLocally = false;
   let phase = "fetch";
   // #1180 — ONE deadline for this whole run. Every bounded phase below draws from what is
   // left of it, so the run's cost is this budget rather than the sum of numbers that each
@@ -1966,6 +1971,7 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       // #1193 — the third argument records what this sweep OBSERVABLY did (#1172 made it
       // rebuild every combo's option list from `defs`). The combo phase below reads it.
       if (rootGraph) reapplyDefsToLiveNodes(rootGraph, defs, comboRebuild);
+      comboRebuiltLocally = comboRebuildCovered(comboRebuild);
     }
     // Hand back the time the unbounded local work took. After this, what remains of the
     // deadline is what remains of the WAITING allowance, which is what the phase below
@@ -1975,7 +1981,14 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     // models resolve and stale entries clear (#185/#181/#223).
     phase = "combo";
     comboApiPresent = typeof a.refreshComboInNodes === "function";
-    if (comboApiPresent) {
+    if (comboApiPresent && comboRebuiltLocally && runOpts?.skipDuplicateComboRefresh === true) {
+      // #1736 — reapplyDefsToLiveNodes() has already rebuilt every live combo from
+      // this run's authoritative payload. Calling refreshComboInNodes() here would
+      // re-fetch the same schema and can remain pending behind concurrent downloads,
+      // leaving the shared refresh slot stuck forever. The local rebuild is the
+      // observed freshness proof, so no duplicate frontend operation is needed.
+      phase = "done";
+    } else if (comboApiPresent) {
       // #1180 — BOUNDED, and this was the fifth place the same mistake had to be found.
       // The fetch phase above is bounded, but `refreshComboInNodes()` issues its own
       // /object_info request (see the note at the combo-trust check), so a connection that
@@ -2089,7 +2102,10 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
               runStartedAtEpoch === backendReconnectEpoch &&
               runStartedAtGeneration === verifiedNodeDefCache.generation();
             nodeDefsRefreshConfirmed =
-              currentRun && !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
+              currentRun &&
+              !didThrow &&
+              !!defs &&
+              (comboRan || (!comboFailed && (comboRebuiltLocally || comboAbandonedAfterRebuild)));
             const lateVerdict = buildRefreshVerdict?.();
             if (!lateVerdict || !initialRefreshVerdict) return initialRefreshVerdict;
             // The late phase can revise only combo freshness. Preserve disclosures produced
@@ -2214,7 +2230,11 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       runStartedAtEpoch === backendReconnectEpoch &&
       runStartedAtGeneration === verifiedNodeDefCache.generation();
     nodeDefsRefreshConfirmed =
-      runIsCurrent && !comboCompletionPending && !didThrow && !!defs && (comboRan || comboAbandonedAfterRebuild);
+      runIsCurrent &&
+      !comboCompletionPending &&
+      !didThrow &&
+      !!defs &&
+      (comboRan || (!comboFailed && (comboRebuiltLocally || comboAbandonedAfterRebuild)));
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
   // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
@@ -2236,7 +2256,9 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
         comboRan,
         // #1193 — the panel's own sweep, reported separately from the frontend's call so the
         // verdict can say which one made the dropdowns current.
-        comboRebuiltLocally: comboAbandonedAfterRebuild,
+        comboRebuiltLocally: comboRebuiltLocally || comboAbandonedAfterRebuild,
+        comboRefreshSkipped:
+          comboApiPresent && comboRebuiltLocally && runOpts?.skipDuplicateComboRefresh === true,
         comboWaitMs,
         phase,
         didThrow,
@@ -35773,7 +35795,15 @@ function buildPanel() {
       // fresh fetch that reflects the just-landed file (#396 completion race).
       const { nextSeen, newlyDone } = reconcileCompletedDownloads(list, seenDoneDownloads);
       seenDoneDownloads = nextSeen;
-      if (newlyDone.length) void refreshComfyNodeDefs(undefined, { force: true });
+      if (newlyDone.length) {
+        void refreshComfyNodeDefs(undefined, {
+          force: true,
+          // #1736 — this background refresh already fetched the authoritative schema and
+          // re-applies every live combo locally. Do not launch the duplicate frontend call
+          // that can remain pending forever while concurrent downloads are draining.
+          skipDuplicateComboRefresh: true,
+        });
+      }
     },
     // Live RunPod pod status → the host pill + open control modal.
     onRunpodStatus(frame) {
