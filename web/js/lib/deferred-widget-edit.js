@@ -57,6 +57,7 @@ export function createDeferredWidgetEditQueue({
   let sequence = 0;
   let timer = null;
   let closed = false;
+  let inFlightDrain = null;
 
   function receiptId() {
     sequence += 1;
@@ -87,7 +88,7 @@ export function createDeferredWidgetEditQueue({
     }, Math.max(0, delay));
   }
 
-  async function drain() {
+  async function drainOnce() {
     if (closed || entries.size === 0) return;
 
     const currentTime = now();
@@ -149,6 +150,35 @@ export function createDeferredWidgetEditQueue({
       }
     }
     if (entries.size) schedule(0);
+  }
+
+  // A timer callback can overlap an earlier async drain (and callers can also
+  // trigger the callback twice in the same turn). Keep one drain authoritative
+  // so every receipt is read, applied, and settled at most once. If the
+  // overlapping callback consumed the pending timer while the first run was
+  // still awaiting the queue probe, start one serialized follow-up afterward.
+  function drain() {
+    if (inFlightDrain) {
+      const active = inFlightDrain;
+      void active.then(
+        () => {
+          if (!closed && entries.size > 0 && timer === null) void drain();
+        },
+        () => {},
+      );
+      return active;
+    }
+    const run = drainOnce();
+    inFlightDrain = run;
+    void run.then(
+      () => {
+        if (inFlightDrain === run) inFlightDrain = null;
+      },
+      () => {
+        if (inFlightDrain === run) inFlightDrain = null;
+      },
+    );
+    return run;
   }
 
   function enqueue({ node_id, widget, expected_value, value, readCurrent, apply } = {}) {

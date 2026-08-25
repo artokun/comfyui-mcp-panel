@@ -12405,6 +12405,19 @@ function deferredWidgetSafetyReason(node, widgetName, value, expectedValue) {
   if (!isSafeDeferredWidgetValue(value) || !isSafeDeferredWidgetValue(expectedValue)) {
     return "the deferred path accepts only scalar widget values";
   }
+  let promotedResolution;
+  try {
+    // The normal writer resolves this route to an inner widget and synchronizes
+    // one or more parent rails. A deferred scalar replay cannot carry that
+    // multi-object transaction, so refuse every recognized promotion before it
+    // can fall through to the host widget by name.
+    promotedResolution = resolvePromotedInnerTarget(node, widgetName, () => null);
+  } catch {
+    return `widget "${widgetName}" has an unreadable promoted/subgraph route; the deferred path fails closed`;
+  }
+  if (promotedResolution?.promoted) {
+    return `widget "${widgetName}" is a promoted/subgraph route and cannot be deferred safely`;
+  }
   const target = Array.isArray(node.widgets)
     ? node.widgets.find((candidate) => candidate?.name === widgetName)
     : null;
@@ -12421,6 +12434,7 @@ function deferredWidgetSafetyReason(node, widgetName, value, expectedValue) {
   }
   if (
     typeof target.beforeQueued === "function" ||
+    typeof target.afterQueued === "function" ||
     typeof target.serializeValue === "function" ||
     Array.isArray(target.linkedWidgets) && target.linkedWidgets.length > 0 ||
     typeof target.options?.values === "function"

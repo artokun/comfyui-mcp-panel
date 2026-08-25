@@ -15,8 +15,13 @@ import {
   isSafeDeferredWidgetValue,
   sameDeferredWidgetValue,
 } from "../../web/js/lib/deferred-widget-edit.js";
+import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
 
 const panelSource = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const scopedBatchSeedSource = readFileSync(
+  new URL("../../web/js/lib/scoped-batch-seed.js", import.meta.url),
+  "utf8",
+).replace(/\r\n/g, "\n");
 
 test("#1716 queue status requires both running and pending lists", () => {
   assert.deepEqual(deferredWidgetQueueCounts({ queue_running: [1], queue_pending: [2, 3] }), {
@@ -119,6 +124,49 @@ test("#1716 helper refuses a changed expected value without calling apply", asyn
   edits.close();
 });
 
+test("#1716 overlapping drains apply each parked edit at most once", async () => {
+  const timers = [];
+  const applied = [];
+  let releaseApply;
+  const applyGate = new Promise((resolve) => {
+    releaseApply = resolve;
+  });
+  const edits = createDeferredWidgetEditQueue({
+    readQueue: async () => ({ queue_running: [], queue_pending: [] }),
+    setTimer: (fn) => {
+      timers.push(fn);
+      return fn;
+    },
+    clearTimer: () => {},
+  });
+
+  for (const label of ["first", "second"]) {
+    edits.enqueue({
+      node_id: 3,
+      widget: label,
+      expected_value: "old",
+      value: "new",
+      readCurrent: async () => ({ ok: true, value: "old" }),
+      apply: async () => {
+        applied.push(label);
+        await applyGate;
+      },
+    });
+  }
+
+  const timer = timers.shift();
+  timer();
+  timer();
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseApply();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(applied, ["first", "second"]);
+  assert.equal(edits.pending(), 0);
+  edits.close();
+});
+
 function buildProductionDeferredSafety() {
   const safetyStart = panelSource.indexOf("function deferredWidgetSafetyReason(");
   const safetyEnd = panelSource.indexOf("\n\nconst GRAPH_TOOL_EXECUTORS", safetyStart);
@@ -126,6 +174,7 @@ function buildProductionDeferredSafety() {
   const safety = new Function(
     "isSafeDeferredWidgetValue",
     "sameDeferredWidgetValue",
+    "resolvePromotedInnerTarget",
     "classifyMiniMaxH3DirectorWrite",
     "classifyLtxTimelineWrite",
     "classifyPromptRelayTimelineWrite",
@@ -136,6 +185,7 @@ function buildProductionDeferredSafety() {
   )(
     isSafeDeferredWidgetValue,
     sameDeferredWidgetValue,
+    resolvePromotedInnerTarget,
     () => null,
     () => null,
     () => null,
@@ -271,6 +321,50 @@ test("#1716 production graph_set_widget refuses callback-driven widgets before p
   assert.equal(run.deferredQueue.pending(), 0);
   assert.equal(node.widgets[0].value, "old");
   run.deferredQueue.close();
+});
+
+test("#1716 production classifier refuses afterQueued-only widgets", async () => {
+  assert.match(scopedBatchSeedSource, /widget\.beforeQueued\?\./);
+  assert.match(scopedBatchSeedSource, /executeWidgetsCallback\(queuedNodes, ['"]afterQueued['"]/);
+  const node = {
+    id: 7,
+    type: "CustomPrompt",
+    widgets: [{ name: "text", value: "old", afterQueued: () => {} }],
+  };
+  const run = runProductionDeferredBranch({
+    node,
+    queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+  });
+  await assert.rejects(run.call(), /queue-time or composite behavior/);
+  assert.equal(run.deferredQueue.pending(), 0);
+  assert.equal(node.widgets[0].value, "old");
+  run.deferredQueue.close();
+});
+
+test("#1716 production classifier refuses generic promoted subgraph scalar routes", async () => {
+  const node = {
+    id: 7,
+    type: "SubgraphNode",
+    subgraph: { _nodes: [] },
+    inputs: [{ name: "text", _subgraphSlot: { name: "text", linkIds: [] } }],
+    widgets: [{ name: "text", value: "old" }],
+  };
+  const run = runProductionDeferredBranch({
+    node,
+    queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+  });
+  await assert.rejects(run.call(), /promoted\/subgraph route/);
+  assert.equal(run.deferredQueue.pending(), 0);
+  assert.equal(node.widgets[0].value, "old");
+  run.deferredQueue.close();
+});
+
+test("#1716 production classifier still permits an ordinary safe scalar widget", () => {
+  const { safety } = buildProductionDeferredSafety();
+  assert.equal(
+    safety({ type: "KSampler", widgets: [{ name: "text", value: "old" }] }, "text", "new", "old"),
+    null,
+  );
 });
 
 test("#1716 production graph_set_widget refuses a stale expected value", async () => {
