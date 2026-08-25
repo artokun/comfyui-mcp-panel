@@ -1175,20 +1175,8 @@ test("#654: a benign WS blip is NOT a restart", () => {
   assert.equal(shouldReadvertiseAfterComfyRestart({ bridgeConnected: true, outageMs: 6000 }), true);
 });
 
-test("#1785: a confirmed fast restart re-advertises the live route", () => {
-  assert.equal(
-    shouldReadvertiseAfterComfyRestart({
-      bridgeConnected: true,
-      outageMs: 800,
-      restartConfirmed: true,
-    }),
-    true,
-    "an accepted restart marker overrides the duration heuristic",
-  );
-});
-
-test("#1785: a stale restart marker cannot authorize a re-hello without a measured outage", () => {
-  for (const outageMs of [0, undefined, NaN, Infinity, "800"]) {
+test("#1785: a stale restart marker cannot authorize a positive short outage", () => {
+  for (const outageMs of [800, 0, undefined, NaN, Infinity, "800"]) {
     assert.equal(
       shouldReadvertiseAfterComfyRestart({
         bridgeConnected: true,
@@ -1196,7 +1184,7 @@ test("#1785: a stale restart marker cannot authorize a re-hello without a measur
         restartConfirmed: true,
       }),
       false,
-      `unmeasured outage ${String(outageMs)} must fail closed`,
+      `stale marker must not bypass the duration gate for outage ${String(outageMs)}`,
     );
   }
 });
@@ -1405,13 +1393,14 @@ test("#654 wiring: the panel measures, feeds and consults the outage — every s
       "the one-shot claim is stamped from the tracker's own outage identity",
       "      comfyRestartReadvertisedSeq = comfyBackendOutage.seq();",
     ],
-    [
-      "a panel-confirmed restart reaches the duration gate",
-      "        restartConfirmed: readRebootMarker() !== null,",
-    ],
   ]) {
     assert.ok(src.includes(snippet), site);
   }
+  assert.doesNotMatch(
+    src,
+    /restartConfirmed\s*:/,
+    "the persisted reboot marker must not authorize a route re-hello for an uncorrelated outage",
+  );
   // …and the branch RE-ADVERTISES. Asserted POSITIONALLY, not by presence: this
   // file already contains three other `client?.rehello?.()` calls (#607, #310,
   // #508), so a presence check stays green with THIS one deleted — the exact

@@ -38398,12 +38398,6 @@ function buildPanel() {
         // here is the #1138 double-ready-ack harm.
         helloLandedSinceOutage: landedHelloCount > comfyBackendOutage.helloBaseline(),
         alreadyReadvertised: comfyRestartReadvertisedSeq === comfyBackendOutage.seq(),
-        // #1785 — an accepted panel-triggered restart is stronger evidence than
-        // the six-second blip heuristic. A fast restart still invalidates the
-        // orchestrator's cached tab route, so it must re-advertise before the
-        // next panel_set_workflow_target workflow_list probe. The predicate
-        // still requires a measured down/up interval and the one-shot guards.
-        restartConfirmed: readRebootMarker() !== null,
       })
     ) {
       // Claimed BEFORE the send, so a `reconnected` that repeats cannot fire a
