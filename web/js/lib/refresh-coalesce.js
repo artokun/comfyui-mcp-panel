@@ -434,6 +434,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       }
       if (!trailing) {
         let earlyYieldRequested = abandonBeforeLocalWork;
+        let queuedRunOpts = runOpts;
         let queuedHandle = null;
         const queued = (async () => {
           try {
@@ -442,7 +443,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
             /* the in-flight refresh failed — run our own anyway */
           }
           trailing = null;
-          queuedHandle = startRun(undefined, runOpts, earlyYieldRequested);
+          queuedHandle = startRun(undefined, queuedRunOpts, earlyYieldRequested);
           return queuedHandle;
         })();
         trailing = {
@@ -457,8 +458,21 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
           requestEarlyYield: () => {
             earlyYieldRequested = true;
           },
+          // #1736 — a later forced caller may carry the skip option that the queued
+          // successor needs before it starts. Preserve the first caller's budget/options,
+          // then monotonically add this freshness optimization; once the successor starts,
+          // `trailing` is cleared and its run options are immutable.
+          upgradeRunOpts: (nextRunOpts) => {
+            if (nextRunOpts?.skipDuplicateComboRefresh !== true) return;
+            queuedRunOpts = { ...(queuedRunOpts ?? {}), skipDuplicateComboRefresh: true };
+          },
         };
         current.attachNextCompletion?.(trailing);
+      } else {
+        // #1736 — the trailing run is shared, but its options are not frozen until the
+        // queued successor begins. A download completion arriving after a no-skip forced
+        // caller must still upgrade that successor to skip the duplicate frontend call.
+        trailing.upgradeRunOpts?.(runOpts);
       }
       return waitForRun(
         trailing,

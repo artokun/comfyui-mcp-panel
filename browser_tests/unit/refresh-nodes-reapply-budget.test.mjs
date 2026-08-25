@@ -11,6 +11,7 @@ import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/j
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { fetchWholeObjectInfo, TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
+import { reconcileCompletedDownloads } from "../../web/js/lib/download-refresh.js";
 import { describeNodeDefRefresh, NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import {
   collectAllGraphs,
@@ -170,6 +171,20 @@ function deferred() {
   let resolve;
   const promise = new Promise((r) => { resolve = r; });
   return { promise, resolve };
+}
+
+const ON_DOWNLOADS_BODY = extractFunction("onDownloads(list)");
+
+function buildOnDownloads(refreshComfyNodeDefs) {
+  const factory = new Function(
+    "reconcileCompletedDownloads",
+    "refreshComfyNodeDefs",
+    "renderDownloads",
+    `let seenDoneDownloads = new Set();
+     const executors = {${ON_DOWNLOADS_BODY}};
+     return executors.onDownloads;`,
+  );
+  return factory(reconcileCompletedDownloads, refreshComfyNodeDefs, () => {});
 }
 
 async function withWatchdog(promise, label) {
@@ -360,7 +375,7 @@ test("#1695: late combo work is fenced before reconnect successor and collector 
   assert.equal(inFlight, null, "the fenced lifecycle returns to idle");
 });
 
-test("#1736: covered local combo rebuild avoids a stuck duplicate and recovers after concurrent completion", async () => {
+test("#1736: download completion upgrades a queued no-skip refresh and recovers", async () => {
   const firstFetch = deferred();
   const recoveryFetch = deferred();
   const defs = {
@@ -380,6 +395,7 @@ test("#1736: covered local combo rebuild avoids a stuck duplicate and recovers a
     registerNodesFromDefs: async () => {},
     refreshComboInNodes: () => {
       comboCalls += 1;
+      if (comboCalls === 1) return Promise.resolve();
       return backgroundPhase ? new Promise(() => {}) : Promise.resolve();
     },
   };
@@ -406,19 +422,16 @@ test("#1736: covered local combo rebuild avoids a stuck duplicate and recovers a
   });
   const refresh_nodes = buildRefreshNodes({ refreshComfyNodeDefs, commandBudget: 150 });
 
-  const background = refreshComfyNodeDefs(undefined, {
-    force: true,
-    skipDuplicateComboRefresh: true,
-  });
+  const current = refreshComfyNodeDefs(undefined, { force: true });
+  const reconnect = refreshComfyNodeDefs(undefined, { force: true });
+  const onDownloads = buildOnDownloads(refreshComfyNodeDefs);
+  onDownloads([{ id: "d1", status: "downloading" }]);
+  onDownloads([{ id: "d1", status: "done" }]);
   const acknowledgement = refresh_nodes();
-  const completion = refreshComfyNodeDefs(undefined, {
-    force: true,
-    skipDuplicateComboRefresh: true,
-  });
   firstFetch.resolve();
 
   const reply = await withWatchdog(acknowledgement, "panel_refresh_nodes stayed stuck");
-  await withWatchdog(Promise.all([background, completion]), "concurrent refresh completion stayed stuck");
+  await withWatchdog(Promise.all([current, reconnect]), "concurrent refresh completion stayed stuck");
   backgroundPhase = false;
   assert.deepEqual(reply, {
     ok: true,
@@ -429,7 +442,7 @@ test("#1736: covered local combo rebuild avoids a stuck duplicate and recovers a
       "combo widget's option list on the live graph from that same payload. The frontend's duplicate " +
       "refreshComboInNodes() call was skipped because those lists are already current.",
   });
-  assert.equal(comboCalls, 0, "a covered local rebuild does not start the duplicate frontend refresh");
+  assert.equal(comboCalls, 1, "download completion upgrades the queued run before its duplicate frontend refresh");
   assert.deepEqual(comboWidget.options.values, ["fresh.safetensors"]);
   assert.equal(inFlight, null, "the concurrent completion releases the shared slot");
 
@@ -440,7 +453,7 @@ test("#1736: covered local combo rebuild avoids a stuck duplicate and recovers a
   await withWatchdog(recoveryRun, "the recovery refresh did not complete");
   assert.equal(recovered.ok, true);
   assert.equal(recovered.refreshed, true);
-  assert.equal(comboCalls, 1, "recovery may use the normal frontend confirmation path");
+  assert.equal(comboCalls, 2, "recovery may use the normal frontend confirmation path");
   assert.equal(inFlight, null, "the recovery run also returns the slot to idle");
 });
 
