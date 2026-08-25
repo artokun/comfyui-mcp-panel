@@ -357,7 +357,7 @@ test("#1477 a genuine tab switch heals the root tag next to the re-hello", () =>
   assert.match(body, /client\?\.rehello\?\.\(\)/, "the session fence still republishes");
   assert.match(
     body,
-    /if \(!renaming\) tryHealStaleRootWorkflowIdentity\(\)/,
+    /if \(!renaming\) \{[\s\S]*?tryHealStaleRootWorkflowIdentity\(\)/,
     "and the root tag is restamped on the same switch, not a later graph command",
   );
   const heal = panelFunctionSource(PANEL_SRC, "tryHealStaleRootWorkflowIdentity", "stampGraphRootWorkflowUuid");
@@ -365,5 +365,29 @@ test("#1477 a genuine tab switch heals the root tag next to the re-hello", () =>
     heal,
     /assertGraphBoundToActiveWorkflow\(graph, rootGraph, graphCommandBindingBar\("graph_outline"\)\)/,
     "the heal is the shipped fence, not a second spelling of the proof",
+  );
+});
+
+test("#1854 a delayed canvas repaint keeps retrying the guarded root heal", () => {
+  const start = PANEL_SRC.indexOf("function onWorkflowMaybeChanged() {");
+  assert.notEqual(start, -1);
+  const body = PANEL_SRC.slice(start, PANEL_SRC.indexOf("\n  function renderHistory()", start));
+  const sameRouteStart = body.indexOf("if (wfid === currentWorkflowId) {");
+  const sameRoute = body.slice(sameRouteStart, body.indexOf("\n    const initial =", sameRouteStart));
+  assert.match(
+    sameRoute,
+    /staleRootHealDeadline > 0[\s\S]*?tryHealStaleRootWorkflowIdentity\(\)/,
+    "a same-route poll must retry a heal that raced the frontend repaint",
+  );
+  assert.match(
+    body,
+    /staleRootHealDeadline = monotonicNow\(\) \+ STALE_ROOT_HEAL_RETRY_WINDOW_MS[\s\S]*?tryHealStaleRootWorkflowIdentity\(\)/,
+    "the retry must be armed only by a genuine non-rename workflow switch",
+  );
+  const heal = panelFunctionSource(PANEL_SRC, "tryHealStaleRootWorkflowIdentity", "stampGraphRootWorkflowUuid");
+  assert.match(
+    heal,
+    /describeLiveCanvasBinding\(activeWorkflowRef\(\)\) !== "foreign"/,
+    "a read-only content bypass must not retire the retry while the root tag stays foreign",
   );
 });

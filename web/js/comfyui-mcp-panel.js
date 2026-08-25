@@ -3473,6 +3473,11 @@ let currentWorkflowKey = null;
 // place on rename/Save-As (path and the derived .key getter both change), so the
 // instance is the only stable identity a rename leaves intact.
 let currentWorkflowRef = null;
+// #1854 — a frontend tab switch can publish the new active workflow before its reused
+// root graph has finished repainting. Keep the #1477 root-heal eligible for a short,
+// bounded retry window instead of treating the first same-route poll as settled.
+const STALE_ROOT_HEAL_RETRY_WINDOW_MS = 5_000;
+let staleRootHealDeadline = 0;
 /**
  * Flush the live canvas into a workflow's ChangeTracker, and say what happened (#882).
  *
@@ -9250,8 +9255,13 @@ function tryHealStaleRootWorkflowIdentity() {
   try {
     const { graph, rootGraph } = getGraphCtx();
     assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar("graph_outline"));
+    // A read may pass through #995's content-only bypass while the conflicting tag is
+    // still present. That is useful for inspection but does not prove a mutation-ready
+    // binding, so keep the retry alive until the production guard actually restamps it.
+    return describeLiveCanvasBinding(activeWorkflowRef()) !== "foreign";
   } catch {
     /* best-effort — a canvas that cannot prove ownership stays tagged as it is */
+    return false;
   }
 }
 
@@ -35346,6 +35356,18 @@ function buildPanel() {
       // carried, so the settled case (the overwhelming majority of the 600ms ticks
       // that reach this line) costs one comparison and sends nothing.
       noteWorkflowIdentityDrift();
+      // #1854 — the first #1477 heal can race ComfyUI's async canvas repaint. The route
+      // is already current on the next poll, but the root may still carry the previous
+      // tab's tag. Re-run the SAME guarded heal only for the bounded window armed by a
+      // genuine switch; a foreign canvas remains fail-closed because the guard itself
+      // is unchanged.
+      if (staleRootHealDeadline > 0) {
+        if (monotonicNow() <= staleRootHealDeadline) {
+          if (tryHealStaleRootWorkflowIdentity()) staleRootHealDeadline = 0;
+        } else {
+          staleRootHealDeadline = 0;
+        }
+      }
       return; // case 1: no change
     }
 
@@ -35485,7 +35507,12 @@ function buildPanel() {
         // root tag when content proves the canvas is the new tab's. Together they
         // are the atomic identity update a tab switch was leaving split. A rename
         // is the same instance, so the tag already matches and this is a no-op.
-        if (!renaming) tryHealStaleRootWorkflowIdentity();
+        if (!renaming) {
+          staleRootHealDeadline = monotonicNow() + STALE_ROOT_HEAL_RETRY_WINDOW_MS;
+          if (tryHealStaleRootWorkflowIdentity()) staleRootHealDeadline = 0;
+        } else {
+          staleRootHealDeadline = 0;
+        }
         const name = wf?.filename || wfkey || wfid;
         client?.armContext?.(
           renaming
