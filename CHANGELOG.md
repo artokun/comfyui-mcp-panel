@@ -9,8 +9,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.15.83] - 2026-08-25
 
 ### Fixed
-- classify empty completion results
-- diagnose completion delivery outcomes
+- classify empty completion results (#1781)
+- diagnose completion delivery outcomes (#1781)
 
 
 ## [0.15.82] - 2026-08-25
