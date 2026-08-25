@@ -42,3 +42,24 @@ export function isQualifiedNodeId(nodeId) {
 export function canonicalNodeId(nodeId) {
   return isQualifiedNodeId(nodeId) ? nodeId : Number(nodeId);
 }
+
+/**
+ * #1759 — a custom node can mutate a live node's id without repairing
+ * LiteGraph's `_nodes_by_id` index. Reads enumerate `_nodes`, so using the
+ * index alone can send a write to a stale node with the same id (the reported
+ * H3One → MarkdownNote failure). When the live list is available, it is the
+ * authority; the index is only a compatibility fallback for graph-shaped
+ * doubles/older frontends that do not expose that list.
+ *
+ * A missing live-list match deliberately does not fall back to the index: a
+ * stale index entry is not proof that the node is still present.
+ */
+export function resolveLiveNode(graph, nodeId) {
+  const target = canonicalNodeId(nodeId);
+  const liveNodes = graph?._nodes ?? graph?.nodes;
+  if (Array.isArray(liveNodes)) {
+    const matches = liveNodes.filter((node) => node?.id != null && canonicalNodeId(node.id) === target);
+    return matches.length === 1 ? matches[0] : null;
+  }
+  return graph?.getNodeById?.(target) ?? null;
+}
