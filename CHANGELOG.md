@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.84] - 2026-08-25
+
+### Fixed
+- carry both frontend scope option keys (#1782)
+- classify empty completion results (#1781)
+- diagnose completion delivery outcomes (#1781)
+
+
 ## [0.15.83] - 2026-08-25
 
 ### Fixed
