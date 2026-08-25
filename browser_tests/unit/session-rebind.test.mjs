@@ -1407,7 +1407,7 @@ test("#654 wiring: the panel measures, feeds and consults the outage — every s
     ],
     [
       "a panel-confirmed restart reaches the duration gate",
-      "        restartConfirmed: Boolean(ssGet(REBOOT_KEY)),",
+      "        restartConfirmed: readRebootMarker() !== null,",
     ],
   ]) {
     assert.ok(src.includes(snippet), site);

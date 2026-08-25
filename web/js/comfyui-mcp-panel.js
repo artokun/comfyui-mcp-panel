@@ -38403,7 +38403,7 @@ function buildPanel() {
         // orchestrator's cached tab route, so it must re-advertise before the
         // next panel_set_workflow_target workflow_list probe. The predicate
         // still requires a measured down/up interval and the one-shot guards.
-        restartConfirmed: Boolean(ssGet(REBOOT_KEY)),
+        restartConfirmed: readRebootMarker() !== null,
       })
     ) {
       // Claimed BEFORE the send, so a `reconnected` that repeats cannot fire a
