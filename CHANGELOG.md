@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.89] - 2026-08-25
+
+### Fixed
+- rebind active and graph state after refusing to close an unsaved workflow (#1795)
+
 ## [0.15.88] - 2026-08-25
 
 ### Fixed
