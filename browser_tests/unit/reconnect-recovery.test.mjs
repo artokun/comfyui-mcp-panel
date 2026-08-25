@@ -671,10 +671,18 @@ test("#646 wiring: the dispatch fence gates MUTATING graph commands through the 
 test("#663 wiring: BOTH resync sites (open + new) stamp the binding proof, TOCTOU-guarded", () => {
   const stamps =
     SRC.match(/if \(backendReconnectEpoch === openedForEpoch\) postReconnectBindingProofEpoch = openedForEpoch;/g) ?? [];
-  // #1641's pre-load handshake wait and workflow_new retain the compact form. The
-  // final workflow_open stamp is deliberately conditional on its post-load active
-  // settle, so a failed settle cannot leave reconnect proof trusted.
-  assert.equal(stamps.length, 2, "workflow_new and the #1641 handshake wait");
+  // #1641's pre-load handshake wait retains the compact form. workflow_new now
+  // carries the same ownership and binding-generation fence as workflow_open, and
+  // the final workflow_open stamp remains conditional on its post-load active settle.
+  assert.equal(stamps.length, 1, "the #1641 handshake wait");
+  const newStart = SRC.indexOf("async workflow_new({");
+  const openStart = SRC.indexOf("async workflow_open({", newStart);
+  const newBody = SRC.slice(newStart, openStart);
+  assert.match(
+    newBody,
+    /ownsWorkflowReloadGuard\(reloadGuardToken\)[\s\S]*workflowBindingGeneration === bindingGeneration[\s\S]*backendReconnectEpoch === openedForEpoch[\s\S]*postReconnectBindingProofEpoch = openedForEpoch;/,
+    "workflow_new stamps proof only while its shared binding operation remains current",
+  );
   assert.match(
     SRC,
     /if \(!rebindFailed && backendReconnectEpoch === openedForEpoch\) \{[\s\S]*?postReconnectBindingProofEpoch = openedForEpoch;/,

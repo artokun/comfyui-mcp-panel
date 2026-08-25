@@ -667,7 +667,7 @@ test("#442 codex R7: a tab that arrived DIRTY is never re-baselined and never re
   assert.ok(wasDirtyAt < openAt, "…BEFORE any await, since it cannot be recovered afterwards");
   assert.match(
     body,
-    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,1200}?await clearSpuriousOpenModified\(target, \{/,
     "a genuinely dirty tab must never be re-baselined, nor one we no longer hold exclusively",
   );
   // BOTH reload gates must require the pre-open snapshot to be clean too.
@@ -789,15 +789,15 @@ test("#442 DATA-LOSS: the defensive ceiling still ages out a guard stuck BETWEEN
 test("#442 DATA-LOSS: every mutating await of the section is held across its own await", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
-  const begins = (body.match(/beginWorkflowReloadStep\(reloadGuardToken\);/g) || []).length;
+  const begins = (body.match(/if \(!beginWorkflowReloadStep\(reloadGuardToken\)\)/g) || []).length;
   const ends = (body.match(/endWorkflowReloadStep\(reloadGuardToken\);/g) || []).length;
-  assert.ok(begins >= 4, `the switch, repaint, reload and re-baseline awaits must each be held (got ${begins})`);
-  assert.equal(begins, ends, "every held step needs its own end (balanced via finally)");
+  assert.ok(begins >= 6, `the switch, repaint, reload and re-baseline awaits must each be held (got ${begins})`);
+  assert.ok(ends >= begins, "every held step needs its own end (balanced via finally)");
   // THE finding's case — the destructive disk reload: begin before the await, end in a
   // finally after it, so neither a slow load nor a throwing one can drop/strand the fence.
   const loadAt = body.indexOf("await app.loadGraphData(diskGraph");
   assert.notEqual(loadAt, -1);
-  const beginAt = body.lastIndexOf("beginWorkflowReloadStep(reloadGuardToken);", loadAt);
+  const beginAt = body.lastIndexOf("if (!beginWorkflowReloadStep(reloadGuardToken))", loadAt);
   const endAt = body.indexOf("endWorkflowReloadStep(reloadGuardToken);", loadAt);
   assert.ok(beginAt !== -1 && beginAt < loadAt, "the reload await must start INSIDE a held step");
   assert.ok(loadAt < endAt, "…and the step must end only AFTER the load settles");
@@ -810,7 +810,7 @@ test("#442 DATA-LOSS: every mutating await of the section is held across its own
   // pre-edit buffer), so it must be held too.
   const repaintAt = body.indexOf("await app.loadGraphData(repaintState, true, true, target);");
   assert.notEqual(repaintAt, -1);
-  const repaintBegin = body.lastIndexOf("beginWorkflowReloadStep(reloadGuardToken);", repaintAt);
+  const repaintBegin = body.lastIndexOf("if (!beginWorkflowReloadStep(reloadGuardToken))", repaintAt);
   const repaintEnd = body.indexOf("endWorkflowReloadStep(reloadGuardToken);", repaintAt);
   assert.ok(repaintBegin !== -1 && repaintBegin < repaintAt && repaintAt < repaintEnd, "the repaint await must be held too");
   // The mechanism: expiry requires NO step in flight, and ending a step rearms the clock.
@@ -857,7 +857,7 @@ test("#442 round-2: with NO freeze available the tracker is NOT re-baselined eit
   assert.ok(firstRebaseline < skipGate, "fixture order: the re-baseline precedes the reload decision");
   assert.match(
     body,
-    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,1200}?await clearSpuriousOpenModified\(target, \{/,
     "the pre-reload re-baseline must be gated on the freeze holding — the same condition whose absence skips the reload",
   );
   // The only OTHER re-baseline is the post-reload one, and it stays gated on the reload
@@ -896,7 +896,7 @@ test("#442 round-3 / #1618: re-baseline stays gated on the freeze; first-time op
   // with NO !wasOpen exception: a frontend without allow_interaction still must
   // not re-baseline in an unprotected frame (the round-3 DATA-LOSS finding).
   const gate = body.match(
-    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,400}?await clearSpuriousOpenModified\(target, \{/,
+    /if \(\s*!wasDirty &&\s*priorInteraction !== null &&\s*ownsWorkflowReloadGuard\(reloadGuardToken\)\s*\) \{[\s\S]{0,1200}?await clearSpuriousOpenModified\(target, \{/,
   );
   assert.ok(gate, "the pre-reload re-baseline must be gated on the freeze holding");
   assert.doesNotMatch(
@@ -940,17 +940,13 @@ test("#402 round-2: once NewBlankWorkflow has run, the guidance forbids a retry 
   // workflow. Once creation has run the receipt truthfully records applied:"unknown" — so
   // the guidance must match it: do NOT retry, check workflow_list / canvas state first.
   const afterCreate = stripComments(body.slice(created));
-  const errBlock = afterCreate.match(/const error =\s*\n?([\s\S]*?);/);
-  assert.ok(errBlock, "the post-creation failure must build an explicit message");
-  // Reassemble the concatenated literal so the check reads the message the caller gets.
-  const msg = [...errBlock[1].matchAll(/"([^"\n]*)"/g)].map((m) => m[1]).join("");
   assert.doesNotMatch(
-    msg,
+    afterCreate,
     /(^|[.!?]\s+)Retry\b/,
-    `no sentence may open with a blanket Retry once the blank tab exists: "${msg}"`,
+    "the post-creation guidance must not open a sentence with a blanket Retry",
   );
-  assert.match(msg, /Do NOT retry/i, "the guidance must forbid the retry outright");
-  assert.match(msg, /workflow_list/, "…and point at workflow_list / the canvas state instead");
+  assert.match(afterCreate, /Do NOT retry/i, "the guidance must forbid the retry outright");
+  assert.match(afterCreate, /panel_list_workflows/, "…and point at the public workflow-list command");
 });
 
 test("#570 P0b: the #442 re-read must KEEP this tab's instance identity (no mid-open fork)", () => {

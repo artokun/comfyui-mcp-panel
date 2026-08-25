@@ -180,7 +180,7 @@ test("#433 wiring: reconnect bumps the epoch on a MONOTONIC clock; open/new/read
     } else {
       assert.match(
         body,
-        /if \(backendReconnectEpoch === openedForEpoch\) activeWorkflowResyncEpoch = openedForEpoch;/,
+        /ownsWorkflowReloadGuard\(reloadGuardToken\)[\s\S]*workflowBindingGeneration === bindingGeneration[\s\S]*backendReconnectEpoch === openedForEpoch[\s\S]*activeWorkflowResyncEpoch = openedForEpoch;/,
         `${sig} must stamp the resync epoch ONLY if unchanged (TOCTOU guard)`,
       );
     }

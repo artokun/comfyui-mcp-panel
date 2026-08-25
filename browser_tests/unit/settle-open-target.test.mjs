@@ -517,7 +517,7 @@ test("#1575: the settle's await is held INSIDE a reload step, or the fence ages 
   const after = SRC.slice(settleAt, settleAt + 2200);
   assert.match(
     before,
-    /beginWorkflowReloadStep\(reloadGuardToken\);\s*\r?\n\s*try \{\s*\r?\n\s*$/,
+    /if \(!beginWorkflowReloadStep\(reloadGuardToken\)\) \{[\s\S]*?break workflowOpenSteps;\s*\}\s*try \{/,
     "the settle must open a reload step immediately before it",
   );
   assert.match(

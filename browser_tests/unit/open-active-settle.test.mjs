@@ -16,6 +16,34 @@ const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
 
 const sameWorkflowObject = (a, b) => a === b;
 
+// Evaluate the REAL inline ownership/generation block from the panel. The lifecycle
+// test below drives the same guard, generation advance, proof invalidation, and
+// downstream gates that production callers use; it is not a second implementation.
+const RELOAD_GUARD_SOURCE = SRC.match(
+  /let workflowReloadGuard = null;[\s\S]*?function activeWorkflowReloadGuard\(\) \{[\s\S]*?\n\}/,
+);
+assert.ok(RELOAD_GUARD_SOURCE, "could not locate the production reload guard block");
+
+function realReloadGuard({ now, reconnectEpoch = 4 } = {}) {
+  const factory = new Function(
+    "Date",
+    "backendReconnectEpoch",
+    "activeWorkflowResyncEpoch",
+    "postReconnectBindingProofEpoch",
+    `${RELOAD_GUARD_SOURCE[0]}\nreturn { acquireWorkflowReloadGuard, releaseWorkflowReloadGuard, ` +
+      `beginWorkflowReloadStep, endWorkflowReloadStep, ownsWorkflowReloadGuard, ` +
+      `activeWorkflowReloadGuard, nextWorkflowBindingGeneration, invalidateWorkflowBindingProof, ` +
+      `stampProof: (epoch) => { activeWorkflowResyncEpoch = epoch; postReconnectBindingProofEpoch = epoch; }, ` +
+      `proofs: () => ({ activeWorkflowResyncEpoch, postReconnectBindingProofEpoch }) };`,
+  );
+  return factory(
+    { now: () => now.t },
+    reconnectEpoch,
+    reconnectEpoch,
+    reconnectEpoch,
+  );
+}
+
 function fakeClock() {
   let time = 0;
   return {
@@ -145,6 +173,64 @@ test("#887 a superseding open cannot turn an old settle result into success", as
   assert.equal(ended, 1, "a step that never acquired ownership has no cleanup to release");
 });
 
+test("#887 production lifecycle fences workflow_open/new supersession before immediate consumers", () => {
+  const now = { t: 1_000_000 };
+  const reconnectEpoch = 4;
+  const guard = realReloadGuard({ now, reconnectEpoch });
+
+  // The old open owns an awaited switch/probe. A newer workflow_new cannot replace
+  // that live owner, because allowing both loads to settle would make their order
+  // nondeterministic on the canvas.
+  const oldOpenToken = guard.acquireWorkflowReloadGuard("workflow_open:old.json");
+  const oldOpenGeneration = guard.nextWorkflowBindingGeneration();
+  assert.equal(guard.beginWorkflowReloadStep(oldOpenToken), true);
+  assert.equal(
+    guard.acquireWorkflowReloadGuard("workflow_new"),
+    null,
+    "workflow_new must refuse while the open's mutating step is still in flight",
+  );
+  guard.endWorkflowReloadStep(oldOpenToken);
+  guard.releaseWorkflowReloadGuard(oldOpenToken);
+
+  // The new-tab operation then becomes the current binding generation and proves
+  // itself. A late failure from the older open must not retire that proof.
+  const newToken = guard.acquireWorkflowReloadGuard("workflow_new");
+  const newGeneration = guard.nextWorkflowBindingGeneration();
+  assert.equal(guard.beginWorkflowReloadStep(newToken), true);
+  guard.stampProof(reconnectEpoch);
+  guard.endWorkflowReloadStep(newToken);
+  guard.releaseWorkflowReloadGuard(newToken);
+  assert.equal(guard.invalidateWorkflowBindingProof(oldOpenGeneration), false);
+  assert.deepEqual(guard.proofs(), {
+    activeWorkflowResyncEpoch: reconnectEpoch,
+    postReconnectBindingProofEpoch: reconnectEpoch,
+  });
+
+  // Conversely, a failure belonging to the current generation retires both proofs
+  // before the same immediate workflow_list/pin/current-mode consumers run.
+  assert.equal(guard.invalidateWorkflowBindingProof(newGeneration), true);
+  const proof = guard.proofs();
+  const activeConfirmed = !activeWorkflowPossiblyStale({
+    reconnectEpoch,
+    resyncEpoch: proof.activeWorkflowResyncEpoch,
+    reconnectedAt: 100,
+    now: 150,
+  });
+  const bindingSettleWindow = activeWorkflowPossiblyStale({
+    reconnectEpoch,
+    resyncEpoch: proof.activeWorkflowResyncEpoch,
+    reconnectedAt: 100,
+    now: 150,
+  });
+  assert.equal(activeConfirmed, false, "workflow_list must not trust retired active proof");
+  assert.equal(classifyPinnedTarget("workflows/new.json", ["workflows/old.json"]), "mismatch");
+  assert.equal(
+    graphMutationReconnectGate({ cmd: "graph_set_widget", bindingSettleWindow })?.code,
+    "post-reconnect-settling",
+    "current-mode mutation must remain fail-closed until a fresh proof exists",
+  );
+});
+
 test("#887 failed open proof gates the immediate list, pin, and current-mode mutation", () => {
   const reconnectEpoch = 4;
   const reconnectedAt = 100;
@@ -181,8 +267,13 @@ test("#887 failed open proof gates the immediate list, pin, and current-mode mut
       SRC.indexOf("const activeSettle = await settleOwnedOpenedWorkflowActive({"),
       SRC.indexOf("const liveActiveAtReply = (() => {"),
     ),
-    /const invalidEpoch = backendReconnectEpoch - 1[\s\S]*postReconnectBindingProofEpoch = invalidEpoch/,
-    "workflow_open retires both proof epochs before the immediate consumers run",
+    /invalidateWorkflowBindingProof\(openGeneration\)/,
+    "workflow_open retires both proof epochs through the shared generation fence",
+  );
+  assert.match(
+    SRC,
+    /function invalidateWorkflowBindingProof\(generation\) \{[\s\S]*const invalidEpoch = backendReconnectEpoch - 1[\s\S]*postReconnectBindingProofEpoch = invalidEpoch;/,
+    "the shared failure helper invalidates both proof epochs only for the current generation",
   );
 });
 
@@ -207,8 +298,8 @@ test("#887 workflow_open wires the settle probe before releasing its guards", ()
   );
   assert.match(
     SRC.slice(probeAt, releaseAt),
-    /rebindFailed && workflowOpenGeneration <= openGeneration[\s\S]*invalidEpoch/,
-    "a failed open cannot invalidate a newer open generation's proof",
+    /if \(rebindFailed\) \{[\s\S]*invalidateWorkflowBindingProof\(openGeneration\)/,
+    "a failed open retires proof through the shared generation fence",
   );
   assert.match(
     SRC.slice(probeAt, releaseAt),
