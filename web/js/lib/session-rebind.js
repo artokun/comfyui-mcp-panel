@@ -99,6 +99,75 @@ export function shouldReadvertiseAfterComfyRestart({
   return outageMs >= minOutageMs;
 }
 
+/**
+ * #1790 — account for a restart re-advertisement only after its hello landed.
+ *
+ * `sendHello()` is asynchronous: it may wait for the tab-identity lease, be
+ * deferred behind in-flight bridge commands, or be superseded by a socket
+ * change. A caller that marks the outage handled before that promise resolves
+ * can permanently suppress the only hello that would restore graph-tool
+ * routing. Keep the in-flight claim separate from the landed watermark, and
+ * let the completion callback prove that it still belongs to the reconnect
+ * epoch that requested it.
+ *
+ * This helper deliberately does not retry a failed hello itself. The bridge
+ * client owns the socket/route retry paths; this state machine only prevents a
+ * failed attempt from becoming false proof, and coalesces duplicate events
+ * while one attempt is still resolving.
+ */
+export function createRestartReadvertiseController() {
+  let landedOutageSeq = 0;
+  let inFlight = null;
+
+  const validSeq = (value) => Number.isSafeInteger(value) && value > 0;
+
+  return {
+    /** True only for a hello that landed, or one already resolving for this outage. */
+    isReadvertised(outageSeq) {
+      return landedOutageSeq === outageSeq || inFlight?.outageSeq === outageSeq;
+    },
+
+    /**
+     * Start or join the one hello for an outage. The returned promise always
+     * resolves to a boolean and never lets a send failure escape the reconnect
+     * lifecycle.
+     */
+    attempt({ outageSeq, reconnectEpoch, isCurrent, send } = {}) {
+      if (!validSeq(outageSeq) || !Number.isSafeInteger(reconnectEpoch) || reconnectEpoch < 0) {
+        return Promise.resolve(false);
+      }
+      if (landedOutageSeq === outageSeq) return Promise.resolve(true);
+      if (inFlight?.outageSeq === outageSeq) return inFlight.promise;
+
+      let result;
+      try {
+        result = typeof send === "function" ? send() : false;
+      } catch {
+        result = false;
+      }
+      const promise = Promise.resolve(result).then(
+        (sent) => sent === true,
+        () => false,
+      );
+      const record = { outageSeq, reconnectEpoch, promise };
+      inFlight = record;
+      void promise.then((sent) => {
+        if (inFlight === record) inFlight = null;
+        let current = true;
+        try {
+          current = typeof isCurrent !== "function" || isCurrent() === true;
+        } catch {
+          current = false;
+        }
+        // A late result from an older reconnect must not mint proof for the
+        // current outage. A failed result never advances the watermark.
+        if (sent && current) landedOutageSeq = outageSeq;
+      });
+      return promise;
+    },
+  };
+}
+
 // #654 — the accounting that produces the `outageMs` above, for ComfyUI's OWN
 // backend socket (the bridge has its own tracker, `createBridgeOutageTracker`
 // below; the two measure different connections and must not be conflated).
