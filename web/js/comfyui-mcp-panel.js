@@ -313,7 +313,6 @@ import {
 import {
   createObjectInfoSnapshot,
   snapshotAuthorizationNote,
-  noBackendAnswerEstablished,
 } from "./lib/object-info-snapshot.js";
 import { fetchTypeScopedObjectInfo, SCOPED_OBJECT_INFO_DEADLINE_MS } from "./lib/scoped-object-info.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
@@ -1478,6 +1477,7 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // preloaded input. The explicit marker is narrowly supplied by that caller; arbitrary
   // preloaded refresh payloads remain ineligible for whole-schema cache/snapshot authority.
   const preloadedWholeSchema = runOpts?.preloadedWholeSchema === true;
+  const replacementMayReplaceWholeSnapshot = !preloadedDefs || preloadedWholeSchema;
   let defsRegistered = false;
   let comboApiPresent = false;
   let comboRan = false;
@@ -1534,12 +1534,13 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
   // be wrong in the dangerous direction.
   objectInfoCache.invalidate();
-  // #1223 — retire the last-observed snapshot on the SAME event and for the SAME reason.
-  // This function runs exactly when something suspects the schema moved, and a snapshot
-  // that survived a suspicion would authorize writes the burst cache has already been told
-  // not to. Re-recorded below if this run's fetch succeeds, so the cost of being wrong here
-  // is one refused write during an outage, not a stale authorization.
-  objectInfoSnapshot.clear();
+  // #2249 — fence the last-observed snapshot while this replacement is unresolved, but do
+  // not destroy it before the new whole map succeeds. If both whole routes fail, the old
+  // membership-only map is still the only usable evidence for an existing scalar widget;
+  // object-info-snapshot.js re-binds it to the post-invalidation generation only after this
+  // run has conclusively failed. Reconnect handlers still clear it outright because a new
+  // backend process is the one event that can change the type set.
+  objectInfoSnapshot.beginReplacement?.();
   if (typeof verifiedNodeDefCache !== "undefined") verifiedNodeDefCache.clear();
   // #1223 — the epoch this run STARTED on, captured before any fetch. The recording below
   // is refused if a reconnect lands while the fetch is in flight, so a pre-restart schema
@@ -1943,18 +1944,20 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     if ((!preloadedDefs || preloadedWholeSchema) && refreshResponseIsCurrent) {
       // A direct refresh fetch, or graph_add_node's explicitly verified whole payload, is
       // not an objectInfoCache read. Keep its current answer as the burst authority and
-      // retire the snapshot before recording the replacement, so a timeout cannot use the
-      // prior map or membership set. The refresh invalidation above happens first, so this
-      // is the post-refresh generation rather than the add's pre-refresh fence.
+      // replace the held snapshot only after the response has passed the epoch/generation
+      // fences. The refresh invalidation above happens first, so this is the post-refresh
+      // generation rather than the add's pre-refresh fence.
       if (!objectInfoCache.replace(defs)) objectInfoCache.invalidate();
-      objectInfoSnapshot.clear();
-      objectInfoSnapshot.record(defs, {
+      const snapshotRecorded = objectInfoSnapshot.record(defs, {
         observedAtEpoch: runStartedAtEpoch,
         currentEpoch: runStartedAtEpoch,
         observedAtGeneration: runStartedAtGeneration,
         currentGeneration: runStartedAtGeneration,
         whole: true,
       });
+      // `{}` or an unreadable object is an authoritative non-schema response for this
+      // refresh, not a failed replacement that can resurrect the prior membership map.
+      if (!snapshotRecorded) objectInfoSnapshot.clear();
     }
     // #1275 — snapshot the live graph BEFORE the first mutating phase. Everything
     // from here to the combo phase calls into frontend and extension code
@@ -2236,6 +2239,21 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     didThrow = true;
     console.warn("[comfyui-mcp-panel] node-def refresh after reconnect failed:", e);
   } finally {
+    // #2249 — a failed refresh must not turn a previously usable whole snapshot into a
+    // permanent refusal. The pending flag remains set when no current whole response was
+    // recorded; only then may the snapshot rebind to the generation advanced at refresh
+    // start. If the socket/epoch moved, retainAfterReplacementFailure clears it instead.
+    if (
+      replacementMayReplaceWholeSnapshot &&
+      typeof objectInfoSnapshot.retainAfterReplacementFailure === "function" &&
+      objectInfoSnapshot.isReplacementPending?.() === true
+    ) {
+      objectInfoSnapshot.retainAfterReplacementFailure({
+        epoch: backendReconnectEpoch,
+        generation: verifiedNodeDefCache.generation(),
+        socketDown: comfyBackendSocketDown,
+      });
+    }
     // Trust the live combos for suppressing missing-asset candidates ONLY when BOTH an
     // authoritative /object_info payload was actually obtained this call AND the combo
     // lists were refreshed from it. refreshComboInNodes resolving alone is not proof —
@@ -16046,11 +16064,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // its refusal, so the message would name routes another call tried. Declared in the
     // handler's own scope, so each invocation reports what IT observed.
     let oracleFailures = [];
-    // #1560 — may the TYPE-SCOPED last resort be consulted at all?
+    // #1560/#2249 — may the TYPE-SCOPED last resort be consulted at all?
     //
-    // Only when no whole-map route ANSWERED. A route that threw, returned a non-gateway
-    // status, or expressed deny-all as `{}` must never be overruled by a broader per-class
-    // read — the one direction object-info-oracle.js's own note forbids.
+    // A whole-map failure does not establish the requested class is absent. Once a
+    // non-throwing route has been contacted, an exact successful `/object_info/<class>`
+    // response can be authoritative for this write when the whole route timed out,
+    // returned nothing, or returned an unusable response. The one answer it must never
+    // overrule is an authoritative whole empty map (`{}`), which explicitly says deny-all;
+    // a thrown route remains a refusal because it does not provide safe evidence either way.
     //
     // CAPTURED WHERE THE SNAPSHOT MAKES THE SAME JUDGEMENT, from the SAME `outcome.outcomes`
     // in the same statement — never re-read from a variable later. Storing the tag list and
@@ -16424,8 +16445,20 @@ const GRAPH_TOOL_EXECUTORS = {
           socketDown: comfyBackendIsDown(),
           outcomes: outcome?.outcomes,
         });
-        // #1560 — the SAME evidence, read ONCE, in the same statement as the snapshot's.
-        scopedReadLicensed = schemaResponseIsCurrent && noBackendAnswerEstablished(outcome?.outcomes);
+        // #1560/#2249 — the SAME evidence, read ONCE, in the same statement as the
+        // snapshot's. A contacted but unusable whole route leaves the requested class
+        // unanswered; the type-scoped response below can answer that narrower question.
+        // An authoritative empty whole map is the explicit deny-all exception. A list with
+        // only NOT_ATTEMPTED routes licenses nothing, and a retired/reconnected response
+        // cannot be promoted into either route.
+        const wholeProbeCanBeNarrowed =
+          Array.isArray(outcome?.outcomes) &&
+          outcome.outcomes.some((entry) =>
+            ["no-answer", "nothing-returned", "answered-unusable"].includes(entry?.kind),
+          ) &&
+          !outcome.outcomes.some((entry) => entry?.kind === "threw");
+        scopedReadLicensed =
+          schemaResponseIsCurrent && authoritativeEmpty !== true && wholeProbeCanBeNarrowed;
         if (fallback.defs) {
           // Held for the reply. The write is about to be reported as SUCCEEDED and VERIFIED,
           // and it was verified against a schema nobody could re-fetch — an agent that is
@@ -16472,13 +16505,13 @@ const GRAPH_TOOL_EXECUTORS = {
       //
       // TWO GATES, both here rather than in the lib, because only this file holds the facts.
       //
-      //   1. THE SILENCE LICENCE, decided beside the snapshot's own verdict on the SAME
-      //      `outcome.outcomes` and merely READ here. A client that returned an empty schema
-      //      has expressed deny-all, and a broader per-class read must never overrule it. A
-      //      timeout, a client that returned NOTHING, or a proxy's 504 leave the question
-      //      unanswered — those, and only those, may be asked again by another route. It is
-      //      false until a read establishes it, so an unwired or never-run oracle licenses
-      //      nothing.
+      //   1. THE NARROW-QUESTION LICENCE, decided beside the snapshot's own verdict on the
+      //      SAME `outcome.outcomes` and merely READ here. A client that returned an empty
+      //      schema has expressed deny-all, and a broader per-class read must never overrule
+      //      it. A contacted route that timed out, returned an unusable response, or
+      //      returned NOTHING leaves the requested class unanswered; the exact type-scoped
+      //      route may establish it. A thrown route remains refused, and an unwired or
+      //      never-attempted oracle licenses nothing.
       //   2. WHAT THE COMMAND HAS LEFT. The whole-map attempt has already spent most of the
       //      budget by the time this runs (measured on the reported shape: 15,015 ms of a 20s
       //      oracle deadline), so this takes `budget.bounded` like every other step and
@@ -16490,27 +16523,37 @@ const GRAPH_TOOL_EXECUTORS = {
       // the fence's own trust root.
       fetchScopedObjectInfo: async (types) => {
         if (!scopedReadLicensed) {
-          // STATE WHAT WAS OBSERVED, not one cause of it. `noBackendAnswerEstablished` is
-          // false for FOUR different things — a route ANSWERED something unusable, a route
-          // THREW, the outcome list was empty, or every route was NOT_ATTEMPTED — and naming
-          // only the first asserts an event that did not happen in the other three. A refusal
-          // that reports a cause it did not establish is #982's own defect, and the reporter
-          // of #1560 went looking at a backend that was answering fine because of exactly
-          // that. (#1223 makes a similar over-specific claim one sentence earlier in the same
-          // refusal; that one is pre-existing and is not touched here.)
+          // STATE WHAT WAS OBSERVED, not one cause of it. The licence is false for several
+          // distinct cases — a route answered authoritatively, a route threw, the outcome
+          // list was empty, or every route was NOT_ATTEMPTED — and naming only one asserts an
+          // event that did not happen in the others. A refusal that reports a cause it did
+          // not establish is #982's own defect.
           return {
             defs: null,
             covered: [],
             reason:
-              "no whole-schema route was both CONTACTED and SILENT, and a type-scoped read " +
-              "may only stand in for one that was — it must never overrule what a route did " +
-              "establish, and it is not a substitute for a route nobody ran",
+              "the whole-schema evidence did not qualify for a type-scoped fallback, which " +
+              "may not overrule an answer or substitute for a route nobody ran",
           };
         }
+        const scopedEpoch = backendReconnectEpoch;
         const scoped = await fetchTypeScopedObjectInfo(types, {
           fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
           deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
         });
+        // The per-class route is authoritative only for the backend connection that
+        // answered it. A reconnect or a down socket during this await makes that response
+        // as stale as a whole-map response spanning the same event; do not use it to
+        // authorize, retire proofs, or diagnose a removed type.
+        if (scopedEpoch !== backendReconnectEpoch || comfyBackendIsDown()) {
+          return {
+            defs: null,
+            covered: [],
+            reason:
+              "the backend reconnected or went down while the type-scoped /object_info " +
+              "read was in flight, so its answer cannot authorize this write",
+          };
+        }
         if (Array.isArray(scoped.covered)) {
           for (const classType of scoped.covered) {
             if (typeof classType === "string" && classType) {

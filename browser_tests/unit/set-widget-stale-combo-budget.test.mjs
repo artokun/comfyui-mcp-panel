@@ -887,8 +887,8 @@ test("#1709: authoritative empty retires whole cache and snapshot before ordinar
   assert.equal(widget.value, "new", "the timeout refusal did not write");
   assert.deepEqual(
     calls.slice(-2),
-    ["/object_info", "/object_info"],
-    "the later ordinary read reached both live routes after the cache was retired",
+    ["/object_info", "/object_info/LoadImage"],
+    "the later non-definitive whole failure allowed the exact scoped route before refusal",
   );
 });
 

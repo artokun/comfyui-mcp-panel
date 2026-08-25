@@ -163,6 +163,28 @@ test("#1560 A: whole /object_info never lands, per-class answers ⇒ a DIRECT wr
   );
 });
 
+test("#2249: an exact type-scoped answer can validate an existing scalar after a non-definitive whole failure", async () => {
+  const reg = loadedRegistry(["ImageScale"]);
+  const node = regNode(2249, "ImageScale", [{ name: "upscale_factor", type: "FLOAT", value: 1 }]);
+  const backend = largeInstall({ defined: ["ImageScale"] });
+  const { set } = await runSetWidget(node, "upscale_factor", 2, {
+    registry: reg,
+    getRegistry: () => reg,
+    // The whole oracle has no usable answer; this is deliberately not registry-only auth.
+    getFreshObjectInfo: async () => null,
+    fetchScopedObjectInfo: async (types) =>
+      fetchTypeScopedObjectInfo(types, {
+        fetchApi: backend.fetchApi,
+        deadlineMs: SCOPED_OBJECT_INFO_DEADLINE_MS,
+      }),
+    wasTypeEverDefined: () => false,
+    ...HOOKS,
+  });
+  assert.equal(set.value, 2, "the exact live class answer validates the existing scalar widget");
+  assert.equal(node.widgets[0].value, 2);
+  assert.deepEqual(backend.perClassCalls(), ["/object_info/ImageScale"]);
+});
+
 test("#1560 A: a PROMOTED nested write asks about ALL THREE types (#716/#821's 'two types') and succeeds", async () => {
   const reg = loadedRegistry(["KSampler"]);
   const { a, b, resolveSource } = nestedFixture(reg, "KSampler");
@@ -313,11 +335,10 @@ test("#1573: an UNLICENSED scoped route issues NOTHING, and the refusal does not
   // paired with the request list that proves what actually happened.
   const src = readFileSync(PANEL_JS, "utf8");
   const UNLICENSED_REASON =
-    "no whole-schema route was both CONTACTED and SILENT, and a type-scoped read " +
-    "may only stand in for one that was — it must never overrule what a route did " +
-    "establish, and it is not a substitute for a route nobody ran";
+    "the whole-schema evidence did not qualify for a type-scoped fallback, which " +
+    "may not overrule an answer or substitute for a route nobody ran";
   assert.ok(
-    src.includes("no whole-schema route was both CONTACTED and SILENT"),
+    src.includes("the whole-schema evidence did not qualify for a type-scoped fallback"),
     "the reason under test is the panel's own, not one invented here",
   );
 
@@ -543,19 +564,22 @@ test("#1560: scopedAuthorizationTypes names EVERY type the fence asks about, fro
   );
 });
 
-test("#1560: the panel WIRES the scoped route, gated on the silence licence and on the command budget", () => {
+test("#1560/#2249: the panel wires scoped authority after a non-definitive whole failure", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   assert.match(src, /fetchScopedObjectInfo:\s*async \(types\) => \{/, "the capability reaches runSetWidget");
   // The licence is DECIDED beside the snapshot's own verdict, on the SAME `outcome.outcomes`,
   // in the same statement — and merely READ at the gate. A second reading of a fact
   // established at a moment is how the two could disagree, and this handler enters
   // `readObjectInfo` more than once (the #1126 live re-ask).
+  const oracle = src.slice(src.indexOf("const fallback = objectInfoSnapshot.authorize"));
+  assert.match(oracle, /outcomes: outcome\?\.outcomes,\s*\}\);/, "uses the oracle's outcome list");
+  assert.match(oracle, /const wholeProbeCanBeNarrowed =/, "classifies the whole outcome before licensing");
   assert.match(
-    src,
-    /outcomes: outcome\?\.outcomes,\s*\}\);[\s\S]{0,500}?scopedReadLicensed = schemaResponseIsCurrent && noBackendAnswerEstablished\(outcome\?\.outcomes\);/,
-    "decided in the same breath as objectInfoSnapshot.authorize, from the same evidence and current-generation fence",
+    oracle,
+    /schemaResponseIsCurrent && authoritativeEmpty !== true && wholeProbeCanBeNarrowed/,
+    "uses the current-generation fence and rejects authoritative whole emptiness",
   );
-  assert.match(src, /if \(!scopedReadLicensed\) \{/, "a route that ANSWERED is never overruled");
+  assert.match(src, /if \(!scopedReadLicensed\) \{/, "an authoritative whole answer is never overruled");
   assert.match(src, /let scopedReadLicensed = false;/, "and it licenses nothing until a read establishes it");
   assert.match(src, /fetchTypeScopedObjectInfo\(types, \{/, "the panel calls the type-scoped reader");
   assert.match(src, /deadlineMs: budget\.bounded\(SCOPED_OBJECT_INFO_DEADLINE_MS\)/, "bounded by what the command has left");

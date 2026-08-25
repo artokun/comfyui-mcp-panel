@@ -141,6 +141,11 @@ export function createObjectInfoSnapshot() {
   let defs = null;
   let epoch = null;
   let generation = null;
+  // A same-connection refresh retires per-class proof immediately, but its last whole-map
+  // membership observation remains useful if the replacement never answers. Keep that
+  // distinction explicit: while replacement is pending the old map is not authority; once
+  // the replacement fails, it may be re-bound to the new proof generation below.
+  let replacementPending = false;
   // #1582 — have the live whole-map routes already gone silent on THIS connection,
   // after a snapshot was held? The first silent call still has to probe: that is how
   // an answered error keeps refusing, and how a healthy backend still wins. Once
@@ -233,6 +238,7 @@ export function createObjectInfoSnapshot() {
       // A live observation means the whole-map routes answered. The next widget write
       // must be allowed to prefer that live path rather than inheriting a prior silence.
       probesSilent = false;
+      replacementPending = false;
       return true;
     },
 
@@ -267,6 +273,14 @@ export function createObjectInfoSnapshot() {
           reason:
             "the backend ANSWERED the schema probe with something unusable rather than failing " +
             "to answer at all, so this is not the transient silence the last-observed schema covers",
+        };
+      }
+      if (replacementPending) {
+        return {
+          defs: null,
+          reason:
+            "a whole /object_info replacement is still in progress, so the previous " +
+            "schema is held only as a retry fallback until that answer succeeds or fails",
         };
       }
       if (defs === null) {
@@ -319,6 +333,7 @@ export function createObjectInfoSnapshot() {
         : generation;
       return (
         defs !== null &&
+        !replacementPending &&
         !socketDown &&
         Number.isFinite(currentEpoch) &&
         currentEpoch === epoch &&
@@ -352,12 +367,46 @@ export function createObjectInfoSnapshot() {
       return probesSilent === true && this.isReusable(reusableOptions);
     },
 
+    /** Test/diagnostic view of the replacement fence; never exposes the held map. */
+    isReplacementPending() {
+      return replacementPending;
+    },
+
+    /**
+     * Mark the start of a same-connection replacement. The old membership map stays held,
+     * but cannot authorize while the replacement is unresolved.
+     */
+    beginReplacement() {
+      replacementPending = true;
+    },
+
+    /**
+     * Re-bind the held map after a replacement failed without changing the backend epoch.
+     * A down socket, a moved epoch, or an unreadable generation discards it instead.
+     */
+    retainAfterReplacementFailure({ epoch: currentEpoch, generation: currentGeneration, socketDown = false } = {}) {
+      if (
+        defs === null ||
+        socketDown ||
+        !Number.isFinite(currentEpoch) ||
+        currentEpoch !== epoch ||
+        !Number.isFinite(currentGeneration)
+      ) {
+        this.clear();
+        return false;
+      }
+      generation = currentGeneration;
+      replacementPending = false;
+      return true;
+    },
+
     /** Drop it — for anything that knows, or merely suspects, the schema moved. */
     clear() {
       defs = null;
       epoch = null;
       generation = null;
       probesSilent = false;
+      replacementPending = false;
     },
 
     /** Test/diagnostic view. Never used to make a decision. */
