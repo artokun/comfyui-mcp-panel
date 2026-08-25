@@ -760,6 +760,7 @@ import {
   shouldNudgeAfterMidTaskReconnect,
   createBridgeOutageTracker,
   createComfyBackendOutageTracker,
+  createRestartReadvertiseController,
   performSoftReloadRecovery,
   retryDuringReconnect,
   dedupeWorkflowTabRecords,
@@ -988,10 +989,10 @@ function backendSocketReplyFields(wf) {
 // a restart invent or erase an outage (the rule reconnect-staleness.js and
 // #1145's bridge tracker already established).
 const comfyBackendOutage = createComfyBackendOutageTracker({ now: monotonicNow });
-// The outage seq the #654 re-advertise has already fired for. One-shot per
-// outage: `reconnected` can repeat, and a hello is a full re-greeting. 0 is a
-// safe start because the tracker's seq only reaches 1 once an outage has opened.
-let comfyRestartReadvertisedSeq = 0;
+// #1790 — the restart re-advertise watermark is advanced only by a hello that
+// actually landed. A promise that is still waiting for route identity or the
+// rehello gate is an in-flight claim, not proof that graph-tool routing exists.
+const comfyRestartReadvertise = createRestartReadvertiseController();
 // #402 — OPEN RECEIPTS. Every workflow_open / workflow_new that RAN is journaled here
 // with the selector it was asked for, the identity it resolved to, and whether it
 // applied. When a mid-command drop loses the reply, this is the ONLY non-inferential
@@ -38425,20 +38426,22 @@ function buildPanel() {
         // re-registered through its own socket-open hello; a second greeting
         // here is the #1138 double-ready-ack harm.
         helloLandedSinceOutage: landedHelloCount > comfyBackendOutage.helloBaseline(),
-        alreadyReadvertised: comfyRestartReadvertisedSeq === comfyBackendOutage.seq(),
+        alreadyReadvertised: comfyRestartReadvertise.isReadvertised(comfyBackendOutage.seq()),
       })
     ) {
-      // Claimed BEFORE the send, so a `reconnected` that repeats cannot fire a
-      // second greeting while the first is still resolving its identity. The
-      // hello is bounded and the socket's own open-hello remains the fallback,
-      // so a claim spent on a send that never lands costs one restart's
-      // re-advertise — where an unclaimed repeat costs a re-greeting per event.
-      comfyRestartReadvertisedSeq = comfyBackendOutage.seq();
-      try {
-        client?.rehello?.();
-      } catch {
-        // the reconnect path retries the hello
-      }
+      const outageSeq = comfyBackendOutage.seq();
+      const reconnectEpoch = backendReconnectEpoch;
+      // #1790 — do not consume the outage watermark before the async hello is
+      // proven on the wire. The controller coalesces repeated calls while this
+      // attempt is in flight and rejects late success from an older epoch as
+      // proof for the current reconnect.
+      void comfyRestartReadvertise.attempt({
+        outageSeq,
+        reconnectEpoch,
+        isCurrent: () =>
+          reconnectEpoch === backendReconnectEpoch && outageSeq === comfyBackendOutage.seq(),
+        send: () => client?.rehello?.(),
+      });
     }
     // After ComfyUI comes back (backend-only reboot — the page didn't reload),
     // the orchestrator died with it. Respawn + reconnect if the agent was in use.

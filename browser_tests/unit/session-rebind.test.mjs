@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 import {
   shouldResumeAfterComfyReconnect,
   shouldReadvertiseAfterComfyRestart,
+  createRestartReadvertiseController,
   createComfyBackendOutageTracker,
   shouldRehelloAfterCommand,
   shouldNudgeAfterMidTaskReconnect,
@@ -1234,6 +1235,75 @@ test("#654: one-shot per outage — a repeated `reconnected` does not re-greet",
   );
 });
 
+test("#1790: a failed async rehello does not consume the outage watermark", async () => {
+  const controller = createRestartReadvertiseController();
+  let sends = 0;
+  const send = () => (++sends === 1 ? false : true);
+  const current = () => true;
+
+  assert.equal(
+    await controller.attempt({ outageSeq: 1, reconnectEpoch: 1, isCurrent: current, send }),
+    false,
+  );
+  assert.equal(controller.isReadvertised(1), false);
+
+  // A later production reconnect attempt is allowed to retry because the
+  // first promise never proved that a hello reached the orchestrator.
+  assert.equal(
+    await controller.attempt({ outageSeq: 1, reconnectEpoch: 1, isCurrent: current, send }),
+    true,
+  );
+  assert.equal(controller.isReadvertised(1), true);
+  assert.equal(sends, 2);
+});
+
+test("#1790: duplicate reconnect events join an in-flight hello", async () => {
+  const controller = createRestartReadvertiseController();
+  let resolve;
+  let sends = 0;
+  const first = controller.attempt({
+    outageSeq: 1,
+    reconnectEpoch: 1,
+    isCurrent: () => true,
+    send: () => {
+      sends += 1;
+      return new Promise((r) => { resolve = r; });
+    },
+  });
+  const duplicate = controller.attempt({
+    outageSeq: 1,
+    reconnectEpoch: 1,
+    isCurrent: () => true,
+    send: () => {
+      sends += 1;
+      return true;
+    },
+  });
+  assert.strictEqual(duplicate, first);
+  assert.equal(controller.isReadvertised(1), true, "in-flight is a duplicate guard, not landed proof");
+  assert.equal(sends, 1);
+  resolve(true);
+  assert.equal(await duplicate, true);
+  assert.equal(controller.isReadvertised(1), true);
+});
+
+test("#1790: a late hello from an older reconnect epoch cannot mint current proof", async () => {
+  const controller = createRestartReadvertiseController();
+  let epoch = 1;
+  let resolve;
+  const attempt = controller.attempt({
+    outageSeq: 1,
+    reconnectEpoch: 1,
+    isCurrent: () => epoch === 1,
+    send: () => new Promise((r) => { resolve = r; }),
+  });
+
+  epoch = 2;
+  resolve(true);
+  assert.equal(await attempt, true, "the transport did send, but its proof is stale");
+  assert.equal(controller.isReadvertised(1), false);
+});
+
 test("#654 INVARIANT: the re-advertise and the #278 resume can never both fire", () => {
   // The whole reason this is a separate predicate is that #278's
   // `if (bridgeConnected) return false` must stay exactly as strict. Enumerate
@@ -1390,8 +1460,8 @@ test("#654 wiring: the panel measures, feeds and consults the outage — every s
       "      shouldReadvertiseAfterComfyRestart({",
     ],
     [
-      "the one-shot claim is stamped from the tracker's own outage identity",
-      "      comfyRestartReadvertisedSeq = comfyBackendOutage.seq();",
+      "the one-shot state is keyed by the tracker's outage identity",
+      "        alreadyReadvertised: comfyRestartReadvertise.isReadvertised(comfyBackendOutage.seq()),",
     ],
   ]) {
     assert.ok(src.includes(snippet), site);
@@ -1407,14 +1477,18 @@ test("#654 wiring: the panel measures, feeds and consults the outage — every s
   // mutation this assertion was rewritten to catch, and the "wiring tests must
   // check PATHS" lesson. It must be `rehello`, never `connectAgent()`, which
   // early-returns on an already-OPEN socket and so can never produce a hello.
-  const claim = src.indexOf("      comfyRestartReadvertisedSeq = comfyBackendOutage.seq();");
+  const claim = src.indexOf("      void comfyRestartReadvertise.attempt({");
   assert.notEqual(claim, -1);
   const branchEnd = src.indexOf("    // After ComfyUI comes back (backend-only reboot", claim);
   assert.notEqual(branchEnd, -1, "the #654 branch sits above the #278 resume commentary");
   const branch = src.slice(claim, branchEnd);
   assert.ok(
-    branch.includes("client?.rehello?.();"),
+    branch.includes("send: () => client?.rehello?.(),"),
     "the #654 branch must re-advertise the route, and it must do so with rehello",
+  );
+  assert.ok(
+    branch.includes("reconnectEpoch === backendReconnectEpoch && outageSeq === comfyBackendOutage.seq()"),
+    "a late hello may not become proof for a newer reconnect epoch",
   );
   assert.doesNotMatch(
     branch,
