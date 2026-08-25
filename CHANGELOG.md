@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.94] - 2026-08-25
+
+### Fixed
+- fail closed when workflow-open binding settles or reconnect proofs become stale during concurrent tab operations (#887)
+
 ## [0.15.93] - 2026-08-25
 
 ### Fixed
