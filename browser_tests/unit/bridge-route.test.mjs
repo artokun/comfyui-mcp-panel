@@ -442,7 +442,7 @@ test("#640 wiring: every outbound frame site reads bridgeRouteId() and refuses o
   const src = readFileSync(PANEL_JS, "utf8");
   // hello — the registration itself.
   assert.match(src, /tabRouteIdentity\.adopt\(tabSessionId\)/, "the route must be adopted from the COMPLETED lease");
-  assert.match(src, /const routeId = bridgeRouteId\(\);\s*\n\s*if \(!routeId\) \{/);
+  assert.match(src, /const liveRouteId = bridgeRouteId\(\);\s*\n\s*if \(!liveRouteId\) \{/);
   assert.match(src, /tabId: routeId,/, "the hello payload must carry the established route");
   // sendFrame — every control/agent frame.
   assert.match(src, /const routeId = bridgeRouteId\(\);\s*\n\s*if \(!routeId\) return false;/);

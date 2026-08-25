@@ -1006,6 +1006,11 @@ let openReceiptSeq = 0;
 // never mistake a property attached by a later command failure for proof that no
 // workflow-targeting work ran.
 const workflowListReadinessRefusals = new WeakSet();
+// #1787 — a refresh command can arrive on the route the bridge still remembers
+// while a replacement socket is handing this tab over to its live route. Keep
+// this refusal authoritative: the command must not refresh node definitions
+// until the active route is registered on the replacement socket.
+const routeRegistrationReadinessRefusals = new WeakSet();
 // #402 / codex P2 — at most ONE outstanding staleness disk-read per workflow path. The
 // read is bounded by a deadline, but a deadline only stops US waiting: one of the two
 // read paths takes no AbortSignal, so without this a server that accepts requests and
@@ -4957,6 +4962,49 @@ function readWorkflowListReadinessRefusal(error) {
     stage: "pre-probe",
     retryable: true,
   };
+}
+
+function routeRegistrationReadinessRefusalError(reason) {
+  const detail =
+    typeof reason === "string" && reason.trim()
+      ? reason.trim()
+      : "the active bridge route is still being registered";
+  const error = new Error(
+    "panel_refresh_nodes did not run because " +
+      detail +
+      ". Nothing was refreshed; retry after the reconnect settles.",
+  );
+  routeRegistrationReadinessRefusals.add(error);
+  return error;
+}
+
+function readRouteRegistrationReadinessRefusal(error) {
+  if (!error || typeof error !== "object" || !routeRegistrationReadinessRefusals.has(error)) return null;
+  return {
+    code: "route-registration-not-ready",
+    ready: false,
+    applied: false,
+    stage: "pre-refresh",
+    retryable: true,
+  };
+}
+
+// #1787 — the bridge may still dispatch a stale explicit tab_id during the
+// replacement-socket handoff. Wait for the live route before starting the
+// global, otherwise-safe refresh; if the bridge is down entirely, preserve the
+// local refresh path and let its existing backend readiness handling decide.
+const ROUTE_REGISTRATION_WAIT_STEPS_MS = Object.freeze([100, 250, 500, 1000, 2000]);
+async function awaitActiveRouteRegistration() {
+  const client = liveBridgeClient;
+  if (!client || client.isConnected?.() !== true) return;
+  if (client.isRouteReady?.() === true) return;
+  const ready =
+    typeof client.waitForRouteReady === "function"
+      ? await client.waitForRouteReady({ stepsMs: ROUTE_REGISTRATION_WAIT_STEPS_MS })
+      : false;
+  if (ready !== true || liveBridgeClient !== client || client.isRouteReady?.() !== true) {
+    throw routeRegistrationReadinessRefusalError();
+  }
 }
 
 // Per-tab agent session id + which thread this tab is showing. sessionStorage
@@ -12554,6 +12602,10 @@ const GRAPH_TOOL_EXECUTORS = {
   // acknowledgement of that work: subscribe to it instead of queueing a second
   // trailing run. When the slot is empty, force:true still starts a fresh refresh.
   async refresh_nodes() {
+    // #1787 — a stale explicit tab_id can still reach this executor during a
+    // replacement-socket handoff. Do not let the global refresh run until the
+    // bridge has registered the current active route.
+    await awaitActiveRouteRegistration();
     const verdict = await refreshComfyNodeDefs(undefined, {
       force: true,
       joinInFlight: true,
@@ -25173,6 +25225,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
   // the panel has already committed to; see routeIsStale in lib/rehello-gate.js for why
   // that gap exists at all and what leaks through it.
   let lastAdvertisedRouteId = null;
+  // #1787 — when a replacement socket opens after a reconnect, the bridge may
+  // still receive commands addressed to the last route it knew. Preserve that
+  // landed route for one handoff hello; the follow-up hello carries the live
+  // route and creates the bridge's same-socket migration alias.
+  let reconnectRouteHandoff = null;
 
   /** #1095 — is this socket's binding out of date with the committed workflow? */
   function advertisedRouteIsStale() {
@@ -26124,6 +26181,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         } catch (err) {
           const reconnectRefusal = readReconnectRefusal(err);
           const workflowListReadiness = readWorkflowListReadinessRefusal(err);
+          const routeRegistrationReadiness = readRouteRegistrationReadinessRefusal(err);
           reply = {
             rid: msg.rid,
             ok: false,
@@ -26148,6 +26206,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // cannot confuse a workflow-list readiness miss with a graph
             // command blocked by a different fence.
             ...(workflowListReadiness ? { workflow_list_readiness: workflowListReadiness } : {}),
+            // #1787 — this is a read-only, pre-refresh refusal. The route handoff
+            // did not settle, so no node definitions were fetched or registered.
+            ...(routeRegistrationReadiness
+              ? { route_registration_readiness: routeRegistrationReadiness }
+              : {}),
           };
         }
         // Settle the rid ledger BEFORE the dead-socket drop below (#517): even
@@ -26370,6 +26433,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // the active `sock`, don't reject its pending calls, don't scheduleReconnect
       // (that would orphan the new socket and spawn a duplicate). Just let it die.
       if (!isActive()) return;
+      if (typeof lastAdvertisedRouteId === "string" && lastAdvertisedRouteId) {
+        reconnectRouteHandoff = lastAdvertisedRouteId;
+      }
       sock = null;
       handshakeDone = false;
       // #654 — a pending refused-hello retry belongs to the dead socket; the
@@ -26495,6 +26561,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // published only on the landed path below, for the same reason as the uuid: a hello that
     // never reached the orchestrator advertised no route.
     let advertisedRouteId = null;
+    const handoffCandidate = reconnectRouteHandoff;
+    const firstHelloOnSocket = advertisedSock !== target;
+    let usedRouteHandoff = false;
     return sendBridgeHello({
       socket: target,
       isCurrent: () => sock === target && target.readyState === WebSocket.OPEN,
@@ -26506,8 +26575,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // COMPLETED lease (never a value we hope to get) is the same ordering rule
       // as the epoch bump below: nothing is recorded before it is true.
       tabRouteIdentity.adopt(tabSessionId);
-      const routeId = bridgeRouteId();
-      if (!routeId) {
+      const liveRouteId = bridgeRouteId();
+      if (!liveRouteId) {
         // Nothing has been dispatched, so this is a refusal, not a disclosure of
         // something already done — but say so, or the panel just sits on a
         // "connecting" pill it will never leave.
@@ -26519,6 +26588,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // open. Bounded; a landed hello or a fresh socket resets the budget.
         scheduleRouteRefusalRetry();
         return null;
+      }
+      let routeId = liveRouteId;
+      if (
+        firstHelloOnSocket &&
+        typeof handoffCandidate === "string" &&
+        handoffCandidate &&
+        handoffCandidate !== liveRouteId
+      ) {
+        usedRouteHandoff = true;
+        routeId = handoffCandidate;
       }
       // #1095 — recorded only past the refusal, so `advertisedRouteId` is never a route the
       // hello declined to carry. It is published to `lastAdvertisedRouteId` only once the
@@ -26609,6 +26688,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // …and THIS is the binding the orchestrator now holds for this socket. Outbound
           // frames it routes by binding are compared against it (advertisedRouteIsStale).
           lastAdvertisedRouteId = advertisedRouteId;
+          if (reconnectRouteHandoff === handoffCandidate) reconnectRouteHandoff = null;
           // #1095 — release exactly the held frames composed FOR this route, and discard any
           // composed for a workflow the panel has since moved past. Driven from the landed
           // path, so "advertised" means the orchestrator was told, never that we meant to.
@@ -26617,6 +26697,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           // replenished and any pending retry is moot.
           routeRefusalRetries = 0;
           clearRouteRefusalRetry();
+          if (usedRouteHandoff) {
+            // The old route gets this replacement socket only long enough for the
+            // bridge to accept stale explicit targets. Re-advertise immediately on
+            // the same socket so the live route becomes canonical and isRouteReady stays
+            // false until that second hello has landed.
+            void Promise.resolve().then(() => {
+              if (sock === target && target.readyState === WebSocket.OPEN) void sendHello();
+            });
+          }
         }
         return sent === true;
       })
@@ -26898,6 +26987,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       if (attempt > respawnAfterAttempts() && onBridgeClosed?.() === true) return;
       connect();
     }, delay);
+  }
+
+  function routeReady() {
+    if (!sock || sock.readyState !== WebSocket.OPEN || !handshakeDone) return false;
+    if (pendingRouteBindingGeneration !== null) return false;
+    let routeId = null;
+    try {
+      routeId = bridgeRouteId();
+    } catch {
+      routeId = null;
+    }
+    return !!routeId && !!lastAdvertisedRouteId && routeId === lastAdvertisedRouteId;
   }
 
   return {
@@ -27235,6 +27336,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       rehelloGate.cancel();
       pendingRouteBindingGeneration = null;
       advertisedSock = null;
+      reconnectRouteHandoff = null;
       connect();
     },
     currentUrl() {
@@ -27243,6 +27345,17 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     isConnected() {
       return !!sock && sock.readyState === WebSocket.OPEN;
     },
+    /** #1787 — wait only for the bounded replacement-socket route handoff. */
+    async waitForRouteReady({ stepsMs = [100, 250, 500, 1000, 2000] } = {}) {
+      const isReady = () => routeReady();
+      if (isReady()) return true;
+      const steps = Array.isArray(stepsMs) ? stepsMs : [];
+      for (const delay of steps) {
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(delay) || 0)));
+        if (isReady()) return true;
+      }
+      return isReady();
+    },
     /**
      * True only when the live socket has completed its handshake and the
      * orchestrator has advertised the current workflow route. Stamped control
@@ -27250,15 +27363,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
      * socket-open plus a readable route is not sufficient.
      */
     isRouteReady() {
-      if (!sock || sock.readyState !== WebSocket.OPEN || !handshakeDone) return false;
-      if (pendingRouteBindingGeneration !== null) return false;
-      let routeId = null;
-      try {
-        routeId = bridgeRouteId();
-      } catch {
-        routeId = null;
-      }
-      return !!routeId && !!lastAdvertisedRouteId && routeId === lastAdvertisedRouteId;
+      return routeReady();
     },
     /** #1095 — diagnostics only. The in-flight count is NOT exported for callers to gate
      *  on: an earlier cut had the workflow poll read it and decide for itself, and that is
@@ -27287,6 +27392,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       rehelloGate.cancel();
       pendingRouteBindingGeneration = null;
       advertisedSock = null;
+      reconnectRouteHandoff = null;
     },
     destroy() {
       closed = true;
@@ -27305,6 +27411,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       rehelloGate.cancel();
       pendingRouteBindingGeneration = null;
       advertisedSock = null;
+      reconnectRouteHandoff = null;
     },
   };
 }
