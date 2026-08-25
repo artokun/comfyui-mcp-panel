@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.79] - 2026-08-25
+
+### Fixed
+- Render orphan-link repairs with a meaningful activity warning instead of an undefined disconnect summary (#1750)
+
+## [0.15.78] - 2026-08-24
+
+### Fixed
+- Join in-flight panel refreshes through download completion handoff instead of returning `refresh_still_running` (#1758)
+
+## [0.15.77] - 2026-08-25
+
+### Fixed
+- Recover panel refreshes after concurrent download completions and coalesced trailing refreshes (#1736)
+
+## [0.15.76] - 2026-08-24
+
+### Fixed
+- Preserve Save-As canvas identity through partial restores, tab switches, overlap, and failure cleanup (#939)
+- Scale object-info schema probes for remote ComfyUI origins while preserving bounded fail-closed writes (#1734)
+- Recover accessor-backed Impact BooleanWidget writes without masking same-message setter failures (#1735)
+
 ## [0.15.75] - 2026-08-24
 
 ### Fixed

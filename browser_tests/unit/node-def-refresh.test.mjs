@@ -350,7 +350,7 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
   assert.match(body, /return describeNodeDefRefresh\(\{/, "the run verdict is returned");
   assert.match(
     body,
-    /nodeDefsRefreshConfirmed =\s*runIsCurrent && !comboCompletionPending && !didThrow && !!defs && \(comboRan \|\| comboAbandonedAfterRebuild\);/,
+    /nodeDefsRefreshConfirmed =\s*runIsCurrent &&\s*!comboCompletionPending &&\s*!didThrow &&\s*!!defs &&\s*\(comboRan \|\| \(!comboFailed && \(comboRebuiltLocally \|\| comboAbandonedAfterRebuild\)\)\);/,
     "the shared global stays a strict boolean, and #1193 admits the panel's OWN completed " +
       "combo rebuild as the second way the live lists became current",
   );
@@ -367,7 +367,16 @@ test("#635: the shipping registerComfyNodeDefs returns its verdict through the p
   // #1193 — the two inputs must stay SEPARATE all the way to the verdict. Merging them
   // into one flag would make an abandoned-but-locally-rebuilt run indistinguishable from
   // a confirmed one, which is the distinction the disclosure exists to carry.
-  assert.match(body, /comboRebuiltLocally: comboAbandonedAfterRebuild,/, "the verdict is told which one held");
+  assert.match(
+    body,
+    /comboRebuiltLocally: comboRebuiltLocally \|\| comboAbandonedAfterRebuild,/,
+    "the verdict is told which local rebuild held",
+  );
+  assert.match(
+    body,
+    /comboRefreshSkipped:\s*comboApiPresent && comboRebuiltLocally && runOpts\?\.skipDuplicateComboRefresh === true,/,
+    "the verdict discloses a skipped duplicate call",
+  );
   // #1193 — the disclosure is gated on the sweep having COVERED the graph, never on it
   // merely having finished. `comboRebuild.completed` alone is true for a sweep that walked
   // past every V2 combo on the graph, and granting the claim there suppresses a genuine

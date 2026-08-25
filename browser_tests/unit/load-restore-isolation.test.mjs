@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import {
   installNodeConfigureIsolation,
   loadRestoreCompleted,
+  loadGraphDataWithCompletionProof,
   retryNodeRestores,
   verifyNodeRestore,
 } from "../../web/js/lib/load-restore-isolation.js";
@@ -156,6 +157,85 @@ test("install returns null when there is nothing to wrap (fail-open, pre-fix beh
   assert.equal(installNodeConfigureIsolation(null), null);
   assert.equal(installNodeConfigureIsolation({}), null);
   assert.equal(installNodeConfigureIsolation({ LGraphNode: {} }), null);
+});
+
+test("#939 a swallowed partial load is not a completed Save-As repaint", async () => {
+  class LGraphNode {
+    constructor(id, type) {
+      this.id = id;
+      this.type = type;
+      this.widgets_values = ["construction-default"];
+    }
+
+    configure(info) {
+      this.widgets_values = info.widgets_values;
+      return "node-ok";
+    }
+  }
+  class LGraph {
+    constructor(nodes) {
+      this.nodes = nodes;
+      for (const node of nodes) node.graph = this;
+    }
+
+    getNodeById(id) {
+      return this.nodes.find((node) => node.id === id) ?? null;
+    }
+
+    configure(state) {
+      // This is the production shape that matters: node configure throws out of
+      // the graph pass, while loadGraphData catches the throw and resolves.
+      for (const nodeData of state.nodes) this.getNodeById(nodeData.id)?.configure(nodeData);
+      return "graph-ok";
+    }
+
+    serialize() {
+      return { nodes: this.nodes.map((node) => ({ id: node.id, widgets_values: node.widgets_values })) };
+    }
+  }
+  const LG = { LGraph, LGraphNode };
+  const first = new LGraphNode(1, "KSampler");
+  const second = new LGraphNode(2, "FaceDetailer");
+  const third = new LGraphNode(3, "SaveImage");
+  const graph = new LGraph([first, second, third]);
+  const originalConfigure = LGraphNode.prototype.configure;
+  LGraphNode.prototype.configure = function (info) {
+    if (info.id === 2) throw new Error("widgets not built yet");
+    return originalConfigure.call(this, info);
+  };
+
+  try {
+    const payload = {
+      nodes: [
+        { id: 1, widgets_values: ["authored-first"] },
+        { id: 2, widgets_values: ["authored-failing"] },
+        { id: 3, widgets_values: ["authored-after-failure"] },
+      ],
+    };
+    const app = {
+      async loadGraphData(state) {
+        try {
+          graph.configure(state);
+        } catch {
+          // This is loadGraphData's own swallowed restore failure.
+        }
+        return "load-resolved";
+      },
+    };
+    const result = await loadGraphDataWithCompletionProof({
+      liteGraph: LG,
+      graph,
+      load: () => app.loadGraphData(payload),
+    });
+
+    assert.equal(result.value, "load-resolved");
+    assert.equal(result.completed, false, "a resolved load with a swallowed configure throw is not proven complete");
+    assert.deepEqual(graph.serialize().nodes[0].widgets_values, ["authored-first"]);
+    assert.deepEqual(graph.serialize().nodes[1].widgets_values, ["construction-default"]);
+    assert.deepEqual(graph.serialize().nodes[2].widgets_values, ["authored-after-failure"]);
+  } finally {
+    LGraphNode.prototype.configure = originalConfigure;
+  }
 });
 
 test("chained isolations: restoring the INNER one first does not drop the outer's containment", () => {

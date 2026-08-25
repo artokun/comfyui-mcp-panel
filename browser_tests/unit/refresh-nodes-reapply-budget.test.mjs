@@ -1,7 +1,7 @@
-// panel#1562 recurrence: a large /object_info can finish just before the refresh
-// caller's budget, then synchronous schema registration blocks the timer that should
-// produce the retryable verdict. The verdict must cross the relay before that local work,
-// while the single-flight run remains alive and owns registration until it finishes.
+// panel#1758: a large /object_info can finish just before panel_refresh_nodes observes the
+// shared run, then synchronous schema registration begins. The acknowledgement must join
+// that production refresh through registration/reapply and return its settled verdict, while
+// the single-flight run remains the only owner of the mutation.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -11,11 +11,13 @@ import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/j
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { fetchWholeObjectInfo, TRANSPORT_OUTCOME } from "../../web/js/lib/object-info-oracle.js";
+import { reconcileCompletedDownloads } from "../../web/js/lib/download-refresh.js";
 import { describeNodeDefRefresh, NODE_DEF_REFRESH_REASONS } from "../../web/js/lib/node-def-refresh.js";
 import {
   collectAllGraphs,
   comboRebuildCovered,
   isStaleAssetCandidate as isStaleAssetCandidateLib,
+  reapplyDefsToLiveNodes,
   resolveMissingModelDirectory,
 } from "../../web/js/lib/asset-staleness.js";
 import { withoutFrontendVirtualTypes } from "../../web/js/lib/frontend-virtual-nodes.js";
@@ -51,11 +53,16 @@ const nodeDefsBudgetLeft = (deadline, share = 1) => Math.max(1, Math.floor((dead
 const cacheSpy = { invalidate: () => {}, replace: () => true, read: async (f) => f() };
 const snapshotSpy = { clear: () => {}, record: () => true };
 const COMMAND_BUDGET = 2500;
-const RELAY = 3000;
 const FETCH_MS = 2080;
 const BLOCK_MS = 1500;
 
-function buildRun({ appValue, apiValue, withTimeoutImpl = withTimeout, runBudgetMs = 9000 }) {
+function buildRun({
+  appValue,
+  apiValue,
+  reapplyDefsToLiveNodesImpl = () => {},
+  withTimeoutImpl = withTimeout,
+  runBudgetMs = 9000,
+}) {
   const body = extractFunction("async function registerComfyNodeDefs(");
   const names = [
     "app", "api", "recordObjectInfoTypes", "reapplyDefsToLiveNodes", "comboRebuildCovered",
@@ -69,7 +76,7 @@ function buildRun({ appValue, apiValue, withTimeoutImpl = withTimeout, runBudget
   const vals = {
     app: appValue, api: apiValue,
     recordObjectInfoTypes: () => ({}),
-    reapplyDefsToLiveNodes: () => {},
+    reapplyDefsToLiveNodes: reapplyDefsToLiveNodesImpl,
     comboRebuildCovered,
     describeNodeDefRefresh,
     NODE_DEF_REFRESH_REASONS,
@@ -165,10 +172,39 @@ function deferred() {
   return { promise, resolve };
 }
 
-test("#1562: refresh_nodes answers before synchronous reapply and keeps registration single-flight", async () => {
-  // Scaled 10:1 from the report: fetch finishes inside the caller's wait, but fetch plus
-  // synchronous registration exceeds the relay. A retry is issued before the first run's
-  // handoff timer, so an overlapping registration would be observable.
+const ON_DOWNLOADS_BODY = extractFunction("onDownloads(list)");
+
+function buildOnDownloads(refreshComfyNodeDefs) {
+  const factory = new Function(
+    "reconcileCompletedDownloads",
+    "refreshComfyNodeDefs",
+    "renderDownloads",
+    `let seenDoneDownloads = new Set();
+     const executors = {${ON_DOWNLOADS_BODY}};
+     return executors.onDownloads;`,
+  );
+  return factory(reconcileCompletedDownloads, refreshComfyNodeDefs, () => {});
+}
+
+async function withWatchdog(promise, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label)), 1500);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("#1758: refresh_nodes joins through production registration and reapply", async () => {
+  // Scaled from the report: the /object_info response lands before the synchronous
+  // registration/reapply phase, which blocks the event loop. A joined acknowledgement must
+  // still return the completed refresh rather than converting that handoff into
+  // refresh_still_running.
   const TYPES = 5635;
   const defs = {};
   for (let i = 0; i < TYPES; i += 1) defs[`Type${i}`] = { input: {}, output: [] };
@@ -209,28 +245,21 @@ test("#1562: refresh_nodes answers before synchronous reapply and keeps registra
   const reply = await refresh_nodes();
   const elapsed = performance.now() - startedAt;
 
-  assert.ok(elapsed < RELAY, `structured reply arrived at ${Math.round(elapsed)}ms, past ${RELAY}ms relay`);
+  assert.ok(
+    elapsed >= BLOCK_MS,
+    `the acknowledgement must observe production local work before replying; elapsed ${Math.round(elapsed)}ms`,
+  );
   assert.deepEqual(
-    { ok: reply.ok, refreshed: reply.refreshed, reason: reply.reason },
-    { ok: true, refreshed: false, reason: "refresh_still_running" },
+    { ok: reply.ok, refreshed: reply.refreshed },
+    { ok: true, refreshed: true },
   );
   assert.equal(
     registrationCalls,
-    0,
-    "the caller must reply before registerNodesFromDefs/reapply can block the main thread",
+    1,
+    "the joined acknowledgement must wait for registerNodesFromDefs/reapply to finish",
   );
-
-  // This retry sees the still-live first promise and subscribes to its completion. The
-  // acknowledgement path must return that run's settled verdict without queueing a second
-  // forced pass.
-  const retryReply = await refresh_nodes();
-  assert.equal(retryReply.refreshed, true, "the retry observes the completed first refresh");
-  while (inFlight) {
-    const current = inFlight;
-    await current;
-  }
-  assert.equal(registrationCalls, 1, "the retry joined the first run instead of queueing another");
   assert.equal(maxConcurrentRegistrations, 1, "registration passes must remain single-flight");
+  assert.equal(inFlight, null, "the joined production refresh returns the slot to idle");
 });
 
 test("#1695: late combo work is fenced before reconnect successor and collector trust", async () => {
@@ -337,6 +366,88 @@ test("#1695: late combo work is fenced before reconnect successor and collector 
   collector.setRefreshConfirmed(built.getConfirmed());
   assert.equal(collector.collectMissingAssets().models.length, 0, "collectMissingAssets sees only the settled successor");
   assert.equal(inFlight, null, "the fenced lifecycle returns to idle");
+});
+
+test("#1736: download completion upgrades a queued no-skip refresh and recovers", async () => {
+  const firstFetch = deferred();
+  const recoveryFetch = deferred();
+  const defs = {
+    TestLoader: {
+      input: { required: { model: [["fresh.safetensors"], {}] } },
+    },
+  };
+  const comboWidget = { name: "model", options: { values: ["stale.safetensors"] } };
+  const rootGraph = {
+    _nodes: [{ type: "TestLoader", widgets: [comboWidget], constructor: {} }],
+  };
+  let fetches = 0;
+  let comboCalls = 0;
+  let backgroundPhase = true;
+  const appValue = {
+    graph: rootGraph,
+    registerNodesFromDefs: async () => {},
+    refreshComboInNodes: () => {
+      comboCalls += 1;
+      if (comboCalls === 1) return Promise.resolve();
+      return backgroundPhase ? new Promise(() => {}) : Promise.resolve();
+    },
+  };
+  const apiValue = {
+    getNodeDefs: async () => {
+      fetches += 1;
+      if (fetches === 1) await firstFetch.promise;
+      if (fetches === 3) await recoveryFetch.promise;
+      return defs;
+    },
+  };
+  const built = buildRun({
+    appValue,
+    apiValue,
+    reapplyDefsToLiveNodesImpl: reapplyDefsToLiveNodes,
+    runBudgetMs: 100,
+  });
+  let inFlight = null;
+  const refreshComfyNodeDefs = makeRefreshCoalescer({
+    getInFlight: () => inFlight,
+    setInFlight: (value) => { inFlight = value; },
+    runRegister: built.registerComfyNodeDefs,
+    withTimeout,
+  });
+  const refresh_nodes = buildRefreshNodes({ refreshComfyNodeDefs, commandBudget: 150 });
+
+  const current = refreshComfyNodeDefs(undefined, { force: true });
+  const reconnect = refreshComfyNodeDefs(undefined, { force: true });
+  const onDownloads = buildOnDownloads(refreshComfyNodeDefs);
+  onDownloads([{ id: "d1", status: "downloading" }]);
+  onDownloads([{ id: "d1", status: "done" }]);
+  const acknowledgement = refresh_nodes();
+  firstFetch.resolve();
+
+  const reply = await withWatchdog(acknowledgement, "panel_refresh_nodes stayed stuck");
+  await withWatchdog(Promise.all([current, reconnect]), "concurrent refresh completion stayed stuck");
+  backgroundPhase = false;
+  assert.deepEqual(reply, {
+    ok: true,
+    refreshed: true,
+    combo_refresh_confirmed: false,
+    combo_refresh_note:
+      "Node definitions WERE re-registered from a fresh /object_info, and the panel rebuilt every " +
+      "combo widget's option list on the live graph from that same payload. The frontend's duplicate " +
+      "refreshComboInNodes() call was skipped because those lists are already current.",
+  });
+  assert.equal(comboCalls, 1, "download completion upgrades the queued run before its duplicate frontend refresh");
+  assert.deepEqual(comboWidget.options.values, ["fresh.safetensors"]);
+  assert.equal(inFlight, null, "the concurrent completion releases the shared slot");
+
+  const recoveryRun = refreshComfyNodeDefs(undefined, { force: true });
+  const recoveredPromise = refresh_nodes();
+  recoveryFetch.resolve();
+  const recovered = await withWatchdog(recoveredPromise, "refresh_nodes did not recover after completion");
+  await withWatchdog(recoveryRun, "the recovery refresh did not complete");
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.refreshed, true);
+  assert.equal(comboCalls, 2, "recovery may use the normal frontend confirmation path");
+  assert.equal(inFlight, null, "the recovery run also returns the slot to idle");
 });
 
 test("#1562: a later bounded caller upgrades an already-queued trailing run", async () => {

@@ -190,7 +190,8 @@ async function waitForRun(
 //   runRegister(preloadedDefs, runOpts, runControl) : performs the actual (idempotent)
 //                                registration; its own cleanup must NOT clear the slot —
 //                                the coalescer owns the slot lifecycle. `runOpts` is the
-//                                caller's `{ runBudgetMs }`, forwarded verbatim. `runControl`
+//                                caller's `{ runBudgetMs, preloadedWholeSchema,
+//                                skipDuplicateComboRefresh }`, forwarded verbatim. `runControl`
 //                                carries the pre-local-work handoff used by a bounded caller,
 //                                plus `deferCompletion(promise)` for work that may outlive
 //                                the register function's observation budget but still owns
@@ -346,13 +347,23 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
     // #1562 — the caller's RUN allowance, forwarded to every `startRun` below. Built here,
     // once, so no branch can start a run under a different budget than its siblings.
     const runOpts =
-      opts && (Number.isFinite(opts.runBudgetMs) || opts.preloadedWholeSchema === true)
+      opts &&
+      (Number.isFinite(opts.runBudgetMs) ||
+        opts.preloadedWholeSchema === true ||
+        opts.skipDuplicateComboRefresh === true)
         ? {
             ...(Number.isFinite(opts.runBudgetMs) ? { runBudgetMs: opts.runBudgetMs } : {}),
             ...(opts.preloadedWholeSchema === true ? { preloadedWholeSchema: true } : {}),
+            ...(opts.skipDuplicateComboRefresh === true ? { skipDuplicateComboRefresh: true } : {}),
           }
         : undefined;
-    const abandonBeforeLocalWork = !!(opts && opts.abandonBeforeLocalWork);
+    // #1758 — `joinInFlight` is the acknowledgement contract used by
+    // panel_refresh_nodes. If the slot is empty at the exact call boundary, this invocation
+    // becomes the refresh owner; it must still wait through its own registration/reapply
+    // handoff rather than returning refresh_still_running merely because it was asked to
+    // join when possible. Other bounded callers retain the explicit early-handoff behavior.
+    const abandonBeforeLocalWork =
+      !!(opts && opts.abandonBeforeLocalWork) && !joinInFlight;
     const remaining = () => (joinMs === null ? null : joinMs - (Date.now() - startedAt));
     const current = getInFlight();
     if (current) {
@@ -429,6 +440,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
       }
       if (!trailing) {
         let earlyYieldRequested = abandonBeforeLocalWork;
+        let queuedRunOpts = runOpts;
         let queuedHandle = null;
         const queued = (async () => {
           try {
@@ -437,7 +449,7 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
             /* the in-flight refresh failed — run our own anyway */
           }
           trailing = null;
-          queuedHandle = startRun(undefined, runOpts, earlyYieldRequested);
+          queuedHandle = startRun(undefined, queuedRunOpts, earlyYieldRequested);
           return queuedHandle;
         })();
         trailing = {
@@ -452,8 +464,21 @@ export function makeRefreshCoalescer({ getInFlight, setInFlight, runRegister, wi
           requestEarlyYield: () => {
             earlyYieldRequested = true;
           },
+          // #1736 — a later forced caller may carry the skip option that the queued
+          // successor needs before it starts. Preserve the first caller's budget/options,
+          // then monotonically add this freshness optimization; once the successor starts,
+          // `trailing` is cleared and its run options are immutable.
+          upgradeRunOpts: (nextRunOpts) => {
+            if (nextRunOpts?.skipDuplicateComboRefresh !== true) return;
+            queuedRunOpts = { ...(queuedRunOpts ?? {}), skipDuplicateComboRefresh: true };
+          },
         };
         current.attachNextCompletion?.(trailing);
+      } else {
+        // #1736 — the trailing run is shared, but its options are not frozen until the
+        // queued successor begins. A download completion arriving after a no-skip forced
+        // caller must still upgrade that successor to skip the duplicate frontend call.
+        trailing.upgradeRunOpts?.(runOpts);
       }
       return waitForRun(
         trailing,
