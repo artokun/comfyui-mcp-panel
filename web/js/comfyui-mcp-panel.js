@@ -21505,6 +21505,20 @@ const GRAPH_TOOL_EXECUTORS = {
     // Resolve via the shared helper so the #570 fence sees the SAME target this executor will.
     const target = path ? resolveWorkflowSelectorTarget("workflow_close", s, path) : s.activeWorkflow;
     if (!target) throw new Error("no target workflow");
+    // #1795 — closeWorkflow() is a STORE primitive, not the frontend's tab-selection
+    // service. On the active tab it can unload `target` while leaving the same object in
+    // activeWorkflow and the shared LiteGraph canvas still carrying its identity. Capture
+    // the pre-close facts now: after close the target may be unloaded or removed from the
+    // store, so neither its route nor whether this command must repair the active canvas
+    // can be recovered reliably from the post-close state.
+    const closedPath = target.path;
+    const closedRoutingKey = workflowTabId(target);
+    const activeBeforeClose = activeWorkflowRef() || s.activeWorkflow || null;
+    // An unreadable active pointer is not evidence that this was a background close. The
+    // close already has a destructive effect, so recover conservatively rather than
+    // returning a success that may leave the shared canvas bound to the closed tab.
+    const activeCloseNeedsRecovery =
+      !activeBeforeClose || sameWorkflowObject(activeBeforeClose, target);
     // Guard against data loss: don't silently close a workflow with unsaved
     // changes (closeWorkflow bypasses the UI's save prompt). Save first.
     //
@@ -21547,7 +21561,108 @@ const GRAPH_TOOL_EXECUTORS = {
       );
     }
     await s.closeWorkflow(target);
-    return { closed: { path: target.path } };
+
+    // Closing a background tab cannot move the live canvas. Keep that established fast
+    // path, while still returning the unsaved tab's unique route so callers never have to
+    // match the shared "Unsaved Workflow" label.
+    if (!activeCloseNeedsRecovery) {
+      return {
+        closed: {
+          path: closedPath,
+          ...(closedRoutingKey ? { routing_key: closedRoutingKey } : {}),
+        },
+      };
+    }
+
+    // The store may have selected a successor itself, but older/current frontend store
+    // implementations measured for #1575 leave the closed object active. Prefer a
+    // genuinely listed active successor when one exists; otherwise use the first
+    // surviving open tab. Never reopen the closed object, even if the store's list is
+    // momentarily stale while it is unloading.
+    const openAfterClose = Array.isArray(s.openWorkflows)
+      ? s.openWorkflows.filter((workflow) => workflow && !sameWorkflowObject(workflow, target))
+      : null;
+    const activeAfterClose = activeWorkflowRef() || s.activeWorkflow || null;
+    const replacement =
+      openAfterClose?.find((workflow) => sameWorkflowObject(workflow, activeAfterClose)) ||
+      openAfterClose?.[0] ||
+      null;
+    const replacementRoutingKey = replacement ? workflowTabId(replacement) : null;
+    if (!replacement || !replacementRoutingKey) {
+      throw new Error(
+        `workflow_close closed "${closedPath || closedRoutingKey || "the active workflow"}", ` +
+          "but the frontend exposed no surviving open workflow to rebind the active canvas. " +
+          "The close was applied, but the active/graph binding is UNVERIFIED; do NOT retry " +
+          "workflow_close. Call panel_list_workflows and wait for frontend tab selection, " +
+          "then re-open the intended workflow before any graph mutation.",
+      );
+    }
+
+    // Reuse the full production open path: it selects the successor, repaints the shared
+    // canvas from that tab's own live state, proves the root marker/UUID, updates the
+    // reconnect readiness watermark, and reports the final active identity. Do not pass
+    // the close command's rid: the internal recovery is not a caller-issued open and must
+    // never masquerade as the caller's open receipt in workflow_list.
+    let rebound;
+    try {
+      rebound = await GRAPH_TOOL_EXECUTORS.workflow_open({ path: replacementRoutingKey });
+    } catch (error) {
+      throw new Error(
+        `workflow_close closed "${closedPath || closedRoutingKey || "the active workflow"}", ` +
+          "but rebinding the surviving tab was not proven. The close was applied and the " +
+          `active/graph binding is UNVERIFIED: ${coerceMessageText(error)} Do NOT retry ` +
+          "workflow_close; call panel_list_workflows and inspect the active tab before " +
+          "retrying any graph command.",
+      );
+    }
+
+    // The open executor has its own proof, but take one final same-observation check here
+    // before advertising close success. This prevents a late tab move from pairing the
+    // successor's reply with a different active object or a stale graph binding.
+    const activeAfterRebind = activeWorkflowRef();
+    const openAfterRebind = Array.isArray(s.openWorkflows) ? s.openWorkflows : null;
+    const activeIdentity = activeAfterRebind
+      ? establishedWorkflowReplyIdentity(activeAfterRebind)
+      : null;
+    const activeBinding = activeAfterRebind
+      ? describeLiveCanvasBinding(activeAfterRebind)
+      : "unknown";
+    if (
+      !activeAfterRebind ||
+      !sameWorkflowObject(activeAfterRebind, replacement) ||
+      !openAfterRebind?.some((workflow) => sameWorkflowObject(workflow, replacement)) ||
+      !activeIdentity ||
+      activeIdentity.routingKey !== replacementRoutingKey ||
+      activeBinding !== "bound"
+    ) {
+      throw new Error(
+        `workflow_close closed "${closedPath || closedRoutingKey || "the active workflow"}", ` +
+          "but the successor's active/graph binding changed or could not be proven. " +
+          "The close was applied, but this reply is NOT a binding success; do NOT retry " +
+          "workflow_close. Call panel_list_workflows and inspect the active tab before " +
+          "retrying any graph command.",
+      );
+    }
+
+    const reboundActive = {
+      path: workflowDiskIdentityPath(activeAfterRebind),
+      filename: workflowDiskIdentityPath(activeAfterRebind) ? activeAfterRebind.filename : null,
+      routing_key: activeIdentity.routingKey,
+      workflow_uuid: activeIdentity.uuid,
+    };
+    return {
+      closed: {
+        path: closedPath,
+        ...(closedRoutingKey ? { routing_key: closedRoutingKey } : {}),
+      },
+      rebound: reboundActive,
+      active: reboundActive,
+      routing_key: activeIdentity.routingKey,
+      workflow_uuid: activeIdentity.uuid,
+      // These fields are the same live readiness/binding facts the open path just proved;
+      // returning them lets the route consumer re-fence immediately after the close.
+      ...backendSocketReplyFields(activeAfterRebind),
+    };
   },
 
   // --- Subgraphs: select nodes + group into a subgraph ---------------------
