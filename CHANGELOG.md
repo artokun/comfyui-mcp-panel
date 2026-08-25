@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.95] - 2026-08-25
+
+### Fixed
+- support safely validated workflow-library subfolders for panel saves (#1794)
+
 ## [0.15.94] - 2026-08-25
 
 ### Fixed
