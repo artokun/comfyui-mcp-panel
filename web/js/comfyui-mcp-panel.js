@@ -356,6 +356,7 @@ import {
   releaseReconnectScopePin,
 } from "./lib/reconnect-scope-fence.js";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
+import { reconcileFreshDynamicWidgets } from "./lib/dynamic-widget-reconcile.js";
 import {
   createDeferredWidgetEditQueue,
   deferredWidgetQueueCounts,
@@ -14802,6 +14803,40 @@ const GRAPH_TOOL_EXECUTORS = {
       node.pos = placementFor(graph, pos);
       if (title && typeof title === "string") node.title = title;
       graph.add(node);
+      // COMFY_DYNAMICCOMBO_V3 first runs its value setter while LG.createNode is still
+      // detached from a graph. Replay it after registration so the widget-value store and
+      // dynamic rows match the fresh node. A schema-verified stale path such as
+      // `format.codec` is routed through the current `codec` root so the frontend's own
+      // widget/store cleanup removes it.
+      const dynamicReconciliation = reconcileFreshDynamicWidgets(node, currentDef);
+      if (dynamicReconciliation.failures.length) {
+        const storeCleanup = dynamicReconciliation.cleanupStore?.() ?? { cleaned: true };
+        let rollbackError = null;
+        try {
+          safeRemoveNode(graph, node);
+        } catch (error) {
+          rollbackError = error;
+        }
+        const failures = dynamicReconciliation.failures
+          .map(({ name, phase, error }) => `${name} (${phase}: ${error?.message ?? String(error)})`)
+          .join(", ");
+        const storeCleanupError = storeCleanup.cleaned
+          ? null
+          : `widget-store cleanup failed (${storeCleanup.error?.message ?? String(storeCleanup.error)})`;
+        throw new Error(
+          `Cannot add "${class_type}": native dynamic-widget reconciliation failed for ${failures}. ` +
+            (rollbackError || storeCleanupError
+              ? `${[
+                  rollbackError &&
+                    `The panel could not roll back the partially added node (${rollbackError?.message ?? String(rollbackError)})`,
+                  storeCleanupError,
+                ]
+                  .filter(Boolean)
+                  .join("; ")}; ` +
+                "do not retry until the canvas is refreshed."
+              : "The node was removed and nothing was added; RETRY panel_add_node once the frontend dynamic widget is ready."),
+        );
+      }
     } finally {
       graph.afterChange();
     }

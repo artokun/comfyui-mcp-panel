@@ -24,6 +24,8 @@ import { COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
 import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
 import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
+import { reconcileFreshDynamicWidgets } from "../../web/js/lib/dynamic-widget-reconcile.js";
+import { safeRemoveNode } from "../../web/js/lib/safe-remove-node.js";
 
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -233,6 +235,8 @@ export function addNodeCommandBudgetDeps() {
     // a hand-copied sentence here would just be a third place for it to drift.
     addNodeRefreshBusyMessage: (classType) =>
       `HARNESS STUB refusal for "${classType}" — the shipped wording lives in the panel.`,
+    reconcileFreshDynamicWidgets,
+    safeRemoveNode,
   };
 }
 
