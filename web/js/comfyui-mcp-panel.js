@@ -77,6 +77,7 @@ import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMess
 // #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
 // it is how this repo keeps producing near-duplicate bugs, per that file's own header.
 import { withTimeout } from "./lib/bounded-step.js";
+import { createChatScrollStabilizer } from "./lib/chat-scroll-stabilizer.js";
 import { createRunReceiptOutbox } from "./lib/run-receipt-outbox.js";
 import {
   arbitratePanelCopy,
@@ -30492,11 +30493,16 @@ function buildPanel() {
     stickToBottom = true;
     newMsgBtn.hidden = true;
     log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
+    chatScrollStabilizer.schedule();
   });
   // Track the user's scroll position; re-stick (and hide the pill) at the bottom.
   log.addEventListener("scroll", () => {
     stickToBottom = atBottom();
     if (stickToBottom) newMsgBtn.hidden = true;
+  });
+  const chatScrollStabilizer = createChatScrollStabilizer({
+    log,
+    shouldStick: () => stickToBottom,
   });
   body.appendChild(newMsgBtn);
   root.appendChild(body);
@@ -32857,11 +32863,10 @@ function buildPanel() {
       newMsgBtn.hidden = false;
       return;
     }
-    // Defer to after layout so tall content (code blocks, images) still lands
-    // at the true bottom.
-    requestAnimationFrame(() => {
-      log.scrollTop = log.scrollHeight;
-    });
+    // The stabilizer waits for the normal layout frame AND follows later
+    // ResizeObserver deliveries when containment replaces an intrinsic-size
+    // estimate with a replayed message's real height.
+    chatScrollStabilizer.schedule();
   }
 
   // Build an inline, expandable chip (+ hidden preview) for one [Pasted text #N]
@@ -35228,6 +35233,10 @@ function buildPanel() {
     // repainted messages — re-pin it to the bottom so it trails the newest one.
     if (agentWorking) bumpThinking();
     renderTodo(t.todos || [], { persist: false });
+    // A resolved/inert A2UI replay appends directly rather than through a normal
+    // painter. Seed the same post-replay stabilizer after every history pass so
+    // variable-height contained roots cannot leave the log above its true bottom.
+    scrollLog();
   }
 
   function resumableSessionId(t) {
@@ -42183,6 +42192,7 @@ function buildPanel() {
       // running (a remount would otherwise stack a second word cycler / backstop).
       if (workWordTimer) { clearInterval(workWordTimer); workWordTimer = null; }
       if (thinkingSafety) { clearTimeout(thinkingSafety); thinkingSafety = null; }
+      chatScrollStabilizer.dispose();
       document.removeEventListener("keydown", onInterruptKeydown, true);
       // Stop any chat audio before the panel's DOM goes away — a detached
       // <audio> keeps playing, and after an unmount there is no card left to

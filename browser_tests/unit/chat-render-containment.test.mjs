@@ -24,6 +24,10 @@ function functionBody(source, name) {
 test("#1801 contains every direct chat message without changing the feed surface", () => {
   const source = readFileSync(PANEL_JS, "utf8");
   assert.match(source, /log\.className = "cmcp-log"/);
+  assert.match(
+    source,
+    /import \{ createChatScrollStabilizer \} from "\.\/lib\/chat-scroll-stabilizer\.js";/,
+  );
 
   const ruleStart = source.indexOf(".cmcp-log > :not(.cmcp-empty) {");
   assert.ok(ruleStart >= 0, "the production chat feed must contain its message rule");
@@ -50,4 +54,12 @@ test("#1801 contains every direct chat message without changing the feed surface
     assert.match(body, new RegExp(`className = "${className.replaceAll(" ", "\\s+")}`));
     assert.match(body, /log\.appendChild\(/, `${name} must still append to the chat log`);
   }
+
+  const replay = functionBody(source, "paintThread");
+  const renderTodoAt = replay.indexOf("renderTodo(t.todos");
+  const finalScrollAt = replay.indexOf("scrollLog();", renderTodoAt);
+  assert.ok(renderTodoAt >= 0, "replay still renders the thread tray");
+  assert.ok(finalScrollAt > renderTodoAt, "replay seeds a final post-A2UI scroll correction");
+  assert.match(functionBody(source, "mountLiveA2UICard"), /log\.appendChild\(handle\.el\)/);
+  assert.match(functionBody(source, "paintA2UIRecord"), /log\.appendChild\(renderA2UIInert\(/);
 });
