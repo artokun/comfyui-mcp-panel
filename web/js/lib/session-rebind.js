@@ -72,7 +72,10 @@ export function shouldResumeAfterComfyReconnect({
 //   - `outageMs` → the elapsed interval is the ONLY thing separating a real
 //     restart from a WS blip (asset view, image check, tab refocus). Same
 //     reasoning and same default threshold as `shouldNudgeAfterMidTaskReconnect`
-//     below; deliberately one number, not a second one to keep in sync.
+//     below; deliberately one number, not a second one to keep in sync. A
+//     persisted `comfy_reboot` marker is delivery state, not proof for this
+//     outage, so it cannot bypass this gate unless a current outage-correlated
+//     proof is added here.
 //
 // A duration, not a timestamp to subtract from `now`, for #1145's reason: the
 // caller measures the interval once and a duration cannot be silently reread as

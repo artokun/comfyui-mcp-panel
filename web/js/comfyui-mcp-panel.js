@@ -999,6 +999,11 @@ let comfyRestartReadvertisedSeq = 0;
 // own (#433), which explains a matching `active` without our command ever running.
 const openReceipts = [];
 let openReceiptSeq = 0;
+// #1785 — a workflow_list readiness refusal is a trusted, pre-probe outcome. Keep
+// its authority in a WeakSet rather than on the Error object: the bridge catch must
+// never mistake a property attached by a later command failure for proof that no
+// workflow-targeting work ran.
+const workflowListReadinessRefusals = new WeakSet();
 // #402 / codex P2 — at most ONE outstanding staleness disk-read per workflow path. The
 // read is bounded by a deadline, but a deadline only stops US waiting: one of the two
 // read paths takes no AbortSignal, so without this a server that accepts requests and
@@ -4922,6 +4927,33 @@ function liveWorkflowListActive() {
   return {
     active,
     activeIdentity: active ? establishedWorkflowReplyIdentity(active) : null,
+  };
+}
+
+function workflowListReadinessRefusalError(reason) {
+  const detail =
+    typeof reason === "string" && reason.trim()
+      ? reason.trim()
+      : "the reconnect handshake is still settling";
+  const error = new Error(
+    "workflow_list could not verify a live workflow identity after the ComfyUI reconnect (" +
+      detail +
+      ") within the bounded readiness window. This read-only probe changed no workflow target and " +
+      "is safe to retry in a moment; panel_open_workflow(path) can explicitly re-establish the tab " +
+      "if the reconnect does not settle.",
+  );
+  workflowListReadinessRefusals.add(error);
+  return error;
+}
+
+function readWorkflowListReadinessRefusal(error) {
+  if (!error || typeof error !== "object" || !workflowListReadinessRefusals.has(error)) return null;
+  return {
+    code: "reconnect-not-ready",
+    ready: false,
+    applied: false,
+    stage: "pre-probe",
+    retryable: true,
   };
 }
 
@@ -19313,7 +19345,53 @@ const GRAPH_TOOL_EXECUTORS = {
   // --- Workflow tabs: new / list / open / switch / rename / close ----------
   // Uses ComfyUI's workflow service. "New workflow" opens a NEW TAB and never
   // touches the current graph (graph_clear is ONLY for clearing the open one).
-  workflow_list() {
+  async workflow_list() {
+    // #1785 — panel_set_workflow_target({mode:"current"}) uses this read to
+    // recover the live tab after a ComfyUI restart. A command can reach the
+    // panel before the backend reconnect, node-definition refresh, and restored
+    // canvas binding have all settled. Do not publish the restored tab from that
+    // window: it is either stale or lacks a verified route/instance identity.
+    //
+    // The normal path still does no waiting. Only a reconnect signal that is
+    // already present when this probe starts pays the bounded handshake budget.
+    // The proof is evaluated against the CURRENT epoch on every poll, and the
+    // service/active pair is read only after the wait, so a replacement during
+    // the wait cannot be paired with pre-reconnect identity.
+    const reconnectReadinessRequired =
+      comfyBackendIsDown() ||
+      postReconnectSettleWindow() ||
+      nodeDefRefreshInFlight != null;
+    const liveWorkflowListReady = () => {
+      if (comfyBackendIsDown() || nodeDefRefreshInFlight != null) return false;
+      const { active, activeIdentity } = liveWorkflowListActive();
+      if (!active || !activeIdentity?.routingKey || !activeIdentity?.uuid) return false;
+      // A post-reconnect active pointer is not enough. If this call entered
+      // during any reconnect-readiness condition, keep requiring the same
+      // binding proof even after the 30s staleness window expires: expiry is
+      // not proof, and the waiter must not turn its pending=false result into
+      // a false ready answer.
+      if (
+        reconnectReadinessRequired &&
+        postReconnectBindingProofEpoch < backendReconnectEpoch
+      ) {
+        return false;
+      }
+      return true;
+    };
+    if (reconnectReadinessRequired) {
+      const readiness = await waitForReconnectHandshakeBeforeOpen({
+        needsWait: () => !liveWorkflowListReady(),
+        isReady: liveWorkflowListReady,
+      });
+      if (readiness === "timeout") {
+        const reason = comfyBackendIsDown()
+          ? "the backend socket is still reconnecting"
+          : nodeDefRefreshInFlight != null
+            ? "the post-reconnect node-definition refresh is still running"
+            : "the restored canvas binding or live tab identity is not yet proven";
+        throw workflowListReadinessRefusalError(reason);
+      }
+    }
     const s = app?.extensionManager?.workflow;
     if (!s) throw new Error("workflow service unavailable on this frontend");
     // `s` may be a pre-reconnect service.  Read the live binding rather than
@@ -26009,6 +26087,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           reply = { rid: msg.rid, ok: true, result };
         } catch (err) {
           const reconnectRefusal = readReconnectRefusal(err);
+          const workflowListReadiness = readWorkflowListReadinessRefusal(err);
           reply = {
             rid: msg.rid,
             ok: false,
@@ -26028,6 +26107,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // reader answers the stronger question — did the gate mint this,
             // pre-executor? — and returns a freshly built object.
             ...(reconnectRefusal ? { refusal: reconnectRefusal } : {}),
+            // #1785 — this is a read-only, pre-probe refusal. Keep it separate
+            // from the graph-mutation gate's refusal vocabulary so a caller
+            // cannot confuse a workflow-list readiness miss with a graph
+            // command blocked by a different fence.
+            ...(workflowListReadiness ? { workflow_list_readiness: workflowListReadiness } : {}),
           };
         }
         // Settle the rid ledger BEFORE the dead-socket drop below (#517): even

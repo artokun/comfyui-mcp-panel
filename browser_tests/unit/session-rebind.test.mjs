@@ -1175,6 +1175,20 @@ test("#654: a benign WS blip is NOT a restart", () => {
   assert.equal(shouldReadvertiseAfterComfyRestart({ bridgeConnected: true, outageMs: 6000 }), true);
 });
 
+test("#1785: a stale restart marker cannot authorize a positive short outage", () => {
+  for (const outageMs of [800, 0, undefined, NaN, Infinity, "800"]) {
+    assert.equal(
+      shouldReadvertiseAfterComfyRestart({
+        bridgeConnected: true,
+        outageMs,
+        restartConfirmed: true,
+      }),
+      false,
+      `stale marker must not bypass the duration gate for outage ${String(outageMs)}`,
+    );
+  }
+});
+
 test("#654: an unmeasured outage is not evidence of a restart", () => {
   // Absent, zero, negative and unreadable all mean "no outage was measured" —
   // never "a long one". A missed re-advertise leaves the tab exactly as it is
@@ -1382,6 +1396,11 @@ test("#654 wiring: the panel measures, feeds and consults the outage — every s
   ]) {
     assert.ok(src.includes(snippet), site);
   }
+  assert.doesNotMatch(
+    src,
+    /restartConfirmed\s*:/,
+    "the persisted reboot marker must not authorize a route re-hello for an uncorrelated outage",
+  );
   // …and the branch RE-ADVERTISES. Asserted POSITIONALLY, not by presence: this
   // file already contains three other `client?.rehello?.()` calls (#607, #310,
   // #508), so a presence check stays green with THIS one deleted — the exact
