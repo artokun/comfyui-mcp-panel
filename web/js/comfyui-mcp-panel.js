@@ -539,6 +539,7 @@ import {
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
+import { settleOpenedWorkflowActive } from "./lib/settle-open-active.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import {
   applyCurrentDefWidgetValues,
@@ -21069,6 +21070,32 @@ const GRAPH_TOOL_EXECUTORS = {
           }
         }
         }
+      // #887 — the workflow store can publish the requested tab as active before the
+      // frontend's asynchronous tab/canvas transition has settled. The synchronous
+      // reply check below then reports a transient `active_matches_target:true`, while
+      // the next workflow_list sees the previous canvas and pinning refuses. Keep this
+      // bounded probe INSIDE the reload step: graph commands cannot interleave while the
+      // open is proving its final binding, and an unstable/read-unreadable result follows
+      // the existing unknown-rebind failure path rather than becoming false success.
+      if (!rebindFailed) {
+        beginWorkflowReloadStep(reloadGuardToken);
+        try {
+          const activeSettle = await settleOpenedWorkflowActive({
+            target,
+            readActive: activeWorkflowRef,
+            sameWorkflowObject,
+          });
+          if (activeSettle.status !== "settled") {
+            rebindFailed = new Error(
+              activeSettle.status === "different"
+                ? "workflow_open did not leave the requested workflow as the stable active canvas"
+                : "workflow_open could not prove that the requested workflow remained the stable active canvas",
+            );
+          }
+        } finally {
+          endWorkflowReloadStep(reloadGuardToken);
+        }
+      }
       }
     } catch (err) {
       // NEVER claim a reload we did not complete — report the failure and leave the caller
