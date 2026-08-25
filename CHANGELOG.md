@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.81] - 2026-08-25
+
+### Fixed
+- defer safe widget edits until queue idle (#1716)
+
+
 ## [0.15.80] - 2026-08-25
 
 ### Fixed
