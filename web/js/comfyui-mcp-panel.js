@@ -37187,9 +37187,14 @@ function buildPanel() {
           const deliveryStage = classifyCompletionDelivery({
             sendAttempted,
             transportAccepted: framePushed,
+            frameEmitted: frame != null,
             compositionMs: Date.now() - compositionStartedAt,
           });
-          if (deliveryStage !== "transport-accepted" && !AGENT_MUTED) {
+          if (
+            deliveryStage !== "transport-accepted" &&
+            deliveryStage !== "empty-no-frame" &&
+            !AGENT_MUTED
+          ) {
             console.warn("[cmcp] completion delivery diagnostic", {
               prompt_id: promptId,
               stage: deliveryStage,

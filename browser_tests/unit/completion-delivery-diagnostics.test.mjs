@@ -10,6 +10,10 @@ import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame
 
 test("completion delivery diagnostics distinguish panel-observable outcomes", () => {
   assert.equal(classifyCompletionDelivery(), "never-sent");
+  assert.equal(
+    classifyCompletionDelivery({ frameEmitted: false }),
+    "empty-no-frame",
+  );
   assert.equal(classifyCompletionDelivery({ sendAttempted: true }), "transport-failure");
   assert.equal(
     classifyCompletionDelivery({
@@ -26,6 +30,32 @@ test("completion delivery diagnostics distinguish panel-observable outcomes", ()
       compositionMs: COMPLETION_LATE_COMPOSITION_MS,
     }),
     "transport-accepted",
+  );
+});
+
+test("an intentionally empty composer result is not classified as never-sent", async () => {
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-1781-empty",
+      images: [],
+      videos: [],
+      durationMs: null,
+      noMedia: false,
+    },
+    {
+      now: () => new Date(1_000_000_000_000),
+      formatClock: () => "12:00:00",
+    },
+  );
+
+  assert.equal(frame, null);
+  assert.equal(
+    classifyCompletionDelivery({ frameEmitted: frame != null }),
+    "empty-no-frame",
+  );
+  assert.notEqual(
+    classifyCompletionDelivery({ frameEmitted: frame != null }),
+    "never-sent",
   );
 });
 

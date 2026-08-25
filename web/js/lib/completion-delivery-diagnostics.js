@@ -17,9 +17,14 @@ export const COMPLETION_LATE_COMPOSITION_MS = 10_000;
 export function classifyCompletionDelivery({
   sendAttempted = false,
   transportAccepted = false,
+  // A completed flush may intentionally produce no frame (for example, an
+  // ordinary canvas run with no media). That is delivered by lifecycle
+  // contract, not a never-sent transport failure.
+  frameEmitted = true,
   compositionMs = null,
   lateCompositionMs = COMPLETION_LATE_COMPOSITION_MS,
 } = {}) {
+  if (!frameEmitted) return "empty-no-frame";
   if (!sendAttempted) return "never-sent";
   if (!transportAccepted) return "transport-failure";
   if (Number.isFinite(compositionMs) && compositionMs > lateCompositionMs) {
