@@ -100,6 +100,10 @@ export const REFRESH_NODES_EXECUTOR_DEPS = Object.freeze({
   get REFRESH_NODES_RUN_BUDGET_MS() {
     return REFRESH_NODES_RUN_BUDGET_MS;
   },
+  // #1787 — the production executor waits for the active bridge route before
+  // touching the global node-definition refresh. Harnesses inject their own
+  // readiness promise; this default preserves the existing refresh-only cases.
+  awaitActiveRouteRegistration: async () => {},
 });
 
 /** #1413 — the whole-command deadline `graph_set_widget` takes on its first line. */
