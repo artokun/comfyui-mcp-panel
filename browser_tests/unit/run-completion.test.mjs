@@ -367,6 +367,57 @@ test("#269/#468 presentation: a MIXED run (stills + 2 videos) emits EXACTLY ONE 
   assert.match(frames[0].note, /v2\.mp4/, "note names the second video");
 });
 
+test("#1805: cache-assisted and real completion spans are labelled as workflow time", async () => {
+  const formatDuration = (ms) => `${(ms / 1000).toFixed(1)}s`;
+
+  // A cache-assisted prompt still has a real lifecycle span, but the panel does
+  // not observe ComfyUI's execution_cached events and must not call that span a
+  // render benchmark.
+  const cached = makeHarness();
+  cached.tracker.onExecutionStart("cached-prompt");
+  cached.advance(5800);
+  cached.tracker.onExecuted("cached-prompt", {
+    videos: [{ m: { filename: "cached.mp4", type: "output" }, nodeId: "save" }],
+  });
+  cached.tracker.onExecutionSuccess("cached-prompt");
+  assert.equal(cached.flushes[0].durationMs, 5800, "keep the measured workflow span");
+  const cachedDeps = makeFrameDeps({ formatDuration });
+  const cachedFrame = await composeRunCompletionFrame(cached.flushes[0], cachedDeps.deps);
+  assert.match(cachedFrame.note, /workflow completed in 5\.8s/);
+  assert.doesNotMatch(cachedFrame.note, /rendered in/);
+
+  // The same wording applies when still metadata is unavailable and the
+  // completion falls back to the batch-level duration line.
+  const fallbackDeps = makeFrameDeps({
+    formatDuration,
+    fetchImageBytes: () => new Promise(() => {}),
+    fetchImageDimensions: () => new Promise(() => {}),
+    stillsMetadataTimeoutMs: 1,
+  });
+  const fallbackFrame = await composeRunCompletionFrame(
+    { promptId: "cached-stills", images: [{ filename: "cached.png", type: "output" }], durationMs: 5800 },
+    fallbackDeps.deps,
+  );
+  assert.match(fallbackFrame.note, /workflow completed in 5\.8s/);
+  assert.doesNotMatch(fallbackFrame.note, /rendered in/);
+
+  // A genuine long render keeps its full measured duration; only the misleading
+  // render-time label changes.
+  const rendered = makeHarness();
+  rendered.tracker.onExecutionStart("rendered-prompt");
+  rendered.advance(940000);
+  rendered.tracker.onExecuted("rendered-prompt", {
+    images: [{ filename: "rendered.png", type: "output" }],
+  });
+  rendered.tracker.onExecutionSuccess("rendered-prompt");
+  assert.equal(rendered.flushes[0].durationMs, 940000, "preserve true render duration data");
+  const renderedDeps = makeFrameDeps({ formatDuration });
+  const renderedFrame = await composeRunCompletionFrame(rendered.flushes[0], renderedDeps.deps);
+  assert.match(renderedFrame.note, /workflow completed in 940\.0s/);
+  assert.doesNotMatch(renderedFrame.note, /rendered in/);
+  assert.equal(renderedFrame.metadata[0].durationMs, 940000);
+});
+
 test("presentation: a still-storyboard fallback (no blob) still yields ONE frame with the note", async () => {
   const { deps, frames } = makeFrameDeps({ buildVideoStoryboard: async () => null });
   const frame = await composeRunCompletionFrame(

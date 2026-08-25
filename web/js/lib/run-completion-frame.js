@@ -128,6 +128,10 @@ export async function composeRunCompletionFrame(
   // on the line that names the file.
   const finishedClock =
     reconciled && realFinishedAt ? formatStamp(realFinishedAt) : formatClock(finishedAt);
+  // This is the execution_start → execution_success span for the whole prompt.
+  // ComfyUI may satisfy part of that prompt from its execution cache, and this
+  // panel does not consume execution_cached provenance, so it is workflow time,
+  // not a render benchmark.
   const duration = durationMs != null ? formatDuration(durationMs) : null;
   // Age of the completion at the moment we present it. Known ONLY when the real
   // finish time is — with an unknown finish time the age is unknown too, and is
@@ -498,14 +502,14 @@ async function buildStillsSegment(bufImages, deps) {
           : `output ${meta.index} of ${meta.total} from this run`,
       );
       if (meta.siblings.length) parts.push(`alongside: ${meta.siblings.join(", ")}`);
-      if (meta.duration) parts.push(`rendered in ${meta.duration}`);
+      if (meta.duration) parts.push(`workflow completed in ${meta.duration}`);
       if (meta.finishedClock) parts.push(`finished ${meta.finishedClock}`);
       return `• ${meta.filename} — ${parts.join(" · ")}`;
     });
     note += `\n${lines.join("\n")}`;
   } else if (duration || finishedClock) {
     const bits = [];
-    if (duration) bits.push(`rendered in ${duration}`);
+    if (duration) bits.push(`workflow completed in ${duration}`);
     if (finishedClock) bits.push(`finished ${finishedClock}`);
     if (bits.length) note += `\n• ${bits.join(" · ")}`;
   }
@@ -566,7 +570,7 @@ async function buildVideoSegment(v, deps) {
       parts.push(`${storyboardN}-frame storyboard`);
     }
     if (sizeStr) parts.push(sizeStr);
-    if (duration) parts.push(`rendered in ${duration}`);
+    if (duration) parts.push(`workflow completed in ${duration}`);
     if (finishedClock) parts.push(`finished ${finishedClock}`);
     return parts.length ? `\n• ${fileName} — ${parts.join(" · ")}` : "";
   };
