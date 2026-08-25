@@ -1,0 +1,194 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+import {
+  fetchComfyUIReadForMcp,
+  validateFetchComfyUIReadArgs,
+} from "../../web/js/lib/fetch-comfyui-read.js";
+import {
+  commandIsCanvasIndependent,
+  commandIsCanvasTargetless,
+} from "../../web/js/lib/workflow-chat-identity.js";
+
+function response({
+  status = 200,
+  body = "{}",
+  contentType = "application/json",
+  contentLength,
+  url,
+  type,
+  redirected = false,
+  stream = true,
+} = {}) {
+  const bytes = new TextEncoder().encode(body);
+  let offset = 0;
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    ...(url === undefined ? {} : { url }),
+    ...(type === undefined ? {} : { type }),
+    redirected,
+    headers: {
+      get(name) {
+        const key = name.toLowerCase();
+        if (key === "content-type") return contentType;
+        if (key === "content-length") return contentLength == null ? null : String(contentLength);
+        return null;
+      },
+    },
+    ...(stream
+      ? {
+          body: {
+            getReader() {
+              return {
+                async read() {
+                  if (offset >= bytes.byteLength) return { done: true, value: undefined };
+                  const chunk = bytes.subarray(offset, offset + 3);
+                  offset += chunk.byteLength;
+                  return { done: false, value: chunk };
+                },
+                cancel() {},
+                releaseLock() {},
+              };
+            },
+          },
+        }
+      : {
+          body: null,
+          async text() {
+            return body;
+          },
+        }),
+  };
+}
+
+async function rejection(promise, code) {
+  await assert.rejects(promise, (error) => {
+    assert.equal(error.code, code, error.message);
+    return true;
+  });
+}
+
+test("#2283: the three allowed operations use only their fixed same-origin routes", async () => {
+  const calls = [];
+  const bodies = {
+    history: '{"prompt-1":{"status":{"status_str":"success"}}}',
+    system_stats: '{"system":{"os":"windows"},"devices":[]}',
+    logs: "ERROR: render failed\n",
+  };
+  for (const operation of Object.keys(bodies)) {
+    const result = await fetchComfyUIReadForMcp(
+      { operation, workflow_uuid: "stamped-by-bridge", workflow_path: "ignored-by-targetless-read" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => `/comfy${path}`,
+          fetchApi: async (path, init) => {
+            calls.push({ path, init });
+            return response({ body: bodies[operation] });
+          },
+        },
+      },
+    );
+
+    assert.deepEqual(result, {
+      operation,
+      body: bodies[operation],
+      contentType: "application/json",
+      bytes: new TextEncoder().encode(bodies[operation]).byteLength,
+    });
+  }
+
+  assert.deepEqual(calls.map(({ path }) => path), ["/history", "/system_stats", "/internal/logs"]);
+  for (const { init } of calls) {
+    assert.equal(init.method, "GET");
+    assert.equal(init.cache, "no-store");
+    assert.equal(init.credentials, "include");
+    assert.equal(init.redirect, "manual");
+    assert.ok(init.signal instanceof AbortSignal);
+  }
+});
+
+test("#2283: arbitrary paths, URLs, origins, targets, and operation names are refused before fetch", async () => {
+  const invalid = [
+    {},
+    { operation: "object_info" },
+    { operation: "history", path: "/admin" },
+    { operation: "history", url: "https://evil.test" },
+    { operation: "history", origin: "https://evil.test" },
+    { operation: "history", target: "other-tab" },
+    { operation: "history", method: "POST" },
+  ];
+  for (const args of invalid) {
+    assert.throws(() => validateFetchComfyUIReadArgs(args), { code: "invalid_input" }, JSON.stringify(args));
+    await rejection(
+      fetchComfyUIReadForMcp(args, {
+        expectedOrigin: "https://panel.test",
+        api: { apiURL: (path) => path },
+        fetchImpl: async () => { throw new Error("must not fetch"); },
+      }),
+      "invalid_input",
+    );
+  }
+});
+
+test("#2283: the resolved and final response origins stay fenced", async () => {
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "history" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: { apiURL: () => "https://evil.test/history" },
+        fetchImpl: async () => { throw new Error("must not fetch"); },
+      },
+    ),
+    "invalid_origin",
+  );
+
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "system_stats" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: { apiURL: (path) => path },
+        fetchImpl: async (url) => response({ url: "https://evil.test/system_stats" }),
+      },
+    ),
+    "invalid_origin",
+  );
+});
+
+test("#2283: redirects and oversized bodies are refused", async () => {
+  const options = {
+    expectedOrigin: "https://panel.test",
+    api: { apiURL: (path) => path },
+  };
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "logs" },
+      { ...options, fetchImpl: async () => response({ status: 302, url: "https://panel.test/login", stream: false }) },
+    ),
+    "redirect_error",
+  );
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "history" },
+      { ...options, maxBytes: 4, fetchImpl: async () => response({ body: "12345" }) },
+    ),
+    "too_large",
+  );
+});
+
+test("#2283: the command remains on the authenticated rid executor/reply path", () => {
+  const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  assert.match(source, /fetch_comfyui_read\(args = \{\}\)/);
+  assert.match(source, /return fetchComfyUIReadForMcp\(args, \{ api \}\)/);
+  assert.match(source, /"ui_render", "ui_update", "fetch_image", "fetch_comfyui_read"/);
+  assert.match(source, /const isCommandFrame = msg && typeof msg\.rid === "string" && typeof msg\.cmd === "string"/);
+  assert.match(source, /const executor = GRAPH_TOOL_EXECUTORS\[msg\.cmd\]/);
+  assert.match(source, /reply = \{ rid: msg\.rid, ok: true, result \}/);
+  assert.match(source, /deliverReply\(reply, msg\.cmd, superseded, inFlightMark\)/);
+  assert.equal(commandIsCanvasIndependent("fetch_comfyui_read"), true);
+  assert.equal(commandIsCanvasTargetless("fetch_comfyui_read"), true);
+});
