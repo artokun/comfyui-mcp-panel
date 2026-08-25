@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.78] - 2026-08-24
+
+### Fixed
+- Join in-flight panel refreshes through download completion handoff instead of returning `refresh_still_running` (#1758)
+
 ## [0.15.77] - 2026-08-25
 
 ### Fixed
