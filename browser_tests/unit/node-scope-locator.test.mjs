@@ -353,9 +353,10 @@ test("WIRING: resolveNode builds its error through describeMissingNode", async (
   const body = fn.slice(0, fn.indexOf("function normalizeLegacyNodeId"));
   assert.ok(body.includes("describeMissingNode(nodeId, rootGraph, viewingRoot, graph)"),
     "the failure path must go through the locator with the live graph so current ids can be named");
-  // The lookup itself must be unchanged — this is diagnostics only, never a wider search.
-  assert.ok(body.includes("graph.getNodeById(canonicalNodeId(nodeId))"),
-    "resolution must still be scoped to the current graph");
+  // The lookup remains scoped to the current graph, but now follows the live
+  // node list before consulting its possibly stale id index (#1759).
+  assert.ok(body.includes("resolveLiveNode(graph, nodeId)"),
+    "resolution must use the current graph's live-node resolver");
   // And the diagnostic must not be able to break the call.
   assert.ok(body.includes("} catch {"), "reading the root must be guarded");
   // graph_save_subgraph used to throw the bare prefix and skip the locator, so a

@@ -23,7 +23,7 @@ import {
   resolveRailNode,
 } from "../../web/js/lib/subgraph-scope.js";
 import { describeMissingNode } from "../../web/js/lib/node-scope-locator.js";
-import { canonicalNodeId } from "../../web/js/lib/node-id.js";
+import { canonicalNodeId, resolveLiveNode } from "../../web/js/lib/node-id.js";
 import { withWorkflowUuid } from "../../web/js/lib/graph-view-identity.js";
 import {
   rememberAutoLayoutScope,
@@ -250,11 +250,12 @@ function buildShippedScopeTools(app) {
 
   const resolveNode = new Function(
     "canonicalNodeId",
+    "resolveLiveNode",
     "resolveRailNode",
     "getGraphCtx",
     "describeMissingNode",
     `${panelFunctionSource(PANEL_SRC, "resolveNode", "normalizeLegacyNodeId")}\nreturn resolveNode;`,
-  )(canonicalNodeId, resolveRailNode, getGraphCtx, describeMissingNode);
+  )(canonicalNodeId, resolveLiveNode, resolveRailNode, getGraphCtx, describeMissingNode);
 
   return { getGraphCtx, describeActiveGraph, resolveNode };
 }

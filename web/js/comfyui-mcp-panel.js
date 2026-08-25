@@ -456,7 +456,7 @@ import {
 } from "./lib/queue-prompt-chain.js";
 
 
-import { canonicalNodeId, isQualifiedNodeId } from "./lib/node-id.js";
+import { canonicalNodeId, isQualifiedNodeId, resolveLiveNode } from "./lib/node-id.js";
 import { configureAppMode } from "./lib/configure-app-mode.js";
 import { normalizeCanvasDsInPlace } from "./lib/canvas-ds.js";
 import { boundByChars, normalizeViewportMaxChars, viewportTruncation, VIEWPORT_DEFAULT_MAX_CHARS } from "./lib/viewport-char-bound.js";
@@ -11256,7 +11256,10 @@ function nodeDescription(node) {
  * exactly as before, including the numeric-string compatibility surface.
  */
 function resolveNode(graph, nodeId) {
-  const node = graph.getNodeById(canonicalNodeId(nodeId));
+  // #1759 — reads enumerate the live node list, while `_nodes_by_id` can retain
+  // a custom node's old occupant after that node pack mutates ids. Resolve from
+  // the same live list first so panel_set_widget cannot edit the wrong node.
+  const node = resolveLiveNode(graph, nodeId);
   // #697 — a node the READS just listed can be unresolvable here: reads span every
   // scope, while a write applies to the graph being VIEWED. Say WHERE it actually is
   // instead of only that it is not here. Diagnostic-only: runs on the failure path,

@@ -136,6 +136,7 @@ test("WIRING: resolveNode asks WHAT the id is before reporting it missing", asyn
     body.indexOf("describeRailNodeTarget") < body.indexOf("describeMissingNode"),
     "the rail branch must precede the generic miss",
   );
-  // And it stays diagnostics-only: resolution is still the current graph alone.
-  assert.ok(body.includes("graph.getNodeById(canonicalNodeId(nodeId))"));
+  // And it stays diagnostics-only: resolution is still the current graph alone,
+  // with the live-list/index reconciliation covered by #1759.
+  assert.ok(body.includes("resolveLiveNode(graph, nodeId)"));
 });
