@@ -696,6 +696,7 @@ import {
   workflowSaveTimeoutObservation,
 } from "./lib/workflow-save-budget.js";
 import { createRunCompletionTracker } from "./lib/run-completion.js";
+import { classifyCompletionDelivery } from "./lib/completion-delivery-diagnostics.js";
 import {
   clearInheritedExecutionPreview,
   clearStoredExecutionOutputs,
@@ -37125,6 +37126,8 @@ function buildPanel() {
       // the next reconnect recovers it via /history. A confirmed send (or an empty
       // batch that emits no frame) retires it from pending.
       let framePushed = false;
+      let sendAttempted = false;
+      const compositionStartedAt = Date.now();
       // A completed prompt delivers its FULL batch here, exactly once. Compose
       // ONE consolidated agent_event for the whole run — stills AND every video's
       // storyboard folded into a single images+note+metadata turn — so a mixed /
@@ -37151,6 +37154,7 @@ function buildPanel() {
         },
         {
           sendFrame: (frame) => {
+            sendAttempted = true;
             const ok = client.sendFrame(frame);
             if (ok) framePushed = true;
             return ok;
@@ -37180,6 +37184,17 @@ function buildPanel() {
         },
       )
         .then((frame) => {
+          const deliveryStage = classifyCompletionDelivery({
+            sendAttempted,
+            transportAccepted: framePushed,
+            compositionMs: Date.now() - compositionStartedAt,
+          });
+          if (deliveryStage !== "transport-accepted" && !AGENT_MUTED) {
+            console.warn("[cmcp] completion delivery diagnostic", {
+              prompt_id: promptId,
+              stage: deliveryStage,
+            });
+          }
           // frame===null ⇒ empty batch (nothing to deliver) ⇒ delivered. A frame
           // that was pushed ⇒ delivered. A frame that FAILED to push ⇒ re-pend —
           // UNLESS it failed because agents are MUTED, which is intentional,
@@ -37196,6 +37211,16 @@ function buildPanel() {
           pruneRebootMarker();
         })
         .catch((err) => {
+          if (!AGENT_MUTED) {
+            console.warn("[cmcp] completion delivery diagnostic", {
+              prompt_id: promptId,
+              stage: classifyCompletionDelivery({
+                sendAttempted,
+                transportAccepted: framePushed,
+                compositionMs: Date.now() - compositionStartedAt,
+              }),
+            });
+          }
           console.warn("[cmcp] composeRunCompletionFrame failed:", err);
           // Composition threw before/around the send — treat as undelivered so a
           // reconnect can recover the outcome from /history rather than lose it

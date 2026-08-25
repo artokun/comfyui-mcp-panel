@@ -24,6 +24,7 @@
 // leaving the segment pending forever.
 import { duplicateCompletionNote } from "./completion-dedupe.js";
 import { withTimeout } from "./bounded-step.js";
+import { completionCompositionDiagnostic } from "./completion-delivery-diagnostics.js";
 import {
   appendStoryboardCacheBust,
   createStoryboardIdentity,
@@ -146,6 +147,8 @@ export async function composeRunCompletionFrame(
           recoveredAgeMs,
         }
       : {};
+  const completionDiagnostics = () =>
+    completionCompositionDiagnostic({ compositionMs: msBetween(composedAt, now()) });
 
   const outImages = []; // consolidated images for the single frame
   const noteSections = []; // note segments joined into the single note
@@ -265,6 +268,7 @@ export async function composeRunCompletionFrame(
           "or other non-media outputs, read them from the run's history entry.",
       ].join("\n\n"),
       metadata: [{ outputs: "none", reason: "no_media", ...recoveryMetadata() }],
+      completion_diagnostics: completionDiagnostics(),
       ...(promptId != null ? { prompt_id: promptId } : {}),
     };
     sendFrame(frame);
@@ -277,6 +281,7 @@ export async function composeRunCompletionFrame(
     images: outImages,
     note: noteSections.join("\n\n"),
     metadata,
+    completion_diagnostics: completionDiagnostics(),
     // Machine-readable attribution: which prompt this completion belongs to, so
     // a delayed prior-run flush can never be mistaken for the current run (#224).
     ...(promptId != null ? { prompt_id: promptId } : {}),
