@@ -397,6 +397,7 @@ const CANVAS_INDEPENDENT_COMMANDS = new Set([
   'graph_update_node',
   'graph_get_virtual_types',
   'fetch_image',
+  'fetch_comfyui_read',
   'comfy_reboot',
   'free_vram',
 ]);
