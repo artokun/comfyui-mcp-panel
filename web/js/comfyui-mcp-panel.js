@@ -356,6 +356,7 @@ import {
   releaseReconnectScopePin,
 } from "./lib/reconnect-scope-fence.js";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
+import { reconcileFreshDynamicWidgets } from "./lib/dynamic-widget-reconcile.js";
 import {
   createDeferredWidgetEditQueue,
   deferredWidgetQueueCounts,
@@ -14770,6 +14771,11 @@ const GRAPH_TOOL_EXECUTORS = {
       node.pos = placementFor(graph, pos);
       if (title && typeof title === "string") node.title = title;
       graph.add(node);
+      // COMFY_DYNAMICCOMBO_V3 first runs its value setter while LG.createNode is still
+      // detached from a graph. Replay it after registration so the widget-value store and
+      // dynamic rows match the fresh node. This also lets a stale dotted row such as
+      // `format.codec` be removed by the frontend's own dynamic rebuild.
+      reconcileFreshDynamicWidgets(node, currentDef);
     } finally {
       graph.afterChange();
     }

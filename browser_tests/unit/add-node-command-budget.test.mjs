@@ -65,6 +65,7 @@ import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
 import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
+import { reconcileFreshDynamicWidgets } from "../../web/js/lib/dynamic-widget-reconcile.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -396,6 +397,7 @@ function realGraphAddNode({
     addNodeRefreshBusyMessage,
     clearInheritedExecutionPreview,
     sanitizeNodeAuxId,
+    reconcileFreshDynamicWidgets,
     OBJECT_INFO_SEED_WAIT_MS: 8000,
     ADD_NODE_COMMAND_BUDGET_MS: budgetMs,
     ADD_NODE_POST_REFRESH_RESERVE_MS: reserveMs,

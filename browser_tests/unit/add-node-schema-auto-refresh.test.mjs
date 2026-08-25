@@ -90,6 +90,21 @@ function backendObjectInfo() {
       input: { required: { image: [["a.png", "b.png"], {}] } },
       output: ["IMAGE", "MASK"],
     },
+    SaveVideo: {
+      name: "SaveVideo",
+      input: {
+        required: {
+          video: ["VIDEO"],
+          filename_prefix: ["STRING", { default: "video/ComfyUI" }],
+          format: [["auto", "mp4"], { default: "auto" }],
+          codec: [
+            "COMFY_DYNAMICCOMBO_V3",
+            { options: [{ key: "auto", inputs: {} }, { key: "h264", inputs: {} }] },
+          ],
+        },
+      },
+      output: ["VIDEO"],
+    },
   };
 }
 
@@ -103,9 +118,43 @@ function staleLoadImageNodeData() {
 }
 
 function makeComfy({ stale = true } = {}) {
+  function installRebuildAccessor(node, widget) {
+    let value = widget.value;
+    Object.defineProperty(widget, "value", {
+      configurable: true,
+      get() {
+        return value;
+      },
+      set(next) {
+        value = next;
+        node.dynamicRebuilds.push(widget.name);
+        node.widgets = node.widgets.filter(
+          (candidate) => !candidate.name.startsWith(`${widget.name}.`),
+        );
+      },
+    });
+  }
+
   const widgets = {
+    STRING(node, name, spec) {
+      return { widget: node.addWidget("text", name, spec?.[1]?.default ?? "", null, {}) };
+    },
     COMBO(node, name, spec) {
-      return { widget: node.addWidget("combo", name, spec[0][0], null, { values: spec[0] }) };
+      const widget = node.addWidget("combo", name, spec[0][0], null, { values: spec[0] });
+      // The fixture represents the stale SaveVideo format dynamic root reported by #2254.
+      if (node.type === "SaveVideo" && name === "format") installRebuildAccessor(node, widget);
+      return { widget };
+    },
+    COMFY_DYNAMICCOMBO_V3(node, name, spec) {
+      const widget = node.addWidget(
+        "combo",
+        name,
+        spec?.[1]?.options?.[0]?.key ?? "auto",
+        null,
+        {},
+      );
+      installRebuildAccessor(node, widget);
+      return { widget };
     },
   };
 
@@ -126,6 +175,7 @@ function makeComfy({ stale = true } = {}) {
         widgets: [],
         inputs: [],
         outputs: [],
+        dynamicRebuilds: [],
         addWidget(kind, name, value, callback, options) {
           const widget = { type: kind, name, value, callback, options: options ?? {} };
           node.widgets.push(widget);
@@ -137,6 +187,17 @@ function makeComfy({ stale = true } = {}) {
         if (Array.isArray(declared)) widgets.COMBO(node, name, spec);
         else if (typeof widgets[declared] === "function") widgets[declared](node, name, spec);
         else node.inputs.push({ name, type: declared });
+      }
+      if (type === "SaveVideo") {
+        // A stale nested row can survive the constructor's detached initial pass. The
+        // shipped repair must make the native `format` and `codec` setters clean it up
+        // after graph.add registers the node.
+        node.widgets.push({
+          type: "combo",
+          name: "format.codec",
+          value: "auto",
+          options: {},
+        });
       }
       return node;
     },
@@ -159,11 +220,13 @@ function makeComfy({ stale = true } = {}) {
   // the entry is the stale page-load one or already current is the scenario knob.
   void app.registerNodesFromDefs({
     LoadImage: stale ? staleLoadImageNodeData() : backendObjectInfo().LoadImage,
+    SaveVideo: backendObjectInfo().SaveVideo,
   });
 
   const graph = {
     _nodes: [],
     add(node) {
+      node.graph = graph;
       graph._nodes.push(node);
     },
     beforeChange() {},
@@ -390,4 +453,21 @@ test("#1242: an add with no drift never calls the refresh", async () => {
   assert.equal(res.added.type, "LoadImage");
   assert.equal(refreshCalls.length, 0, "a healthy add must not pay for a whole-schema refresh");
   assert.equal(res.added.schema_refreshed, undefined, "nothing to disclose when nothing happened");
+});
+
+test("#2254: a freshly added SaveVideo rebuilds stale format and codec dynamic state", async () => {
+  const comfy = makeComfy({ stale: false });
+  const { graph_add_node } = realGraphAddNode(comfy);
+
+  const res = await graph_add_node({ class_type: "SaveVideo" });
+  const node = comfy.graph._nodes[0];
+
+  assert.equal(res.added.type, "SaveVideo");
+  assert.deepEqual(
+    node.widgets.map((widget) => widget.name),
+    ["filename_prefix", "format", "codec"],
+    "the stale format.codec row is removed while the current codec root remains",
+  );
+  assert.deepEqual(node.dynamicRebuilds, ["format", "codec"]);
+  assert.ok(node.graph, "the replay runs after graph.add registers the node");
 });
