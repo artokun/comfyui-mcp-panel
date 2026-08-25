@@ -173,8 +173,8 @@ export function saveTransportFailureMessage(err, { operation, path, backendSocke
     ? `ComfyUI's same-origin userdata route (${route})`
     : `ComfyUI's same-origin userdata route`;
   return (
-    `${raw || "the request failed"} — ${op.verb} ${target} never reached ComfyUI: the write to ` +
-    `${where} produced NO HTTP response, so there is no status code and no response body to ` +
+    `${raw || "the request failed"} — ${op.verb} ${target} received NO HTTP response from ` +
+    `${where}, so there is no status code and no response body to ` +
     `report — they do not exist (#1757).${socketNote(backendSocket)} This does NOT establish ` +
     `that nothing was written: a reply lost after the request was delivered looks exactly like ` +
     `this from the browser, so read the file back before retrying rather than assuming either ` +

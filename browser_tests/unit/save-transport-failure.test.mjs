@@ -157,6 +157,8 @@ test("#1757 the in-place message states that no status or body EXISTS, rather th
     /no status code and no response body to report — they do not exist/,
     "the issue asked for status+body; the honest answer is that they were never produced",
   );
+  assert.match(err.message, /received NO HTTP response from/, "reports the observed response gap");
+  assert.ok(!/never reached ComfyUI/.test(err.message), "no response does not prove the request was never delivered");
 });
 
 test("#1757 the message refuses to claim the file was left unwritten, and never says 'safe to retry'", async () => {
