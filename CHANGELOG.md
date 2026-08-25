@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.93] - 2026-08-25
+
+### Fixed
+- add an authenticated fixed-operation ComfyUI read relay for history, system stats, and logs (#2283)
+
 ## [0.15.92] - 2026-08-25
 
 ### Fixed
