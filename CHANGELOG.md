@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.87] - 2026-08-25
+
+### Fixed
+- rebuild fresh SaveVideo dynamic widgets and clear stale widget state (#2254)
+
 ## [0.15.86] - 2026-08-25
 
 ### Fixed
