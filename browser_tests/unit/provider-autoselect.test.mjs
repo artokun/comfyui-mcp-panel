@@ -102,23 +102,49 @@ const readiness = (backend, { ready, available, ...extra }) => ({
 const CLAUDE_ON_MACOS = readiness("claude", { ready: true, available: false });
 const OLLAMA_RUNNING = readiness("ollama", { ready: true, available: true });
 
-test("#1818 a saved provider the host probe cannot see is kept, not re-decided", () => {
+test("#1818 a saved provider the host probe cannot see is offered and pre-selected", () => {
   const result = providerDiscoveryDecision({
     backends: [CLAUDE_ON_MACOS, OLLAMA_RUNNING],
     selectedBackend: "claude",
     hasSavedChoice: true,
     discoveryComplete: true,
   });
-  // Symptom 1: no card. `choose` here is the bug.
-  assert.equal(result.action, "keep");
-  // Symptom 2: the active provider is in the list, not filtered out of it.
+  // THE defect: claude was filtered out of the list entirely, so the card could
+  // not list it and the call site's `selected:` resolved to null. It is present
+  // now, and first, so the user's own provider is the pre-selected entry.
   assert.deepEqual(
     result.candidates.map((entry) => entry.backend),
     ["claude", "ollama"],
   );
+  // And the panel must ASK rather than relocate: on main this same frame
+  // returned `select: ollama` and moved a working Claude session onto a provider
+  // the reporter's log shows was not even reachable.
+  assert.equal(result.action, "choose");
+  assert.equal(result.backend, undefined);
 });
 
-test("#1818 the keep decision does not depend on a live handshake", () => {
+test("#1818 a saved provider is never silently replaced, whatever the probe says", () => {
+  // The harm on main is the SILENT part. With the saved entry back in the list
+  // there is always more than one candidate, so the `select` branch — which
+  // applies a provider with no user input — is unreachable while a saved choice
+  // is offerable. Checked across every alternative count.
+  for (const others of [[OLLAMA_RUNNING], [OLLAMA_RUNNING, readiness("codex", { ready: true, available: true })]]) {
+    const result = providerDiscoveryDecision({
+      backends: [CLAUDE_ON_MACOS, ...others],
+      selectedBackend: "claude",
+      hasSavedChoice: true,
+      discoveryComplete: true,
+    });
+    assert.equal(result.action, "choose", `${others.length} alternatives`);
+    assert.equal(result.backend, undefined);
+    assert.ok(
+      result.candidates.some((entry) => entry.backend === "claude"),
+      "the saved provider stays in the list it is chosen from",
+    );
+  }
+});
+
+test("#1818 the decision does not depend on a live handshake", () => {
   // `connectedBackend` is set from the `models` frame, which the orchestrator
   // pushes only after an uncached SDK model probe; `discovery_complete: true`
   // arrives after three localhost fetches that fail instantly when nothing is
@@ -132,24 +158,38 @@ test("#1818 the keep decision does not depend on a live handshake", () => {
     hasSavedChoice: true,
     discoveryComplete: true,
   });
+  assert.ok(
+    result.candidates.some((entry) => entry.backend === "claude"),
+    "no handshake landed, and the saved provider is still offered",
+  );
+});
+
+test("#1818 the saved provider alone means no card at all", () => {
+  // Nothing else offerable, so there is nothing to ask about: the user keeps the
+  // provider they already had and the restart is silent. `select` here resolves
+  // to the SAME backend already in `selectedBackend`, which the call site treats
+  // as a re-pick (persist only, no reconnect).
+  const result = providerDiscoveryDecision({
+    backends: [CLAUDE_ON_MACOS, readiness("codex", { ready: false, available: false })],
+    selectedBackend: "claude",
+    hasSavedChoice: true,
+    discoveryComplete: true,
+  });
+  assert.deepEqual({ action: result.action, backend: result.backend }, {
+    action: "select",
+    backend: "claude",
+  });
+});
+
+test("#1818 a reachable saved provider still short-circuits with no card", () => {
+  const result = providerDiscoveryDecision({
+    backends: [readiness("claude", { ready: true, available: true }), OLLAMA_RUNNING],
+    selectedBackend: "claude",
+    hasSavedChoice: true,
+    discoveryComplete: true,
+  });
   assert.equal(result.action, "keep");
-  // And it must NOT quietly move the user onto the one provider the probe CAN
-  // see — the reporter's Ollama was not even reachable.
-  assert.equal(result.backend, undefined);
 });
-
-test("#1818 restarting again re-reads the same state and still does not re-prompt", () => {
-  // The reported loop: same localStorage, same frame, card every single time.
-  const mount = () =>
-    providerDiscoveryDecision({
-      backends: [CLAUDE_ON_MACOS, OLLAMA_RUNNING],
-      selectedBackend: "claude",
-      hasSavedChoice: true,
-      discoveryComplete: true,
-    }).action;
-  assert.deepEqual([mount(), mount(), mount()], ["keep", "keep", "keep"]);
-});
-
 test("#1818 a saved provider that is genuinely gone still falls through", () => {
   // An uninstalled codex / signed-out gemini reports ready:false. That is the
   // signal that survives the fix — "your provider disappeared" must keep working,
