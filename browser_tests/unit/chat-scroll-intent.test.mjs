@@ -279,21 +279,83 @@ test("production DOM wiring skips an app scroll, preserves the marker, and re-st
   surface.scrollIntent.dispose();
 });
 
-test("production wiring ignores nested input and scroll targets while preserving root scrolling", () => {
+test("nested gesture targets (wheel, touchmove, pointerdown) from descendant elements count as scroll intent", () => {
   const surface = buildProductionScrollSurface();
-  const nestedInput = {};
+  const nestedElement = {};
+
+  // Pointerdown on a nested element (e.g., a button inside a message card) should mark intent
+  surface.log.scrollTop = 300;
+  emit(surface.log, "pointerdown", {}, nestedElement);
+  emit(surface.log, "scroll");
+  assert.equal(
+    surface.stickToBottom,
+    false,
+    "a pointerdown gesture on a descendant element must still latch stickToBottom off"
+  );
+
+  // Wheel on a nested element should also mark intent
+  const surface2 = buildProductionScrollSurface();
+  surface2.log.scrollTop = 300;
+  emit(surface2.log, "wheel", {}, nestedElement);
+  emit(surface2.log, "scroll");
+  assert.equal(
+    surface2.stickToBottom,
+    false,
+    "a wheel gesture on a descendant element must still latch stickToBottom off"
+  );
+
+  // Touchmove on a nested element should also mark intent
+  const surface3 = buildProductionScrollSurface();
+  surface3.log.scrollTop = 300;
+  emit(surface3.log, "touchmove", {}, nestedElement);
+  emit(surface3.log, "scroll");
+  assert.equal(
+    surface3.stickToBottom,
+    false,
+    "a touchmove gesture on a descendant element must still latch stickToBottom off"
+  );
+
+  surface.disposeChatScrollListeners();
+  surface.scrollIntent.dispose();
+  surface2.disposeChatScrollListeners();
+  surface2.scrollIntent.dispose();
+  surface3.disposeChatScrollListeners();
+  surface3.scrollIntent.dispose();
+});
+
+test("programmatic scroll events on nested elements do not count as user intent", () => {
+  const surface = buildProductionScrollSurface();
+  const nestedElement = {};
+
+  // Scroll events on nested elements (non-user-generated) should not mark intent
+  surface.log.scrollTop = 300;
+  emit(surface.log, "scroll", {}, nestedElement);
+  emit(surface.log, "scroll");
+  assert.equal(
+    surface.stickToBottom,
+    true,
+    "a programmatic scroll event on a nested element must not unstick"
+  );
+
+  surface.disposeChatScrollListeners();
+  surface.scrollIntent.dispose();
+});
+
+test("keydown in form fields (nested editable elements) counts as scroll intent", () => {
+  const surface = buildProductionScrollSurface();
+  const textField = {}; // Simulates an input/textarea within the chat
 
   surface.log.scrollTop = 300;
-  emit(surface.log, "pointerdown", {}, nestedInput);
-  emit(surface.log, "scroll", {}, nestedInput);
-  assert.equal(surface.stickToBottom, true, "nested code/card/thinking activity is not root intent");
-
+  // User typing in a form field inside the chat (e.g., a TextField in an A2UI card)
+  // should count as scroll intent
+  emit(surface.log, "keydown", { key: "ArrowDown" }, textField);
   emit(surface.log, "scroll");
-  assert.equal(surface.stickToBottom, true, "nested activity must not unstick a root anchoring scroll");
+  assert.equal(
+    surface.stickToBottom,
+    false,
+    "a keydown event on a nested form field must count as scroll intent"
+  );
 
-  emit(surface.log, "wheel");
-  emit(surface.log, "scroll");
-  assert.equal(surface.stickToBottom, false, "root user scrolling remains intentional");
   surface.disposeChatScrollListeners();
   surface.scrollIntent.dispose();
 });

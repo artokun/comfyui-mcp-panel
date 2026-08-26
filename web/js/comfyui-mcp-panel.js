@@ -31554,7 +31554,6 @@ function buildPanel() {
   const scrollIntent = createChatScrollIntentTracker();
   const chatScrollIntentListenerOptions = { passive: true };
   const onChatScrollIntent = (event) => {
-    if (event.target !== event.currentTarget) return;
     scrollIntent.note(event);
   };
   const onChatScrollEnd = (event) => {
