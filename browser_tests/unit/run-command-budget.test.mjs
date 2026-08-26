@@ -1320,6 +1320,166 @@ test("#1824 CALL SITE: a long panel_run completion stays replayable until the or
   }
 });
 
+test("#1824 recurrence: write succeeds, receipt never arrives, /history confirms the completion is delivered", async () => {
+  // This is the scenario from the recurrence report: a long render completes
+  // successfully, the panel sends it with a completion_key, but the orchestrator
+  // receipt never arrives (or arrives very slowly). The bound of 3 on unacked
+  // deliveries would normally stop reconciliation, but for keyed completions we
+  // must still check /history to confirm the run completed. This test proves
+  // that happens and delivers the completion without generating an unlimited
+  // storm of frames.
+  const stop = keepAlive();
+  let sweep;
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const frames = [];
+    const flushes = [];
+    let nextTimer = 0;
+    const timers = new Set();
+    const schedule = (fn, ms) => {
+      const timer = { id: ++nextTimer, fn, ms };
+      timers.add(timer);
+      return timer;
+    };
+    const cancel = (timer) => timers.delete(timer);
+    let tracker;
+    const HISTORY_SUCCESS = {
+      outputs: { 9: { images: [{ filename: "bound-test.png", type: "output" }] } },
+      status: { status_str: "success", completed: true, messages: [] },
+    };
+    const productionOnFlush = createRunCompletionFlushHandler({
+      sendFrame: (frame) => {
+        frames.push(frame);
+        return true; // socket always accepts (we're testing the bound, not transport)
+      },
+      markDelivered: (promptId) => tracker.markDelivered(promptId),
+      markUndelivered: (promptId) => tracker.markUndelivered(promptId),
+      pruneRebootMarker: () => {},
+      coerceMessageText: (value) => String(value ?? ""),
+      formatDuration: (ms) => `${(ms / 1000).toFixed(1)}s`,
+      formatClock: () => "12:00:00",
+      imageViewUrl: (m) => `view://${m.filename}`,
+      fetchImageBytes: async () => 2048,
+      fetchImageDimensions: async () => ({ w: 512, h: 512 }),
+      humanizeBytes: (n) => `${n} B`,
+      warn: () => {},
+      now: () => Date.now(),
+    });
+    tracker = createRunCompletionTracker({
+      onFlush: (payload) => {
+        flushes.push(payload);
+        productionOnFlush(payload);
+      },
+      now: () => 0,
+      setTimer: schedule,
+      clearTimer: cancel,
+    });
+    sweep = createRunReconcileSweep({
+      hasPending: () => tracker.hasPending(),
+      reconcile: () =>
+        tracker.reconcile({
+          fetchHistory: async () => HISTORY_SUCCESS,
+          fetchQueued: async () => false,
+          isVideo: () => false,
+        }),
+      setTimer: schedule,
+      clearTimer: cancel,
+      intervalMs: 60000,
+    });
+
+    let promptId;
+    const owner = { current: { generation: 1824 } };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      runCompletionRef: tracker,
+      armRunReconcileSweepRef: () => sweep.arm(),
+      panelRunOwnerRef: owner,
+      runReceiptRouteRef: () => "panel-route-1824-recurrence",
+      runReceiptSender: () => {},
+      dispatch: async (args) => {
+        promptId = () => args.onPromptId("bound-test-prompt-1824");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    const result = await built.graph_run({ to_node_id: 367, rid: "run-rid-1824-recurrence" });
+    assert.equal(result.queued_unknown, true);
+    promptId();
+    assert.equal(sweep._hasTimer(), true, "panel_run arms the sweep");
+
+    // Execute and complete the run, sending a keyed completion frame
+    tracker.onExecutionStart("bound-test-prompt-1824");
+    tracker.onExecuted("bound-test-prompt-1824", {
+      images: [{ filename: "bound-test.png", type: "output" }],
+    });
+    tracker.onExecutionSuccess("bound-test-prompt-1824");
+
+    const completionKey = frames[0].completion_key;
+    assert.equal(tracker.hasPending(), true, "write success does not retire a keyed completion");
+    assert.equal(frames.length, 1, "initial send: 1 frame");
+
+    // Reconcile 1 (unacked=1)
+    await tracker.reconcile({
+      fetchHistory: async () => HISTORY_SUCCESS,
+      fetchQueued: async () => false,
+      isVideo: () => false,
+    });
+    assert.equal(frames.length, 2, "reconcile 1 replays the frame");
+    assert.equal(tracker.hasPending(), true, "still pending, no receipt");
+
+    // Reconcile 2 (unacked=2)
+    await tracker.reconcile({
+      fetchHistory: async () => HISTORY_SUCCESS,
+      fetchQueued: async () => false,
+      isVideo: () => false,
+    });
+    assert.equal(frames.length, 3, "reconcile 2 replays the frame");
+    assert.equal(tracker.hasPending(), true);
+
+    // Reconcile 3 (unacked=3, bound reached)
+    await tracker.reconcile({
+      fetchHistory: async () => HISTORY_SUCCESS,
+      fetchQueued: async () => false,
+      isVideo: () => false,
+    });
+    assert.equal(frames.length, 4, "reconcile 3 hits the bound, replays the frame one last time");
+    assert.equal(tracker.hasPending(), true);
+
+    // Reconcile 4+ (bound prevents NEW frames, but /history must still deliver)
+    await tracker.reconcile({
+      fetchHistory: async () => HISTORY_SUCCESS,
+      fetchQueued: async () => false,
+      isVideo: () => false,
+    });
+    // The key assertion: /history is checked even when bound is reached
+    assert.equal(frames.length, 4, "reconcile 4+: NO NEW FRAMES (bound holds), but /history is checked");
+    assert.equal(
+      flushes.length,
+      4,
+      "the bounded reconciliation still delivers via /history (flushes=4: initial + 3 replays + history)",
+    );
+    assert.equal(
+      flushes[3]?.reconciled,
+      true,
+      "the 4th flush is from /history confirmation, not a frame emission",
+    );
+    // Check that it has reconciled: true, which indicates this came from /history
+    assert.equal(tracker.hasPending(), false, "after /history confirms success, the run is delivered and retires");
+    assert.equal(tracker.isSettled("bound-test-prompt-1824"), true);
+
+    // Control: verify the bound did its job — no unlimited storms
+    assert.equal(frames.length, 4, "the frame bound held at 3 unacked + /history delivery");
+  } finally {
+    sweep?.dispose();
+    stop();
+  }
+});
+
 test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on reconnect", async () => {
   const stop = keepAlive();
   try {

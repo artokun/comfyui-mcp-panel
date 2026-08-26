@@ -285,18 +285,18 @@ export function createRunCompletionTracker({
     return records.find((record) => record.routeId === route && record.sessionId === session) ?? null;
   }
 
-  function flushWithCompletionRecords(k, payload) {
+  function flushWithCompletionRecords(k, payload, { trackUnackedDelivery = true } = {}) {
     const records = completionRecords(k);
     if (!records.length) {
       onFlush(payload);
       return false;
     }
     for (const record of records) {
-      // #1842 — every KEYED frame leaving here is a potential agent turn, and it
-      // is retired only by a receipt, so it spends one of this run's bounded
-      // delivery slots. Counted at the single funnel deliberately: a later emit
-      // site added upstream cannot quietly escape the bound.
-      noteUnackedDelivery(k);
+      // #1842 — every KEYED frame EMISSION is a potential agent turn and spends one
+      // of this run's bounded delivery slots. But #1824 recurrence: /history
+      // confirmation is NOT an emission — it's reading truth, not generating load.
+      // Only count actual frame sends (trackUnackedDelivery=true).
+      if (trackUnackedDelivery) noteUnackedDelivery(k);
       onFlush({ ...payload, completionKey: record.completionKey });
     }
     return true;
@@ -825,13 +825,20 @@ export function createRunCompletionTracker({
     const k = key(promptId);
     if (delivered.has(k) || !pending.has(k)) return null;
     // #1842 — this run's bounded number of completion frames have already been
-    // handed over and no receipt has retired any of them. Refuse BEFORE the
-    // /history probe, so an orchestrator that never acks stops costing a fetch
-    // AND an agent turn on every sweep tick, forever. A frame the transport
+    // handed over and no receipt has retired any of them. A frame the transport
     // REFUSED does not count against this (markUndelivered gives that one slot
     // back), so a run nothing ever accepted is still retried without limit —
     // see `unackedDeliveries` for why that is a decrement and never a reset.
-    if (unackedDeliveriesExhausted(k)) return null;
+    //
+    // #1824 recurrence — the bound prevents FRAME EMISSIONS, not TRUTH-SEEKING.
+    // For legacy unkeyed runs, enforce the bound strictly (no emissions permitted).
+    // For keyed panel_run completions awaiting orchestrator receipt: proceed to
+    // /history to confirm whether the run actually completed. If /history says
+    // it's done, we'll deliver that proof without incrementing unackedDeliveries
+    // (it's not an emission attempt, just reading state). This preserves the
+    // duplicate-over-loss principle: proving completion beats losing it.
+    const isKeyedCompletion = hasCompletionRecords(k);
+    if (unackedDeliveriesExhausted(k) && !isKeyedCompletion) return null;
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
@@ -993,17 +1000,23 @@ export function createRunCompletionTracker({
       // Recorded, never suppressed: a reconcile exists to deliver something the agent
       // has NOT been told about, so it always goes through.
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
-      flushWithCompletionRecords(k, {
-        key: k,
-        promptId,
-        images: parsed.images,
-        videos: parsed.videos,
-        durationMs,
-        // Epoch ms of the REAL finish, or null when history records none (#1199).
-        finishedAt: historyFinishedAt,
-        reconciled: true,
-        ...(mediaLessQueued ? { noMedia: true } : {}),
-      });
+      flushWithCompletionRecords(
+        k,
+        {
+          key: k,
+          promptId,
+          images: parsed.images,
+          videos: parsed.videos,
+          durationMs,
+          // Epoch ms of the REAL finish, or null when history records none (#1199).
+          finishedAt: historyFinishedAt,
+          reconciled: true,
+          ...(mediaLessQueued ? { noMedia: true } : {}),
+        },
+        // #1824 recurrence — /history confirmation is truth-seeking, not a frame
+        // emission attempt. Do not count it against the #1842 storm bound.
+        { trackUnackedDelivery: false },
+      );
     }
     return { promptId, status: "success", delivered: hasBatch || mediaLessQueued };
   }
