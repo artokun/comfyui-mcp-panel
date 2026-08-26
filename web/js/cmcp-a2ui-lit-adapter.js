@@ -1,97 +1,67 @@
-// cmcp-a2ui-lit-adapter.js — routes a scoped set of A2UI leaf components
-// (Text, Divider, Image) through the vendored @a2ui/lit basic catalog
-// (web/js/vendor/a2ui-lit.bundle.js), per Task 1's GO decision.
-// Button is a native <button> in cmcp-a2ui.js (#1407).
+// cmcp-a2ui-lit-adapter.js — renders the scoped set of A2UI leaf components
+// (Text, Divider, Image) as plain DOM.
 //
-// SCOPE (see task-3-report.md "deviations" for the full rationale):
-//   - Row/Column/Card containers stay hand-rolled in cmcp-a2ui.js. The
-//     official renderer has no notion of a "foreign" child component type,
-//     so a Column containing [Heading, comfy:graph, comfy:chart, Button]
-//     (exactly the Step-3 fixture) cannot be expressed as one Lit-managed
-//     subtree without a bespoke Catalog. Hand-rolled plain <div>s let any
-//     mix of Lit leaves and comfy:* SVG builders sit side by side as
-//     ordinary DOM siblings.
-//   - TextField/Select/Checkbox stay hand-rolled. Submit-button
-//     serialization needs a synchronous, reliable read of each field's
-//     CURRENT value; the basic catalog's two-way binding writes through an
-//     internal signal/binder with no documented external read API, and
-//     ChoicePicker's rendered markup varies by variant/displayStyle. Native
-//     <input>/<select> keeps that contract exact and dependency-free.
-//   - Heading stays hand-rolled (reviewer fix): the catalog maps it to
-//     Text{variant:hN}, which needs a markdown renderer and otherwise
-//     renders literal "#" prefixes. A plain <hN> is strictly better.
-//   - Text, Divider, Image have no children to interleave and no
-//     read-back requirement, so each mounts as its own tiny
-//     single-component a2ui-surface, wrapped in a plain <span> the
-//     hand-rolled container tree slots in like any other child.
-//   - Button is native HTML in cmcp-a2ui.js. The catalog's Shadow DOM
-//     action callback does not fire on ComfyUI frontend 1.49.6 (#1407).
+// #1854 — the vendored @a2ui/lit bundle this file used to dynamically import
+// has been REMOVED. It was 234 KB of minified third-party code (bundling zod)
+// whose entire job was producing a span, an hr and an img. Every other
+// component type was already hand-rolled here or in cmcp-a2ui.js because the
+// catalog did not fit: Row/Column/Card containers, TextField/Select/Checkbox
+// (no reliable synchronous value read-back), Heading (the catalog rendered
+// literal "#" prefixes), and Button, whose Shadow DOM action callback never
+// fires on ComfyUI frontend 1.49.6 (#1407).
 //
-// The vendor bundle is dynamically imported INSIDE a function, never at
-// module top level, so this file (and cmcp-a2ui.js, which imports it) stays
-// importable under `node --test` with no DOM/browser present.
-
-let _bundlePromise = null;
-function loadBundle() {
-  if (!_bundlePromise) _bundlePromise = import("./vendor/a2ui-lit.bundle.js");
-  return _bundlePromise;
-}
-
-let _surfaceSeq = 0;
-
-/** v0.9 component messages for ONE leaf, id "root" (a2ui-surface always
- *  renders starting from "root"). */
-function leafMessages(c) {
-  switch (c.type) {
-    case "Text":
-      return [{ id: "root", component: "Text", text: c.text }];
-    case "Divider":
-      return [{ id: "root", component: "Divider" }];
-    case "Image":
-      // Catalog prop names are `url`/`description`, not `src`/`alt`.
-      return [{ id: "root", component: "Image", url: c.src, description: c.caption || "" }];
-    default:
-      throw new Error("cmcp-a2ui-lit-adapter: unmapped leaf type " + c.type);
-  }
-}
+// It also carried three Comfy Registry scanner findings — obfuscated-code,
+// credential-access and any-folder-access — on a file no reviewer can read.
+//
+// Removing it closes an async hole as well. The old mount returned an EMPTY
+// wrapper synchronously and filled it in only once the dynamic import
+// resolved, which needed a stale-mount guard for the case where the card was
+// repainted or detached in between. These render synchronously, so a leaf is
+// never briefly blank and there is no window in which to be superseded.
+//
+// Button stays native HTML in cmcp-a2ui.js (#1407); this file must never
+// handle it, and a test asserts that.
 
 /**
- * Mount ONE leaf component as its own tiny a2ui-surface. Returns a plain
- * <span> wrapper synchronously (empty); it fills in once the vendor bundle
- * resolves (cached after the first call across all leaves/cards).
+ * Mount ONE leaf component as plain DOM, synchronously.
+ *
+ * Every leaf keeps the same outer span.cmcp-a2ui-lit-leaf wrapper the Lit
+ * version returned, so existing card CSS and the hand-rolled container tree
+ * in cmcp-a2ui.js slot these in unchanged.
+ *
+ * Image src is NOT widened here: cmcp-a2ui.js's validator already restricts it
+ * via isAllowedImageSrc() to ComfyUI /view, blob: and data:image/ URLs, and a
+ * spec that fails validation never reaches this function.
  */
 export function mountA2uiLeaf(c) {
   const wrap = document.createElement("span");
   wrap.className = "cmcp-a2ui-lit-leaf";
   wrap.dataset.a2uiType = c.type;
 
-  loadBundle().then(({ basicCatalog, MessageProcessor }) => {
-    // Stale-mount guard (reviewer fix): a superseded update() paint (or a
-    // removed card) can detach this wrapper before the bundle resolves —
-    // don't mount a surface into a dead span.
-    if (!wrap.isConnected) return;
-    const surfaceId = `leaf-${++_surfaceSeq}`;
-    const surfaceEl = document.createElement("a2ui-surface");
-    const processor = new MessageProcessor([basicCatalog]);
-    processor.onSurfaceCreated((s) => {
-      surfaceEl.surface = s;
-    });
-    processor.processMessages([
-      { version: "v0.9", createSurface: { surfaceId, catalogId: basicCatalog.id } },
-      { version: "v0.9", updateComponents: { surfaceId, components: leafMessages(c) } },
-    ]);
-    wrap.appendChild(surfaceEl);
-    wrap._a2uiProcessor = processor;
-    wrap._a2uiSurfaceId = surfaceId;
-  });
-
-  return wrap;
+  switch (c.type) {
+    case "Text":
+      wrap.textContent = typeof c.text === "string" ? c.text : "";
+      return wrap;
+    case "Divider":
+      wrap.appendChild(document.createElement("hr"));
+      return wrap;
+    case "Image": {
+      const img = document.createElement("img");
+      img.src = c.src;
+      // The catalog called these url/description; the spec calls them
+      // src/caption. Caption doubles as alt text, empty when absent.
+      img.alt = typeof c.caption === "string" ? c.caption : "";
+      wrap.appendChild(img);
+      return wrap;
+    }
+    default:
+      throw new Error("cmcp-a2ui-lit-adapter: unmapped leaf type " + c.type);
+  }
 }
 
 /**
- * Entry point cmcp-a2ui.js's mountComponents() calls for the leaf types
- * routed through Lit (Text, Divider, Image). Button is a native <button>
- * in that file so a click reaches ctx.choose() on frontend 1.49.6 (#1407).
+ * Entry point cmcp-a2ui.js's mountComponents() calls for the leaf types routed
+ * through this adapter (Text, Divider, Image).
  */
 export function mountStandardComponent(c) {
   return mountA2uiLeaf(c);
