@@ -845,11 +845,12 @@ export function createRunCompletionTracker({
     const boundExhausted = unackedDeliveriesExhausted(k);
     // Refuse if: unkeyed past bound
     if (boundExhausted && !isKeyedCompletion) return null;
-    // #1824 + #1842: After maxPastBoundDeliveries, refuse further /history probes
-    // to prevent transport storms from minting infinite agent turns
+    // #1824 + #1842: After maxPastBoundDeliveries, refuse ALL further /history probes
+    // to prevent transport storms from minting infinite agent turns (markUndelivered can
+    // temporarily lower unackedDeliveries, so we check count independently of current bound)
     const pastBoundCount = deliveredPastBound.get(k) ?? 0;
-    if (boundExhausted && isKeyedCompletion && pastBoundCount >= maxPastBoundDeliveries) {
-      return null; // Already delivered max past-bound; stop probing
+    if (isKeyedCompletion && pastBoundCount >= maxPastBoundDeliveries) {
+      return null; // Already delivered max past-bound; stop all probing
     }
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
@@ -950,9 +951,16 @@ export function createRunCompletionTracker({
       clearReconcileRetry(k);
       // #1824 recurrence: retire from pending after delivering maxPastBoundDeliveries
       // past the bound. Otherwise keep pending for orchestrator receipt.
-      const pastBoundCount = deliveredPastBound.get(k) ?? 0;
-      if (unackedDeliveriesExhausted(k) && pastBoundCount >= maxPastBoundDeliveries) {
-        markDelivered(k); // bound reached + delivered max past-bound → retire
+      // Note: this will be checked again later after we potentially increment the count,
+      // so we use a predictive check: if we're past-bound and about to deliver, would
+      // that put us at maxPastBoundDeliveries?
+      const willDeliverPastBound = unackedDeliveriesExhausted(k);
+      if (willDeliverPastBound) {
+        const currentCount = deliveredPastBound.get(k) ?? 0;
+        if (currentCount + 1 >= maxPastBoundDeliveries) {
+          // This delivery will be the maxPastBoundDeliveries-th, so retire after it
+          markDelivered(k); // bound reached + will deliver max past-bound → retire
+        }
       }
       // (else: keep in pending for orchestrator receipt or future /history delivery)
     } else {
