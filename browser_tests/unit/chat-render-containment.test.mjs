@@ -28,6 +28,21 @@ test("#1801 contains every direct chat message without changing the feed surface
     source,
     /import \{ createChatScrollStabilizer \} from "\.\/lib\/chat-scroll-stabilizer\.js";/,
   );
+  assert.match(
+    source,
+    /import \{ createChatScrollIntentTracker, updateChatStickiness \} from "\.\/lib\/chat-scroll-intent\.js";/,
+  );
+
+  const scrollIntentStart = source.indexOf("const scrollIntent = createChatScrollIntentTracker();");
+  assert.ok(scrollIntentStart >= 0, "the production scroll listener must track user intent");
+  const scrollListenerEnd = source.indexOf("  const chatScrollStabilizer =", scrollIntentStart);
+  const scrollListener = source.slice(scrollIntentStart, scrollListenerEnd);
+  assert.match(scrollListener, /scrollIntent\.consume\(\)/);
+  assert.match(scrollListener, /scrollIntent\.endProgrammaticScroll\(\)/);
+  assert.match(scrollListener, /updateChatStickiness\(/);
+  assert.doesNotMatch(scrollListener, /stickToBottom\s*=\s*atBottom\(\)/);
+  assert.match(source, /scrollIntent\.noteProgrammaticScroll\(\{ behavior: "smooth" \}\);\s*log\.scrollTo\(/);
+  assert.match(source, /beforeScroll: \(\) => scrollIntent\.noteProgrammaticScroll\(\)/);
 
   const ruleStart = source.indexOf(".cmcp-log > :not(.cmcp-empty) {");
   assert.ok(ruleStart >= 0, "the production chat feed must contain its message rule");

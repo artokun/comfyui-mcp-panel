@@ -18,6 +18,7 @@ const defaultRequestFrame = (fn) =>
 export function createChatScrollStabilizer({
   log,
   shouldStick = () => true,
+  beforeScroll = () => {},
   requestFrame = defaultRequestFrame,
   ResizeObserverCtor = typeof ResizeObserver === "function" ? ResizeObserver : null,
   MutationObserverCtor = typeof MutationObserver === "function" ? MutationObserver : null,
@@ -53,6 +54,11 @@ export function createChatScrollStabilizer({
   const scrollNow = () => {
     framePending = false;
     if (!canStick()) return;
+    try {
+      beforeScroll();
+    } catch {
+      // A teardown hook must not prevent the best-effort scroll itself.
+    }
     try {
       log.scrollTop = log.scrollHeight;
     } catch {
