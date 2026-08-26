@@ -1677,6 +1677,44 @@ test('#1864 (codex gate r2): a NAMED save is untouched by a concurrent title edi
   assert.deepEqual(svc.calls, [['saveWorkflow', 'workflows/Foo.json']], 'the requested save landed')
 })
 
+test('#1864 (codex gate r3): a traversal path is not ownership — the redirect declines it', async () => {
+  // `normalizePath` collapses separators but does not RESOLVE them, so a path can carry the
+  // managed "workflows/" prefix and still point outside the folder. The redirect ends in a
+  // forced write and skips the collision guard, so it must not accept one. Defensive: the
+  // frontend builds its records from the /userdata listing and never produces "..".
+  const active = {
+    path: 'workflows/../settings/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows/../settings',
+    initialMode: 'app', // ⇒ reconstructed target diverges, and it is occupied below
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({
+    files: ['workflows/../settings/Foo.json', 'workflows/../settings/Foo.app.json'],
+    active
+  })
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, undefined, {
+        autoWorkflowName: () => 'Untitled',
+        existsOnDisk: async (p) => svc.disk.has(p)
+      }),
+    (err) => {
+      assert.match(err.message, /409 Conflict/)
+      return true
+    }
+  )
+
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow'),
+    'no forced write outside the managed workflows folder'
+  )
+})
+
 // ---------------------------------------------------------------------------
 // ComfyUI frontend 1.47.x (issue #268). The workflow store no longer exposes
 // `saveWorkflowAs`; it exposes the low-level pair `saveAs(wf, path)` (builds a

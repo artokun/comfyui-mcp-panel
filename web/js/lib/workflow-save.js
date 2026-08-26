@@ -161,9 +161,25 @@ function pathIsAppSuffixedSiblingOf(wf, base) {
  *
  *  Compares the path's OWN basename rather than re-deriving one from the mode, so it stays
  *  independent of the extension reconstruction that is the thing being second-guessed. */
+
+/** #1864 (codex gate r3) — TRUE only for a path that lands INSIDE the managed workflows
+ *  folder. `normalizePath` collapses separators but does not RESOLVE them, so
+ *  "workflows/../settings/Foo.json" carries the managed prefix while pointing at other
+ *  userdata entirely. Nothing the frontend builds contains "..": its records come from the
+ *  /userdata listing, so this is a defensive floor rather than a reported shape — but the
+ *  redirect it guards ends in a forced write, and the collision guard it bypasses is the
+ *  only other thing standing there, so the floor is worth its four lines. Mirrors the
+ *  segment rules validateWorkflowSubfolder already applies to the one input that may
+ *  select a subdirectory. */
+function isUnderWorkflowsRoot(path) {
+  const p = normalizePath(path);
+  if (!p.startsWith(`${WORKFLOWS_ROOT}/`)) return false;
+  return !p.split("/").some((segment) => segment === ".." || segment === ".");
+}
 async function ownsItsPathOnDisk(currentPath, currentName, existsOnDisk) {
   if (!currentPath || !currentName) return false;
   if (isExternalWorkflowPath(currentPath) || isUrlDerivedWorkflowPath(currentPath)) return false;
+  if (!isUnderWorkflowsRoot(currentPath)) return false;
   if (baseName(currentPath.split("/").pop()) !== currentName) return false;
   if (typeof existsOnDisk !== "function") return false;
   try {
