@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.98] - 2026-08-26
+
+### Fixed
+- preserve panel_run completion receipts across delayed prompts, teardown, and restart (#1824)
+
 ## [0.15.97] - 2026-08-26
 
 ### Fixed
