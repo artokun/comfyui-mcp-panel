@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.104] - 2026-08-26
+
+### Fixed
+- a save that named nothing is never told to "choose a different name" (#1866)
+
+### Changed
+- local YARA parity replica, and defuse the changelog's own network tokens (#1874)
+- drive the receipt-less completion end to end, through the real delivery boundary (#1872)
+
+
 ## [0.15.103] - 2026-08-26
 
 ### Fixed
