@@ -1094,6 +1094,7 @@ test("#1728 CALL SITE: late capture crosses the bridge, arms the real sweep, and
       intervalMs: 60000,
     });
     let latePromptId;
+    const completionKey = JSON.stringify(["panel-route-1728", "session-1728", "late-reconnect-prompt-1728", "generation-a"]);
     const built = realGraphRun({
       app,
       apiTarget,
@@ -1237,25 +1238,29 @@ test("#1824 CALL SITE: a long panel_run completion stays replayable until the or
 
     const result = await built.graph_run({ to_node_id: 327, rid: "run-rid-1824" });
     assert.equal(result.queued_unknown, true);
-    latePromptId();
-    assert.equal(sweep._hasTimer(), true, "the real panel_run capture arms reconciliation");
-
     // The render lasts 458,180 ms — far beyond the old fixed completion cutoff.
+    // Deliberately deliver the execution lifecycle BEFORE the delayed /prompt
+    // response. The production tracker must retain this media batch and replay
+    // it keyed when the real panel_run receipt finally arrives.
     tracker.onExecutionStart("long-prompt-1824");
     const sentP = waitForSend();
     tracker.onExecuted("long-prompt-1824", {
       images: [{ filename: "long-render.png", type: "output" }],
     });
     tracker.onExecutionSuccess("long-prompt-1824");
+    assert.equal(frames.length, 0, "media-before-prompt is held, not delivered unkeyed");
+    latePromptId();
+    assert.equal(sweep._hasTimer(), true, "the real panel_run capture arms reconciliation");
     await sentP;
     assert.equal(flushes.length, 1);
     assert.equal(frames.length, 1);
     const completionKey = frames[0].completion_key;
-    assert.equal(
-      completionKey,
-      JSON.stringify(["panel-route-1824", 1824, "long-prompt-1824"]),
-      "the frame carries a stable route/session/prompt delivery key",
-    );
+    const completionParts = JSON.parse(completionKey);
+    assert.equal(completionParts[0], "panel-route-1824");
+    assert.equal(completionParts[1], "1824");
+    assert.equal(completionParts[2], "long-prompt-1824");
+    assert.equal(typeof completionParts[3], "string");
+    assert.ok(completionParts[3].length > 0, "the frame carries a per-queue generation nonce");
     assert.equal(tracker.hasPending(), true, "socket acceptance does not retire the completion");
     assert.equal(tracker.isSettled("long-prompt-1824"), false);
     assert.equal(tracker.acknowledgeDelivery("long-prompt-1824", "stale-key"), false);
@@ -1312,6 +1317,7 @@ test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on re
       },
     });
     let latePromptId;
+    const completionKey = JSON.stringify(["panel-route-1728", "session-1728", "late-reconnect-prompt-1728", "generation-a"]);
     const built = realGraphRun({
       app,
       apiTarget,
@@ -1319,7 +1325,7 @@ test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on re
       serializeMs: 400,
       panelRunOwnerRef: { current: { generation: 1 } },
       runReceiptRouteRef: () => "panel-route-1728",
-      runReceiptSender: (rid, promptId, routeId) => outbox.enqueue(rid, promptId, routeId),
+      runReceiptSender: (rid, promptId, routeId, key) => outbox.enqueue(rid, promptId, routeId, key || completionKey),
       dispatch: async (args) => {
         latePromptId = () => args.onPromptId("late-reconnect-prompt-1728");
         return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
@@ -1336,7 +1342,12 @@ test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on re
     outbox.notifyRouteReady();
     assert.equal(outbox.pendingSize(), 0, "the reconnect flush retires the receipt only after sendFrame true");
     assert.deepEqual(receiptFrames, [
-      { type: "run_receipt", run_rid: "run-rid-reconnect-1728", prompt_id: "late-reconnect-prompt-1728" },
+      {
+        type: "run_receipt",
+        run_rid: "run-rid-reconnect-1728",
+        prompt_id: "late-reconnect-prompt-1728",
+        completion_key: completionKey,
+      },
     ]);
   } finally {
     stop();
@@ -1431,7 +1442,7 @@ test("#1728 production bridge wiring fences same-route re-advertisement before r
   assert.match(sendHello, /pendingRouteBindingGeneration = bindingGeneration/);
   assert.match(sendHello, /sent === true/);
   assert.match(ready, /pendingRouteBindingGeneration !== null/);
-  assert.match(sender, /runReceiptOutbox\.enqueue\(rid, promptId, routeId\)/);
+  assert.match(sender, /runReceiptOutbox\.enqueue\(rid, promptId, routeId, completionKey\)/);
   assert.doesNotMatch(sender, /routeId\s*\?\?/);
 });
 

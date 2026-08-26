@@ -71,6 +71,26 @@ function normalizeRunIds(runs) {
   return out;
 }
 
+/** Keep the keyed completion identity beside its reboot-owned prompt id. */
+function normalizeCompletionMeta(entries) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(entries) ? entries : []) {
+    const promptId = typeof raw?.promptId === "string" ? raw.promptId.trim() : "";
+    const completionKey = typeof raw?.completionKey === "string" ? raw.completionKey.trim() : "";
+    if (!promptId || !completionKey || completionKey.length > 512 || seen.has(promptId)) continue;
+    seen.add(promptId);
+    out.push({
+      promptId,
+      completionKey,
+      routeId: raw?.routeId == null ? null : String(raw.routeId),
+      sessionId: raw?.sessionId == null ? null : String(raw.sessionId),
+    });
+    if (out.length >= 256) break;
+  }
+  return out;
+}
+
 /**
  * Serialize the reboot marker for sessionStorage.
  *
@@ -88,6 +108,7 @@ export function encodeRebootMarker({
   sessionId = null,
   attempts = 0,
   totalAttempts,
+  completionMeta = [],
 } = {}) {
   const ids = normalizeRunIds(runs);
   const armed = Number.isFinite(armedRunCount) ? Math.max(0, Math.trunc(armedRunCount)) : ids.length;
@@ -124,6 +145,7 @@ export function encodeRebootMarker({
     // restart while stranding the one that did.
     tid: threadId == null ? null : String(threadId),
     sid: sessionId == null ? null : String(sessionId),
+    cm: normalizeCompletionMeta(completionMeta),
   };
   if (t != null) out.t = t;
   if (ts != null) out.ts = ts;
@@ -156,6 +178,7 @@ export function decodeRebootMarker(raw) {
     // claiming "none were made" would suppress the duplicate warning on a guess.
     attempts: null,
     totalAttempts: null,
+    completionMeta: [],
   };
   if (text[0] !== "{") return empty; // legacy "1"
   let parsed = null;
@@ -192,6 +215,7 @@ export function decodeRebootMarker(raw) {
       : Number.isFinite(parsed.t)
         ? Math.max(0, Math.trunc(parsed.t)) // older marker: the episode count is all we have
         : null,
+    completionMeta: normalizeCompletionMeta(parsed.cm),
   };
 }
 
@@ -389,14 +413,22 @@ function pickUnconfirmed(runs, isDeliveryUnconfirmed) {
  * @param {{isKnown?:(id:string)=>boolean, onQueued?:(id:string)=>void}} tracker
  * @returns {string[]} the ids newly adopted (empty ⇒ nothing to reconcile)
  */
-export function adoptRebootRuns(runs, tracker) {
+export function adoptRebootRuns(runs, tracker, completionMeta = []) {
   const adopted = [];
   const ids = normalizeRunIds(runs);
   if (!ids.length || !tracker || typeof tracker.onQueued !== "function") return adopted;
+  const metaByPrompt = new Map(
+    normalizeCompletionMeta(completionMeta).map((entry) => [entry.promptId, entry]),
+  );
   for (const id of ids) {
     try {
       if (typeof tracker.isKnown === "function" && tracker.isKnown(id)) continue;
-      tracker.onQueued(id);
+      const meta = metaByPrompt.get(id);
+      tracker.onQueued(id, meta ? {
+        routeId: meta.routeId,
+        sessionId: meta.sessionId,
+        completionKey: meta.completionKey,
+      } : undefined);
       adopted.push(id);
     } catch {
       /* a malformed id must never wedge the resume flow */
@@ -415,6 +447,7 @@ function markerFields(marker) {
     sessionId: marker.sessionId,
     attempts: marker.attempts,
     totalAttempts: marker.totalAttempts,
+    completionMeta: marker.completionMeta,
   };
 }
 

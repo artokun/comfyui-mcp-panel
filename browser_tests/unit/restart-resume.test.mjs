@@ -498,6 +498,37 @@ test("#585 P1(version): a v1 marker still round-trips every field", () => {
   assert.equal(m.sessionId, "s-A");
 });
 
+test("#1824: restart adoption preserves the keyed completion route and session", () => {
+  const completionKey = JSON.stringify(["panel-route-1824", "session-1824", "P", "generation-a"]);
+  const raw = encodeRebootMarker({
+    at: 1000,
+    runs: ["P"],
+    completionMeta: [{
+      promptId: "P",
+      completionKey,
+      routeId: "panel-route-1824",
+      sessionId: "session-1824",
+    }],
+  });
+  const marker = decodeRebootMarker(raw);
+  assert.deepEqual(marker.completionMeta, [{
+    promptId: "P",
+    completionKey,
+    routeId: "panel-route-1824",
+    sessionId: "session-1824",
+  }]);
+
+  const fresh = makeTracker();
+  assert.deepEqual(adoptRebootRuns(marker.runs, fresh, marker.completionMeta), ["P"]);
+  assert.equal(fresh.completionKeyFor("P"), completionKey);
+  assert.deepEqual(fresh.completionMetadata(), [{
+    promptId: "P",
+    completionKey,
+    routeId: "panel-route-1824",
+    sessionId: "session-1824",
+  }]);
+});
+
 // ── the resume must reach the conversation that ASKED for the restart ─────────
 
 test("#585 P1(session): switching conversations between arm and ack must not misdeliver the resume", () => {
