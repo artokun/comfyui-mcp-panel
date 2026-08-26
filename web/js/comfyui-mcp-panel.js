@@ -67,6 +67,7 @@
 import {
   MAX_PROMOTION_CHAIN_DEPTH,
   followPromotionToConcrete,
+  promotedInputAliases,
   resolvePromotedInnerTarget,
 } from "./lib/widget-write.js";
 import { describeVoiceError } from "./lib/voice-error.js";
@@ -9501,9 +9502,7 @@ function sourceForSubgraphInput(subgraphNode, subgraphInput) {
 function promotedHostAliases(subgraphNode) {
   const aliases = new Set();
   for (const input of subgraphNode?.inputs ?? []) {
-    for (const value of [input?.name, input?.label, input?._subgraphSlot?.name, input?._subgraphSlot?.label]) {
-      if (value != null && String(value).length > 0) aliases.add(String(value));
-    }
+    for (const value of promotedInputAliases(input)) aliases.add(value);
   }
   return [...aliases];
 }
@@ -14056,7 +14055,13 @@ const GRAPH_TOOL_EXECUTORS = {
         // #609: bound each widget value AND the total widgets size so a
         // ResolutionMaster/LTXDirector/VHS blob (or a many-widget node) can't consume
         // the entire budget in one node's detail — even the protected first line.
-        const summary = capSummaryWidgets(summarizeNode(n), detailWidgetCap, maxChars);
+        const summary = {
+          ...capSummaryWidgets(summarizeNode(n), detailWidgetCap, maxChars),
+          // #2314 — MCP must distinguish a definitive ordinary node from an
+          // older Panel whose detail projection cannot classify promotion.
+          // Positive-only emission made missing capability look like false.
+          is_subgraph: !!n.subgraph,
+        };
         line = JSON.stringify(summary);
         // Final guard: if the fully-capped detail STILL exceeds max_chars (a node with
         // very many/large slots, which capSummaryWidgets doesn't touch), degrade the

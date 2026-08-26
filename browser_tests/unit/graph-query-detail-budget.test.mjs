@@ -191,6 +191,28 @@ test("#1681 shipped graph_query keeps default detail at 2048 and raises one expl
   assert.equal(Object.keys(defaultRow).join(","), Object.keys(raisedRow).join(","), "detail row shape is unchanged");
 });
 
+test("#2314 detail rows explicitly classify ordinary and promoted nodes", () => {
+  const ordinary = detailRows(query({ ids: [78], fields: "detail" }))[0];
+  assert.equal(ordinary.is_subgraph, false);
+
+  const promoted = {
+    id: 83,
+    type: "SubgraphNode",
+    title: "Promoted rail",
+    widgets: [{ name: "prompt_alias", value: "old" }],
+    inputs: [],
+    outputs: [],
+    subgraph: { _nodes: [] },
+  };
+  graph._nodes.push(promoted);
+  try {
+    const row = detailRows(query({ ids: [83], fields: "detail" }))[0];
+    assert.equal(row.is_subgraph, true);
+  } finally {
+    graph._nodes.pop();
+  }
+});
+
 test("#1681 shipped graph_query ignores the raised cap for broad and multi-ID detail", () => {
   const broad = query({ fields: "detail", widget_max_chars: 8192 });
   const multi = query({ ids: [78, 79], fields: "detail", widget_max_chars: 8192 });

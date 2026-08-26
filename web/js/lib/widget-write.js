@@ -1396,12 +1396,7 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   const matches = [];
   for (const input of subgraphNode.inputs ?? []) {
     const subgraphInput = input?._subgraphSlot ?? null;
-    const aliases = [
-      input?.name,
-      input?.label,
-      subgraphInput?.name,
-      subgraphInput?.label,
-    ].map((a) => (a == null ? null : String(a).toLowerCase()));
+    const aliases = promotedInputAliases(input, subgraphInput).map((a) => a.toLowerCase());
     // Labels are used ONLY to DETECT which promotion the caller meant (a caller
     // may address by a renamed promotion's display label). Locating the parent's
     // authoritative rail widget is done LATER by the promotion RELATIONSHIP
@@ -1522,6 +1517,25 @@ export function followPromotionToConcrete(target, resolveSource) {
     depth += 1;
   }
   return { node, widget, depth };
+}
+
+/** Every addressable spelling of a promoted host rail. Frontend versions have
+ * carried the programmatic name/label on the input, its backing subgraph slot,
+ * or the rail widget projection. Keep graph_get_subgraph's witness enumeration
+ * and graph_set_widget's live resolver on this exact shared alias contract. */
+export function promotedInputAliases(input, subgraphInput = input?._subgraphSlot ?? null) {
+  return [
+    input?.name,
+    input?.label,
+    input?.widget?.name,
+    input?.widget?.label,
+    input?._widget?.name,
+    input?._widget?.label,
+    subgraphInput?.name,
+    subgraphInput?.label,
+  ]
+    .filter((value) => value != null && String(value).length > 0)
+    .map((value) => String(value));
 }
 
 /**

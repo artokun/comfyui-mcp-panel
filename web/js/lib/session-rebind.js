@@ -804,6 +804,11 @@ export function buildHelloPayload({
     // #2314 P1: the promoted-scope fence also validates the object-keyed live
     // graph identity, not only graph-local owner/workflow fields.
     enforces_expected_scope_graph_identity_at_write: true,
+    // #2314 P1: graph_get_subgraph publishes the complete alias -> immediate
+    // -> terminal promotion witness consumed by the orchestrator. This is a
+    // separate capability from the write-boundary fence so an older bundle is
+    // never mistaken for one that can classify renamed promotion aliases.
+    publishes_promoted_terminal_witnesses: true,
     // Advertise that this build understands `agent_note` — an orchestrator frame that is
     // delivered to the AGENT ONLY and never rendered as a chat bubble.
     //

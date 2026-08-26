@@ -3,6 +3,12 @@ import assert from "node:assert/strict";
 import { graphViewIdentityFor } from "../../web/js/lib/graph-view-identity.js";
 import { subgraphValueProvenance } from "../../web/js/lib/subgraph-value-provenance.js";
 import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
+import {
+  followPromotionToConcrete,
+  MAX_PROMOTION_CHAIN_DEPTH,
+  promotedInputAliases,
+  resolvePromotedInnerTarget,
+} from "../../web/js/lib/widget-write.js";
 
 /**
  * #636 (minor) — panel_get_subgraph(173) reported inner node 166 value "MiniMax_H3"
@@ -152,6 +158,105 @@ test("WIRING: production graph_get_subgraph publishes the terminal nested-promot
   const out = getSubgraph({ node_id: 78 });
   assert.deepEqual(out.promoted_terminals, [terminal]);
   assert.equal(out.nodes[0].id, 188);
+});
+
+test("WIRING: production alias witness keeps outer, immediate, and terminal names distinct", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const helperStart = src.indexOf("function resolveSubgraphLink(");
+  const helperEnd = src.indexOf("\nfunction findPromotedHostInput", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "production promotion helper range must remain extractable");
+  const makeWitnesses = new Function(
+    "resolvePromotedInnerTarget",
+    "followPromotionToConcrete",
+    "MAX_PROMOTION_CHAIN_DEPTH",
+    "promotedInputAliases",
+    `${src.slice(helperStart, helperEnd)}; return promotedTerminalWitnesses;`,
+  )(
+    resolvePromotedInnerTarget,
+    followPromotionToConcrete,
+    MAX_PROMOTION_CHAIN_DEPTH,
+    promotedInputAliases,
+  );
+
+  const cases = [
+    {
+      outer: "prompt_alias",
+      immediate: "prompt_b",
+      terminalType: "AnimaRegionalCanvasInline",
+      terminalWidget: "quality_prompt",
+      inputs: [{ name: "quality_prompt", type: "STRING" }],
+    },
+    {
+      outer: "dynamic_alias",
+      immediate: "dynamic_b",
+      terminalType: "NestedConcreteNode",
+      terminalWidget: "model.prompt",
+      inputs: [
+        { name: "model", type: "COMFY_DYNAMICCOMBO_V3" },
+        { name: "model.prompt", type: "STRING" },
+      ],
+    },
+    {
+      outer: "stack_alias",
+      immediate: "stack_b",
+      terminalType: "DaSiWa_LTX2LoraLoader",
+      terminalWidget: "stack_data",
+      inputs: [{ name: "stack_data", type: "STRING" }],
+    },
+  ];
+
+  for (const testCase of cases) {
+    const terminal = {
+      id: 2768,
+      type: testCase.terminalType,
+      inputs: testCase.inputs.map((input, index) => ({
+        ...input,
+        ...(index === testCase.inputs.findIndex((candidate) => candidate.name === testCase.terminalWidget)
+          ? { widget: { name: testCase.terminalWidget } }
+          : {}),
+      })),
+      widgets: [{ name: testCase.terminalWidget, value: "old" }],
+    };
+    const terminalSlot = testCase.inputs.findIndex((candidate) => candidate.name === testCase.terminalWidget);
+    const inner = {
+      id: 188,
+      type: "SubgraphB",
+      inputs: [{ name: testCase.immediate, widget: { name: testCase.immediate }, _subgraphSlot: { name: "inner_alias", linkIds: [2] } }],
+      widgets: [{ name: testCase.immediate, value: "old" }],
+      subgraph: {
+        _nodes: [terminal],
+        getNodeById: (id) => (String(id) === "2768" ? terminal : null),
+        getLink: (id) => (id === 2 ? { origin_id: 2768, target_id: 2768, target_slot: terminalSlot } : null),
+      },
+    };
+    const parent = {
+      id: 78,
+      inputs: [{
+        name: testCase.outer,
+        label: "outer display",
+        _subgraphSlot: { name: "parent_alias", linkIds: [1] },
+      }],
+      subgraph: {
+        _nodes: [inner],
+        getNodeById: (id) => (String(id) === "188" ? inner : null),
+        getLink: (id) => (id === 1 ? { origin_id: 188, target_id: 188, target_slot: 0 } : null),
+      },
+    };
+
+    const entries = makeWitnesses(parent);
+    const witness = entries.find((entry) => entry.widget === testCase.outer);
+    assert.deepEqual(witness, {
+      widget: testCase.outer,
+      immediate_node_id: 188,
+      immediate_widget: testCase.immediate,
+      terminal_node_id: 2768,
+      terminal_node_type: testCase.terminalType,
+      terminal_widget: testCase.terminalWidget,
+      terminal_inputs: testCase.inputs,
+      chain_depth: 1,
+    });
+  }
 });
 
 test("WIRING: production graph_get_subgraph redacts instance provenance", async () => {
