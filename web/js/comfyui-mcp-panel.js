@@ -18189,7 +18189,10 @@ const GRAPH_TOOL_EXECUTORS = {
         armRunReconcileSweepRef === dispatchArmRunReconcileSweep;
       if (ownsDispatch) {
         try {
-          dispatchRunCompletion?.onQueued(id);
+          dispatchRunCompletion?.onQueued(id, {
+            routeId: dispatchReceiptRoute,
+            sessionId: dispatchOwner?.generation ?? null,
+          });
         } catch {}
         try {
           dispatchArmRunReconcileSweep?.();
@@ -37550,6 +37553,20 @@ function buildPanel() {
         // receipt) is still proof the resume was taken — stronger proof, in fact.
         onRebootResumeReceipt(ack.mid);
         markRead(ack.mid);
+        return;
+      }
+      // #1824 — a successful WebSocket write only proves the browser handed the
+      // frame to the socket. Retire a panel_run completion only after the
+      // orchestrator accepts the same route-scoped completion key; until then
+      // the tracker keeps /history reconciliation armed and replays idempotently.
+      if (
+        ack?.kind === "completion" &&
+        typeof ack.prompt_id === "string" &&
+        typeof ack.completion_key === "string"
+      ) {
+        if (runCompletionRef?.acknowledgeDelivery(ack.prompt_id, ack.completion_key)) {
+          pruneRebootMarker();
+        }
         return;
       }
       // Effort change while the agent was mid-turn: it can't change a running
