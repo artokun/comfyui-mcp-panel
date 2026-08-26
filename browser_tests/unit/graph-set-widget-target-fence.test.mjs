@@ -91,8 +91,8 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
   const rootGraph = { _nodes: [{ id: 78, subgraph: graphA }, { id: 79, subgraph: graphB }] };
   const describe = (graph) =>
     graph === graphA
-      ? { scope: "subgraph", owner_node_id: 78, workflow_uuid: "workflow-a" }
-      : { scope: "subgraph", owner_node_id: 79, workflow_uuid: "workflow-a" };
+      ? { scope: "subgraph", owner_node_id: 78, workflow_uuid: "workflow-a", graph_identity: "graph-a" }
+      : { scope: "subgraph", owner_node_id: 78, workflow_uuid: "workflow-a", graph_identity: "graph-b" };
   const findOwner = (_root, graph) =>
     graph === graphA ? { id: 78 } : graph === graphB ? { id: 79 } : null;
   const assertScope = makeScopeHelpers(describe, findOwner);
@@ -125,7 +125,7 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
     76,
     "OrdinaryNode",
     "workflow-a",
-    { scope: "subgraph", owner_node_id: 78, workflow_uuid: "workflow-a" },
+    { scope: "subgraph", owner_node_id: 78, workflow_uuid: "workflow-a", graph_identity: "graph-a" },
     liveTarget,
     undefined,
   );
@@ -145,7 +145,47 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
   writes += 1;
   assert.equal(writes, 1);
   assert.throws(
-    () => assertScope(currentCtx(), { scope: "subgraph", owner_node_id: "not-an-id" }),
+    () => assertScope(currentCtx(), {
+      scope: "subgraph",
+      owner_node_id: "not-an-id",
+      graph_identity: "graph-a",
+    }),
     /canonical node id/,
   );
+  assert.throws(
+    () => assertScope(currentCtx(), { scope: "subgraph", owner_node_id: 78 }),
+    /graph_identity must be a non-empty string/,
+  );
+});
+
+test("#2314 same owner id in a different graph is refused at the shipped fence", () => {
+  const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
+  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperSource = PANEL_SRC.slice(helperStart, helperEnd);
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    `${helperSource}; return assertExpectedPromotedScope;`,
+  )(
+    (graph) => ({
+      scope: "subgraph",
+      owner_node_id: 78,
+      workflow_uuid: "workflow-a",
+      graph_identity: graph.name === "A" ? "graph-a" : "graph-b",
+    }),
+    () => ({ id: 78 }),
+  );
+  const graphA = { name: "A" };
+  const graphB = { name: "B" };
+  const current = () => ({ graph: currentGraph, rootGraph: {} });
+  let currentGraph = graphA;
+  const expected = {
+    scope: "subgraph",
+    owner_node_id: 78,
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph-a",
+  };
+  assert.doesNotThrow(() => assertScope(current(), expected));
+  currentGraph = graphB;
+  assert.throws(() => assertScope(current(), expected), /promoted receiver changed before dispatch/);
 });

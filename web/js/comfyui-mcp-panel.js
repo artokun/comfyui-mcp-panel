@@ -203,7 +203,11 @@ import {
 import { assertAddNodeResolvableRefreshing, isRegisteredNodeType } from "./lib/node-resolve.js";
 import { fetchSingleNodeInfo } from "./lib/single-node-def.js";
 import { createVerifiedNodeDefCache } from "./lib/verified-node-def-cache.js";
-import { withWorkflowUuid } from "./lib/graph-view-identity.js";
+import {
+  graphViewIdentityFor,
+  withGraphViewIdentity,
+  withWorkflowUuid,
+} from "./lib/graph-view-identity.js";
 import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-reply-identity.js";
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
@@ -9575,7 +9579,8 @@ function describeActiveGraph(graph) {
   } catch {
     workflowUuid = null;
   }
-  const withLiveIdentity = (viewing) => withWorkflowUuid(viewing, root, workflowUuid);
+  const withLiveIdentity = (viewing) =>
+    withGraphViewIdentity(withWorkflowUuid(viewing, root, workflowUuid), graph);
   if (!root || !graph || graph === root) return withLiveIdentity({ scope: "root" });
   const owner = findSubgraphOwner(root, graph);
   if (owner) {
@@ -9630,6 +9635,13 @@ function assertExpectedPromotedScope(current, expectedScope) {
   ) {
     throw new Error("graph_set_widget expected_scope.workflow_uuid must be a non-empty string");
   }
+  if (
+    typeof expected.graph_identity !== "string" ||
+    expected.graph_identity.length === 0 ||
+    expected.graph_identity.length > 256
+  ) {
+    throw new Error("graph_set_widget expected_scope.graph_identity must be a non-empty string");
+  }
 
   const liveViewing = describeActiveGraph(current.graph);
   const liveOwner = findSubgraphOwner(current.rootGraph, current.graph);
@@ -9637,7 +9649,8 @@ function assertExpectedPromotedScope(current, expectedScope) {
   if (
     liveViewing.scope !== "subgraph" ||
     liveOwnerId !== expectedOwner ||
-    (expected.workflow_uuid !== undefined && liveViewing.workflow_uuid !== expected.workflow_uuid)
+    (expected.workflow_uuid !== undefined && liveViewing.workflow_uuid !== expected.workflow_uuid) ||
+    liveViewing.graph_identity !== expected.graph_identity
   ) {
     throw new Error(
       `graph_set_widget promoted receiver changed before dispatch: expected subgraph owner ${expectedOwner}` +
@@ -14363,7 +14376,15 @@ const GRAPH_TOOL_EXECUTORS = {
     const safeProvenance = redactWidgetValue("", subgraphValueProvenance(node));
     return {
       viewing: describeActiveGraph(graph),
-      subgraph_of: { node_id: node.id, title: node.title },
+      // The wrapper id is local to `graph`; the write happens after entering
+      // `sub`, so carry the object-keyed identity of that exact target graph.
+      // A parent/root viewing token alone cannot distinguish two same-id
+      // subgraphs elsewhere in the workflow.
+      subgraph_of: {
+        node_id: node.id,
+        title: node.title,
+        graph_identity: graphViewIdentityFor(sub),
+      },
       // #636 — the inner nodes below are the DEFINITION's; the parent instance's
       // promoted widgets can override them. Carry both, labelled, so a legitimate
       // per-instance override cannot be misread as stale data.

@@ -801,6 +801,9 @@ export function buildHelloPayload({
     // #2314: graph_set_widget validates an optional promoted subgraph owner and
     // workflow witness against the LIVE canvas at the same synchronous boundary.
     enforces_expected_scope_at_write: true,
+    // #2314 P1: the promoted-scope fence also validates the object-keyed live
+    // graph identity, not only graph-local owner/workflow fields.
+    enforces_expected_scope_graph_identity_at_write: true,
     // Advertise that this build understands `agent_note` — an orchestrator frame that is
     // delivered to the AGENT ONLY and never rendered as a chat bubble.
     //

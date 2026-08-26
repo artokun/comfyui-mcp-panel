@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { graphViewIdentityFor } from "../../web/js/lib/graph-view-identity.js";
 import { subgraphValueProvenance } from "../../web/js/lib/subgraph-value-provenance.js";
 import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
 
@@ -117,6 +118,7 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     "describeActiveGraph",
     "subgraphValueProvenance",
     "redactWidgetValue",
+    "graphViewIdentityFor",
     "MAX_STATE_NODES",
     "fixedCapNote",
     "summarizeNode",
@@ -127,13 +129,18 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     () => ({ graph: "root" }),
     subgraphValueProvenance,
     redactWidgetValue,
+    graphViewIdentityFor,
     50,
     () => "truncation note",
     (node) => ({ id: node.id, mode: node.mode, inputs: node.inputs, outputs: node.outputs }),
   );
 
   const out = getSubgraph({ node_id: 173 });
-  assert.deepEqual(out.subgraph_of, { node_id: 173, title: "Reusable secret node" });
+  assert.deepEqual(out.subgraph_of, {
+    node_id: 173,
+    title: "Reusable secret node",
+    graph_identity: graphViewIdentityFor(parent.subgraph),
+  });
   assert.deepEqual(out.instance_widgets, {
     ordinarySettings: { value: "SECRET" },
     apiKey: { value: REDACTED_WIDGET_VALUE },

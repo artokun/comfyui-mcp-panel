@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 
-import { withWorkflowUuid } from "../../web/js/lib/graph-view-identity.js";
+import {
+  graphViewIdentityFor,
+  withGraphViewIdentity,
+  withWorkflowUuid,
+} from "../../web/js/lib/graph-view-identity.js";
 
 const PANEL_SRC = fs.readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
 
@@ -41,14 +45,29 @@ test("an explicit live identity wins over a stale root tag", () => {
   assert.deepEqual(withWorkflowUuid({ scope: "root" }, root, null), { scope: "root" });
 });
 
+test("graph read identity is stable per live graph object and differs across graphs", () => {
+  const graphA = {};
+  const graphB = {};
+  const first = graphViewIdentityFor(graphA);
+  assert.match(first, /^graph:/);
+  assert.equal(graphViewIdentityFor(graphA), first);
+  assert.notEqual(graphViewIdentityFor(graphB), first);
+  assert.deepEqual(withGraphViewIdentity({ scope: "subgraph", owner_node_id: 7 }, graphA), {
+    scope: "subgraph",
+    owner_node_id: 7,
+    graph_identity: first,
+  });
+});
+
 test("production graph read callers publish the live viewing identity", () => {
   assert.match(PANEL_SRC, /const workflow = activeWorkflowRef\(\);/);
-  assert.match(PANEL_SRC, /const withLiveIdentity = \(viewing\) => withWorkflowUuid\(viewing, root, workflowUuid\);/);
+  assert.match(PANEL_SRC, /withGraphViewIdentity\(withWorkflowUuid\(viewing, root, workflowUuid\), graph\)/);
 
   const subgraphStart = PANEL_SRC.indexOf("graph_get_subgraph({ node_id }) {");
   const subgraphEnd = PANEL_SRC.indexOf("async graph_add_node", subgraphStart);
   assert.ok(subgraphStart >= 0 && subgraphEnd > subgraphStart);
   assert.match(PANEL_SRC.slice(subgraphStart, subgraphEnd), /viewing: describeActiveGraph\(graph\)/);
+  assert.match(PANEL_SRC.slice(subgraphStart, subgraphEnd), /graph_identity: graphViewIdentityFor\(sub\)/);
 
   const queryStart = PANEL_SRC.indexOf("graph_query({");
   const queryEnd = PANEL_SRC.indexOf("graph_find_nodes({", queryStart);
