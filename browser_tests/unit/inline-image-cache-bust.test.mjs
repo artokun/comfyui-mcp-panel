@@ -119,21 +119,33 @@ test("#1834: the card and the completion frame's probes address ONE url", () => 
   assert.equal(buffered[0].promptId, "run-a");
 });
 
-test("#1834: id-less runs (#224) are busted too, not silently left stale", () => {
-  // Back-to-back runs with no prompt_id are a supported path, and it is the one
-  // where filenames are MOST likely to repeat. Handing the URL back unbusted
-  // because the key was missing would leave the original bug live here.
+test("#1834: an id-less run is left UNBUSTED rather than given a local key", () => {
+  // This looks like the fix declining to do its job, and pinning it is the
+  // point. An id-less run (#224 — legacy; a current ComfyUI `executed` always
+  // carries a prompt id) could be busted here with a minted key, and it would
+  // be WRONG: `buildStillsSegment` mints independently, so the card and the
+  // completion note's size/dimensions would address different URLs and could
+  // describe different bytes. That is #1718's "metadata right, picture wrong"
+  // reintroduced by the fix for its sibling.
+  //
+  // So the guard is: never bust one of the two surfaces without the other.
+  // Closing the id-less gap for real needs a per-run identity threaded through
+  // the completion tracker, which a caller cannot fake locally.
   const { onExecuted, painted } = productionOnExecuted();
   onExecuted({ detail: { output: { images: [SAME_FILE] } } });
-  onExecuted({ detail: { output: { images: [SAME_FILE] } } });
 
-  assert.equal(painted.length, 2);
-  assert.match(painted[0].url, /[?&]cmcp_prompt=/);
-  assert.match(painted[1].url, /[?&]cmcp_prompt=/);
-  assert.notEqual(
+  assert.equal(painted.length, 1);
+  assert.doesNotMatch(
     painted[0].url,
-    painted[1].url,
-    "a minted identity must make each id-less run's card unique",
+    /[?&]cmcp_prompt=/,
+    "no run identity means no key — not a locally invented one",
+  );
+  // The invariant that actually matters: whatever the card is painted from,
+  // the frame's probe computes the SAME string for the same run.
+  assert.equal(
+    painted[0].url,
+    appendImageCacheBust(painted[0].url, undefined),
+    "card and probe must agree on the id-less path too",
   );
 });
 
@@ -234,4 +246,9 @@ test("#1834: appendImageCacheBust preserves a fragment and existing query", () =
   // A non-string / empty URL is handed straight back rather than becoming "?…".
   assert.equal(appendImageCacheBust("", "p1"), "");
   assert.equal(appendImageCacheBust(null, "p1"), null);
+  // Strict on the KEY as well — see the id-less test above. A missing key must
+  // not become a minted one, or the two surfaces stop agreeing.
+  assert.equal(appendImageCacheBust("/view?filename=a.png"), "/view?filename=a.png");
+  assert.equal(appendImageCacheBust("/view?filename=a.png", ""), "/view?filename=a.png");
+  assert.equal(appendImageCacheBust("/view?filename=a.png", 7), "/view?filename=a.png");
 });

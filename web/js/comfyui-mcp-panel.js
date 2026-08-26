@@ -39216,6 +39216,14 @@ function buildPanel() {
         // pixels, and the person approves the wrong render. `cmcp_prompt`
         // matches the key the completion frame's size/dimension probes use, so
         // both surfaces address ONE URL and share ONE download.
+        //
+        // The prompt id is passed through AS IS — no local fallback when it is
+        // missing. An id-less run (#224, legacy; a current ComfyUI `executed`
+        // always carries one) then keeps the stale-card exposure, and that is
+        // the lesser evil: a key minted here would not be the key the frame's
+        // probe mints, so the note's size and dimensions could describe a
+        // different file from the one on screen. Closing it properly means
+        // threading a per-run identity through the completion tracker.
         paintImage(appendImageCacheBust(url, d.prompt_id), m.filename);
         inlineImages.push(m);
       }

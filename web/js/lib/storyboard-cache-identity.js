@@ -49,21 +49,29 @@ export function appendStoryboardCacheBust(url, identity) {
 /**
  * Append a run-unique query key to a still image's /view URL (#1834).
  *
- * Keyed on the PROMPT ID rather than a fresh identity per call, so that every
- * surface addressing the same run's output — the chat card painted from
- * `executed`, and the completion frame's size/dimension probes — lands on ONE
- * URL. Two keys would mean two downloads of the same bytes and, worse, would let
- * the probe report the size of a file the card never showed.
+ * `key` must identify the RUN, not the call. Two surfaces address the same
+ * output — the chat card painted from `executed`, and the completion frame's
+ * size/dimension probes — and they have to agree: sharing one URL is what makes
+ * the reported size and pixel dimensions describe the bytes the person is
+ * actually looking at, and costs one download instead of two. The prompt id is
+ * that identity, which is why it is passed in rather than minted here.
  *
- * A run with NO prompt id is real here (#224 covers back-to-back id-less runs),
- * and that is precisely the case where filenames are most likely to repeat. It
- * gets a minted identity instead of being handed back unbusted, because leaving
- * one path stale is how this class of bug survives its own fix. The generator is
- * media-kind agnostic despite its name — it mints "this session, this attempt".
+ * DELIBERATELY STRICT: an absent key returns the URL untouched rather than
+ * minting one. Minting here looks like extra safety and is the opposite — the
+ * two call sites mint INDEPENDENTLY, so the card and the probe would land on
+ * different URLs and could describe different bytes. That is the #1718 failure
+ * (metadata right, picture wrong) reintroduced by the fix for its sibling.
+ *
+ * The cost is that id-less runs (#224 — legacy, and not something a current
+ * ComfyUI `executed` produces) keep the stale-card exposure. Closing that needs
+ * a per-run identity threaded through the completion tracker's buffer, flush and
+ * delivery so both surfaces read ONE value; it is not something a caller can
+ * fake locally. A caller that owns both the probe and the paint — as
+ * `composeShowMediaReply` does, where one `url` local feeds both — can pass its
+ * own minted identity safely, and does.
  */
-export function appendImageCacheBust(url, promptId) {
-  if (typeof url !== "string" || !url) return url;
-  const key = typeof promptId === "string" && promptId ? promptId : createStoryboardIdentity();
+export function appendImageCacheBust(url, key) {
+  if (typeof url !== "string" || !url || typeof key !== "string" || !key) return url;
   return appendCacheBustParam(url, "cmcp_prompt", key);
 }
 

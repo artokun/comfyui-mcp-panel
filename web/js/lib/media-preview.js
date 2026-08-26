@@ -464,11 +464,13 @@ export async function composeShowMediaReply(items, deps = {}) {
       // #1834 — a STILL is exposed to exactly the same thing, and was the half
       // of it left unguarded: /view is keyed by filename, ComfyUI sets no
       // Cache-Control on it, so showing a name whose file has since been
-      // rewritten paints the old pixels. There is no prompt id on this surface
-      // — the agent is naming a file, not a run — so the helper mints a
-      // per-show identity, which is what "show me this" already means. Busting
-      // BEFORE the probe below keeps probe and card on one URL, as video does.
-      if (kind === "image" && url) url = appendImageCacheBust(url);
+      // rewritten paints the old pixels. There is no run identity on this
+      // surface — the agent is naming a file, not a run — so this mints one,
+      // which is what "show me this" already means. Minting is safe HERE and
+      // nowhere else in this fix: the single `url` local below feeds both the
+      // /view probe and the painter, so the two cannot land on different
+      // bytes. Busting BEFORE the probe is what preserves that, as video does.
+      if (kind === "image" && url) url = appendImageCacheBust(url, createStoryboardIdentity());
     } else if (typeof item?.dataUrl === "string" && item.dataUrl) {
       url = item.dataUrl;
     }
