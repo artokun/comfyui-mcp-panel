@@ -17,9 +17,90 @@ import { dirname, join } from "node:path";
 
 import {
   collectRelativeImportSpecifiers,
+  createDirtySafeBundleHealRetry,
   primeModuleCache,
   resolveBundleStaleness,
 } from "../../web/js/lib/bundle-version.js";
+
+test("#1830 dirty-safe bundle heal waits for every unsaved workflow to become clean", async () => {
+  const timers = [];
+  let blocked = true;
+  let heals = 0;
+  const retry = createDirtySafeBundleHealRetry({
+    isBlocked: () => blocked,
+    heal: () => {
+      heals += 1;
+    },
+    setTimer: (fn, ms) => {
+      const timer = { fn, ms, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (timer) => {
+      timer.cancelled = true;
+    },
+    retryMs: 25,
+  });
+
+  assert.equal(retry.schedule(), true);
+  assert.equal(retry.schedule(), false, "repeated stale probes share one waiter");
+  assert.equal(timers[0].ms, 25);
+  timers[0].fn();
+  await Promise.resolve();
+  assert.equal(heals, 0, "dirty work never triggers navigation/healing");
+  assert.equal(timers.length, 2, "the cheap blocker poll remains armed");
+
+  blocked = false;
+  timers[1].fn();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(heals, 1, "healing is retried once the workflows are clean");
+  assert.equal(retry.pending(), false);
+});
+
+test("#1830 dirty-safe bundle heal cancellation prevents a stale timer from navigating", () => {
+  let timer;
+  let heals = 0;
+  const retry = createDirtySafeBundleHealRetry({
+    isBlocked: () => false,
+    heal: () => {
+      heals += 1;
+    },
+    setTimer: (fn) => (timer = { fn, cancelled: false }),
+    clearTimer: (value) => {
+      value.cancelled = true;
+    },
+  });
+  retry.schedule();
+  retry.cancel();
+  if (!timer.cancelled) timer.fn();
+  assert.equal(heals, 0);
+  assert.equal(retry.pending(), false);
+});
+
+test("#1830 root-new/child-old ESM linking tolerates a missing optional healer export", async () => {
+  const oldChildUrl =
+    "data:text/javascript," +
+    encodeURIComponent("export const primeModuleCache = () => {}; export const resolveBundleStaleness = () => 'stale';");
+  const rootUrl =
+    "data:text/javascript," +
+    encodeURIComponent(
+      `import * as bundleVersion from ${JSON.stringify(oldChildUrl)};
+       export const linked = typeof bundleVersion.createDirtySafeBundleHealRetry === "function";
+       export const prime = typeof bundleVersion.primeModuleCache === "function";`,
+    );
+  const linked = await import(rootUrl);
+  assert.equal(linked.linked, false, "the stale child has no optional healer export");
+  assert.equal(linked.prime, true, "the old child still links its existing required exports");
+
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  assert.match(source, /import \* as bundleVersion from "\.\/lib\/bundle-version\.js";/);
+  assert.match(source, /typeof bundleVersion\.createDirtySafeBundleHealRetry === "function"/);
+  assert.doesNotMatch(source, /import \{[\s\S]*createDirtySafeBundleHealRetry[\s\S]*\} from "\.\/lib\/bundle-version\.js";/);
+});
 
 test("resolveBundleStaleness: equal versions are current", () => {
   assert.equal(resolveBundleStaleness({ running: "0.11.39", installed: "0.11.39" }), "current");
@@ -252,6 +333,12 @@ test("#584 healer navigation guards: unsaved-work refusal, socket-down defer, ca
   const prime = body.indexOf("primeModuleCache({");
   const socketDown = body.indexOf("if (comfyBackendIsDown())", prime);
   assert.ok(socketDown > prime, "the socket is re-checked after the prime, before navigating");
+  const postPrimeDirty = body.indexOf("const postPrimeHealBlockers", prime);
+  assert.ok(postPrimeDirty > prime && postPrimeDirty < socketDown, "dirtiness is rechecked after the bounded prime");
+  assert.ok(
+    body.indexOf("dirtySafeBundleHealRetry.schedule();", postPrimeDirty) < socketDown,
+    "new edits after the prime return the heal to its dirty-safe retry loop",
+  );
   const deferUnarm = body.indexOf("ssSet(BUNDLE_HEAL_KEY, null);", socketDown);
   assert.ok(
     deferUnarm !== -1 && deferUnarm < body.indexOf("window.location.replace", socketDown),
@@ -264,6 +351,12 @@ test("#584 healer navigation guards: unsaved-work refusal, socket-down defer, ca
   // never happened and the heal attempt must not be counted as spent.
   const notice = body.indexOf("armReloadBlockedNotice({");
   const navigate = body.indexOf("window.location.replace");
+  const finalDirty = body.indexOf("const finalHealBlockers", postPrimeDirty);
+  assert.ok(finalDirty > postPrimeDirty && finalDirty < navigate, "dirtiness is rechecked immediately before navigation");
+  assert.ok(
+    body.indexOf("ssSet(BUNDLE_HEAL_KEY, null);", finalDirty) < navigate,
+    "the final TOCTOU refusal un-arms the marker",
+  );
   assert.ok(notice !== -1 && notice < navigate, "the cancelled-navigation notice is armed before navigating");
   const noticeBlock = body.slice(notice, navigate);
   assert.ok(

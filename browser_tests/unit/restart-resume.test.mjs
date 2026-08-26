@@ -529,6 +529,29 @@ test("#1824: restart adoption preserves the keyed completion route and session",
   }]);
 });
 
+test("#1830: restart adoption preserves multiple same-prompt completion nonces", () => {
+  const keyA = JSON.stringify(["panel-route-1830", "session-1830", "P", "nonce-a"]);
+  const keyB = JSON.stringify(["panel-route-1830", "session-1830", "P", "nonce-b"]);
+  const rows = [keyA, keyB].map((completionKey) => ({
+    promptId: "P",
+    completionKey,
+    routeId: "panel-route-1830",
+    sessionId: "session-1830",
+  }));
+  const marker = decodeRebootMarker(
+    encodeRebootMarker({ at: 1000, runs: ["P"], completionMeta: rows }),
+  );
+  assert.deepEqual(marker.completionMeta, rows);
+
+  const fresh = makeTracker();
+  assert.deepEqual(adoptRebootRuns(marker.runs, fresh, marker.completionMeta), ["P"]);
+  assert.deepEqual(
+    fresh.completionMetadata().map((entry) => entry.completionKey),
+    [keyA, keyB],
+    "marker adoption passes every exact row to the tracker",
+  );
+});
+
 test("#1824: a timeout-released terminal batch survives teardown and late prompt adoption", async () => {
   const firstFlushes = [];
   const first = makeTracker((payload) => firstFlushes.push(payload));

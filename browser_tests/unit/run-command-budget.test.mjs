@@ -667,7 +667,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, panelRunOwnerRef }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef }) {
   const seen = { dispatchArgs: null };
   const deps = {
     RUN_COMMAND_BUDGET_MS: budgetMs,
@@ -724,6 +724,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     armRunReconcileSweepRef: armRunReconcileSweepRef ?? (() => {}),
     runReceiptSender: runReceiptSender ?? null,
     runReceiptRouteRef: runReceiptRouteRef ?? (() => null),
+    runReceiptSessionRef: runReceiptSessionRef ?? (() => null),
     panelRunOwnerRef: panelRunOwnerRef ?? { current: {} },
   };
   const names = Object.keys(deps);
@@ -1229,6 +1230,7 @@ test("#1824 CALL SITE: a long panel_run completion stays replayable until the or
       armRunReconcileSweepRef: () => sweep.arm(),
       panelRunOwnerRef: owner,
       runReceiptRouteRef: () => "panel-route-1824",
+      runReceiptSessionRef: () => "1824",
       runReceiptSender: () => {},
       dispatch: async (args) => {
         latePromptId = () => args.onPromptId("long-prompt-1824");

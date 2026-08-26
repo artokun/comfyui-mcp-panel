@@ -135,3 +135,65 @@ export function reloadWouldBeBlockedMessage(blockers) {
     `(Ctrl+Shift+R) and confirm the dialog.`
   );
 }
+
+/**
+ * Run an agent-commanded frontend reload through every dirtiness fence.
+ *
+ * The command reply must not call a clean, pre-prime snapshot "scheduled": the
+ * cache prime can yield to a user edit, and the final check can race one too.
+ * Returning the refusal lets the command handler throw it through its normal
+ * `{ok:false,error}` reply path while keeping navigation out of the refused path.
+ *
+ * @param {object} deps
+ * @param {() => string[]} deps.getBlockers
+ * @param {() => Promise<unknown>} deps.prime
+ * @param {() => void} deps.clearSidebarReopen
+ * @param {(message: string) => void} deps.appendSystem
+ * @param {() => void} deps.armNotice
+ * @param {() => void} deps.navigate
+ * @returns {Promise<{ok: true}|{ok: false, stage: string, error: string}>}
+ */
+export async function runAgentFrontendReload({
+  getBlockers,
+  prime,
+  clearSidebarReopen,
+  appendSystem,
+  armNotice,
+  navigate,
+} = {}) {
+  const blockersNow = () => {
+    try {
+      return typeof getBlockers === "function" ? getBlockers() : [];
+    } catch {
+      return [];
+    }
+  };
+  const refuse = (stage, blockers) => {
+    const error = reloadWouldBeBlockedMessage(blockers);
+    try {
+      clearSidebarReopen?.();
+    } catch {}
+    try {
+      appendSystem?.(error);
+    } catch {}
+    return { ok: false, stage, error };
+  };
+
+  const initial = blockersNow();
+  if (initial.length) return refuse("initial", initial);
+
+  try {
+    await prime?.();
+  } catch {
+    // A failed or timed-out cache prime does not waive the dirtiness fences.
+  }
+  const postPrime = blockersNow();
+  if (postPrime.length) return refuse("post-prime", postPrime);
+
+  const beforeNavigation = blockersNow();
+  if (beforeNavigation.length) return refuse("pre-navigation", beforeNavigation);
+
+  armNotice?.();
+  navigate?.();
+  return { ok: true };
+}

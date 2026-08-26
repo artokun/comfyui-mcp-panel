@@ -21,6 +21,7 @@ import {
 } from "../../web/js/lib/run-completion.js";
 import { createRunCompletionFlushHandler } from "../../web/js/lib/run-completion-delivery.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
+import { runCompletionKeyMatchesContext } from "../../web/js/lib/run-completion-persistence.js";
 
 /** Deterministic scheduler: timers are held until tick() fires the due ones. */
 function makeHarness({ debounceMs = 1500, maxRearms = 40 } = {}) {
@@ -334,6 +335,85 @@ function makeFrameDeps(overrides = {}) {
   };
   return { deps, frames, painted, uploadCalls };
 }
+
+test("#1830 keeps two same-prompt nonce rows and retires them by exact key", () => {
+  const h = makeHarness();
+  const P = "same-prompt";
+  const keyA = JSON.stringify(["route-a", "session-a", P, "nonce-a"]);
+  const keyB = JSON.stringify(["route-a", "session-a", P, "nonce-b"]);
+
+  h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a", completionKey: keyA });
+  h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a", completionKey: keyB });
+  assert.deepEqual(
+    h.tracker.completionMetadata().map((row) => row.completionKey),
+    [keyA, keyB],
+    "restoring/queueing the same prompt id does not overwrite the other nonce",
+  );
+
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecuted(P, imgs([img("same-prompt.png")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.deepEqual(
+    h.flushes.map((payload) => payload.completionKey),
+    [keyA, keyB],
+    "the lifecycle sends one exact completion identity for each retained row",
+  );
+
+  assert.equal(h.tracker.acknowledgeDelivery(P, keyA), true);
+  assert.deepEqual(h.tracker.completionMetadata().map((row) => row.completionKey), [keyB]);
+  assert.equal(h.tracker.acknowledgeDelivery(P, keyA), false, "a stale duplicate receipt is harmless");
+  assert.equal(h.tracker.acknowledgeDelivery(P, keyB), true);
+  assert.equal(h.tracker.completionMetadata().length, 0);
+  assert.equal(h.tracker.hasPending(), false);
+});
+
+test("#1830 lifecycle send fence rejects a session switch on the same route and retries exact identity", async () => {
+  const { deps } = makeFrameDeps();
+  const P = "session-switch-prompt";
+  const completionKey = JSON.stringify(["route-a", "session-a", P, "nonce-a"]);
+  let activeSession = "session-a";
+  const rejected = [];
+  const accepted = [];
+  let tracker;
+  const productionOnFlush = createRunCompletionFlushHandler({
+    ...deps,
+    sendFrame: (frame) => {
+      if (!runCompletionKeyMatchesContext(frame.completion_key, "route-a", activeSession)) {
+        rejected.push(frame);
+        return false;
+      }
+      accepted.push(frame);
+      return true;
+    },
+    markDelivered: (promptId, key) => tracker.markDelivered(promptId, key),
+    markUndelivered: (promptId, key) => tracker.markUndelivered(promptId, key),
+    pruneRebootMarker: () => {},
+    isAgentMuted: () => false,
+  });
+  tracker = createRunCompletionTracker({
+    onFlush: productionOnFlush,
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a", completionKey });
+  tracker.onExecutionStart(P);
+  tracker.onExecuted(P, imgs([img("session-switch.png", "temp")]));
+  tracker.onExecutionSuccess(P);
+  activeSession = "session-b";
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(rejected.length, 1, "a same-route session switch rejects the in-flight completion");
+  assert.equal(rejected[0].completion_key, completionKey);
+  assert.equal(tracker.hasPending(), true, "the rejected completion remains recoverable");
+
+  activeSession = "session-a";
+  await tracker.reconcile();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(accepted.length, 1, "the exact completion is retried once its original session returns");
+  assert.equal(accepted[0].completion_key, completionKey);
+  assert.equal(tracker.acknowledgeDelivery(P, completionKey), true);
+  assert.equal(tracker.hasPending(), false);
+});
 
 test("#269/#468 presentation: a MIXED run (stills + 2 videos) emits EXACTLY ONE agent_event with all outputs", async () => {
   const { deps, frames } = makeFrameDeps();
