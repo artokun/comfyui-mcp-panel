@@ -1,3 +1,9 @@
+
+// #1854 — the intrinsic captured ONCE at module load. Invoking through a
+// per-call property lookup on the function object would read an overrideable
+// own property, so a shadowed one could throw before the original ran; this
+// reads nothing off the target at call time.
+const rawApply = Reflect.apply;
 // Keep a batch=1 graph_run tied to the exact ComfyUI queue item it created.
 //
 // ComfyUI's queuePrompt() pushes an item and, when another item is already being
@@ -257,7 +263,12 @@ function associateQueueItem(state, entry, beforeLength) {
 function installQueuePromptObserver(app, state) {
   if (typeof app?.queuePrompt !== "function") return false;
   if (app[SNAPSHOT_QUEUE_PROMPT]) return true;
-  const original = app.queuePrompt.bind(app);
+  // #1854 — see configure-app-mode.js. EARLY binding is load-bearing here:
+  // this captures the pre-patch function, and app.queuePrompt is replaced on
+  // the next line. Resolving the property at call time instead would re-enter
+  // the wrapper below and recurse forever.
+  const queuePromptFn = app.queuePrompt;
+  const original = (...a) => rawApply(queuePromptFn, app, a);
   app.queuePrompt = function snapshotQueuePrompt(...args) {
     const entry = state.claiming;
     const queueItems = queueItemsOf(app);
@@ -301,7 +312,9 @@ export function installGraphToPromptSnapshotBarrier(app) {
   if (!app || typeof app.graphToPrompt !== "function") return null;
   if (app[SNAPSHOT_STATE]) return app[SNAPSHOT_STATE];
 
-  const original = app.graphToPrompt.bind(app);
+  // #1854 — early binding is load-bearing; see the note above.
+  const graphToPromptFn = app.graphToPrompt;
+  const original = (...a) => rawApply(graphToPromptFn, app, a);
   const state = {
     app,
     original,
