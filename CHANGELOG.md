@@ -6,9 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.106] - 2026-08-26
+
 ### Fixed
 - a release tag proves the tagged tree is the version it claims, and that nothing shipped untagged (#1882)
 - the release tag guard fails closed on an unreadable commit, and checks its own tag target (#1882)
+
+### Fixed
+- the tag guard fails closed on an unreadable commit, and checks its own tag target (#1887)
+- a release tag proves the tagged tree is the version it claims (#1885)
+- de-duplicate the 0.15.105 changelog section (#1884)
+
+### Changed
+- 0.15.105 does not contain the release tag guard (#1888)
+
 
 ## [0.15.105] - 2026-08-26
 
