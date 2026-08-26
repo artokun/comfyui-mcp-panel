@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.103] - 2026-08-26
+
+### Fixed
+- stop tripping the registry network rule on Function.prototype.bind (#1867)
+- drop the vendored @a2ui/lit bundle and render leaves natively (#1865)
+- partially_queued early returns include seed-repetition warning (#1857)
+
+### Changed
+- add behavioural test for repeating_controls_note attachment (#1862)
+
+
 ## [0.15.102] - 2026-08-26
 
 ### Fixed
