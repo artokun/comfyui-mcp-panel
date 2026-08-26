@@ -722,7 +722,7 @@ import {
 } from "./lib/execution-preview-attach.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { composeShowMediaReply } from "./lib/media-preview.js";
-import { appendStoryboardCacheBust, createStoryboardIdentity } from "./lib/storyboard-cache-identity.js";
+import { appendImageCacheBust, appendStoryboardCacheBust, createStoryboardIdentity } from "./lib/storyboard-cache-identity.js";
 import {
   bindSourcePlayback,
   sourceMediaDuration,
@@ -39207,7 +39207,16 @@ function buildPanel() {
         // something the agent cannot perceive (#710).
         paintAudio(url, m.filename);
       } else {
-        paintImage(url, m.filename);
+        // #1834 — THE CARD's URL is the one that has to be unique, not just the
+        // metadata probe's. `/view?filename=…` is stable across runs, and a
+        // SaveImage prefix that recycles a name (a `%date%`+`%counter%` prefix
+        // whose counter overlaps an earlier day) makes the browser serve the
+        // PREVIOUS run's bytes here while the file viewer — which fetches
+        // fresh — shows the new ones. Same filename, two different sets of
+        // pixels, and the person approves the wrong render. `cmcp_prompt`
+        // matches the key the completion frame's size/dimension probes use, so
+        // both surfaces address ONE URL and share ONE download.
+        paintImage(appendImageCacheBust(url, d.prompt_id), m.filename);
         inlineImages.push(m);
       }
     }

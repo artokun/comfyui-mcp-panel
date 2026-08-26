@@ -1,0 +1,237 @@
+// #1834 — the chat's inline image card must not show a PREVIOUS run's pixels.
+//
+// ComfyUI's /view is keyed by filename and nothing sets Cache-Control on it
+// (server.py says so in its own comment; `no-store` is attached only on the
+// dangerous-content-type branch). A SaveImage `filename_prefix` built from
+// `%date%` + `%counter%` can therefore re-emit a name an earlier day's run
+// already used, and the browser paints the cached bytes under the new name. The
+// reporter saw exactly that: the chat thumbnail for `test_face_00005_.png`
+// showed a studio background while opening the same filename in the file viewer
+// showed the grass-field render they had just prompted for.
+//
+// WHAT THIS PINS, and why it is pinned HERE rather than on the helper:
+//
+// The first attempt at this bug (PR #1835) added the cache-bust inside
+// `buildStillsSegment`, on the URL handed to `fetchImageBytes` /
+// `fetchImageDimensions`. Those are the completion frame's SIZE AND DIMENSION
+// PROBES. The picture the person actually looks at is painted much earlier, by
+// `onExecuted`, from a bare `imageViewUrl(m)` — so the symptom was untouched and
+// the issue was closed on a fix that could not reach it. A helper-level test
+// would have passed just as happily.
+//
+// So this drives the SHIPPED `onExecuted` out of the panel source and asserts on
+// what `paintImage` is actually handed.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+import { appendImageCacheBust } from "../../web/js/lib/storyboard-cache-identity.js";
+import { composeShowMediaReply } from "../../web/js/lib/media-preview.js";
+
+const panelSrc = readFileSync(
+  new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+  "utf8",
+);
+
+/** Instantiate the production `onExecuted` with injected panel helpers. */
+function productionOnExecuted() {
+  const start = panelSrc.indexOf("  function onExecuted(ev) {");
+  const end = panelSrc.indexOf("\n  function onExecError(ev)", start);
+  assert.ok(start >= 0 && end > start, "could not isolate production onExecuted");
+
+  const painted = [];
+  const buffered = [];
+  const onExecuted = new Function(
+    "imageViewUrl",
+    "isVideoOutput",
+    "isAudioOutput",
+    "paintVideo",
+    "paintAudio",
+    "paintImage",
+    "runCompletion",
+    "stripMisattachedExecutionPreviews",
+    "app",
+    "createStoryboardIdentity",
+    "appendStoryboardCacheBust",
+    "appendImageCacheBust",
+    `return (${panelSrc.slice(start, end).trim()});`,
+  )(
+    (m) =>
+      `/view?filename=${m.filename}&subfolder=${m.subfolder ?? ""}&type=${m.type || "output"}`,
+    () => false,
+    () => false,
+    () => {},
+    () => {},
+    (url, name) => painted.push({ url, name }),
+    { onExecuted: (promptId, output) => buffered.push({ promptId, output }) },
+    () => {},
+    {},
+    () => "identity",
+    (url) => url,
+    appendImageCacheBust,
+  );
+  return { onExecuted, painted, buffered };
+}
+
+const SAME_FILE = { filename: "test_face_00005_.png", type: "output" };
+
+test("#1834: two runs reusing one filename paint two DIFFERENT card URLs", () => {
+  const { onExecuted, painted } = productionOnExecuted();
+
+  onExecuted({ detail: { prompt_id: "run-a", output: { images: [SAME_FILE] } } });
+  onExecuted({ detail: { prompt_id: "run-b", output: { images: [SAME_FILE] } } });
+
+  assert.equal(painted.length, 2, "both runs must paint a card");
+  // THE bug: identical URL → the browser's HTTP cache answers the second card
+  // with the first run's bytes.
+  assert.notEqual(
+    painted[0].url,
+    painted[1].url,
+    "a re-used output filename must not resolve to one cacheable URL",
+  );
+  for (const p of painted) {
+    assert.match(p.url, /[?&]cmcp_prompt=/, "each card URL carries the run key");
+    // The bust must not cost the URL its meaning — /view still has to resolve.
+    assert.match(p.url, /[?&]filename=test_face_00005_\.png(?:&|$)/);
+    assert.match(p.url, /[?&]type=output(?:&|$)/);
+  }
+  assert.match(painted[0].url, /[?&]cmcp_prompt=run-a(?:&|$)/);
+  assert.match(painted[1].url, /[?&]cmcp_prompt=run-b(?:&|$)/);
+  assert.equal(painted[0].name, "test_face_00005_.png", "the caption is untouched");
+});
+
+test("#1834: the card and the completion frame's probes address ONE url", () => {
+  // buildStillsSegment busts with the same key (PR #1835). If these two ever
+  // diverge the size/dimensions reported in the completion note describe a
+  // download the card never made — the exact "metadata was right, picture was
+  // wrong" split that #1718 reported for storyboards.
+  const { onExecuted, painted, buffered } = productionOnExecuted();
+  onExecuted({ detail: { prompt_id: "run-a", output: { images: [SAME_FILE] } } });
+
+  const probeUrl = appendImageCacheBust(
+    `/view?filename=${SAME_FILE.filename}&subfolder=&type=output`,
+    "run-a",
+  );
+  assert.equal(painted[0].url, probeUrl);
+  // The raw ref still rides the completion buffer unmodified — the agent's
+  // image blocks are resolved by the orchestrator, not from this URL.
+  assert.deepEqual(buffered[0].output.images, [SAME_FILE]);
+  assert.equal(buffered[0].promptId, "run-a");
+});
+
+test("#1834: id-less runs (#224) are busted too, not silently left stale", () => {
+  // Back-to-back runs with no prompt_id are a supported path, and it is the one
+  // where filenames are MOST likely to repeat. Handing the URL back unbusted
+  // because the key was missing would leave the original bug live here.
+  const { onExecuted, painted } = productionOnExecuted();
+  onExecuted({ detail: { output: { images: [SAME_FILE] } } });
+  onExecuted({ detail: { output: { images: [SAME_FILE] } } });
+
+  assert.equal(painted.length, 2);
+  assert.match(painted[0].url, /[?&]cmcp_prompt=/);
+  assert.match(painted[1].url, /[?&]cmcp_prompt=/);
+  assert.notEqual(
+    painted[0].url,
+    painted[1].url,
+    "a minted identity must make each id-less run's card unique",
+  );
+});
+
+// ── the other surface that paints an inline image card ─────────────────────
+//
+// `panel_show_media` reaches the SAME chat card through its own composer, and
+// its video branch already carries the #1718 bust on the adjacent line. Stills
+// were the half left unguarded, so the reported symptom is reproducible there
+// too: show a filename, let the file be rewritten, show it again.
+
+function showMediaHarness() {
+  const paintedImages = [];
+  const probed = [];
+  return {
+    paintedImages,
+    probed,
+    deps: {
+      paintImage: (url, caption) => paintedImages.push({ url, caption }),
+      paintVideo: () => {},
+      paintAudio: () => {},
+      paintFileLink: () => {},
+      imageViewUrl: (ref) =>
+        `/view?filename=${ref.filename}&subfolder=${ref.subfolder ?? ""}&type=${ref.type ?? "output"}`,
+      coerceMessageText: (v) => (typeof v === "string" ? v : v == null ? "" : String(v)),
+      humanizeBytes: () => null,
+      fetchMediaBytes: async () => null,
+      probeMedia: (url) => {
+        probed.push(url);
+        return { ok: true };
+      },
+      warn: () => {},
+      setTimer: (fn, ms) => ({ fn, ms }),
+      clearTimer: () => {},
+    },
+  };
+}
+
+const IMAGE_REF = {
+  kind: "viewRef",
+  viewRef: { filename: "test_face_00005_.png", subfolder: "", type: "output" },
+  filename: "test_face_00005_.png",
+};
+
+test("#1834: show_media re-showing one filename paints two distinct URLs", async () => {
+  const first = showMediaHarness();
+  const second = showMediaHarness();
+  await composeShowMediaReply([IMAGE_REF], first.deps);
+  await composeShowMediaReply([IMAGE_REF], second.deps);
+
+  assert.equal(first.paintedImages.length, 1);
+  assert.equal(second.paintedImages.length, 1);
+  assert.match(first.paintedImages[0].url, /[?&]cmcp_prompt=/);
+  assert.notEqual(
+    first.paintedImages[0].url,
+    second.paintedImages[0].url,
+    "a rewritten file must not be re-shown from the browser's cache",
+  );
+  assert.match(first.paintedImages[0].url, /[?&]filename=test_face_00005_\.png(?:&|$)/);
+});
+
+test("#1834: show_media probes the SAME url it paints", async () => {
+  // The probe decides whether the card is claimed as shown. Probing an unbusted
+  // URL while painting a busted one would answer for a different request than
+  // the card makes — the video branch busts before its probe for the same
+  // reason.
+  const h = showMediaHarness();
+  await composeShowMediaReply([IMAGE_REF], h.deps);
+  assert.equal(h.probed.length, 1);
+  assert.equal(h.probed[0], h.paintedImages[0].url);
+});
+
+test("#1834: an inline data URL is left alone — its bytes are already here", async () => {
+  const h = showMediaHarness();
+  const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
+  await composeShowMediaReply(
+    [{ kind: "dataUrl", dataUrl, filename: "inline.png" }],
+    h.deps,
+  );
+  assert.equal(h.paintedImages.length, 1);
+  assert.equal(
+    h.paintedImages[0].url,
+    dataUrl,
+    "a data URL carries no cache identity to bust and must not be rewritten",
+  );
+});
+
+test("#1834: appendImageCacheBust preserves a fragment and existing query", () => {
+  assert.equal(
+    appendImageCacheBust("/view?filename=a.png#frag", "p1"),
+    "/view?filename=a.png&cmcp_prompt=p1#frag",
+  );
+  assert.equal(appendImageCacheBust("/view", "p1"), "/view?cmcp_prompt=p1");
+  assert.equal(appendImageCacheBust("/view?", "p1"), "/view?cmcp_prompt=p1");
+  assert.equal(
+    appendImageCacheBust("/view?filename=a b.png", "p 1"),
+    "/view?filename=a b.png&cmcp_prompt=p%201",
+  );
+  // A non-string / empty URL is handed straight back rather than becoming "?…".
+  assert.equal(appendImageCacheBust("", "p1"), "");
+  assert.equal(appendImageCacheBust(null, "p1"), null);
+});
