@@ -38,7 +38,7 @@ jobs:
       # The registry applies .comfyignore with gitignore semantics: a bare
       # `vendor/` matches a vendor dir at ANY depth, so the exclusion meant for
       # the root CI artefact also silently dropped web/js/vendor/ (the runtime
-      # marked/DOMPurify/qrcode/a2ui-lit imports) from the pack — the browser
+      # marked/DOMPurify/qrcode imports) from the pack — the browser
       # 404'd on import and the sidebar never registered (#749). The parity
       # scan below reimplements the matching root-anchored and cannot see this
       # class of loss, so assert with git's OWN ignore engine instead (empty
@@ -54,8 +54,16 @@ jobs:
             web/js/vendor/marked.esm.js \
             web/js/vendor/purify.es.js \
             web/js/vendor/qrcode.esm.js \
-            web/js/vendor/a2ui-lit.bundle.js \
           ; do
+            # A path that no longer exists passes check-ignore trivially, so a stale
+            # entry reads as coverage while asserting nothing at all.
+            # web/js/vendor/a2ui-lit.bundle.js sat in this list after #1865 deleted the
+            # file, and every publish stayed green over it (#1882). Fail on the stale
+            # entry itself, so this list cannot rot back into a no-op.
+            if [ ! -e "$f" ]; then
+              echo "::error file=.github/workflows/publish_action.yml::$f is listed in the pack-contents gate but does not exist — remove the entry or restore the file; a listed-but-missing path makes this check silently vacuous"
+              exit 1
+            fi
             if git -c core.excludesFile=.comfyignore check-ignore -q "$f"; then
               echo "::error file=.comfyignore::$f is exclude-matched but imported at runtime — the published pack would 404 on import and the sidebar would never register (#749)"
               exit 1
