@@ -556,6 +556,11 @@ import {
   titleRewriteWarning,
 } from "./lib/node-title-rewrite.js";
 import {
+  captureSlotNames,
+  describeSlotRewrites,
+  slotRewriteWarning,
+} from "./lib/slot-rename-disclosure.js";
+import {
   snapshotGraphState,
   describeInputLink,
   orphanedInputLinkId,
@@ -16417,6 +16422,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // is the silent state mismatch #1855 reports. See node-title-rewrite.js for
     // why this DISCLOSES rather than putting the old title back.
     const titlesBefore = captureNodeTitles([origin, target]);
+    // #1873 — the same hook that rewrites a title also RE-ADDRESSES the node.
+    // Impact-Pack's ImpactSwitch renames every non-`select` input from its
+    // POSITION on each onConnectionsChange and clamps `select`; Easy-Use's
+    // *IndexSwitch nodes append/remove position-named slots. ComfyUI keys the
+    // queued prompt on the LIVE slot name, so a name this panel reported on an
+    // earlier connect can stop existing without anything saying so — which is
+    // how a link the canvas shows becomes "no input to that node at all" at run
+    // time. Captured alongside the titles, for the same reason: the rename
+    // happens on the throw path and the success path alike.
+    const slotsBefore = captureSlotNames([origin, target]);
     graph.beforeChange();
     let link;
     let connectErr = null;
@@ -16443,6 +16458,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // and the success path alike, so computing this per-branch would report it on
     // one and drop it on the other.
     const titleRewrites = describeTitleRewrites(titlesBefore);
+    // #1873 — read back in the SAME place as the titles, before the verdict
+    // branches, so a re-addressed node is disclosed on both of them.
+    const slotRewrites = describeSlotRewrites(slotsBefore);
     if (connectErr) {
       const landed = findLandedInboundLink(graph, origin, outIdx, target, inboundLinkIdsBefore);
       if (!landed) {
@@ -16502,6 +16520,10 @@ const GRAPH_TOOL_EXECUTORS = {
         // the wire landed; the rename is a second, independent thing that
         // happened to the same command.
         ...(titleRewrites.length ? { title_rewritten: titleRewrites } : {}),
+        // #1873 — a throw from a dynamic-input hook is exactly when the node is
+        // most likely to have been left re-addressed, so this path needs the
+        // disclosure at least as much as the clean one.
+        ...(slotRewrites.length ? { slots_rewritten: slotRewrites } : {}),
         warning: [
           landedAfterThrowWarning(
             connectErr,
@@ -16512,6 +16534,7 @@ const GRAPH_TOOL_EXECUTORS = {
               : "",
           ),
           titleRewriteWarning(titleRewrites),
+          slotRewriteWarning(slotRewrites),
         ]
           .filter(Boolean)
           .join(" "),
@@ -16578,8 +16601,21 @@ const GRAPH_TOOL_EXECUTORS = {
       // #1855 — the reported path: a connect that fully succeeded and renamed its
       // target on the way. Emitted only when a title actually moved, so an
       // ordinary connect's payload is byte-identical to before.
-      ...(titleRewrites.length
-        ? { title_rewritten: titleRewrites, warning: titleRewriteWarning(titleRewrites) }
+      ...(titleRewrites.length ? { title_rewritten: titleRewrites } : {}),
+      // #1873 — same shape for the slot names and widget values the connect
+      // re-addressed. Emitted only when something the caller could already be
+      // holding actually moved: a brand-new trailing input slot is the expected
+      // behaviour of every dynamic-input node and is never reported, so an
+      // ordinary connect's payload stays byte-identical to before.
+      ...(slotRewrites.length ? { slots_rewritten: slotRewrites } : {}),
+      // Both riders share the single `warning` key, so neither can drop the
+      // other's sentence when one connect does both at once.
+      ...(titleRewrites.length || slotRewrites.length
+        ? {
+            warning: [titleRewriteWarning(titleRewrites), slotRewriteWarning(slotRewrites)]
+              .filter(Boolean)
+              .join(" "),
+          }
         : {}),
     };
   },

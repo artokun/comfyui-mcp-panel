@@ -50,6 +50,11 @@ import {
   describeTitleRewrites,
   titleRewriteWarning,
 } from "../../web/js/lib/node-title-rewrite.js";
+import {
+  captureSlotNames,
+  describeSlotRewrites,
+  slotRewriteWarning,
+} from "../../web/js/lib/slot-rename-disclosure.js";
 import { findExistingRailSlot } from "../../web/js/lib/rail-slot.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -147,6 +152,9 @@ function buildExecutors(graph, canvas = {}) {
     "captureNodeTitles",
     "describeTitleRewrites",
     "titleRewriteWarning",
+    "captureSlotNames",
+    "describeSlotRewrites",
+    "slotRewriteWarning",
     `const GRAPH_TOOL_EXECUTORS = {
 ${connectSrc}
 ${exposeOutSrc}
@@ -181,6 +189,9 @@ return GRAPH_TOOL_EXECUTORS;`,
     captureNodeTitles,
     describeTitleRewrites,
     titleRewriteWarning,
+    captureSlotNames,
+    describeSlotRewrites,
+    slotRewriteWarning,
   );
 }
 
