@@ -10,6 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { findSubgraphOwner } from "../../web/js/lib/subgraph-scope.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -27,16 +28,17 @@ const helpersSrc = panelSrc.slice(
 const methodMatch = panelSrc.match(/graph_promote_widget\(\{ node_id, widget, demote \}\) \{[\s\S]*?\n  \},/);
 assert.ok(methodMatch, "could not locate graph_promote_widget in panel source");
 
-function realPromoteWidget(document, getGraphCtx, resolveNode, pressableWidgetHint = () => "") {
+function realPromoteWidget(document, getGraphCtx, resolveNode, pressableWidgetHint = () => "", findSubgraphOwnerFn = findSubgraphOwner) {
   return new Function(
     "document",
     "getGraphCtx",
     "resolveNode",
     "pressableWidgetHint",
+    "findSubgraphOwner",
     `${helpersSrc}
      const executors = { ${methodMatch[0]} };
      return executors.graph_promote_widget;`,
-  )(document, getGraphCtx, resolveNode, pressableWidgetHint);
+  )(document, getGraphCtx, resolveNode, pressableWidgetHint, findSubgraphOwnerFn);
 }
 
 /** Pinia as getPiniaStore finds it: #vue-app → __vue_app__ → $pinia._s.get(id). */
