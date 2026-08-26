@@ -176,8 +176,16 @@ function isUnderWorkflowsRoot(path) {
   if (!p.startsWith(`${WORKFLOWS_ROOT}/`)) return false;
   return !p.split("/").some((segment) => segment === ".." || segment === ".");
 }
-async function ownsItsPathOnDisk(currentPath, currentName, existsOnDisk) {
+async function ownsItsPathOnDisk(rawPath, currentPath, currentName, existsOnDisk) {
   if (!currentPath || !currentName) return false;
+  // BOTH predicates read the RAW path, exactly as directoryOf reads the raw `wf.directory`.
+  // Checking the NORMALIZED one made the URL test inert (codex gate r4): normalizePath
+  // collapses "//" to "/", so "workflows/http://host/…" arrives as "workflows/http:/host/…"
+  // and the "://" this predicate requires is already gone. Verified by execution, not by
+  // reading. isExternalWorkflowPath survives normalization either way (a leading "\" becomes
+  // a leading "/", which it also matches), but it is read from the same source so the two
+  // can never disagree about which string they judged.
+  if (isExternalWorkflowPath(rawPath) || isUrlDerivedWorkflowPath(rawPath)) return false;
   if (isExternalWorkflowPath(currentPath) || isUrlDerivedWorkflowPath(currentPath)) return false;
   if (!isUnderWorkflowsRoot(currentPath)) return false;
   if (baseName(currentPath.split("/").pop()) !== currentName) return false;
@@ -919,7 +927,7 @@ export async function saveActiveWorkflow(
     !desired &&
     validatedSubfolder === undefined &&
     finalTargetPath !== currentPath &&
-    (await ownsItsPathOnDisk(currentPath, currentName, existsOnDisk))
+    (await ownsItsPathOnDisk(wf?.path, currentPath, currentName, existsOnDisk))
   ) {
     assertExpect(); // #330: the oracle awaited — still the workflow we were asked to save?
     const occupied = (await probeTargetCollision(svc, wf, finalTargetPath, existsOnDisk)) === "exists";

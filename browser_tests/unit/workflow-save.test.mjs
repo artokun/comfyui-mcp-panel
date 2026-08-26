@@ -1715,6 +1715,43 @@ test('#1864 (codex gate r3): a traversal path is not ownership — the redirect 
   )
 })
 
+test('#1864 (codex gate r4): a URL-derived path is judged RAW — normalization must not hide it', async () => {
+  // `normalizePath` collapses "//" to "/", so a URL-derived tab's path arrives as
+  // "workflows/http:/host/…" — the "://" the predicate requires is gone, and reading the
+  // normalized value made the guard inert. #1066's tab must keep the copy route: its path
+  // is not a file at all, and force-writing it is not a save.
+  const active = {
+    path: 'workflows/http://127.0.0.1:8188/api/view?filename=x.png/Foo.app.json',
+    filename: 'Foo',
+    directory: 'workflows/http://127.0.0.1:8188/api/view?filename=x.png',
+    initialMode: 'graph',
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json'], active })
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, undefined, {
+        autoWorkflowName: () => 'Untitled',
+        // A hostile oracle: 200 for the URL path too. Production answers 500 ⇒ null here
+        // (#1066), so the guard is what has to hold, not the probe.
+        existsOnDisk: async (p) => svc.disk.has(p) || p === 'workflows/http:/127.0.0.1:8188/api/view?filename=x.png/Foo.app.json'
+      }),
+    (err) => {
+      assert.match(err.message, /409 Conflict/)
+      return true
+    }
+  )
+
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow'),
+    'a URL source is never force-written in place — it keeps the checked copy route (#1066)'
+  )
+})
+
 // ---------------------------------------------------------------------------
 // ComfyUI frontend 1.47.x (issue #268). The workflow store no longer exposes
 // `saveWorkflowAs`; it exposes the low-level pair `saveAs(wf, path)` (builds a
