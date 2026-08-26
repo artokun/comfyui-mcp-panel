@@ -90,6 +90,7 @@ export function createRunReceiptOutbox({
           type: "run_receipt",
           run_rid: entry.runRid,
           prompt_id: entry.promptId,
+          ...(entry.completionKey ? { completion_key: entry.completionKey } : {}),
         }) === true;
       } catch {
         sent = false;
@@ -104,7 +105,7 @@ export function createRunReceiptOutbox({
   }
 
   return {
-    enqueue(runRid, promptId, routeId) {
+    enqueue(runRid, promptId, routeId, completionKey = null) {
       const rid = text(runRid);
       const pid = text(promptId);
       const route = text(routeId);
@@ -115,7 +116,15 @@ export function createRunReceiptOutbox({
           const oldest = pending.keys().next();
           if (!oldest.done) pending.delete(oldest.value);
         }
-        pending.set(key, { routeId: route, runRid: rid, promptId: pid, createdAt: now() });
+        pending.set(key, {
+          routeId: route,
+          runRid: rid,
+          promptId: pid,
+          ...(typeof completionKey === "string" && completionKey.trim()
+            ? { completionKey: completionKey.trim() }
+            : {}),
+          createdAt: now(),
+        });
       }
       flush();
       return !pending.has(key);

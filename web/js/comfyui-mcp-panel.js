@@ -5052,6 +5052,13 @@ const CURRENT_THREAD_KEY = "comfyui-mcp.panel.currentThreadId";
 // nudges it to continue — making install→restart→continue autonomous. Survives
 // a page reload (sessionStorage) in case the restart reloads the frontend.
 const REBOOT_KEY = "comfyui-mcp.panel.rebootResume";
+// Keyed panel-run completion identities survive a component teardown and a
+// frontend reload. The reboot marker carries the same metadata for a ComfyUI
+// restart; this smaller ledger covers an ordinary panel remount as well.
+const RUN_COMPLETION_META_KEY = "comfyui-mcp.panel.runCompletionMeta.v1";
+// Unkeyed terminal media released after the bounded panel_run hold. This is a
+// separate ledger because the prompt-scoped completion key may arrive later.
+const RUN_COMPLETION_TERMINAL_KEY = "comfyui-mcp.panel.runCompletionTerminal.v1";
 // Set while a soft reload (orchestrator respawn, no ComfyUI restart) is in
 // flight. Value is the trigger origin ("agent" | "user") so that after the
 // fresh orchestrator reconnects we resume the session and — only for an
@@ -5293,6 +5300,108 @@ function ssSet(key, val) {
   } catch {
     // sessionStorage unavailable — resume/restore degrade to off.
   }
+}
+
+function readRunCompletionMetadata() {
+  const raw = ssGet(RUN_COMPLETION_META_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (entry) =>
+          entry &&
+          typeof entry.promptId === "string" &&
+          entry.promptId.trim() &&
+          typeof entry.completionKey === "string" &&
+          entry.completionKey.trim() &&
+          entry.completionKey.length <= 512,
+      )
+      .slice(0, 256)
+      .map((entry) => ({
+        promptId: entry.promptId.trim(),
+        completionKey: entry.completionKey.trim(),
+        routeId: entry.routeId == null ? null : String(entry.routeId),
+        sessionId: entry.sessionId == null ? null : String(entry.sessionId),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function persistRunCompletionMetadata(entries) {
+  const safe = Array.isArray(entries) ? entries.slice(0, 256) : [];
+  if (!safe.length) {
+    ssSet(RUN_COMPLETION_META_KEY, null);
+    return;
+  }
+  try {
+    ssSet(RUN_COMPLETION_META_KEY, JSON.stringify(safe));
+  } catch {
+    // Storage is best-effort; the in-memory tracker remains authoritative.
+  }
+}
+
+function restoreRunCompletionMetadata(tracker) {
+  if (!tracker || typeof tracker.onQueued !== "function") return 0;
+  const entries = readRunCompletionMetadata();
+  for (const entry of entries) {
+    try {
+      tracker.onQueued(entry.promptId, entry);
+    } catch {
+      // A malformed persisted row must not prevent the panel from mounting.
+    }
+  }
+  return entries.length;
+}
+
+function readRunCompletionTerminals() {
+  const raw = ssGet(RUN_COMPLETION_TERMINAL_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (entry) =>
+          entry &&
+          typeof entry.promptId === "string" &&
+          entry.promptId.trim() &&
+          entry.payload &&
+          typeof entry.payload === "object" &&
+          (Array.isArray(entry.payload.images) || Array.isArray(entry.payload.videos)),
+      )
+      .slice(0, 64);
+  } catch {
+    return [];
+  }
+}
+
+function persistRunCompletionTerminals(entries) {
+  const safe = Array.isArray(entries) ? entries.slice(0, 64) : [];
+  if (!safe.length) {
+    ssSet(RUN_COMPLETION_TERMINAL_KEY, null);
+    return;
+  }
+  try {
+    ssSet(RUN_COMPLETION_TERMINAL_KEY, JSON.stringify(safe));
+  } catch {
+    // Storage is best-effort; the in-memory tracker remains authoritative.
+  }
+}
+
+function restoreRunCompletionTerminals(tracker) {
+  if (!tracker || typeof tracker.restoreTerminalCompletion !== "function") return 0;
+  let restored = 0;
+  for (const entry of readRunCompletionTerminals()) {
+    try {
+      if (tracker.restoreTerminalCompletion(entry)) restored += 1;
+    } catch {
+      // A malformed persisted row must not prevent the panel from mounting.
+    }
+  }
+  return restored;
 }
 
 // Sticky auto-connect: once the user has connected, the panel auto-reconnects
@@ -17901,6 +18010,10 @@ const GRAPH_TOOL_EXECUTORS = {
     const dispatchOwner = panelRunOwnerRef.current;
     const dispatchRunCompletion = runCompletionRef;
     const dispatchArmRunReconcileSweep = armRunReconcileSweepRef;
+    // Mark the dispatch before queuePrompt can produce a fast execution_success.
+    // The tracker holds that completion until the delayed /prompt response gives
+    // it a prompt-scoped key, then replays the exact batch keyed.
+    const dispatchPanelRunToken = dispatchRunCompletion?.beginPanelRun?.() ?? null;
     const { app, graph, rootGraph } = getGraphCtx();
     // /run invokes this executor directly rather than through bridge dispatch.
     // Queueing a stale root would render the wrong workflow even though no graph
@@ -18189,7 +18302,11 @@ const GRAPH_TOOL_EXECUTORS = {
         armRunReconcileSweepRef === dispatchArmRunReconcileSweep;
       if (ownsDispatch) {
         try {
-          dispatchRunCompletion?.onQueued(id);
+          dispatchRunCompletion?.onQueued(id, {
+            routeId: dispatchReceiptRoute,
+            sessionId: dispatchOwner?.generation ?? null,
+            dispatchToken: dispatchPanelRunToken,
+          });
         } catch {}
         try {
           dispatchArmRunReconcileSweep?.();
@@ -18200,7 +18317,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // event channel; this is metadata only, never an agent_event completion.
       if (receiptRid && sendReceipt) {
         try {
-          sendReceipt(receiptRid, id, dispatchReceiptRoute);
+          sendReceipt(
+            receiptRid,
+            id,
+            dispatchReceiptRoute,
+            dispatchRunCompletion?.completionKeyFor?.(id) ?? null,
+          );
         } catch {}
       }
     };
@@ -37278,6 +37400,7 @@ function buildPanel() {
         const armedMarker = encodeRebootMarker({
           at: Date.now(),
           runs: armedRuns,
+          completionMeta: runCompletionRef?.completionMetadata?.() ?? [],
           // WHICH conversation asked for the restart. The wait set above is global;
           // the delivery target is not. Recorded here because this is the only
           // moment we know it — by the time the ready ack lands the user may have
@@ -37571,6 +37694,20 @@ function buildPanel() {
         markRead(ack.mid);
         return;
       }
+      // #1824 — a successful WebSocket write only proves the browser handed the
+      // frame to the socket. Retire a panel_run completion only after the
+      // orchestrator accepts the same route-scoped completion key; until then
+      // the tracker keeps /history reconciliation armed and replays idempotently.
+      if (
+        ack?.kind === "completion" &&
+        typeof ack.prompt_id === "string" &&
+        typeof ack.completion_key === "string"
+      ) {
+        if (runCompletionRef?.acknowledgeDelivery(ack.prompt_id, ack.completion_key)) {
+          pruneRebootMarker();
+        }
+        return;
+      }
       // Effort change while the agent was mid-turn: it can't change a running
       // turn's effort, so it applies once the current turn finishes (no more
       // killing the in-flight reply). Let the user know so the picker selection
@@ -37741,8 +37878,8 @@ function buildPanel() {
       return null;
     }
   };
-  const panelRunReceiptSender = (rid, promptId, routeId) =>
-    runReceiptOutbox.enqueue(rid, promptId, routeId);
+  const panelRunReceiptSender = (rid, promptId, routeId, completionKey) =>
+    runReceiptOutbox.enqueue(rid, promptId, routeId, completionKey);
   const panelRunReceiptTransport = {
     routeId: panelRunReceiptRouteRef,
     ready: () => client.isRouteReady?.() === true,
@@ -37863,6 +38000,8 @@ function buildPanel() {
   // This closure owns ONLY presentation: it receives the full, correctly-scoped
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
+    onCompletionStateChange: (entries) => persistRunCompletionMetadata(entries),
+    onTerminalCompletionStateChange: (entries) => persistRunCompletionTerminals(entries),
     // comfyui-mcp#1739 — a run re-pended by markUndelivered (the completion frame's
     // sendFrame failed: bridge/socket churn, e.g. around a workflow-tab switch
     // re-hello) re-enters a ledger that may have NO sweeper left: flush() retired
@@ -38092,6 +38231,15 @@ function buildPanel() {
   });
   const armRunReconcileSweep = () => runReconcileSweep.arm();
   armRunReconcileSweepRef = armRunReconcileSweep;
+  // Remount/reload adoption restores the exact key and route/session metadata
+  // before the first reconcile probe, so a retained completion can be replayed
+  // as the same panel_run receipt rather than downgraded to a fresh run.
+  if (
+    restoreRunCompletionMetadata(runCompletion) > 0 ||
+    restoreRunCompletionTerminals(runCompletion) > 0
+  ) {
+    armRunReconcileSweep();
+  }
 
   // ── #585: correlated restart-resume ───────────────────────────────────────
   // After a ComfyUI restart the panel nudges the agent to continue. If a render
@@ -38276,9 +38424,10 @@ function buildPanel() {
   function adoptRebootRunsHere() {
     const tracker = runCompletionRef;
     if (!tracker) return;
-    const runs = readRebootMarker()?.runs ?? [];
+    const marker = readRebootMarker();
+    const runs = marker?.runs ?? [];
     if (!runs.length) return;
-    adoptRebootRuns(runs, tracker);
+    adoptRebootRuns(runs, tracker, marker?.completionMeta ?? []);
     // Only start probing once the bridge is up. Reconcile's give-up path fires a
     // one-time "safe to requeue" frame and then EVICTS the run — firing that at a
     // disconnected agent burns the run's only outcome on a dropped frame. That
@@ -42503,6 +42652,9 @@ function buildPanel() {
       // reconcile await (codex P1 unmount-resurrection leak). Only null the shared
       // refs if they still point at THIS instance — a newer mount may already own them.
       runReconcileSweep.dispose();
+      persistRunCompletionMetadata(runCompletion.completionMetadata?.() ?? []);
+      persistRunCompletionTerminals(runCompletion.terminalCompletionMetadata?.() ?? []);
+      runCompletion.dispose?.();
       if (panelRunOwnerRef.current === mountOwner) {
         panelRunOwnerRef.current = null;
         runReceiptOutbox.setTransport(null);

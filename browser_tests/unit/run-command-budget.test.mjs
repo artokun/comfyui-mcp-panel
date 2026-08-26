@@ -76,6 +76,7 @@ import {
 } from "../../web/js/lib/queue-prompt-chain.js";
 import { MUTATION_BINDING_BAR } from "../../web/js/lib/graph-binding.js";
 import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
+import { createRunCompletionFlushHandler } from "../../web/js/lib/run-completion-delivery.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js";
 import { createRunReceiptOutbox } from "../../web/js/lib/run-receipt-outbox.js";
@@ -1093,6 +1094,7 @@ test("#1728 CALL SITE: late capture crosses the bridge, arms the real sweep, and
       intervalMs: 60000,
     });
     let latePromptId;
+    const completionKey = JSON.stringify(["panel-route-1728", "session-1728", "late-reconnect-prompt-1728", "generation-a"]);
     const built = realGraphRun({
       app,
       apiTarget,
@@ -1147,6 +1149,172 @@ test("#1728 CALL SITE: late capture crosses the bridge, arms the real sweep, and
   }
 });
 
+test("#1824 CALL SITE: a long panel_run completion stays replayable until the orchestrator receipt", async () => {
+  const stop = keepAlive();
+  let sweep;
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, queue: "never" });
+    app.graph = { _nodes: [] };
+    const frames = [];
+    const flushes = [];
+    const timers = new Set();
+    let nextTimer = 0;
+    const schedule = (fn, ms) => {
+      const timer = { id: ++nextTimer, fn, ms };
+      timers.add(timer);
+      return timer;
+    };
+    const cancel = (timer) => timers.delete(timer);
+    let resolveSend;
+    const waitForSend = () =>
+      new Promise((resolve) => {
+        resolveSend = resolve;
+      });
+    let tracker;
+    const productionOnFlush = createRunCompletionFlushHandler({
+      sendFrame: (frame) => {
+        frames.push(frame);
+        resolveSend?.(frame);
+        resolveSend = null;
+        return true; // the browser socket accepted it; the orchestrator ack is separate
+      },
+      markDelivered: (promptId) => tracker.markDelivered(promptId),
+      markUndelivered: (promptId) => tracker.markUndelivered(promptId),
+      pruneRebootMarker: () => {},
+      coerceMessageText: (value) => String(value ?? ""),
+      formatDuration: (ms) => `${(ms / 1000).toFixed(1)}s`,
+      formatClock: () => "12:00:00",
+      imageViewUrl: (m) => `view://${m.filename}`,
+      fetchImageBytes: async () => 2048,
+      fetchImageDimensions: async () => ({ w: 512, h: 512 }),
+      humanizeBytes: (n) => `${n} B`,
+      warn: () => {},
+      now: () => Date.now(),
+    });
+    tracker = createRunCompletionTracker({
+      onFlush: (payload) => {
+        flushes.push(payload);
+        productionOnFlush(payload);
+      },
+      now: () => 458180,
+      setTimer: schedule,
+      clearTimer: cancel,
+    });
+    const history = {
+      outputs: { 9: { images: [{ filename: "long-render.png", type: "output" }] } },
+      status: { status_str: "success", completed: true, messages: [] },
+    };
+    sweep = createRunReconcileSweep({
+      hasPending: () => tracker.hasPending(),
+      reconcile: () =>
+        tracker.reconcile({
+          fetchHistory: async () => history,
+          fetchQueued: async () => false,
+          isVideo: () => false,
+        }),
+      setTimer: schedule,
+      clearTimer: cancel,
+      intervalMs: 60000,
+    });
+
+    let latePromptId;
+    const owner = { current: { generation: 1824 } };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      runCompletionRef: tracker,
+      armRunReconcileSweepRef: () => sweep.arm(),
+      panelRunOwnerRef: owner,
+      runReceiptRouteRef: () => "panel-route-1824",
+      runReceiptSender: () => {},
+      dispatch: async (args) => {
+        latePromptId = () => args.onPromptId("long-prompt-1824");
+        return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
+      },
+    });
+
+    const result = await built.graph_run({ to_node_id: 327, rid: "run-rid-1824" });
+    assert.equal(result.queued_unknown, true);
+    // The render lasts 458,180 ms — far beyond the old fixed completion cutoff.
+    // Deliberately deliver the execution lifecycle BEFORE the delayed /prompt
+    // response. The production tracker must retain this media batch and replay
+    // it keyed when the real panel_run receipt finally arrives.
+    tracker.onExecutionStart("long-prompt-1824");
+    tracker.onExecuted("long-prompt-1824", {
+      images: [{ filename: "long-render.png", type: "output" }],
+    });
+    assert.equal(frames.length, 0, "media-before-prompt is held, not delivered unkeyed");
+
+    // The production hold really expires while this render is still active.
+    // The eventual execution_success must still retain the media as a
+    // recoverable terminal record rather than taking the ordinary unkeyed path.
+    const timeout = [...timers].find((candidate) => candidate.ms === 30000);
+    assert.ok(timeout, "the production panel_run hold has a 30-second timeout");
+    timers.delete(timeout);
+    const unkeyedP = waitForSend();
+    await timeout.fn();
+    assert.equal(frames.length, 0, "the hold timeout does not flush an active render");
+    tracker.onExecutionSuccess("long-prompt-1824");
+    await unkeyedP;
+    assert.equal(frames.length, 1, "the expired hold emits its best-effort unkeyed frame");
+    assert.equal(frames[0].completion_key, undefined, "the timeout frame has no prompt key yet");
+    assert.equal(flushes[0].awaitingCompletionKey, true);
+    assert.equal(tracker.hasPending(), true, "the timeout frame remains in the recovery ledger");
+    assert.equal(tracker.isSettled("long-prompt-1824"), false);
+
+    const sentP = waitForSend();
+    latePromptId();
+    assert.equal(sweep._hasTimer(), true, "the real panel_run capture arms reconciliation");
+    await sentP;
+    assert.equal(flushes.length, 2, "the delayed prompt binds and replays the held terminal media");
+    assert.equal(frames.length, 2);
+    const completionKey = frames[1].completion_key;
+    const completionParts = JSON.parse(completionKey);
+    assert.equal(completionParts[0], "panel-route-1824");
+    assert.equal(completionParts[1], "1824");
+    assert.equal(completionParts[2], "long-prompt-1824");
+    assert.equal(typeof completionParts[3], "string");
+    assert.ok(completionParts[3].length > 0, "the frame carries a per-queue generation nonce");
+    assert.equal(tracker.hasPending(), true, "socket acceptance does not retire the completion");
+    assert.equal(tracker.isSettled("long-prompt-1824"), false);
+    assert.equal(tracker.acknowledgeDelivery("long-prompt-1824", "stale-key"), false);
+    assert.equal(tracker.hasPending(), true, "a stale receipt cannot retire the run");
+
+    // A safety-sweep/history replay before the receipt must send the same logical
+    // completion, not lose it and not create an unkeyed duplicate.
+    const replayP = waitForSend();
+    await tracker.reconcile({
+      fetchHistory: async () => history,
+      fetchQueued: async () => false,
+      isVideo: () => false,
+    });
+    await replayP;
+    assert.equal(frames.length, 3, "pending history reconciliation replays the completion");
+    assert.equal(frames[2].completion_key, completionKey, "replay uses the same idempotency key");
+    assert.equal(tracker.hasPending(), true, "replay remains pending until the receipt");
+
+    assert.equal(
+      tracker.acknowledgeDelivery("long-prompt-1824", completionKey),
+      true,
+      "the matching orchestrator receipt settles the exact run",
+    );
+    assert.equal(tracker.hasPending(), false);
+    assert.equal(tracker.isSettled("long-prompt-1824"), true);
+
+    const timer = [...timers].find((candidate) => candidate.ms === 60000);
+    assert.ok(timer, "the safety sweep remains armed while the receipt is missing");
+    timers.delete(timer);
+    await timer.fn();
+    assert.equal(sweep._hasTimer(), false, "the sweep self-disarms after the receipt drains the ledger");
+  } finally {
+    sweep?.dispose();
+    stop();
+  }
+});
+
 test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on reconnect", async () => {
   const stop = keepAlive();
   try {
@@ -1166,6 +1334,7 @@ test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on re
       },
     });
     let latePromptId;
+    const completionKey = JSON.stringify(["panel-route-1728", "session-1728", "late-reconnect-prompt-1728", "generation-a"]);
     const built = realGraphRun({
       app,
       apiTarget,
@@ -1173,7 +1342,7 @@ test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on re
       serializeMs: 400,
       panelRunOwnerRef: { current: { generation: 1 } },
       runReceiptRouteRef: () => "panel-route-1728",
-      runReceiptSender: (rid, promptId, routeId) => outbox.enqueue(rid, promptId, routeId),
+      runReceiptSender: (rid, promptId, routeId, key) => outbox.enqueue(rid, promptId, routeId, key || completionKey),
       dispatch: async (args) => {
         latePromptId = () => args.onPromptId("late-reconnect-prompt-1728");
         return { outcome: "unverified", queueMark: 1, verified: 0, inFlight: 1, error: "stub" };
@@ -1190,7 +1359,12 @@ test("#1728 CALL SITE: a closed-route receipt is retained and flushed once on re
     outbox.notifyRouteReady();
     assert.equal(outbox.pendingSize(), 0, "the reconnect flush retires the receipt only after sendFrame true");
     assert.deepEqual(receiptFrames, [
-      { type: "run_receipt", run_rid: "run-rid-reconnect-1728", prompt_id: "late-reconnect-prompt-1728" },
+      {
+        type: "run_receipt",
+        run_rid: "run-rid-reconnect-1728",
+        prompt_id: "late-reconnect-prompt-1728",
+        completion_key: completionKey,
+      },
     ]);
   } finally {
     stop();
@@ -1285,7 +1459,7 @@ test("#1728 production bridge wiring fences same-route re-advertisement before r
   assert.match(sendHello, /pendingRouteBindingGeneration = bindingGeneration/);
   assert.match(sendHello, /sent === true/);
   assert.match(ready, /pendingRouteBindingGeneration !== null/);
-  assert.match(sender, /runReceiptOutbox\.enqueue\(rid, promptId, routeId\)/);
+  assert.match(sender, /runReceiptOutbox\.enqueue\(rid, promptId, routeId, completionKey\)/);
   assert.doesNotMatch(sender, /routeId\s*\?\?/);
 });
 
