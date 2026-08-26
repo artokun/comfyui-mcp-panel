@@ -216,6 +216,12 @@ export function describeSlotRewrites(snapshot) {
 
 const MAX_DISCLOSURE_VALUE_LENGTH = 120;
 
+function boundDisclosureText(text) {
+  return text.length > MAX_DISCLOSURE_VALUE_LENGTH
+    ? `${text.slice(0, MAX_DISCLOSURE_VALUE_LENGTH)}…`
+    : text;
+}
+
 /**
  * Convert an arbitrary live graph value to a bounded JSON-safe scalar. The
  * comparison above deliberately retains the original values so Object.is()
@@ -227,14 +233,12 @@ function safeDisclosureValue(value) {
     if (value === null || value === undefined) return null;
     switch (typeof value) {
       case "string":
-        return value.length > MAX_DISCLOSURE_VALUE_LENGTH
-          ? `${value.slice(0, MAX_DISCLOSURE_VALUE_LENGTH)}…`
-          : value;
+        return boundDisclosureText(value);
       case "number":
       case "boolean":
         return value;
       case "bigint":
-        return `${value}n`;
+        return boundDisclosureText(`${value}n`);
       case "symbol":
         return "(symbol)";
       case "function":
@@ -242,9 +246,7 @@ function safeDisclosureValue(value) {
       default: {
         const json = JSON.stringify(value);
         if (typeof json !== "string") return "(unrenderable)";
-        return json.length > MAX_DISCLOSURE_VALUE_LENGTH
-          ? `${json.slice(0, MAX_DISCLOSURE_VALUE_LENGTH)}…`
-          : json;
+        return boundDisclosureText(json);
       }
     }
   } catch {
@@ -272,15 +274,13 @@ function renderValue(value) {
   try {
     if (value === null || value === undefined) return "null";
     const type = typeof value;
-    if (type === "bigint") return `${value}n`;
+    if (type === "bigint") return boundDisclosureText(`${value}n`);
     if (type === "number" || type === "boolean") return String(value);
     if (type === "symbol" || type === "function") return `(${type})`;
     const json = JSON.stringify(value);
     // `undefined` when the value is not serialisable at all — never interpolate that.
     if (typeof json !== "string") return `(${type})`;
-    return json.length > MAX_DISCLOSURE_VALUE_LENGTH
-      ? `${json.slice(0, MAX_DISCLOSURE_VALUE_LENGTH)}…`
-      : json;
+    return boundDisclosureText(json);
   } catch {
     return "(unrenderable)";
   }

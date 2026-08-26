@@ -511,8 +511,11 @@ test("#1873 hostile widget VALUES are safe in the full bridge envelope (gate P1)
     },
   });
   const oversized = { payload: "x".repeat(1000) };
+  const giantBigIntDigits = "9".repeat(100_000);
+  const giantBigInt = BigInt(giantBigIntDigits);
   for (const [label, hostile, expected] of [
     ["BigInt", 2n, "2n"],
+    ["giant BigInt", giantBigInt, null],
     ["circular", circular, "(unrenderable)"],
     ["oversized", oversized, null],
     ["throwing getter", throwingGetter, "(unrenderable)"],
@@ -553,9 +556,24 @@ test("#1873 hostile widget VALUES are safe in the full bridge envelope (gate P1)
       assert.equal(typeof rewrite?.to, "string", `${label}: oversized value is represented as text`);
       assert.ok(rewrite.to.length <= 121, `${label}: disclosure value is bounded`);
       assert.equal(rewrite.to.endsWith("…"), true, `${label}: truncation is disclosed`);
-      assert.equal(encoded.includes("x".repeat(1000)), false, `${label}: raw object is not leaked`);
+      const rawValue = label === "giant BigInt" ? `${giantBigIntDigits}n` : "x".repeat(1000);
+      assert.equal(encoded.includes(rawValue), false, `${label}: raw value is not leaked`);
     }
   }
+});
+
+test("#1873 warning rendering bounds a direct giant BigInt too", () => {
+  const giantDigits = "9".repeat(100_000);
+  const giant = BigInt(giantDigits);
+  const warning = slotRewriteWarning([
+    { node_id: 2, slots: [], widgets: [{ name: "select", from: 1, to: giant }] },
+  ]);
+  const reply = { rid: "giant-warning-rid", ok: true, result: { warning } };
+
+  assert.doesNotThrow(() => JSON.stringify(reply), "the direct warning envelope must serialize");
+  assert.ok(warning.length < 2000, "the warning stays bounded");
+  assert.equal(warning.includes(`${giantDigits}n`), false, "the giant BigInt is not leaked");
+  assert.match(warning, /widget "select" 1 → 9+…/);
 });
 
 test("#1873 a connect that changes nothing addressable stays byte-identical", () => {
