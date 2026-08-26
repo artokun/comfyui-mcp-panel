@@ -24,7 +24,10 @@ import {
 } from "../../web/js/lib/subgraph-scope.js";
 import { describeMissingNode } from "../../web/js/lib/node-scope-locator.js";
 import { canonicalNodeId, resolveLiveNode } from "../../web/js/lib/node-id.js";
-import { withWorkflowUuid } from "../../web/js/lib/graph-view-identity.js";
+import {
+  withGraphViewIdentity,
+  withWorkflowUuid,
+} from "../../web/js/lib/graph-view-identity.js";
 import {
   rememberAutoLayoutScope,
   clearAutoLayoutScope,
@@ -243,10 +246,11 @@ function buildShippedScopeTools(app) {
     "workflowObjectUuid",
     "workflowStableUuid",
     "withWorkflowUuid",
+    "withGraphViewIdentity",
     "findSubgraphOwner",
     "isSubgraphInRoot",
     `${panelFunctionSource(PANEL_SRC, "describeActiveGraph", "captureGraphSnapshot")}\nreturn describeActiveGraph;`,
-  )(app, () => null, () => "", () => "", withWorkflowUuid, findSubgraphOwner, isSubgraphInRoot);
+  )(app, () => null, () => "", () => "", withWorkflowUuid, withGraphViewIdentity, findSubgraphOwner, isSubgraphInRoot);
 
   const resolveNode = new Function(
     "canonicalNodeId",

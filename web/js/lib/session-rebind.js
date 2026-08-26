@@ -798,6 +798,21 @@ export function buildHelloPayload({
     // synchronous write boundary, so the orchestrator can fence a node
     // replacement between its final identity probe and mutation.
     enforces_expected_node_type_at_write: true,
+    // #2314: graph_set_widget validates an optional promoted subgraph owner and
+    // workflow witness against the LIVE canvas at the same synchronous boundary.
+    enforces_expected_scope_at_write: true,
+    // #2314 P1: the promoted-scope fence also validates the object-keyed live
+    // graph identity, not only graph-local owner/workflow fields.
+    enforces_expected_scope_graph_identity_at_write: true,
+    // #2314 P1: graph_get_subgraph publishes the complete alias -> immediate
+    // -> terminal promotion witness consumed by the orchestrator. This is a
+    // separate capability from the write-boundary fence so an older bundle is
+    // never mistaken for one that can classify renamed promotion aliases.
+    publishes_promoted_terminal_witnesses: true,
+    // #2314 final-rail race: graph_set_widget re-resolves the promoted alias
+    // through the live owner/input relationship immediately before mutation,
+    // so an external/relinked host input cannot permit an inner/shared write.
+    enforces_promoted_parent_rail_at_write: true,
     // Advertise that this build understands `agent_note` — an orchestrator frame that is
     // delivered to the AGENT ONLY and never rendered as a chat bubble.
     //

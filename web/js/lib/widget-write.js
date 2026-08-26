@@ -1396,12 +1396,7 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   const matches = [];
   for (const input of subgraphNode.inputs ?? []) {
     const subgraphInput = input?._subgraphSlot ?? null;
-    const aliases = [
-      input?.name,
-      input?.label,
-      subgraphInput?.name,
-      subgraphInput?.label,
-    ].map((a) => (a == null ? null : String(a).toLowerCase()));
+    const aliases = promotedInputAliases(input, subgraphInput).map((a) => a.toLowerCase());
     // Labels are used ONLY to DETECT which promotion the caller meant (a caller
     // may address by a renamed promotion's display label). Locating the parent's
     // authoritative rail widget is done LATER by the promotion RELATIONSHIP
@@ -1494,20 +1489,53 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
  *   { node: null, widget: null, error }     → a deeper promotion link is unresolvable
  *   { node, widget, cycle: true }           → a promotion cycle was detected (defensive)
  */
+/** Maximum number of nested promoted containers the write path will traverse.
+ * A cycle is handled separately, but a bounded walk is still required for
+ * hostile/malformed graphs whose resolver keeps producing fresh objects. */
+export const MAX_PROMOTION_CHAIN_DEPTH = 16;
+
 export function followPromotionToConcrete(target, resolveSource) {
   let node = target?.node ?? null;
   let widget = target?.widget ?? null;
   const seen = new Set();
+  let depth = 0;
   while (node && node.subgraph) {
     if (seen.has(node)) return { node, widget, cycle: true };
+    if (depth >= MAX_PROMOTION_CHAIN_DEPTH) {
+      return {
+        node: null,
+        widget: null,
+        error: `promoted chain exceeded the maximum depth of ${MAX_PROMOTION_CHAIN_DEPTH}`,
+      };
+    }
     seen.add(node);
     const res = resolvePromotedInnerTarget(node, widget?.name, resolveSource);
     if (!res.promoted) return { node, widget, terminalVirtual: true };
     if (!res.target) return { node: null, widget: null, error: res.error };
     node = res.target.node;
     widget = res.target.widget;
+    depth += 1;
   }
-  return { node, widget };
+  return { node, widget, depth };
+}
+
+/** Every addressable spelling of a promoted host rail. Frontend versions have
+ * carried the programmatic name/label on the input, its backing subgraph slot,
+ * or the rail widget projection. Keep graph_get_subgraph's witness enumeration
+ * and graph_set_widget's live resolver on this exact shared alias contract. */
+export function promotedInputAliases(input, subgraphInput = input?._subgraphSlot ?? null) {
+  return [
+    input?.name,
+    input?.label,
+    input?.widget?.name,
+    input?.widget?.label,
+    input?._widget?.name,
+    input?._widget?.label,
+    subgraphInput?.name,
+    subgraphInput?.label,
+  ]
+    .filter((value) => value != null && String(value).length > 0)
+    .map((value) => String(value));
 }
 
 /**
@@ -1525,14 +1553,17 @@ export function collectPromotionIntermediates(target, resolveSource) {
   let node = target?.node ?? null;
   let widget = target?.widget ?? null;
   const seen = new Set();
+  let depth = 0;
   while (node && node.subgraph) {
     if (seen.has(node)) break;
+    if (depth >= MAX_PROMOTION_CHAIN_DEPTH) break;
     seen.add(node);
     out.push(node);
     const res = resolvePromotedInnerTarget(node, widget?.name, resolveSource);
     if (!res.promoted || !res.target) break;
     node = res.target.node;
     widget = res.target.widget;
+    depth += 1;
   }
   return out;
 }
