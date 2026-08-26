@@ -548,6 +548,11 @@ import {
   readStoredLink,
 } from "./lib/connect-verify.js";
 import {
+  captureNodeTitles,
+  describeTitleRewrites,
+  titleRewriteWarning,
+} from "./lib/node-title-rewrite.js";
+import {
   snapshotGraphState,
   describeInputLink,
   orphanedInputLinkId,
@@ -15668,6 +15673,26 @@ const GRAPH_TOOL_EXECUTORS = {
         "before creating this node, and the node was built from the CURRENT definition. Nodes " +
         "ALREADY on the canvas keep the shape they were created with.";
     }
+    // #1855 — the add's own claim, checked against the node it just made. This is
+    // NOT the fix for that issue: `added.title` is already a live read of
+    // `node.title`, and the frontend's LGraph.add does not touch `title`, so the
+    // reported reversion happens later, at CONNECT (see node-title-rewrite.js).
+    // But nothing here ever compared the two, so a class that DID rename itself
+    // during creation would have its substituted name reported in the `title`
+    // field of a success payload — the caller asked for one name, silently got
+    // another, and the reply read as confirmation. Say which name landed instead.
+    // Last of the warning writers on purpose: the blocks above ASSIGN
+    // `added.warning`, so this has to append rather than be overwritten.
+    if (typeof title === "string" && title && added.title !== title) {
+      added.title_not_applied = { requested: title, actual: added.title ?? null };
+      added.warning =
+        `${added.warning ? `${added.warning} ` : ""}` +
+        `The requested title ${JSON.stringify(title)} is NOT what this node ended up with — it ` +
+        `carries ${JSON.stringify(added.title ?? null)}. "${class_type}" rewrote its own title while it was ` +
+        `being created, so the name in this reply is the node's ACTUAL one, not the one you asked ` +
+        `for. panel_edit_node can set it again, but a class that owns its title will keep ` +
+        `rewriting it (on connect, and after every run).`;
+    }
     return { added };
   },
 
@@ -16350,6 +16375,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // nothing" and "threw after wiring it" collapse into one indistinguishable
     // answer.
     const inboundLinkIdsBefore = linkIdExclusionSet(inputLinkIds(target));
+    // #1855 — the titles both endpoints carry BEFORE the wire is made. LiteGraph
+    // calls `target.onConnectInput(...)` from inside connectSlots, and a pack is
+    // free to rewrite its own title from there: KJNodes' PreviewAnimation resets
+    // it to "Preview Animation" unconditionally, discarding the name the caller
+    // had just given it via panel_add_node. Nothing in the reply said so, which
+    // is the silent state mismatch #1855 reports. See node-title-rewrite.js for
+    // why this DISCLOSES rather than putting the old title back.
+    const titlesBefore = captureNodeTitles([origin, target]);
     graph.beforeChange();
     let link;
     let connectErr = null;
@@ -16371,6 +16404,11 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
+    // #1855 — read the endpoints' titles back the moment the mutation is over,
+    // BEFORE the verdict branches: the hook that renames runs on the throw path
+    // and the success path alike, so computing this per-branch would report it on
+    // one and drop it on the other.
+    const titleRewrites = describeTitleRewrites(titlesBefore);
     if (connectErr) {
       const landed = findLandedInboundLink(graph, origin, outIdx, target, inboundLinkIdsBefore);
       if (!landed) {
@@ -16425,14 +16463,24 @@ const GRAPH_TOOL_EXECUTORS = {
             ? { replaced_link: replacedLink }
             : {}),
         },
-        warning: landedAfterThrowWarning(
-          connectErr,
-          landed.inputIndex !== inIdx
-            ? `The node re-slotted it: the link landed on input ` +
-                `"${landedSlot?.name ?? landed.inputIndex}" (index ${landed.inputIndex}), not the ` +
-                `requested "${target.inputs?.[inIdx]?.name ?? inIdx}" (index ${inIdx}).`
-            : "",
-        ),
+        // #1855 — APPENDED to the throw-path warning, never replacing it. This
+        // path already owes the caller the louder fact that a hook threw after
+        // the wire landed; the rename is a second, independent thing that
+        // happened to the same command.
+        ...(titleRewrites.length ? { title_rewritten: titleRewrites } : {}),
+        warning: [
+          landedAfterThrowWarning(
+            connectErr,
+            landed.inputIndex !== inIdx
+              ? `The node re-slotted it: the link landed on input ` +
+                  `"${landedSlot?.name ?? landed.inputIndex}" (index ${landed.inputIndex}), not the ` +
+                  `requested "${target.inputs?.[inIdx]?.name ?? inIdx}" (index ${inIdx}).`
+              : "",
+          ),
+          titleRewriteWarning(titleRewrites),
+        ]
+          .filter(Boolean)
+          .join(" "),
       };
     }
     if (!link) {
@@ -16493,6 +16541,12 @@ const GRAPH_TOOL_EXECUTORS = {
         ...(autoMatched.length ? { auto_matched: autoMatched } : {}),
         ...(replacedLink ? { replaced_link: replacedLink } : {}),
       },
+      // #1855 — the reported path: a connect that fully succeeded and renamed its
+      // target on the way. Emitted only when a title actually moved, so an
+      // ordinary connect's payload is byte-identical to before.
+      ...(titleRewrites.length
+        ? { title_rewritten: titleRewrites, warning: titleRewriteWarning(titleRewrites) }
+        : {}),
     };
   },
 

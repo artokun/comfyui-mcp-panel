@@ -45,6 +45,11 @@ import {
   landedAfterThrowWarning,
   readStoredLink,
 } from "../../web/js/lib/connect-verify.js";
+import {
+  captureNodeTitles,
+  describeTitleRewrites,
+  titleRewriteWarning,
+} from "../../web/js/lib/node-title-rewrite.js";
 import { findExistingRailSlot } from "../../web/js/lib/rail-slot.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -139,6 +144,9 @@ function buildExecutors(graph, canvas = {}) {
     "findLandedRailLink",
     "isRailLinkPersisted",
     "landedAfterThrowWarning",
+    "captureNodeTitles",
+    "describeTitleRewrites",
+    "titleRewriteWarning",
     `const GRAPH_TOOL_EXECUTORS = {
 ${connectSrc}
 ${exposeOutSrc}
@@ -170,6 +178,9 @@ return GRAPH_TOOL_EXECUTORS;`,
     findLandedRailLink,
     isRailLinkPersisted,
     landedAfterThrowWarning,
+    captureNodeTitles,
+    describeTitleRewrites,
+    titleRewriteWarning,
   );
 }
 
