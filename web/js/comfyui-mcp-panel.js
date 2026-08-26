@@ -27953,6 +27953,16 @@ const PANEL_CSS = `
   border: 1px solid var(--p-content-border-color, #3f3f46);
   border-radius: var(--p-border-radius-md, 6px);
   display: flex; flex-direction: column; gap: 0.5rem;
+  /* The card lists EVERY provider (16 of them) plus the trailing "then start the
+     agent" command, so it is far taller than the panel - ~2700px against a ~680px
+     body. As a plain flex item its min-height resolves to auto, so it refuses to
+     shrink: .cmcp-log collapses instead and .cmcp-body{overflow:hidden} simply
+     CLIPS the remainder - no scrollbar, no way to reach it. On a remote/https
+     ComfyUI (a RunPod pod) the clipped tail is the one line that matters, because
+     connectCommand() puts the pod's own URL in that start command and it is the
+     LAST child. min-height:0 lets the card shrink to the space it actually has;
+     overflow-y then scrolls its own content instead of losing it. */
+  min-height: 0; overflow-y: auto; overscroll-behavior: contain;
 }
 /* The base rule sets display, which beats the UA [hidden] rule — so re-assert
    it or "onboard.hidden = true" won't actually hide the card. */
