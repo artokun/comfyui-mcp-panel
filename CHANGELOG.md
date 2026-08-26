@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.101] - 2026-08-26
+
+### Fixed
+- atomically fence promoted widget receiver scope (#2314) (#1831)
+- bound the pre-receipt completion replay so it cannot storm the agent (#1850)
+
+
 ## [0.15.100] - 2026-08-26
 
 ### Fixed
