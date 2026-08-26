@@ -20,6 +20,7 @@ import {
   RELOAD_BLOCKED_AFTER_MS,
   unsavedReloadBlockers,
   reloadWouldBeBlockedMessage,
+  reloadBlockerUnreadableMessage,
 } from "../../web/js/lib/reload-blocked.js";
 import { commandFingerprint, createCommandDedupeLedger } from "../../web/js/lib/command-dedupe.js";
 import { createRehelloGate, routeIsStale } from "../../web/js/lib/rehello-gate.js";
@@ -484,3 +485,57 @@ test("#1830 WIRING: the frontend soft_reload awaits the decision and returns its
   assert.match(block, /else \{[\s\S]*setTimeout\(\(\) => onReload\(scope\), 60\)/)
   assert.doesNotMatch(block, /setTimeout\(\(\) => onReload\(scope\), 60\)[\s\S]*if \(scope === "frontend"\)/)
 })
+
+// #1839 — a destructive reload used to fail OPEN when the blocker read threw.
+// blockersNow() caught and returned [], and [] is the CLEAN signal that permits
+// navigation — so an unreadable dirtiness state meant "nothing is dirty" and the
+// tab navigated, discarding exactly the unsaved work the fence exists to protect.
+// The #1830 reporter was saved by this refusal firing correctly, so the throw path
+// is not theoretical.
+for (const stage of ["initial", "post-prime", "pre-navigation"]) {
+  test(`#1839: a blocker read that throws at the ${stage} fence refuses, never navigates`, async () => {
+    let reads = 0;
+    let navigations = 0;
+    let armed = 0;
+    const surfaced = [];
+    // Throw only at the fence under test, so each gate is pinned on its own.
+    const throwAt = { "initial": 1, "post-prime": 2, "pre-navigation": 3 }[stage];
+    const result = await runAgentFrontendReload({
+      getBlockers: () => {
+        reads += 1;
+        if (reads === throwAt) throw new Error("openWorkflows unavailable");
+        return [];
+      },
+      prime: async () => {},
+      clearSidebarReopen: () => {},
+      appendSystem: (m) => surfaced.push(m),
+      armNotice: () => { armed += 1; },
+      navigate: () => { navigations += 1; },
+    });
+    assert.equal(result.ok, false, "an unreadable blocker state must not read as clean");
+    assert.equal(result.stage, stage);
+    assert.equal(navigations, 0, "nothing may navigate while dirtiness is UNKNOWN");
+    assert.equal(armed, 0, "a refused command never arms the cancelled-navigation notice");
+    // It must say what happened, not invent dirty workflows it never saw (#796).
+    assert.equal(result.error, reloadBlockerUnreadableMessage());
+    assert.match(result.error, /could not read/i);
+    assert.doesNotMatch(result.error, /unsaved changes — /);
+    assert.deepEqual(surfaced, [result.error]);
+  });
+}
+
+test("#1839 control: a readable, clean blocker state still navigates", async () => {
+  // Without this, the three cases above are satisfiable by refusing everything —
+  // which would break every legitimate reload instead of fixing the fail-open.
+  let navigations = 0;
+  const result = await runAgentFrontendReload({
+    getBlockers: () => [],
+    prime: async () => {},
+    clearSidebarReopen: () => {},
+    appendSystem: () => {},
+    armNotice: () => {},
+    navigate: () => { navigations += 1; },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(navigations, 1);
+});

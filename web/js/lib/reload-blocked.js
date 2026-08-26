@@ -137,6 +137,22 @@ export function reloadWouldBeBlockedMessage(blockers) {
 }
 
 /**
+ * The refusal for a blocker state that could not be READ.
+ *
+ * Deliberately not reloadWouldBeBlockedMessage(): that one names the dirty
+ * workflows, and naming none while claiming unsaved changes would be a claim
+ * about something nobody observed. This says what actually happened.
+ */
+export function reloadBlockerUnreadableMessage() {
+  return (
+    `Did NOT reload the panel: could not read which workflows have unsaved changes, ` +
+    `so whether reloading would discard work is UNKNOWN. A reload is not reversible, ` +
+    `so this refuses rather than guess. Nothing was changed. Try again, or reload the ` +
+    `tab yourself (Ctrl+Shift+R) once you have checked your open workflows.`
+  );
+}
+
+/**
  * Run an agent-commanded frontend reload through every dirtiness fence.
  *
  * The command reply must not call a clean, pre-prime snapshot "scheduled": the
@@ -161,15 +177,23 @@ export async function runAgentFrontendReload({
   armNotice,
   navigate,
 } = {}) {
+  // #1839 — an empty array is the CLEAN signal that permits navigation, so
+  // returning [] on a throw made an unreadable blocker state mean "nothing is
+  // dirty" and navigated: a destructive, irreversible action failing OPEN on the
+  // exact check that exists to prevent it. The #1830 reporter was saved by this
+  // refusal firing correctly, which is what makes the throw path worth closing.
+  //
+  // Unreadable is reported as its own outcome rather than folded into either
+  // answer: "could not determine" is not "determined not" (#796).
   const blockersNow = () => {
     try {
-      return typeof getBlockers === "function" ? getBlockers() : [];
+      return { readable: true, blockers: typeof getBlockers === "function" ? getBlockers() : [] };
     } catch {
-      return [];
+      return { readable: false, blockers: [] };
     }
   };
-  const refuse = (stage, blockers) => {
-    const error = reloadWouldBeBlockedMessage(blockers);
+  const refuse = (stage, blockers, readable = true) => {
+    const error = readable ? reloadWouldBeBlockedMessage(blockers) : reloadBlockerUnreadableMessage();
     try {
       clearSidebarReopen?.();
     } catch {}
@@ -180,7 +204,8 @@ export async function runAgentFrontendReload({
   };
 
   const initial = blockersNow();
-  if (initial.length) return refuse("initial", initial);
+  if (!initial.readable) return refuse("initial", [], false);
+  if (initial.blockers.length) return refuse("initial", initial.blockers);
 
   try {
     await prime?.();
@@ -188,10 +213,12 @@ export async function runAgentFrontendReload({
     // A failed or timed-out cache prime does not waive the dirtiness fences.
   }
   const postPrime = blockersNow();
-  if (postPrime.length) return refuse("post-prime", postPrime);
+  if (!postPrime.readable) return refuse("post-prime", [], false);
+  if (postPrime.blockers.length) return refuse("post-prime", postPrime.blockers);
 
   const beforeNavigation = blockersNow();
-  if (beforeNavigation.length) return refuse("pre-navigation", beforeNavigation);
+  if (!beforeNavigation.readable) return refuse("pre-navigation", [], false);
+  if (beforeNavigation.blockers.length) return refuse("pre-navigation", beforeNavigation.blockers);
 
   armNotice?.();
   navigate?.();
