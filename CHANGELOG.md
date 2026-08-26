@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.100] - 2026-08-26
+
+### Fixed
+- preserve chat autoscroll through browser scroll anchoring and interactive-card reveals (#1841)
+- cache-bust inline previews when ComfyUI reuses an output filename (#1834)
+- keep completion identity safe across reroutes, reloads, repeated registration, and id-less receipts (#1837, #1839, #1845)
+
 ## [0.15.99] - 2026-08-26
 
 ### Fixed
