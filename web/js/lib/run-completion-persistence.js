@@ -98,8 +98,51 @@ export function normalizeRunCompletionMetadata(
 }
 
 /**
+ * The identity of a restore CONTEXT: the workflow route plus the agent
+ * conversation a set of rows belongs to. Rows are adopted by CONTEXT rather than
+ * one at a time, so "has this mount already taken these rows" is a single
+ * comparison that cannot drift row by row.
+ */
+export function runCompletionContextKey(routeId, sessionId) {
+  const route = text(routeId);
+  const session = sessionId == null ? null : text(sessionId);
+  return JSON.stringify([route, session]);
+}
+
+/**
+ * The rows that no ADOPTED context owns — the set to merge back on every write.
+ *
+ * This replaces a mount-time `partitionRunCompletionMetadata(...).deferred`
+ * snapshot. That snapshot is frozen and the live route is not: the moment a
+ * mount adopts a second route's rows (because the user switched the canvas
+ * without remounting), the snapshot still calls those rows foreign and merges
+ * them into every later write — resurrecting rows the tracker has since retired,
+ * so a later mount replays a completion the agent was already given.
+ *
+ * Re-reading storage here is what keeps "foreign" a live question. A row is
+ * foreign because NOTHING in this mount owns it, never because of where the
+ * route happened to be at the instant the panel mounted.
+ */
+export function selectDeferredRunCompletionMetadata(entries, adoptedContextKeys) {
+  const adopted =
+    adoptedContextKeys instanceof Set ? adoptedContextKeys : new Set(adoptedContextKeys || []);
+  return normalizeRunCompletionMetadata(entries).filter(
+    (entry) => !adopted.has(runCompletionContextKey(entry.routeId, entry.sessionId)),
+  );
+}
+
+/**
  * Split persisted rows at remount. Only the active workflow route is safe to
  * reconcile now; foreign rows remain durable for a later mount of their route.
+ *
+ * #1839 — "a later mount" was the load-bearing assumption, and it is wrong: the
+ * route moves under a LIVE mount every time the user switches workflow tab, with
+ * no remount at all. So this is not a once-per-mount computation. Callers re-run
+ * it against the route that is live at the MOMENT OF RESTORE (see
+ * `rehydrateRunCompletionForLiveRoute` in the panel) and record what they took
+ * with `runCompletionContextKey`. Re-computing is the fix; widening what counts
+ * as current would replay a row onto a canvas the user is not looking at, which
+ * is worse than the bug this partition exists to prevent.
  */
 export function partitionRunCompletionMetadata(entries, activeRouteId, activeSessionId) {
   const routeId = text(activeRouteId);

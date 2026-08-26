@@ -88,7 +88,14 @@ test("#1830 production wiring owner-gates stale mount persistence and restores b
   ).replace(/\r\n/g, "\n");
   assert.match(source, /partitionRunCompletionMetadata\(\s*readRunCompletionMetadata\(\),\s*completionRestoreRoute,\s*completionRestoreSession/);
   assert.match(source, /if \(panelRunOwnerRef\.current !== mountOwner\) return;/);
-  assert.match(source, /mergeRunCompletionMetadata\(entries, deferredRunCompletionMetadata\)/);
+  // #1839 P1(b) — the foreign set merged back on every write is RE-READ from the
+  // ledger and filtered by the contexts this mount has adopted. It used to be the
+  // mount-time `completionRestore.deferred` snapshot, which the route-change
+  // rehydrate leaves stale (see run-completion-route-rehydrate.test.mjs).
+  assert.match(
+    source,
+    /mergeRunCompletionMetadata\(\s*entries,[\s\S]{0,400}?selectDeferredRunCompletionMetadata\(\s*readRunCompletionMetadata\(\),\s*adoptedRunCompletionContexts,\s*\),\s*\),\s*\);/,
+  );
   assert.match(source, /restoreRunCompletionMetadata\(runCompletion, completionRestore\.current\)/);
   assert.match(source, /if \(!runCompletionKeyMatchesContext\(frame\.completion_key, liveRoute, liveSession\)\) return false;/);
   assert.match(source, /sendFrame: sendRunCompletionFrame/);
