@@ -19235,7 +19235,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // happen") into `incomplete_reason`.
       const unresolved = (runScopeResult.indeterminate ?? 0) + (runScopeResult.inFlight ?? 0);
       if (runScopeResult.verified > 0 && unresolved === 0) {
-        return {
+        const result = {
           queued: true,
           complete: false,
           partially_queued: true,
@@ -19254,6 +19254,26 @@ const GRAPH_TOOL_EXECUTORS = {
             `Re-run only the remaining ${Math.max(0, batch - runScopeResult.verified)} — ` +
             `re-running the full batch would queue the already-running prompt(s) again.`,
         };
+        // #1998 — when the scoped batch was DRIVEN, report what the controls actually did
+        // and do NOT also ship #988's "this batch WILL reuse the same values": that sentence
+        // is what the drive stops being true, and two contradictory statements in one result
+        // is worse than either alone. The #988 note stays in charge whenever the drive did
+        // not run (arming threw, or a frontend with no hooks to wrap).
+        const driveNote = scopedBatchDriveNote(controlDriveObservations, batch);
+        if (driveNote) {
+          result.batch_controls = controlDriveObservations;
+          result.batch_controls_note = driveNote;
+        }
+        // #988 — attach the PRE-dispatch finding, now covering exactly the controls the drive
+        // did NOT arm (gate P1-2). The subtraction happens at the arming site, before dispatch,
+        // so this keeps #988's "computed BEFORE dispatch" property; what changed is that an
+        // unarmed control keeps its warning instead of being silenced by an unrelated one.
+        const repeatingNote = scopedBatchSeedNote(repeatingControls, batch);
+        if (repeatingNote) {
+          result.repeating_controls = repeatingControls;
+          result.repeating_controls_note = repeatingNote;
+        }
+        return result;
       }
       // Nothing verified. But "nothing verified" is still not always "nothing
       // queued": an indeterminate dispatch left the panel and may have been
@@ -19324,7 +19344,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // rendering, and are already registered for reconnect reconciliation above.
         // Reporting this as a failure would send the caller to re-run work that is
         // running; between the two misreadings that is the destructive one.
-        return {
+        const result = {
           queued: true,
           complete: false,
           partially_queued: true,
@@ -19337,6 +19357,26 @@ const GRAPH_TOOL_EXECUTORS = {
             `re-running anything: re-running the whole batch would queue the already-running ` +
             `prompt(s) again.`,
         };
+        // #1998 — when the scoped batch was DRIVEN, report what the controls actually did
+        // and do NOT also ship #988's "this batch WILL reuse the same values": that sentence
+        // is what the drive stops being true, and two contradictory statements in one result
+        // is worse than either alone. The #988 note stays in charge whenever the drive did
+        // not run (arming threw, or a frontend with no hooks to wrap).
+        const driveNote = scopedBatchDriveNote(controlDriveObservations, batch);
+        if (driveNote) {
+          result.batch_controls = controlDriveObservations;
+          result.batch_controls_note = driveNote;
+        }
+        // #988 — attach the PRE-dispatch finding, now covering exactly the controls the drive
+        // did NOT arm (gate P1-2). The subtraction happens at the arming site, before dispatch,
+        // so this keeps #988's "computed BEFORE dispatch" property; what changed is that an
+        // unarmed control keeps its warning instead of being silenced by an unrelated one.
+        const repeatingNote = scopedBatchSeedNote(repeatingControls, batch);
+        if (repeatingNote) {
+          result.repeating_controls = repeatingControls;
+          result.repeating_controls_note = repeatingNote;
+        }
+        return result;
       }
       // NOTHING CONFIRMED. `queued` is OMITTED rather than set false, and that holds even
       // when NOTHING has left the panel yet — which is the one thing this branch got wrong
