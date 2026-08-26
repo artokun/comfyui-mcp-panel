@@ -76,7 +76,7 @@ test("#1882 a coherent release passes", () => {
     range: [
       { sha: "aaaaaaaa1", subject: "chore: release v0.15.104", version: "0.15.104", parentVersion: "0.15.103" },
     ],
-    tagTargetFor: tagsAt({ "0.15.103": "zzzzzzzz9" }),
+    tagTargetFor: tagsAt({ "0.15.104": "aaaaaaaa1", "0.15.103": "zzzzzzzz9" }),
   });
   assert.deepEqual(violations, []);
 });
@@ -137,7 +137,7 @@ test("#1882 the v0.15.98 shape is caught: 0.15.97 shipped in the range with no t
         parentVersion: "0.15.85",
       },
     ],
-    tagTargetFor: tagsAt({ "0.15.96": "9999999999" }),
+    tagTargetFor: tagsAt({ "0.15.98": "1111111111", "0.15.96": "9999999999" }),
   });
   assert.equal(violations.length, 1, violations.join("\n"));
   assert.match(violations[0], /^0\.15\.97 was cut by 7b477d55 /);
@@ -163,7 +163,7 @@ test("#1882 a tag is credited only when it resolves to the commit that cut the v
     tag: "v0.15.98",
     treeAtTag: treeAt("0.15.98"),
     range,
-    tagTargetFor: tagsAt({ "0.15.97": "deadbeef00" }),
+    tagTargetFor: tagsAt({ "0.15.98": "1111111111", "0.15.97": "deadbeef00" }),
   });
   assert.equal(wrongTarget.length, 1, wrongTarget.join("\n"));
   assert.match(wrongTarget[0], /v0\.15\.97 exists but resolves to deadbeef, not the commit that cut 0\.15\.97/);
@@ -172,21 +172,21 @@ test("#1882 a tag is credited only when it resolves to the commit that cut the v
     tag: "v0.15.98",
     treeAtTag: treeAt("0.15.98"),
     range,
-    tagTargetFor: tagsAt({ "0.15.97": "7b477d5500" }),
+    tagTargetFor: tagsAt({ "0.15.98": "1111111111", "0.15.97": "7b477d5500" }),
   });
   assert.deepEqual(rightTarget, []);
 });
 
-test("#1882 the tag's own release commit is never reported as an untagged gap", () => {
-  // At push time this tag legitimately has no *earlier* tag for its own version,
-  // and flagging it would make every single release red.
+test("#1882 the tag's own release commit is not reported as a gap when the tag sits on it", () => {
+  // The ordinary release: the tag labels the commit that cut its version. Flagging
+  // this would make every single release red.
   const violations = auditTag({
     tag: "v0.15.105",
     treeAtTag: treeAt("0.15.105"),
     range: [
       { sha: "abcabcabc", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
     ],
-    tagTargetFor: noTags,
+    tagTargetFor: tagsAt({ "0.15.105": "abcabcabc" }),
   });
   assert.deepEqual(violations, []);
 });
@@ -199,7 +199,7 @@ test("#1882 a pyproject.toml edit that leaves the version alone is not a release
       { sha: "ddddddddd", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
       { sha: "eeeeeeeee", subject: "chore: widen a dependency pin", version: "0.15.104", parentVersion: "0.15.104" },
     ],
-    tagTargetFor: noTags,
+    tagTargetFor: tagsAt({ "0.15.105": "ddddddddd" }),
   });
   assert.deepEqual(violations, []);
 });
@@ -223,6 +223,74 @@ test("#1882 unavailable history is a violation, not an empty range that passes",
   assert.equal(violations.length, 1, violations.join("\n"));
   assert.match(violations[0], /untagged-release scan could not run/);
   assert.match(violations[0], /shallow clone/);
+});
+
+test("#1882 a commit whose version could not be read is reported, never skipped", () => {
+  // Fail-open at a finer grain than an empty range: `git show <sha>:pyproject.toml`
+  // failing used to read back null, and null was treated as "not a release", so one
+  // unreadable blob could hide the very gap the scan exists to find.
+  const violations = auditTag({
+    tag: "v0.15.98",
+    treeAtTag: treeAt("0.15.98"),
+    range: [
+      { sha: "1111111111", subject: "chore: release v0.15.98", version: "0.15.98", parentVersion: "0.15.97" },
+      {
+        sha: "7b477d5500",
+        subject: "chore: release v0.15.97",
+        version: null,
+        parentVersion: null,
+        versionError: "pyproject.toml exists at 7b477d55 but could not be read: EIO",
+      },
+    ],
+    tagTargetFor: tagsAt({ "0.15.98": "1111111111" }),
+  });
+  assert.equal(violations.length, 1, violations.join("\n"));
+  assert.match(violations[0], /could not be read/);
+  assert.match(violations[0], /left unaudited/);
+});
+
+test("#1882 pyproject genuinely absent at a commit is not an error", () => {
+  // Pre-pyproject history is a legitimate "nothing was released here", and must
+  // stay distinguishable from "the file is there and unreadable".
+  const violations = auditTag({
+    tag: "v0.15.105",
+    treeAtTag: treeAt("0.15.105"),
+    range: [
+      { sha: "aaaaaaaa1", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
+      { sha: "bbbbbbbb2", subject: "docs: readme", version: null, parentVersion: null, versionError: null },
+    ],
+    tagTargetFor: tagsAt({ "0.15.105": "aaaaaaaa1" }),
+  });
+  assert.deepEqual(violations, []);
+});
+
+test("#1882 the tag being pushed is not exempt from the target check", () => {
+  // Rule 1 only proves the TREE at the tag says 0.15.106. A tag force-moved off
+  // the commit that cut 0.15.106 onto a later commit carrying the same version
+  // labels a different build than the one that published — and `v === expected`
+  // used to skip the check entirely.
+  const range = [
+    { sha: "1atercommit", subject: "fix: a later commit, same version", version: "0.15.106", parentVersion: "0.15.106" },
+    { sha: "cut0106cut", subject: "chore: release v0.15.106", version: "0.15.106", parentVersion: "0.15.105" },
+  ];
+  const moved = auditTag({
+    tag: "v0.15.106",
+    treeAtTag: treeAt("0.15.106"),
+    range,
+    tagTargetFor: tagsAt({ "0.15.106": "1atercommit" }),
+  });
+  assert.equal(moved.length, 1, moved.join("\n"));
+  assert.match(moved[0], /v0\.15\.106 resolves to 1atercom/);
+  assert.match(moved[0], /was cut by cut0106c/);
+  assert.match(moved[0], /different build than the one the Registry publishes/);
+
+  const inPlace = auditTag({
+    tag: "v0.15.106",
+    treeAtTag: treeAt("0.15.106"),
+    range,
+    tagTargetFor: tagsAt({ "0.15.106": "cut0106cut" }),
+  });
+  assert.deepEqual(inPlace, []);
 });
 
 test("#1882 a history failure still reports the tree-vs-tag mismatch it could check", () => {

@@ -40,14 +40,19 @@
  *      mirrors ci.yml's three-way gate but anchors it to the TAG, which ci.yml
  *      cannot see.
  *
- *   2. NO PUBLISHED VERSION WAS SKIPPED. Walk first-parent from the previous
- *      reachable tag to this one. Every commit in that range whose pyproject
- *      version differs from its parent's is a commit that shipped a version, so
- *      it must carry a tag OF ITS OWN — the tag for `<v>` must resolve to THAT
- *      COMMIT, not merely exist. A tag is a movable label; crediting one by name
- *      alone would let `v0.15.97` sit on an unrelated commit while the commit
- *      that actually published 0.15.97 stayed untagged, which is the very
- *      confusion this guard exists to end.
+ *   2. EVERY VERSION CUT IN THE RANGE IS LABELLED BY ITS OWN TAG. Walk
+ *      first-parent from the previous reachable tag to this one. Every commit in
+ *      that range whose pyproject version differs from its parent's cut a
+ *      version, so the tag for `<v>` must resolve to THAT COMMIT, not merely
+ *      exist. A tag is a movable label; crediting one by name alone would let
+ *      `v0.15.97` sit on an unrelated commit while the commit that actually
+ *      published 0.15.97 stayed untagged, which is the very confusion this guard
+ *      exists to end.
+ *
+ *      The tag being pushed is NOT exempt from that. Rule 1 only proves the tree
+ *      AT the tag declares `<X>`; it cannot see a tag moved off the commit that
+ *      cut `<X>` onto a later commit carrying the same version — a tag labelling
+ *      a different build than the one that publishes.
  *
  *      This direction has no race. It only ever looks at versions that shipped
  *      STRICTLY BEFORE the tag being pushed, so a tag pushed minutes after its
@@ -60,12 +65,15 @@
  *      so this never re-litigates the whole history and cannot become
  *      permanently red over a historical gap nobody intends to backfill.
  *
- * IT FAILS CLOSED. Every git lookup this needs can fail — a shallow clone, tags
- * that were never fetched, an unreadable object. The first draft turned each of
- * those into an empty range, which made the gap scan silently vacuous while the
- * job still reported success. That is the identical shape as the stale
- * pack-contents entry this issue also fixes, and it is worse in a guard than
- * anywhere else: unavailable history is reported as a violation, never as a pass.
+ * IT FAILS CLOSED, AT EVERY GRAIN. Every git lookup this needs can fail — a
+ * shallow clone, tags that were never fetched, an unreadable blob on one commit.
+ * The first draft turned each of those into "nothing to see": a missing range, or
+ * a commit whose version read back `null` and was skipped as "not a release".
+ * Both made the scan silently vacuous while the job still reported success, which
+ * is the identical shape as the stale pack-contents entry this change also
+ * removes. Unreadable history is a violation here, never a pass. A path that is
+ * genuinely ABSENT from a commit is a different thing from one that cannot be
+ * read, and only the latter is an error.
  *
  * WHAT A TAG PUSH DOES AND DOES NOT RUN. `publish_action.yml` filters `on.push`
  * by `branches: [main]`, and GitHub does not run a `branches`-filtered push
@@ -164,13 +172,37 @@ export function auditTag({ tag, treeAtTag, range = [], tagTargetFor, historyErro
     return violations;
   }
 
-  // ---- Rule 2: nothing shipped between the previous tag and this one untagged.
+  // ---- Rule 2: every version cut in the range is labelled by its own tag.
   for (const c of range) {
+    // A commit whose version could not be READ is not a commit without a release.
+    // Skipping it on a null would let one unreadable blob hide exactly the gap
+    // this scan exists to find — fail-open at a finer grain than an empty range.
+    if (c?.versionError) {
+      violations.push(
+        `${tag}: ${c.versionError}. Refusing to report this release as coherent with ` +
+          `a commit in the range left unaudited (#1882).`,
+      );
+      continue;
+    }
+
     const v = c?.version;
     if (!v || v === c.parentVersion) continue; // pyproject touched, version unchanged
-    if (v === expected) continue; // this tag's own release commit
     const target = typeof tagTargetFor === "function" ? tagTargetFor(v) : null;
     if (target && target === c.sha) continue;
+
+    // The tag being pushed is NOT exempt from the target check. Rule 1 only proves
+    // the tree AT the tag declares <X>; it cannot see a tag moved off the commit
+    // that cut <X> onto a later commit carrying the same version — a tag labelling
+    // a different build than the one that publishes.
+    if (v === expected) {
+      violations.push(
+        `${tag} resolves to ${target ? short(target) : "(no such tag)"}, but ${expected} ` +
+          `was cut by ${short(c.sha)} ("${c.subject}"). The tag does not label the commit ` +
+          `that changed pyproject.toml to ${expected}, so it points at a different build ` +
+          `than the one the Registry publishes (#1882).`,
+      );
+      continue;
+    }
 
     // A version bump reaching main is what triggers publish_action.yml. It is
     // ALMOST always a version that shipped, but not certainly: the workflow runs
@@ -211,6 +243,43 @@ const showOrNull = (rev, path) => {
     return null;
   }
 };
+
+/**
+ * pyproject's version at one revision, distinguishing the three outcomes a bare
+ * try/catch collapses into one:
+ *
+ *   { version: "0.15.97", error: null }  read it
+ *   { version: null, error: null }       pyproject.toml is genuinely ABSENT at this
+ *                                        commit (pre-pyproject history) — nothing
+ *                                        was released here
+ *   { version: null, error: "..." }      the file is there and could not be read, or
+ *                                        carries no [project].version — UNKNOWN, and
+ *                                        unknown must never read as "no release"
+ */
+function versionAtRev(rev) {
+  let present;
+  try {
+    present = git("ls-tree", "--name-only", rev, "--", "pyproject.toml").trim() !== "";
+  } catch (e) {
+    return { version: null, error: `could not list pyproject.toml at ${short(rev)}: ${e.message}` };
+  }
+  if (!present) return { version: null, error: null };
+
+  let text;
+  try {
+    text = git("show", `${rev}:pyproject.toml`);
+  } catch (e) {
+    return {
+      version: null,
+      error: `pyproject.toml exists at ${short(rev)} but could not be read: ${e.message}`,
+    };
+  }
+  const version = pyprojectVersion(text);
+  if (version === null) {
+    return { version: null, error: `pyproject.toml at ${short(rev)} has no [project].version` };
+  }
+  return { version, error: null };
+}
 
 export function collectFromGit(tag) {
   const treeAtTag = {
@@ -280,11 +349,24 @@ export function collectFromGit(tag) {
         .filter((l) => l && !l.startsWith("commit "))
         .map((line) => {
           const [sha, subject] = line.split("\0");
+          const own = versionAtRev(sha);
+
+          // A root commit has no first parent; that is not an error, it just means
+          // whatever it declares is a first appearance.
+          let hasParent = true;
+          try {
+            git("rev-parse", "--verify", "--quiet", `${sha}^`);
+          } catch {
+            hasParent = false;
+          }
+          const parent = hasParent ? versionAtRev(`${sha}^`) : { version: null, error: null };
+
           return {
             sha,
             subject: subject ?? "",
-            version: pyprojectVersion(showOrNull(sha, "pyproject.toml")),
-            parentVersion: pyprojectVersion(showOrNull(`${sha}^`, "pyproject.toml")),
+            version: own.version,
+            parentVersion: parent.version,
+            versionError: own.error ?? parent.error ?? null,
           };
         });
     } catch (e) {
