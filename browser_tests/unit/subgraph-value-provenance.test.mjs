@@ -78,6 +78,28 @@ test("no promotion-to-inner-widget PAIRING is asserted", () => {
 });
 
 // ── WIRING ────────────────────────────────────────────────────────────────
+test("WIRING: production graph_get_subgraph gives MCP a definitive non-promoted error", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const start = src.indexOf("graph_get_subgraph({ node_id }) {");
+  const end = src.indexOf("async graph_add_node(", start);
+  assert.ok(start >= 0 && end > start, "graph_get_subgraph handler must remain extractable");
+  const method = src.slice(start, end).replace(/,\s*$/, "");
+  const getSubgraph = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    `return ({${method}}).graph_get_subgraph;`,
+  )(
+    () => ({ graph: {} }),
+    (_graph, id) => ({ id, type: "OrdinaryNode" }),
+  );
+
+  assert.throws(
+    () => getSubgraph({ node_id: 78 }),
+    /Node 78 \(OrdinaryNode\) is not a subgraph/,
+  );
+});
+
 test("WIRING: production graph_get_subgraph redacts instance provenance", async () => {
   // Execute the module-private handler's source fragment. A source-only assertion
   // would miss a sanitizer applied to the wrong object, while a helper-only test
