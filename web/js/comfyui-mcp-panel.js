@@ -30424,6 +30424,24 @@ function buildPanel() {
       "The agent runs on YOUR machine on your own AI subscription (Claude, ChatGPT, Gemini, …) or a local model (Ollama, LM Studio, llama.cpp) — no API keys. Set up a provider (Node ≥ 22), start the agent with the command below, then click Connect.",
     );
     onboard.append(title, sub);
+    // The start command goes FIRST, above the provider list. It is the only line on this
+    // card specific to THIS ComfyUI: connectCommand() puts the page's own origin into it,
+    // which on a remote/https host (a RunPod pod) is the pod URL the user cannot guess. The
+    // sixteen provider blocks are ~2700px of card, so as the LAST child this was the part
+    // nobody ever reached. The closing "click Connect" line still goes at the end of the
+    // card, because that is the last thing the user actually does.
+    const runCol = document.createElement("div");
+    runCol.className = "cmcp-onboard-col";
+    const runProv = document.createElement("div");
+    runProv.className = "cmcp-onboard-prov";
+    runProv.textContent = tr("panel.then_start_the_agent_on_this_machine", "Start the agent (on this machine)");
+    runCol.appendChild(runProv);
+    // No URL needed: the panel sends the ComfyUI host (window.location) in its
+    // hello, so a bare `connect` auto-targets whatever ComfyUI is open. Offer the
+    // command per shell (PowerShell / Command Prompt / macOS·Linux) — the PS pill
+    // ships the `cmd /c` wrapper, so no separate execution-policy caveat is needed.
+    runCol.append(makeShellCommandBlock(connectCommand()));
+    onboard.appendChild(runCol);
     for (const id of ["claude", "codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
@@ -30449,25 +30467,10 @@ function buildPanel() {
       col.append(s2, onboardCmd(meta.login));
       onboard.appendChild(col);
     }
-    // External orchestrator: the agent runs on THIS machine — after signing in,
-    // the user starts it themselves (the panel can't spawn it) and clicks Connect.
-    // Surface the exact command with the ComfyUI URL pre-filled + a Windows caveat.
-    const runCol = document.createElement("div");
-    runCol.className = "cmcp-onboard-col";
-    const runProv = document.createElement("div");
-    runProv.className = "cmcp-onboard-prov";
-    runProv.textContent = tr("panel.then_start_the_agent_on_this_machine", "Then start the agent (on this machine)");
-    runCol.appendChild(runProv);
-    // No URL needed: the panel sends the ComfyUI host (window.location) in its
-    // hello, so a bare `connect` auto-targets whatever ComfyUI is open. Offer the
-    // command per shell (PowerShell / Command Prompt / macOS·Linux) — the PS pill
-    // ships the `cmd /c` wrapper, so no separate execution-policy caveat is needed.
-    runCol.append(makeShellCommandBlock(connectCommand()));
     const clickNote = document.createElement("div");
     clickNote.className = "cmcp-onboard-step";
     clickNote.textContent = tr("panel.then_click_connect_above", "…then click Connect above.");
-    runCol.appendChild(clickNote);
-    onboard.appendChild(runCol);
+    onboard.appendChild(clickNote);
   }
 
   // Apply per-provider readiness from GET /backends: toggle the onboarding card,
