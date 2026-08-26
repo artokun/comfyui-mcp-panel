@@ -14569,7 +14569,11 @@ const GRAPH_TOOL_EXECUTORS = {
           }
         : {}),
       nodes: inner.slice(0, MAX_STATE_NODES).map(summarizeNode),
-      ...(promotedTerminals.length ? { promoted_terminals: promotedTerminals } : {}),
+      // The hello capability promises a complete alias witness. Publish an
+      // explicit empty array too, so the consumer can distinguish a subgraph
+      // with no promoted aliases from a current/legacy capability-skewed
+      // response that omitted the witness entirely.
+      promoted_terminals: promotedTerminals,
     };
   },
 

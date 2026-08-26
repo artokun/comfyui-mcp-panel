@@ -160,6 +160,42 @@ test("WIRING: production graph_get_subgraph publishes the terminal nested-promot
   assert.equal(out.nodes[0].id, 188);
 });
 
+test("WIRING: production graph_get_subgraph publishes an explicit empty witness array", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const start = src.indexOf("graph_get_subgraph({ node_id }) {");
+  const end = src.indexOf("async graph_add_node(", start);
+  assert.ok(start >= 0 && end > start, "graph_get_subgraph handler must remain extractable");
+  const method = src.slice(start, end).replace(/,\s*$/, "");
+  const parent = { id: 78, title: "Ordinary container", inputs: [], subgraph: { _nodes: [] } };
+  const getSubgraph = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "describeActiveGraph",
+    "subgraphValueProvenance",
+    "redactWidgetValue",
+    "graphViewIdentityFor",
+    "MAX_STATE_NODES",
+    "fixedCapNote",
+    "summarizeNode",
+    "promotedTerminalWitnesses",
+    `return ({${method}}).graph_get_subgraph;`,
+  )(
+    () => ({ graph: {} }),
+    () => parent,
+    () => ({ scope: "root", graph_identity: "root" }),
+    () => ({}),
+    () => ({}),
+    () => "graph:ordinary",
+    50,
+    () => "truncation note",
+    (node) => ({ id: node.id, type: node.type }),
+    () => [],
+  );
+
+  assert.deepEqual(getSubgraph({ node_id: 78 }).promoted_terminals, []);
+});
+
 test("WIRING: production alias witness keeps outer, immediate, and terminal names distinct", async () => {
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
@@ -256,6 +292,20 @@ test("WIRING: production alias witness keeps outer, immediate, and terminal name
       terminal_inputs: testCase.inputs,
       chain_depth: 1,
     });
+    for (const alias of [testCase.outer, "outer display", "parent_alias"]) {
+      const aliasWitness = entries.find((entry) => entry.widget === alias);
+      assert.equal(aliasWitness?.immediate_node_id, 188, `missing witness for ${alias}`);
+      assert.equal(aliasWitness?.immediate_widget, testCase.immediate, `wrong target for ${alias}`);
+    }
+
+    const missingSlotEntries = makeWitnesses({
+      ...parent,
+      inputs: [{ name: testCase.outer, label: "outer display" }],
+    });
+    assert.match(
+      missingSlotEntries.find((entry) => entry.widget === testCase.outer)?.error ?? "",
+      /_subgraphSlot missing|unresolved/i,
+    );
   }
 });
 
