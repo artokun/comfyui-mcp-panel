@@ -335,3 +335,134 @@ test("#1271 refuse at the root — promotion is an inner-widget operation", () =
   const { fn } = makeHarness({ atRoot: true });
   assert.throws(() => fn({ node_id: 3, widget: "steps" }), /Enter the subgraph first/);
 });
+
+test("#2321 nested subgraph: promote from innermost graph (root → 142 → 133 → inner node)", () => {
+  // Build the reported shape: root → outer(142) → inner(133) → node to promote
+  // The parent lookup must walk the FULL hierarchy, not just rootGraph._nodes.
+
+  // Inner subgraph inputs (for node 133)
+  const innerSubgraphInputs = [];
+  const addInnerInput = (name, type) => {
+    const input = {
+      name,
+      type,
+      label: undefined,
+      connect(_slot, _node) {
+        return { id: 1 };  // linkConnects = true
+      },
+    };
+    innerSubgraphInputs.push(input);
+    return input;
+  };
+
+  // Innermost graph (node 133's subgraph)
+  const innermostSubgraph = {
+    id: "subgraph-133-uuid",
+    inputs: [],
+    addInput() {},
+    removeInput() {},
+    beforeChange() {},
+    afterChange() {},
+  };
+
+  // Inner node (the node we're promoting a widget from) - lives in innermostSubgraph
+  const innerNode = {
+    id: 50,
+    type: "KSampler",
+    widgets: [{ name: "steps", type: "number" }],
+    getSlotFromWidget: (w) => w ? { name: w.name, type: "*", label: w.label, widget: { name: w.name } } : null,
+  };
+
+  // Middle graph (node 142's subgraph) - contains node 133
+  const middleSubgraphInputs = [];
+  const middleSubgraph = {
+    id: "subgraph-142-uuid",
+    _nodes: [],
+    inputs: middleSubgraphInputs,
+    addInput(name, type) {
+      const input = {
+        name,
+        type,
+        label: undefined,
+        connect(_slot, _node) {
+          return { id: 1 };
+        },
+      };
+      this.inputs.push(input);
+      return input;
+    },
+    removeInput(input) {
+      this.inputs = this.inputs.filter((x) => x !== input);
+    },
+    beforeChange() {},
+    afterChange() {},
+  };
+
+  // Node 133 (inner SubgraphNode) - lives in middleSubgraph, owns innermostSubgraph
+  const node133 = {
+    id: 133,
+    subgraph: innermostSubgraph,  // This node owns the innermost graph
+    inputs: innerSubgraphInputs,
+    rootGraph: { id: "root-uuid" },
+    computeSize() {},
+    setDirtyCanvas() {},
+    invalidatePromotedViews() {},
+  };
+  middleSubgraph._nodes.push(node133);
+
+  // Root graph - contains node 142
+  const rootGraph = {
+    id: "root-uuid",
+    _nodes: [],
+    inputs: [],
+  };
+
+  // Node 142 (outer SubgraphNode) - lives in rootGraph, owns middleSubgraph
+  const node142 = {
+    id: 142,
+    subgraph: middleSubgraph,  // This node owns the middle graph
+    inputs: middleSubgraphInputs,
+    rootGraph,
+    computeSize() {},
+    setDirtyCanvas() {},
+    invalidatePromotedViews() {},
+  };
+  rootGraph._nodes.push(node142);
+
+  // Wire node 133's subgraph to the middle graph
+  innermostSubgraph.addInput = (name, type) => {
+    const input = {
+      name,
+      type,
+      label: undefined,
+      connect(_slot, _node) {
+        return { id: 1 };
+      },
+    };
+    innerSubgraphInputs.push(input);
+    return input;
+  };
+  innermostSubgraph.removeInput = (input) => {
+    const idx = innerSubgraphInputs.indexOf(input);
+    if (idx >= 0) innerSubgraphInputs.splice(idx, 1);
+  };
+
+  // Create the promotion function
+  const fn = realPromoteWidget(
+    mockDocument({ previewExposure: makePreviewStore() }),
+    () => ({ graph: innermostSubgraph, canvas: { setDirty() {} }, rootGraph }),
+    (_g, id) => {
+      if (Number(id) === innerNode.id) return innerNode;
+      throw new Error(`No node with id ${id} in the current graph`);
+    },
+  );
+
+  // The promotion should work: find node 133 as the parent
+  const result = fn({ node_id: innerNode.id, widget: "steps" });
+
+  // The fix walks ALL graphs; without it, it only searches rootGraph._nodes
+  // and finds nothing because node 133 is not there (it's inside middleSubgraph).
+  assert.equal(result.promoted, "steps", "promotion should succeed");
+  assert.equal(result.from_node, innerNode.id, "source node should be inner");
+  assert.deepEqual(result.on_subgraph_nodes, [133], "must find node 133 as the parent");
+});
