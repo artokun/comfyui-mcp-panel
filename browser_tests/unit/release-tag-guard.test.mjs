@@ -40,8 +40,9 @@ const treeAt = (v) => ({
   panelJs: `const PANEL_VERSION = "${v}";\n`,
 });
 
-const noTags = () => false;
-const tagsFor = (...vs) => (v) => vs.includes(v);
+const noTags = () => null;
+/** version -> the commit its tag resolves to. */
+const tagsAt = (map) => (v) => map[v] ?? null;
 
 // ---------------------------------------------------------------------------
 // parsers
@@ -51,7 +52,7 @@ test("#1882 pyprojectVersion reads [project].version and ignores other tables", 
   const toml =
     '[build-system]\nversion = "9.9.9"\n\n[project]\nname = "x"\nversion = "0.15.97"\n\n[tool.comfy]\nversion = "1.2.3"\n';
   assert.equal(pyprojectVersion(toml), "0.15.97");
-  assert.equal(pyprojectVersion("[tool.comfy]\nversion = \"1.2.3\"\n"), null);
+  assert.equal(pyprojectVersion('[tool.comfy]\nversion = "1.2.3"\n'), null);
   assert.equal(pyprojectVersion(null), null);
 });
 
@@ -72,8 +73,10 @@ test("#1882 a coherent release passes", () => {
   const violations = auditTag({
     tag: "v0.15.104",
     treeAtTag: treeAt("0.15.104"),
-    range: [{ sha: "aaaaaaaa1", subject: "chore: release v0.15.104", version: "0.15.104", parentVersion: "0.15.103" }],
-    hasTagFor: tagsFor("0.15.103"),
+    range: [
+      { sha: "aaaaaaaa1", subject: "chore: release v0.15.104", version: "0.15.104", parentVersion: "0.15.103" },
+    ],
+    tagTargetFor: tagsAt({ "0.15.103": "zzzzzzzz9" }),
   });
   assert.deepEqual(violations, []);
 });
@@ -84,12 +87,9 @@ test("#1882 the v0.15.90 shape is caught: tag says .90, tree still declares 0.15
   // asymmetry is why all three witnesses are compared and not just two.
   const violations = auditTag({
     tag: "v0.15.90",
-    treeAtTag: {
-      ...treeAt("0.15.85"),
-      packageJson: JSON.stringify({ version: "0.15.90" }),
-    },
+    treeAtTag: { ...treeAt("0.15.85"), packageJson: JSON.stringify({ version: "0.15.90" }) },
     range: [],
-    hasTagFor: noTags,
+    tagTargetFor: noTags,
   });
   assert.equal(violations.length, 2, violations.join("\n"));
   assert.ok(violations.some((v) => v.includes("pyproject.toml declares 0.15.85")));
@@ -102,7 +102,7 @@ test("#1882 an unreadable version witness is a violation, not a silent pass", ()
     tag: "v0.15.104",
     treeAtTag: { ...treeAt("0.15.104"), panelJs: "// PANEL_VERSION constant removed\n" },
     range: [],
-    hasTagFor: noTags,
+    tagTargetFor: noTags,
   });
   assert.equal(violations.length, 1);
   assert.match(violations[0], /could not read a version from PANEL_VERSION/);
@@ -113,7 +113,7 @@ test("#1882 a non-release tag is reported rather than silently audited as cohere
     tag: "nightly",
     treeAtTag: treeAt("0.15.104"),
     range: [],
-    hasTagFor: noTags,
+    tagTargetFor: noTags,
   });
   assert.equal(violations.length, 1);
   assert.match(violations[0], /not a v<major>\.<minor>\.<patch> release tag/);
@@ -130,17 +130,51 @@ test("#1882 the v0.15.98 shape is caught: 0.15.97 shipped in the range with no t
     range: [
       { sha: "1111111111", subject: "chore: release v0.15.98", version: "0.15.98", parentVersion: "0.15.97" },
       { sha: "2222222222", subject: "fix: something", version: "0.15.97", parentVersion: "0.15.97" },
-      { sha: "7b477d5500", subject: "Merge pull request #1826 from artokun/release/0.15.97", version: "0.15.97", parentVersion: "0.15.85" },
+      {
+        sha: "7b477d5500",
+        subject: "Merge pull request #1826 from artokun/release/0.15.97",
+        version: "0.15.97",
+        parentVersion: "0.15.85",
+      },
     ],
-    hasTagFor: tagsFor("0.15.96"),
+    tagTargetFor: tagsAt({ "0.15.96": "9999999999" }),
   });
   assert.equal(violations.length, 1, violations.join("\n"));
-  assert.match(violations[0], /^0\.15\.97 was published by 7b477d55 /);
+  assert.match(violations[0], /^0\.15\.97 was cut by 7b477d55 /);
   assert.match(violations[0], /no v0\.15\.97 tag exists/);
   // The remedy has to be in the message: the reason this sat unfixed is that
   // pushing the tag was believed to re-publish to the Registry.
   assert.match(violations[0], /git tag -a v0\.15\.97 7b477d55/);
-  assert.match(violations[0], /does not re-trigger the publish workflow/);
+  assert.match(violations[0], /cannot re-trigger the publish workflow/);
+  // ...and the message must NOT prescribe tagging unconditionally, because a
+  // version that was cut but never shipped would then get a tag asserting it was.
+  assert.match(violations[0], /If it did not ship, do not tag it/);
+});
+
+test("#1882 a tag is credited only when it resolves to the commit that cut the version", () => {
+  // A tag is a movable label. Crediting v0.15.97 by NAME would let it sit on an
+  // unrelated commit while the commit that actually published 0.15.97 stayed
+  // untagged — the same confusion the guard exists to end.
+  const range = [
+    { sha: "1111111111", subject: "chore: release v0.15.98", version: "0.15.98", parentVersion: "0.15.97" },
+    { sha: "7b477d5500", subject: "chore: release v0.15.97", version: "0.15.97", parentVersion: "0.15.85" },
+  ];
+  const wrongTarget = auditTag({
+    tag: "v0.15.98",
+    treeAtTag: treeAt("0.15.98"),
+    range,
+    tagTargetFor: tagsAt({ "0.15.97": "deadbeef00" }),
+  });
+  assert.equal(wrongTarget.length, 1, wrongTarget.join("\n"));
+  assert.match(wrongTarget[0], /v0\.15\.97 exists but resolves to deadbeef, not the commit that cut 0\.15\.97/);
+
+  const rightTarget = auditTag({
+    tag: "v0.15.98",
+    treeAtTag: treeAt("0.15.98"),
+    range,
+    tagTargetFor: tagsAt({ "0.15.97": "7b477d5500" }),
+  });
+  assert.deepEqual(rightTarget, []);
 });
 
 test("#1882 the tag's own release commit is never reported as an untagged gap", () => {
@@ -149,8 +183,10 @@ test("#1882 the tag's own release commit is never reported as an untagged gap", 
   const violations = auditTag({
     tag: "v0.15.105",
     treeAtTag: treeAt("0.15.105"),
-    range: [{ sha: "abcabcabc", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" }],
-    hasTagFor: noTags,
+    range: [
+      { sha: "abcabcabc", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
+    ],
+    tagTargetFor: noTags,
   });
   assert.deepEqual(violations, []);
 });
@@ -163,22 +199,43 @@ test("#1882 a pyproject.toml edit that leaves the version alone is not a release
       { sha: "ddddddddd", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
       { sha: "eeeeeeeee", subject: "chore: widen a dependency pin", version: "0.15.104", parentVersion: "0.15.104" },
     ],
-    hasTagFor: noTags,
+    tagTargetFor: noTags,
   });
   assert.deepEqual(violations, []);
 });
 
-test("#1882 an already-tagged prior release in the range is fine", () => {
+// ---------------------------------------------------------------------------
+// fail closed — an unrunnable scan must never read as a clean one
+// ---------------------------------------------------------------------------
+
+test("#1882 unavailable history is a violation, not an empty range that passes", () => {
+  // The first draft turned every git failure into `range = []`, so a shallow
+  // clone or unfetched tags made rule 2 silently vacuous while the job still
+  // reported success — the same "guard that isn't a guard" shape as the stale
+  // pack-contents entry.
   const violations = auditTag({
-    tag: "v0.15.105",
-    treeAtTag: treeAt("0.15.105"),
-    range: [
-      { sha: "ffffffff1", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
-      { sha: "ffffffff2", subject: "chore: release v0.15.104", version: "0.15.104", parentVersion: "0.15.103" },
-    ],
-    hasTagFor: tagsFor("0.15.104"),
+    tag: "v0.15.98",
+    treeAtTag: treeAt("0.15.98"),
+    range: [],
+    tagTargetFor: noTags,
+    historyError: "this is a shallow clone, so the range cannot be walked",
   });
-  assert.deepEqual(violations, []);
+  assert.equal(violations.length, 1, violations.join("\n"));
+  assert.match(violations[0], /untagged-release scan could not run/);
+  assert.match(violations[0], /shallow clone/);
+});
+
+test("#1882 a history failure still reports the tree-vs-tag mismatch it could check", () => {
+  const violations = auditTag({
+    tag: "v0.15.90",
+    treeAtTag: treeAt("0.15.85"),
+    range: [],
+    tagTargetFor: noTags,
+    historyError: "no v* tags are visible",
+  });
+  assert.ok(violations.length >= 2, violations.join("\n"));
+  assert.ok(violations.some((v) => v.includes("pyproject.toml declares 0.15.85")));
+  assert.ok(violations.some((v) => v.includes("untagged-release scan could not run")));
 });
 
 // ---------------------------------------------------------------------------
@@ -189,9 +246,9 @@ test("#1882 the guard is wired to tag pushes and actually invokes the checker", 
   const wf = read(".github/workflows/release-tag-guard.yml");
   assert.match(wf, /node scripts\/check-release-tag\.mjs/, "the workflow must run the checker");
   assert.match(wf, /on:\s*\n\s*push:\s*\n\s*tags:\s*\n\s*- "v\*"/, "must trigger on v* tag pushes");
-  // fetch-depth: 0 is load-bearing, not hygiene. On a shallow checkout
-  // `git describe` finds no earlier tag, the range collapses, and rule 2
-  // degrades to a no-op that still reports success.
+  // fetch-depth: 0 is load-bearing, not hygiene. On a shallow checkout the range
+  // cannot be walked at all; the checker now reports that rather than passing,
+  // so a regression here turns every release red instead of silently vacuous.
   assert.match(wf, /fetch-depth: 0/, "rule 2 needs full history to walk the range");
   assert.match(wf, /fetch-tags: true/, "rule 2 needs the tag list to test against");
 });

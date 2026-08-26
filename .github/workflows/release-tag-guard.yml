@@ -19,7 +19,11 @@ name: Release tag guard
 # filters `on.push` by `branches: [main]`, and GitHub does not run a
 # `branches`-filtered push workflow for a tag ref — empirically confirmed by the
 # ten tags above, every one of which was pushed with no publish run appearing.
-# So creating a missing historical tag is safe: it runs this audit and nothing else.
+# So creating a missing historical tag is safe. Note the converse, which is easy
+# to get backwards: GitHub loads workflow files from the ref the event carries,
+# so a tag pushed at a commit predating THIS file runs no guard either. A
+# historical backfill is therefore safe but unaudited -- audit it after the fact
+# with the workflow_dispatch input below, which runs this file from main.
 
 on:
   push:
