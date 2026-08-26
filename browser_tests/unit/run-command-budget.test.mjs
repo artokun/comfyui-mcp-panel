@@ -1657,11 +1657,12 @@ test("#1565 CALL SITE: graph_run takes its budget from RUN_COMMAND_BUDGET_MS on 
 
 /**
  * A frontend for the UNSCOPED path.
- * @param {"late"|"never"|"silent"|"postThenHang"} mode
+ * @param {"late"|"never"|"silent"|"postThenHang"|"swallowed"} mode
  *   late         posts and settles after drainMs (healthy)
  *   never        never settles; posts drainMs later (the busy processor)
  *   silent       never settles, never posts
  *   postThenHang posts and captures a prompt_id, then never settles (partial batch)
+ *   swallowed    posts, the post THROWS, and the queue call RESOLVES anyway — panel#1845
  */
 function makeUnscopedFrontend({ apiTarget, mode, drainMs = 5 }) {
   const app = {
@@ -1684,6 +1685,21 @@ function makeUnscopedFrontend({ apiTarget, mode, drainMs = 5 }) {
         const t = setTimeout(post, drainMs);
         if (typeof t.unref === "function") t.unref();
         return new Promise(() => {});
+      }
+      if (mode === "swallowed") {
+        // ComfyUI_frontend's OWN error handling, verbatim in shape: the queue loop wraps
+        // each post in `try { … } catch (error) { this.ui.dialog.show(formatPromptError(
+        // error)); … break }`. It does NOT rethrow — so a POST /prompt that never got a
+        // response leaves `app.queuePrompt` RESOLVING NORMALLY, and the run path sees a
+        // clean return with nothing behind it.
+        for (let i = 0; i < Math.max(1, Math.floor(Number(batch)) || 1); i++) {
+          try {
+            await post();
+          } catch {
+            break;
+          }
+        }
+        return true;
       }
       for (let i = 0; i < Math.max(1, Math.floor(Number(batch)) || 1); i++) await post();
       return true;
@@ -1911,6 +1927,141 @@ test("#1565 P1: an unreadable request cannot stop a fetch that previously went o
     await interceptor("/prompt", hostile);
     assert.equal(reached, true, "the request still went out");
     assert.equal(interceptor.state.posted, 0, "it simply is not counted");
+  } finally {
+    stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6. panel#1845 — THE ASYMMETRIC FAILURE: the HTTP surface is down, the canvas is not.
+//
+// REPORTED: `panel_run({})` answered `{"queued":true,"batch_count":1}` — no prompt id —
+// while nothing queued and no output directory was ever created. In the same window
+// `panel_free_vram` and `/upload/image` both threw `Failed to fetch`. So the BROWSER's
+// HTTP path to ComfyUI was down while the LiteGraph canvas stayed fully readable, which
+// is why the run sails past every pre-flight (they read live graph objects) and only dies
+// at POST /prompt — and why `app.queuePrompt` then RESOLVES: the frontend catches that
+// throw, shows a dialog and breaks its batch loop rather than rethrowing.
+//
+// The receipt channels are then all silent AT ONCE, and this is the combination no other
+// test in this file drives:
+//   • no rejection body      — there was no response to read one from;
+//   • `missingPromptIds` 0   — the interceptor counts a 200 WITHOUT an id, and a fetch
+//                              that threw never reaches that counter (it increments
+//                              `posted` and unwinds through `finally`);
+//   • `lastNodeErrors` {}    — nothing validated, so nothing was recorded.
+// `summarizePromptRejection` therefore returns null (correctly — this is not a refusal),
+// and the ONLY thing standing between the caller and a false success is the id-less clause
+// of `buildQueueAcceptResult`.
+//
+// MEASURED against the reporter's own panel v0.15.43: that clause did not exist yet
+// (`buildQueueAcceptResult` returned `{queued:true, batch_count:N}` unconditionally, with
+// `prompt_id` merely omitted), and driving THIS fixture against that build reproduces the
+// reported bytes exactly. #1690 added the clause; v0.15.64 shipped it.
+//
+// So this is a pin, not a fix — and it is a pin the shipped path did not have. The clause
+// was covered only in queue-rejection.test.mjs, at the HELPER. MEASURED: re-introducing the
+// v0.15.43 behaviour AT THE CALL SITE — `queuedPromptIds.length === 0 && missingPromptIds
+// === 0 ? {queued:true, batch_count:batch} : buildQueueAcceptResult(…)`, the hand-built
+// reply object that never consults the guard — left ALL 6924 panel unit tests green while
+// `graph_run({})` answered `{"queued":true,"batch_count":1}` again. A guard that exists
+// but is bypassed at one call site is indistinguishable from a guard that works.
+// ---------------------------------------------------------------------------
+
+/** The reporter's machine: every ComfyUI HTTP call from the BROWSER rejects. */
+function makeUnreachableServer() {
+  const calls = [];
+  const fetchApi = async (route, options) => {
+    calls.push({ route, options, at: Date.now() });
+    throw new TypeError("Failed to fetch");
+  };
+  fetchApi.calls = calls;
+  return fetchApi;
+}
+
+test("#1845 CALL SITE: a full run whose POST /prompt THREW is outcome-unknown, never a bare queued:true", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeUnreachableServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "swallowed" });
+    // Explicitly empty, and that is the point: the fallback channel has nothing to say
+    // here, so it cannot be what saves the reply.
+    app.lastNodeErrors = {};
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({});
+    // REACHABILITY, not plausibility: the run really did get to the queue call and the
+    // POST really did leave, so this reply is the production path's answer to the
+    // reported input — not a pre-flight refusal wearing the right shape.
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "the production queue path attempted one /prompt request");
+    assert.equal(apiTarget.fetchApi.calls[0].route, "/prompt");
+    assert.notDeepEqual(
+      res,
+      { queued: true, batch_count: 1 },
+      "the reported response, verbatim — a false success on a mutation: the caller waits " +
+        "for a completion that will never arrive and tells the user a render is in flight",
+    );
+    assert.notEqual(res.queued, true, "nothing was accepted, so nothing may claim it queued");
+    assert.equal("queued" in res, false, "…and `queued:false` is not honest either — the field is OMITTED");
+    assert.equal(res.queued_unknown, true, "it takes the honest shape the rest of the run path already uses");
+    assert.equal(res.prompt_id, undefined, "there is no receipt to name");
+    assert.match(String(res.error), /prompt_id/);
+    assert.match(String(res.retry_guidance), /queue or history before retrying/);
+  } finally {
+    stop();
+  }
+});
+
+test("#1845 CONTROL: a genuinely accepted full run still reports queued:true WITH its prompt id", async () => {
+  const stop = keepAlive();
+  try {
+    // The SAME fixture and the same swallow-on-throw queue loop, differing from the pin
+    // above in exactly one dimension: the HTTP surface answers. Every "stop the false
+    // success" change is satisfiable by never reporting success at all, which would break
+    // every legitimate run — strictly worse than the bug. This is what forbids that.
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "swallowed" });
+    app.lastNodeErrors = {};
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({});
+    assert.equal(apiTarget.fetchApi.calls.length, 1);
+    assert.deepEqual(res, { queued: true, batch_count: 1, prompt_id: "srv-1" });
+  } finally {
+    stop();
+  }
+});
+
+
+test("#1845 CONTROL: a batch that queued SOME prompts before the surface died keeps the ids it earned", async () => {
+  const stop = keepAlive();
+  try {
+    // The other direction of the same cliff. The first POST answers with a real receipt,
+    // the second throws. MEASURED, not read: the reply is
+    // `{queued:true, batch_count:2, prompt_id:"srv-1"}` — a minted id is a receipt of
+    // acceptance and outranks everything beside it (#1504), so the render that IS on the
+    // GPU is reported as running and stays correlatable. That is deliberate, and this
+    // control exists to keep it that way: the #1845 pin above must never be widened into
+    // treating any thrown post as a whole-run failure, which would send the caller to
+    // re-render work already in flight.
+    //
+    // Noted and NOT changed here: `batch_count` echoes what was REQUESTED, so a partial
+    // batch's reply does not itself state how many of the N were accepted (the prompt ids
+    // do). That is a different question from #1845 — which is a run with NO receipt at all
+    // — and nobody has reported it, so it is measured and left alone rather than patched
+    // speculatively on a mutation path.
+    const calls = [];
+    const fetchApi = async (route, options) => {
+      calls.push({ route, options, at: Date.now() });
+      if (calls.length === 1) return jsonResponse(200, { prompt_id: "srv-1" });
+      throw new TypeError("Failed to fetch");
+    };
+    fetchApi.calls = calls;
+    const apiTarget = { fetchApi };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "swallowed" });
+    app.lastNodeErrors = {};
+    const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
+    const res = await built.graph_run({ batch_count: 2 });
+    assert.equal(calls.length, 2, "the batch attempted both /prompt requests");
+    assert.deepEqual(res, { queued: true, batch_count: 2, prompt_id: "srv-1" });
   } finally {
     stop();
   }
