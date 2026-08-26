@@ -281,6 +281,7 @@ test("WIRING: production alias witness keeps outer, immediate, and terminal name
         label: "outer display",
         widget: projectedWidget,
         _widget: projectedWidget,
+        widgetId: `root:78:${testCase.outer}`,
         _subgraphSlot: { name: "parent_alias", linkIds: [1] },
       }],
       subgraph: {
@@ -294,7 +295,11 @@ test("WIRING: production alias witness keeps outer, immediate, and terminal name
     const witness = entries.find((entry) => entry.widget === testCase.outer);
     assert.deepEqual(witness, {
       widget: testCase.outer,
-      parent_rail: { authoritative: true, widget: testCase.immediate },
+      parent_rail: {
+        authoritative: true,
+        widget: testCase.immediate,
+        widget_id: `root:78:${testCase.outer}`,
+      },
       immediate_node_id: 188,
       immediate_widget: testCase.immediate,
       terminal_node_id: 2768,

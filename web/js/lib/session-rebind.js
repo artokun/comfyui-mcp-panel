@@ -809,6 +809,10 @@ export function buildHelloPayload({
     // separate capability from the write-boundary fence so an older bundle is
     // never mistaken for one that can classify renamed promotion aliases.
     publishes_promoted_terminal_witnesses: true,
+    // #2314 final-rail race: graph_set_widget re-resolves the promoted alias
+    // through the live owner/input relationship immediately before mutation,
+    // so an external/relinked host input cannot permit an inner/shared write.
+    enforces_promoted_parent_rail_at_write: true,
     // Advertise that this build understands `agent_note` — an orchestrator frame that is
     // delivered to the AGENT ONLY and never rendered as a chat bubble.
     //

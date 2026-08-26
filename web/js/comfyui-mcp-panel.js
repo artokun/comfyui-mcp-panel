@@ -9727,7 +9727,13 @@ function promotedTerminalWitnesses(subgraphNode) {
     }
     entries.push({
       widget,
-      parent_rail: { authoritative: true, widget: parentRail.name },
+      parent_rail: {
+        authoritative: true,
+        widget: parentRail.name,
+        ...(typeof resolution.target.input?.widgetId === "string" && resolution.target.input.widgetId.length > 0
+          ? { widget_id: resolution.target.input.widgetId }
+          : {}),
+      },
       immediate_node_id: resolution.target.node.id,
       immediate_widget: resolution.target.widget.name,
       terminal_node_id: terminalNode.id,
@@ -9906,8 +9912,61 @@ function assertExpectedPromotedScope(current, expectedScope, resolveTerminal) {
         `${expected.workflow_uuid ? ` in workflow ${expected.workflow_uuid}` : ""}, ` +
         `found ${liveViewing.scope} owner ${liveOwnerId ?? "unverifiable"}` +
         `${liveViewing.workflow_uuid ? ` in workflow ${liveViewing.workflow_uuid}` : ""}. ` +
-        "Nothing was applied.",
+      "Nothing was applied.",
     );
+  }
+
+  // A scope witness alone only proves that the final node id is in the right
+  // child graph. A promoted inner write also needs the OUTER host input's
+  // authoritative rail: if that input was relinked after MCP's outer proof,
+  // writing the captured inner/shared definition would be a false success.
+  // Re-resolve through the same identity-authenticated path used by the live
+  // setter, synchronously at this mutation boundary. `input.link != null`
+  // therefore yields no parentWidget and fails closed.
+  if (expected.promoted_widget !== undefined || expected.parent_rail !== undefined) {
+    if (typeof expected.promoted_widget !== "string" || expected.promoted_widget.length === 0) {
+      throw new Error("graph_set_widget expected_scope.promoted_widget must be a non-empty string");
+    }
+    const expectedRail = expected.parent_rail;
+    if (!expectedRail || typeof expectedRail !== "object" || Array.isArray(expectedRail)) {
+      throw new Error("graph_set_widget expected_scope.parent_rail must be a structured authority witness");
+    }
+    if (expectedRail.authoritative !== true || typeof expectedRail.widget !== "string" || expectedRail.widget.length === 0) {
+      throw new Error("graph_set_widget expected_scope.parent_rail must prove an authoritative widget");
+    }
+    if (
+      expectedRail.widget_id !== undefined &&
+      (typeof expectedRail.widget_id !== "string" || expectedRail.widget_id.length === 0)
+    ) {
+      throw new Error("graph_set_widget expected_scope.parent_rail.widget_id must be a non-empty string");
+    }
+    const ownerNode = liveOwner?.node;
+    let promoted;
+    try {
+      promoted = ownerNode
+        ? resolvePromotedInnerTarget(ownerNode, expected.promoted_widget, sourceForSubgraphInput)
+        : null;
+    } catch {
+      promoted = null;
+    }
+    const target = promoted?.promoted === true ? promoted.target : null;
+    const parentWidget = target?.parentWidget ?? null;
+    const parentWidgets = target?.parentWidgets;
+    const liveWidgetId = target?.input?.widgetId;
+    if (
+      !target ||
+      !parentWidget ||
+      !Array.isArray(parentWidgets) ||
+      parentWidgets[0] !== parentWidget ||
+      !Array.isArray(ownerNode?.widgets) ||
+      !ownerNode.widgets.includes(parentWidget) ||
+      parentWidget.name !== expectedRail.widget ||
+      (expectedRail.widget_id !== undefined && liveWidgetId !== expectedRail.widget_id)
+    ) {
+      throw new Error(
+        "graph_set_widget promoted parent rail changed or became unverifiable before dispatch. Nothing was applied.",
+      );
+    }
   }
 
   if (expected.terminal !== undefined) {
