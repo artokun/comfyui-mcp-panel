@@ -2692,10 +2692,15 @@ const DISCORD_INVITE_URL = "https://discord.gg/cW9arBhzCu";
 // prompt chips, a nine-item slash list and a Discord invite. A link is not a
 // capability index and does not pretend to be one — it is the missing signpost.
 const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
-// Panel version — surfaced in the "Need help?" diagnostics blob. Bump via
-// `node scripts/set-version.mjs <v>` (updates this AND pyproject together); CI
-// and the publish gate FAIL if the two ever drift, so this can't go stale.
-const PANEL_VERSION = "0.15.85";
+// Panel version — surfaced in the "Need help?" diagnostics blob, and read by
+// comfyui-mcp to gate capability floors (BRIDGE_CAPABILITY_MIN_PANEL_VERSION), so
+// a stale value here makes the orchestrator REFUSE commands this panel can serve.
+// Bump via `node scripts/set-version.mjs <v>` (writes this AND pyproject). CI and
+// the publish gate compare both against package.json — comparing only these two
+// could never catch the real failure, that set-version.mjs was not run at all,
+// since one script writes them together. That is how 0.15.86..0.15.96 shipped
+// still announcing 0.15.85.
+const PANEL_VERSION = "0.15.96";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at

@@ -234,7 +234,7 @@ jobs:
       - name: pyproject.toml is valid + has registry fields + JS version matches
         run: |
           python - <<'PY'
-          import tomllib, re, sys
+          import tomllib, re, sys, json
           d = tomllib.load(open("pyproject.toml", "rb"))
           proj = d.get("project", {})
           comfy = d.get("tool", {}).get("comfy", {})
@@ -250,10 +250,19 @@ jobs:
           js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
           m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
           assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
-          if m.group(1) != proj["version"]:
+          # package.json is the version npm bumps at release; pyproject + PANEL_VERSION are
+          # what set-version.mjs writes. Comparing only the latter two could never catch the
+          # real failure — that set-version.mjs was not run AT ALL — because one script writes
+          # both, so they cannot disagree. That is exactly how 0.15.86..0.15.96 shipped with
+          # pyproject and PANEL_VERSION frozen at 0.15.85 while CI stayed green. Compare all
+          # three, so a release that skips set-version.mjs is a RED build.
+          pkg = json.load(open("package.json", encoding="utf-8")).get("version")
+          seen = {"package.json": pkg, "pyproject.toml": proj["version"], "PANEL_VERSION": m.group(1)}
+          if len(set(seen.values())) != 1:
               sys.exit(
-                  f"VERSION MISMATCH: pyproject={proj['version']} but PANEL_VERSION={m.group(1)} "
-                  f"in comfyui-mcp-panel.js — run `node scripts/set-version.mjs {proj['version']}`."
+                  "VERSION MISMATCH: "
+                  + ", ".join(f"{k}={v}" for k, v in seen.items())
+                  + f" — run `node scripts/set-version.mjs {pkg}`."
               )
-          print(f"pyproject OK: {proj['name']} {proj['version']} (JS PANEL_VERSION matches)")
+          print(f"pyproject OK: {proj['name']} {proj['version']} (package.json + JS PANEL_VERSION match)")
           PY
