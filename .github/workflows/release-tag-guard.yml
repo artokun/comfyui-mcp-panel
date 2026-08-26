@@ -52,5 +52,5 @@ jobs:
 
       - name: Audit the release tag
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: node scripts/check-release-tag.mjs "$TAG"

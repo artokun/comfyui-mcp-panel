@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.15.105] - 2026-08-26
 
 ### Fixed
+- a release tag proves the tagged tree is the version it claims, and that nothing shipped untagged (#1882)
 - scrolling up during a streaming turn no longer snaps back to the bottom (#1879)
 - graph_connect reports live dynamic slot rewrites and safely bounds hostile disclosure values (#1876)
 - the pruned-retry disclosure says why the first post is not pre-pruned (#1881)
