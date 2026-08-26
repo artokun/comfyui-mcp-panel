@@ -80,6 +80,12 @@ import { withTimeout } from "./lib/bounded-step.js";
 import { createChatScrollStabilizer } from "./lib/chat-scroll-stabilizer.js";
 import { createRunReceiptOutbox } from "./lib/run-receipt-outbox.js";
 import {
+  mergeRunCompletionMetadata,
+  normalizeRunCompletionMetadata,
+  partitionRunCompletionMetadata,
+  runCompletionKeyMatchesRoute,
+} from "./lib/run-completion-persistence.js";
+import {
   arbitratePanelCopy,
   countExtensionsNamed,
   describeDuplicatePanelCopies,
@@ -779,7 +785,11 @@ import { createRehelloGate, routeIsStale } from "./lib/rehello-gate.js";
  *  where nobody is going to act on an answer it cannot give. Everything else is refused
  *  while the route is stale (see sendFrame). */
 const SESSION_ORDERED_FRAMES = new Set(["resume_session", "new_session"]);
-import { primeModuleCache, resolveBundleStaleness } from "./lib/bundle-version.js";
+import {
+  createDirtySafeBundleHealRetry,
+  primeModuleCache,
+  resolveBundleStaleness,
+} from "./lib/bundle-version.js";
 import { describeModuleCache, readModuleCacheSummary } from "./lib/module-cache-report.js";
 import { classifyManager404 } from "./lib/manager-404.js";
 import { probeConsoleRoute, UNBUILT_ROUTE_TITLE } from "./lib/console-route-probe.js";
@@ -5306,32 +5316,14 @@ function readRunCompletionMetadata() {
   const raw = ssGet(RUN_COMPLETION_META_KEY);
   if (!raw) return [];
   try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(
-        (entry) =>
-          entry &&
-          typeof entry.promptId === "string" &&
-          entry.promptId.trim() &&
-          typeof entry.completionKey === "string" &&
-          entry.completionKey.trim() &&
-          entry.completionKey.length <= 512,
-      )
-      .slice(0, 256)
-      .map((entry) => ({
-        promptId: entry.promptId.trim(),
-        completionKey: entry.completionKey.trim(),
-        routeId: entry.routeId == null ? null : String(entry.routeId),
-        sessionId: entry.sessionId == null ? null : String(entry.sessionId),
-      }));
+    return normalizeRunCompletionMetadata(JSON.parse(raw));
   } catch {
     return [];
   }
 }
 
 function persistRunCompletionMetadata(entries) {
-  const safe = Array.isArray(entries) ? entries.slice(0, 256) : [];
+  const safe = normalizeRunCompletionMetadata(entries);
   if (!safe.length) {
     ssSet(RUN_COMPLETION_META_KEY, null);
     return;
@@ -5343,17 +5335,18 @@ function persistRunCompletionMetadata(entries) {
   }
 }
 
-function restoreRunCompletionMetadata(tracker) {
+function restoreRunCompletionMetadata(tracker, entries) {
   if (!tracker || typeof tracker.onQueued !== "function") return 0;
-  const entries = readRunCompletionMetadata();
-  for (const entry of entries) {
+  let restored = 0;
+  for (const entry of normalizeRunCompletionMetadata(entries)) {
     try {
       tracker.onQueued(entry.promptId, entry);
+      restored += 1;
     } catch {
       // A malformed persisted row must not prevent the panel from mounting.
     }
   }
-  return entries.length;
+  return restored;
 }
 
 function readRunCompletionTerminals() {
@@ -37997,11 +37990,52 @@ function buildPanel() {
   // flushes a true orphan (outputs with no start/executing signal), so a partial
   // batch can't be emitted for a legitimately long run.
   //
+  // Partition the durable ledger before the tracker is created. A remount can
+  // happen while a different workflow route is active; replaying an old row on
+  // that route would stamp the frame for the wrong canvas. Keep foreign rows in
+  // storage for a later mount of their own route, and merge them back on every
+  // write from this tracker.
+  let completionRestoreRoute = null;
+  try {
+    completionRestoreRoute = bridgeRouteId();
+  } catch {}
+  const completionRestore = partitionRunCompletionMetadata(
+    readRunCompletionMetadata(),
+    completionRestoreRoute,
+  );
+  const deferredRunCompletionMetadata = completionRestore.deferred;
+  const persistOwnedRunCompletionMetadata = (entries) => {
+    // Async composition from a torn-down mount can settle after its replacement
+    // has already acknowledged and cleared a completion. Never let that stale
+    // frontend instance resurrect its old pending snapshot.
+    if (panelRunOwnerRef.current !== mountOwner) return;
+    persistRunCompletionMetadata(
+      mergeRunCompletionMetadata(entries, deferredRunCompletionMetadata),
+    );
+  };
+  const persistOwnedRunCompletionTerminals = (entries) => {
+    if (panelRunOwnerRef.current !== mountOwner) return;
+    persistRunCompletionTerminals(entries);
+  };
+  const sendRunCompletionFrame = (frame) => {
+    if (typeof frame?.completion_key === "string") {
+      let liveRoute = null;
+      try {
+        liveRoute = bridgeRouteId();
+      } catch {}
+      // A workflow switch can race the async completion composer. Refuse the
+      // write and let markUndelivered + the safety sweep retain it until its
+      // original route is live again; never stamp it onto the replacement tab.
+      if (!runCompletionKeyMatchesRoute(frame.completion_key, liveRoute)) return false;
+    }
+    return client.sendFrame(frame);
+  };
+
   // This closure owns ONLY presentation: it receives the full, correctly-scoped
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
-    onCompletionStateChange: (entries) => persistRunCompletionMetadata(entries),
-    onTerminalCompletionStateChange: (entries) => persistRunCompletionTerminals(entries),
+    onCompletionStateChange: persistOwnedRunCompletionMetadata,
+    onTerminalCompletionStateChange: persistOwnedRunCompletionTerminals,
     // comfyui-mcp#1739 — a run re-pended by markUndelivered (the completion frame's
     // sendFrame failed: bridge/socket churn, e.g. around a workflow-tab switch
     // re-hello) re-enters a ledger that may have NO sweeper left: flush() retired
@@ -38030,7 +38064,7 @@ function buildPanel() {
     // #1199 — `finishedAt` and `reconciled` are forwarded by the production
     // delivery seam so recovered completions retain their real finish time.
     onFlush: createRunCompletionFlushHandler({
-      sendFrame: (frame) => client.sendFrame(frame),
+      sendFrame: sendRunCompletionFrame,
       markDelivered: (promptId) => runCompletion.markDelivered(promptId),
       markUndelivered: (promptId) => runCompletion.markUndelivered(promptId),
       pruneRebootMarker,
@@ -38235,7 +38269,7 @@ function buildPanel() {
   // before the first reconcile probe, so a retained completion can be replayed
   // as the same panel_run receipt rather than downgraded to a fresh run.
   if (
-    restoreRunCompletionMetadata(runCompletion) > 0 ||
+    restoreRunCompletionMetadata(runCompletion, completionRestore.current) > 0 ||
     restoreRunCompletionTerminals(runCompletion) > 0
   ) {
     armRunReconcileSweep();
@@ -42652,8 +42686,8 @@ function buildPanel() {
       // reconcile await (codex P1 unmount-resurrection leak). Only null the shared
       // refs if they still point at THIS instance — a newer mount may already own them.
       runReconcileSweep.dispose();
-      persistRunCompletionMetadata(runCompletion.completionMetadata?.() ?? []);
-      persistRunCompletionTerminals(runCompletion.terminalCompletionMetadata?.() ?? []);
+      persistOwnedRunCompletionMetadata(runCompletion.completionMetadata?.() ?? []);
+      persistOwnedRunCompletionTerminals(runCompletion.terminalCompletionMetadata?.() ?? []);
       runCompletion.dispose?.();
       if (panelRunOwnerRef.current === mountOwner) {
         panelRunOwnerRef.current = null;
@@ -42754,6 +42788,11 @@ function installSidebarTabGuard(tabId, getRoot, onDetach) {
 // orchestrator's fence message (#709) already names. There is no panel-side
 // channel that can retrofit self-healing into already-shipped JS.
 const BUNDLE_HEAL_KEY = "comfyui-mcp.panel.bundleHealAttempted";
+const dirtySafeBundleHealRetry = createDirtySafeBundleHealRetry({
+  isBlocked: () =>
+    unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows).length > 0,
+  heal: () => healStaleBundleIfNeeded(),
+});
 
 async function healStaleBundleIfNeeded() {
   try {
@@ -42777,6 +42816,7 @@ async function healStaleBundleIfNeeded() {
     const installed = body?.version;
     const staleness = resolveBundleStaleness({ running: PANEL_VERSION, installed });
     if (staleness === "current") {
+      dirtySafeBundleHealRetry.cancel();
       // A previous heal took — clear the marker so the NEXT update heals too.
       if (ssGet(BUNDLE_HEAL_KEY)) ssSet(BUNDLE_HEAL_KEY, null);
       // #584 — "current" IS THE BLIND SPOT. This compares one number: the
@@ -42834,12 +42874,15 @@ async function healStaleBundleIfNeeded() {
     // reload-blocked.js: an unknown flag is not evidence of unsaved work.)
     const healBlockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
     if (healBlockers.length) {
+      dirtySafeBundleHealRetry.schedule();
       console.warn(
         `[comfyui-mcp-panel] this tab is running a STALE panel bundle (running ${PANEL_VERSION}, ` +
-          `installed ${installed}). ${reloadWouldBeBlockedMessage(healBlockers)}`,
+          `installed ${installed}). ${reloadWouldBeBlockedMessage(healBlockers)} ` +
+          `The panel will retry its safe reload after those workflows are saved.`,
       );
       return;
     }
+    dirtySafeBundleHealRetry.cancel();
     ssSet(BUNDLE_HEAL_KEY, marker);
     if (ssGet(BUNDLE_HEAL_KEY) !== marker) {
       // codex gate round 3 — the loop guard is itself an operation that can

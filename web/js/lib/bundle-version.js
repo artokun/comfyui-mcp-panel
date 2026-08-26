@@ -40,6 +40,66 @@ export function resolveBundleStaleness({ running, installed } = {}) {
 }
 
 /**
+ * Retry a proven-stale bundle heal after unsaved-work blockers become clean.
+ * The poll only reads blocker state; the expensive version probe/cache prime is
+ * invoked once, after navigation is safe. Multiple stale probes share one poll.
+ */
+export function createDirtySafeBundleHealRetry({
+  isBlocked,
+  heal,
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  clearTimer = (timer) => clearTimeout(timer),
+  retryMs = 1000,
+} = {}) {
+  let timer = null;
+
+  const schedule = () => {
+    if (timer !== null || typeof isBlocked !== "function" || typeof heal !== "function") {
+      return false;
+    }
+    try {
+      timer = setTimer(() => {
+        timer = null;
+        let blocked = true;
+        try {
+          blocked = isBlocked() === true;
+        } catch {
+          // An unreadable workflow list is not permission to navigate. The
+          // production blocker helper itself fails open only on readable rows;
+          // an exception here is weaker evidence, so wait and inspect again.
+          blocked = true;
+        }
+        if (blocked) {
+          schedule();
+          return;
+        }
+        Promise.resolve()
+          .then(() => heal())
+          .catch(() => {});
+      }, retryMs);
+      return true;
+    } catch {
+      timer = null;
+      return false;
+    }
+  };
+
+  return {
+    schedule,
+    cancel() {
+      if (timer === null) return;
+      try {
+        clearTimer(timer);
+      } catch {}
+      timer = null;
+    },
+    pending() {
+      return timer !== null;
+    },
+  };
+}
+
+/**
  * Extract RELATIVE module specifiers ("./x.js", "../y.js") from a module's
  * static import/export statements AND its literal dynamic import("...") calls
  * (e.g. cmcp-a2ui-lit-adapter.js's lazily-loaded vendor bundle — omitting it

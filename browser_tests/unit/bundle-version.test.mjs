@@ -17,9 +17,66 @@ import { dirname, join } from "node:path";
 
 import {
   collectRelativeImportSpecifiers,
+  createDirtySafeBundleHealRetry,
   primeModuleCache,
   resolveBundleStaleness,
 } from "../../web/js/lib/bundle-version.js";
+
+test("#1830 dirty-safe bundle heal waits for every unsaved workflow to become clean", async () => {
+  const timers = [];
+  let blocked = true;
+  let heals = 0;
+  const retry = createDirtySafeBundleHealRetry({
+    isBlocked: () => blocked,
+    heal: () => {
+      heals += 1;
+    },
+    setTimer: (fn, ms) => {
+      const timer = { fn, ms, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (timer) => {
+      timer.cancelled = true;
+    },
+    retryMs: 25,
+  });
+
+  assert.equal(retry.schedule(), true);
+  assert.equal(retry.schedule(), false, "repeated stale probes share one waiter");
+  assert.equal(timers[0].ms, 25);
+  timers[0].fn();
+  await Promise.resolve();
+  assert.equal(heals, 0, "dirty work never triggers navigation/healing");
+  assert.equal(timers.length, 2, "the cheap blocker poll remains armed");
+
+  blocked = false;
+  timers[1].fn();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(heals, 1, "healing is retried once the workflows are clean");
+  assert.equal(retry.pending(), false);
+});
+
+test("#1830 dirty-safe bundle heal cancellation prevents a stale timer from navigating", () => {
+  let timer;
+  let heals = 0;
+  const retry = createDirtySafeBundleHealRetry({
+    isBlocked: () => false,
+    heal: () => {
+      heals += 1;
+    },
+    setTimer: (fn) => (timer = { fn, cancelled: false }),
+    clearTimer: (value) => {
+      value.cancelled = true;
+    },
+  });
+  retry.schedule();
+  retry.cancel();
+  if (!timer.cancelled) timer.fn();
+  assert.equal(heals, 0);
+  assert.equal(retry.pending(), false);
+});
 
 test("resolveBundleStaleness: equal versions are current", () => {
   assert.equal(resolveBundleStaleness({ running: "0.11.39", installed: "0.11.39" }), "current");
