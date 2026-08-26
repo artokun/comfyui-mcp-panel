@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.97] - 2026-08-26
+
+### Fixed
+- the start command leads the setup card instead of trailing it (#1822)
+- the provider setup card scrolls instead of clipping its own tail (#1821)
+- the version gate compares an independent witness, and unsticks 0.15.85 (#1825)
+
+
 ## [0.15.96] - 2026-08-25
 
 ### Fixed
