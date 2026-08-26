@@ -1,9 +1,16 @@
 #!/usr/bin/env node
 // Single source of truth for bumping the panel version — updates BOTH
 // pyproject.toml [project].version AND the PANEL_VERSION constant in
-// web/js/comfyui-mcp-panel.js so they can never drift. CI + the publish gate
-// assert they match, so forgetting one is a red build, not a silent stale
-// version in the "Need help?" diagnostics.
+// web/js/comfyui-mcp-panel.js so they can never drift, then stamps the
+// changelogs.
+//
+// It deliberately does NOT write package.json — `npm version` owns that (and the
+// lockfile with it). That makes package.json an INDEPENDENT witness: CI and the
+// publish gate assert all three agree, so a release that bumps npm and forgets
+// to run this script is a red build. Asserting only the two files below would be
+// worthless for that, because this one script writes both and they cannot
+// disagree — which is exactly how 0.15.86..0.15.96 shipped with pyproject and
+// PANEL_VERSION frozen at 0.15.85 and CI green throughout.
 //
 //   node scripts/set-version.mjs 0.6.8
 //

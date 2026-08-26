@@ -206,7 +206,7 @@ jobs:
       - name: pyproject.toml is valid + has registry fields + JS version matches
         run: |
           python - <<'PY'
-          import tomllib, re, sys
+          import tomllib, re, sys, json
           d = tomllib.load(open("pyproject.toml", "rb"))
           proj = d.get("project", {})
           comfy = d.get("tool", {}).get("comfy", {})
@@ -219,9 +219,14 @@ jobs:
           js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
           m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
           assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
-          if m.group(1) != proj["version"]:
-              sys.exit(f"VERSION MISMATCH: pyproject={proj['version']} PANEL_VERSION={m.group(1)} — run scripts/set-version.mjs")
-          print(f"publishing {proj['name']} {proj['version']} (JS PANEL_VERSION matches)")
+          # Three-way, for the reason spelled out in ci.yml: pyproject and PANEL_VERSION are
+          # written by the same script, so comparing just those two cannot detect that the
+          # script never ran. package.json is the independent witness.
+          pkg = json.load(open("package.json", encoding="utf-8")).get("version")
+          seen = {"package.json": pkg, "pyproject.toml": proj["version"], "PANEL_VERSION": m.group(1)}
+          if len(set(seen.values())) != 1:
+              sys.exit("VERSION MISMATCH: " + ", ".join(f"{k}={v}" for k, v in seen.items()) + " — run scripts/set-version.mjs")
+          print(f"publishing {proj['name']} {proj['version']} (package.json + JS PANEL_VERSION match)")
           PY
       # --------------------------------------------------------------------
 
