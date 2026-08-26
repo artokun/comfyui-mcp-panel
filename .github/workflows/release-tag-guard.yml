@@ -1,0 +1,60 @@
+name: Release tag guard
+
+# "Was version X released?" is answered from `git tag`, and that operand has been
+# wrong in BOTH directions on this repo (#1882):
+#
+#   * v0.15.86..v0.15.96 are tagged but their trees all declare version "0.15.85".
+#     publish_action.yml fires on `paths: [pyproject.toml]`, so for tagged commits
+#     that never touched that file the workflow NEVER RAN — no job, no red X, no
+#     annotation. Ten consecutive versions silently never shipped.
+#   * 0.15.97 IS on the Registry (from the merge of release/0.15.97) and has no tag,
+#     so two reporters were told it "was never released".
+#
+# The guard therefore hangs off the TAG PUSH, not off the publish job: the first
+# failure mode is precisely that the publish job did not execute, and a guard
+# inside a workflow that never runs is not a guard. A tag push is an event that
+# did occur all ten times.
+#
+# THIS WORKFLOW DOES NOT PUBLISH AND CANNOT TRIGGER A PUBLISH. publish_action.yml
+# filters `on.push` by `branches: [main]`, and GitHub does not run a
+# `branches`-filtered push workflow for a tag ref — empirically confirmed by the
+# ten tags above, every one of which was pushed with no publish run appearing.
+# So creating a missing historical tag is safe. Note the converse, which is easy
+# to get backwards: GitHub loads workflow files from the ref the event carries,
+# so a tag pushed at a commit predating THIS file runs no guard either. A
+# historical backfill is therefore safe but unaudited -- audit it after the fact
+# with the workflow_dispatch input below, which runs this file from main.
+
+on:
+  push:
+    tags:
+      - "v*"
+  # So a historical tag can be audited on demand without pushing anything.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to audit (e.g. v0.15.104)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    name: Tag and tree declare the same version
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The audit walks first-parent from the previous reachable tag and reads
+          # pyproject.toml at each commit, so it needs real history AND the tag
+          # list. A shallow checkout would make `git describe` find no earlier tag
+          # and silently reduce rule 2 to a no-op.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Audit the release tag
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: node scripts/check-release-tag.mjs "$TAG"
