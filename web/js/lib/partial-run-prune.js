@@ -338,6 +338,10 @@ export function prunedRetryNote({ toNodeId, namedNode, removed }) {
     `to the requested branch (comfyui-mcp#1871). Nothing was queued by that refusal. The ` +
     `panel then re-posted the SAME run with the ${list.length} node(s) outside the requested ` +
     `branch omitted — ${shown.join(", ")}${more} — and that is the prompt ComfyUI accepted. ` +
+    `The first post is NOT pre-pruned, on purpose: ComfyUI drops every cached output whose `
+      + `node is absent from the prompt it was handed, so pruning every scoped run would evict `
+      + `the other branch's cached results and make your next FULL run recompute a branch it `
+      + `had already rendered. The prune is spent only where the alternative is this refusal. ` +
     `The nodes that executed are exactly node ${toNodeId} and its upstream dependencies, ` +
     `which is what run-to-node asks for; the omitted nodes are untouched on your canvas and ` +
     `a FULL run will still fail on them until the pack behind node ${namedNode} is installed.`

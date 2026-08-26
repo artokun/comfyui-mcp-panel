@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- scrolling up during a streaming turn no longer snaps back to the bottom (#1879)
+- the pruned-retry disclosure says why the first post is not pre-pruned (#1871)
+
 ## [0.15.104] - 2026-08-26
 
 ### Fixed
