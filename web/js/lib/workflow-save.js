@@ -2318,14 +2318,19 @@ function isConflictError(err) {
 function conflictError(desiredName, { named = true } = {}) {
   const nm = baseName(desiredName) || "that name";
   if (!named) {
+    // NAMES NO CAUSE, deliberately — the same discipline explainUserDataStoreFailure keeps
+    // a few hundred lines down. This is reached from two places (the up-front pre-check and
+    // the post-write rollback) whose situations differ, and the causes are several (an
+    // externally-loaded path, a never-persisted tab, a rename in flight, a target that
+    // appeared mid-save), so picking one would be an inference presented as a finding. It
+    // states only what was OBSERVED and the two remedies that exist.
     return new Error(
-      `refusing to save "${nm}" in place: this save supplied NO name, and this tab could not be ` +
-        `proven to own a workflow file on disk (an externally-loaded path, or a tab whose name and ` +
-        `path disagree), so the only destination left was a workflow file that already exists ` +
-        `(409 Conflict). There is no "different name" to choose, because none was given: pass an ` +
-        `explicit name to panel_save_workflow to write a copy, or reopen the workflow from ` +
-        `panel_list_workflows so the tab is bound to its real file. Nothing was written and the ` +
-        `active tab was left unchanged (issue #309/#1864).`,
+      `refusing to save "${nm}": this save supplied NO name, so its destination was derived from ` +
+        `the workflow's own name — and a workflow file already occupies it (409 Conflict). There ` +
+        `is no "different name" to choose, because none was given: pass an explicit name to ` +
+        `panel_save_workflow to write a copy, or reopen the workflow from panel_list_workflows so ` +
+        `the tab is bound to the file it should be saving. Nothing was written and the active tab ` +
+        `was left unchanged (issue #309/#1864).`,
     );
   }
   return new Error(
