@@ -292,6 +292,11 @@ export function createRunCompletionTracker({
       return false;
     }
     for (const record of records) {
+      // #1842 — every KEYED frame leaving here is a potential agent turn, and it
+      // is retired only by a receipt, so it spends one of this run's bounded
+      // delivery slots. Counted at the single funnel deliberately: a later emit
+      // site added upstream cannot quietly escape the bound.
+      noteUnackedDelivery(k);
       onFlush({ ...payload, completionKey: record.completionKey });
     }
     return true;
@@ -401,6 +406,12 @@ export function createRunCompletionTracker({
     markTerminal(id);
     touchFence(delivered, k);
     pending.delete(k);
+    // #1842 — the replay budget is scoped to runs still in `pending`; a key
+    // retired from it can never be re-composed by reconcile, so drop the record
+    // rather than let the map outlive what it counts. Deliberately does NOT
+    // touch `awaitingDelivery`/`unconfirmedDelivery` — see the note below on why
+    // this optimistic retire must not release the #585 delivery hold.
+    clearUnackedDeliveries(k);
     // #356 Bug 2 — panelQueued deliberately SURVIVES this. `markDelivered` here is
     // OPTIMISTIC (flush/execution_success/reconcile all call it before the caller has
     // confirmed the frame reached the agent), and markUndelivered can re-pend the run.
@@ -452,6 +463,79 @@ export function createRunCompletionTracker({
   // would already be the real problem, and trading a correctness property for that
   // is a bad trade.
   const unconfirmedDelivery = new Map(); // key -> ts
+  // ── #1842: BOUND the pre-receipt reconcile REPLAY ─────────────────────────
+  //
+  // A keyed panel_run completion deliberately STAYS in `pending` until the
+  // orchestrator's receipt, and #1824 deliberately lets a /history reconcile
+  // REPLAY that completion under the SAME completion key before the receipt
+  // arrives — that is how a frame lost in transit is recovered, and the key is
+  // what makes the replay idempotent downstream.
+  //
+  // What was missing is a BOUND. `reconcileKey`'s only entry guard was
+  // `delivered.has(k) || !pending.has(k)`, and a run awaiting a receipt
+  // satisfies neither — so `hasPending()` stayed true forever, the 20-second
+  // safety sweep re-armed forever, and the same finished run was re-composed and
+  // re-emitted on EVERY tick, for as long as the panel was open. Six such runs
+  // became the reported forty-plus consecutive agent turns of nothing but
+  // replays, continuing long after the agent stopped calling panel_run.
+  //
+  // The premise the unbounded replay rests on — "the key makes it idempotent
+  // downstream" — is a property of the OTHER process, and it was simply false
+  // for the orchestrator the reporters were running: comfyui-mcp did not send
+  // `ack {kind:"completion"}` at all before v0.52.122, so no receipt could ever
+  // arrive and every replay minted a fresh agent turn. A retry whose success
+  // depends on a peer capability it cannot observe must be bounded, or a peer
+  // that never answers turns it into an infinite loop.
+  //
+  // So: the replay stays, and what is counted is the only thing that can
+  // actually reach the agent — a completion frame the TRANSPORT ACCEPTED for
+  // this run which no receipt has retired. Past the budget the panel stops
+  // re-sending; the run simply remains pending-and-unconfirmed, which the #585
+  // machinery already reports honestly (isDeliveryUnconfirmed).
+  //
+  // A transport REFUSAL (markUndelivered) DECREMENTS this by one; it must never
+  // reset it. A refused frame never left the browser, so it must not spend
+  // budget — but it is not evidence about the frames that DID leave, and
+  // treating it as such is how a bound becomes decorative: with a reset, a
+  // flapping bridge (refuse → accept → refuse → accept …) mints one fresh agent
+  // turn per flap, forever, which is the exact failure this exists to stop
+  // (codex gate R1 P1). Decrementing yields precisely the wanted quantity —
+  // emissions minus known failures, i.e. frames that plausibly reached someone —
+  // so a run whose frames are ALWAYS refused is retried without limit (#370 /
+  // #1739 untouched: nothing ever landed), while the number that can LAND is
+  // capped however the transport behaves.
+  //
+  // Cleared outright only when the run is retired: a confirmed delivery
+  // (markDelivered / acknowledgeDelivery) or an eviction. Nothing else may clear
+  // it, because nothing else is evidence about frames already accepted.
+  //
+  // Deliberately NOT keyed off `awaitingDelivery`: that is a 120s watchdog whose
+  // expiry is a #585 DISCLOSURE signal, not permission to compose another frame.
+  const unackedDeliveries = new Map(); // key -> frames accepted, none acked yet
+  // Three (~60s at RUN_RECONCILE_SWEEP_MS: one live delivery + two sweeps) is a
+  // generous allowance for a frame genuinely lost in transit and still finite. A
+  // fourth would not recover anything the first three did not — nothing about
+  // the run changes between ticks except the clock.
+  const maxUnackedDeliveries = 3;
+  function clearUnackedDeliveries(k) {
+    unackedDeliveries.delete(k);
+  }
+  /** A completion frame for `k` has just been handed to the caller. */
+  function noteUnackedDelivery(k) {
+    if (k === NO_PROMPT_KEY) return;
+    if (!hasCompletionRecords(k)) return; // an unkeyed run is retired by its caller
+    unackedDeliveries.set(k, (unackedDeliveries.get(k) ?? 0) + 1);
+  }
+  /** …and the caller has reported that THAT one never left the browser. */
+  function releaseUnackedDelivery(k) {
+    const outstanding = unackedDeliveries.get(k);
+    if (outstanding === undefined) return;
+    if (outstanding <= 1) unackedDeliveries.delete(k);
+    else unackedDeliveries.set(k, outstanding - 1);
+  }
+  function unackedDeliveriesExhausted(k) {
+    return (unackedDeliveries.get(k) ?? 0) >= maxUnackedDeliveries;
+  }
   // Bound the in-flight window well past any realistic compose (metadata HEADs +
   // video storyboard sampling).
   const deliveryConfirmTimeoutMs = 120000;
@@ -740,6 +824,14 @@ export function createRunCompletionTracker({
   async function reconcileKey(promptId, fetchHistory, fetchQueued, isVideo) {
     const k = key(promptId);
     if (delivered.has(k) || !pending.has(k)) return null;
+    // #1842 — this run's bounded number of completion frames have already been
+    // handed over and no receipt has retired any of them. Refuse BEFORE the
+    // /history probe, so an orchestrator that never acks stops costing a fetch
+    // AND an agent turn on every sweep tick, forever. A frame the transport
+    // REFUSED does not count against this (markUndelivered gives that one slot
+    // back), so a run nothing ever accepted is still retried without limit —
+    // see `unackedDeliveries` for why that is a decrement and never a reset.
+    if (unackedDeliveriesExhausted(k)) return null;
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
@@ -947,6 +1039,7 @@ export function createRunCompletionTracker({
     starts.delete(k);
     startObserved.delete(k);
     pending.delete(k); // EVICT — bounds the ledger
+    clearUnackedDeliveries(k); // #1842 — the run is gone; nothing left to bound
     panelQueued.delete(k); // #356 Bug 2 — evicted with it
     liveReplays.delete(k);
     clearCompletionRecords(k);
@@ -1379,6 +1472,12 @@ export function createRunCompletionTracker({
       // cancel any in-flight retry so the re-pend restarts cleanly on the next edge.
       delivered.delete(k);
       clearReconcileRetry(k);
+      // #1842 — that frame never left the browser, so it must not spend a
+      // delivery slot. Give exactly IT back, and nothing more: a refusal says
+      // nothing about the frames that DID leave, and resetting the count on one
+      // would let a flapping transport mint an unbounded number of agent turns
+      // for one finished run — the bound this change exists to impose.
+      releaseUnackedDelivery(k);
       // It is back to being OWED, not in-flight — drop the delivery hold so the
       // 120s backstop can't be what decides isSettled() for it (#585).
       clearAwaitingDelivery(k);
@@ -1620,6 +1719,7 @@ export function createRunCompletionTracker({
     _terminal: terminal,
     _awaitingDelivery: awaitingDelivery,
     _unconfirmedDelivery: unconfirmedDelivery,
+    _unackedDeliveries: unackedDeliveries,
     _terminalNoKeyCompletion: terminalNoKeyCompletion,
     _terminalNoKeyFlushed: terminalNoKeyFlushed,
     _panelRunCompletionKeys: panelRunCompletionKeys,
