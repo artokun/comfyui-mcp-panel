@@ -3479,6 +3479,37 @@ const _tempWorkflowInstanceIds = new WeakMap(); // wf object -> "tmp:<uuid>"
 // recognize it as naming this same instance (#186).
 const _priorTempWorkflowIds = new WeakMap();
 
+// The workflow service exposes Vue proxies from openWorkflows while the active
+// binding and lifecycle callbacks can expose the raw ComfyWorkflow object. Route
+// identity is per OBJECT INSTANCE, so key both temporary-id stores on the same
+// raw object as the UUID store; otherwise one unsaved tab can mint different
+// `tmp:` handles in the active record and its open-list record during a
+// reconnect/probe race.
+function tempWorkflowInstanceId(wf) {
+  const raw = rawWorkflowObject(wf);
+  return raw && typeof raw === "object" ? _tempWorkflowInstanceIds.get(raw) : undefined;
+}
+
+function setTempWorkflowInstanceId(wf, id) {
+  const raw = rawWorkflowObject(wf);
+  if (raw && typeof raw === "object") _tempWorkflowInstanceIds.set(raw, id);
+}
+
+function deleteTempWorkflowInstanceId(wf) {
+  const raw = rawWorkflowObject(wf);
+  if (raw && typeof raw === "object") _tempWorkflowInstanceIds.delete(raw);
+}
+
+function priorTempWorkflowId(wf) {
+  const raw = rawWorkflowObject(wf);
+  return raw && typeof raw === "object" ? _priorTempWorkflowIds.get(raw) : undefined;
+}
+
+function setPriorTempWorkflowId(wf, id) {
+  const raw = rawWorkflowObject(wf);
+  if (raw && typeof raw === "object") _priorTempWorkflowIds.set(raw, id);
+}
+
 const _workflowObjectUuids = new WeakMap();
 const _workflowUuidOwners = new Map();
 // `graph_load` replaces the graph while intentionally keeping the active workflow object
@@ -3817,7 +3848,7 @@ function workflowDiskIdentityPath(wf) {
 function workflowRecordMatchesSelector(w, sel) {
   if (!w || typeof sel !== "string" || !sel) return false;
   if (workflowTabId(w) === sel) return true;
-  if (_priorTempWorkflowIds.get(w) === sel) return true;
+  if (priorTempWorkflowId(w) === sel) return true;
   if (!workflowDiskIdentityPath(w)) return false;
   return (
     w.path === sel ||
@@ -4812,16 +4843,16 @@ function workflowTabId(wf = activeWorkflowRef()) {
   // Key on the STABLE object instance, not the mutable wf.key (see the note at
   // _tempWorkflowInstanceIds): the same unsaved workflow must keep ONE tmp: id for
   // its lifetime, or the 600ms poll churns it into a re-hello storm.
-  let id = _tempWorkflowInstanceIds.get(wf);
+  let id = tempWorkflowInstanceId(wf);
   if (!id) {
     id = "tmp:" + crypto.randomUUID();
-    _tempWorkflowInstanceIds.set(wf, id);
+    setTempWorkflowInstanceId(wf, id);
     // Retain the FIRST tmp: id ever minted for this object, for its whole life, so a
     // create-time pin survives the tab's first save (tmp:→wf:) — see
     // _priorTempWorkflowIds. Never overwrite it: save-adopt clears the routing map
     // above, and a later isTemporary flag-drift (#215) would otherwise mint a fresh
     // tmp: here and clobber the original create-time pin (guard-off-by-one).
-    if (!_priorTempWorkflowIds.has(wf)) _priorTempWorkflowIds.set(wf, id);
+    if (!priorTempWorkflowId(wf)) setPriorTempWorkflowId(wf, id);
   }
   return id;
 }
@@ -7794,7 +7825,7 @@ async function groundUnsavedWorkflow() {
       // ("clear all … preserves workflow identity") red. The tmp: id this tab already
       // routes on is enough — threads carry it as `workflowRouteKey`, which is what the
       // filter matches — and if none exists yet there is nothing to bridge anyway.
-      identityProbe: (wf) => ({ routeId: (wf ? _tempWorkflowInstanceIds.get(wf) : null) ?? null }),
+      identityProbe: (wf) => ({ routeId: (wf ? tempWorkflowInstanceId(wf) : null) ?? null }),
       // #1263 — grounding is a FIRST SAVE, and a first save swaps the active
       // ComfyWorkflow object. Without this carry the successor's next identity
       // read re-minted the workflow uuid mid-session (no object cache on the new
@@ -27211,7 +27242,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               // (same-instance save), the orchestrator keeps injecting the pre-save
               // "tmp:<uuid>" pin (it moves the pin unchanged across the save's tab-id
               // migration), so this same instance must still be recognized (#186).
-              const priorTemp = wf ? _priorTempWorkflowIds.get(wf) : null;
+              const priorTemp = wf ? priorTempWorkflowId(wf) : null;
               const forms = wf ? workflowIdentityForms(wf, workflowTabId(wf), [priorTemp]) : [];
               const verdict = classifyPinnedTarget(pinnedPath, forms);
               if (verdict === "unknown") {
@@ -36581,7 +36612,7 @@ function buildPanel() {
     // drives via a one-shot context on the next message.
     if (followsPanel) {
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
-      if (wfid.startsWith("wf:") && wf) _tempWorkflowInstanceIds.delete(wf);
+      if (wfid.startsWith("wf:") && wf) deleteTempWorkflowInstanceId(wf);
       // #847 — CARRY THE ROUTE STAMP ACROSS THE SAVE, on every thread that holds it.
       //
       // A first save moves the tab from `tmp:<uuid>` to `wf:<path>` and re-mints the
@@ -36638,7 +36669,7 @@ function buildPanel() {
       // that made an earlier cut re-attribute one workflow's chats to another.
       const priorRouteIds = migratableRouteIds({
         newRouteId: wfid,
-        candidateRouteIds: [currentWorkflowId, wf ? _priorTempWorkflowIds.get(wf) : null],
+        candidateRouteIds: [currentWorkflowId, wf ? priorTempWorkflowId(wf) : null],
         openRouteIds: stillOpenRouteIds,
       });
 
@@ -36742,7 +36773,7 @@ function buildPanel() {
       wfid.startsWith("wf:");
     if (adopting) {
       const t = threadForWorkflow(historyKey);
-      if (wf) _tempWorkflowInstanceIds.delete(wf);
+      if (wf) deleteTempWorkflowInstanceId(wf);
       currentWorkflowId = wfid;
       currentWorkflowKey = wfkey;
       currentWorkflowRef = wf;
@@ -36843,7 +36874,7 @@ function buildPanel() {
       const currentWorkflowKeys = currentWorkflowIdentityKeys({
         storageKey: workflowStorageKey(),
         routeId: liveRouteId,
-        priorRouteId: activeWf ? _priorTempWorkflowIds.get(activeWf) : null,
+        priorRouteId: activeWf ? priorTempWorkflowId(activeWf) : null,
       });
       // #847 — and the identity this tab held before GROUNDING created this path. The
       // WeakMap above cannot help here: grounding replaces the workflow object, so it has
