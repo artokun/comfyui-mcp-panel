@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.102] - 2026-08-26
+
+### Fixed
+- a connect that renames its target says so, instead of leaving the caller a stale title (#1856)
+
+
 ## [0.15.101] - 2026-08-26
 
 ### Fixed
