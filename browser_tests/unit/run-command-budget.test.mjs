@@ -2071,3 +2071,139 @@ test("#1845 CONTROL: a batch that queued SOME prompts before the surface died ke
     stop();
   }
 });
+
+// #1861 — a scoped batch with repeating controls must attach repeating_controls_note
+// to the partially_queued result. The note is ONLY attached for scoped batches with
+// batch > 1, and the path must be DRIVEN to verify the attachment happens. A source-grep
+// test that counts call sites is insufficient; removing one call site would pass the
+// grep while missing the real code path.
+//
+// SCENARIO: a scoped run with batch_count > 1 and a graph containing a
+// control_after_generate widget with an advancing mode (e.g., "randomize"). The run uses
+// postThenHang mode with a budget short enough to expire mid-batch, triggering one of
+// the two partially_queued early returns that call attachControlRepetitionNote.
+//
+// ASSERTION: the returned result carries repeating_controls_note when the conditions above
+// are met.
+//
+// The trap: the existing #1565 P1 test uses makeUnscopedFrontend with batch_count 1, and
+// the note only attaches for batch > 1. Asserting the note there asserts something that
+// legitimately should not be present and will not fail for the right reason.
+
+/** Helper to make a scoped frontend with control_after_generate widget. */
+function makeScopedFrontendWithControlWidget({ apiTarget, mode, drainMs = 5, batch = 4 }) {
+  // Graph with a KSampler node that has control_after_generate widget with randomize mode
+  const controlWidget = {
+    name: "control_after_generate",
+    value: "randomize",
+    type: "combo",
+    options: {
+      values: ["fixed", "increment", "decrement", "randomize", "increment-wrap"],
+      serialize: false,
+      canvasOnly: true,
+    },
+  };
+
+  const graph = {
+    _nodes: [
+      {
+        id: 3,
+        type: "KSampler",
+        widgets: [{ name: "seed", value: 0 }, controlWidget, { name: "steps", value: 20 }],
+      },
+      {
+        id: 9,
+        type: "SaveImage",
+        widgets: [],
+      },
+      {
+        id: 327,
+        type: "SaveImage",
+        widgets: [],
+      },
+    ],
+  };
+
+  const app = {
+    queueItems: [],
+    graph,
+    graphToPrompt: async () => ({
+      output: {
+        "3": { class_type: "KSampler", inputs: {} },
+        "9": { class_type: "SaveImage", inputs: {} },
+        "327": { class_type: "SaveImage", inputs: {} },
+      },
+      workflow: {},
+    }),
+    queuePrompt: async (_number, batchCount = 1) => {
+      const post = () =>
+        apiTarget.fetchApi("/prompt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: {
+              "3": { class_type: "KSampler", inputs: {} },
+              "9": { class_type: "SaveImage", inputs: {} },
+              "327": { class_type: "SaveImage", inputs: {} },
+            },
+            client_id: "x",
+          }),
+        });
+      if (mode === "postThenHang") {
+        await post();
+        return new Promise(() => {});
+      }
+      return true;
+    },
+  };
+  return app;
+}
+
+test("#1861: a scoped batch with repeating controls attaches the note to partially_queued result", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeScopedFrontendWithControlWidget({ apiTarget, mode: "postThenHang" });
+
+    // Dispatch that simulates a partial batch where only SOME prompts verified before
+    // the verification process ran out (e.g., due to timeout or other verification failure).
+    // This triggers the first partially_queued early return (verified > 0 && unresolved === 0)
+    // at line 19237-19276 in comfyui-mcp-panel.js.
+    const dispatch = async () => {
+      // Return outcome "unverified" so the check (runScopeResult.outcome !== "dispatched")
+      // is true and we enter the early return block. Set verified=2 and unresolved=0
+      // so the condition (verified > 0 && unresolved === 0) triggers the first return.
+      return {
+        outcome: "unverified",
+        queueMark: 1,
+        verified: 2, // out of batch_count: 4 — some were verified
+        indeterminate: 0, // none are indeterminate
+        inFlight: 0, // none are in flight
+        error: "verification incomplete",
+      };
+    };
+
+    const built = realGraphRun({ app, apiTarget, budgetMs: 600, serializeMs: 400, dispatch });
+    const res = await built.graph_run({ to_node_id: 327, batch_count: 4 });
+
+    // The run should be partial because some prompts verified, none unresolved
+    assert.equal(res.queued, true, "some prompts queued");
+    assert.equal(res.partially_queued, true, "batch is partial");
+    assert.equal(res.complete, false, "run did not complete");
+    assert.equal(res.queued_count, 2, "2 prompts were verified");
+
+    // The key assertion: repeating_controls_note should be present
+    // because we have a scoped batch with batch > 1 and repeating controls
+    assert.ok(
+      res.repeating_controls_note,
+      "repeating_controls_note should be attached for scoped batch with repeating controls",
+    );
+    assert.ok(Array.isArray(res.repeating_controls), "repeating_controls array should be present");
+    assert.ok(res.repeating_controls.length > 0, "repeating_controls should not be empty");
+
+    // Verify the note mentions the control widget we added
+    assert.match(String(res.repeating_controls_note), /randomize/, "note should mention the randomize mode");
+  } finally {
+    stop();
+  }
+});
