@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.96] - 2026-08-25
+
+### Fixed
+- keep the selected provider visible and preselected when host availability is incomplete (#1818)
+
 ## [0.15.95] - 2026-08-25
 
 ### Fixed
