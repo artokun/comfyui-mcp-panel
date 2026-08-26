@@ -463,6 +463,39 @@ test("#1873 the disclosure is produced by the FIX, not by the fixture", () => {
   assert.equal(res.warning, undefined);
 });
 
+test("#1873 a node that becomes unreadable mid-connect does not fail a LANDED wire", () => {
+  const { graph, sw } = loadedSwitchFixture();
+  // The pack breaks its own `widgets` accessor from inside the connect. This is
+  // the one property `describeSlotRewrites` reads that `graph_connect` does not,
+  // so a throw here can ONLY escape through the disclosure rider — which is
+  // exactly the contract its header promises it never does. The capture already
+  // happened, so the BEFORE snapshot exists and the read-back is what throws.
+  let broken = false;
+  const original = sw.widgets;
+  Object.defineProperty(sw, "widgets", {
+    configurable: true,
+    get() {
+      if (broken) throw new TypeError("widgets accessor removed by the pack");
+      return original;
+    },
+  });
+  const source = graph.getNodeById(1);
+  const prior = source.connect;
+  source.connect = (outIdx, target, inIdx) => {
+    const link = prior(outIdx, target, inIdx);
+    broken = true;
+    return link;
+  };
+  const graph_connect = buildConnect(graph);
+
+  const res = graph_connect({ from_node_id: 1, from_output: 0, to_node_id: 2, to_input: "input3" });
+
+  // The wire landed; the unreadable node must cost the caller nothing but the
+  // disclosure it could not compute.
+  assert.equal(res.connected.to.node_id, 2);
+  assert.equal(res.slots_rewritten, undefined);
+});
+
 test("#1873 a connect that changes nothing addressable stays byte-identical", () => {
   const graph = mkGraph();
   const source = mkNodeWithOutput(graph, 1, "Load Image");

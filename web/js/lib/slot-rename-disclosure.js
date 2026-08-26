@@ -164,30 +164,41 @@ export function describeSlotRewrites(snapshot) {
   for (const entry of snapshot ?? []) {
     const node = entry?.node;
     if (!node || typeof node !== "object") continue;
-    const slots = [];
-    for (const kind of ["input", "output"]) {
-      const before = (kind === "input" ? entry.inputs : entry.outputs) ?? [];
-      const after = slotNames(kind === "input" ? node.inputs : node.outputs);
-      for (let i = 0; i < before.length; i++) {
-        // `i >= after.length` is a REMOVAL, reported as `to: null`. Indices at or
-        // beyond `before.length` are new slots and are deliberately not read.
-        const to = i < after.length ? after[i] : null;
-        if (before[i] === to) continue;
-        slots.push({ kind, index: i, from: before[i] ?? null, to });
+    // Per-node try, matching `captureSlotNames`. `node.inputs` / `node.outputs` /
+    // `node.widgets` / `node.id` are property READS, and an extension is free to
+    // install a throwing getter or a Proxy over any of them (cg-use-everywhere
+    // already replaces frontend API surface this panel calls). Without this, such
+    // a read escapes AFTER the wire has landed and turns a successful connect
+    // into a reported failure — the exact outcome the "never throws" contract in
+    // the header exists to prevent, and the one #1272 spent a whole issue undoing.
+    try {
+      const slots = [];
+      for (const kind of ["input", "output"]) {
+        const before = (kind === "input" ? entry.inputs : entry.outputs) ?? [];
+        const after = slotNames(kind === "input" ? node.inputs : node.outputs);
+        for (let i = 0; i < before.length; i++) {
+          // `i >= after.length` is a REMOVAL, reported as `to: null`. Indices at or
+          // beyond `before.length` are new slots and are deliberately not read.
+          const to = i < after.length ? after[i] : null;
+          if (before[i] === to) continue;
+          slots.push({ kind, index: i, from: before[i] ?? null, to });
+        }
       }
+      const widgets = [];
+      const widgetsBefore = entry.widgets ?? [];
+      const widgetsAfter = widgetValues(node.widgets);
+      for (let i = 0; i < widgetsBefore.length && i < widgetsAfter.length; i++) {
+        const was = widgetsBefore[i];
+        const now = widgetsAfter[i];
+        if (was?.name !== now?.name) continue;
+        if (Object.is(was?.value, now?.value)) continue;
+        widgets.push({ name: was?.name ?? null, from: was?.value, to: now?.value });
+      }
+      if (!slots.length && !widgets.length) continue;
+      rewrites.push({ node_id: node.id, slots, widgets });
+    } catch {
+      /* an unreadable node contributes no disclosure, never a thrown verdict */
     }
-    const widgets = [];
-    const widgetsBefore = entry.widgets ?? [];
-    const widgetsAfter = widgetValues(node.widgets);
-    for (let i = 0; i < widgetsBefore.length && i < widgetsAfter.length; i++) {
-      const was = widgetsBefore[i];
-      const now = widgetsAfter[i];
-      if (was?.name !== now?.name) continue;
-      if (Object.is(was?.value, now?.value)) continue;
-      widgets.push({ name: was?.name ?? null, from: was?.value, to: now?.value });
-    }
-    if (!slots.length && !widgets.length) continue;
-    rewrites.push({ node_id: node.id, slots, widgets });
   }
   return rewrites;
 }
