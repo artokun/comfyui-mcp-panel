@@ -332,4 +332,11 @@ test("#1871 the disclosure names the node ComfyUI refused, what was omitted, and
   assert.match(note, /Nothing was queued by that refusal/);
   // It must not leave the caller thinking the missing pack is now fine.
   assert.match(note, /FULL run will still fail/);
+  // #1871 was filed BECAUSE the note said WHAT happened but never why the first post was
+  // not pruned to begin with, which reads as an ordering bug the panel forgot to fix. It
+  // is a deliberate trade (see this module's header): pruning every scoped run would make
+  // ComfyUI evict the other branch's cache. Pin the reason so it travels WITH the refusal
+  // rather than living only in a source comment the reporter cannot see.
+  assert.match(note, /NOT pre-pruned, on purpose/);
+  assert.match(note, /evict the other branch's cached results/);
 });
