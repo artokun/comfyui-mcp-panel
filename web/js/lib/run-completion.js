@@ -80,6 +80,9 @@ export function createRunCompletionKey(routeId, sessionId, promptId, nonce = nul
  * @param {(promptId:(string|null)) => void} [opts.onRepend]  Called after
  *   markUndelivered() re-pends a run, so the wiring can re-arm recovery
  *   (the safety sweep) for the ledger the run just re-entered (#1739).
+ * @param {(entries:Array<object>) => void} [opts.onTerminalCompletionStateChange]
+ *   Called when a completion released without its prompt-scoped key changes
+ *   state, so teardown/reload can preserve the exact media batch.
  * @param {(fn:Function, ms:number) => any} [opts.setTimer]
  * @param {(t:any) => void} [opts.clearTimer]
  * @param {number} [opts.debounceMs]       Orphan-flush / re-arm interval (default 1500).
@@ -91,6 +94,7 @@ export function createRunCompletionTracker({
   onReconcileInterrupted,
   onReconcileGiveUp,
   onCompletionStateChange,
+  onTerminalCompletionStateChange,
   // comfyui-mcp#1739 — called AFTER markUndelivered() has re-pended a run. The
   // pending ledger is recovery-driven (reconnect edges + the safety sweep, which
   // SELF-DISARMS the moment it observes an empty ledger), and flush() retires a
@@ -181,7 +185,16 @@ export function createRunCompletionTracker({
   // onQueued can attach that key; otherwise the ordinary unkeyed path marks it
   // delivered and the later prompt receipt has nothing to replay.
   const terminalNoKeyCompletion = new Map(); // key -> payload
+  // The timeout fallback may already have emitted an unkeyed frame, but it must
+  // remain recoverable until the delayed /prompt identity binds it.
+  const terminalNoKeyFlushed = new Set(); // keys whose unkeyed fallback was sent
   const panelRunDispatches = new Map(); // token -> timer
+  // Lifecycle prompt ids observed while a panel_run hold is active remain
+  // associated with that dispatch after the 30-second timer expires. Without
+  // this handoff fence, a long render finishing after the timer bypasses
+  // terminalNoKeyCompletion entirely and is marked delivered unkeyed.
+  const panelRunCompletionKeys = new Set();
+  let panelRunLateCapture = false;
   // A panel_run completion is not retired when the browser socket accepts the
   // frame. Keep the stable route+prompt key with the run so /history retries
   // carry the same idempotency key until the orchestrator acknowledges it.
@@ -371,12 +384,34 @@ export function createRunCompletionTracker({
     );
   }
 
-  function releaseUnkeyedCompletion(k, payload) {
-    terminalNoKeyCompletion.delete(k);
+  function releaseUnkeyedCompletion(k, payload, { retire = false } = {}) {
+    if (terminalNoKeyFlushed.has(k)) {
+      if (retire) {
+        terminalNoKeyCompletion.delete(k);
+        terminalNoKeyFlushed.delete(k);
+        markDelivered(k);
+        notifyTerminalCompletionStateChange();
+      }
+      return;
+    }
+    if (k !== NO_PROMPT_KEY && !pending.has(k)) {
+      pending.set(k, { promptId: k, at: now() });
+    }
+    terminalNoKeyFlushed.add(k);
     markTerminal(k);
     markDispatched(k);
-    markDelivered(k);
-    onFlush({ ...payload, key: k, promptId: payload.promptId ?? promptIdOf(k) });
+    onFlush({
+      ...payload,
+      key: k,
+      promptId: payload.promptId ?? promptIdOf(k),
+      awaitingCompletionKey: true,
+    });
+    if (retire) {
+      terminalNoKeyCompletion.delete(k);
+      terminalNoKeyFlushed.delete(k);
+      markDelivered(k);
+    }
+    notifyTerminalCompletionStateChange();
   }
 
   function releaseHeldUnkeyedCompletions() {
@@ -386,14 +421,47 @@ export function createRunCompletionTracker({
     }
   }
 
+  function notePanelRunLifecycle(k) {
+    if (k === NO_PROMPT_KEY) return;
+    if (panelRunDispatches.size || panelRunLateCapture) {
+      panelRunCompletionKeys.add(k);
+      if (!panelRunDispatches.size) panelRunLateCapture = false;
+    }
+  }
+
   function completionMetadataSnapshot() {
     return [...completionMeta.entries()].map(([promptId, value]) => ({ promptId, ...value }));
+  }
+
+  function terminalCompletionMetadataSnapshot() {
+    return [...terminalNoKeyCompletion.entries()].map(([promptId, payload]) => ({
+      promptId,
+      payload: {
+        promptId,
+        images: Array.isArray(payload?.images) ? [...payload.images] : [],
+        videos: Array.isArray(payload?.videos) ? [...payload.videos] : [],
+        durationMs: Number.isFinite(payload?.durationMs) ? payload.durationMs : null,
+        finishedAt: Number.isFinite(payload?.finishedAt) ? payload.finishedAt : null,
+        ...(typeof payload?.duplicateOf === "string" ? { duplicateOf: payload.duplicateOf } : {}),
+        ...(typeof payload?.looksCached === "boolean" ? { looksCached: payload.looksCached } : {}),
+      },
+      unkeyedFlushed: terminalNoKeyFlushed.has(promptId),
+    }));
   }
 
   function notifyCompletionStateChange() {
     if (typeof onCompletionStateChange !== "function") return;
     try {
       onCompletionStateChange(completionMetadataSnapshot());
+    } catch {
+      /* persistence is best-effort and must never affect delivery */
+    }
+  }
+
+  function notifyTerminalCompletionStateChange() {
+    if (typeof onTerminalCompletionStateChange !== "function") return;
+    try {
+      onTerminalCompletionStateChange(terminalCompletionMetadataSnapshot());
     } catch {
       /* persistence is best-effort and must never affect delivery */
     }
@@ -518,13 +586,21 @@ export function createRunCompletionTracker({
         ? { duplicateOf: verdict.duplicateOf, looksCached: !!verdict.looksCached }
         : {}),
     };
-    if (!completionKey && panelRunDispatches.size && k !== NO_PROMPT_KEY) {
+    if (
+      !completionKey &&
+      (panelRunDispatches.size || panelRunCompletionKeys.has(k)) &&
+      k !== NO_PROMPT_KEY
+    ) {
       // Do not retire this as an ordinary canvas completion while a panel_run
       // dispatch is waiting for its delayed prompt receipt. The bounded dispatch
       // hold lets onQueued re-key the exact media batch; its timer is the explicit
       // compatibility fence for a legacy/aborted queue response.
       terminalNoKeyCompletion.set(k, payload);
       markTerminal(k);
+      notifyTerminalCompletionStateChange();
+      // Once the bounded hold has expired, release the unkeyed best-effort
+      // frame immediately but retain the terminal record for keyed replay.
+      if (!panelRunDispatches.size) releaseUnkeyedCompletion(k, payload);
       return;
     }
     markTerminal(k);
@@ -569,6 +645,13 @@ export function createRunCompletionTracker({
   async function reconcileKey(promptId, fetchHistory, fetchQueued, isVideo) {
     const k = key(promptId);
     if (delivered.has(k) || !pending.has(k)) return null;
+    // A timeout-released panel_run already owns the exact media batch, but its
+    // delayed /prompt identity has not supplied the completion key yet. Do not
+    // replace that recoverable record with an unkeyed /history delivery: the
+    // later onQueued callback must still be able to bind and replay it.
+    if (terminalNoKeyCompletion.has(k) && !completionKeys.has(k)) {
+      return { promptId, status: "success", delivered: false };
+    }
     // #1619 — a live executed batch is stronger than a remote history probe:
     // it is the exact output for this prompt, already observed on the panel's
     // authenticated websocket. Retain the temp PreviewImage descriptor when a
@@ -773,6 +856,10 @@ export function createRunCompletionTracker({
     panelQueued.delete(k); // #356 Bug 2 — evicted with it
     liveReplays.delete(k);
     completionKeys.delete(k);
+    panelRunCompletionKeys.delete(k);
+    terminalNoKeyCompletion.delete(k);
+    terminalNoKeyFlushed.delete(k);
+    notifyTerminalCompletionStateChange();
     markTerminal(promptId); // fence any stray late execution_start; ages out (not pinned)
     if (typeof onReconcileGiveUp === "function") {
       try {
@@ -843,6 +930,7 @@ export function createRunCompletionTracker({
       // being RE-PENDED for retry (markUndelivered clears `delivered` but not
       // `terminal`). NO_PROMPT_KEY is never in `terminal`, so id-less runs proceed.
       if (terminal.has(k)) return;
+      notePanelRunLifecycle(k);
       // Runs are sequential: a new run beginning means EVERY prior run has ended
       // (even one whose end signal we missed). Flush every existing buffer under
       // ITS OWN key/timing first, so an older buffer — including a legacy
@@ -885,6 +973,7 @@ export function createRunCompletionTracker({
       markStart(id, { observed: false });
       trackPending(id);
       const k = key(id);
+      notePanelRunLifecycle(k);
       const buf = ensureBuffer(k);
       if (images.length) buf.images.push(...images);
       if (videos.length) buf.videos.push(...videos);
@@ -904,6 +993,7 @@ export function createRunCompletionTracker({
     startObserved.delete(k);
         return;
       }
+      notePanelRunLifecycle(k);
       // #356 Bug 2 — a run that produced NO image and NO video buffers nothing
       // (onExecuted discards a media-less `executed`), so flush() returns at its
       // `!buf` guard and the agent is never told the run finished. For a canvas run
@@ -986,7 +1076,13 @@ export function createRunCompletionTracker({
       // If already terminal (reconcile surfaced this run's outcome), don't re-mark
       // (which would clear a re-pend). The caller uses wasTerminal() BEFORE calling
       // this to suppress a duplicate run_error frame (codex P1).
-      if (!terminal.has(k)) markDelivered(k);
+      if (!terminal.has(k)) {
+        panelRunCompletionKeys.delete(k);
+        terminalNoKeyCompletion.delete(k);
+        terminalNoKeyFlushed.delete(k);
+        notifyTerminalCompletionStateChange();
+        markDelivered(k);
+      }
     },
 
     /**
@@ -1064,6 +1160,9 @@ export function createRunCompletionTracker({
       const lateMedia = id != null ? terminalNoKeyCompletion.get(k) : null;
       if (lateMedia) {
         terminalNoKeyCompletion.delete(k);
+        terminalNoKeyFlushed.delete(k);
+        panelRunCompletionKeys.delete(k);
+        notifyTerminalCompletionStateChange();
         delivered.delete(k);
         if (completionKeys.has(k)) {
           if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
@@ -1072,7 +1171,7 @@ export function createRunCompletionTracker({
           markDispatched(k);
           onFlush({ ...lateMedia, key: k, completionKey: completionKeys.get(k) });
         } else {
-          releaseUnkeyedCompletion(k, lateMedia);
+          releaseUnkeyedCompletion(k, lateMedia, { retire: true });
         }
       }
       // #1728 P2 — execution_success can win the race with the delayed /prompt
@@ -1083,6 +1182,7 @@ export function createRunCompletionTracker({
       const lateSuccess = id != null ? terminalNoMediaSuccess.get(k) : null;
       if (lateSuccess) {
         terminalNoMediaSuccess.delete(k);
+        panelRunCompletionKeys.delete(k);
         delivered.delete(k);
         if (completionKeys.has(k)) {
           if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
@@ -1121,7 +1221,11 @@ export function createRunCompletionTracker({
       liveReplays.delete(key(id));
       completionKeys.delete(key(id));
       completionMeta.delete(key(id));
+      terminalNoKeyCompletion.delete(key(id));
+      terminalNoKeyFlushed.delete(key(id));
+      panelRunCompletionKeys.delete(key(id));
       notifyCompletionStateChange();
+      notifyTerminalCompletionStateChange();
       markDelivered(id);
     },
 
@@ -1138,7 +1242,11 @@ export function createRunCompletionTracker({
       liveReplays.delete(k);
       completionKeys.delete(k);
       completionMeta.delete(k);
+      terminalNoKeyCompletion.delete(k);
+      terminalNoKeyFlushed.delete(k);
+      panelRunCompletionKeys.delete(k);
       notifyCompletionStateChange();
+      notifyTerminalCompletionStateChange();
       markDelivered(k);
       return true;
     },
@@ -1175,6 +1283,7 @@ export function createRunCompletionTracker({
       const token = `panel-run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
       const timer = setTimer(() => {
         panelRunDispatches.delete(token);
+        if (!panelRunDispatches.size) panelRunLateCapture = true;
         releaseHeldUnkeyedCompletions();
       }, 30_000);
       panelRunDispatches.set(token, timer);
@@ -1200,11 +1309,48 @@ export function createRunCompletionTracker({
       return completionMetadataSnapshot();
     },
 
+    /** Persistable terminal media held for a delayed prompt-scoped key. */
+    terminalCompletionMetadata() {
+      return terminalCompletionMetadataSnapshot();
+    },
+
+    /** Restore one held terminal record after teardown/reload. */
+    restoreTerminalCompletion(entry) {
+      const k = key(entry?.promptId);
+      const payload = entry?.payload;
+      if (
+        k === NO_PROMPT_KEY ||
+        !payload ||
+        typeof payload !== "object" ||
+        (!Array.isArray(payload.images) && !Array.isArray(payload.videos)) ||
+        (!payload.images?.length && !payload.videos?.length)
+      ) {
+        return false;
+      }
+      terminalNoKeyCompletion.set(k, {
+        key: k,
+        promptId: k,
+        images: Array.isArray(payload.images) ? [...payload.images] : [],
+        videos: Array.isArray(payload.videos) ? [...payload.videos] : [],
+        durationMs: Number.isFinite(payload.durationMs) ? payload.durationMs : null,
+        finishedAt: Number.isFinite(payload.finishedAt) ? payload.finishedAt : null,
+        ...(typeof payload.duplicateOf === "string" ? { duplicateOf: payload.duplicateOf } : {}),
+        ...(typeof payload.looksCached === "boolean" ? { looksCached: payload.looksCached } : {}),
+      });
+      if (entry.unkeyedFlushed === true) terminalNoKeyFlushed.add(k);
+      else terminalNoKeyFlushed.delete(k);
+      panelRunCompletionKeys.add(k);
+      if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
+      markTerminal(k);
+      return true;
+    },
+
     dispose() {
       for (const timer of panelRunDispatches.values()) {
         try { clearTimer(timer); } catch {}
       }
       panelRunDispatches.clear();
+      panelRunLateCapture = false;
     },
 
     /**
@@ -1363,5 +1509,7 @@ export function createRunCompletionTracker({
     _awaitingDelivery: awaitingDelivery,
     _unconfirmedDelivery: unconfirmedDelivery,
     _terminalNoKeyCompletion: terminalNoKeyCompletion,
+    _terminalNoKeyFlushed: terminalNoKeyFlushed,
+    _panelRunCompletionKeys: panelRunCompletionKeys,
   };
 }

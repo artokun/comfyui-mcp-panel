@@ -5056,6 +5056,9 @@ const REBOOT_KEY = "comfyui-mcp.panel.rebootResume";
 // frontend reload. The reboot marker carries the same metadata for a ComfyUI
 // restart; this smaller ledger covers an ordinary panel remount as well.
 const RUN_COMPLETION_META_KEY = "comfyui-mcp.panel.runCompletionMeta.v1";
+// Unkeyed terminal media released after the bounded panel_run hold. This is a
+// separate ledger because the prompt-scoped completion key may arrive later.
+const RUN_COMPLETION_TERMINAL_KEY = "comfyui-mcp.panel.runCompletionTerminal.v1";
 // Set while a soft reload (orchestrator respawn, no ComfyUI restart) is in
 // flight. Value is the trigger origin ("agent" | "user") so that after the
 // fresh orchestrator reconnects we resume the session and — only for an
@@ -5351,6 +5354,54 @@ function restoreRunCompletionMetadata(tracker) {
     }
   }
   return entries.length;
+}
+
+function readRunCompletionTerminals() {
+  const raw = ssGet(RUN_COMPLETION_TERMINAL_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (entry) =>
+          entry &&
+          typeof entry.promptId === "string" &&
+          entry.promptId.trim() &&
+          entry.payload &&
+          typeof entry.payload === "object" &&
+          (Array.isArray(entry.payload.images) || Array.isArray(entry.payload.videos)),
+      )
+      .slice(0, 64);
+  } catch {
+    return [];
+  }
+}
+
+function persistRunCompletionTerminals(entries) {
+  const safe = Array.isArray(entries) ? entries.slice(0, 64) : [];
+  if (!safe.length) {
+    ssSet(RUN_COMPLETION_TERMINAL_KEY, null);
+    return;
+  }
+  try {
+    ssSet(RUN_COMPLETION_TERMINAL_KEY, JSON.stringify(safe));
+  } catch {
+    // Storage is best-effort; the in-memory tracker remains authoritative.
+  }
+}
+
+function restoreRunCompletionTerminals(tracker) {
+  if (!tracker || typeof tracker.restoreTerminalCompletion !== "function") return 0;
+  let restored = 0;
+  for (const entry of readRunCompletionTerminals()) {
+    try {
+      if (tracker.restoreTerminalCompletion(entry)) restored += 1;
+    } catch {
+      // A malformed persisted row must not prevent the panel from mounting.
+    }
+  }
+  return restored;
 }
 
 // Sticky auto-connect: once the user has connected, the panel auto-reconnects
@@ -37931,6 +37982,7 @@ function buildPanel() {
   // batch + duration for a completed prompt and composes the single agent_event.
   const runCompletion = createRunCompletionTracker({
     onCompletionStateChange: (entries) => persistRunCompletionMetadata(entries),
+    onTerminalCompletionStateChange: (entries) => persistRunCompletionTerminals(entries),
     // comfyui-mcp#1739 — a run re-pended by markUndelivered (the completion frame's
     // sendFrame failed: bridge/socket churn, e.g. around a workflow-tab switch
     // re-hello) re-enters a ledger that may have NO sweeper left: flush() retired
@@ -38163,7 +38215,12 @@ function buildPanel() {
   // Remount/reload adoption restores the exact key and route/session metadata
   // before the first reconcile probe, so a retained completion can be replayed
   // as the same panel_run receipt rather than downgraded to a fresh run.
-  if (restoreRunCompletionMetadata(runCompletion) > 0) armRunReconcileSweep();
+  if (
+    restoreRunCompletionMetadata(runCompletion) > 0 ||
+    restoreRunCompletionTerminals(runCompletion) > 0
+  ) {
+    armRunReconcileSweep();
+  }
 
   // ── #585: correlated restart-resume ───────────────────────────────────────
   // After a ComfyUI restart the panel nudges the agent to continue. If a render
@@ -42577,6 +42634,7 @@ function buildPanel() {
       // refs if they still point at THIS instance — a newer mount may already own them.
       runReconcileSweep.dispose();
       persistRunCompletionMetadata(runCompletion.completionMetadata?.() ?? []);
+      persistRunCompletionTerminals(runCompletion.terminalCompletionMetadata?.() ?? []);
       runCompletion.dispose?.();
       if (panelRunOwnerRef.current === mountOwner) {
         panelRunOwnerRef.current = null;

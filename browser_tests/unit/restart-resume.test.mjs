@@ -529,6 +529,64 @@ test("#1824: restart adoption preserves the keyed completion route and session",
   }]);
 });
 
+test("#1824: a timeout-released terminal batch survives teardown and late prompt adoption", async () => {
+  const firstFlushes = [];
+  const first = makeTracker((payload) => firstFlushes.push(payload));
+  const dispatchToken = first.beginPanelRun();
+  first.onExecutionStart("P-timeout");
+  first.onExecuted("P-timeout", {
+    images: [{ filename: "timeout.png", type: "output" }],
+  });
+  first.onExecutionSuccess("P-timeout");
+  first._fireTimers(30000);
+  assert.equal(firstFlushes.length, 1, "the expired production hold emits its fallback frame");
+  assert.equal(firstFlushes[0].awaitingCompletionKey, true);
+  assert.equal(first.hasPending(), true);
+  const terminalState = first.terminalCompletionMetadata();
+  assert.deepEqual(terminalState[0], {
+    promptId: "P-timeout",
+    payload: {
+      promptId: "P-timeout",
+      images: [{ filename: "timeout.png", type: "output" }],
+      videos: [],
+      durationMs: 0,
+      finishedAt: 1_000_000,
+    },
+    unkeyedFlushed: true,
+  });
+  first.dispose();
+
+  const replayed = [];
+  const fresh = makeTracker((payload) => replayed.push(payload));
+  assert.equal(fresh.restoreTerminalCompletion(terminalState[0]), true);
+  await fresh.reconcile({
+    fetchHistory: async () => ({
+      outputs: { 9: { images: [{ filename: "history.png", type: "output" }] } },
+      status: { status_str: "success", completed: true, messages: [] },
+    }),
+    fetchQueued: async () => false,
+    isVideo: () => false,
+  });
+  assert.equal(replayed.length, 0, "history cannot replace the retained unkeyed terminal record");
+  assert.equal(fresh.terminalCompletionMetadata().length, 1);
+  fresh.onQueued("P-timeout", {
+    routeId: "panel-route-1824",
+    sessionId: "session-1824",
+    dispatchToken,
+  });
+  assert.equal(replayed.length, 1, "the delayed prompt binds and replays after restart");
+  assert.equal(replayed[0].promptId, "P-timeout");
+  assert.equal(replayed[0].images[0].filename, "timeout.png");
+  assert.equal(typeof replayed[0].completionKey, "string");
+  assert.equal(fresh.hasPending(), true, "restart adoption still waits for the matching receipt");
+  assert.equal(
+    fresh.acknowledgeDelivery("P-timeout", replayed[0].completionKey),
+    true,
+    "the bound completion can be retired only by its exact receipt",
+  );
+  assert.equal(fresh.hasPending(), false);
+});
+
 // ── the resume must reach the conversation that ASKED for the restart ─────────
 
 test("#585 P1(session): switching conversations between arm and ack must not misdeliver the resume", () => {

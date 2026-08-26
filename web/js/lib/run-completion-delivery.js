@@ -47,6 +47,7 @@ export function createRunCompletionFlushHandler({
     images: flImages,
     videos: flVideos,
     completionKey,
+    awaitingCompletionKey,
     durationMs,
     noMedia,
     duplicateOf,
@@ -60,6 +61,9 @@ export function createRunCompletionFlushHandler({
     // orchestrator's matching receipt arrives. Legacy/canvas completions without
     // a key retain the existing transport-confirmation behavior.
     const awaitsReceipt = typeof completionKey === "string" && completionKey.length > 0;
+    // A timeout fallback may be sent before delayed /prompt identity arrives.
+    // It remains recoverable until the tracker can replay it with a key.
+    const awaitsCompletionKey = awaitingCompletionKey === true;
     let framePushed = false;
     let sendAttempted = false;
     const compositionStartedAt = now();
@@ -145,15 +149,19 @@ export function createRunCompletionFlushHandler({
         // permanent suppression (sendFrame returns false for both a down socket
         // AND AGENT_MUTED): a muted completion must NOT be recovered/replayed on
         // a later unmute+reconnect, so treat it as delivered (codex P1).
-        if (frame == null || (framePushed && !awaitsReceipt)) markDelivered(promptId);
-        else if (framePushed && awaitsReceipt) {
-          // The receipt, not the browser write, retires this panel_run.
+        if (frame == null && !awaitsCompletionKey) markDelivered(promptId);
+        else if (framePushed && !awaitsReceipt && !awaitsCompletionKey) markDelivered(promptId);
+        else if (framePushed && (awaitsReceipt || awaitsCompletionKey)) {
+          // A receipt retires keyed delivery; a delayed prompt identity retires
+          // the recoverable unkeyed fallback by replaying it keyed.
         } else if (isAgentMuted()) markDelivered(promptId);
         else markUndelivered(promptId);
         // #585: for legacy/unkeyed frames this is the moment "the agent was
         // told" becomes true (or is re-pended). Keyed panel_run frames update
         // the marker from the orchestrator acknowledgement callback instead.
-        if (frame == null || !awaitsReceipt || isAgentMuted()) pruneRebootMarker();
+        if ((frame == null && !awaitsCompletionKey) || (!awaitsReceipt && !awaitsCompletionKey) || isAgentMuted()) {
+          pruneRebootMarker();
+        }
       })
       .catch((err) => {
         if (!isAgentMuted()) {
@@ -170,9 +178,13 @@ export function createRunCompletionFlushHandler({
         // Composition threw before/around the send — treat as undelivered so a
         // reconnect can recover the outcome from /history rather than lose it
         // (but respect an intentional mute, as above).
-        if ((framePushed && !awaitsReceipt) || isAgentMuted()) markDelivered(promptId);
-        else if (!(framePushed && awaitsReceipt)) markUndelivered(promptId);
-        if (!awaitsReceipt || isAgentMuted()) pruneRebootMarker(); // #585 — see the .then branch above
+        if ((framePushed && !awaitsReceipt && !awaitsCompletionKey) || isAgentMuted()) markDelivered(promptId);
+        else if (framePushed && (awaitsReceipt || awaitsCompletionKey)) {
+          // The already-pushed frame remains recoverable until its key/receipt.
+        } else markUndelivered(promptId);
+        if ((!awaitsReceipt && !awaitsCompletionKey) || isAgentMuted()) {
+          pruneRebootMarker(); // #585 — see the .then branch above
+        }
       });
   };
 }
