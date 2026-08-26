@@ -24196,9 +24196,28 @@ const GRAPH_TOOL_EXECUTORS = {
           pressableWidgetHint(node, widget),
       );
     }
-    // The parent SubgraphNode instance(s) embedding this subgraph (root-level
-    // search, same as describeActiveGraph). The widget is exposed on these.
-    const parents = (rootGraph._nodes ?? []).filter((n) => n.subgraph === graph);
+    // The parent SubgraphNode instance(s) embedding this subgraph. For a nested
+    // subgraph (root → node 142 → node 133), walk ALL graphs in the hierarchy
+    // (not just rootGraph._nodes) to find EVERY node whose subgraph field matches.
+    // The original search missed any subgraph nodes themselves nested inside
+    // an outer subgraph (#2321). Multiple SubgraphNodes can share the same
+    // subgraph definition, so collect all owners, not just the first.
+    const parents = [];
+    const seen = new Set();
+    const stack = [rootGraph];
+    while (stack.length) {
+      const g = stack.pop();
+      if (!g || seen.has(g)) continue;
+      seen.add(g);
+      for (const node of g._nodes ?? []) {
+        if (node?.subgraph === graph) {
+          parents.push(node);
+        }
+        if (node?.subgraph && !seen.has(node.subgraph)) {
+          stack.push(node.subgraph);
+        }
+      }
+    }
     if (!parents.length) {
       throw new Error("Could not locate the parent subgraph node for the open subgraph.");
     }
