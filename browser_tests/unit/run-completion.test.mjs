@@ -370,6 +370,32 @@ test("#1837 a repeat registration REUSES the run's identity — one finished run
   assert.equal(h.tracker.hasPending(), false);
 });
 
+test("#1837 a reused identity re-registered on another route/session does not duplicate", () => {
+  const h = makeHarness();
+  const P = "ctx-switch-prompt";
+
+  // The identity tuple is [route, session, prompt, key], so reusing one key under a
+  // second route/session would land as a DISTINCT record and flush a byte-identical
+  // duplicate frame — strictly worse than the #1837 regression, since both copies
+  // carry the same completion key and the agent cannot tell them apart.
+  const first = h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a" });
+  h.tracker.onQueued(P, { routeId: "route-b", sessionId: "session-b" });
+  assert.deepEqual(
+    h.tracker.completionMetadata().map((row) => row.completionKey),
+    [first],
+    "one key is one receipt, whichever context re-registers it",
+  );
+
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecuted(P, imgs([img("ctx-switch.png")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.deepEqual(
+    h.flushes.map((payload) => payload.completionKey),
+    [first],
+    "no byte-identical duplicate frame",
+  );
+});
+
 test("#1830 keeps two same-prompt nonce rows and retires them by exact key", () => {
   const h = makeHarness();
   const P = "same-prompt";

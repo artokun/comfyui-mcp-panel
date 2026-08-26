@@ -225,6 +225,13 @@ export function createRunCompletionTracker({
   function addCompletionRecord(k, { routeId, sessionId, completionKey }) {
     const identity = completionIdentity(k, routeId, sessionId, completionKey);
     if (!identity || completionKeys.has(identity)) return false;
+    // #1837 — the identity tuple includes route/session, so the SAME completion key
+    // re-registered under a different route/session would land as a second record and
+    // flush a byte-identical duplicate frame. One key is one receipt no matter which
+    // context re-registers it; distinct SUPPLIED keys still get their own record.
+    if (completionRecords(k).some((record) => record.completionKey === String(completionKey).trim())) {
+      return false;
+    }
     const route = String(routeId).trim();
     const session = sessionId == null ? null : String(sessionId).trim();
     const exactKey = String(completionKey).trim();
