@@ -73,7 +73,12 @@ import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import { missingAssetScanMayBeStale, missingAssetScopeNote } from "./lib/missing-asset-scope.js";
-import { armReloadBlockedNotice, unsavedReloadBlockers, reloadWouldBeBlockedMessage } from "./lib/reload-blocked.js";
+import {
+  armReloadBlockedNotice,
+  runAgentFrontendReload,
+  unsavedReloadBlockers,
+  reloadWouldBeBlockedMessage,
+} from "./lib/reload-blocked.js";
 // #1180 — the repo's one bounded-step primitive. A second timeout helper written alongside
 // it is how this repo keeps producing near-duplicate bugs, per that file's own header.
 import { withTimeout } from "./lib/bounded-step.js";
@@ -26341,26 +26346,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // undeliverable-reply path has nothing of the user's to redact.
             if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
           } else if (msg.cmd === "soft_reload") {
-            // Agent-triggered soft reload. Reply FIRST (below), then bounce —
-            // an "orchestrator" scope kills this very session, so the resume
-            // flow (SOFT_RELOAD_KEY) continues the conversation afterward.
+            // Agent-triggered soft reload. A frontend reload awaits every
+            // dirtiness fence before replying; an orchestrator reload still
+            // replies first because it deliberately kills this very session.
             if (!onReload) throw new Error("This panel build can't soft-reload.");
             const scope = msg.scope === "frontend" ? "frontend" : "orchestrator";
-            // #701 — decide BEFORE replying. The guard that stops a doomed
-            // frontend reload runs 60ms later inside onReload, by which point
-            // this command has already told the agent "scheduled". Live-verified
-            // on the rig: the tab correctly did NOT navigate and its socket
-            // survived, and the agent was still told the reload was scheduled —
-            // so it has no reason to look, and the panel-side notice it does
-            // emit is not something the agent can read.
-            //
-            // Report what will actually happen, on the reply the caller gets.
-            const reloadBlockers =
-              scope === "frontend"
-                ? unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows)
-                : [];
-            if (reloadBlockers.length) {
-              result = reloadWouldBeBlockedMessage(reloadBlockers);
+            if (scope === "frontend") {
+              result = await onReload(scope);
+              if (result == null) throw new Error("The frontend reload did not produce a decision.");
             } else {
               result = `soft reload (${scope}) scheduled`;
               setTimeout(() => onReload(scope), 60);
@@ -37304,7 +37297,7 @@ function buildPanel() {
     },
     // The agent called panel_reload — perform the soft reload it asked for.
     onReload(scope) {
-      softReload("agent", scope);
+      return softReload("agent", scope);
     },
     onAction(name) {
       // A tool/operation started (or changed). Only meaningful while a turn is
@@ -40130,27 +40123,46 @@ function buildPanel() {
   async function softReload(origin = "user", scope = "orchestrator") {
     if (reloading) return;
     if (scope === "frontend") {
+      const primeFrontendModuleCache = async () => {
+        try {
+          await Promise.race([
+            primeModuleCache({
+              entryUrl: import.meta.url,
+              fetchImpl: (url, opts) => fetch(url, { credentials: "same-origin", ...opts }),
+            }),
+            new Promise((resolve) => setTimeout(resolve, 5000)),
+          ]);
+        } catch {
+          /* reload decision continues; dirtiness is checked independently */
+        }
+      };
+      if (origin === "agent") {
+        ssSet(SIDEBAR_REOPEN_KEY, "1");
+        appendSystem(tr("panel.reloading_the_panel_ui_new_frontend_code", "Reloading the panel UI (new frontend code)…"));
+        const reloadResult = await runAgentFrontendReload({
+          getBlockers: () =>
+            unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows),
+          prime: primeFrontendModuleCache,
+          clearSidebarReopen: () => ssSet(SIDEBAR_REOPEN_KEY, null),
+          appendSystem,
+          armNotice: () => armReloadBlockedNotice({ notify: (m) => appendSystem(m) }),
+          navigate: () => {
+            try {
+              const u = new URL(window.location.href);
+              u.searchParams.set("cmcpReload", String(Date.now()));
+              window.location.replace(u.toString());
+            } catch {
+              window.location.reload();
+            }
+          },
+        });
+        if (!reloadResult.ok) throw new Error(reloadResult.error);
+        return `soft reload (${scope}) scheduled`;
+      }
       // Nothing to respawn — just re-fetch the panel with a cache-bust. The
       // session id persists in sessionStorage, so we reconnect + resume on load.
       // Arm the reopen flag so our sidebar tab re-activates after the reload
       // (ComfyUI won't, since our tab isn't registered yet when it restores).
-      // #701 defect (2) — an AGENT-commanded reload must not start something the
-      // browser will refuse to finish. With unsaved work open, `beforeunload`
-      // blocks the navigation, and it drops this tab's socket BEFORE raising the
-      // dialog: the tab ends up with no reload and no bridge, and nobody is at the
-      // keyboard to answer the prompt. Reproduced on the rig with 3 unsaved
-      // workflows — "soft reload (frontend) scheduled", then a disconnect, then
-      // nothing, with the page never navigating.
-      //
-      // A USER-initiated reload still proceeds: they are right there and can
-      // answer the dialog. Only the commanded path refuses.
-      if (origin === "agent") {
-        const blockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
-        if (blockers.length) {
-          appendSystem(reloadWouldBeBlockedMessage(blockers));
-          return;
-        }
-      }
       ssSet(SIDEBAR_REOPEN_KEY, "1");
       appendSystem(tr("panel.reloading_the_panel_ui_new_frontend_code", "Reloading the panel UI (new frontend code)…"));
       // #584 — the cmcpReload page-URL param busts only the top document; the
@@ -40159,37 +40171,11 @@ function buildPanel() {
       // the pack's module graph with cache:"reload" first. Best-effort and
       // time-bounded: a commanded reload must never hang on a slow server,
       // and a failed prime must not cancel it.
-      try {
-        await Promise.race([
-          primeModuleCache({
-            entryUrl: import.meta.url,
-            fetchImpl: (url, opts) => fetch(url, { credentials: "same-origin", ...opts }),
-          }),
-          new Promise((resolve) => setTimeout(resolve, 5000)),
-        ]);
-      } catch {
-        /* reload regardless — worst case is the pre-#584 behaviour */
-      }
-      if (origin === "agent") {
-        const postPrimeBlockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
-        if (postPrimeBlockers.length) {
-          ssSet(SIDEBAR_REOPEN_KEY, null);
-          appendSystem(reloadWouldBeBlockedMessage(postPrimeBlockers));
-          return;
-        }
-      }
+      await primeFrontendModuleCache();
       // #701(2) — the navigation below can be CANCELLED by ComfyUI's unsaved-work
       // beforeunload, after the browser has already torn down our socket. If that
       // happens this code survives the deadline and says so; if the reload works, the
       // document is destroyed and the notice never fires. Arm it BEFORE navigating.
-      if (origin === "agent") {
-        const finalBlockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
-        if (finalBlockers.length) {
-          ssSet(SIDEBAR_REOPEN_KEY, null);
-          appendSystem(reloadWouldBeBlockedMessage(finalBlockers));
-          return;
-        }
-      }
       armReloadBlockedNotice({ notify: (m) => appendSystem(m) });
       try {
         const u = new URL(window.location.href);
