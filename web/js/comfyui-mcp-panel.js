@@ -9653,6 +9653,27 @@ function promotedTerminalWitnesses(subgraphNode) {
       entries.push({ widget, error: resolution.error || "the immediate promotion was unresolved" });
       continue;
     }
+    // A promotion relation is not write authority by itself. The live setter
+    // refuses when the host input is externally linked (or otherwise has no
+    // identity-authenticated local rail), because writing the resolved inner
+    // widget would report success while the queue still reads the enclosing
+    // rail's value. Do not publish a positive witness for that inner target.
+    const parentRail = resolution.target.parentWidget;
+    if (
+      !parentRail ||
+      typeof parentRail.name !== "string" ||
+      parentRail.name.length === 0 ||
+      !Array.isArray(resolution.target.parentWidgets) ||
+      resolution.target.parentWidgets[0] !== parentRail
+    ) {
+      entries.push({
+        widget,
+        immediate_node_id: resolution.target.node?.id,
+        immediate_widget: resolution.target.widget?.name,
+        error: "the promoted parent rail was missing, externally linked, or not authoritative",
+      });
+      continue;
+    }
 
     let terminal;
     try {
@@ -9706,6 +9727,7 @@ function promotedTerminalWitnesses(subgraphNode) {
     }
     entries.push({
       widget,
+      parent_rail: { authoritative: true, widget: parentRail.name },
       immediate_node_id: resolution.target.node.id,
       immediate_widget: resolution.target.widget.name,
       terminal_node_id: terminalNode.id,

@@ -115,6 +115,7 @@ test("WIRING: production graph_get_subgraph publishes the terminal nested-promot
   const method = src.slice(start, end).replace(/,\s*$/, "");
   const terminal = {
     widget: "quality_prompt",
+    parent_rail: { authoritative: true, widget: "quality_prompt" },
     immediate_node_id: 188,
     immediate_widget: "quality_prompt",
     terminal_node_id: 2768,
@@ -293,6 +294,7 @@ test("WIRING: production alias witness keeps outer, immediate, and terminal name
     const witness = entries.find((entry) => entry.widget === testCase.outer);
     assert.deepEqual(witness, {
       widget: testCase.outer,
+      parent_rail: { authoritative: true, widget: testCase.immediate },
       immediate_node_id: 188,
       immediate_widget: testCase.immediate,
       terminal_node_id: 2768,
@@ -316,6 +318,103 @@ test("WIRING: production alias witness keeps outer, immediate, and terminal name
       /_subgraphSlot missing|unresolved/i,
     );
   }
+});
+
+test("WIRING: production witness refuses an externally-linked parent rail", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const helperStart = src.indexOf("function resolveSubgraphLink(");
+  const helperEnd = src.indexOf("\nfunction findPromotedHostInput", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "production promotion helper range must remain extractable");
+  const makeWitnesses = new Function(
+    "resolvePromotedInnerTarget",
+    "followPromotionToConcrete",
+    "MAX_PROMOTION_CHAIN_DEPTH",
+    "promotedInputAliases",
+    `${src.slice(helperStart, helperEnd)}; return promotedTerminalWitnesses;`,
+  )(
+    resolvePromotedInnerTarget,
+    followPromotionToConcrete,
+    MAX_PROMOTION_CHAIN_DEPTH,
+    promotedInputAliases,
+  );
+  const rail = { name: "quality_prompt", value: "old" };
+  const inner = {
+    id: 188,
+    type: "PrimitiveStringMultiline",
+    inputs: [{ name: "quality_prompt", widget: { name: "quality_prompt" } }],
+    widgets: [{ name: "quality_prompt", value: "old" }],
+  };
+  const parent = {
+    id: 78,
+    widgets: [rail],
+    inputs: [{
+      name: "quality_prompt",
+      widget: rail,
+      _widget: rail,
+      _subgraphSlot: { name: "quality_prompt", linkIds: [1] },
+    }],
+    subgraph: {
+      _nodes: [inner],
+      getNodeById: (id) => (String(id) === "188" ? inner : null),
+      getLink: () => ({ origin_id: 188, target_id: 188, target_slot: 0 }),
+    },
+  };
+  parent.inputs[0].link = 99;
+
+  const [entry] = makeWitnesses(parent);
+  assert.equal(entry.widget, "quality_prompt");
+  assert.equal(entry.parent_rail, undefined);
+  assert.match(entry.error, /externally linked|not authoritative/i);
+});
+
+test("WIRING: production witness re-evaluates parent authority after a promotion relink", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const helperStart = src.indexOf("function resolveSubgraphLink(");
+  const helperEnd = src.indexOf("\nfunction findPromotedHostInput", helperStart);
+  const makeWitnesses = new Function(
+    "resolvePromotedInnerTarget",
+    "followPromotionToConcrete",
+    "MAX_PROMOTION_CHAIN_DEPTH",
+    "promotedInputAliases",
+    `${src.slice(helperStart, helperEnd)}; return promotedTerminalWitnesses;`,
+  )(
+    resolvePromotedInnerTarget,
+    followPromotionToConcrete,
+    MAX_PROMOTION_CHAIN_DEPTH,
+    promotedInputAliases,
+  );
+  const rail = { name: "quality_prompt", value: "old" };
+  const input = {
+    name: "quality_alias",
+    widget: rail,
+    _widget: rail,
+    _subgraphSlot: { name: "quality_alias", linkIds: [1] },
+  };
+  const inner = {
+    id: 188,
+    type: "PrimitiveStringMultiline",
+    inputs: [{ name: "quality_prompt", widget: { name: "quality_prompt" } }],
+    widgets: [{ name: "quality_prompt", value: "old" }],
+  };
+  const parent = {
+    id: 78,
+    widgets: [rail],
+    inputs: [input],
+    subgraph: {
+      _nodes: [inner],
+      getNodeById: (id) => (String(id) === "188" ? inner : null),
+      getLink: () => ({ origin_id: 188, target_id: 188, target_slot: 0 }),
+    },
+  };
+
+  const [before] = makeWitnesses(parent);
+  assert.equal(before.parent_rail.authoritative, true);
+  input.link = 100;
+  const [after] = makeWitnesses(parent);
+  assert.equal(after.parent_rail, undefined);
+  assert.match(after.error, /externally linked|not authoritative/i);
 });
 
 test("WIRING: production witness refuses to publish [] for an unenumerable proxyWidgets relation", async () => {
