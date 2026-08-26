@@ -612,6 +612,22 @@ export function driveControlHooksAcrossScopedBatch(nodes, { batchCount = null } 
   const armed = [];
   const armedWidgets = new Set();
   const restores = [];
+
+  // #1998 — retire any existing wrappers on this widget BEFORE wrapping them again.
+  // When graph_run handlers execute concurrently (async), drive2 can wrap drive1's wrapper
+  // before drive1's restore() has a chance to set state.retired=true. Retiring early prevents
+  // the old wrapper from counting calls that belong to the new drive.
+  const retireExistingWrappersOnWidget = (w) => {
+    try {
+      const beforeState = w.beforeQueued?._cmcpWrapperState;
+      const afterState = w.afterQueued?._cmcpWrapperState;
+      if (beforeState) beforeState.retired = true;
+      if (afterState) afterState.retired = true;
+    } catch {
+      /* widget mutation is best-effort */
+    }
+  };
+
   if (Array.isArray(nodes)) {
     for (const node of nodes) {
       try {
@@ -626,6 +642,9 @@ export function driveControlHooksAcrossScopedBatch(nodes, { batchCount = null } 
           if (!isControlAfterGenerateWidget(w)) continue;
           if (typeof w.beforeQueued !== "function") continue;
           if (typeof w.afterQueued !== "function") continue;
+
+          // #1998 — retire old wrappers before wrapping again
+          retireExistingWrappersOnWidget(w);
           const paired = governedValueWidget(widgets, w, i);
           const target = paired.widget ?? null;
           const entry = {
@@ -677,6 +696,21 @@ export function driveControlHooksAcrossScopedBatch(nodes, { batchCount = null } 
           const state = { retired: false, calls: 0 };
           const wrappedBefore = forced(before);
           const wrappedAfter = forced(after);
+          // #1998 — attach state to wrapper so future drives can retire it early
+          try {
+            Object.defineProperty(wrappedBefore, '_cmcpWrapperState', {
+              value: state,
+              enumerable: false,
+              configurable: true,
+            });
+            Object.defineProperty(wrappedAfter, '_cmcpWrapperState', {
+              value: state,
+              enumerable: false,
+              configurable: true,
+            });
+          } catch {
+            /* wrapper is not extensible, state will be discovered via inheritance or retirement logic */
+          }
           w.beforeQueued = wrappedBefore;
           w.afterQueued = wrappedAfter;
           armedWidgets.add(w);
