@@ -838,7 +838,8 @@ export function createRunCompletionTracker({
     // (it's not an emission attempt, just reading state). This preserves the
     // duplicate-over-loss principle: proving completion beats losing it.
     const isKeyedCompletion = hasCompletionRecords(k);
-    if (unackedDeliveriesExhausted(k) && !isKeyedCompletion) return null;
+    const boundExhausted = unackedDeliveriesExhausted(k);
+    if (boundExhausted && !isKeyedCompletion) return null;
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
@@ -855,6 +856,10 @@ export function createRunCompletionTracker({
       if (hasCompletionRecords(k)) markTerminal(k);
       else markDelivered(k);
       markDispatched(k);
+      // If bound exhausted, don't emit new frames; only truth-seeking (history probe) is allowed
+      if (boundExhausted) {
+        return { promptId, status: "success", delivered: false };
+      }
       flushWithCompletionRecords(k, { ...liveReplay, replayed: true });
       return { promptId, status: "success", delivered: true };
     }
@@ -1009,23 +1014,25 @@ export function createRunCompletionTracker({
       // Recorded, never suppressed: a reconcile exists to deliver something the agent
       // has NOT been told about, so it always goes through.
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
-      flushWithCompletionRecords(
-        k,
-        {
-          key: k,
-          promptId,
-          images: parsed.images,
-          videos: parsed.videos,
-          durationMs,
-          // Epoch ms of the REAL finish, or null when history records none (#1199).
-          finishedAt: historyFinishedAt,
-          reconciled: true,
-          ...(mediaLessQueued ? { noMedia: true } : {}),
-        },
-        // #1824 recurrence — /history confirmation is truth-seeking, not a frame
-        // emission attempt. Do not count it against the #1842 storm bound.
-        { trackUnackedDelivery: false },
-      );
+      // #1824 recurrence: bound prevents frame EMISSIONS (#1842), not truth-seeking.
+      // After bound exhausted, don't emit new frames (check #1842 test). Only proceed
+      // to /history to confirm completion, then retire via markDelivered.
+      if (!boundExhausted) {
+        flushWithCompletionRecords(
+          k,
+          {
+            key: k,
+            promptId,
+            images: parsed.images,
+            videos: parsed.videos,
+            durationMs,
+            // Epoch ms of the REAL finish, or null when history records none (#1199).
+            finishedAt: historyFinishedAt,
+            reconciled: true,
+            ...(mediaLessQueued ? { noMedia: true } : {}),
+          },
+        );
+      }
     }
     return { promptId, status: "success", delivered: hasBatch || mediaLessQueued };
   }
