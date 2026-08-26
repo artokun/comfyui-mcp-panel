@@ -25,9 +25,11 @@ import { dirname, join } from "node:path";
 
 import {
   auditTag,
+  collectFromGit,
   packageJsonVersion,
   panelVersion,
   pyprojectVersion,
+  versionAtRev,
   versionOfTag,
 } from "../../scripts/check-release-tag.mjs";
 
@@ -249,22 +251,63 @@ test("#1882 a commit whose version could not be read is reported, never skipped"
   assert.match(violations[0], /left unaudited/);
 });
 
-test("#1882 versionAtRev reports unknown rather than returning a bare null", async () => {
-  // Exercises the git-backed reader against the real repository rather than
-  // injected data, because the fail-open bug lived in the reader, not the rules.
-  const { execFileSync } = await import("node:child_process");
-  const run = (args) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+test("#1882 versionAtRev itself returns an error, never a bare null, on an unreadable rev", () => {
+  // Drives the git-backed reader directly. The previous version of this test
+  // re-implemented the git calls instead of calling versionAtRev, so reverting
+  // the reader to `catch { return null }` left the suite green — the exact
+  // "green suite proves nothing" trap this whole issue is about.
+  const good = versionAtRev("HEAD");
+  assert.equal(good.error, null);
+  assert.match(good.version, /^\d+\.\d+\.\d+/);
 
-  // A real commit: readable, and its version parses.
-  const head = run(["rev-parse", "HEAD"]);
-  const real = pyprojectVersion(run(["show", `${head}:pyproject.toml`]));
-  assert.match(real, /^\d+\.\d+\.\d+/);
+  // A syntactically valid SHA that resolves to nothing: `git show` fails, and the
+  // reader must say UNKNOWN rather than "this revision released no version".
+  const bad = versionAtRev("0".repeat(40));
+  assert.equal(bad.version, null);
+  assert.ok(bad.error, "an unreadable rev must carry an error, not a bare null");
+  assert.match(bad.error, /could not be read/);
+});
 
-  // pyproject.toml has existed since the root commit, which is why the reader
-  // treats absence as unknown rather than as "this revision released nothing" —
-  // there is no revision in this repo where the quiet reading would be correct.
-  const rootCommit = run(["rev-list", "--max-parents=0", "HEAD"]).split("\n").pop().trim();
-  assert.notEqual(run(["ls-tree", "--name-only", rootCommit, "--", "pyproject.toml"]), "");
+test("#1882 a reader failure reaches auditTag as a violation through the real range walk", () => {
+  // End-to-end over real history: collectFromGit walks v0.15.104 for real and the
+  // injected reader fails on every commit, so the wiring — reader -> versionError
+  // -> auditTag -> violation — is exercised rather than assumed. With the real
+  // reader the same tag is clean, which is asserted second so a broken walk
+  // cannot make this test pass vacuously.
+  const failing = collectFromGit("v0.15.104", {
+    readVersionAt: (rev) => ({ version: null, error: `simulated unreadable blob at ${rev}` }),
+  });
+  assert.equal(failing.historyError, null, "the range itself must still walk");
+  assert.ok(failing.range.length > 0, "expected commits in v0.15.103..v0.15.104");
+  assert.ok(failing.range.every((c) => c.versionError), "every entry must carry the read failure");
+
+  const violations = auditTag({
+    tag: "v0.15.104",
+    treeAtTag: treeAt("0.15.104"),
+    range: failing.range,
+    tagTargetFor: failing.tagTargetFor,
+  });
+  assert.ok(violations.length > 0, "a range of unreadable commits must not audit as coherent");
+  assert.ok(violations.every((v) => /left unaudited/.test(v)));
+
+  const real = collectFromGit("v0.15.104");
+  assert.equal(real.historyError, null);
+  assert.deepEqual(
+    auditTag({
+      tag: "v0.15.104",
+      treeAtTag: {
+        pyproject: readFileSync(join(root, "pyproject.toml"), "utf8").replace(
+          /^version = ".*"$/m,
+          'version = "0.15.104"',
+        ),
+        packageJson: JSON.stringify({ version: "0.15.104" }),
+        panelJs: 'const PANEL_VERSION = "0.15.104";',
+      },
+      range: real.range,
+      tagTargetFor: real.tagTargetFor,
+    }),
+    [],
+  );
 });
 
 test("#1882 the tag being pushed is not exempt from the target check", () => {

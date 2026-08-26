@@ -255,7 +255,7 @@ const showOrNull = (rev, path) => {
  * this repo since the root commit (4f22ed0f) — a revision without it means the
  * release model changed, not that the revision released nothing.
  */
-function versionAtRev(rev) {
+export function versionAtRev(rev) {
   let text;
   try {
     text = git("show", `${rev}:pyproject.toml`);
@@ -274,7 +274,16 @@ function versionAtRev(rev) {
   return { version, error: null };
 }
 
-export function collectFromGit(tag) {
+/**
+ * @param {string} tag
+ * @param {{readVersionAt?: (rev:string)=>{version:string|null, error:string|null}}} [deps]
+ *        the version reader is injectable ONLY so a test can drive a read failure
+ *        through the real range walk. Every commit in this repo's history is
+ *        readable, so the failure path cannot be reached from real data — and an
+ *        unexercised failure path is how the first two drafts of this guard
+ *        shipped fail-open.
+ */
+export function collectFromGit(tag, { readVersionAt = versionAtRev } = {}) {
   const treeAtTag = {
     pyproject: showOrNull(tag, "pyproject.toml"),
     packageJson: showOrNull(tag, "package.json"),
@@ -342,7 +351,7 @@ export function collectFromGit(tag) {
         .filter((l) => l && !l.startsWith("commit "))
         .map((line) => {
           const [sha, subject] = line.split("\0");
-          const own = versionAtRev(sha);
+          const own = readVersionAt(sha);
 
           // A root commit has no first parent; that is not an error, it just means
           // whatever it declares is a first appearance.
@@ -352,7 +361,7 @@ export function collectFromGit(tag) {
           } catch {
             hasParent = false;
           }
-          const parent = hasParent ? versionAtRev(`${sha}^`) : { version: null, error: null };
+          const parent = hasParent ? readVersionAt(`${sha}^`) : { version: null, error: null };
 
           return {
             sha,
