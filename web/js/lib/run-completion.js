@@ -925,10 +925,19 @@ export function createRunCompletionTracker({
     const holdsForCompletionAck =
       wasPanelQueued && parsed.status === "success" && hasCompletionKey;
     if (holdsForCompletionAck) {
-      // The terminal fence is needed to suppress late ComfyUI lifecycle events,
-      // but the recovery ledger must remain until the orchestrator receipt.
+      // The terminal fence is needed to suppress late ComfyUI lifecycle events.
+      // For keyed panel_run completions, normally keep pending for orchestrator receipt.
+      // But #1824 recurrence: if the bound prevents further emissions, /history
+      // confirmation is our proof of completion. Duplicate-over-loss means proving
+      // it is better than losing it, so retire when the bound is reached.
       markTerminal(k);
       clearReconcileRetry(k);
+      // Only retire from pending if the bound has been exhausted. Otherwise keep
+      // it pending for the receipt, per the original #1824 design.
+      if (unackedDeliveriesExhausted(k)) {
+        markDelivered(k); // bound reached → /history is sufficient proof
+      }
+      // (else: keep in pending for orchestrator receipt)
     } else {
       markDelivered(k); // also clears any scheduled retry for this key
     }
