@@ -1610,6 +1610,73 @@ test('#1864 (codex gate P1): a same-object rename DURING the probes declines the
   )
 })
 
+test('#1864 (codex gate r2): a name drift during the in-place probe refuses, and writes nothing', async () => {
+  // The path-drift guard in the in-place branch re-reads `path` only. For a NO-NAME save
+  // the destination was derived from the tab's own NAME, so a same-object rename landing
+  // inside `classifyInPlaceOverwrite`'s awaited disk read moves the tab off the identity
+  // the write was authorized on while `path` stays put — and "Foo.json" would be written
+  // for a tab that now reports "Bar". This is reachable on the plain in-place route (no
+  // redirect involved); the redirect merely brings more tabs onto it.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: false, // drifted ⇒ classifyInPlaceOverwrite actually reads disk
+    isTemporary: true,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json'], active })
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, undefined, {
+        autoWorkflowName: () => 'Untitled',
+        existsOnDisk: async (p) => svc.disk.has(p),
+        readDiskBytes: async () => {
+          active.filename = 'Bar' // the rename lands inside this await
+          return new TextEncoder().encode('{"id":"a"}')
+        }
+      }),
+    (err) => {
+      assert.match(err.message, /name changed during the save/)
+      assert.match(err.message, /Nothing was written/)
+      return true
+    }
+  )
+
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'nothing was written')
+})
+
+test('#1864 (codex gate r2): a NAMED save is untouched by a concurrent title edit', async () => {
+  // The scoping half. The caller chose "Foo" itself, so `filename` never fed the
+  // destination — a title edit landing mid-save must not reject the save that was
+  // explicitly asked for.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: false,
+    isTemporary: true,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json'], active })
+
+  const saved = await saveActiveWorkflow(svc, 'Foo', {
+    existsOnDisk: async (p) => svc.disk.has(p),
+    readDiskBytes: async () => {
+      active.filename = 'Bar'
+      return new TextEncoder().encode('{"id":"a"}')
+    }
+  })
+
+  assert.equal(saved, 'Foo')
+  assert.deepEqual(svc.calls, [['saveWorkflow', 'workflows/Foo.json']], 'the requested save landed')
+})
+
 // ---------------------------------------------------------------------------
 // ComfyUI frontend 1.47.x (issue #268). The workflow store no longer exposes
 // `saveWorkflowAs`; it exposes the low-level pair `saveAs(wf, path)` (builds a

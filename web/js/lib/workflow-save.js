@@ -1279,6 +1279,23 @@ export async function saveActiveWorkflow(
       `refusing to save: the active workflow's path changed during the save (now "${wf.path}") — retry.`,
     );
   }
+  // #1864 (codex gate r2) — THE SAME DRIFT, ONE FIELD OVER. When no name was supplied the
+  // destination was derived from the tab's OWN name, so `filename` is load-bearing INPUT to
+  // it, not decoration. A same-object rename during the awaited probe above moves the tab
+  // off the identity this write was authorized on while `path` stays put, and the check
+  // directly above cannot see it — the write would land on "Foo.json" for a tab that now
+  // reports "Bar". Refuse, exactly as for a path drift.
+  //
+  // SCOPED TO A NO-NAME SAVE ON PURPOSE. A caller that PASSED a name chose the destination
+  // itself and `filename` never fed it, so a concurrent title edit is irrelevant there —
+  // refusing would reject the very save the caller explicitly asked for.
+  if (!desired && baseName(wf.filename) !== currentName) {
+    throw new Error(
+      `refusing to save: this save supplied no name, so its destination came from the workflow's ` +
+        `own name — and that name changed during the save (now "${baseName(wf.filename)}", was ` +
+        `"${currentName}"). Nothing was written — retry.`,
+    );
+  }
   if (inPlace === "conflict") {
     throw new Error(
       `refusing to save "${effectiveName}": its file "${currentPath}" changed on disk since this tab ` +
