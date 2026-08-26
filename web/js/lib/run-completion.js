@@ -517,11 +517,11 @@ export function createRunCompletionTracker({
   // fourth would not recover anything the first three did not — nothing about
   // the run changes between ticks except the clock.
   const maxUnackedDeliveries = 3;
-  // #1824 recurrence: track entries that have delivered past the bound, and count
-  // how many times. Allow exactly 2 deliveries past the bound (for the keyed completion's
-  // /history confirmation and a possible update), then refuse all further probes (#1842).
-  const deliveredPastBound = new Map(); // key -> count of past-bound deliveries
-  const maxPastBoundDeliveries = 2;
+  // #1824 recurrence: track entries that have delivered past the bound when /history
+  // confirmed success. Allow EXACTLY ONE confirmed delivery past the bound, then refuse
+  // all further probes. This preserves duplicate-over-loss while preventing storms (#1842).
+  // Keyed completions WITHOUT confirmation still respect the bound.
+  const deliveredPastBound = new Set();
   function clearUnackedDeliveries(k) {
     unackedDeliveries.delete(k);
     deliveredPastBound.delete(k);
@@ -838,17 +838,12 @@ export function createRunCompletionTracker({
     //
     // #1824 recurrence — the bound prevents FRAME EMISSIONS, not TRUTH-SEEKING.
     // For legacy unkeyed runs, enforce the bound strictly (no emissions permitted).
-    // For keyed panel_run completions awaiting orchestrator receipt: proceed to
-    // /history to confirm completion, up to maxPastBoundDeliveries times. Once the
-    // limit is reached, refuse all further probes regardless of current unacked state
-    // (markUndelivered can lower it back below the bound). This allows the /history
-    // confirmation and a possible update (e.g., on receipt), while preventing ComfyUI
-    // query storms (#1842).
+    // For keyed panel_run completions: /history can confirm success past the bound.
+    // Unconfirmed keyed completions still respect the bound.
     const isKeyedCompletion = hasCompletionRecords(k);
     const boundExhausted = unackedDeliveriesExhausted(k);
-    const pastBoundCount = deliveredPastBound.get(k) ?? 0;
-    const hasReachedPastBoundLimit = isKeyedCompletion && pastBoundCount >= maxPastBoundDeliveries;
-    if ((boundExhausted && !isKeyedCompletion) || hasReachedPastBoundLimit) return null;
+    // Refuse if: unkeyed past bound
+    if (boundExhausted && !isKeyedCompletion) return null;
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
@@ -1025,12 +1020,12 @@ export function createRunCompletionTracker({
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
       // #1824 recurrence: bound prevents frame EMISSIONS (#1842), not truth-seeking.
       // Normal replays within the bound are emitted normally. After the bound is
-      // exhausted, /history-confirmed keyed completions may still deliver (with
-      // trackUnackedDelivery=false to not count as emissions). This preserves the
-      // duplicate-over-loss principle: proving completion beats losing it (#1824).
-      // Since these deliveries don't increment unackedDeliveries, they don't cause
-      // storms (#1842) — the bound prevents NEW emissions, not all deliveries.
-      const shouldDeliver = !boundExhausted || (boundExhausted && hasCompletionKey);
+      // exhausted, /history-confirmed keyed completions may deliver EXACTLY ONCE (with
+      // trackUnackedDelivery=false to not count as emissions). Unconfirmed keyed
+      // completions still respect the bound. This preserves duplicate-over-loss while
+      // preventing storms (#1842).
+      const hasDeliveredConfirmed = deliveredPastBound.has(k);
+      const shouldDeliver = !boundExhausted || (boundExhausted && hasCompletionKey && !hasDeliveredConfirmed);
       if (shouldDeliver) {
         flushWithCompletionRecords(
           k,
@@ -1051,10 +1046,11 @@ export function createRunCompletionTracker({
           // #1842 storm bound). This preserves the duplicate-over-loss principle.
           { trackUnackedDelivery: !boundExhausted },
         );
-        // Track that we've delivered past the bound for this keyed completion,
-        // limiting to maxPastBoundDeliveries to prevent storms (#1842).
+        // #1824 recurrence: Mark that we've delivered this confirmed completion past
+        // the bound. Future reconciles will refuse all further probes (alreadyDeliveredConfirmed
+        // check prevents re-entry). This allows exactly ONE confirmed delivery past the bound.
         if (boundExhausted && hasCompletionKey) {
-          deliveredPastBound.set(k, (deliveredPastBound.get(k) ?? 0) + 1);
+          deliveredPastBound.add(k);
         }
       }
     }
