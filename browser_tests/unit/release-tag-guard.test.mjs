@@ -19,20 +19,68 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 
 import {
   auditTag,
+  collectFromGit,
+  firstParentAtRev,
   packageJsonVersion,
   panelVersion,
   pyprojectVersion,
+  versionAtRev,
   versionOfTag,
 } from "../../scripts/check-release-tag.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const read = (rel) => readFileSync(join(root, rel), "utf8");
+
+/**
+ * The hosted unit job intentionally uses a shallow checkout. Keep tests that
+ * exercise the git-backed collector independent of the panel repository's
+ * fetched tags by creating the smallest real history the collector needs.
+ * This still runs the production `git show`, `git describe`, `git rev-list`,
+ * and `git for-each-ref` calls; it only makes their inputs deterministic.
+ */
+function withReleaseHistory(callback) {
+  const fixture = mkdtempSync(join(tmpdir(), "panel-release-tag-guard-"));
+  const runGit = (...args) =>
+    execFileSync("git", args, { cwd: fixture, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+
+  const writeVersion = (version) => {
+    writeFileSync(
+      join(fixture, "pyproject.toml"),
+      `[project]\nname = "release-tag-guard-fixture"\nversion = "${version}"\n`,
+    );
+    writeFileSync(join(fixture, "package.json"), `${JSON.stringify({ version })}\n`);
+    mkdirSync(join(fixture, "web", "js"), { recursive: true });
+    writeFileSync(join(fixture, "web", "js", "comfyui-mcp-panel.js"), `const PANEL_VERSION = "${version}";\n`);
+  };
+
+  try {
+    runGit("init", "--initial-branch=main");
+    runGit("config", "user.email", "release-tag-guard-fixture@example.invalid");
+    runGit("config", "user.name", "release-tag-guard-fixture");
+
+    writeVersion("0.15.103");
+    runGit("add", ".");
+    runGit("commit", "-m", "chore: fixture release v0.15.103");
+    runGit("tag", "v0.15.103");
+
+    writeVersion("0.15.104");
+    runGit("add", ".");
+    runGit("commit", "-m", "chore: fixture release v0.15.104");
+    runGit("tag", "v0.15.104");
+
+    return callback(fixture);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
 
 const treeAt = (v) => ({
   pyproject: `[project]\nname = "comfyui-mcp-panel"\nversion = "${v}"\n`,
@@ -76,7 +124,7 @@ test("#1882 a coherent release passes", () => {
     range: [
       { sha: "aaaaaaaa1", subject: "chore: release v0.15.104", version: "0.15.104", parentVersion: "0.15.103" },
     ],
-    tagTargetFor: tagsAt({ "0.15.103": "zzzzzzzz9" }),
+    tagTargetFor: tagsAt({ "0.15.104": "aaaaaaaa1", "0.15.103": "zzzzzzzz9" }),
   });
   assert.deepEqual(violations, []);
 });
@@ -137,7 +185,7 @@ test("#1882 the v0.15.98 shape is caught: 0.15.97 shipped in the range with no t
         parentVersion: "0.15.85",
       },
     ],
-    tagTargetFor: tagsAt({ "0.15.96": "9999999999" }),
+    tagTargetFor: tagsAt({ "0.15.98": "1111111111", "0.15.96": "9999999999" }),
   });
   assert.equal(violations.length, 1, violations.join("\n"));
   assert.match(violations[0], /^0\.15\.97 was cut by 7b477d55 /);
@@ -163,7 +211,7 @@ test("#1882 a tag is credited only when it resolves to the commit that cut the v
     tag: "v0.15.98",
     treeAtTag: treeAt("0.15.98"),
     range,
-    tagTargetFor: tagsAt({ "0.15.97": "deadbeef00" }),
+    tagTargetFor: tagsAt({ "0.15.98": "1111111111", "0.15.97": "deadbeef00" }),
   });
   assert.equal(wrongTarget.length, 1, wrongTarget.join("\n"));
   assert.match(wrongTarget[0], /v0\.15\.97 exists but resolves to deadbeef, not the commit that cut 0\.15\.97/);
@@ -172,21 +220,21 @@ test("#1882 a tag is credited only when it resolves to the commit that cut the v
     tag: "v0.15.98",
     treeAtTag: treeAt("0.15.98"),
     range,
-    tagTargetFor: tagsAt({ "0.15.97": "7b477d5500" }),
+    tagTargetFor: tagsAt({ "0.15.98": "1111111111", "0.15.97": "7b477d5500" }),
   });
   assert.deepEqual(rightTarget, []);
 });
 
-test("#1882 the tag's own release commit is never reported as an untagged gap", () => {
-  // At push time this tag legitimately has no *earlier* tag for its own version,
-  // and flagging it would make every single release red.
+test("#1882 the tag's own release commit is not reported as a gap when the tag sits on it", () => {
+  // The ordinary release: the tag labels the commit that cut its version. Flagging
+  // this would make every single release red.
   const violations = auditTag({
     tag: "v0.15.105",
     treeAtTag: treeAt("0.15.105"),
     range: [
       { sha: "abcabcabc", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
     ],
-    tagTargetFor: noTags,
+    tagTargetFor: tagsAt({ "0.15.105": "abcabcabc" }),
   });
   assert.deepEqual(violations, []);
 });
@@ -199,7 +247,7 @@ test("#1882 a pyproject.toml edit that leaves the version alone is not a release
       { sha: "ddddddddd", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
       { sha: "eeeeeeeee", subject: "chore: widen a dependency pin", version: "0.15.104", parentVersion: "0.15.104" },
     ],
-    tagTargetFor: noTags,
+    tagTargetFor: tagsAt({ "0.15.105": "ddddddddd" }),
   });
   assert.deepEqual(violations, []);
 });
@@ -223,6 +271,140 @@ test("#1882 unavailable history is a violation, not an empty range that passes",
   assert.equal(violations.length, 1, violations.join("\n"));
   assert.match(violations[0], /untagged-release scan could not run/);
   assert.match(violations[0], /shallow clone/);
+});
+
+test("#1882 a commit whose version could not be read is reported, never skipped", () => {
+  // Fail-open at a finer grain than an empty range: `git show <sha>:pyproject.toml`
+  // failing used to read back null, and null was treated as "not a release", so one
+  // unreadable blob could hide the very gap the scan exists to find.
+  const violations = auditTag({
+    tag: "v0.15.98",
+    treeAtTag: treeAt("0.15.98"),
+    range: [
+      { sha: "1111111111", subject: "chore: release v0.15.98", version: "0.15.98", parentVersion: "0.15.97" },
+      {
+        sha: "7b477d5500",
+        subject: "chore: release v0.15.97",
+        version: null,
+        parentVersion: null,
+        versionError: "pyproject.toml exists at 7b477d55 but could not be read: EIO",
+      },
+    ],
+    tagTargetFor: tagsAt({ "0.15.98": "1111111111" }),
+  });
+  assert.equal(violations.length, 1, violations.join("\n"));
+  assert.match(violations[0], /could not be read/);
+  assert.match(violations[0], /left unaudited/);
+});
+
+test("#1882 versionAtRev itself returns an error, never a bare null, on an unreadable rev", () => {
+  // Drives the git-backed reader directly. The previous version of this test
+  // re-implemented the git calls instead of calling versionAtRev, so reverting
+  // the reader to `catch { return null }` left the suite green — the exact
+  // "green suite proves nothing" trap this whole issue is about.
+  const good = versionAtRev("HEAD");
+  assert.equal(good.error, null);
+  assert.match(good.version, /^\d+\.\d+\.\d+/);
+
+  // A syntactically valid SHA that resolves to nothing: `git show` fails, and the
+  // reader must say UNKNOWN rather than "this revision released no version".
+  const bad = versionAtRev("0".repeat(40));
+  assert.equal(bad.version, null);
+  assert.ok(bad.error, "an unreadable rev must carry an error, not a bare null");
+  assert.match(bad.error, /could not be read/);
+});
+
+test("#1882 a reader failure reaches auditTag as a violation through the real range walk", () => {
+  withReleaseHistory((cwd) => {
+    // End-to-end over an isolated real history: collectFromGit walks
+    // v0.15.104 for real and the injected reader fails on every commit, so the
+    // wiring — reader -> versionError -> auditTag -> violation — is exercised
+    // rather than assumed. With the real reader the same tag is clean, which
+    // is asserted second so a broken walk cannot make this test pass vacuously.
+    const failing = collectFromGit("v0.15.104", {
+      cwd,
+      readVersionAt: (rev) => ({ version: null, error: `simulated unreadable blob at ${rev}` }),
+    });
+    assert.equal(failing.historyError, null, "the range itself must still walk");
+    assert.ok(failing.range.length > 0, "expected commits in v0.15.103..v0.15.104");
+    assert.ok(failing.range.every((c) => c.versionError), "every entry must carry the read failure");
+
+    const violations = auditTag({
+      tag: "v0.15.104",
+      treeAtTag: failing.treeAtTag,
+      range: failing.range,
+      tagTargetFor: failing.tagTargetFor,
+    });
+    assert.ok(violations.length > 0, "a range of unreadable commits must not audit as coherent");
+    assert.ok(violations.every((v) => /left unaudited/.test(v)));
+
+    const real = collectFromGit("v0.15.104", { cwd });
+    assert.equal(real.historyError, null);
+    assert.deepEqual(
+      auditTag({
+        tag: "v0.15.104",
+        treeAtTag: real.treeAtTag,
+        range: real.range,
+        tagTargetFor: real.tagTargetFor,
+      }),
+      [],
+    );
+  });
+});
+
+test("#1882 a failed historical parent lookup is a violation, never a root commit", () => {
+  withReleaseHistory((cwd) => {
+    // Keep the real collectFromGit -> versionAtRev walk, but make the
+    // underlying parent lookup fail through the production helper. The old
+    // rev-parse catch converted this exact failure into `hasParent = false`,
+    // which made the range look auditable and could let this release pass.
+    const failing = collectFromGit("v0.15.104", {
+      cwd,
+      firstParentAt: (rev) =>
+        firstParentAtRev(rev, () => {
+          throw new Error(`simulated historical parent lookup failure for ${rev}`);
+        }),
+    });
+    assert.equal(failing.historyError, null, "the commit range itself must still walk");
+    assert.ok(failing.range.length > 0, "expected commits in v0.15.103..v0.15.104");
+    assert.ok(
+      failing.range.every((c) => /historical parent lookup .* failed/.test(c.versionError ?? "")),
+      "every historical parent lookup failure must be carried into the range entry",
+    );
+
+    const violations = auditTag({ tag: "v0.15.104", ...failing });
+    assert.ok(violations.length > 0, "a failed parent lookup must not audit as coherent");
+    assert.ok(violations.every((v) => /left unaudited/.test(v)));
+  });
+});
+
+test("#1882 the tag being pushed is not exempt from the target check", () => {
+  // Rule 1 only proves the TREE at the tag says 0.15.106. A tag force-moved off
+  // the commit that cut 0.15.106 onto a later commit carrying the same version
+  // labels a different build than the one that published — and `v === expected`
+  // used to skip the check entirely.
+  const range = [
+    { sha: "1atercommit", subject: "fix: a later commit, same version", version: "0.15.106", parentVersion: "0.15.106" },
+    { sha: "cut0106cut", subject: "chore: release v0.15.106", version: "0.15.106", parentVersion: "0.15.105" },
+  ];
+  const moved = auditTag({
+    tag: "v0.15.106",
+    treeAtTag: treeAt("0.15.106"),
+    range,
+    tagTargetFor: tagsAt({ "0.15.106": "1atercommit" }),
+  });
+  assert.equal(moved.length, 1, moved.join("\n"));
+  assert.match(moved[0], /v0\.15\.106 resolves to 1atercom/);
+  assert.match(moved[0], /was cut by cut0106c/);
+  assert.match(moved[0], /different build than the one the Registry publishes/);
+
+  const inPlace = auditTag({
+    tag: "v0.15.106",
+    treeAtTag: treeAt("0.15.106"),
+    range,
+    tagTargetFor: tagsAt({ "0.15.106": "cut0106cut" }),
+  });
+  assert.deepEqual(inPlace, []);
 });
 
 test("#1882 a history failure still reports the tree-vs-tag mismatch it could check", () => {
