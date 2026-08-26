@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.99] - 2026-08-26
+
+### Fixed
+- make recovered-completion reload refusals visible to the agent (#1830)
+
 ## [0.15.98] - 2026-08-26
 
 ### Fixed
