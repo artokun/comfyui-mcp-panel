@@ -231,12 +231,26 @@ export function auditTag({ tag, treeAtTag, range = [], tagTargetFor, historyErro
 // git-backed shell
 // ---------------------------------------------------------------------------
 
-const git = (...args) =>
-  execFileSync("git", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+/**
+ * git bound to a working directory. `cwd` exists so the walk can be exercised
+ * against a purpose-built repository: CI checks this repo out shallow and
+ * without tags, so any test keyed on OUR history passes locally and fails on the
+ * runner — which is how the first version of these tests went red in CI while
+ * green here.
+ */
+const gitIn =
+  (cwd) =>
+  (...args) =>
+    execFileSync("git", cwd ? ["-C", cwd, ...args] : args, {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
 
-const showOrNull = (rev, path) => {
+const git = gitIn(null);
+
+const showOrNull = (rev, path, runGit = git) => {
   try {
-    return git("show", `${rev}:${path}`);
+    return runGit("show", `${rev}:${path}`);
   } catch {
     return null;
   }
@@ -255,10 +269,10 @@ const showOrNull = (rev, path) => {
  * this repo since the root commit (4f22ed0f) — a revision without it means the
  * release model changed, not that the revision released nothing.
  */
-export function versionAtRev(rev) {
+export function versionAtRev(rev, runGit = git) {
   let text;
   try {
-    text = git("show", `${rev}:pyproject.toml`);
+    text = runGit("show", `${rev}:pyproject.toml`);
   } catch (e) {
     return {
       version: null,
@@ -311,22 +325,28 @@ export function firstParentAtRev(rev, runGit = git) {
  * @param {{
  *   readVersionAt?: (rev:string)=>{version:string|null, error:string|null},
  *   firstParentAt?: (rev:string)=>{parent:string|null, error:string|null},
+ *   cwd?: string,
  * }} [deps]
  *        the version reader is injectable ONLY so a test can drive a read failure
  *        through the real range walk. Every commit in this repo's history is
  *        readable, so the failure path cannot be reached from real data — and an
  *        unexercised failure path is how the first two drafts of this guard
  *        shipped fail-open. The parent resolver is injectable for the same reason:
- *        a real repository cannot manufacture a failed lookup on demand.
+ *        a real repository cannot manufacture a failed lookup on demand. `cwd`
+ *        lets tests provide an isolated local history without depending on the
+ *        checkout's fetched tags or depth.
  */
 export function collectFromGit(
   tag,
-  { readVersionAt = versionAtRev, firstParentAt = firstParentAtRev } = {},
+  { readVersionAt, firstParentAt, cwd } = {},
 ) {
+  const runGit = cwd ? gitIn(cwd) : git;
+  const readVersion = readVersionAt ?? ((rev) => versionAtRev(rev, runGit));
+  const firstParent = firstParentAt ?? ((rev) => firstParentAtRev(rev, runGit));
   const treeAtTag = {
-    pyproject: showOrNull(tag, "pyproject.toml"),
-    packageJson: showOrNull(tag, "package.json"),
-    panelJs: showOrNull(tag, "web/js/comfyui-mcp-panel.js"),
+    pyproject: showOrNull(tag, "pyproject.toml", runGit),
+    packageJson: showOrNull(tag, "package.json", runGit),
+    panelJs: showOrNull(tag, "web/js/comfyui-mcp-panel.js", runGit),
   };
 
   // Fail closed from here down. Each of these can fail on a runner in a way that
@@ -338,7 +358,7 @@ export function collectFromGit(
   const tagTargets = new Map();
 
   try {
-    if (git("rev-parse", "--is-shallow-repository").trim() === "true") {
+    if (runGit("rev-parse", "--is-shallow-repository").trim() === "true") {
       historyError =
         "this is a shallow clone, so the range cannot be walked (checkout needs fetch-depth: 0)";
     }
@@ -350,7 +370,7 @@ export function collectFromGit(
     try {
       // `%(*objectname)` is the peeled target and is non-empty only for annotated
       // tags; lightweight tags report the commit in `%(objectname)`.
-      for (const line of git(
+      for (const line of runGit(
         "for-each-ref",
         "--format=%(refname:short)%00%(objectname)%00%(*objectname)",
         "refs/tags/v*",
@@ -374,13 +394,13 @@ export function collectFromGit(
     // Failure here is legitimate for the first tag in history, so it is NOT an
     // error — the range simply starts at the root.
     try {
-      previousTag = git("describe", "--tags", "--abbrev=0", "--match", "v*", `${tag}^`).trim();
+      previousTag = runGit("describe", "--tags", "--abbrev=0", "--match", "v*", `${tag}^`).trim();
     } catch {
       previousTag = null;
     }
 
     try {
-      range = git(
+      range = runGit(
         "rev-list",
         "--first-parent",
         "--format=%H%x00%s",
@@ -390,13 +410,13 @@ export function collectFromGit(
         .filter((l) => l && !l.startsWith("commit "))
         .map((line) => {
           const [sha, subject] = line.split("\0");
-          const own = readVersionAt(sha);
+          const own = readVersion(sha);
 
-          const parentRef = firstParentAt(sha);
+          const parentRef = firstParent(sha);
           const parent = parentRef.error
             ? { version: null, error: parentRef.error }
             : parentRef.parent
-              ? readVersionAt(parentRef.parent)
+              ? readVersion(parentRef.parent)
               : { version: null, error: null };
           const versionErrors = [own.error, parent.error].filter(Boolean);
 

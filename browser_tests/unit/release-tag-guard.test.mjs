@@ -19,9 +19,11 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 
 import {
   auditTag,
@@ -36,6 +38,49 @@ import {
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const read = (rel) => readFileSync(join(root, rel), "utf8");
+
+/**
+ * The hosted unit job intentionally uses a shallow checkout. Keep tests that
+ * exercise the git-backed collector independent of the panel repository's
+ * fetched tags by creating the smallest real history the collector needs.
+ * This still runs the production `git show`, `git describe`, `git rev-list`,
+ * and `git for-each-ref` calls; it only makes their inputs deterministic.
+ */
+function withReleaseHistory(callback) {
+  const fixture = mkdtempSync(join(tmpdir(), "panel-release-tag-guard-"));
+  const runGit = (...args) =>
+    execFileSync("git", args, { cwd: fixture, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+
+  const writeVersion = (version) => {
+    writeFileSync(
+      join(fixture, "pyproject.toml"),
+      `[project]\nname = "release-tag-guard-fixture"\nversion = "${version}"\n`,
+    );
+    writeFileSync(join(fixture, "package.json"), `${JSON.stringify({ version })}\n`);
+    mkdirSync(join(fixture, "web", "js"), { recursive: true });
+    writeFileSync(join(fixture, "web", "js", "comfyui-mcp-panel.js"), `const PANEL_VERSION = "${version}";\n`);
+  };
+
+  try {
+    runGit("init", "--initial-branch=main");
+    runGit("config", "user.email", "release-tag-guard-fixture@example.invalid");
+    runGit("config", "user.name", "release-tag-guard-fixture");
+
+    writeVersion("0.15.103");
+    runGit("add", ".");
+    runGit("commit", "-m", "chore: fixture release v0.15.103");
+    runGit("tag", "v0.15.103");
+
+    writeVersion("0.15.104");
+    runGit("add", ".");
+    runGit("commit", "-m", "chore: fixture release v0.15.104");
+    runGit("tag", "v0.15.104");
+
+    return callback(fixture);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
 
 const treeAt = (v) => ({
   pyproject: `[project]\nname = "comfyui-mcp-panel"\nversion = "${v}"\n`,
@@ -270,68 +315,67 @@ test("#1882 versionAtRev itself returns an error, never a bare null, on an unrea
 });
 
 test("#1882 a reader failure reaches auditTag as a violation through the real range walk", () => {
-  // End-to-end over real history: collectFromGit walks v0.15.104 for real and the
-  // injected reader fails on every commit, so the wiring — reader -> versionError
-  // -> auditTag -> violation — is exercised rather than assumed. With the real
-  // reader the same tag is clean, which is asserted second so a broken walk
-  // cannot make this test pass vacuously.
-  const failing = collectFromGit("v0.15.104", {
-    readVersionAt: (rev) => ({ version: null, error: `simulated unreadable blob at ${rev}` }),
-  });
-  assert.equal(failing.historyError, null, "the range itself must still walk");
-  assert.ok(failing.range.length > 0, "expected commits in v0.15.103..v0.15.104");
-  assert.ok(failing.range.every((c) => c.versionError), "every entry must carry the read failure");
+  withReleaseHistory((cwd) => {
+    // End-to-end over an isolated real history: collectFromGit walks
+    // v0.15.104 for real and the injected reader fails on every commit, so the
+    // wiring — reader -> versionError -> auditTag -> violation — is exercised
+    // rather than assumed. With the real reader the same tag is clean, which
+    // is asserted second so a broken walk cannot make this test pass vacuously.
+    const failing = collectFromGit("v0.15.104", {
+      cwd,
+      readVersionAt: (rev) => ({ version: null, error: `simulated unreadable blob at ${rev}` }),
+    });
+    assert.equal(failing.historyError, null, "the range itself must still walk");
+    assert.ok(failing.range.length > 0, "expected commits in v0.15.103..v0.15.104");
+    assert.ok(failing.range.every((c) => c.versionError), "every entry must carry the read failure");
 
-  const violations = auditTag({
-    tag: "v0.15.104",
-    treeAtTag: treeAt("0.15.104"),
-    range: failing.range,
-    tagTargetFor: failing.tagTargetFor,
-  });
-  assert.ok(violations.length > 0, "a range of unreadable commits must not audit as coherent");
-  assert.ok(violations.every((v) => /left unaudited/.test(v)));
-
-  const real = collectFromGit("v0.15.104");
-  assert.equal(real.historyError, null);
-  assert.deepEqual(
-    auditTag({
+    const violations = auditTag({
       tag: "v0.15.104",
-      treeAtTag: {
-        pyproject: readFileSync(join(root, "pyproject.toml"), "utf8").replace(
-          /^version = ".*"$/m,
-          'version = "0.15.104"',
-        ),
-        packageJson: JSON.stringify({ version: "0.15.104" }),
-        panelJs: 'const PANEL_VERSION = "0.15.104";',
-      },
-      range: real.range,
-      tagTargetFor: real.tagTargetFor,
-    }),
-    [],
-  );
+      treeAtTag: failing.treeAtTag,
+      range: failing.range,
+      tagTargetFor: failing.tagTargetFor,
+    });
+    assert.ok(violations.length > 0, "a range of unreadable commits must not audit as coherent");
+    assert.ok(violations.every((v) => /left unaudited/.test(v)));
+
+    const real = collectFromGit("v0.15.104", { cwd });
+    assert.equal(real.historyError, null);
+    assert.deepEqual(
+      auditTag({
+        tag: "v0.15.104",
+        treeAtTag: real.treeAtTag,
+        range: real.range,
+        tagTargetFor: real.tagTargetFor,
+      }),
+      [],
+    );
+  });
 });
 
 test("#1882 a failed historical parent lookup is a violation, never a root commit", () => {
-  // Keep the real collectFromGit -> versionAtRev walk, but make the underlying
-  // parent lookup fail through the production helper. The old rev-parse catch
-  // converted this exact failure into `hasParent = false`, which made the range
-  // look auditable and could let this release pass.
-  const failing = collectFromGit("v0.15.104", {
-    firstParentAt: (rev) =>
-      firstParentAtRev(rev, () => {
-        throw new Error(`simulated historical parent lookup failure for ${rev}`);
-      }),
-  });
-  assert.equal(failing.historyError, null, "the commit range itself must still walk");
-  assert.ok(failing.range.length > 0, "expected commits in v0.15.103..v0.15.104");
-  assert.ok(
-    failing.range.every((c) => /historical parent lookup .* failed/.test(c.versionError ?? "")),
-    "every historical parent lookup failure must be carried into the range entry",
-  );
+  withReleaseHistory((cwd) => {
+    // Keep the real collectFromGit -> versionAtRev walk, but make the
+    // underlying parent lookup fail through the production helper. The old
+    // rev-parse catch converted this exact failure into `hasParent = false`,
+    // which made the range look auditable and could let this release pass.
+    const failing = collectFromGit("v0.15.104", {
+      cwd,
+      firstParentAt: (rev) =>
+        firstParentAtRev(rev, () => {
+          throw new Error(`simulated historical parent lookup failure for ${rev}`);
+        }),
+    });
+    assert.equal(failing.historyError, null, "the commit range itself must still walk");
+    assert.ok(failing.range.length > 0, "expected commits in v0.15.103..v0.15.104");
+    assert.ok(
+      failing.range.every((c) => /historical parent lookup .* failed/.test(c.versionError ?? "")),
+      "every historical parent lookup failure must be carried into the range entry",
+    );
 
-  const violations = auditTag({ tag: "v0.15.104", ...failing });
-  assert.ok(violations.length > 0, "a failed parent lookup must not audit as coherent");
-  assert.ok(violations.every((v) => /left unaudited/.test(v)));
+    const violations = auditTag({ tag: "v0.15.104", ...failing });
+    assert.ok(violations.length > 0, "a failed parent lookup must not audit as coherent");
+    assert.ok(violations.every((v) => /left unaudited/.test(v)));
+  });
 });
 
 test("#1882 the tag being pushed is not exempt from the target check", () => {
