@@ -517,8 +517,12 @@ export function createRunCompletionTracker({
   // fourth would not recover anything the first three did not — nothing about
   // the run changes between ticks except the clock.
   const maxUnackedDeliveries = 3;
+  // #1824 recurrence: track entries that have already been delivered exactly once
+  // past the bound via /history confirmation. On the next reconcile, retire them.
+  const deliveredPastBound = new Set();
   function clearUnackedDeliveries(k) {
     unackedDeliveries.delete(k);
+    deliveredPastBound.delete(k);
   }
   /** A completion frame for `k` has just been handed to the caller. */
   function noteUnackedDelivery(k) {
@@ -937,12 +941,12 @@ export function createRunCompletionTracker({
       // it is better than losing it, so retire when the bound is reached.
       markTerminal(k);
       clearReconcileRetry(k);
-      // Only retire from pending if the bound has been exhausted. Otherwise keep
-      // it pending for the receipt, per the original #1824 design.
-      if (unackedDeliveriesExhausted(k)) {
-        markDelivered(k); // bound reached → /history is sufficient proof
+      // #1824 recurrence: retire from pending only after we've delivered the /history
+      // confirmation once past the bound. Otherwise keep pending for orchestrator receipt.
+      if (unackedDeliveriesExhausted(k) && deliveredPastBound.has(k)) {
+        markDelivered(k); // bound reached + already delivered → retire
       }
-      // (else: keep in pending for orchestrator receipt)
+      // (else: keep in pending for orchestrator receipt or /history-confirmed delivery)
     } else {
       markDelivered(k); // also clears any scheduled retry for this key
     }
@@ -1015,9 +1019,11 @@ export function createRunCompletionTracker({
       // has NOT been told about, so it always goes through.
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
       // #1824 recurrence: bound prevents frame EMISSIONS (#1842), not truth-seeking.
-      // After bound exhausted, don't emit new frames (check #1842 test). Only proceed
-      // to /history to confirm completion, then retire via markDelivered.
-      if (!boundExhausted) {
+      // Normal replays within the bound are emitted normally. After the bound is
+      // exhausted, /history-confirmed completions are still delivered (with
+      // trackUnackedDelivery=false to not count as emissions), then retired.
+      const shouldDeliver = !boundExhausted || (boundExhausted && hasCompletionKey);
+      if (shouldDeliver) {
         flushWithCompletionRecords(
           k,
           {
@@ -1031,7 +1037,16 @@ export function createRunCompletionTracker({
             reconciled: true,
             ...(mediaLessQueued ? { noMedia: true } : {}),
           },
+          // #1824 recurrence: /history confirmation is not a frame emission — it's
+          // truth-seeking. After the bound is exhausted, only deliver /history
+          // confirmations (with trackUnackedDelivery=false to not count against the
+          // #1842 storm bound). This preserves the duplicate-over-loss principle.
+          { trackUnackedDelivery: !boundExhausted },
         );
+        // Track that we've delivered once past the bound for this keyed completion.
+        if (boundExhausted && hasCompletionKey) {
+          deliveredPastBound.add(k);
+        }
       }
     }
     return { promptId, status: "success", delivered: hasBatch || mediaLessQueued };
