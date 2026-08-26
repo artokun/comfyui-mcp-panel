@@ -336,6 +336,66 @@ function makeFrameDeps(overrides = {}) {
   return { deps, frames, painted, uploadCalls };
 }
 
+test("#1837 a repeat registration REUSES the run's identity — one finished run, one agent turn", () => {
+  const h = makeHarness();
+  const P = "repeat-registration";
+
+  // Neither call supplies a completion key, so the tracker mints one. #1833 dropped
+  // the `existingKey ||` term, and because createRunCompletionKey salts with
+  // Date.now()+Math.random() the second call invented a SECOND identity for the same
+  // prompt — an identity no orchestrator ticket ever opened. flushWithCompletionRecords
+  // emits one frame per record, so a single finished run became two agent turns: the
+  // exact symptom #1830 was filed about.
+  const first = h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a" });
+  const second = h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a" });
+  assert.equal(second, first, "a repeat registration reports the identity the run already carries");
+  assert.deepEqual(
+    h.tracker.completionMetadata().map((row) => row.completionKey),
+    [first],
+    "minting must not add a second row the orchestrator never asked for",
+  );
+
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecuted(P, imgs([img("repeat-registration.png")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.deepEqual(
+    h.flushes.map((payload) => payload.completionKey),
+    [first],
+    "ONE completion frame for one completed prompt",
+  );
+
+  // The single retained row still retires normally against its own receipt.
+  assert.equal(h.tracker.acknowledgeDelivery(P, first), true);
+  assert.equal(h.tracker.completionMetadata().length, 0);
+  assert.equal(h.tracker.hasPending(), false);
+});
+
+test("#1837 a reused identity re-registered on another route/session does not duplicate", () => {
+  const h = makeHarness();
+  const P = "ctx-switch-prompt";
+
+  // The identity tuple is [route, session, prompt, key], so reusing one key under a
+  // second route/session would land as a DISTINCT record and flush a byte-identical
+  // duplicate frame — strictly worse than the #1837 regression, since both copies
+  // carry the same completion key and the agent cannot tell them apart.
+  const first = h.tracker.onQueued(P, { routeId: "route-a", sessionId: "session-a" });
+  h.tracker.onQueued(P, { routeId: "route-b", sessionId: "session-b" });
+  assert.deepEqual(
+    h.tracker.completionMetadata().map((row) => row.completionKey),
+    [first],
+    "one key is one receipt, whichever context re-registers it",
+  );
+
+  h.tracker.onExecutionStart(P);
+  h.tracker.onExecuted(P, imgs([img("ctx-switch.png")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.deepEqual(
+    h.flushes.map((payload) => payload.completionKey),
+    [first],
+    "no byte-identical duplicate frame",
+  );
+});
+
 test("#1830 keeps two same-prompt nonce rows and retires them by exact key", () => {
   const h = makeHarness();
   const P = "same-prompt";
