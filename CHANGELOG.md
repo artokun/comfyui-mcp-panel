@@ -6,9 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.105] - 2026-08-26
+
 ### Fixed
 - scrolling up during a streaming turn no longer snaps back to the bottom (#1879)
 - the pruned-retry disclosure says why the first post is not pre-pruned (#1871)
+- graph_connect reports live dynamic slot rewrites and safely bounds hostile disclosure values (#1873)
+
+### Fixed
+- a connect that re-addresses its target's slots says so (#1876)
+- the pruned-retry note says WHY the first post is not pre-pruned (#1881)
+- normalise CRLF in the scope-fence source pins so they run on Windows (#1880)
+- preserve unsaved workflow identity across proxy reads (#1790) (#1875)
+
 
 ## [0.15.104] - 2026-08-26
 
