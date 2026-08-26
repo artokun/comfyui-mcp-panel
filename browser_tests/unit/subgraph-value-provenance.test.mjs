@@ -100,6 +100,60 @@ test("WIRING: production graph_get_subgraph gives MCP a definitive non-promoted 
   );
 });
 
+test("WIRING: production graph_get_subgraph publishes the terminal nested-promotion witness", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const start = src.indexOf("graph_get_subgraph({ node_id }) {");
+  const end = src.indexOf("async graph_add_node(", start);
+  assert.ok(start >= 0 && end > start, "graph_get_subgraph handler must remain extractable");
+  const method = src.slice(start, end).replace(/,\s*$/, "");
+  const terminal = {
+    widget: "quality_prompt",
+    immediate_node_id: 188,
+    immediate_widget: "quality_prompt",
+    terminal_node_id: 2768,
+    terminal_node_type: "AnimaRegionalCanvasInline",
+    terminal_widget: "quality_prompt",
+    terminal_inputs: [],
+    chain_depth: 1,
+  };
+  const parent = {
+    id: 78,
+    title: "Nested container",
+    inputs: [],
+    subgraph: { _nodes: [{ id: 188, type: "SubgraphB", is_subgraph: true }] },
+  };
+  const graph = {};
+  const getSubgraph = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "describeActiveGraph",
+    "subgraphValueProvenance",
+    "redactWidgetValue",
+    "graphViewIdentityFor",
+    "MAX_STATE_NODES",
+    "fixedCapNote",
+    "summarizeNode",
+    "promotedTerminalWitnesses",
+    `return ({${method}}).graph_get_subgraph;`,
+  )(
+    () => ({ graph }),
+    () => parent,
+    () => ({ scope: "root", graph_identity: "root" }),
+    () => ({}),
+    () => ({}),
+    () => "graph:nested",
+    50,
+    () => "truncation note",
+    (node) => ({ id: node.id, type: node.type }),
+    () => [terminal],
+  );
+
+  const out = getSubgraph({ node_id: 78 });
+  assert.deepEqual(out.promoted_terminals, [terminal]);
+  assert.equal(out.nodes[0].id, 188);
+});
+
 test("WIRING: production graph_get_subgraph redacts instance provenance", async () => {
   // Execute the module-private handler's source fragment. A source-only assertion
   // would miss a sanitizer applied to the wrong object, while a helper-only test
@@ -144,6 +198,7 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     "MAX_STATE_NODES",
     "fixedCapNote",
     "summarizeNode",
+    "promotedTerminalWitnesses",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph }),
@@ -155,6 +210,7 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     50,
     () => "truncation note",
     (node) => ({ id: node.id, mode: node.mode, inputs: node.inputs, outputs: node.outputs }),
+    () => [],
   );
 
   const out = getSubgraph({ node_id: 173 });

@@ -1494,20 +1494,34 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
  *   { node: null, widget: null, error }     → a deeper promotion link is unresolvable
  *   { node, widget, cycle: true }           → a promotion cycle was detected (defensive)
  */
+/** Maximum number of nested promoted containers the write path will traverse.
+ * A cycle is handled separately, but a bounded walk is still required for
+ * hostile/malformed graphs whose resolver keeps producing fresh objects. */
+export const MAX_PROMOTION_CHAIN_DEPTH = 16;
+
 export function followPromotionToConcrete(target, resolveSource) {
   let node = target?.node ?? null;
   let widget = target?.widget ?? null;
   const seen = new Set();
+  let depth = 0;
   while (node && node.subgraph) {
     if (seen.has(node)) return { node, widget, cycle: true };
+    if (depth >= MAX_PROMOTION_CHAIN_DEPTH) {
+      return {
+        node: null,
+        widget: null,
+        error: `promoted chain exceeded the maximum depth of ${MAX_PROMOTION_CHAIN_DEPTH}`,
+      };
+    }
     seen.add(node);
     const res = resolvePromotedInnerTarget(node, widget?.name, resolveSource);
     if (!res.promoted) return { node, widget, terminalVirtual: true };
     if (!res.target) return { node: null, widget: null, error: res.error };
     node = res.target.node;
     widget = res.target.widget;
+    depth += 1;
   }
-  return { node, widget };
+  return { node, widget, depth };
 }
 
 /**
@@ -1525,14 +1539,17 @@ export function collectPromotionIntermediates(target, resolveSource) {
   let node = target?.node ?? null;
   let widget = target?.widget ?? null;
   const seen = new Set();
+  let depth = 0;
   while (node && node.subgraph) {
     if (seen.has(node)) break;
+    if (depth >= MAX_PROMOTION_CHAIN_DEPTH) break;
     seen.add(node);
     out.push(node);
     const res = resolvePromotedInnerTarget(node, widget?.name, resolveSource);
     if (!res.promoted || !res.target) break;
     node = res.target.node;
     widget = res.target.widget;
+    depth += 1;
   }
   return out;
 }

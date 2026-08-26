@@ -189,3 +189,57 @@ test("#2314 same owner id in a different graph is refused at the shipped fence",
   currentGraph = graphB;
   assert.throws(() => assertScope(current(), expected), /promoted receiver changed before dispatch/);
 });
+
+test("#2314 terminal endpoint is part of the shipped receiver fence", () => {
+  const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
+  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "production scope helper boundary not found");
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    `${PANEL_SRC.slice(helperStart, helperEnd)}; return assertExpectedPromotedScope;`,
+  )(
+    () => ({
+      scope: "subgraph",
+      owner_node_id: 78,
+      workflow_uuid: "workflow-a",
+      graph_identity: "graph-a",
+    }),
+    () => ({ id: 78 }),
+  );
+  const current = { graph: {}, rootGraph: {} };
+  const expected = {
+    scope: "subgraph",
+    owner_node_id: 78,
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph-a",
+    terminal: {
+      node_id: 2768,
+      type: "KSampler",
+      widget: "steps",
+      inputs: [{ name: "steps", type: "INT" }],
+      chain_depth: 1,
+    },
+  };
+  const liveTerminal = () => ({
+    node_id: 2768,
+    type: "KSampler",
+    widget: "steps",
+    inputs: [{ name: "steps", type: "INT" }],
+    depth: 1,
+  });
+
+  assert.doesNotThrow(() => assertScope(current, expected, liveTerminal));
+  assert.throws(
+    () => assertScope(current, { ...expected, terminal: { ...expected.terminal, node_id: 99 } }, liveTerminal),
+    /promoted terminal receiver changed or became unverifiable/,
+  );
+  assert.throws(
+    () => assertScope(current, { ...expected, terminal: { ...expected.terminal, chain_depth: 17 } }, liveTerminal),
+    /chain_depth must be a bounded integer/,
+  );
+  assert.throws(
+    () => assertScope(current, expected),
+    /could not verify the terminal promotion endpoint/,
+  );
+});

@@ -64,7 +64,11 @@
 // bottom). Deferral approach contributed by @FreesoSaiFared.
 // Used by the unpack preflight's divergence scan. It was called without ever being imported,
 // so that path threw ReferenceError rather than refusing cleanly (#1136 sweep).
-import { resolvePromotedInnerTarget } from "./lib/widget-write.js";
+import {
+  MAX_PROMOTION_CHAIN_DEPTH,
+  followPromotionToConcrete,
+  resolvePromotedInnerTarget,
+} from "./lib/widget-write.js";
 import { describeVoiceError } from "./lib/voice-error.js";
 import { voiceRecognitionLang } from "./lib/voice-language.js";
 import { isEmbeddedDesktopShell, voiceInputSupport } from "./lib/voice-support.js";
@@ -9491,6 +9495,107 @@ function sourceForSubgraphInput(subgraphNode, subgraphInput) {
   return null;
 }
 
+/** Return the addressable aliases for every host promotion on a subgraph node.
+ * Labels are included because panel_set_widget accepts the displayed alias,
+ * while the resolver itself still authenticates the backing relationship. */
+function promotedHostAliases(subgraphNode) {
+  const aliases = new Set();
+  for (const input of subgraphNode?.inputs ?? []) {
+    for (const value of [input?.name, input?.label, input?._subgraphSlot?.name, input?._subgraphSlot?.label]) {
+      if (value != null && String(value).length > 0) aliases.add(String(value));
+    }
+  }
+  return [...aliases];
+}
+
+/** The terminal shape is deliberately small and value-free. It carries the
+ * identity/type/widget needed by the receiver fence and the input declarations
+ * needed by MCP's dynamic-combo guard, without copying arbitrary widget values. */
+function terminalPromotionShape(node) {
+  if (!Array.isArray(node?.inputs)) return null;
+  const inputs = [];
+  for (const input of node.inputs) {
+    if (!input || typeof input.name !== "string" || input.name.length === 0) return null;
+    if (input.type !== undefined && typeof input.type !== "string") return null;
+    inputs.push({ name: input.name, ...(input.type !== undefined ? { type: input.type } : {}) });
+  }
+  return inputs;
+}
+
+/** Resolve each promoted host alias through the same recursive path used by
+ * graph_set_widget. A missing/cyclic/malformed/deep endpoint is returned as an
+ * explicit error entry so MCP cannot mistake an incomplete witness for a safe
+ * one-hop mapping. */
+function promotedTerminalWitnesses(subgraphNode) {
+  const entries = [];
+  for (const widget of promotedHostAliases(subgraphNode)) {
+    let resolution;
+    try {
+      resolution = resolvePromotedInnerTarget(subgraphNode, widget, sourceForSubgraphInput);
+    } catch (error) {
+      entries.push({
+        widget,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+    if (!resolution?.promoted) continue;
+    if (!resolution.target) {
+      entries.push({ widget, error: resolution.error || "the immediate promotion was unresolved" });
+      continue;
+    }
+
+    let terminal;
+    try {
+      terminal = followPromotionToConcrete(resolution.target, sourceForSubgraphInput);
+    } catch (error) {
+      terminal = { error: error instanceof Error ? error.message : String(error) };
+    }
+    const terminalNode = terminal?.node;
+    const terminalWidget = terminal?.widget;
+    const terminalShape = terminalPromotionShape(terminalNode);
+    if (
+      !terminalNode ||
+      !terminalWidget ||
+      terminal?.cycle ||
+      terminal?.error ||
+      terminal?.terminalVirtual ||
+      terminalNode.subgraph ||
+      terminal?.depth === undefined ||
+      !Number.isSafeInteger(terminal.depth) ||
+      terminal.depth < 0 ||
+      terminal.depth > MAX_PROMOTION_CHAIN_DEPTH ||
+      (typeof terminalNode.id !== "number" && typeof terminalNode.id !== "string") ||
+      typeof terminalNode.type !== "string" ||
+      terminalNode.type.length === 0 ||
+      typeof terminalWidget.name !== "string" ||
+      terminalWidget.name.length === 0 ||
+      !terminalShape
+    ) {
+      entries.push({
+        widget,
+        immediate_node_id: resolution.target.node?.id,
+        immediate_widget: resolution.target.widget?.name,
+        error:
+          terminal?.error ||
+          (terminal?.cycle ? "the promotion chain is cyclic" : "the terminal promotion endpoint was malformed or unresolved"),
+      });
+      continue;
+    }
+    entries.push({
+      widget,
+      immediate_node_id: resolution.target.node.id,
+      immediate_widget: resolution.target.widget.name,
+      terminal_node_id: terminalNode.id,
+      terminal_node_type: terminalNode.type,
+      terminal_widget: terminalWidget.name,
+      terminal_inputs: terminalShape,
+      chain_depth: terminal.depth,
+    });
+  }
+  return entries;
+}
+
 function findPromotedHostInput(subgraphNode, source) {
   return (subgraphNode.inputs ?? []).find((input) => {
     const subgraphInput = input?._subgraphSlot;
@@ -9616,7 +9721,7 @@ function canonicalExpectedPromotedOwner(value) {
   return Number.isSafeInteger(parsed) ? String(parsed) : null;
 }
 
-function assertExpectedPromotedScope(current, expectedScope) {
+function assertExpectedPromotedScope(current, expectedScope, resolveTerminal) {
   if (expectedScope === undefined) return;
   if (!expectedScope || typeof expectedScope !== "object" || Array.isArray(expectedScope)) {
     throw new Error("graph_set_widget expected_scope must be a structured subgraph witness");
@@ -9659,6 +9764,59 @@ function assertExpectedPromotedScope(current, expectedScope) {
         `${liveViewing.workflow_uuid ? ` in workflow ${liveViewing.workflow_uuid}` : ""}. ` +
         "Nothing was applied.",
     );
+  }
+
+  if (expected.terminal !== undefined) {
+    const terminal = expected.terminal;
+    if (!terminal || typeof terminal !== "object" || Array.isArray(terminal)) {
+      throw new Error("graph_set_widget expected_scope.terminal must be a structured endpoint witness");
+    }
+    const terminalId = canonicalExpectedPromotedOwner(terminal.node_id);
+    if (!terminalId) {
+      throw new Error("graph_set_widget expected_scope.terminal.node_id must be a canonical node id");
+    }
+    if (typeof terminal.type !== "string" || terminal.type.length === 0) {
+      throw new Error("graph_set_widget expected_scope.terminal.type must be a non-empty string");
+    }
+    if (typeof terminal.widget !== "string" || terminal.widget.length === 0) {
+      throw new Error("graph_set_widget expected_scope.terminal.widget must be a non-empty string");
+    }
+    if (!Number.isSafeInteger(terminal.chain_depth) || terminal.chain_depth < 0 || terminal.chain_depth > 16) {
+      throw new Error("graph_set_widget expected_scope.terminal.chain_depth must be a bounded integer");
+    }
+    if (!Array.isArray(terminal.inputs)) {
+      throw new Error("graph_set_widget expected_scope.terminal.inputs must be an array");
+    }
+    for (const input of terminal.inputs) {
+      if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.name !== "string" || input.name.length === 0) {
+        throw new Error("graph_set_widget expected_scope.terminal.inputs must contain named input shapes");
+      }
+      if (input.type !== undefined && typeof input.type !== "string") {
+        throw new Error("graph_set_widget expected_scope.terminal.inputs type must be a string");
+      }
+    }
+    if (typeof resolveTerminal !== "function") {
+      throw new Error("graph_set_widget could not verify the terminal promotion endpoint");
+    }
+    let observed;
+    try {
+      observed = resolveTerminal();
+    } catch {
+      observed = null;
+    }
+    const observedId = canonicalExpectedPromotedOwner(observed?.node_id);
+    if (
+      !observed ||
+      observedId !== terminalId ||
+      observed.type !== terminal.type ||
+      observed.widget !== terminal.widget ||
+      observed.depth !== terminal.chain_depth ||
+      JSON.stringify(observed.inputs) !== JSON.stringify(terminal.inputs)
+    ) {
+      throw new Error(
+        "graph_set_widget promoted terminal receiver changed or became unverifiable before dispatch. Nothing was applied.",
+      );
+    }
   }
 }
 
@@ -14371,6 +14529,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const sub = node.subgraph;
     if (!sub) throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
     const inner = [...(sub._nodes ?? sub.nodes ?? [])];
+    const promotedTerminals = promotedTerminalWitnesses(node);
     // #1729 — provenance is a second structured-read path: its raw instance_widgets
     // map must follow the same recursive credential redaction as node summaries.
     const safeProvenance = redactWidgetValue("", subgraphValueProvenance(node));
@@ -14405,6 +14564,7 @@ const GRAPH_TOOL_EXECUTORS = {
           }
         : {}),
       nodes: inner.slice(0, MAX_STATE_NODES).map(summarizeNode),
+      ...(promotedTerminals.length ? { promoted_terminals: promotedTerminals } : {}),
     };
   },
 
@@ -16885,7 +17045,47 @@ const GRAPH_TOOL_EXECUTORS = {
         });
         if (expected_scope === undefined && expected_node_type === undefined && !enforceDeferredExpected) return;
         const current = getGraphCtx();
-        assertExpectedPromotedScope(current, expected_scope);
+        assertExpectedPromotedScope(current, expected_scope, () => {
+          let terminalNode = node;
+          let terminalWidget = node?.widgets?.find((candidate) => candidate?.name === widget) ?? null;
+          let depth = 0;
+          if (node?.subgraph) {
+            const resolved = resolvePromotedInnerTarget(node, widget, sourceForSubgraphInput);
+            if (!resolved?.promoted || !resolved.target) return null;
+            const reached = followPromotionToConcrete(resolved.target, sourceForSubgraphInput);
+            if (
+              !reached?.node ||
+              !reached.widget ||
+              reached.cycle ||
+              reached.error ||
+              reached.terminalVirtual ||
+              reached.node.subgraph
+            ) {
+              return null;
+            }
+            terminalNode = reached.node;
+            terminalWidget = reached.widget;
+            depth = reached.depth;
+          }
+          const inputs = terminalPromotionShape(terminalNode);
+          if (
+            !terminalNode ||
+            !terminalWidget ||
+            !inputs ||
+            (typeof terminalNode.id !== "number" && typeof terminalNode.id !== "string") ||
+            typeof terminalNode.type !== "string" ||
+            typeof terminalWidget.name !== "string"
+          ) {
+            return null;
+          }
+          return {
+            node_id: terminalNode.id,
+            type: terminalNode.type,
+            widget: terminalWidget.name,
+            inputs,
+            depth,
+          };
+        });
         const liveTarget = resolveNode(current.graph, node_id);
         if (
           expected_node_type !== undefined &&

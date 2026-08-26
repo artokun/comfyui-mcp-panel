@@ -37,6 +37,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { followPromotionToConcrete, MAX_PROMOTION_CHAIN_DEPTH } from "../../web/js/lib/widget-write.js";
 import { refreshComboOptionsFromDefs } from "../../web/js/lib/asset-staleness.js";
 import { commandTargetsActiveWorkflow } from "../../web/js/lib/workflow-chat-identity.js";
 
@@ -1041,6 +1042,33 @@ test("#458 set_widget: NESTED promotion CYCLE ⇒ FAIL CLOSED (terminates, no mu
       }),
     (err) => err instanceof Error && /could not be resolved to a concrete backend node/.test(err.message),
   );
+});
+
+test("#2314 terminal witness walk is depth-bounded and fails closed", () => {
+  const nodes = Array.from({ length: MAX_PROMOTION_CHAIN_DEPTH + 2 }, (_, index) => ({
+    id: 1000 + index,
+    type: `Subgraph${index}`,
+    widgets: [{ name: "steps", type: "INT", value: 20 }],
+    inputs: [{ name: "steps", _subgraphSlot: { name: "steps" } }],
+  }));
+  for (let index = 0; index < nodes.length - 1; index += 1) {
+    nodes[index].subgraph = {
+      _nodes: [nodes[index + 1]],
+      getNodeById: (id) => (String(id) === String(nodes[index + 1].id) ? nodes[index + 1] : null),
+    };
+  }
+  const resolveSource = (node) => {
+    const index = nodes.indexOf(node);
+    return index >= 0 && index < nodes.length - 1
+      ? { sourceNodeId: String(nodes[index + 1].id), sourceWidgetName: "steps" }
+      : null;
+  };
+  const result = followPromotionToConcrete(
+    { node: nodes[0], widget: nodes[0].widgets[0], input: null, parentWidget: null, parentWidgets: [] },
+    resolveSource,
+  );
+  assert.match(result.error, /maximum depth/);
+  assert.equal(result.node, null);
 });
 
 test("#458 set_widget: NESTED promoted COMBO recovery keys on the CONCRETE type ⇒ just-staged value accepted (not falsely rejected)", async () => {
