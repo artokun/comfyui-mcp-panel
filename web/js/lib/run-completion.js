@@ -1228,7 +1228,17 @@ export function createRunCompletionTracker({
       if (id != null) {
         panelQueued.add(k);
         const suppliedKey = typeof completionKey === "string" && completionKey.trim() ? completionKey.trim() : null;
-        nextKey = suppliedKey || createRunCompletionKey(routeId, sessionId, k);
+        // #1837 — retaining several SUPPLIED identities for one prompt is deliberate:
+        // each one is a receipt the orchestrator opened, and each is owed its own
+        // frame. Minting is different. createRunCompletionKey salts with
+        // Date.now()+Math.random(), so a repeat registration of a run we already hold
+        // would invent an identity NO orchestrator ticket knows — and since the flush
+        // emits one frame per record, that invented row becomes a second agent turn
+        // for a single finished run. Reuse what the run already carries instead.
+        // This is the term 4641ed01 added alongside the salt, replacing a key its own
+        // comment called "deterministic across retries"; #1833 dropped it.
+        const existingKey = completionRecordFor(k)?.completionKey ?? null;
+        nextKey = suppliedKey || existingKey || createRunCompletionKey(routeId, sessionId, k);
         if (nextKey) {
           if (addCompletionRecord(k, { completionKey: nextKey, routeId, sessionId })) {
             notifyCompletionStateChange();
