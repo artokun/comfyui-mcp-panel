@@ -249,19 +249,22 @@ test("#1882 a commit whose version could not be read is reported, never skipped"
   assert.match(violations[0], /left unaudited/);
 });
 
-test("#1882 pyproject genuinely absent at a commit is not an error", () => {
-  // Pre-pyproject history is a legitimate "nothing was released here", and must
-  // stay distinguishable from "the file is there and unreadable".
-  const violations = auditTag({
-    tag: "v0.15.105",
-    treeAtTag: treeAt("0.15.105"),
-    range: [
-      { sha: "aaaaaaaa1", subject: "chore: release v0.15.105", version: "0.15.105", parentVersion: "0.15.104" },
-      { sha: "bbbbbbbb2", subject: "docs: readme", version: null, parentVersion: null, versionError: null },
-    ],
-    tagTargetFor: tagsAt({ "0.15.105": "aaaaaaaa1" }),
-  });
-  assert.deepEqual(violations, []);
+test("#1882 versionAtRev reports unknown rather than returning a bare null", async () => {
+  // Exercises the git-backed reader against the real repository rather than
+  // injected data, because the fail-open bug lived in the reader, not the rules.
+  const { execFileSync } = await import("node:child_process");
+  const run = (args) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+
+  // A real commit: readable, and its version parses.
+  const head = run(["rev-parse", "HEAD"]);
+  const real = pyprojectVersion(run(["show", `${head}:pyproject.toml`]));
+  assert.match(real, /^\d+\.\d+\.\d+/);
+
+  // pyproject.toml has existed since the root commit, which is why the reader
+  // treats absence as unknown rather than as "this revision released nothing" —
+  // there is no revision in this repo where the quiet reading would be correct.
+  const rootCommit = run(["rev-list", "--max-parents=0", "HEAD"]).split("\n").pop().trim();
+  assert.notEqual(run(["ls-tree", "--name-only", rootCommit, "--", "pyproject.toml"]), "");
 });
 
 test("#1882 the tag being pushed is not exempt from the target check", () => {

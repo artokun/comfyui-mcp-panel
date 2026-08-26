@@ -71,9 +71,7 @@
  * a commit whose version read back `null` and was skipped as "not a release".
  * Both made the scan silently vacuous while the job still reported success, which
  * is the identical shape as the stale pack-contents entry this change also
- * removes. Unreadable history is a violation here, never a pass. A path that is
- * genuinely ABSENT from a commit is a different thing from one that cannot be
- * read, and only the latter is an error.
+ * removes. Unreadable history is a violation here, never a pass.
  *
  * WHAT A TAG PUSH DOES AND DOES NOT RUN. `publish_action.yml` filters `on.push`
  * by `branches: [main]`, and GitHub does not run a `branches`-filtered push
@@ -245,33 +243,28 @@ const showOrNull = (rev, path) => {
 };
 
 /**
- * pyproject's version at one revision, distinguishing the three outcomes a bare
+ * pyproject's version at one revision, separating the two outcomes a bare
  * try/catch collapses into one:
  *
  *   { version: "0.15.97", error: null }  read it
- *   { version: null, error: null }       pyproject.toml is genuinely ABSENT at this
- *                                        commit (pre-pyproject history) — nothing
- *                                        was released here
- *   { version: null, error: "..." }      the file is there and could not be read, or
- *                                        carries no [project].version — UNKNOWN, and
- *                                        unknown must never read as "no release"
+ *   { version: null, error: "..." }      UNKNOWN — unreadable, missing, or carrying
+ *                                        no [project].version. Never "no release".
+ *
+ * Absence is an error rather than a quiet "nothing shipped here" because
+ * pyproject.toml is what publish_action.yml triggers on, and it has existed on
+ * this repo since the root commit (4f22ed0f) — a revision without it means the
+ * release model changed, not that the revision released nothing.
  */
 function versionAtRev(rev) {
-  let present;
-  try {
-    present = git("ls-tree", "--name-only", rev, "--", "pyproject.toml").trim() !== "";
-  } catch (e) {
-    return { version: null, error: `could not list pyproject.toml at ${short(rev)}: ${e.message}` };
-  }
-  if (!present) return { version: null, error: null };
-
   let text;
   try {
     text = git("show", `${rev}:pyproject.toml`);
   } catch (e) {
     return {
       version: null,
-      error: `pyproject.toml exists at ${short(rev)} but could not be read: ${e.message}`,
+      error:
+        `pyproject.toml could not be read at ${short(rev)} (${e.message.split("\n")[0]}) — ` +
+        `that file is what publish_action.yml triggers on, so this revision cannot be audited`,
     };
   }
   const version = pyprojectVersion(text);
