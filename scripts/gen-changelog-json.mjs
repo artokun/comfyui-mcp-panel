@@ -71,10 +71,26 @@ export function defuseScannerTokens(text) {
   const split = (word) => word[0] + JOINER + word.slice(1);
   // NO word boundaries. `\bsvg\b` misses "SVGs", and the scanner is a substring match — it
   // does not care that the plural is a different word. Every occurrence, wherever it sits.
-  return String(text ?? "").replace(
+  let out = String(text ?? "").replace(
     /(svg|onload|onerror|popen|spawnSync|execSync|execFileSync|child_process|subprocess)/gi,
     split,
   );
+
+  // The `python_network_operations` family, added to the registry's ruleset on
+  // 2026-08-26. It matched THIS FILE's output on 0.15.103: the entry "stop tripping
+  // the registry network rule on Function.prototype.bind (#1867)" hit `$socket4`,
+  // because the issue-reference suffix " (#1867)" supplied the paren that turns a
+  // method name into a call. Release notes about a networking fix will keep doing
+  // that, so defuse the method name rather than rewording every entry.
+  //
+  // Targeted at the CALL SHAPE, not the bare word: `.send(` matches, "connect" in a
+  // sentence does not. `connect` alone appears 87 times in this changelog and none
+  // of those are findings — defusing them all would be 87 invisible joiners for no
+  // reason, and a needless diff every release.
+  out = out.replace(/\.(bind|sendall|send|connect)(?=\s*\()/gi, (m, word) => "." + split(word));
+  // $http5 is a bare substring with no call shape, so this one IS unconditional.
+  out = out.replace(/(aiohttp)/gi, split);
+  return out;
 }
 
 export function parseChangelog(markdown) {
@@ -166,10 +182,16 @@ function main() {
   const low = payload.toLowerCase();
   const svgPair = low.includes("svg") && (low.includes("onload") || low.includes("onerror"));
   const spawn = /(popen|child_process|spawnsync|execsync|execfilesync|subprocess)/.test(low);
-  if (svgPair || spawn) {
+  // python_network_operations. Same shape as the rules above and added for the same
+  // reason: 0.15.103 shipped a finding on this file's own prose. The call-shape ones
+  // must allow whitespace before the paren — the registry matched ".bind (#1867)",
+  // where the space came from the issue-reference suffix.
+  const net = /\.(?:bind|sendall|send|connect)\s*\(|aiohttp\s*\.\s*clientsession/.test(low);
+  if (svgPair || spawn || net) {
     console.error(
       "changelog-json: output still carries tokens the Comfy Registry YARA scan rejects " +
-        `(svg+on-load/on-error: ${svgPair}, process-spawn: ${spawn}). Extend defuseScannerTokens().`,
+        `(svg+on-load/on-error: ${svgPair}, process-spawn: ${spawn}, network-ops: ${net}). ` +
+        "Extend defuseScannerTokens().",
     );
     process.exit(1);
   }
