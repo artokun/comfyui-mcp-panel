@@ -77,6 +77,7 @@ import {
 import { MUTATION_BINDING_BAR } from "../../web/js/lib/graph-binding.js";
 import { createRunCompletionTracker } from "../../web/js/lib/run-completion.js";
 import { createRunCompletionFlushHandler } from "../../web/js/lib/run-completion-delivery.js";
+import { attachControlRepetitionNote } from "../../web/js/lib/partial-queue-result.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js";
 import { createRunReceiptOutbox } from "../../web/js/lib/run-receipt-outbox.js";
@@ -709,6 +710,8 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     // ReferenceError at RUN time, which is how this harness caught the omission.
     driveControlHooksAcrossScopedBatch,
     scopedBatchDriveNote,
+    // #1998 — helper to attach control-repetition notes to partial queue results
+    attachControlRepetitionNote,
     rgthreeFixedSeedNote,
     summarizePromptRejection,
     buildQueueAcceptResult,
@@ -1789,6 +1792,8 @@ test("#1565 P1: prompts that DID queue before the budget expired are reported wi
     assert.deepEqual(res.queued_prompt_ids, ["srv-1"]);
     assert.equal(res.complete, false);
     assert.match(String(res.incomplete_reason), /command budget/);
+    // #1998 FIX: the harness can now resolve attachControlRepetitionNote, confirming
+    // the helper is properly injected and the extracted graph_run can call it without error
   } finally {
     stop();
   }
