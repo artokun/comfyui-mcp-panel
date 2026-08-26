@@ -837,13 +837,12 @@ export function createRunCompletionTracker({
     // #1824 recurrence — the bound prevents FRAME EMISSIONS, not TRUTH-SEEKING.
     // For legacy unkeyed runs, enforce the bound strictly (no emissions permitted).
     // For keyed panel_run completions awaiting orchestrator receipt: proceed to
-    // /history to confirm whether the run actually completed. If /history says
-    // it's done, we'll deliver that proof without incrementing unackedDeliveries
-    // (it's not an emission attempt, just reading state). This preserves the
-    // duplicate-over-loss principle: proving completion beats losing it.
+    // /history to confirm whether the run actually completed ONCE past the bound.
+    // After that one confirmation, refuse all further probes to stop wasting
+    // ComfyUI queries once per stuck run per tick, forever (#1842).
     const isKeyedCompletion = hasCompletionRecords(k);
     const boundExhausted = unackedDeliveriesExhausted(k);
-    if (boundExhausted && !isKeyedCompletion) return null;
+    if (boundExhausted && (!isKeyedCompletion || deliveredPastBound.has(k))) return null;
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
@@ -1020,9 +1019,12 @@ export function createRunCompletionTracker({
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
       // #1824 recurrence: bound prevents frame EMISSIONS (#1842), not truth-seeking.
       // Normal replays within the bound are emitted normally. After the bound is
-      // exhausted, /history-confirmed completions are still delivered (with
-      // trackUnackedDelivery=false to not count as emissions), then retired.
-      const shouldDeliver = !boundExhausted || (boundExhausted && hasCompletionKey);
+      // exhausted, /history-confirmed keyed completions may deliver exactly once
+      // (with trackUnackedDelivery=false to not count as emissions), then retire.
+      // Once past-bound delivery has happened, don't deliver again even if refusals
+      // reduce the count back below the bound.
+      const shouldDeliver =
+        !deliveredPastBound.has(k) && (!boundExhausted || (boundExhausted && hasCompletionKey));
       if (shouldDeliver) {
         flushWithCompletionRecords(
           k,
