@@ -268,6 +268,9 @@ import {
   findDivergentPromotedValues,
 } from "./lib/unpack-promoted-values.js";
 import {
+  attachControlRepetitionNote,
+} from "./lib/partial-queue-result.js";
+import {
   withPreservedPromotedInstanceWidgets,
   applySavedSubgraphHostWidgets,
 } from "./lib/subgraph-instance-widgets.js";
@@ -19235,7 +19238,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // happen") into `incomplete_reason`.
       const unresolved = (runScopeResult.indeterminate ?? 0) + (runScopeResult.inFlight ?? 0);
       if (runScopeResult.verified > 0 && unresolved === 0) {
-        return {
+        const result = {
           queued: true,
           complete: false,
           partially_queued: true,
@@ -19254,6 +19257,9 @@ const GRAPH_TOOL_EXECUTORS = {
             `Re-run only the remaining ${Math.max(0, batch - runScopeResult.verified)} — ` +
             `re-running the full batch would queue the already-running prompt(s) again.`,
         };
+        // #1998 — attach control-repetition warning and observations to the result
+        attachControlRepetitionNote(result, controlDriveObservations, repeatingControls, batch, scopedBatchDriveNote, scopedBatchSeedNote);
+        return result;
       }
       // Nothing verified. But "nothing verified" is still not always "nothing
       // queued": an indeterminate dispatch left the panel and may have been
@@ -19324,7 +19330,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // rendering, and are already registered for reconnect reconciliation above.
         // Reporting this as a failure would send the caller to re-run work that is
         // running; between the two misreadings that is the destructive one.
-        return {
+        const result = {
           queued: true,
           complete: false,
           partially_queued: true,
@@ -19337,6 +19343,9 @@ const GRAPH_TOOL_EXECUTORS = {
             `re-running anything: re-running the whole batch would queue the already-running ` +
             `prompt(s) again.`,
         };
+        // #1998 — attach control-repetition warning and observations to the result
+        attachControlRepetitionNote(result, controlDriveObservations, repeatingControls, batch, scopedBatchDriveNote, scopedBatchSeedNote);
+        return result;
       }
       // NOTHING CONFIRMED. `queued` is OMITTED rather than set false, and that holds even
       // when NOTHING has left the panel yet — which is the one thing this branch got wrong

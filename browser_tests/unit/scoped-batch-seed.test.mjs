@@ -996,13 +996,10 @@ test("#1998 P1-1 CALL SITE: the drive is armed over the SCOPE, and null arms not
 
 test("#1998 P1-2 CALL SITE: the #988 warning is subtracted by ATTRIBUTED widgets, not suppressed wholesale", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
-  const sites = [...src.matchAll(/const repeatingNote = ([^\n;]+)/g)].map((m) => m[1].trim());
-  assert.equal(sites.length, 1);
-  assert.equal(
-    sites[0],
-    "scopedBatchSeedNote(repeatingControls, batch)",
-    `the note must not be gated on the observation array existing, got: ${sites[0]}`,
-  );
+  // #1998 fix: repeatingNote is built in the helper (lib/partial-queue-result.js),
+  // called from both early-return paths. Verify both paths call the helper.
+  const calls = [...src.matchAll(/attachControlRepetitionNote\(/g)];
+  assert.ok(calls.length >= 2, `both early-return paths must call attachControlRepetitionNote (found ${calls.length} calls)`);
   // ARMED is not enough (gate r2 P1-A): a control whose hook calls came from another run
   // was being subtracted on the strength of that run's work. Only the ATTRIBUTED set may
   // silence #988's warning.
