@@ -4,7 +4,12 @@ import { readFileSync } from "node:fs";
 import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
 import { findSubgraphOwner } from "../../web/js/lib/subgraph-scope.js";
 
-const PANEL_SRC = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+// This tree is CRLF; CI checks out LF. Every source pin below anchors on a BLANK LINE,
+// and a literal two-newline anchor never matches a CRLF blank line — so these four fence
+// pins passed on CI and were dead on Windows, one of them slicing to -1 and swallowing
+// the rest of the file as a fake "helper". The five sibling pin files already normalise
+// at read time; this one was missed (comfyui-mcp#2314).
+const PANEL_SRC = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
 function extractShippingMethod(signature) {
   const start = PANEL_SRC.indexOf(signature);
