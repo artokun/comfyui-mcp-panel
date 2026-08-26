@@ -9,12 +9,13 @@ import {
   normalizeRunCompletionMetadata,
   parseRunCompletionIdentity,
   partitionRunCompletionMetadata,
+  runCompletionKeyMatchesContext,
   runCompletionKeyMatchesRoute,
 } from "../../web/js/lib/run-completion-persistence.js";
 
 const row = ({
   routeId = "tab-a::wf:workflows/a.json",
-  sessionId = "mount-7",
+  sessionId = "agent-session-7",
   promptId = "prompt-a",
   nonce = "queue-a",
 } = {}) => ({
@@ -48,7 +49,7 @@ test("#1830 remount restores only the active route and retains foreign routes", 
     promptId: "prompt-b",
     nonce: "queue-b",
   });
-  const partitioned = partitionRunCompletionMetadata([foreign, active], active.routeId);
+  const partitioned = partitionRunCompletionMetadata([foreign, active], active.routeId, active.sessionId);
   assert.deepEqual(partitioned.current, [active]);
   assert.deepEqual(partitioned.deferred, [foreign]);
 
@@ -70,6 +71,8 @@ test("#1830 keyed completion cannot leave on a replacement workflow route", () =
   assert.equal(runCompletionKeyMatchesRoute(completion.completionKey, completion.routeId), true);
   assert.equal(runCompletionKeyMatchesRoute(completion.completionKey, "replacement-route"), false);
   assert.equal(runCompletionKeyMatchesRoute("malformed", completion.routeId), false);
+  assert.equal(runCompletionKeyMatchesContext(completion.completionKey, completion.routeId, completion.sessionId), true);
+  assert.equal(runCompletionKeyMatchesContext(completion.completionKey, completion.routeId, "replacement-session"), false);
 });
 
 test("#1830 id-less events never become persisted completion identities", () => {
@@ -83,10 +86,10 @@ test("#1830 production wiring owner-gates stale mount persistence and restores b
     join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js"),
     "utf8",
   ).replace(/\r\n/g, "\n");
-  assert.match(source, /partitionRunCompletionMetadata\(\s*readRunCompletionMetadata\(\),\s*completionRestoreRoute/);
+  assert.match(source, /partitionRunCompletionMetadata\(\s*readRunCompletionMetadata\(\),\s*completionRestoreRoute,\s*completionRestoreSession/);
   assert.match(source, /if \(panelRunOwnerRef\.current !== mountOwner\) return;/);
   assert.match(source, /mergeRunCompletionMetadata\(entries, deferredRunCompletionMetadata\)/);
   assert.match(source, /restoreRunCompletionMetadata\(runCompletion, completionRestore\.current\)/);
-  assert.match(source, /if \(!runCompletionKeyMatchesRoute\(frame\.completion_key, liveRoute\)\) return false;/);
+  assert.match(source, /if \(!runCompletionKeyMatchesContext\(frame\.completion_key, liveRoute, liveSession\)\) return false;/);
   assert.match(source, /sendFrame: sendRunCompletionFrame/);
 });

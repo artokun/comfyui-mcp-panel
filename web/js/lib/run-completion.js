@@ -196,10 +196,99 @@ export function createRunCompletionTracker({
   const panelRunCompletionKeys = new Set();
   let panelRunLateCapture = false;
   // A panel_run completion is not retired when the browser socket accepts the
-  // frame. Keep the stable route+prompt key with the run so /history retries
-  // carry the same idempotency key until the orchestrator acknowledges it.
-  const completionKeys = new Map(); // key -> route-scoped completion key
-  const completionMeta = new Map(); // key -> { completionKey, routeId, sessionId }
+  // frame. Keep every exact route+agent-session+prompt+nonce identity with the
+  // run so restored same-prompt rows cannot overwrite one another.
+  const completionKeys = new Map(); // composite identity -> completion key
+  const completionMeta = new Map(); // composite identity -> { promptId, completionKey, routeId, sessionId }
+  const completionIdentitiesByPrompt = new Map(); // prompt key -> Set(composite identity)
+
+  function completionIdentity(k, routeId, sessionId, completionKey) {
+    const route = routeId == null ? "" : String(routeId).trim();
+    const session = sessionId == null ? null : String(sessionId).trim();
+    const exactKey = typeof completionKey === "string" ? completionKey.trim() : "";
+    if (!route || !exactKey) return null;
+    return JSON.stringify([route, session, k, exactKey]);
+  }
+
+  function completionRecords(k) {
+    const identities = completionIdentitiesByPrompt.get(k);
+    if (!identities) return [];
+    return [...identities]
+      .map((identity) => completionMeta.get(identity))
+      .filter(Boolean);
+  }
+
+  function hasCompletionRecords(k) {
+    return completionRecords(k).length > 0;
+  }
+
+  function addCompletionRecord(k, { routeId, sessionId, completionKey }) {
+    const identity = completionIdentity(k, routeId, sessionId, completionKey);
+    if (!identity || completionKeys.has(identity)) return false;
+    const route = String(routeId).trim();
+    const session = sessionId == null ? null : String(sessionId).trim();
+    const exactKey = String(completionKey).trim();
+    completionKeys.set(identity, exactKey);
+    completionMeta.set(identity, {
+      promptId: promptIdOf(k),
+      completionKey: exactKey,
+      routeId: route,
+      sessionId: session,
+    });
+    let identities = completionIdentitiesByPrompt.get(k);
+    if (!identities) {
+      identities = new Set();
+      completionIdentitiesByPrompt.set(k, identities);
+    }
+    identities.add(identity);
+    return true;
+  }
+
+  function removeCompletionRecord(k, completionKey) {
+    const identities = completionIdentitiesByPrompt.get(k);
+    if (!identities) return false;
+    let removed = false;
+    for (const identity of [...identities]) {
+      const meta = completionMeta.get(identity);
+      if (meta?.completionKey !== completionKey) continue;
+      completionKeys.delete(identity);
+      completionMeta.delete(identity);
+      identities.delete(identity);
+      removed = true;
+    }
+    if (!identities.size) completionIdentitiesByPrompt.delete(k);
+    return removed;
+  }
+
+  function clearCompletionRecords(k) {
+    const identities = completionIdentitiesByPrompt.get(k);
+    if (!identities) return;
+    for (const identity of identities) {
+      completionKeys.delete(identity);
+      completionMeta.delete(identity);
+    }
+    completionIdentitiesByPrompt.delete(k);
+  }
+
+  function completionRecordFor(k, routeId, sessionId) {
+    const records = completionRecords(k);
+    if (routeId === undefined && sessionId === undefined) return records.at(-1) ?? null;
+    const route = routeId == null ? null : String(routeId).trim();
+    const session = sessionId == null ? null : String(sessionId).trim();
+    return records.find((record) => record.routeId === route && record.sessionId === session) ?? null;
+  }
+
+  function flushWithCompletionRecords(k, payload) {
+    const records = completionRecords(k);
+    if (!records.length) {
+      onFlush(payload);
+      return false;
+    }
+    for (const record of records) {
+      onFlush({ ...payload, completionKey: record.completionKey });
+    }
+    return true;
+  }
   // Far beyond any realistic WS-replay-after-reconnect delay, so pruning an entry
   // older than this can never re-open the double-delivery window it guards.
   const deliveredTtlMs = 10 * 60 * 1000;
@@ -430,7 +519,7 @@ export function createRunCompletionTracker({
   }
 
   function completionMetadataSnapshot() {
-    return [...completionMeta.entries()].map(([promptId, value]) => ({ promptId, ...value }));
+    return [...completionMeta.values()].map((value) => ({ ...value }));
   }
 
   function terminalCompletionMetadataSnapshot() {
@@ -570,7 +659,7 @@ export function createRunCompletionTracker({
     // A successful browser write is not proof the orchestrator received the
     // completion. Keep panel_run in pending until the matching completion ack;
     // the stable key makes every /history replay idempotent downstream.
-    const completionKey = completionKeys.get(k);
+    const hasCompletionKey = hasCompletionRecords(k);
     const payload = {
       key: k,
       promptId: promptIdOf(k),
@@ -578,7 +667,6 @@ export function createRunCompletionTracker({
       videos: buf.videos,
       durationMs,
       finishedAt: now(),
-      ...(completionKey ? { completionKey } : {}),
       // #986 — the agent is TOLD this output was already announced, never denied it.
       // Which of a replay or a fast re-render it is cannot be proven, so the panel
       // reports what it observed and lets the reader decide.
@@ -587,7 +675,7 @@ export function createRunCompletionTracker({
         : {}),
     };
     if (
-      !completionKey &&
+      !hasCompletionKey &&
       (panelRunDispatches.size || panelRunCompletionKeys.has(k)) &&
       k !== NO_PROMPT_KEY
     ) {
@@ -605,14 +693,14 @@ export function createRunCompletionTracker({
     }
     markTerminal(k);
     markDispatched(k);
-    if (!completionKey) markDelivered(k);
+    if (!hasCompletionKey) markDelivered(k);
     if (
       k !== NO_PROMPT_KEY &&
       payload.images.some((image) => image?.type === "temp")
     ) {
       liveReplays.set(k, payload);
     }
-    onFlush(payload);
+    flushWithCompletionRecords(k, payload);
   }
 
   /**
@@ -649,7 +737,7 @@ export function createRunCompletionTracker({
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
     // later onQueued callback must still be able to bind and replay it.
-    if (terminalNoKeyCompletion.has(k) && !completionKeys.has(k)) {
+    if (terminalNoKeyCompletion.has(k) && !hasCompletionRecords(k)) {
       return { promptId, status: "success", delivered: false };
     }
     // #1619 — a live executed batch is stronger than a remote history probe:
@@ -658,10 +746,10 @@ export function createRunCompletionTracker({
     // bridge send failed, and replay it without requiring /history to succeed.
     const liveReplay = liveReplays.get(k);
     if (liveReplay) {
-      if (completionKeys.has(k)) markTerminal(k);
+      if (hasCompletionRecords(k)) markTerminal(k);
       else markDelivered(k);
       markDispatched(k);
-      onFlush({ ...liveReplay, replayed: true });
+      flushWithCompletionRecords(k, { ...liveReplay, replayed: true });
       return { promptId, status: "success", delivered: true };
     }
     let entry = null;
@@ -727,9 +815,9 @@ export function createRunCompletionTracker({
     // media-less recovery below would never fire — the mistake this line exists to
     // prevent, and the one the reconcile test caught.
     const wasPanelQueued = panelQueued.has(k);
-    const completionKey = completionKeys.get(k);
+    const hasCompletionKey = hasCompletionRecords(k);
     const holdsForCompletionAck =
-      wasPanelQueued && parsed.status === "success" && completionKey != null;
+      wasPanelQueued && parsed.status === "success" && hasCompletionKey;
     if (holdsForCompletionAck) {
       // The terminal fence is needed to suppress late ComfyUI lifecycle events,
       // but the recovery ledger must remain until the orchestrator receipt.
@@ -806,13 +894,12 @@ export function createRunCompletionTracker({
       // Recorded, never suppressed: a reconcile exists to deliver something the agent
       // has NOT been told about, so it always goes through.
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
-      onFlush({
+      flushWithCompletionRecords(k, {
         key: k,
         promptId,
         images: parsed.images,
         videos: parsed.videos,
         durationMs,
-        ...(completionKey ? { completionKey } : {}),
         // Epoch ms of the REAL finish, or null when history records none (#1199).
         finishedAt: historyFinishedAt,
         reconciled: true,
@@ -855,7 +942,7 @@ export function createRunCompletionTracker({
     pending.delete(k); // EVICT — bounds the ledger
     panelQueued.delete(k); // #356 Bug 2 — evicted with it
     liveReplays.delete(k);
-    completionKeys.delete(k);
+    clearCompletionRecords(k);
     panelRunCompletionKeys.delete(k);
     terminalNoKeyCompletion.delete(k);
     terminalNoKeyFlushed.delete(k);
@@ -1031,12 +1118,11 @@ export function createRunCompletionTracker({
         markTerminal(k);
         clearReconcileRetry(k);
         markDispatched(k);
-        onFlush({
+        flushWithCompletionRecords(k, {
           key: k,
           promptId: promptIdOf(k),
           images: [],
           videos: [],
-          ...(completionKeys.get(k) ? { completionKey: completionKeys.get(k) } : {}),
           durationMs: mediaLessStart != null ? now() - mediaLessStart : null,
           finishedAt: now(),
           noMedia: true,
@@ -1060,7 +1146,7 @@ export function createRunCompletionTracker({
       // A panel_run remains owed until the orchestrator explicitly acknowledges
       // the completion frame. Ordinary canvas runs retain the legacy transport
       // confirmation behavior.
-      if (!completionKeys.has(k)) markDelivered(k);
+      if (!hasCompletionRecords(k)) markDelivered(k);
     },
 
     /** ComfyUI `execution_error` — drop this prompt's buffer, deliver no batch. */
@@ -1137,20 +1223,16 @@ export function createRunCompletionTracker({
     onQueued(id, { routeId, sessionId = null, completionKey, dispatchToken = null } = {}) {
       const k = key(id);
       trackPending(id);
+      let nextKey = null;
       // #356 Bug 2 — records that THIS run carried panel_run's wait-for-it promise.
       if (id != null) {
         panelQueued.add(k);
         const suppliedKey = typeof completionKey === "string" && completionKey.trim() ? completionKey.trim() : null;
-        const existingKey = completionKeys.get(k);
-        const nextKey = suppliedKey || existingKey || createRunCompletionKey(routeId, sessionId, k);
+        nextKey = suppliedKey || createRunCompletionKey(routeId, sessionId, k);
         if (nextKey) {
-          completionKeys.set(k, nextKey);
-          completionMeta.set(k, {
-            completionKey: nextKey,
-            routeId: routeId == null ? null : String(routeId),
-            sessionId: sessionId == null ? null : String(sessionId),
-          });
-          notifyCompletionStateChange();
+          if (addCompletionRecord(k, { completionKey: nextKey, routeId, sessionId })) {
+            notifyCompletionStateChange();
+          }
         }
       }
       if (dispatchToken && panelRunDispatches.has(dispatchToken)) {
@@ -1164,12 +1246,12 @@ export function createRunCompletionTracker({
         panelRunCompletionKeys.delete(k);
         notifyTerminalCompletionStateChange();
         delivered.delete(k);
-        if (completionKeys.has(k)) {
+        if (hasCompletionRecords(k)) {
           if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
           markTerminal(k);
           clearReconcileRetry(k);
           markDispatched(k);
-          onFlush({ ...lateMedia, key: k, completionKey: completionKeys.get(k) });
+          flushWithCompletionRecords(k, { ...lateMedia, key: k });
         } else {
           releaseUnkeyedCompletion(k, lateMedia, { retire: true });
         }
@@ -1184,7 +1266,7 @@ export function createRunCompletionTracker({
         terminalNoMediaSuccess.delete(k);
         panelRunCompletionKeys.delete(k);
         delivered.delete(k);
-        if (completionKeys.has(k)) {
+        if (hasCompletionRecords(k)) {
           if (!pending.has(k)) pending.set(k, { promptId: k, at: now() });
           markTerminal(k);
           clearReconcileRetry(k);
@@ -1192,17 +1274,17 @@ export function createRunCompletionTracker({
           markDelivered(k);
         }
         markDispatched(k);
-        onFlush({
+        flushWithCompletionRecords(k, {
           key: k,
           promptId: lateSuccess.promptId,
           images: [],
           videos: [],
-          ...(completionKeys.get(k) ? { completionKey: completionKeys.get(k) } : {}),
           durationMs: lateSuccess.durationMs,
           finishedAt: lateSuccess.finishedAt,
           noMedia: true,
         });
       }
+      return nextKey;
     },
 
     /**
@@ -1210,17 +1292,26 @@ export function createRunCompletionTracker({
      * agent (legacy transport confirmation, an empty batch, or the keyed
      * orchestrator receipt). Retires it from pending and drops any retained replay.
      */
-    markDelivered(id) {
+    markDelivered(id, completionKey) {
+      const k = key(id);
+      const exactKey = typeof completionKey === "string" && completionKey.trim() ? completionKey.trim() : null;
+      if (exactKey) {
+        if (!removeCompletionRecord(k, exactKey)) return;
+        if (hasCompletionRecords(k)) {
+          notifyCompletionStateChange();
+          return;
+        }
+      } else {
+        clearCompletionRecords(k);
+      }
       // The CALLER confirming delivery is the only proof the agent was told, so
       // this — not the tracker's own optimistic retire — is what releases the
       // delivery hold isSettled() reports on (#585).
-      clearAwaitingDelivery(key(id));
+      clearAwaitingDelivery(k);
       // #356 Bug 2 — and it is the only point at which the panel-queued mark can be
       // retired safely, for the same reason: before this, a re-pend is still possible.
-      panelQueued.delete(key(id));
-      liveReplays.delete(key(id));
-      completionKeys.delete(key(id));
-      completionMeta.delete(key(id));
+      panelQueued.delete(k);
+      liveReplays.delete(k);
       terminalNoKeyCompletion.delete(key(id));
       terminalNoKeyFlushed.delete(key(id));
       panelRunCompletionKeys.delete(key(id));
@@ -1236,12 +1327,14 @@ export function createRunCompletionTracker({
     acknowledgeDelivery(id, completionKey) {
       if (id == null || typeof completionKey !== "string") return false;
       const k = key(id);
-      if (completionKeys.get(k) !== completionKey) return false;
+      if (!removeCompletionRecord(k, completionKey)) return false;
+      if (hasCompletionRecords(k)) {
+        notifyCompletionStateChange();
+        return true;
+      }
       clearAwaitingDelivery(k);
       panelQueued.delete(k);
       liveReplays.delete(k);
-      completionKeys.delete(k);
-      completionMeta.delete(k);
       terminalNoKeyCompletion.delete(k);
       terminalNoKeyFlushed.delete(k);
       panelRunCompletionKeys.delete(k);
@@ -1257,9 +1350,11 @@ export function createRunCompletionTracker({
      * the live batch, then falls back to /history when the lifecycle output was
      * not observed (#370/#1619).
      */
-    markUndelivered(id) {
+    markUndelivered(id, completionKey) {
       if (id == null) return;
       const k = key(id);
+      const exactKey = typeof completionKey === "string" && completionKey.trim() ? completionKey.trim() : null;
+      if (exactKey && !completionRecords(k).some((record) => record.completionKey === exactKey)) return;
       // Clear ONLY the delivery/reconcile fence so the outcome is re-reconciled and
       // re-delivered. The `terminal` REPLAY fence is deliberately LEFT intact: the
       // run already completed, so a late/replayed execution_start for it must stay
@@ -1300,8 +1395,8 @@ export function createRunCompletionTracker({
     },
 
     /** Stable key used by the matching run_receipt control frame. */
-    completionKeyFor(id) {
-      return completionKeys.get(key(id)) ?? null;
+    completionKeyFor(id, routeId, sessionId) {
+      return completionRecordFor(key(id), routeId, sessionId)?.completionKey ?? null;
     },
 
     /** Persistable route/session/key metadata for pending panel-run ids. */

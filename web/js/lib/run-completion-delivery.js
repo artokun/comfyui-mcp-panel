@@ -149,13 +149,13 @@ export function createRunCompletionFlushHandler({
         // permanent suppression (sendFrame returns false for both a down socket
         // AND AGENT_MUTED): a muted completion must NOT be recovered/replayed on
         // a later unmute+reconnect, so treat it as delivered (codex P1).
-        if (frame == null && !awaitsCompletionKey) markDelivered(promptId);
-        else if (framePushed && !awaitsReceipt && !awaitsCompletionKey) markDelivered(promptId);
+        if (frame == null && !awaitsCompletionKey) markDelivered(promptId, completionKey);
+        else if (framePushed && !awaitsReceipt && !awaitsCompletionKey) markDelivered(promptId, completionKey);
         else if (framePushed && (awaitsReceipt || awaitsCompletionKey)) {
           // A receipt retires keyed delivery; a delayed prompt identity retires
           // the recoverable unkeyed fallback by replaying it keyed.
-        } else if (isAgentMuted()) markDelivered(promptId);
-        else markUndelivered(promptId);
+        } else if (isAgentMuted()) markDelivered(promptId, completionKey);
+        else markUndelivered(promptId, completionKey);
         // #585: for legacy/unkeyed frames this is the moment "the agent was
         // told" becomes true (or is re-pended). Keyed panel_run frames update
         // the marker from the orchestrator acknowledgement callback instead.
@@ -178,10 +178,10 @@ export function createRunCompletionFlushHandler({
         // Composition threw before/around the send — treat as undelivered so a
         // reconnect can recover the outcome from /history rather than lose it
         // (but respect an intentional mute, as above).
-        if ((framePushed && !awaitsReceipt && !awaitsCompletionKey) || isAgentMuted()) markDelivered(promptId);
+        if ((framePushed && !awaitsReceipt && !awaitsCompletionKey) || isAgentMuted()) markDelivered(promptId, completionKey);
         else if (framePushed && (awaitsReceipt || awaitsCompletionKey)) {
           // The already-pushed frame remains recoverable until its key/receipt.
-        } else markUndelivered(promptId);
+        } else markUndelivered(promptId, completionKey);
         if ((!awaitsReceipt && !awaitsCompletionKey) || isAgentMuted()) {
           pruneRebootMarker(); // #585 — see the .then branch above
         }

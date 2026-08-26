@@ -83,7 +83,7 @@ import {
   mergeRunCompletionMetadata,
   normalizeRunCompletionMetadata,
   partitionRunCompletionMetadata,
-  runCompletionKeyMatchesRoute,
+  runCompletionKeyMatchesContext,
 } from "./lib/run-completion-persistence.js";
 import {
   arbitratePanelCopy,
@@ -785,11 +785,58 @@ import { createRehelloGate, routeIsStale } from "./lib/rehello-gate.js";
  *  where nobody is going to act on an answer it cannot give. Everything else is refused
  *  while the route is stale (see sendFrame). */
 const SESSION_ORDERED_FRAMES = new Set(["resume_session", "new_session"]);
-import {
-  createDirtySafeBundleHealRetry,
-  primeModuleCache,
-  resolveBundleStaleness,
-} from "./lib/bundle-version.js";
+// Namespace linking keeps a newer root compatible with a cached older child
+// bundle: optional exports must be feature-detected, not statically imported.
+import * as bundleVersion from "./lib/bundle-version.js";
+const { primeModuleCache, resolveBundleStaleness } = bundleVersion;
+const createDirtySafeBundleHealRetry =
+  typeof bundleVersion.createDirtySafeBundleHealRetry === "function"
+    ? bundleVersion.createDirtySafeBundleHealRetry
+    : ({
+        isBlocked,
+        heal,
+        setTimer = (fn, ms) => setTimeout(fn, ms),
+        clearTimer = (timer) => clearTimeout(timer),
+        retryMs = 1000,
+      } = {}) => {
+        let timer = null;
+        const schedule = () => {
+          if (timer !== null || typeof isBlocked !== "function" || typeof heal !== "function") {
+            return false;
+          }
+          try {
+            timer = setTimer(() => {
+              timer = null;
+              let blocked = true;
+              try {
+                blocked = isBlocked() === true;
+              } catch {
+                blocked = true;
+              }
+              if (blocked) {
+                schedule();
+                return;
+              }
+              Promise.resolve().then(() => heal()).catch(() => {});
+            }, retryMs);
+            return true;
+          } catch {
+            timer = null;
+            return false;
+          }
+        };
+        return {
+          schedule,
+          cancel() {
+            if (timer === null) return;
+            try {
+              clearTimer(timer);
+            } catch {}
+            timer = null;
+          },
+          pending: () => timer !== null,
+        };
+      };
 import { describeModuleCache, readModuleCacheSummary } from "./lib/module-cache-report.js";
 import { classifyManager404 } from "./lib/manager-404.js";
 import { probeConsoleRoute, UNBUILT_ROUTE_TITLE } from "./lib/console-route-probe.js";
@@ -872,6 +919,9 @@ let runReceiptSender = null;
 // enqueue into a replacement mount, but the outbox will only flush when that same
 // route is live, so a remount cannot misattribute a receipt to another workflow.
 let runReceiptRouteRef = null;
+// The dispatch captures the actual agent conversation session, not the panel
+// mount generation. A route can remain stable while SESSION_KEY changes.
+let runReceiptSessionRef = null;
 // A callback from an old mount must never register into a replacement tracker or
 // sweep. This owner is a stable object per mount rather than a mutable generation
 // number that an old callback could accidentally match after wrap/reuse.
@@ -18000,6 +18050,11 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       dispatchReceiptRoute = typeof runReceiptRouteRef === "function" ? runReceiptRouteRef() : null;
     } catch {}
+    let dispatchReceiptSession = null;
+    try {
+      dispatchReceiptSession =
+        typeof runReceiptSessionRef === "function" ? runReceiptSessionRef() : null;
+    } catch {}
     const dispatchOwner = panelRunOwnerRef.current;
     const dispatchRunCompletion = runCompletionRef;
     const dispatchArmRunReconcileSweep = armRunReconcileSweepRef;
@@ -18293,13 +18348,14 @@ const GRAPH_TOOL_EXECUTORS = {
         panelRunOwnerRef.current === dispatchOwner &&
         runCompletionRef === dispatchRunCompletion &&
         armRunReconcileSweepRef === dispatchArmRunReconcileSweep;
+      let registeredCompletionKey = null;
       if (ownsDispatch) {
         try {
-          dispatchRunCompletion?.onQueued(id, {
+          registeredCompletionKey = dispatchRunCompletion?.onQueued(id, {
             routeId: dispatchReceiptRoute,
-            sessionId: dispatchOwner?.generation ?? null,
+            sessionId: dispatchReceiptSession,
             dispatchToken: dispatchPanelRunToken,
-          });
+          }) ?? null;
         } catch {}
         try {
           dispatchArmRunReconcileSweep?.();
@@ -18314,7 +18370,13 @@ const GRAPH_TOOL_EXECUTORS = {
             receiptRid,
             id,
             dispatchReceiptRoute,
-            dispatchRunCompletion?.completionKeyFor?.(id) ?? null,
+            registeredCompletionKey ||
+              dispatchRunCompletion?.completionKeyFor?.(
+                id,
+                dispatchReceiptRoute,
+                dispatchReceiptSession,
+              ) ||
+              null,
           );
         } catch {}
       }
@@ -37880,6 +37942,8 @@ function buildPanel() {
   };
   runReceiptOutbox.setTransport(panelRunReceiptTransport);
   runReceiptRouteRef = panelRunReceiptRouteRef;
+  const panelRunReceiptSessionRef = () => ssGet(SESSION_KEY);
+  runReceiptSessionRef = panelRunReceiptSessionRef;
   runReceiptSender = panelRunReceiptSender;
 
   // #758 — announce an update once the transcript exists to receive it. Deliberately
@@ -37999,9 +38063,11 @@ function buildPanel() {
   try {
     completionRestoreRoute = bridgeRouteId();
   } catch {}
+  const completionRestoreSession = ssGet(SESSION_KEY);
   const completionRestore = partitionRunCompletionMetadata(
     readRunCompletionMetadata(),
     completionRestoreRoute,
+    completionRestoreSession,
   );
   const deferredRunCompletionMetadata = completionRestore.deferred;
   const persistOwnedRunCompletionMetadata = (entries) => {
@@ -38023,10 +38089,12 @@ function buildPanel() {
       try {
         liveRoute = bridgeRouteId();
       } catch {}
+      const liveSession = ssGet(SESSION_KEY);
       // A workflow switch can race the async completion composer. Refuse the
-      // write and let markUndelivered + the safety sweep retain it until its
-      // original route is live again; never stamp it onto the replacement tab.
-      if (!runCompletionKeyMatchesRoute(frame.completion_key, liveRoute)) return false;
+      // write when either route OR agent conversation changed, and let
+      // markUndelivered + the safety sweep retain it until the exact context is
+      // live again; never stamp it onto a replacement tab/session.
+      if (!runCompletionKeyMatchesContext(frame.completion_key, liveRoute, liveSession)) return false;
     }
     return client.sendFrame(frame);
   };
@@ -38065,8 +38133,8 @@ function buildPanel() {
     // delivery seam so recovered completions retain their real finish time.
     onFlush: createRunCompletionFlushHandler({
       sendFrame: sendRunCompletionFrame,
-      markDelivered: (promptId) => runCompletion.markDelivered(promptId),
-      markUndelivered: (promptId) => runCompletion.markUndelivered(promptId),
+      markDelivered: (promptId, completionKey) => runCompletion.markDelivered(promptId, completionKey),
+      markUndelivered: (promptId, completionKey) => runCompletion.markUndelivered(promptId, completionKey),
       pruneRebootMarker,
       coerceMessageText,
       formatDuration,
@@ -40102,10 +40170,26 @@ function buildPanel() {
       } catch {
         /* reload regardless — worst case is the pre-#584 behaviour */
       }
+      if (origin === "agent") {
+        const postPrimeBlockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
+        if (postPrimeBlockers.length) {
+          ssSet(SIDEBAR_REOPEN_KEY, null);
+          appendSystem(reloadWouldBeBlockedMessage(postPrimeBlockers));
+          return;
+        }
+      }
       // #701(2) — the navigation below can be CANCELLED by ComfyUI's unsaved-work
       // beforeunload, after the browser has already torn down our socket. If that
       // happens this code survives the deadline and says so; if the reload works, the
       // document is destroyed and the notice never fires. Arm it BEFORE navigating.
+      if (origin === "agent") {
+        const finalBlockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
+        if (finalBlockers.length) {
+          ssSet(SIDEBAR_REOPEN_KEY, null);
+          appendSystem(reloadWouldBeBlockedMessage(finalBlockers));
+          return;
+        }
+      }
       armReloadBlockedNotice({ notify: (m) => appendSystem(m) });
       try {
         const u = new URL(window.location.href);
@@ -42701,6 +42785,7 @@ function buildPanel() {
       if (armRunReconcileSweepRef === armRunReconcileSweep) armRunReconcileSweepRef = null;
       if (runCompletionRef === runCompletion) runCompletionRef = null;
       if (runReceiptRouteRef === panelRunReceiptRouteRef) runReceiptRouteRef = null;
+      if (runReceiptSessionRef === panelRunReceiptSessionRef) runReceiptSessionRef = null;
       if (runReceiptSender === panelRunReceiptSender) runReceiptSender = null;
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).
@@ -42918,6 +43003,20 @@ async function healStaleBundleIfNeeded() {
           `panel still reports ${PANEL_VERSION} afterwards, hard-refresh (Ctrl+Shift+R).`,
       );
     }
+    // The cache prime can take the full five-second budget. A workflow may have
+    // become dirty while it was in flight, so re-check before any marker-backed
+    // navigation and return the heal attempt to the retry loop.
+    const postPrimeHealBlockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
+    if (postPrimeHealBlockers.length) {
+      ssSet(BUNDLE_HEAL_KEY, null);
+      dirtySafeBundleHealRetry.schedule();
+      console.warn(
+        `[comfyui-mcp-panel] the stale-bundle heal found new unsaved work after refreshing the ` +
+          `module graph. ${reloadWouldBeBlockedMessage(postPrimeHealBlockers)} ` +
+          `The panel will retry its safe reload after those workflows are saved.`,
+      );
+      return;
+    }
     // #584 — the probe + prime above can span a NEW backend disconnect (a
     // restart still in progress): reloading into a down server re-fetches
     // whatever the half-restarted backend serves and strands the tab on the
@@ -42945,6 +43044,19 @@ async function healStaleBundleIfNeeded() {
     // loop-guard marker: the reload never happened, and the next page load or
     // reconnect must get its heal attempt back. Same arm-before-navigate order
     // as the commanded reload path.
+    // This is the final TOCTOU fence: do not arm the blocked-navigation notice or
+    // navigate if a workflow became dirty after the post-prime check.
+    const finalHealBlockers = unsavedReloadBlockers(app?.extensionManager?.workflow?.openWorkflows);
+    if (finalHealBlockers.length) {
+      ssSet(BUNDLE_HEAL_KEY, null);
+      dirtySafeBundleHealRetry.schedule();
+      console.warn(
+        `[comfyui-mcp-panel] the stale-bundle heal was cancelled because workflow edits appeared ` +
+          `immediately before navigation. ${reloadWouldBeBlockedMessage(finalHealBlockers)} ` +
+          `The panel will retry its safe reload after those workflows are saved.`,
+      );
+      return;
+    }
     armReloadBlockedNotice({
       notify: (m) => {
         ssSet(BUNDLE_HEAL_KEY, null);

@@ -12,7 +12,7 @@ function text(value) {
 
 /**
  * Validate the current completion-key wire shape:
- *   [workflow route, panel mount generation, prompt id, queue nonce]
+ *   [workflow route, agent conversation session, prompt id, queue nonce]
  *
  * The nonce is what distinguishes a genuinely reused ComfyUI prompt id. An
  * older three-part key is not safe to adopt as the current shape because doing
@@ -39,6 +39,22 @@ export function parseRunCompletionIdentity(value) {
 export function runCompletionKeyMatchesRoute(completionKey, activeRouteId) {
   const identity = parseRunCompletionIdentity(completionKey);
   return !!identity && identity.routeId === text(activeRouteId);
+}
+
+/**
+ * True only when a keyed completion belongs to the exact live route/session.
+ * A route can stay unchanged while the agent conversation changes, so route
+ * equality alone is not a sufficient send fence.
+ */
+export function runCompletionKeyMatchesContext(
+  completionKey,
+  activeRouteId,
+  activeSessionId,
+) {
+  const identity = parseRunCompletionIdentity(completionKey);
+  const routeId = text(activeRouteId);
+  const sessionId = activeSessionId == null ? null : text(activeSessionId);
+  return !!identity && identity.routeId === routeId && identity.sessionId === sessionId;
 }
 
 /** Normalize and cross-check rows read from sessionStorage. */
@@ -85,12 +101,13 @@ export function normalizeRunCompletionMetadata(
  * Split persisted rows at remount. Only the active workflow route is safe to
  * reconcile now; foreign rows remain durable for a later mount of their route.
  */
-export function partitionRunCompletionMetadata(entries, activeRouteId) {
+export function partitionRunCompletionMetadata(entries, activeRouteId, activeSessionId) {
   const routeId = text(activeRouteId);
+  const sessionId = activeSessionId == null ? null : text(activeSessionId);
   const current = [];
   const deferred = [];
   for (const entry of normalizeRunCompletionMetadata(entries)) {
-    (routeId && entry.routeId === routeId ? current : deferred).push(entry);
+    (routeId && entry.routeId === routeId && entry.sessionId === sessionId ? current : deferred).push(entry);
   }
   return { current, deferred };
 }

@@ -78,8 +78,8 @@ function normalizeCompletionMeta(entries) {
   for (const raw of Array.isArray(entries) ? entries : []) {
     const promptId = typeof raw?.promptId === "string" ? raw.promptId.trim() : "";
     const completionKey = typeof raw?.completionKey === "string" ? raw.completionKey.trim() : "";
-    if (!promptId || !completionKey || completionKey.length > 512 || seen.has(promptId)) continue;
-    seen.add(promptId);
+    if (!promptId || !completionKey || completionKey.length > 512 || seen.has(completionKey)) continue;
+    seen.add(completionKey);
     out.push({
       promptId,
       completionKey,
@@ -417,18 +417,27 @@ export function adoptRebootRuns(runs, tracker, completionMeta = []) {
   const adopted = [];
   const ids = normalizeRunIds(runs);
   if (!ids.length || !tracker || typeof tracker.onQueued !== "function") return adopted;
-  const metaByPrompt = new Map(
-    normalizeCompletionMeta(completionMeta).map((entry) => [entry.promptId, entry]),
-  );
+  const metaByPrompt = new Map();
+  for (const entry of normalizeCompletionMeta(completionMeta)) {
+    const rows = metaByPrompt.get(entry.promptId) ?? [];
+    rows.push(entry);
+    metaByPrompt.set(entry.promptId, rows);
+  }
   for (const id of ids) {
     try {
       if (typeof tracker.isKnown === "function" && tracker.isKnown(id)) continue;
-      const meta = metaByPrompt.get(id);
-      tracker.onQueued(id, meta ? {
-        routeId: meta.routeId,
-        sessionId: meta.sessionId,
-        completionKey: meta.completionKey,
-      } : undefined);
+      const metas = metaByPrompt.get(id) ?? [];
+      if (metas.length) {
+        for (const meta of metas) {
+          tracker.onQueued(id, {
+            routeId: meta.routeId,
+            sessionId: meta.sessionId,
+            completionKey: meta.completionKey,
+          });
+        }
+      } else {
+        tracker.onQueued(id, undefined);
+      }
       adopted.push(id);
     } catch {
       /* a malformed id must never wedge the resume flow */
