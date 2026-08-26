@@ -906,10 +906,24 @@ export async function saveActiveWorkflow(
     (await ownsItsPathOnDisk(currentPath, currentName, existsOnDisk))
   ) {
     assertExpect(); // #330: the oracle awaited — still the workflow we were asked to save?
-    if ((await probeTargetCollision(svc, wf, finalTargetPath, existsOnDisk)) === "exists") {
+    const occupied = (await probeTargetCollision(svc, wf, finalTargetPath, existsOnDisk)) === "exists";
+    assertExpect(); // and again after the collision probe, before the route is fixed
+    // RE-VALIDATE THE PROOF SYNCHRONOUSLY (codex gate P1). `assertExpect` protects the
+    // workflow OBJECT, not its FIELDS: `path` and `filename` are plain writable properties
+    // on ComfyUI's UserFile, so a same-object rename landing during the two probes above
+    // keeps object identity — assertExpect passes — while moving the tab off the very
+    // identity this redirect was authorized on. `ownsItsPathOnDisk` sampled both before
+    // those awaits, and the in-place branch's own drift check re-reads `path` but not
+    // `filename`, so without this the redirect could write "Foo.json" for a tab that now
+    // calls itself "Bar" — the stale-path write the #1535 boundary test forbids.
+    //
+    // Nothing is awaited between this re-read and the assignment, so the destination cannot
+    // drift after it. A drift simply DECLINES the redirect and falls through to the
+    // collision guard below: the same refusal this state already gets today, which is the
+    // fail-safe direction rather than a new behaviour.
+    if (occupied && normalizePath(wf.path) === currentPath && baseName(wf.filename) === currentName) {
       finalTargetPath = currentPath;
     }
-    assertExpect(); // and again after the collision probe, before the route is fixed
   }
 
   const relocates = finalTargetPath !== currentPath;

@@ -1559,6 +1559,57 @@ test('#1864: a NAMED Save-As collision keeps the exact #309 wording comfyui-mcp 
   )
 })
 
+test('#1864 (codex gate P1): a same-object rename DURING the probes declines the redirect', async () => {
+  // `assertExpect` protects the workflow OBJECT, not its fields — `path` and `filename` are
+  // plain writable properties on ComfyUI's UserFile. A rename landing while the ownership
+  // and collision probes are in flight keeps object identity, so the entry-time proof
+  // ("this tab is named Foo and occupies workflows/Foo.json") can be stale by the time the
+  // destination is fixed. Writing "Foo.json" for a tab that now calls itself "Bar" is the
+  // stale-path write the #1535 boundary forbids, so the redirect must decline and let the
+  // collision guard refuse — which is what this state already did before the redirect existed.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'app', // ⇒ reconstructed target is workflows/Foo.app.json, which is taken
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json', 'workflows/Foo.app.json'], active })
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, undefined, {
+        autoWorkflowName: () => 'Untitled',
+        existsOnDisk: async (p) => {
+          const present = svc.disk.has(p)
+          // The rename lands INSIDE the ownership probe's await — after it sampled
+          // `filename`, before the destination is fixed. (The collision probe answers
+          // from the store index and never reaches this oracle, so hooking the tab's own
+          // path is the only way to land in that window.)
+          if (p === 'workflows/Foo.json') active.filename = 'Bar'
+          return present
+        }
+      }),
+    (err) => {
+      assert.match(err.message, /409 Conflict/)
+      return true
+    }
+  )
+
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow'),
+    'the tab whose name moved during the save is never written on the strength of a stale proof'
+  )
+  assert.deepEqual(
+    [...svc.disk].sort(),
+    ['workflows/Foo.app.json', 'workflows/Foo.json'],
+    'and nothing on disk changed'
+  )
+})
+
 // ---------------------------------------------------------------------------
 // ComfyUI frontend 1.47.x (issue #268). The workflow store no longer exposes
 // `saveWorkflowAs`; it exposes the low-level pair `saveAs(wf, path)` (builds a
