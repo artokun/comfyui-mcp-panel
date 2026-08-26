@@ -49,6 +49,11 @@ import {
   describeTitleRewrites,
   titleRewriteWarning,
 } from "../../web/js/lib/node-title-rewrite.js";
+import {
+  captureSlotNames,
+  describeSlotRewrites,
+  slotRewriteWarning,
+} from "../../web/js/lib/slot-rename-disclosure.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
   applyCurrentDefWidgetValues,
@@ -167,6 +172,9 @@ function buildConnect(graph, titleDeps = {}) {
     captureNodeTitles,
     describeTitleRewrites,
     titleRewriteWarning,
+    captureSlotNames,
+    describeSlotRewrites,
+    slotRewriteWarning,
     ...titleDeps,
   };
   const names = Object.keys(deps);
