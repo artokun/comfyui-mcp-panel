@@ -266,11 +266,20 @@ test("WIRING: production alias witness keeps outer, immediate, and terminal name
         getLink: (id) => (id === 2 ? { origin_id: 2768, target_id: 2768, target_slot: terminalSlot } : null),
       },
     };
+    const projectedWidget = {
+      name: testCase.immediate,
+      label: "outer display",
+      _subgraphSlot: { name: "parent_alias" },
+    };
     const parent = {
       id: 78,
+      widgets: [projectedWidget],
+      properties: { proxyWidgets: [[188, testCase.immediate]] },
       inputs: [{
         name: testCase.outer,
         label: "outer display",
+        widget: projectedWidget,
+        _widget: projectedWidget,
         _subgraphSlot: { name: "parent_alias", linkIds: [1] },
       }],
       subgraph: {
@@ -307,6 +316,37 @@ test("WIRING: production alias witness keeps outer, immediate, and terminal name
       /_subgraphSlot missing|unresolved/i,
     );
   }
+});
+
+test("WIRING: production witness refuses to publish [] for an unenumerable proxyWidgets relation", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
+  const helperStart = src.indexOf("function resolveSubgraphLink(");
+  const helperEnd = src.indexOf("\nfunction findPromotedHostInput", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "production promotion helper range must remain extractable");
+  const makeWitnesses = new Function(
+    "resolvePromotedInnerTarget",
+    "followPromotionToConcrete",
+    "MAX_PROMOTION_CHAIN_DEPTH",
+    "promotedInputAliases",
+    `${src.slice(helperStart, helperEnd)}; return promotedTerminalWitnesses;`,
+  )(
+    resolvePromotedInnerTarget,
+    followPromotionToConcrete,
+    MAX_PROMOTION_CHAIN_DEPTH,
+    promotedInputAliases,
+  );
+
+  const entries = makeWitnesses({
+    id: 78,
+    properties: { proxyWidgets: [[188, "quality_prompt"]] },
+    widgets: [],
+    inputs: [],
+    subgraph: { _nodes: [] },
+  });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].widget, "quality_prompt");
+  assert.match(entries[0].error, /proxyWidgets|node\.widgets|_subgraphSlot/i);
 });
 
 test("WIRING: production graph_get_subgraph redacts instance provenance", async () => {

@@ -9496,15 +9496,112 @@ function sourceForSubgraphInput(subgraphNode, subgraphInput) {
   return null;
 }
 
-/** Return the addressable aliases for every host promotion on a subgraph node.
- * Labels are included because panel_set_widget accepts the displayed alias,
- * while the resolver itself still authenticates the backing relationship. */
-function promotedHostAliases(subgraphNode) {
-  const aliases = new Set();
-  for (const input of subgraphNode?.inputs ?? []) {
-    for (const value of promotedInputAliases(input)) aliases.add(value);
+/**
+ * Return the addressable aliases for every host promotion on a subgraph node,
+ * including the legacy `proxyWidgets`/`node.widgets` projection shape. The
+ * witness producer must not reduce a known promotion relation to `[]` merely
+ * because the current frontend did not materialize a connectable input for it.
+ */
+function promotedHostAliasRecords(subgraphNode) {
+  const records = [];
+  const seen = new Set();
+  const inputs = Array.isArray(subgraphNode?.inputs) ? subgraphNode.inputs : [];
+  const projectedWidgets = Array.isArray(subgraphNode?.widgets) ? subgraphNode.widgets : [];
+  const add = (widget, relation, error) => {
+    if (typeof widget !== "string" || widget.length === 0) return;
+    const existingUnbound = records.find(
+      (record) =>
+        record.widget.toLowerCase() === widget.toLowerCase() &&
+        !record.relation &&
+        !record.error,
+    );
+    if (relation && existingUnbound) {
+      existingUnbound.relation = relation;
+      return;
+    }
+    if (!relation && !error && existingUnbound) return;
+    const relationKey = relation
+      ? `${String(relation.nodeId)}:${relation.widgetName.toLowerCase()}`
+      : "unbound";
+    const key = `${widget.toLowerCase()}|${relationKey}|${error ?? ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    records.push({ widget, ...(relation ? { relation } : {}), ...(error ? { error } : {}) });
+  };
+
+  // Modern link-backed promotions expose the aliases through host inputs and
+  // their _subgraphSlot. This remains the primary relation-aware path.
+  for (const input of inputs) {
+    for (const value of promotedInputAliases(input)) add(value, null, null);
   }
-  return [...aliases];
+  // Some frontend builds attach _subgraphSlot to a projected widget rather
+  // than the host input. Include those aliases too; resolution below will
+  // still require the live host relation before publishing a success witness.
+  for (const widget of projectedWidgets) {
+    if (widget?._subgraphSlot) {
+      for (const value of promotedInputAliases(widget, widget._subgraphSlot)) add(value, null, null);
+    }
+  }
+
+  const rawProxyWidgets = subgraphNode?.properties?.proxyWidgets;
+  if (rawProxyWidgets === undefined) return records;
+  if (!Array.isArray(rawProxyWidgets)) {
+    add(
+      "<proxyWidgets>",
+      null,
+      "properties.proxyWidgets was present but not an array; promoted relations could not be enumerated",
+    );
+    return records;
+  }
+
+  // `properties.proxyWidgets` is the serialized relation: [inner node id,
+  // inner widget name]. Match it to the live projected widget and/or its
+  // _subgraphSlot, then carry the expected target into witness validation.
+  for (const raw of rawProxyWidgets) {
+    const nodeId = Array.isArray(raw) ? raw[0] : undefined;
+    const widgetName = Array.isArray(raw) ? raw[1] : undefined;
+    if (
+      (typeof nodeId !== "number" && typeof nodeId !== "string") ||
+      (typeof widgetName !== "string" || widgetName.length === 0)
+    ) {
+      add(
+        typeof widgetName === "string" && widgetName.length > 0 ? widgetName : "<proxyWidgets>",
+        null,
+        "properties.proxyWidgets contained a malformed promoted relation",
+      );
+      continue;
+    }
+    const relation = { nodeId, widgetName };
+    const aliases = new Set();
+    for (const widget of projectedWidgets) {
+      const widgetAliases = promotedInputAliases(widget, widget?._subgraphSlot);
+      const linkedInput = inputs.some(
+        (input) => input?._widget === widget || input?.widget === widget,
+      );
+      if (
+        linkedInput ||
+        widgetAliases.some((alias) => alias.toLowerCase() === widgetName.toLowerCase())
+      ) {
+        for (const value of widgetAliases) aliases.add(value);
+      }
+    }
+    for (const input of inputs) {
+      const inputAliases = promotedInputAliases(input);
+      if (inputAliases.some((alias) => alias.toLowerCase() === widgetName.toLowerCase())) {
+        for (const value of inputAliases) aliases.add(value);
+      }
+    }
+    if (aliases.size === 0) {
+      add(
+        widgetName,
+        relation,
+        "properties.proxyWidgets named a promoted relation that had no live node.widgets/_subgraphSlot projection",
+      );
+      continue;
+    }
+    for (const alias of aliases) add(alias, relation, null);
+  }
+  return records;
 }
 
 /** The terminal shape is deliberately small and value-free. It carries the
@@ -9527,7 +9624,12 @@ function terminalPromotionShape(node) {
  * one-hop mapping. */
 function promotedTerminalWitnesses(subgraphNode) {
   const entries = [];
-  for (const widget of promotedHostAliases(subgraphNode)) {
+  for (const record of promotedHostAliasRecords(subgraphNode)) {
+    const widget = record.widget;
+    if (record.error) {
+      entries.push({ widget, error: record.error });
+      continue;
+    }
     let resolution;
     try {
       resolution = resolvePromotedInnerTarget(subgraphNode, widget, sourceForSubgraphInput);
@@ -9538,7 +9640,15 @@ function promotedTerminalWitnesses(subgraphNode) {
       });
       continue;
     }
-    if (!resolution?.promoted) continue;
+    if (!resolution?.promoted) {
+      entries.push({
+        widget,
+        error: record.relation
+          ? "the proxyWidgets relation was not represented by a live _subgraphSlot promotion"
+          : "the promoted alias was not represented by a live host input",
+      });
+      continue;
+    }
     if (!resolution.target) {
       entries.push({ widget, error: resolution.error || "the immediate promotion was unresolved" });
       continue;
@@ -9578,6 +9688,19 @@ function promotedTerminalWitnesses(subgraphNode) {
         error:
           terminal?.error ||
           (terminal?.cycle ? "the promotion chain is cyclic" : "the terminal promotion endpoint was malformed or unresolved"),
+      });
+      continue;
+    }
+    if (
+      record.relation &&
+      (String(resolution.target.node?.id) !== String(record.relation.nodeId) ||
+        resolution.target.widget?.name !== record.relation.widgetName)
+    ) {
+      entries.push({
+        widget,
+        immediate_node_id: resolution.target.node?.id,
+        immediate_widget: resolution.target.widget?.name,
+        error: "the live _subgraphSlot target disagreed with properties.proxyWidgets",
       });
       continue;
     }
