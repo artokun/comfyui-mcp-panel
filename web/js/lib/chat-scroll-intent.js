@@ -25,7 +25,8 @@ export function isUserScrollIntent(event) {
 export function createChatScrollIntentTracker() {
   let pending = false;
   let pendingTimer = null;
-  let programmatic = null;
+  let programmatic = [];
+  let disposed = false;
 
   const clearPendingTimer = () => {
     if (pendingTimer !== null) {
@@ -35,10 +36,10 @@ export function createChatScrollIntentTracker() {
   };
 
   const clearProgrammatic = () => {
-    if (programmatic?.timer !== null && programmatic?.timer !== undefined) {
-      clearTimeout(programmatic.timer);
+    for (const scroll of programmatic) {
+      if (scroll.timer !== null) clearTimeout(scroll.timer);
     }
-    programmatic = null;
+    programmatic = [];
   };
 
   const clearPending = () => {
@@ -48,6 +49,7 @@ export function createChatScrollIntentTracker() {
 
   return {
     note(event) {
+      if (disposed) return;
       if (!isUserScrollIntent(event)) return;
       // A new user event owns the next scroll transaction, even if it interrupts
       // an in-flight smooth programmatic scroll.
@@ -60,31 +62,39 @@ export function createChatScrollIntentTracker() {
       }, USER_SCROLL_INTENT_EXPIRY_MS);
     },
     noteProgrammaticScroll({ behavior = "auto" } = {}) {
+      if (disposed) return;
       // A smooth jump can also schedule an instant stabilizer pass. Keep the
       // longer-lived guard for the same scroll transaction instead of letting
       // that follow-up downgrade it to a one-event guard.
-      if (programmatic?.smooth && behavior !== "smooth") return;
-      clearProgrammatic();
-      if (behavior === "smooth") {
-        const timer = setTimeout(() => {
-          programmatic = null;
-        }, PROGRAMMATIC_SCROLL_GUARD_MS);
-        programmatic = { smooth: true, timer };
-      } else {
-        // The next scroll event belongs to this synchronous/auto operation. Do
-        // not discard `pending`: a real user scroll may follow it.
-        programmatic = { smooth: false, timer: null };
-      }
+      if (programmatic.some(({ smooth }) => smooth)) return;
+
+      const scroll = { smooth: behavior === "smooth", timer: null };
+      scroll.timer = setTimeout(() => {
+        const index = programmatic.indexOf(scroll);
+        if (index !== -1) programmatic.splice(index, 1);
+      }, PROGRAMMATIC_SCROLL_GUARD_MS);
+      programmatic.push(scroll);
     },
     endProgrammaticScroll() {
-      clearProgrammatic();
+      if (disposed) return;
+      const smooth = programmatic.filter(({ smooth }) => smooth);
+      for (const scroll of smooth) {
+        if (scroll.timer !== null) clearTimeout(scroll.timer);
+      }
+      programmatic = programmatic.filter(({ smooth }) => !smooth);
     },
     consume() {
-      if (programmatic) {
+      if (disposed) return false;
+      if (programmatic.some(({ smooth }) => smooth)) {
         // An app-owned scroll must not spend a genuine user marker. Auto scrolls
         // have one event; smooth scrolls remain guarded until scrollend (or the
         // bounded fallback above).
-        if (programmatic.timer === null) clearProgrammatic();
+        return false;
+      }
+      const autoIndex = programmatic.findIndex(({ smooth }) => !smooth);
+      if (autoIndex !== -1) {
+        const [scroll] = programmatic.splice(autoIndex, 1);
+        if (scroll.timer !== null) clearTimeout(scroll.timer);
         return false;
       }
       const wasPending = pending;
@@ -92,6 +102,7 @@ export function createChatScrollIntentTracker() {
       return wasPending;
     },
     dispose() {
+      disposed = true;
       clearPending();
       clearProgrammatic();
     },

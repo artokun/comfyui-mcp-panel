@@ -30908,30 +30908,49 @@ function buildPanel() {
     arrow.className = "pi pi-arrow-down";
     newMsgBtn.append(arrow, document.createTextNode(" " + tr("panel.new_messages", "New messages")));
   }
-  newMsgBtn.addEventListener("click", () => {
+  const onNewMessagesClick = () => {
     stickToBottom = true;
     newMsgBtn.hidden = true;
     scrollIntent.noteProgrammaticScroll({ behavior: "smooth" });
     log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
     chatScrollStabilizer.schedule();
-  });
+  };
+  newMsgBtn.addEventListener("click", onNewMessagesClick);
   // Track actual user input separately from scroll events. `content-visibility: auto`
   // (#1801) lets off-screen messages replace their intrinsic-size estimate with their
   // real height; scroll anchoring then emits a browser scroll event with no user intent.
   // Such an event must not latch stickToBottom off while the transcript settles.
   const scrollIntent = createChatScrollIntentTracker();
-  for (const eventName of ["wheel", "touchmove", "pointerdown", "keydown"]) {
-    log.addEventListener(eventName, (event) => scrollIntent.note(event), { passive: true });
-  }
-  log.addEventListener("scrollend", () => scrollIntent.endProgrammaticScroll(), { passive: true });
-  log.addEventListener("scroll", () => {
+  const chatScrollIntentListenerOptions = { passive: true };
+  const onChatScrollIntent = (event) => {
+    if (event.target !== event.currentTarget) return;
+    scrollIntent.note(event);
+  };
+  const onChatScrollEnd = (event) => {
+    if (event.target !== event.currentTarget) return;
+    scrollIntent.endProgrammaticScroll();
+  };
+  const onChatLogScroll = (event) => {
+    if (event.target !== event.currentTarget) return;
     const isAtBottom = atBottom();
     stickToBottom = updateChatStickiness(stickToBottom, {
       atBottom: isAtBottom,
       userScrollIntent: scrollIntent.consume(),
     });
     if (isAtBottom) newMsgBtn.hidden = true;
-  });
+  };
+  const disposeChatScrollListeners = () => {
+    for (const eventName of ["wheel", "touchmove", "pointerdown", "keydown"]) {
+      log.removeEventListener(eventName, onChatScrollIntent, chatScrollIntentListenerOptions);
+    }
+    log.removeEventListener("scrollend", onChatScrollEnd, chatScrollIntentListenerOptions);
+    log.removeEventListener("scroll", onChatLogScroll);
+  };
+  for (const eventName of ["wheel", "touchmove", "pointerdown", "keydown"]) {
+    log.addEventListener(eventName, onChatScrollIntent, chatScrollIntentListenerOptions);
+  }
+  log.addEventListener("scrollend", onChatScrollEnd, chatScrollIntentListenerOptions);
+  log.addEventListener("scroll", onChatLogScroll);
   const chatScrollStabilizer = createChatScrollStabilizer({
     log,
     shouldStick: () => stickToBottom,
@@ -42737,6 +42756,8 @@ function buildPanel() {
       // running (a remount would otherwise stack a second word cycler / backstop).
       if (workWordTimer) { clearInterval(workWordTimer); workWordTimer = null; }
       if (thinkingSafety) { clearTimeout(thinkingSafety); thinkingSafety = null; }
+      newMsgBtn.removeEventListener("click", onNewMessagesClick);
+      disposeChatScrollListeners();
       chatScrollStabilizer.dispose();
       scrollIntent.dispose();
       document.removeEventListener("keydown", onInterruptKeydown, true);

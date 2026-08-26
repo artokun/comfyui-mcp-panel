@@ -19,17 +19,45 @@ assert.ok(listenerStart >= 0 && listenerEnd > listenerStart, "production chat sc
 const productionListener = panelSource.slice(listenerStart, listenerEnd);
 
 class ChatLog extends EventTarget {
+  constructor() {
+    super();
+    this.listeners = new Map();
+  }
+
   scrollHeight = 1000;
   scrollTop = 400;
   clientHeight = 100;
+
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners.set(
+      type,
+      (this.listeners.get(type) ?? []).filter((entry) => entry !== listener),
+    );
+  }
+
+  dispatchEvent(event) {
+    return this.dispatchEventFrom(this, event);
+  }
+
+  dispatchEventFrom(target, event) {
+    const delivered = { ...event, target, currentTarget: this };
+    for (const listener of [...(this.listeners.get(event.type) ?? [])]) listener(delivered);
+    return true;
+  }
+
+  listenerCount() {
+    return [...this.listeners.values()].reduce((count, listeners) => count + listeners.length, 0);
+  }
 }
 
-function emit(log, type, props = {}) {
-  const event = new Event(type);
-  for (const [key, value] of Object.entries(props)) {
-    if (key !== "type") event[key] = value;
-  }
-  log.dispatchEvent(event);
+function emit(log, type, props = {}, target = log) {
+  log.dispatchEventFrom(target, { type, ...props });
 }
 
 function buildProductionScrollSurface() {
@@ -42,7 +70,7 @@ function buildProductionScrollSurface() {
     "atBottom",
     "createChatScrollIntentTracker",
     "updateChatStickiness",
-    `let stickToBottom = true;\n${productionListener}\nreturn {\n  log,\n  newMsgBtn,\n  scrollIntent,\n  get stickToBottom() { return stickToBottom; },\n};`,
+    `let stickToBottom = true;\n${productionListener}\nreturn {\n  log,\n  newMsgBtn,\n  scrollIntent,\n  disposeChatScrollListeners,\n  get stickToBottom() { return stickToBottom; },\n};`,
   );
   return build(log, newMsgBtn, atBottom, createChatScrollIntentTracker, updateChatStickiness);
 }
@@ -71,6 +99,29 @@ test("programmatic scroll cancellation preserves the real marker for the followi
   tracker.endProgrammaticScroll();
   assert.equal(tracker.consume(), true);
   tracker.dispose();
+});
+
+test("production wiring preserves a root marker across multiple app writes before scroll delivery", () => {
+  const surface = buildProductionScrollSurface();
+
+  emit(surface.log, "pointerdown");
+  // These are the two production callers' writes before the browser delivers
+  // either scroll event (for example, reveal/anchoring corrections in one turn).
+  surface.scrollIntent.noteProgrammaticScroll();
+  surface.log.scrollTop = 350;
+  surface.scrollIntent.noteProgrammaticScroll();
+  surface.log.scrollTop = 300;
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, true, "the first app write must not spend the marker");
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, true, "the second app write must not spend the marker");
+
+  surface.log.scrollTop = 250;
+  emit(surface.log, "wheel");
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, false, "the following root user scroll must still unstick");
+  surface.disposeChatScrollListeners();
+  surface.scrollIntent.dispose();
 });
 
 test("wheel, touch, pointer, and vertical keyboard scrolling preserve user intent", () => {
@@ -129,6 +180,7 @@ test("production DOM wiring expires input that never scrolls before a later brow
     surface.log.scrollTop = 300;
     emit(surface.log, "scroll");
     assert.equal(surface.stickToBottom, true, "an unrelated later scroll must not unstick the feed");
+    surface.disposeChatScrollListeners();
     surface.scrollIntent.dispose();
   }
 });
@@ -149,5 +201,41 @@ test("production DOM wiring skips an app scroll, preserves the marker, and re-st
   surface.log.scrollTop = 900;
   emit(surface.log, "scroll");
   assert.equal(surface.stickToBottom, true, "reaching bottom must re-stick in the production listener");
+  surface.disposeChatScrollListeners();
   surface.scrollIntent.dispose();
+});
+
+test("production wiring ignores nested input and scroll targets while preserving root scrolling", () => {
+  const surface = buildProductionScrollSurface();
+  const nestedInput = {};
+
+  surface.log.scrollTop = 300;
+  emit(surface.log, "pointerdown", {}, nestedInput);
+  emit(surface.log, "scroll", {}, nestedInput);
+  assert.equal(surface.stickToBottom, true, "nested code/card/thinking activity is not root intent");
+
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, true, "nested activity must not unstick a root anchoring scroll");
+
+  emit(surface.log, "wheel");
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, false, "root user scrolling remains intentional");
+  surface.disposeChatScrollListeners();
+  surface.scrollIntent.dispose();
+});
+
+test("production teardown removes every scroll listener and leaves the tracker inert", () => {
+  const surface = buildProductionScrollSurface();
+  assert.equal(surface.log.listenerCount(), 6, "the production surface installs six scroll listeners");
+
+  surface.disposeChatScrollListeners();
+  surface.scrollIntent.dispose();
+  assert.equal(surface.log.listenerCount(), 0, "teardown removes every production scroll listener");
+
+  surface.log.scrollTop = 250;
+  emit(surface.log, "pointerdown");
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, true, "post-dispose input cannot change stickiness");
+  surface.scrollIntent.note({ type: "wheel" });
+  assert.equal(surface.scrollIntent.consume(), false, "post-dispose tracker calls are inert");
 });
