@@ -8,7 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - a release tag proves the tagged tree is the version it claims, and that nothing shipped untagged (#1882)
-
+- the release tag guard fails closed on an unreadable commit, and checks its own tag target (#1882)
 
 ## [0.15.105] - 2026-08-26
 
