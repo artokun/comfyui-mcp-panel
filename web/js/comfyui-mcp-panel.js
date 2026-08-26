@@ -88,7 +88,9 @@ import {
   mergeRunCompletionMetadata,
   normalizeRunCompletionMetadata,
   partitionRunCompletionMetadata,
+  runCompletionContextKey,
   runCompletionKeyMatchesContext,
+  selectDeferredRunCompletionMetadata,
 } from "./lib/run-completion-persistence.js";
 import {
   arbitratePanelCopy,
@@ -916,6 +918,17 @@ let runCompletionRef = null;
 // prompt is queued so the sweep re-reconciles pending runs against /history until
 // they drain. Set in buildPanel; null while unmounted.
 let armRunReconcileSweepRef = null;
+// #1839 P1(b) — re-partitions the durable run-completion ledger against the LIVE
+// workflow route. bridgeRouteId() is derived from the active workflow, so it moves
+// under a mounted panel with no remount at all, and the ledger's mount-time
+// partition does not follow it. The 600 ms workflow poll calls this on every tick.
+//
+// Module-scoped for the SAME reason as the sweep ref above: onWorkflowMaybeChanged
+// runs once synchronously (and then on the poll) from a point in buildPanel's
+// closure ABOVE where the tracker is created, so a `let` declared alongside the
+// tracker would be in its temporal dead zone for that first call. Null while
+// unmounted, and the caller is optional-chained, so an unmounted panel is a no-op.
+let rehydrateRunCompletionForLiveRouteRef = null;
 // A late prompt receipt has to cross the bridge to the MCP consumer. Capture the
 // sender at mount time so an old graph_run cannot publish into a replacement tab
 // after teardown/reconnect.
@@ -5369,6 +5382,41 @@ function ssSet(key, val) {
 
 function readRunCompletionMetadata() {
   const raw = ssGet(RUN_COMPLETION_META_KEY);
+  if (!raw) return [];
+  try {
+    return normalizeRunCompletionMetadata(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * #1839 — the SAME read, but able to say "I could not read it": `[]` when the
+ * ledger is genuinely empty, `null` when it could not be read.
+ *
+ * readRunCompletionMetadata() cannot make that distinction. ssGet swallows a
+ * throwing sessionStorage (private-mode quota, a blocked origin) and returns
+ * null, and a malformed value is caught and returned as `[]` — so "no rows" and
+ * "no answer" are byte-identical to every caller.
+ *
+ * That matters because ADOPTING a route/session context is irreversible for the
+ * life of the mount: it marks the context this tracker's, so later polls skip it
+ * AND the next persist stops treating its rows as foreign — dropping rows the
+ * read never saw. Adoption must therefore be taken on an answer, never on a
+ * silence; callers refuse on null and retry on the next poll tick.
+ *
+ * Unparseable bytes ARE an answer — nothing recoverable is in there and no
+ * future read will change that — so they normalize to `[]` like any other row
+ * that fails the cross-check. Only a THROWING store, which may hold rows we
+ * simply cannot see right now, is "unknown".
+ */
+function readRunCompletionMetadataOrUnknown() {
+  let raw = null;
+  try {
+    raw = window.sessionStorage.getItem(RUN_COMPLETION_META_KEY) || null;
+  } catch {
+    return null; // storage unreadable — NOT an empty ledger
+  }
   if (!raw) return [];
   try {
     return normalizeRunCompletionMetadata(JSON.parse(raw));
@@ -35877,6 +35925,16 @@ function buildPanel() {
   // So everything below commits unconditionally, exactly as it did before #1095, and only
   // the hello waits. See lib/rehello-gate.js.
   function onWorkflowMaybeChanged() {
+    // #1839 P1(b) — the durable run-completion ledger is partitioned against the
+    // LIVE bridge route, and that route moves without a remount. Re-check it
+    // here, BEFORE the unchanged-route early return below: `wfid` is the saved
+    // HANDLE, and bridgeRouteId() also moves when this tab's route identity
+    // finally establishes (leased asynchronously, null until then) — a change no
+    // workflow handle reflects. Best-effort and null while unmounted; a hook
+    // throw must never break the workflow poll.
+    try {
+      rehydrateRunCompletionForLiveRouteRef?.();
+    } catch {}
     const wf = activeWorkflowRef();
     const wfid = workflowTabId();
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
@@ -38057,19 +38115,72 @@ function buildPanel() {
     completionRestoreRoute = bridgeRouteId();
   } catch {}
   const completionRestoreSession = ssGet(SESSION_KEY);
+  // `null` here means the ledger could not be READ, which is not the same answer
+  // as an empty one — see readRunCompletionMetadataOrUnknown. Partitioning an
+  // unreadable ledger yields two empty halves, and on the old wiring the first
+  // persist then overwrote the key with them.
+  const completionRestoreStored = readRunCompletionMetadataOrUnknown();
   const completionRestore = partitionRunCompletionMetadata(
-    readRunCompletionMetadata(),
+    completionRestoreStored ?? [],
     completionRestoreRoute,
     completionRestoreSession,
   );
-  const deferredRunCompletionMetadata = completionRestore.deferred;
+  // #1839 P1(b) — the route/session CONTEXTS whose rows this mount's tracker has
+  // taken ownership of. Everything else in storage belongs to a workflow this
+  // panel is not driving and is merged back untouched on every write.
+  //
+  // A LIVE SET, deliberately not the mount-time `completionRestore.deferred`
+  // snapshot it replaces. That snapshot is frozen and the route is not: once the
+  // rehydrate below adopts a second route's rows, the snapshot still calls them
+  // foreign and re-merges them into every later persist — resurrecting rows the
+  // tracker has since retired, so the next mount replays a completion the agent
+  // already received. Membership here is what makes "foreign" a live question.
+  const adoptedRunCompletionContexts = new Set();
+  const adoptRunCompletionContext = (routeId, sessionId) => {
+    const route = typeof routeId === "string" ? routeId.trim() : "";
+    // A route this tab has not established names no canvas (bridgeRouteId()
+    // REFUSES rather than falling back). Adopting under it would claim rows for
+    // a route that does not exist yet and strip them of their own route's
+    // ownership — so refuse, exactly as the partition does.
+    if (!route) return false;
+    const contextKey = runCompletionContextKey(route, sessionId);
+    if (adoptedRunCompletionContexts.has(contextKey)) return false;
+    adoptedRunCompletionContexts.add(contextKey);
+    return true;
+  };
+  // The cheap half of the question, asked BEFORE any storage work: the
+  // overwhelming majority of the 600 ms ticks that reach the rehydrate below are
+  // already-adopted contexts and must not pay a ledger parse to learn that.
+  const runCompletionContextNeedsAdoption = (routeId, sessionId) => {
+    const route = typeof routeId === "string" ? routeId.trim() : "";
+    if (!route) return false;
+    return !adoptedRunCompletionContexts.has(runCompletionContextKey(route, sessionId));
+  };
+  // Claim the mount's own context only if the ledger was actually READ. On an
+  // unreadable store the rehydrate below retries on the next poll tick instead of
+  // permanently marking these rows as this tracker's and dropping them.
+  if (completionRestoreStored !== null) {
+    adoptRunCompletionContext(completionRestoreRoute, completionRestoreSession);
+  }
   const persistOwnedRunCompletionMetadata = (entries) => {
     // Async composition from a torn-down mount can settle after its replacement
     // has already acknowledged and cleared a completion. Never let that stale
     // frontend instance resurrect its old pending snapshot.
     if (panelRunOwnerRef.current !== mountOwner) return;
+    // Re-read at PERSIST time, never a value closed over at mount.
+    const stored = readRunCompletionMetadataOrUnknown();
+    // An unreadable ledger cannot say which rows belong to another route, and
+    // writing without them would DELETE every foreign row — a completion nobody
+    // ever delivers, which is the failure this whole ledger exists to prevent.
+    // The tracker stays authoritative in memory and the next state change
+    // re-attempts the write. Deliberately the same trade the delivery path
+    // makes: a duplicate turn beats a lost render.
+    if (stored === null) return;
     persistRunCompletionMetadata(
-      mergeRunCompletionMetadata(entries, deferredRunCompletionMetadata),
+      mergeRunCompletionMetadata(
+        entries,
+        selectDeferredRunCompletionMetadata(stored, adoptedRunCompletionContexts),
+      ),
     );
   };
   const persistOwnedRunCompletionTerminals = (entries) => {
@@ -38335,6 +38446,71 @@ function buildPanel() {
   ) {
     armRunReconcileSweep();
   }
+
+  /** #1839 P1(b) — RE-PARTITION WHEN THE LIVE ROUTE MOVES, not only at mount.
+   *
+   *  `completionRestore` above is computed ONCE, against whatever route was live
+   *  when this panel mounted. bridgeRouteId() is derived from the LIVE active
+   *  workflow, so it moves under us with NO remount — the same property #1095
+   *  documents at the hello. The partition's own comment ("keep foreign rows in
+   *  storage for a later mount of their own route") assumes a route change
+   *  implies a remount, and it does not.
+   *
+   *  Reported shape: a completion is still owed on workflow B, the user reloads
+   *  while workflow A is the canvas, B's row is deferred — and switching back to
+   *  B inside the same mount never adopts it. The row stays durable in storage,
+   *  but only a LATER mount picks it up, so the run is "successful, no completion
+   *  event, recovered by hand with get_history" (#1739 / #585 / #370) with a
+   *  workflow switch in front of it.
+   *
+   *  The reconcile sweep CANNOT be this hook. It arms on runCompletion.hasPending(),
+   *  and a deferred row is precisely one the tracker does not know about — so the
+   *  sweep is disarmed for exactly the rows that need recovering. Whatever fires
+   *  has to be independent of tracker state, which the workflow poll is.
+   *
+   *  NOTHING IS WIDENED. The partition is RE-COMPUTED against the route that is
+   *  live at the moment of restore, so a row belonging to a workflow that is not
+   *  on the canvas right now stays deferred and cannot stamp a completion frame
+   *  onto the wrong canvas. sendRunCompletionFrame still re-checks route AND
+   *  session at the instant the frame leaves, so the wrong-canvas write is fenced
+   *  twice, not once.
+   *
+   *  Also covers a route change that changes no workflow at all: this tab's route
+   *  identity is leased ASYNCHRONOUSLY (createTabRouteIdentity), so bridgeRouteId()
+   *  can still be null at mount — in which case the mount-time partition defers
+   *  EVERY row, including the active workflow's — and only becomes readable once
+   *  the lease lands. That null → id edge is a route change too, and it is picked
+   *  up here on the next poll tick. */
+  const rehydrateRunCompletionForLiveRoute = () => {
+    let liveRoute = null;
+    try {
+      liveRoute = bridgeRouteId();
+    } catch {}
+    const liveSession = ssGet(SESSION_KEY);
+    // Already this mount's, or not routable — one Set lookup on the overwhelming
+    // majority of the 600 ms ticks that reach this line, and no storage read.
+    if (!runCompletionContextNeedsAdoption(liveRoute, liveSession)) return 0;
+    // READ BEFORE ADOPTING, and refuse on an unreadable ledger. Adoption is
+    // irreversible for the life of the mount: it marks the context this
+    // tracker's, so every later tick skips it AND the next persist stops
+    // treating its rows as foreign and drops them. A transient sessionStorage
+    // failure is indistinguishable from an empty ledger through
+    // readRunCompletionMetadata(), so adopting on that answer would strand — and
+    // then delete — rows that were there all along. Returning retries next tick.
+    const stored = readRunCompletionMetadataOrUnknown();
+    if (stored === null) return 0;
+    if (!adoptRunCompletionContext(liveRoute, liveSession)) return 0;
+    const restored = restoreRunCompletionMetadata(
+      runCompletion,
+      partitionRunCompletionMetadata(stored, liveRoute, liveSession).current,
+    );
+    // Adopted rows are pending-but-unswept until something arms the sweep: the
+    // run they name finished while this panel was not listening, so no lifecycle
+    // edge is coming and /history is the only place its outputs exist.
+    if (restored > 0) armRunReconcileSweep();
+    return restored;
+  };
+  rehydrateRunCompletionForLiveRouteRef = rehydrateRunCompletionForLiveRoute;
 
   // ── #585: correlated restart-resume ───────────────────────────────────────
   // After a ComfyUI restart the panel nudges the agent to continue. If a render
@@ -42769,6 +42945,9 @@ function buildPanel() {
       // suppressed resume.
       stopRebootWatch();
       if (armRunReconcileSweepRef === armRunReconcileSweep) armRunReconcileSweepRef = null;
+      if (rehydrateRunCompletionForLiveRouteRef === rehydrateRunCompletionForLiveRoute) {
+        rehydrateRunCompletionForLiveRouteRef = null;
+      }
       if (runCompletionRef === runCompletion) runCompletionRef = null;
       if (runReceiptRouteRef === panelRunReceiptRouteRef) runReceiptRouteRef = null;
       if (runReceiptSessionRef === panelRunReceiptSessionRef) runReceiptSessionRef = null;
