@@ -496,16 +496,28 @@ test("#1873 a node that becomes unreadable mid-connect does not fail a LANDED wi
   assert.equal(res.slots_rewritten, undefined);
 });
 
-test("#1873 a hostile widget VALUE cannot fail a landed wire (gate P1)", () => {
-  // A widget value is whatever the pack put there, and it is interpolated into
-  // the warning sentence. `JSON.stringify` throws on two shapes that a pack can
-  // genuinely produce, and the throw would come from a rider running AFTER the
-  // wire landed — reporting a successful connect as an error.
+test("#1873 hostile widget VALUES are safe in the full bridge envelope (gate P1)", () => {
+  // A widget value is whatever the pack put there. The bridge serializes the
+  // FULL reply envelope after the executor returns, so protecting only the
+  // warning sentence is insufficient: raw values in slots_rewritten would still
+  // turn a landed wire into a missing reply.
   const circular = { name: "loop" };
   circular.self = circular;
+  const throwingGetter = {};
+  Object.defineProperty(throwingGetter, "secret", {
+    enumerable: true,
+    get() {
+      throw new Error("hostile getter");
+    },
+  });
+  const oversized = { payload: "x".repeat(1000) };
   for (const [label, hostile, expected] of [
-    ["BigInt", 2n, /widget "select" 1 → 2n/],
-    ["circular", circular, /widget "select" 1 → \(unrenderable\)/],
+    ["BigInt", 2n, "2n"],
+    ["circular", circular, "(unrenderable)"],
+    ["oversized", oversized, null],
+    ["throwing getter", throwingGetter, "(unrenderable)"],
+    ["symbol", Symbol("secret"), "(symbol)"],
+    ["function", () => "secret", "(function)"],
   ]) {
     const graph = mkGraph();
     const source = mkNodeWithOutput(graph, 1, "Load Image");
@@ -526,10 +538,23 @@ test("#1873 a hostile widget VALUE cannot fail a landed wire (gate P1)", () => {
     const graph_connect = buildConnect(graph);
 
     const res = graph_connect({ from_node_id: 1, from_output: 0, to_node_id: 2, to_input: "input1" });
+    const rewrite = res.slots_rewritten?.[0]?.widgets?.[0];
+    const reply = { rid: `${label}-rid`, ok: true, result: res };
+    let encoded;
+    assert.doesNotThrow(() => {
+      encoded = JSON.stringify(reply);
+    }, `${label}: the production bridge envelope must serialize`);
 
     assert.equal(res.connected.to.node_id, 2, `${label}: the wire landed`);
     assert.equal(res.slots_rewritten.length, 1, `${label}: the change is still disclosed`);
-    assert.match(res.warning, expected, `${label}: the value is rendered, not stringified raw`);
+    assert.notEqual(rewrite?.to, hostile, `${label}: the raw value is not returned`);
+    if (expected) assert.equal(rewrite?.to, expected, `${label}: hostile value has a fixed safe form`);
+    else {
+      assert.equal(typeof rewrite?.to, "string", `${label}: oversized value is represented as text`);
+      assert.ok(rewrite.to.length <= 121, `${label}: disclosure value is bounded`);
+      assert.equal(rewrite.to.endsWith("…"), true, `${label}: truncation is disclosed`);
+      assert.equal(encoded.includes("x".repeat(1000)), false, `${label}: raw object is not leaked`);
+    }
   }
 });
 

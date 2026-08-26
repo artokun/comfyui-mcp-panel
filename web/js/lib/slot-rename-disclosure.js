@@ -157,7 +157,9 @@ export function captureSlotNames(nodes) {
  *
  * @returns {Array<{node_id: unknown, slots: Array<{kind: string, index: number,
  *   from: string|null, to: string|null}>, widgets: Array<{name: string|null,
- *   from: unknown, to: unknown}>}>} one entry per node that actually changed.
+ *   from: string|number|boolean|null, to: string|number|boolean|null}>}>} one
+ *   entry per node that actually changed. Widget values and node ids are safe,
+ *   bounded JSON scalars; the live values remain private to this comparison.
  */
 export function describeSlotRewrites(snapshot) {
   const rewrites = [];
@@ -181,7 +183,12 @@ export function describeSlotRewrites(snapshot) {
           // beyond `before.length` are new slots and are deliberately not read.
           const to = i < after.length ? after[i] : null;
           if (before[i] === to) continue;
-          slots.push({ kind, index: i, from: before[i] ?? null, to });
+          slots.push({
+            kind,
+            index: i,
+            from: safeDisclosureValue(before[i] ?? null),
+            to: safeDisclosureValue(to),
+          });
         }
       }
       const widgets = [];
@@ -192,15 +199,57 @@ export function describeSlotRewrites(snapshot) {
         const now = widgetsAfter[i];
         if (was?.name !== now?.name) continue;
         if (Object.is(was?.value, now?.value)) continue;
-        widgets.push({ name: was?.name ?? null, from: was?.value, to: now?.value });
+        widgets.push({
+          name: safeDisclosureValue(was?.name ?? null),
+          from: safeDisclosureValue(was?.value),
+          to: safeDisclosureValue(now?.value),
+        });
       }
       if (!slots.length && !widgets.length) continue;
-      rewrites.push({ node_id: node.id, slots, widgets });
+      rewrites.push({ node_id: safeDisclosureValue(node.id), slots, widgets });
     } catch {
       /* an unreadable node contributes no disclosure, never a thrown verdict */
     }
   }
   return rewrites;
+}
+
+const MAX_DISCLOSURE_VALUE_LENGTH = 120;
+
+/**
+ * Convert an arbitrary live graph value to a bounded JSON-safe scalar. The
+ * comparison above deliberately retains the original values so Object.is()
+ * can distinguish real changes; this is the boundary where those values must
+ * stop being able to enter a graph_connect reply.
+ */
+function safeDisclosureValue(value) {
+  try {
+    if (value === null || value === undefined) return null;
+    switch (typeof value) {
+      case "string":
+        return value.length > MAX_DISCLOSURE_VALUE_LENGTH
+          ? `${value.slice(0, MAX_DISCLOSURE_VALUE_LENGTH)}…`
+          : value;
+      case "number":
+      case "boolean":
+        return value;
+      case "bigint":
+        return `${value}n`;
+      case "symbol":
+        return "(symbol)";
+      case "function":
+        return "(function)";
+      default: {
+        const json = JSON.stringify(value);
+        if (typeof json !== "string") return "(unrenderable)";
+        return json.length > MAX_DISCLOSURE_VALUE_LENGTH
+          ? `${json.slice(0, MAX_DISCLOSURE_VALUE_LENGTH)}…`
+          : json;
+      }
+    }
+  } catch {
+    return "(unrenderable)";
+  }
 }
 
 /**
@@ -229,7 +278,9 @@ function renderValue(value) {
     const json = JSON.stringify(value);
     // `undefined` when the value is not serialisable at all — never interpolate that.
     if (typeof json !== "string") return `(${type})`;
-    return json.length > 120 ? `${json.slice(0, 120)}…` : json;
+    return json.length > MAX_DISCLOSURE_VALUE_LENGTH
+      ? `${json.slice(0, MAX_DISCLOSURE_VALUE_LENGTH)}…`
+      : json;
   } catch {
     return "(unrenderable)";
   }
