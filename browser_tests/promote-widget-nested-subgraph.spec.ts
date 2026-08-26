@@ -1,10 +1,19 @@
 /**
- * mcp#2321: panel_promote_widget fails on nested subgraphs (root → 142 → 133).
+ * mcp#2321: panel_promote_widget failed on a NESTED subgraph (root → 142 → 133).
  *
- * The parent lookup searches only the ROOT graph for the subgraph node, but
- * node 133 does not live at root — it lives inside node 142. The fix uses
- * findSubgraphOwner to walk the graph hierarchy, finding the immediate parent
- * regardless of nesting depth.
+ * The parent lookup scanned only `rootGraph._nodes` for a node whose `.subgraph`
+ * is the open graph. One level down that works; two levels down the owning
+ * SubgraphNode does not live at root — it lives inside the outer subgraph — so
+ * the scan came back empty and the command threw
+ * "Could not locate the parent subgraph node for the open subgraph."
+ *
+ * The fix (panel #1828 / 717ae98) walks the whole graph hierarchy instead.
+ *
+ * These two cases are the mutation pair: revert the walk to the old
+ * `rootGraph._nodes` filter and the NESTED case must fail with that exact
+ * message while the SINGLE-LEVEL case keeps passing — the single-level case is
+ * the control that proves the nested failure is about depth, not about the
+ * harness.
  *
  * PREREQUISITE: a real ComfyUI at http://localhost:8188 with this pack linked
  * into custom_nodes and CORS enabled (see playwright.config.ts).
@@ -24,11 +33,40 @@ async function command(
   bridge: MockBridge,
   cmd: string,
   args: Record<string, unknown> = {},
-  timeoutMs = 15_000
+  timeoutMs = 20_000
 ): Promise<Record<string, unknown>> {
   const reply = (await bridge.command(cmd, args, timeoutMs)) as unknown as CmdReply
   if (!reply.ok) throw new Error(reply.error ?? `command "${cmd}" failed`)
   return reply.result ?? {}
+}
+
+/** graph_add_node returns { added: summarizeNode(node) }. */
+async function addNode(bridge: MockBridge, classType: string): Promise<number> {
+  const res = await command(bridge, 'graph_add_node', { class_type: classType })
+  const added = res.added as { id?: number | string } | undefined
+  expect(added?.id, `graph_add_node(${classType}) returned no id`).toBeDefined()
+  return Number(added!.id)
+}
+
+/**
+ * graph_create_subgraph takes `node_ids` (an ARRAY) and returns
+ * { subgraph: { node_id } } — the id of the NEW SubgraphNode that replaced the
+ * selection, which is NOT the id of the node that went in.
+ */
+async function createSubgraph(bridge: MockBridge, nodeIds: number[]): Promise<number> {
+  const res = await command(bridge, 'graph_create_subgraph', { node_ids: nodeIds })
+  const sub = res.subgraph as { node_id?: number | string } | undefined
+  expect(sub?.node_id, 'graph_create_subgraph returned no subgraph node_id').toBeDefined()
+  return Number(sub!.node_id)
+}
+
+/**
+ * Ids cross the bridge as JSON and come back as strings inside a subgraph
+ * scope, so compare numerically rather than asserting a wire type this test
+ * does not care about.
+ */
+function ids(value: unknown): number[] {
+  return (Array.isArray(value) ? value : [value]).map(Number)
 }
 
 // Serve THIS checkout's web/js
@@ -36,119 +74,67 @@ test.beforeEach(async ({ context }) => {
   await routeWorktreeSource(context)
 })
 
+async function openPanel(panel: { goto: () => Promise<unknown>; setBridgeUrl: (u: string) => Promise<unknown>; openSidebar: () => Promise<unknown>; connect: () => Promise<unknown> }, mockBridge: MockBridge) {
+  await panel.goto()
+  await panel.setBridgeUrl(mockBridge.url)
+  await panel.openSidebar()
+  await panel.connect()
+  await command(mockBridge, 'graph_clear')
+}
+
 test.describe('panel_promote_widget on nested subgraphs (mcp#2321)', () => {
-  test('promotes a widget on a node inside a nested subgraph (root → outer → inner)', async ({
+  test('promotes a widget two levels deep (root → outer → inner)', async ({
     panel,
     mockBridge
   }) => {
-    await panel.goto()
-    await panel.setBridgeUrl(mockBridge.url)
-    await panel.openSidebar()
-    await panel.connect()
+    await openPanel(panel, mockBridge)
 
-    await command(mockBridge, 'graph_clear')
+    // root → outer  (the "node 142" of the report)
+    const outerSeed = await addNode(mockBridge, 'CheckpointLoaderSimple')
+    const outerSubgraphNodeId = await createSubgraph(mockBridge, [outerSeed])
+    await command(mockBridge, 'graph_enter_subgraph', { node_id: outerSubgraphNodeId })
 
-    // Create outer subgraph (node 142 equivalent)
-    const outerRes = await command(mockBridge, 'graph_add_node', { class_type: 'Reroute' })
-    const outerNode = outerRes.added as { id: number } | undefined
-    expect(outerNode?.id).toBeDefined()
-    const outerNodeId = Number(outerNode!.id)
-
-    // Create outer subgraph from this node
-    const outerSubgraphRes = await command(mockBridge, 'graph_create_subgraph', {
-      node_id: outerNodeId,
-      title: 'Outer Subgraph'
-    })
-    expect(outerSubgraphRes.created).toBe(true)
-
-    // Enter outer subgraph
-    await command(mockBridge, 'graph_enter_subgraph', { node_id: outerNodeId })
-
-    // Create inner node in outer subgraph
-    const innerSubgraphNodeRes = await command(mockBridge, 'graph_add_node', {
-      class_type: 'Reroute'
-    })
-    const innerSubgraphNode = innerSubgraphNodeRes.added as { id: number } | undefined
-    expect(innerSubgraphNode?.id).toBeDefined()
-    const innerSubgraphNodeId = Number(innerSubgraphNode!.id)
-
-    // Create inner subgraph (node 133 equivalent)
-    const innerRes = await command(mockBridge, 'graph_create_subgraph', {
-      node_id: innerSubgraphNodeId,
-      title: 'Inner Subgraph'
-    })
-    expect(innerRes.created).toBe(true)
-
-    // Enter inner subgraph
+    // outer → inner  (the "node 133" of the report). This SubgraphNode lives
+    // INSIDE the outer subgraph, so it is absent from rootGraph._nodes — that
+    // absence is the whole bug.
+    const innerSeed = await addNode(mockBridge, 'CheckpointLoaderSimple')
+    const innerSubgraphNodeId = await createSubgraph(mockBridge, [innerSeed])
     await command(mockBridge, 'graph_enter_subgraph', { node_id: innerSubgraphNodeId })
 
-    // Add a node with a widget inside the inner subgraph
-    const deepNodeRes = await command(mockBridge, 'graph_add_node', {
-      class_type: 'CheckpointLoader',
-      optional_inputs: false
-    })
-    const deepNode = deepNodeRes.added as { id: number } | undefined
-    expect(deepNode?.id).toBeDefined()
-    const deepNodeId = Number(deepNode!.id)
+    // A node two levels down, whose widget we promote onto its immediate parent.
+    const deepNodeId = await addNode(mockBridge, 'CheckpointLoaderSimple')
 
-    // This should NOT throw "Could not locate the parent subgraph node for the open subgraph"
-    // It should find the immediate parent (innerSubgraphNode) which lives inside outerNode
     const promoteRes = await command(mockBridge, 'graph_promote_widget', {
       node_id: deepNodeId,
       widget: 'ckpt_name'
     })
 
-    // Verify promotion succeeded
     expect(promoteRes.promoted).toBe('ckpt_name')
-    expect(promoteRes.from_node).toBe(deepNodeId)
-    expect(promoteRes.on_subgraph_nodes).toContain(innerSubgraphNodeId)
+    expect(ids(promoteRes.from_node)).toEqual([deepNodeId])
+    // The immediate parent is the INNER SubgraphNode, which the old root-only
+    // scan could never see.
+    expect(ids(promoteRes.on_subgraph_nodes)).toContain(innerSubgraphNodeId)
   })
 
-  test('still promotes widgets on single-level subgraphs (root → outer)', async ({
+  test('still promotes one level deep (root → outer) — control', async ({
     panel,
     mockBridge
   }) => {
-    await panel.goto()
-    await panel.setBridgeUrl(mockBridge.url)
-    await panel.openSidebar()
-    await panel.connect()
+    await openPanel(panel, mockBridge)
 
-    await command(mockBridge, 'graph_clear')
+    const seed = await addNode(mockBridge, 'CheckpointLoaderSimple')
+    const subgraphNodeId = await createSubgraph(mockBridge, [seed])
+    await command(mockBridge, 'graph_enter_subgraph', { node_id: subgraphNodeId })
 
-    // Create outer subgraph
-    const outerRes = await command(mockBridge, 'graph_add_node', { class_type: 'Reroute' })
-    const outerNode = outerRes.added as { id: number } | undefined
-    expect(outerNode?.id).toBeDefined()
-    const outerNodeId = Number(outerNode!.id)
+    const nodeId = await addNode(mockBridge, 'CheckpointLoaderSimple')
 
-    // Create subgraph
-    const subgraphRes = await command(mockBridge, 'graph_create_subgraph', {
-      node_id: outerNodeId,
-      title: 'Test Subgraph'
-    })
-    expect(subgraphRes.created).toBe(true)
-
-    // Enter subgraph
-    await command(mockBridge, 'graph_enter_subgraph', { node_id: outerNodeId })
-
-    // Add a node with a widget
-    const nodeRes = await command(mockBridge, 'graph_add_node', {
-      class_type: 'CheckpointLoader',
-      optional_inputs: false
-    })
-    const node = nodeRes.added as { id: number } | undefined
-    expect(node?.id).toBeDefined()
-    const nodeId = Number(node!.id)
-
-    // Promote the widget — this should work as before
     const promoteRes = await command(mockBridge, 'graph_promote_widget', {
       node_id: nodeId,
       widget: 'ckpt_name'
     })
 
-    // Verify promotion succeeded
     expect(promoteRes.promoted).toBe('ckpt_name')
-    expect(promoteRes.from_node).toBe(nodeId)
-    expect(promoteRes.on_subgraph_nodes).toContain(outerNodeId)
+    expect(ids(promoteRes.from_node)).toEqual([nodeId])
+    expect(ids(promoteRes.on_subgraph_nodes)).toContain(subgraphNodeId)
   })
 })
