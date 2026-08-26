@@ -713,7 +713,7 @@ import {
   runBoundedWorkflowSave,
   workflowSaveTimeoutObservation,
 } from "./lib/workflow-save-budget.js";
-import { createRunCompletionTracker } from "./lib/run-completion.js";
+import { createRunCompletionTracker, NO_PROMPT_KEY } from "./lib/run-completion.js";
 import { createRunCompletionFlushHandler } from "./lib/run-completion-delivery.js";
 import {
   clearInheritedExecutionPreview,
@@ -722,7 +722,7 @@ import {
 } from "./lib/execution-preview-attach.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
 import { composeShowMediaReply } from "./lib/media-preview.js";
-import { appendStoryboardCacheBust, createStoryboardIdentity } from "./lib/storyboard-cache-identity.js";
+import { appendImageCacheBust, appendStoryboardCacheBust, createStoryboardIdentity } from "./lib/storyboard-cache-identity.js";
 import {
   bindSourcePlayback,
   sourceMediaDuration,
@@ -39187,6 +39187,23 @@ function buildPanel() {
     // storyboard delivered asynchronously below.
     const inlineImages = [];
     const videos = [];
+    // #1834 — the still cards' cache key: the id the completion frame's probes
+    // will bust with, derived the way the tracker derives it. It runs BOTH of
+    // the tracker's steps, because either one alone puts the card on a
+    // different URL from the probe — stale pixels, and a note describing a file
+    // the card never fetched:
+    //
+    //   key(id)        = id == null ? NO_PROMPT_KEY : String(id)
+    //   promptIdOf(k)  = k === NO_PROMPT_KEY ? null : k
+    //
+    // `String` because a numeric prompt id reaches the frame as "7"; the
+    // NO_PROMPT_KEY check because an id that IS the sentinel is mapped back to
+    // null there, so busting the card on it would be a key the probe never
+    // uses. A null result deliberately busts nothing — see the paint below.
+    const runCacheKey = (() => {
+      const k = d.prompt_id == null ? NO_PROMPT_KEY : String(d.prompt_id);
+      return k === NO_PROMPT_KEY ? null : k;
+    })();
     for (const m of media) {
       if (!m || !m.filename) continue;
       const url = imageViewUrl(m);
@@ -39207,7 +39224,25 @@ function buildPanel() {
         // something the agent cannot perceive (#710).
         paintAudio(url, m.filename);
       } else {
-        paintImage(url, m.filename);
+        // #1834 — THE CARD's URL is the one that has to be unique, not just the
+        // metadata probe's. `/view?filename=…` is stable across runs, and a
+        // SaveImage prefix that recycles a name (a `%date%`+`%counter%` prefix
+        // whose counter overlaps an earlier day) makes the browser serve the
+        // PREVIOUS run's bytes here while the file viewer — which fetches
+        // fresh — shows the new ones. Same filename, two different sets of
+        // pixels, and the person approves the wrong render. `cmcp_prompt`
+        // matches the key the completion frame's size/dimension probes use, so
+        // both surfaces address ONE URL and share ONE download.
+        //
+        // There is no local FALLBACK when the id is missing. An id-less run
+        // (#224, legacy; a current ComfyUI `executed` always carries one) then
+        // keeps the stale-card exposure, and that is the lesser evil: the
+        // tracker collapses every id-less run onto the shared NO_PROMPT_KEY and
+        // `promptIdOf` hands the frame `null`, so there is no per-run value the
+        // probe could agree with — a key minted here would just make the note
+        // describe a different file from the one on screen. Closing it needs a
+        // per-run identity threaded through the tracker's buffer and flush.
+        paintImage(appendImageCacheBust(url, runCacheKey), m.filename);
         inlineImages.push(m);
       }
     }

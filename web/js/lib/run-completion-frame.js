@@ -26,6 +26,7 @@ import { duplicateCompletionNote } from "./completion-dedupe.js";
 import { withTimeout } from "./bounded-step.js";
 import { completionCompositionDiagnostic } from "./completion-delivery-diagnostics.js";
 import {
+  appendImageCacheBust,
   appendStoryboardCacheBust,
   createStoryboardIdentity,
   storyboardPosterUploadName,
@@ -303,16 +304,6 @@ export async function composeRunCompletionFrame(
 // An epoch below this is not a wall clock — it is a relative counter (a test
 // harness clock, a duration, 0). Sep 2001; every real Date.now() clears it.
 const MIN_PLAUSIBLE_EPOCH_MS = 1_000_000_000_000;
-
-/** Append a cache-bust parameter to an image /view URL using the prompt_id. */
-function appendImageCacheBust(url, promptId) {
-  if (typeof url !== "string" || !url || typeof promptId !== "string" || !promptId) return url;
-  const hashAt = url.indexOf("#");
-  const beforeHash = hashAt >= 0 ? url.slice(0, hashAt) : url;
-  const hash = hashAt >= 0 ? url.slice(hashAt) : "";
-  const separator = beforeHash.includes("?") ? (/[?&]$/.test(beforeHash) ? "" : "&") : "?";
-  return `${beforeHash}${separator}cmcp_prompt=${encodeURIComponent(promptId)}${hash}`;
-}
 
 /** Epoch ms → Date, or null when the value isn't a plausible wall clock (#1199). */
 function epochToDate(ms) {
