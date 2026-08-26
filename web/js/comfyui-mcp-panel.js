@@ -713,7 +713,7 @@ import {
   runBoundedWorkflowSave,
   workflowSaveTimeoutObservation,
 } from "./lib/workflow-save-budget.js";
-import { createRunCompletionTracker } from "./lib/run-completion.js";
+import { createRunCompletionTracker, NO_PROMPT_KEY } from "./lib/run-completion.js";
 import { createRunCompletionFlushHandler } from "./lib/run-completion-delivery.js";
 import {
   clearInheritedExecutionPreview,
@@ -39187,14 +39187,23 @@ function buildPanel() {
     // storyboard delivered asynchronously below.
     const inlineImages = [];
     const videos = [];
-    // #1834 — the still cards' cache key, normalised EXACTLY as the completion
-    // tracker normalises the same id (`key = (id) => id == null ? NO_PROMPT_KEY
-    // : String(id)`, and `promptIdOf` hands that string to the frame). Mirroring
-    // it is the whole point: a numeric prompt id reaches the frame's probes as
-    // "7", so a card keyed on the raw `7` would be left unbusted while the probe
-    // busted — stale pixels AND a note describing a file the card never fetched.
-    // `null` when there is no id at all, which deliberately busts nothing.
-    const runCacheKey = d.prompt_id == null ? null : String(d.prompt_id);
+    // #1834 — the still cards' cache key: the id the completion frame's probes
+    // will bust with, derived the way the tracker derives it. It runs BOTH of
+    // the tracker's steps, because either one alone puts the card on a
+    // different URL from the probe — stale pixels, and a note describing a file
+    // the card never fetched:
+    //
+    //   key(id)        = id == null ? NO_PROMPT_KEY : String(id)
+    //   promptIdOf(k)  = k === NO_PROMPT_KEY ? null : k
+    //
+    // `String` because a numeric prompt id reaches the frame as "7"; the
+    // NO_PROMPT_KEY check because an id that IS the sentinel is mapped back to
+    // null there, so busting the card on it would be a key the probe never
+    // uses. A null result deliberately busts nothing — see the paint below.
+    const runCacheKey = (() => {
+      const k = d.prompt_id == null ? NO_PROMPT_KEY : String(d.prompt_id);
+      return k === NO_PROMPT_KEY ? null : k;
+    })();
     for (const m of media) {
       if (!m || !m.filename) continue;
       const url = imageViewUrl(m);

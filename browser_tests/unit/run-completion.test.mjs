@@ -599,6 +599,7 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
     "createStoryboardIdentity",
     "appendStoryboardCacheBust",
     "appendImageCacheBust",
+    "NO_PROMPT_KEY",
     `return (runCompletion) => [
       (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()}),
       (${panelSrc.slice(
@@ -622,6 +623,7 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
     // by inline-image-cache-bust.test.mjs. Kept identity-ish so the image refs
     // buffered below stay comparable.
     (url) => url,
+  NO_PROMPT_KEY,
   );
 
   const registrationStart = panelSrc.indexOf(

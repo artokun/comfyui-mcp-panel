@@ -55,6 +55,7 @@ function productionOnExecuted() {
     "createStoryboardIdentity",
     "appendStoryboardCacheBust",
     "appendImageCacheBust",
+    "NO_PROMPT_KEY",
     `return (${panelSrc.slice(start, end).trim()});`,
   )(
     (m) =>
@@ -70,6 +71,7 @@ function productionOnExecuted() {
     () => "identity",
     (url) => url,
     appendImageCacheBust,
+    NO_PROMPT_KEY,
   );
   return { onExecuted, painted, buffered };
 }
@@ -163,6 +165,27 @@ test("#1834: a NON-STRING prompt id is normalised the way the tracker does", () 
   assert.equal(painted[1].url, appendImageCacheBust(rawViewUrl(SAME_FILE), promptIdOf(key(8))));
   assert.match(painted[0].url, /[?&]cmcp_prompt=7(?:&|$)/);
   assert.notEqual(painted[0].url, painted[1].url);
+});
+
+test("#1834: a prompt id that IS the reserved sentinel busts nothing", () => {
+  // `promptIdOf` maps NO_PROMPT_KEY back to null, so the completion frame gets
+  // no key for such a run. Busting the card on the literal string would put it
+  // on a URL the probe never requests. Running only `key()` and not
+  // `promptIdOf()` is exactly that half-mirror, so it is pinned.
+  //
+  // Not reachable from a current ComfyUI (prompt ids are UUIDs); pinned because
+  // the call site claims to mirror the tracker, and a claim that is only true
+  // for the inputs someone thought of is how this fix went wrong the first time.
+  const { onExecuted, painted } = productionOnExecuted();
+  onExecuted({ detail: { prompt_id: NO_PROMPT_KEY, output: { images: [SAME_FILE] } } });
+
+  assert.equal(painted.length, 1);
+  assert.equal(promptIdOf(key(NO_PROMPT_KEY)), null, "the tracker maps it to null");
+  assert.equal(
+    painted[0].url,
+    rawViewUrl(SAME_FILE),
+    "the card must not carry a key the completion probes will never use",
+  );
 });
 
 test("#1834: an id-less run is left UNBUSTED rather than given a local key", () => {

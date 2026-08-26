@@ -20,6 +20,7 @@ import {
   appendStoryboardCacheBust,
   createStoryboardIdentity,
 } from "../../web/js/lib/storyboard-cache-identity.js";
+import { NO_PROMPT_KEY } from "../../web/js/lib/run-completion.js";
 
 const panelSrc = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const frameSrc = readFileSync(new URL("../../web/js/lib/run-completion-frame.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
@@ -143,6 +144,7 @@ test("#1718 production boundary: late poster results stay with their render atte
     "app",
     "createStoryboardIdentity",
     "appendStoryboardCacheBust",
+    "NO_PROMPT_KEY",
     `return (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()});`,
   )(
     (m) => `/view?filename=${m.filename}&type=${m.type || "output"}`,
@@ -156,6 +158,7 @@ test("#1718 production boundary: late poster results stay with their render atte
     {},
     createStoryboardIdentity,
     appendStoryboardCacheBust,
+    NO_PROMPT_KEY,
   );
 
   const painted = [];
