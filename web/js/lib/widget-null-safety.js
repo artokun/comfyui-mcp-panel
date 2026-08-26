@@ -1,3 +1,9 @@
+
+// #1854 — the intrinsic captured ONCE at module load. Invoking through a
+// per-call property lookup on the function object would read an overrideable
+// own property, so a shadowed one could throw before the original ran; this
+// reads nothing off the target at call time.
+const rawApply = Reflect.apply;
 // Null-widget serialization guard for graph_run (#445).
 //
 // A workflow can carry nodes whose serialized widget values are `null` — most
@@ -157,7 +163,7 @@ export function installGraphToPromptNullSafety(app) {
   // #1854 — early binding is load-bearing: app.graphToPrompt is replaced
   // below, so a call-time lookup would re-enter this wrapper and recurse.
   const graphToPromptFn = app.graphToPrompt;
-  const orig = (...a) => graphToPromptFn.call(app, ...a);
+  const orig = (...a) => rawApply(graphToPromptFn, app, a);
   app.graphToPrompt = async function nullSafeGraphToPrompt(graph, ...rest) {
     // graphToPrompt defaults its graph arg to the app's root graph; mirror that
     // so we sanitize exactly what the original is about to serialize.

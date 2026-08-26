@@ -32,6 +32,12 @@ import { controlAfterGenerateEntries } from "./control-after-generate.js";
 // timeout helper is how this repo keeps producing near-duplicate bugs (bounded-step's
 // own header), so there is not one.
 import { withTimeout } from "./bounded-step.js";
+
+// #1854 — the intrinsic captured ONCE at module load. Invoking through a
+// per-call property lookup on the function object would read an overrideable
+// own property, so a shadowed one could throw before the original ran; this
+// reads nothing off the target at call time.
+const rawApply = Reflect.apply;
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -1874,7 +1880,7 @@ export async function dispatchScopedRun({
   //      to an older value any more, so no run can displace another's guard.
   const entryFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
   // #1854 — invoked through Function.prototype.call; see configure-app-mode.js.
-  const origFetchApi = entryFetchApi ? (...a) => entryFetchApi.call(apiTarget, ...a) : null;
+  const origFetchApi = entryFetchApi ? (...a) => rawApply(entryFetchApi, apiTarget, a) : null;
   if (!origFetchApi) {
     return {
       outcome: "unverifiable",
@@ -1980,7 +1986,7 @@ export async function dispatchScopedRun({
     // #1854 — captured into a local FIRST so this still snapshots the fetchApi
     // installed RIGHT NOW, which is the whole point of the note above.
     const chainBelowFn = typeof apiTarget.fetchApi === "function" ? apiTarget.fetchApi : null;
-    const chainBelow = chainBelowFn ? (...a) => chainBelowFn.call(apiTarget, ...a) : origFetchApi;
+    const chainBelow = chainBelowFn ? (...a) => rawApply(chainBelowFn, apiTarget, a) : origFetchApi;
     const guard = createScopedRunGuard({
       origFetchApi: chainBelow,
       execIds,

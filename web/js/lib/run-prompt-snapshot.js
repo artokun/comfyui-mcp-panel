@@ -1,3 +1,9 @@
+
+// #1854 — the intrinsic captured ONCE at module load. Invoking through a
+// per-call property lookup on the function object would read an overrideable
+// own property, so a shadowed one could throw before the original ran; this
+// reads nothing off the target at call time.
+const rawApply = Reflect.apply;
 // Keep a batch=1 graph_run tied to the exact ComfyUI queue item it created.
 //
 // ComfyUI's queuePrompt() pushes an item and, when another item is already being
@@ -262,7 +268,7 @@ function installQueuePromptObserver(app, state) {
   // the next line. Resolving the property at call time instead would re-enter
   // the wrapper below and recurse forever.
   const queuePromptFn = app.queuePrompt;
-  const original = (...a) => queuePromptFn.call(app, ...a);
+  const original = (...a) => rawApply(queuePromptFn, app, a);
   app.queuePrompt = function snapshotQueuePrompt(...args) {
     const entry = state.claiming;
     const queueItems = queueItemsOf(app);
@@ -308,7 +314,7 @@ export function installGraphToPromptSnapshotBarrier(app) {
 
   // #1854 — early binding is load-bearing; see the note above.
   const graphToPromptFn = app.graphToPrompt;
-  const original = (...a) => graphToPromptFn.call(app, ...a);
+  const original = (...a) => rawApply(graphToPromptFn, app, a);
   const state = {
     app,
     original,

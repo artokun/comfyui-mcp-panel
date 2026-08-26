@@ -10,6 +10,12 @@
 
 import { normalizedCanvasDs } from "./canvas-ds.js";
 
+// #1854 — the intrinsic captured ONCE at module load. Invoking through a
+// per-call property lookup on the function object would read an overrideable
+// own property, so a shadowed one could throw before the original ran; this
+// reads nothing off the target at call time.
+const rawApply = Reflect.apply;
+
 export const APP_MODE_META_NAMESPACE = "comfyui_mcp";
 
 function isPlainObject(value) {
@@ -260,8 +266,8 @@ export function configureAppMode({
   // despite it containing none. Do not simplify back.
   const beforeFn = typeof rootGraph.beforeChange === "function" ? rootGraph.beforeChange : null;
   const afterFn = typeof rootGraph.afterChange === "function" ? rootGraph.afterChange : null;
-  const before = beforeFn ? (...a) => beforeFn.call(rootGraph, ...a) : null;
-  const after = afterFn ? (...a) => afterFn.call(rootGraph, ...a) : null;
+  const before = beforeFn ? (...a) => rawApply(beforeFn, rootGraph, a) : null;
+  const after = afterFn ? (...a) => rawApply(afterFn, rootGraph, a) : null;
   before?.();
   try {
     const extra = extraBag(rootGraph);
