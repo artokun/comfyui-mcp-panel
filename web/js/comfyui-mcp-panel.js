@@ -34692,6 +34692,7 @@ function buildPanel() {
         scrollIntent.noteProgrammaticScroll();
         log.scrollTop = log.scrollHeight;
         try {
+          scrollIntent.noteProgrammaticScroll();
           card.scrollIntoView({ block: "nearest" });
         } catch {
           /* detached keep-alive root: the tab-forward above re-attaches it */
@@ -34979,6 +34980,7 @@ function buildPanel() {
         scrollIntent.noteProgrammaticScroll();
         log.scrollTop = log.scrollHeight;
         try {
+          scrollIntent.noteProgrammaticScroll();
           card.scrollIntoView({ block: "nearest" });
         } catch {
           /* detached keep-alive root: the tab-forward above re-attaches it */

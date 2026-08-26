@@ -8,6 +8,7 @@ import {
   isUserScrollIntent,
   updateChatStickiness,
 } from "../../web/js/lib/chat-scroll-intent.js";
+import { revealInteractiveCard } from "../../web/js/lib/interactive-card-reveal.js";
 
 const panelSource = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -19,14 +20,29 @@ assert.ok(listenerStart >= 0 && listenerEnd > listenerStart, "production chat sc
 const productionListener = panelSource.slice(listenerStart, listenerEnd);
 
 class ChatLog extends EventTarget {
-  constructor() {
+  constructor({ dispatchScrollOnWrite = false } = {}) {
     super();
     this.listeners = new Map();
+    this._scrollTop = 400;
+    this.dispatchScrollOnWrite = dispatchScrollOnWrite;
+    this.programmaticWrites = [];
   }
 
   scrollHeight = 1000;
-  scrollTop = 400;
   clientHeight = 100;
+
+  get scrollTop() {
+    return this._scrollTop;
+  }
+
+  set scrollTop(value) {
+    this.programmaticWrites.push(value);
+    if (this.dispatchScrollOnWrite) {
+      this.dispatchEventFrom(this, { type: "scroll" });
+    } else {
+      this._scrollTop = value;
+    }
+  }
 
   addEventListener(type, listener) {
     const listeners = this.listeners.get(type) ?? [];
@@ -60,8 +76,8 @@ function emit(log, type, props = {}, target = log) {
   log.dispatchEventFrom(target, { type, ...props });
 }
 
-function buildProductionScrollSurface() {
-  const log = new ChatLog();
+function buildProductionScrollSurface(options) {
+  const log = new ChatLog(options);
   const newMsgBtn = { hidden: true };
   const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight <= 48;
   const build = new Function(
@@ -73,6 +89,36 @@ function buildProductionScrollSurface() {
     `let stickToBottom = true;\n${productionListener}\nreturn {\n  log,\n  newMsgBtn,\n  scrollIntent,\n  disposeChatScrollListeners,\n  get stickToBottom() { return stickToBottom; },\n};`,
   );
   return build(log, newMsgBtn, atBottom, createChatScrollIntentTracker, updateChatStickiness);
+}
+
+function productionRevealScrollNowSource(painterName) {
+  const painterStart = panelSource.indexOf(`function ${painterName}(`);
+  assert.ok(painterStart >= 0, `${painterName} production painter not found`);
+  const callbackStart = panelSource.indexOf("scrollNow: () => {", painterStart);
+  assert.ok(callbackStart > painterStart, `${painterName} production reveal callback not found`);
+  const bodyStart = panelSource.indexOf("{", callbackStart);
+  let depth = 0;
+  for (let i = bodyStart; i < panelSource.length; i += 1) {
+    if (panelSource[i] === "{") depth += 1;
+    if (panelSource[i] === "}" && --depth === 0) return panelSource.slice(bodyStart + 1, i);
+  }
+  assert.fail(`${painterName} production reveal callback is not balanced`);
+}
+
+function buildProductionRevealScrollNow(painterName, surface) {
+  const card = {
+    scrollIntoView() {
+      surface.cardScrolls += 1;
+      surface.log.dispatchEventFrom(surface.log, { type: "scroll" });
+    },
+  };
+  const scrollNow = new Function(
+    "scrollIntent",
+    "log",
+    "card",
+    productionRevealScrollNowSource(painterName),
+  );
+  return () => scrollNow(surface.scrollIntent, surface.log, card);
 }
 
 test("programmatic and anchoring scroll events do not count as user intent", () => {
@@ -122,6 +168,34 @@ test("production wiring preserves a root marker across multiple app writes befor
   assert.equal(surface.stickToBottom, false, "the following root user scroll must still unstick");
   surface.disposeChatScrollListeners();
   surface.scrollIntent.dispose();
+});
+
+test("production reveal paths fence both writes before preserving a later root scroll", () => {
+  for (const painterName of ["paintQuestion", "paintSecret"]) {
+    const surface = buildProductionScrollSurface({ dispatchScrollOnWrite: true });
+    surface.cardScrolls = 0;
+    const scrollNow = buildProductionRevealScrollNow(painterName, surface);
+
+    emit(surface.log, "pointerdown");
+    revealInteractiveCard({ scrollNow, retryMs: 0 });
+    assert.deepEqual(surface.log.programmaticWrites, [surface.log.scrollHeight]);
+    assert.equal(surface.cardScrolls, 1, `${painterName} must deliver its card reveal scroll`);
+    assert.equal(
+      surface.stickToBottom,
+      true,
+      `${painterName} must fence both synchronous programmatic scroll deliveries`,
+    );
+
+    surface.log._scrollTop = 250;
+    emit(surface.log, "scroll");
+    assert.equal(
+      surface.stickToBottom,
+      false,
+      `${painterName} must preserve the marker for the later root scroll`,
+    );
+    surface.disposeChatScrollListeners();
+    surface.scrollIntent.dispose();
+  }
 });
 
 test("wheel, touch, pointer, and vertical keyboard scrolling preserve user intent", () => {
