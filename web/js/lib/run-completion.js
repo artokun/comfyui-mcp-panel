@@ -517,9 +517,11 @@ export function createRunCompletionTracker({
   // fourth would not recover anything the first three did not — nothing about
   // the run changes between ticks except the clock.
   const maxUnackedDeliveries = 3;
-  // #1824 recurrence: track entries that have already been delivered exactly once
-  // past the bound via /history confirmation. On the next reconcile, retire them.
-  const deliveredPastBound = new Set();
+  // #1824 recurrence: track entries that have delivered past the bound, and count
+  // how many times. Allow exactly 2 deliveries past the bound (for the keyed completion's
+  // /history confirmation and a possible update), then refuse all further probes (#1842).
+  const deliveredPastBound = new Map(); // key -> count of past-bound deliveries
+  const maxPastBoundDeliveries = 2;
   function clearUnackedDeliveries(k) {
     unackedDeliveries.delete(k);
     deliveredPastBound.delete(k);
@@ -837,12 +839,13 @@ export function createRunCompletionTracker({
     // #1824 recurrence — the bound prevents FRAME EMISSIONS, not TRUTH-SEEKING.
     // For legacy unkeyed runs, enforce the bound strictly (no emissions permitted).
     // For keyed panel_run completions awaiting orchestrator receipt: proceed to
-    // /history to confirm whether the run actually completed ONCE past the bound.
-    // After that one confirmation, refuse all further probes to stop wasting
-    // ComfyUI queries once per stuck run per tick, forever (#1842).
+    // /history to confirm completion, up to maxPastBoundDeliveries times. This allows
+    // the /history confirmation and a possible update (e.g., on receipt), while
+    // preventing ComfyUI query storms (#1842).
     const isKeyedCompletion = hasCompletionRecords(k);
     const boundExhausted = unackedDeliveriesExhausted(k);
-    if (boundExhausted && (!isKeyedCompletion || deliveredPastBound.has(k))) return null;
+    const pastBoundCount = deliveredPastBound.get(k) ?? 0;
+    if (boundExhausted && (!isKeyedCompletion || pastBoundCount >= maxPastBoundDeliveries)) return null;
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
@@ -1019,12 +1022,12 @@ export function createRunCompletionTracker({
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
       // #1824 recurrence: bound prevents frame EMISSIONS (#1842), not truth-seeking.
       // Normal replays within the bound are emitted normally. After the bound is
-      // exhausted, /history-confirmed keyed completions may deliver exactly once
-      // (with trackUnackedDelivery=false to not count as emissions), then retire.
-      // Once past-bound delivery has happened, don't deliver again even if refusals
-      // reduce the count back below the bound.
-      const shouldDeliver =
-        !deliveredPastBound.has(k) && (!boundExhausted || (boundExhausted && hasCompletionKey));
+      // exhausted, /history-confirmed keyed completions may still deliver (with
+      // trackUnackedDelivery=false to not count as emissions). This preserves the
+      // duplicate-over-loss principle: proving completion beats losing it (#1824).
+      // Since these deliveries don't increment unackedDeliveries, they don't cause
+      // storms (#1842) — the bound prevents NEW emissions, not all deliveries.
+      const shouldDeliver = !boundExhausted || (boundExhausted && hasCompletionKey);
       if (shouldDeliver) {
         flushWithCompletionRecords(
           k,
@@ -1045,9 +1048,10 @@ export function createRunCompletionTracker({
           // #1842 storm bound). This preserves the duplicate-over-loss principle.
           { trackUnackedDelivery: !boundExhausted },
         );
-        // Track that we've delivered once past the bound for this keyed completion.
+        // Track that we've delivered past the bound for this keyed completion,
+        // limiting to maxPastBoundDeliveries to prevent storms (#1842).
         if (boundExhausted && hasCompletionKey) {
-          deliveredPastBound.add(k);
+          deliveredPastBound.set(k, (deliveredPastBound.get(k) ?? 0) + 1);
         }
       }
     }
