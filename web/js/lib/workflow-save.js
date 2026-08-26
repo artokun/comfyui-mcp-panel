@@ -144,6 +144,59 @@ function pathIsAppSuffixedSiblingOf(wf, base) {
   return normalizePath(`${directoryOf(wf)}${base}${APP_JSON_EXT}`) === path;
 }
 
+/** #1864 — PROVE that `currentPath` is this tab's OWN, writable workflow file: a managed
+ *  /userdata path, still carrying the name the tab reports, and CONFIRMED present on disk.
+ *
+ *  Three conditions, each load-bearing and each the fail-safe direction when unprovable:
+ *   · MANAGED — an external (absolute/UNC/drive) or URL-derived path is not addressable by
+ *     the /userdata write at all (directoryOf redirects those to the workflows root for
+ *     exactly that reason, #285/#1066), so it can never be saved "in place".
+ *   · NAME AGREES WITH PATH — a tab whose `filename` has moved on from its `path` (a rename
+ *     in flight) holds two destinations, and the file at the OLD path is not the one the
+ *     caller is editing. Writing it on the strength of the path alone is the hazard the
+ *     #1535 boundary test names; a stem mismatch therefore proves nothing.
+ *   · ON DISK (200) — the authoritative oracle, not the in-memory `isTemporary`/`isPersisted`
+ *     flags, which drift in BOTH directions after an open-ack race (#215/#442). A 404, an
+ *     inconclusive status, a throw, or no oracle at all all read as "not proven".
+ *
+ *  Compares the path's OWN basename rather than re-deriving one from the mode, so it stays
+ *  independent of the extension reconstruction that is the thing being second-guessed. */
+
+/** #1864 (codex gate r3) — TRUE only for a path that lands INSIDE the managed workflows
+ *  folder. `normalizePath` collapses separators but does not RESOLVE them, so
+ *  "workflows/../settings/Foo.json" carries the managed prefix while pointing at other
+ *  userdata entirely. Nothing the frontend builds contains "..": its records come from the
+ *  /userdata listing, so this is a defensive floor rather than a reported shape — but the
+ *  redirect it guards ends in a forced write, and the collision guard it bypasses is the
+ *  only other thing standing there, so the floor is worth its four lines. Mirrors the
+ *  segment rules validateWorkflowSubfolder already applies to the one input that may
+ *  select a subdirectory. */
+function isUnderWorkflowsRoot(path) {
+  const p = normalizePath(path);
+  if (!p.startsWith(`${WORKFLOWS_ROOT}/`)) return false;
+  return !p.split("/").some((segment) => segment === ".." || segment === ".");
+}
+async function ownsItsPathOnDisk(rawPath, currentPath, currentName, existsOnDisk) {
+  if (!currentPath || !currentName) return false;
+  // BOTH predicates read the RAW path, exactly as directoryOf reads the raw `wf.directory`.
+  // Checking the NORMALIZED one made the URL test inert (codex gate r4): normalizePath
+  // collapses "//" to "/", so "workflows/http://host/…" arrives as "workflows/http:/host/…"
+  // and the "://" this predicate requires is already gone. Verified by execution, not by
+  // reading. isExternalWorkflowPath survives normalization either way (a leading "\" becomes
+  // a leading "/", which it also matches), but it is read from the same source so the two
+  // can never disagree about which string they judged.
+  if (isExternalWorkflowPath(rawPath) || isUrlDerivedWorkflowPath(rawPath)) return false;
+  if (isExternalWorkflowPath(currentPath) || isUrlDerivedWorkflowPath(currentPath)) return false;
+  if (!isUnderWorkflowsRoot(currentPath)) return false;
+  if (baseName(currentPath.split("/").pop()) !== currentName) return false;
+  if (typeof existsOnDisk !== "function") return false;
+  try {
+    return (await existsOnDisk(currentPath)) === true;
+  } catch {
+    return false; // oracle threw ⇒ unproven ⇒ leave the save on the checked route
+  }
+}
+
 /** A readable, TOTAL description of a thrown value for an error message. Deliberately
  *  local and defensive: `String(err)` on a plain object yields "[object Object]", and
  *  `JSON.stringify` returns UNDEFINED for an object whose `toJSON()` does — so neither is
@@ -811,7 +864,7 @@ export async function saveActiveWorkflow(
   // grounding — it only ever saves a never-persisted workflow — alone), and an
   // external/URL-derived source cannot match, because directoryOf() redirects those to
   // the workflows root so the equality below can never hold for them.
-  const finalTargetPath =
+  let finalTargetPath =
     validatedSubfolder === undefined && !desired && !wasUnsaved && pathIsAppSuffixedSiblingOf(wf, currentName)
       ? currentPath
       : effectiveName
@@ -833,6 +886,68 @@ export async function saveActiveWorkflow(
       `refusing to save: cannot resolve a target filename for "${currentPath}" — saving now ` +
         `could MOVE (destroy) the original (issue #226). Pass an explicit name.`,
     );
+  }
+
+  // #1864 — A SAVE THAT NAMED NOTHING MUST NEVER BE TOLD TO "choose a different name".
+  //
+  // The target above is RECONSTRUCTED (this workflow's directory + its reported filename +
+  // its mode-derived extension). When any of those three drifts from the path the tab
+  // actually occupies, a no-name save silently becomes a Save-As — and if a file already
+  // sits at that reconstructed path, the #309 collision guard refuses with "a workflow
+  // named X already exists (409 Conflict) — choose a different name". For a call that
+  // supplied no name that is impossible advice: the reporter's own workflow was never
+  // written, and their only way out was to fork a third file under a new name.
+  //
+  // Reproduced by execution against this module (no-name save, error verbatim) from every
+  // one of: a `directory` that no longer matches the path's own folder; a ".app.json" file
+  // whose tab reads unsaved, so the #1535 pin above is skipped and the target reconstructs
+  // as ".json"; and an `initialMode` of "app" on a plain ".json" whose ".app.json" sibling
+  // exists. What they share is not a cause but a SHAPE — a reconstructed destination the
+  // tab does not occupy — so the repair is stated against the shape.
+  //
+  // THE FILE THE TAB OCCUPIES WINS, but only on PROOF (`ownsItsPathOnDisk`): a managed
+  // path, still carrying the tab's own name, CONFIRMED on disk. That is the same bar
+  // #1535 set when it pinned a no-name save to its own ".app.json"; this generalizes it
+  // from one reconstruction to any of them, and the write it produces is the one the panel
+  // makes anyway — `saveInPlace` → the store's `saveWorkflow` → `UserFile.save()` writes
+  // `this.path`, which IS `currentPath` here. Nothing relocates, so #226 has nothing to
+  // protect against on this route.
+  //
+  // ONLY WHEN THE RECONSTRUCTED TARGET IS OCCUPIED. An ABSENT target is a save that
+  // completes — it creates the sibling and refuses nobody — and that is P0-b's deliberate
+  // "an on-disk Foo.json in app mode copies to Foo.app.json" direction, which #1535
+  // explicitly left standing. Redirecting it too would reverse a decision this issue did
+  // not ask about, so the redirect fires only where the save would otherwise DEAD-END.
+  //
+  // Unprovable cases keep today's behaviour and reach the guard below: an EXTERNAL source
+  // (its absolute path is not addressable by the /userdata write at all, so "in place" does
+  // not exist for it — #285), a genuinely never-persisted tab, and a rename in flight. They
+  // get an honest refusal instead of the name advice (see `conflictError`).
+  if (
+    !desired &&
+    validatedSubfolder === undefined &&
+    finalTargetPath !== currentPath &&
+    (await ownsItsPathOnDisk(wf?.path, currentPath, currentName, existsOnDisk))
+  ) {
+    assertExpect(); // #330: the oracle awaited — still the workflow we were asked to save?
+    const occupied = (await probeTargetCollision(svc, wf, finalTargetPath, existsOnDisk)) === "exists";
+    assertExpect(); // and again after the collision probe, before the route is fixed
+    // RE-VALIDATE THE PROOF SYNCHRONOUSLY (codex gate P1). `assertExpect` protects the
+    // workflow OBJECT, not its FIELDS: `path` and `filename` are plain writable properties
+    // on ComfyUI's UserFile, so a same-object rename landing during the two probes above
+    // keeps object identity — assertExpect passes — while moving the tab off the very
+    // identity this redirect was authorized on. `ownsItsPathOnDisk` sampled both before
+    // those awaits, and the in-place branch's own drift check re-reads `path` but not
+    // `filename`, so without this the redirect could write "Foo.json" for a tab that now
+    // calls itself "Bar" — the stale-path write the #1535 boundary test forbids.
+    //
+    // Nothing is awaited between this re-read and the assignment, so the destination cannot
+    // drift after it. A drift simply DECLINES the redirect and falls through to the
+    // collision guard below: the same refusal this state already gets today, which is the
+    // fail-safe direction rather than a new behaviour.
+    if (occupied && normalizePath(wf.path) === currentPath && baseName(wf.filename) === currentName) {
+      finalTargetPath = currentPath;
+    }
   }
 
   const relocates = finalTargetPath !== currentPath;
@@ -861,7 +976,7 @@ export async function saveActiveWorkflow(
     //   "no-oracle" — no disk oracle at all (older frontend / test) → legacy path.
     const targetState = await probeTargetCollision(svc, wf, finalTargetPath, existsOnDisk);
     if (targetState === "exists") {
-      throw conflictError(effectiveName);
+      throw conflictError(effectiveName, { named: !!desired });
     }
 
     // #285 — EXTERNAL source: a real file loaded from an ABSOLUTE path OUTSIDE the
@@ -901,8 +1016,13 @@ export async function saveActiveWorkflow(
         copiedFrom: reportedCopySource,
         sourceExternal: true, // absolute external path — not /userdata-verifiable
       });
-      return await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
-        copyToUserDir(wf, effectiveName, finalTargetPath),
+      return await withConflictRollback(
+        svc,
+        wf,
+        effectiveName,
+        finalTargetPath,
+        () => copyToUserDir(wf, effectiveName, finalTargetPath),
+        { named: !!desired },
       );
     }
 
@@ -1017,8 +1137,13 @@ export async function saveActiveWorkflow(
       const sourceNorm = normalizePath(sourcePath);
       const sourceOnDiskBefore = await probeSourceOnDisk(existsOnDisk, sourceNorm);
       assertExpect(); // #330: the extra pre-copy probe must not open a switch window
-      const activeName = await withConflictRollback(svc, wf, effectiveName, finalTargetPath, () =>
-        atomicCopy(wf, effectiveName, finalTargetPath),
+      const activeName = await withConflictRollback(
+        svc,
+        wf,
+        effectiveName,
+        finalTargetPath,
+        () => atomicCopy(wf, effectiveName, finalTargetPath),
+        { named: !!desired },
       );
       // BACKSTOP: fail LOUDLY only if the copy actually REMOVED a source we CONFIRMED
       // (disk 200) was present and is now CONFIRMED absent (disk 404) — classifyOriginalOnDisk
@@ -1176,6 +1301,23 @@ export async function saveActiveWorkflow(
   if (normalizePath(wf.path) !== currentPath) {
     throw new Error(
       `refusing to save: the active workflow's path changed during the save (now "${wf.path}") — retry.`,
+    );
+  }
+  // #1864 (codex gate r2) — THE SAME DRIFT, ONE FIELD OVER. When no name was supplied the
+  // destination was derived from the tab's OWN name, so `filename` is load-bearing INPUT to
+  // it, not decoration. A same-object rename during the awaited probe above moves the tab
+  // off the identity this write was authorized on while `path` stays put, and the check
+  // directly above cannot see it — the write would land on "Foo.json" for a tab that now
+  // reports "Bar". Refuse, exactly as for a path drift.
+  //
+  // SCOPED TO A NO-NAME SAVE ON PURPOSE. A caller that PASSED a name chose the destination
+  // itself and `filename` never fed it, so a concurrent title edit is irrelevant there —
+  // refusing would reject the very save the caller explicitly asked for.
+  if (!desired && baseName(wf.filename) !== currentName) {
+    throw new Error(
+      `refusing to save: this save supplied no name, so its destination came from the workflow's ` +
+        `own name — and that name changed during the save (now "${baseName(wf.filename)}", was ` +
+        `"${currentName}"). Nothing was written — retry.`,
     );
   }
   if (inPlace === "conflict") {
@@ -2221,9 +2363,31 @@ function isConflictError(err) {
 }
 
 /** The clean, uniform filename-conflict error surfaced by both the pre-check and
- *  the post-write rollback (#309). */
-function conflictError(desiredName) {
+ *  the post-write rollback (#309).
+ *
+ *  `named: false` marks a save that supplied NO name (#1864). "Choose a different name" is
+ *  not advice such a caller can take — it never chose one — and following it literally is
+ *  what forced a reporter to fork a third workflow file. The wording for a NAMED Save-As is
+ *  deliberately byte-identical to before: comfyui-mcp matches it (`isSaveAsNameConflict`,
+ *  panel-tools.ts) to attach the rename remedy, and that remedy is right for a Save-As. */
+function conflictError(desiredName, { named = true } = {}) {
   const nm = baseName(desiredName) || "that name";
+  if (!named) {
+    // NAMES NO CAUSE, deliberately — the same discipline explainUserDataStoreFailure keeps
+    // a few hundred lines down. This is reached from two places (the up-front pre-check and
+    // the post-write rollback) whose situations differ, and the causes are several (an
+    // externally-loaded path, a never-persisted tab, a rename in flight, a target that
+    // appeared mid-save), so picking one would be an inference presented as a finding. It
+    // states only what was OBSERVED and the two remedies that exist.
+    return new Error(
+      `refusing to save "${nm}": this save supplied NO name, so its destination was derived from ` +
+        `the workflow's own name — and a workflow file already occupies it (409 Conflict). There ` +
+        `is no "different name" to choose, because none was given: pass an explicit name to ` +
+        `panel_save_workflow to write a copy, or reopen the workflow from panel_list_workflows so ` +
+        `the tab is bound to the file it should be saving. Nothing was written and the active tab ` +
+        `was left unchanged (issue #309/#1864).`,
+    );
+  }
   return new Error(
     `a workflow named "${nm}" already exists (409 Conflict) — choose a different name. ` +
       `The active tab was left unchanged (issue #309).`,
@@ -2260,7 +2424,7 @@ function safeAssign(obj, key, value) {
  *  Derived getter-only flags are skipped via safeAssign so restoration never throws.
  *  A non-conflict error is rethrown untouched. Nothing on disk is modified here — a
  *  409 means the server wrote nothing, and the pre-existing file is never our source. */
-async function withConflictRollback(svc, wf, desiredName, finalTargetPath, fn) {
+async function withConflictRollback(svc, wf, desiredName, finalTargetPath, fn, { named = true } = {}) {
   const prevActive = svc?.activeWorkflow;
   const snap = wf
     ? {
@@ -2290,7 +2454,7 @@ async function withConflictRollback(svc, wf, desiredName, finalTargetPath, fn) {
       safeAssign(wf, "isTemporary", snap.isTemporary);
       safeAssign(wf, "isPersisted", snap.isPersisted);
     }
-    throw conflictError(desiredName);
+    throw conflictError(desiredName, { named });
   }
 }
 

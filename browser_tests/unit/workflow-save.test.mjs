@@ -1342,6 +1342,417 @@ test('#1535 boundary: a filename that no longer matches the path does NOT author
 })
 
 // ---------------------------------------------------------------------------
+// #1864 — a save that supplied NO name must never be refused with "choose a
+// different name".
+//
+// The target is RECONSTRUCTED from the workflow's directory + reported filename +
+// mode-derived extension. When any of those drifts from the path the tab occupies, a
+// no-name save quietly becomes a Save-As; and when a file already sits at that
+// reconstructed path, the #309 collision guard refused with "a workflow named X
+// already exists (409 Conflict) — choose a different name". The reporter had given no
+// name, so there was no different one to choose: their workflow went unwritten and the
+// only way forward was a third file under a new name.
+//
+// The repair is stated against the SHAPE (a reconstructed destination the tab does not
+// occupy), not against any one cause, and it fires ONLY when that destination is
+// occupied — an absent one is a save that completes, which is P0-b's deliberate
+// direction and is pinned below.
+
+test('#1864: a NO-NAME save whose reconstructed target is OCCUPIED writes the tab OWN file', async () => {
+  // The drifted-".app.json" shape. `isTemporary` is derived from `size` and drifts after
+  // an open-ack race (#215/#442), which skips the #1535 pin (it requires `!wasUnsaved`),
+  // so the target reconstructs as ".json" — and the ".json" sibling is already there,
+  // left by an earlier fork of exactly the kind #1535 was filed about.
+  const active = {
+    path: 'workflows/Anima Turbo.app.json',
+    filename: 'Anima Turbo',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: false, // drifted
+    isTemporary: true,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({
+    files: ['workflows/Anima Turbo.app.json', 'workflows/Anima Turbo.json'],
+    active
+  })
+
+  const saved = await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk: async (p) => svc.disk.has(p)
+  })
+
+  assert.equal(saved, 'Anima Turbo')
+  assert.ok(
+    svc.calls.some((c) => c[0] === 'saveWorkflow' && c[1] === 'workflows/Anima Turbo.app.json'),
+    'the write lands on the file the tab occupies'
+  )
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveAs'), 'no Save-As copy was invented')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'and nothing was moved (#226)')
+  assert.deepEqual(
+    [...svc.disk].sort(),
+    ['workflows/Anima Turbo.app.json', 'workflows/Anima Turbo.json'],
+    'the file that "already exists" is neither written nor removed'
+  )
+})
+
+test('#1864: an app-mode tab whose .app.json sibling ALREADY exists saves its own .json in place', async () => {
+  // The mirror shape, and the one a user reaches by repeating P0-b: an on-disk
+  // "Foo.json" that reads app-mode reconstructs a target of "Foo.app.json", the copy
+  // route creates it, and a later no-name save of the ".json" tab then dead-ended on
+  // the sibling its own earlier save had produced.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'app',
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json', 'workflows/Foo.app.json'], active })
+
+  await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk: async (p) => svc.disk.has(p)
+  })
+
+  assert.deepEqual(svc.calls, [['saveWorkflow', 'workflows/Foo.json']], 'in place, and only that')
+  assert.ok(svc.disk.has('workflows/Foo.app.json'), 'the pre-existing sibling is untouched')
+})
+
+test('#1864 boundary: an ABSENT reconstructed target still COPIES — P0-b is unchanged', async () => {
+  // The same tab as above with the sibling REMOVED. A save that can complete is not the
+  // failure this fix is about, so the redirect must not fire here: #1535 deliberately
+  // left this direction ("Foo.json" in app mode forks "Foo.app.json") standing, and
+  // reversing it is a product decision, not a bug fix. Runs WITH a disk oracle — the
+  // pre-existing P0-b test passes none, so without this one the "only when occupied"
+  // condition would be pinned by nothing production actually reaches.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'app',
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json'], active })
+
+  await saveActiveWorkflow(svc, undefined, {
+    autoWorkflowName: () => 'Untitled',
+    existsOnDisk: async (p) => svc.disk.has(p)
+  })
+
+  assert.ok(svc.calls.some((c) => c[0] === 'saveAs'), 'still the atomic copy route')
+  assert.ok(svc.disk.has('workflows/Foo.app.json'), 'the app-mode sibling is created')
+  assert.ok(svc.disk.has('workflows/Foo.json'), 'and the source survives (#226)')
+  assert.ok(!svc.calls.some((c) => c[0] === 'renameWorkflow'), 'nothing moved')
+})
+
+test('#1864: a rename in flight is NOT proof of ownership — the stale path is never written', async () => {
+  // The #1535 boundary, re-asserted with the reconstructed target OCCUPIED so it runs
+  // through the new redirect. A tab whose `filename` has moved on from its `path` holds
+  // two destinations, and the file at the OLD path is not the one being edited — so the
+  // redirect must refuse it, exactly as the pre-existing boundary test demands for the
+  // absent-target case.
+  const active = {
+    path: 'workflows/Old Name.app.json',
+    filename: 'Fresh Name',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({
+    files: ['workflows/Old Name.app.json', 'workflows/Fresh Name.json'],
+    active
+  })
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, undefined, { existsOnDisk: async (p) => svc.disk.has(p) }),
+    (err) => {
+      assert.ok(
+        !svc.calls.some((c) => c[0] === 'saveWorkflow' && c[1] === 'workflows/Old Name.app.json'),
+        'the file at the stale path must not be written on the strength of its path'
+      )
+      // …but the refusal must still not hand a no-name caller the one instruction it
+      // cannot follow.
+      assert.ok(!/choose a different name/.test(err.message), err.message)
+      assert.match(err.message, /supplied NO name/)
+      return true
+    }
+  )
+  assert.deepEqual(
+    [...svc.disk].sort(),
+    ['workflows/Fresh Name.json', 'workflows/Old Name.app.json'],
+    'nothing was written'
+  )
+})
+
+test('#1864: an EXTERNALLY-loaded source keeps refusing, but says what it actually needs', async () => {
+  // An absolute path is not addressable by the /userdata write at all (#285), so "save
+  // in place" does not exist for it and the refusal stands. Only the ADVICE changes: a
+  // caller that named nothing is told to pass a name or rebind the tab, instead of being
+  // sent to pick a different one it never had.
+  const active = {
+    path: 'C:/packs/Anima Turbo.json',
+    filename: 'Anima Turbo',
+    directory: 'C:/packs',
+    initialMode: 'graph',
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({
+    files: ['C:/packs/Anima Turbo.json', 'workflows/Anima Turbo.json'],
+    active
+  })
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, undefined, { existsOnDisk: async (p) => svc.disk.has(p) }),
+    (err) => {
+      assert.ok(!/choose a different name/.test(err.message), err.message)
+      assert.match(err.message, /409 Conflict/)
+      assert.match(err.message, /Nothing was written/)
+      return true
+    }
+  )
+  assert.deepEqual(
+    [...svc.disk].sort(),
+    ['C:/packs/Anima Turbo.json', 'workflows/Anima Turbo.json'],
+    'the external original and the managed file are both untouched (#226/#285)'
+  )
+})
+
+test('#1864: a NAMED Save-As collision keeps the exact #309 wording comfyui-mcp matches on', async () => {
+  // panel-tools.ts `isSaveAsNameConflict` tests this text verbatim to attach the
+  // rename remedy (mcp#1873). That remedy is right for a Save-As, so the named wording
+  // is deliberately byte-identical to before — only the no-name case diverges.
+  const active = {
+    path: 'workflows/Source.json',
+    filename: 'Source',
+    directory: 'workflows',
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Source.json', 'workflows/Taken.json'], active })
+
+  await assert.rejects(
+    () => saveActiveWorkflow(svc, 'Taken', { existsOnDisk: async (p) => svc.disk.has(p) }),
+    (err) => {
+      assert.equal(
+        err.message,
+        'a workflow named "Taken" already exists (409 Conflict) — choose a different name. ' +
+          'The active tab was left unchanged (issue #309).'
+      )
+      return true
+    }
+  )
+})
+
+test('#1864 (codex gate P1): a same-object rename DURING the probes declines the redirect', async () => {
+  // `assertExpect` protects the workflow OBJECT, not its fields — `path` and `filename` are
+  // plain writable properties on ComfyUI's UserFile. A rename landing while the ownership
+  // and collision probes are in flight keeps object identity, so the entry-time proof
+  // ("this tab is named Foo and occupies workflows/Foo.json") can be stale by the time the
+  // destination is fixed. Writing "Foo.json" for a tab that now calls itself "Bar" is the
+  // stale-path write the #1535 boundary forbids, so the redirect must decline and let the
+  // collision guard refuse — which is what this state already did before the redirect existed.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'app', // ⇒ reconstructed target is workflows/Foo.app.json, which is taken
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json', 'workflows/Foo.app.json'], active })
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, undefined, {
+        autoWorkflowName: () => 'Untitled',
+        existsOnDisk: async (p) => {
+          const present = svc.disk.has(p)
+          // The rename lands INSIDE the ownership probe's await — after it sampled
+          // `filename`, before the destination is fixed. (The collision probe answers
+          // from the store index and never reaches this oracle, so hooking the tab's own
+          // path is the only way to land in that window.)
+          if (p === 'workflows/Foo.json') active.filename = 'Bar'
+          return present
+        }
+      }),
+    (err) => {
+      assert.match(err.message, /409 Conflict/)
+      return true
+    }
+  )
+
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow'),
+    'the tab whose name moved during the save is never written on the strength of a stale proof'
+  )
+  assert.deepEqual(
+    [...svc.disk].sort(),
+    ['workflows/Foo.app.json', 'workflows/Foo.json'],
+    'and nothing on disk changed'
+  )
+})
+
+test('#1864 (codex gate r2): a name drift during the in-place probe refuses, and writes nothing', async () => {
+  // The path-drift guard in the in-place branch re-reads `path` only. For a NO-NAME save
+  // the destination was derived from the tab's own NAME, so a same-object rename landing
+  // inside `classifyInPlaceOverwrite`'s awaited disk read moves the tab off the identity
+  // the write was authorized on while `path` stays put — and "Foo.json" would be written
+  // for a tab that now reports "Bar". This is reachable on the plain in-place route (no
+  // redirect involved); the redirect merely brings more tabs onto it.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: false, // drifted ⇒ classifyInPlaceOverwrite actually reads disk
+    isTemporary: true,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json'], active })
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, undefined, {
+        autoWorkflowName: () => 'Untitled',
+        existsOnDisk: async (p) => svc.disk.has(p),
+        readDiskBytes: async () => {
+          active.filename = 'Bar' // the rename lands inside this await
+          return new TextEncoder().encode('{"id":"a"}')
+        }
+      }),
+    (err) => {
+      assert.match(err.message, /name changed during the save/)
+      assert.match(err.message, /Nothing was written/)
+      return true
+    }
+  )
+
+  assert.ok(!svc.calls.some((c) => c[0] === 'saveWorkflow'), 'nothing was written')
+})
+
+test('#1864 (codex gate r2): a NAMED save is untouched by a concurrent title edit', async () => {
+  // The scoping half. The caller chose "Foo" itself, so `filename` never fed the
+  // destination — a title edit landing mid-save must not reject the save that was
+  // explicitly asked for.
+  const active = {
+    path: 'workflows/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows',
+    initialMode: 'graph',
+    isPersisted: false,
+    isTemporary: true,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json'], active })
+
+  const saved = await saveActiveWorkflow(svc, 'Foo', {
+    existsOnDisk: async (p) => svc.disk.has(p),
+    readDiskBytes: async () => {
+      active.filename = 'Bar'
+      return new TextEncoder().encode('{"id":"a"}')
+    }
+  })
+
+  assert.equal(saved, 'Foo')
+  assert.deepEqual(svc.calls, [['saveWorkflow', 'workflows/Foo.json']], 'the requested save landed')
+})
+
+test('#1864 (codex gate r3): a traversal path is not ownership — the redirect declines it', async () => {
+  // `normalizePath` collapses separators but does not RESOLVE them, so a path can carry the
+  // managed "workflows/" prefix and still point outside the folder. The redirect ends in a
+  // forced write and skips the collision guard, so it must not accept one. Defensive: the
+  // frontend builds its records from the /userdata listing and never produces "..".
+  const active = {
+    path: 'workflows/../settings/Foo.json',
+    filename: 'Foo',
+    directory: 'workflows/../settings',
+    initialMode: 'app', // ⇒ reconstructed target diverges, and it is occupied below
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({
+    files: ['workflows/../settings/Foo.json', 'workflows/../settings/Foo.app.json'],
+    active
+  })
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, undefined, {
+        autoWorkflowName: () => 'Untitled',
+        existsOnDisk: async (p) => svc.disk.has(p)
+      }),
+    (err) => {
+      assert.match(err.message, /409 Conflict/)
+      return true
+    }
+  )
+
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow'),
+    'no forced write outside the managed workflows folder'
+  )
+})
+
+test('#1864 (codex gate r4): a URL-derived path is judged RAW — normalization must not hide it', async () => {
+  // `normalizePath` collapses "//" to "/", so a URL-derived tab's path arrives as
+  // "workflows/http:/host/…" — the "://" the predicate requires is gone, and reading the
+  // normalized value made the guard inert. #1066's tab must keep the copy route: its path
+  // is not a file at all, and force-writing it is not a save.
+  const active = {
+    path: 'workflows/http://127.0.0.1:8188/api/view?filename=x.png/Foo.app.json',
+    filename: 'Foo',
+    directory: 'workflows/http://127.0.0.1:8188/api/view?filename=x.png',
+    initialMode: 'graph',
+    isPersisted: true,
+    isTemporary: false,
+    originalContent: '{"id":"a"}',
+    changeTracker: { prepareForSave() {} }
+  }
+  const svc = makeFaithfulService({ files: ['workflows/Foo.json'], active })
+
+  await assert.rejects(
+    () =>
+      saveActiveWorkflow(svc, undefined, {
+        autoWorkflowName: () => 'Untitled',
+        // A hostile oracle: 200 for the URL path too. Production answers 500 ⇒ null here
+        // (#1066), so the guard is what has to hold, not the probe.
+        existsOnDisk: async (p) => svc.disk.has(p) || p === 'workflows/http:/127.0.0.1:8188/api/view?filename=x.png/Foo.app.json'
+      }),
+    (err) => {
+      assert.match(err.message, /409 Conflict/)
+      return true
+    }
+  )
+
+  assert.ok(
+    !svc.calls.some((c) => c[0] === 'saveWorkflow'),
+    'a URL source is never force-written in place — it keeps the checked copy route (#1066)'
+  )
+})
+
+// ---------------------------------------------------------------------------
 // ComfyUI frontend 1.47.x (issue #268). The workflow store no longer exposes
 // `saveWorkflowAs`; it exposes the low-level pair `saveAs(wf, path)` (builds a
 // NEW copy object at `path`, leaving the source object and its file untouched)
