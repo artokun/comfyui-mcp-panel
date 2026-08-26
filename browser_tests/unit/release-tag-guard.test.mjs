@@ -26,6 +26,7 @@ import { dirname, join } from "node:path";
 import {
   auditTag,
   collectFromGit,
+  firstParentAtRev,
   packageJsonVersion,
   panelVersion,
   pyprojectVersion,
@@ -308,6 +309,29 @@ test("#1882 a reader failure reaches auditTag as a violation through the real ra
     }),
     [],
   );
+});
+
+test("#1882 a failed historical parent lookup is a violation, never a root commit", () => {
+  // Keep the real collectFromGit -> versionAtRev walk, but make the underlying
+  // parent lookup fail through the production helper. The old rev-parse catch
+  // converted this exact failure into `hasParent = false`, which made the range
+  // look auditable and could let this release pass.
+  const failing = collectFromGit("v0.15.104", {
+    firstParentAt: (rev) =>
+      firstParentAtRev(rev, () => {
+        throw new Error(`simulated historical parent lookup failure for ${rev}`);
+      }),
+  });
+  assert.equal(failing.historyError, null, "the commit range itself must still walk");
+  assert.ok(failing.range.length > 0, "expected commits in v0.15.103..v0.15.104");
+  assert.ok(
+    failing.range.every((c) => /historical parent lookup .* failed/.test(c.versionError ?? "")),
+    "every historical parent lookup failure must be carried into the range entry",
+  );
+
+  const violations = auditTag({ tag: "v0.15.104", ...failing });
+  assert.ok(violations.length > 0, "a failed parent lookup must not audit as coherent");
+  assert.ok(violations.every((v) => /left unaudited/.test(v)));
 });
 
 test("#1882 the tag being pushed is not exempt from the target check", () => {

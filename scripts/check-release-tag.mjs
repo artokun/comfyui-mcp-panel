@@ -275,15 +275,54 @@ export function versionAtRev(rev) {
 }
 
 /**
+ * Resolve a commit's first parent without conflating a failed lookup with a
+ * root commit. `rev-parse <rev>^` exits non-zero for both, so its catch block
+ * cannot safely decide that the commit is a root. `rev-list --parents`
+ * succeeds for a root and gives us an explicit, parseable distinction.
+ *
+ * @param {string} rev
+ * @param {(...args:string[])=>string} [runGit]
+ * @returns {{parent:string|null, error:string|null}}
+ */
+export function firstParentAtRev(rev, runGit = git) {
+  let output;
+  try {
+    output = runGit("rev-list", "--parents", "-n", "1", rev).trim();
+  } catch (e) {
+    return {
+      parent: null,
+      error:
+        `historical parent lookup for ${short(rev)} failed: ${e.message.split("\n")[0]}`,
+    };
+  }
+
+  const fields = output.split(/\s+/).filter(Boolean);
+  if (!fields.length) {
+    return {
+      parent: null,
+      error: `historical parent lookup for ${short(rev)} returned no commit data`,
+    };
+  }
+  return { parent: fields[1] ?? null, error: null };
+}
+
+/**
  * @param {string} tag
- * @param {{readVersionAt?: (rev:string)=>{version:string|null, error:string|null}}} [deps]
+ * @param {{
+ *   readVersionAt?: (rev:string)=>{version:string|null, error:string|null},
+ *   firstParentAt?: (rev:string)=>{parent:string|null, error:string|null},
+ * }} [deps]
  *        the version reader is injectable ONLY so a test can drive a read failure
  *        through the real range walk. Every commit in this repo's history is
  *        readable, so the failure path cannot be reached from real data — and an
  *        unexercised failure path is how the first two drafts of this guard
- *        shipped fail-open.
+ *        shipped fail-open. The parent resolver is injectable for the same reason:
+ *        a real repository cannot manufacture a failed lookup on demand.
  */
-export function collectFromGit(tag, { readVersionAt = versionAtRev } = {}) {
+export function collectFromGit(
+  tag,
+  { readVersionAt = versionAtRev, firstParentAt = firstParentAtRev } = {},
+) {
   const treeAtTag = {
     pyproject: showOrNull(tag, "pyproject.toml"),
     packageJson: showOrNull(tag, "package.json"),
@@ -353,22 +392,20 @@ export function collectFromGit(tag, { readVersionAt = versionAtRev } = {}) {
           const [sha, subject] = line.split("\0");
           const own = readVersionAt(sha);
 
-          // A root commit has no first parent; that is not an error, it just means
-          // whatever it declares is a first appearance.
-          let hasParent = true;
-          try {
-            git("rev-parse", "--verify", "--quiet", `${sha}^`);
-          } catch {
-            hasParent = false;
-          }
-          const parent = hasParent ? readVersionAt(`${sha}^`) : { version: null, error: null };
+          const parentRef = firstParentAt(sha);
+          const parent = parentRef.error
+            ? { version: null, error: parentRef.error }
+            : parentRef.parent
+              ? readVersionAt(parentRef.parent)
+              : { version: null, error: null };
+          const versionErrors = [own.error, parent.error].filter(Boolean);
 
           return {
             sha,
             subject: subject ?? "",
             version: own.version,
             parentVersion: parent.version,
-            versionError: own.error ?? parent.error ?? null,
+            versionError: versionErrors.length ? versionErrors.join("; ") : null,
           };
         });
     } catch (e) {
