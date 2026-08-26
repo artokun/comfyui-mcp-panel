@@ -203,10 +203,42 @@ export function describeSlotRewrites(snapshot) {
   return rewrites;
 }
 
+/**
+ * A never-throwing, bounded rendering of an arbitrary value.
+ *
+ * Slot NAMES arrive here already coerced to `string | null` by `slotNames`, but
+ * WIDGET VALUES are whatever the pack put on the widget, and a bare
+ * `JSON.stringify` on those has two failure modes that both end in a `TypeError`
+ * thrown from a disclosure rider — i.e. a landed connect reported as an error,
+ * the precise thing this module must never cause:
+ *
+ *   - a BigInt: "Do not know how to serialize a BigInt"
+ *   - a circular object: "Converting circular structure to JSON"
+ *
+ * Length is bounded for a third reason that is not a throw: a widget holding a
+ * large object (a Load3D transform, a serialized curve) would otherwise paste its
+ * entire JSON into a warning sentence.
+ */
+function renderValue(value) {
+  try {
+    if (value === null || value === undefined) return "null";
+    const type = typeof value;
+    if (type === "bigint") return `${value}n`;
+    if (type === "number" || type === "boolean") return String(value);
+    if (type === "symbol" || type === "function") return `(${type})`;
+    const json = JSON.stringify(value);
+    // `undefined` when the value is not serialisable at all — never interpolate that.
+    if (typeof json !== "string") return `(${type})`;
+    return json.length > 120 ? `${json.slice(0, 120)}…` : json;
+  } catch {
+    return "(unrenderable)";
+  }
+}
+
 /** `"input3" → "input2"`, or `"input4" → (removed)` for a slot that is gone. */
 function renderSlot(change) {
-  const to = change.to == null ? "(removed)" : JSON.stringify(change.to);
-  return `${change.kind} ${change.index} ${JSON.stringify(change.from)} → ${to}`;
+  const to = change.to == null ? "(removed)" : renderValue(change.to);
+  return `${change.kind} ${change.index} ${renderValue(change.from)} → ${to}`;
 }
 
 /**
@@ -220,15 +252,26 @@ function renderSlot(change) {
  */
 export function slotRewriteWarning(rewrites) {
   if (!rewrites?.length) return "";
-  const list = rewrites
-    .map((r) => {
-      const parts = r.slots.map(renderSlot);
-      for (const w of r.widgets) {
-        parts.push(`widget ${JSON.stringify(w.name)} ${JSON.stringify(w.from ?? null)} → ${JSON.stringify(w.to ?? null)}`);
-      }
-      return `node ${r.node_id}: ${parts.join(", ")}`;
-    })
-    .join("; ");
+  // Every value that reaches the template goes through `renderValue`, and the
+  // whole list is built inside a try: this function is called from the RETURN
+  // EXPRESSION of a connect whose wire has already landed, so a throw here would
+  // report a successful mutation as a failure. When the list cannot be rendered
+  // the disclosure still goes out — the caller needs to know their names moved
+  // far more than they need the itemisation.
+  let list = "";
+  try {
+    list = rewrites
+      .map((r) => {
+        const parts = r.slots.map(renderSlot);
+        for (const w of r.widgets) {
+          parts.push(`widget ${renderValue(w.name)} ${renderValue(w.from)} → ${renderValue(w.to)}`);
+        }
+        return `node ${renderValue(r.node_id)}: ${parts.join(", ")}`;
+      })
+      .join("; ");
+  } catch {
+    list = "the details could not be rendered";
+  }
   return (
     `This connect RE-ADDRESSED ${rewrites.length === 1 ? "a node" : `${rewrites.length} nodes`} — ${list}. ` +
     `The panel did not do this: LiteGraph runs the target's own onConnectionsChange hook from ` +

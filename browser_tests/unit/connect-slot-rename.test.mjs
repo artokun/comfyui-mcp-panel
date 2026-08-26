@@ -496,6 +496,43 @@ test("#1873 a node that becomes unreadable mid-connect does not fail a LANDED wi
   assert.equal(res.slots_rewritten, undefined);
 });
 
+test("#1873 a hostile widget VALUE cannot fail a landed wire (gate P1)", () => {
+  // A widget value is whatever the pack put there, and it is interpolated into
+  // the warning sentence. `JSON.stringify` throws on two shapes that a pack can
+  // genuinely produce, and the throw would come from a rider running AFTER the
+  // wire landed — reporting a successful connect as an error.
+  const circular = { name: "loop" };
+  circular.self = circular;
+  for (const [label, hostile, expected] of [
+    ["BigInt", 2n, /widget "select" 1 → 2n/],
+    ["circular", circular, /widget "select" 1 → \(unrenderable\)/],
+  ]) {
+    const graph = mkGraph();
+    const source = mkNodeWithOutput(graph, 1, "Load Image");
+    const node = {
+      id: 2,
+      title: "Switch",
+      graph,
+      inputs: [{ name: "input1", type: "IMAGE", link: null }],
+      outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+      widgets: [{ name: "select", value: 1, options: { max: 1 } }],
+    };
+    graph.nodes.push(node);
+    attachConnect(source, {
+      onChange: () => {
+        node.widgets[0].value = hostile;
+      },
+    });
+    const graph_connect = buildConnect(graph);
+
+    const res = graph_connect({ from_node_id: 1, from_output: 0, to_node_id: 2, to_input: "input1" });
+
+    assert.equal(res.connected.to.node_id, 2, `${label}: the wire landed`);
+    assert.equal(res.slots_rewritten.length, 1, `${label}: the change is still disclosed`);
+    assert.match(res.warning, expected, `${label}: the value is rendered, not stringified raw`);
+  }
+});
+
 test("#1873 a connect that changes nothing addressable stays byte-identical", () => {
   const graph = mkGraph();
   const source = mkNodeWithOutput(graph, 1, "Load Image");
