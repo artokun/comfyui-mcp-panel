@@ -798,6 +798,9 @@ export function buildHelloPayload({
     // synchronous write boundary, so the orchestrator can fence a node
     // replacement between its final identity probe and mutation.
     enforces_expected_node_type_at_write: true,
+    // #2314: graph_set_widget validates an optional promoted subgraph owner and
+    // workflow witness against the LIVE canvas at the same synchronous boundary.
+    enforces_expected_scope_at_write: true,
     // Advertise that this build understands `agent_note` — an orchestrator frame that is
     // delivered to the AGENT ONLY and never rendered as a chat bubble.
     //

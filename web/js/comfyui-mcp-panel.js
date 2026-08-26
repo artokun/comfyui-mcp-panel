@@ -9599,6 +9599,56 @@ function describeActiveGraph(graph) {
   return withLiveIdentity({ scope: "root" });
 }
 
+/** #2314 — validate the promoted receiver at the synchronous mutation boundary.
+ * The MCP-side graph_query is only a classification read; navigation can replace
+ * the viewed graph before the write resumes. The expected scope is therefore an
+ * envelope the panel itself must compare against its current canvas immediately
+ * before runSetWidget reaches applyWidgetWrite. */
+function canonicalExpectedPromotedOwner(value) {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? String(value) : null;
+  if (typeof value !== "string" || !/^-?(?:0|[1-9]\d*)$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? String(parsed) : null;
+}
+
+function assertExpectedPromotedScope(current, expectedScope) {
+  if (expectedScope === undefined) return;
+  if (!expectedScope || typeof expectedScope !== "object" || Array.isArray(expectedScope)) {
+    throw new Error("graph_set_widget expected_scope must be a structured subgraph witness");
+  }
+  const expected = expectedScope;
+  if (expected.scope !== "subgraph") {
+    throw new Error("graph_set_widget expected_scope.scope must be \"subgraph\"");
+  }
+  const expectedOwner = canonicalExpectedPromotedOwner(expected.owner_node_id);
+  if (!expectedOwner) {
+    throw new Error("graph_set_widget expected_scope.owner_node_id must be a canonical node id");
+  }
+  if (
+    expected.workflow_uuid !== undefined &&
+    (typeof expected.workflow_uuid !== "string" || expected.workflow_uuid.length === 0)
+  ) {
+    throw new Error("graph_set_widget expected_scope.workflow_uuid must be a non-empty string");
+  }
+
+  const liveViewing = describeActiveGraph(current.graph);
+  const liveOwner = findSubgraphOwner(current.rootGraph, current.graph);
+  const liveOwnerId = canonicalExpectedPromotedOwner(liveOwner?.id);
+  if (
+    liveViewing.scope !== "subgraph" ||
+    liveOwnerId !== expectedOwner ||
+    (expected.workflow_uuid !== undefined && liveViewing.workflow_uuid !== expected.workflow_uuid)
+  ) {
+    throw new Error(
+      `graph_set_widget promoted receiver changed before dispatch: expected subgraph owner ${expectedOwner}` +
+        `${expected.workflow_uuid ? ` in workflow ${expected.workflow_uuid}` : ""}, ` +
+        `found ${liveViewing.scope} owner ${liveOwnerId ?? "unverifiable"}` +
+        `${liveViewing.workflow_uuid ? ` in workflow ${liveViewing.workflow_uuid}` : ""}. ` +
+        "Nothing was applied.",
+    );
+  }
+}
+
 // ---- per-turn graph snapshots (rollback foundation, #44) -------------------
 // Before each turn that may edit the graph, capture the ROOT workflow JSON so a
 // whole turn's worth of agent edits can be reverted to a known-good point in one
@@ -16119,6 +16169,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // Keep the established handler signature stable for the source-level
     // wiring checks; these fields are an explicit protocol extension, not new
     // positional arguments.
+    const expected_scope =
+      arguments[0] && typeof arguments[0] === "object" ? arguments[0].expected_scope : undefined;
     const { defer_until_idle, expected_value, defer_replay } = arguments[0] ?? {};
     // #1413 — ONE deadline for the whole command, taken BEFORE anything awaits, so the
     // bounded steps inside it compose instead of adding (#1192, #671). The step this
@@ -16180,6 +16232,7 @@ const GRAPH_TOOL_EXECUTORS = {
           workflow_uuid,
           builder_state,
           expected_node_type: node.type,
+          expected_scope,
           expected_value,
           defer_replay: true,
         });
@@ -16221,6 +16274,7 @@ const GRAPH_TOOL_EXECUTORS = {
             workflow_uuid,
             builder_state,
             expected_node_type: deferredNode.type,
+            expected_scope,
             expected_value,
             defer_replay: true,
           }),
@@ -16808,8 +16862,9 @@ const GRAPH_TOOL_EXECUTORS = {
           cmd: "graph_set_widget",
           [WORKFLOW_UUID_FIELD]: workflow_uuid,
         });
-        if (expected_node_type === undefined && !enforceDeferredExpected) return;
+        if (expected_scope === undefined && expected_node_type === undefined && !enforceDeferredExpected) return;
         const current = getGraphCtx();
+        assertExpectedPromotedScope(current, expected_scope);
         const liveTarget = resolveNode(current.graph, node_id);
         if (
           expected_node_type !== undefined &&
