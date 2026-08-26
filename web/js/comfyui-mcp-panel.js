@@ -30911,6 +30911,7 @@ function buildPanel() {
   newMsgBtn.addEventListener("click", () => {
     stickToBottom = true;
     newMsgBtn.hidden = true;
+    scrollIntent.noteProgrammaticScroll({ behavior: "smooth" });
     log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
     chatScrollStabilizer.schedule();
   });
@@ -30922,6 +30923,7 @@ function buildPanel() {
   for (const eventName of ["wheel", "touchmove", "pointerdown", "keydown"]) {
     log.addEventListener(eventName, (event) => scrollIntent.note(event), { passive: true });
   }
+  log.addEventListener("scrollend", () => scrollIntent.endProgrammaticScroll(), { passive: true });
   log.addEventListener("scroll", () => {
     const isAtBottom = atBottom();
     stickToBottom = updateChatStickiness(stickToBottom, {
@@ -30933,6 +30935,7 @@ function buildPanel() {
   const chatScrollStabilizer = createChatScrollStabilizer({
     log,
     shouldStick: () => stickToBottom,
+    beforeScroll: () => scrollIntent.noteProgrammaticScroll(),
   });
   body.appendChild(newMsgBtn);
   root.appendChild(body);
@@ -34667,6 +34670,7 @@ function buildPanel() {
         newMsgBtn.hidden = true;
       },
       scrollNow: () => {
+        scrollIntent.noteProgrammaticScroll();
         log.scrollTop = log.scrollHeight;
         try {
           card.scrollIntoView({ block: "nearest" });
@@ -34953,6 +34957,7 @@ function buildPanel() {
         newMsgBtn.hidden = true;
       },
       scrollNow: () => {
+        scrollIntent.noteProgrammaticScroll();
         log.scrollTop = log.scrollHeight;
         try {
           card.scrollIntoView({ block: "nearest" });
@@ -42733,6 +42738,7 @@ function buildPanel() {
       if (workWordTimer) { clearInterval(workWordTimer); workWordTimer = null; }
       if (thinkingSafety) { clearTimeout(thinkingSafety); thinkingSafety = null; }
       chatScrollStabilizer.dispose();
+      scrollIntent.dispose();
       document.removeEventListener("keydown", onInterruptKeydown, true);
       // Stop any chat audio before the panel's DOM goes away — a detached
       // <audio> keeps playing, and after an unmount there is no card left to
