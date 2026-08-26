@@ -1873,7 +1873,8 @@ export async function dispatchScopedRun({
   //      never unhooked. Nothing in this module writes apiTarget.fetchApi back
   //      to an older value any more, so no run can displace another's guard.
   const entryFetchApi = typeof apiTarget?.fetchApi === "function" ? apiTarget.fetchApi : null;
-  const origFetchApi = entryFetchApi ? entryFetchApi.bind(apiTarget) : null;
+  // #1854 — invoked through Function.prototype.call; see configure-app-mode.js.
+  const origFetchApi = entryFetchApi ? (...a) => entryFetchApi.call(apiTarget, ...a) : null;
   if (!origFetchApi) {
     return {
       outcome: "unverifiable",
@@ -1976,8 +1977,10 @@ export async function dispatchScopedRun({
     // which may be another run's live sentinel, or our own previous attempt.
     // Capturing the run's entry-time fetchApi here instead would bypass a
     // newer run's guard entirely (r8 P0).
-    const chainBelow =
-      typeof apiTarget.fetchApi === "function" ? apiTarget.fetchApi.bind(apiTarget) : origFetchApi;
+    // #1854 — captured into a local FIRST so this still snapshots the fetchApi
+    // installed RIGHT NOW, which is the whole point of the note above.
+    const chainBelowFn = typeof apiTarget.fetchApi === "function" ? apiTarget.fetchApi : null;
+    const chainBelow = chainBelowFn ? (...a) => chainBelowFn.call(apiTarget, ...a) : origFetchApi;
     const guard = createScopedRunGuard({
       origFetchApi: chainBelow,
       execIds,

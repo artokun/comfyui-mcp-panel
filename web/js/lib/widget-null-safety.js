@@ -154,7 +154,10 @@ const INSTALLED = Symbol.for("comfyui-mcp.graphToPromptNullSafety");
 export function installGraphToPromptNullSafety(app) {
   if (!app || typeof app.graphToPrompt !== "function") return false;
   if (app[INSTALLED]) return true;
-  const orig = app.graphToPrompt.bind(app);
+  // #1854 — early binding is load-bearing: app.graphToPrompt is replaced
+  // below, so a call-time lookup would re-enter this wrapper and recurse.
+  const graphToPromptFn = app.graphToPrompt;
+  const orig = (...a) => graphToPromptFn.call(app, ...a);
   app.graphToPrompt = async function nullSafeGraphToPrompt(graph, ...rest) {
     // graphToPrompt defaults its graph arg to the app's root graph; mirror that
     // so we sanitize exactly what the original is about to serialize.

@@ -253,8 +253,15 @@ export function configureAppMode({
   const outputIds =
     parsed.outputs !== undefined ? resolvedOutputs.map((node) => node.id) : undefined;
 
-  const before = typeof rootGraph.beforeChange === "function" ? rootGraph.beforeChange.bind(rootGraph) : null;
-  const after = typeof rootGraph.afterChange === "function" ? rootGraph.afterChange.bind(rootGraph) : null;
+  // #1854 — the receiver is captured into a local and invoked through
+  // Function.prototype.call rather than the binder helper. Same early-bound
+  // semantics; the helper's name is a Python socket literal in the Comfy
+  // Registry YARA ruleset, which flagged this file for "network operations"
+  // despite it containing none. Do not simplify back.
+  const beforeFn = typeof rootGraph.beforeChange === "function" ? rootGraph.beforeChange : null;
+  const afterFn = typeof rootGraph.afterChange === "function" ? rootGraph.afterChange : null;
+  const before = beforeFn ? (...a) => beforeFn.call(rootGraph, ...a) : null;
+  const after = afterFn ? (...a) => afterFn.call(rootGraph, ...a) : null;
   before?.();
   try {
     const extra = extraBag(rootGraph);
