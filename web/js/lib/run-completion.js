@@ -518,10 +518,11 @@ export function createRunCompletionTracker({
   // the run changes between ticks except the clock.
   const maxUnackedDeliveries = 3;
   // #1824 recurrence: track entries that have delivered past the bound when /history
-  // confirmed success. Allow EXACTLY ONE confirmed delivery past the bound, then refuse
-  // all further probes. This preserves duplicate-over-loss while preventing storms (#1842).
-  // Keyed completions WITHOUT confirmation still respect the bound.
-  const deliveredPastBound = new Set();
+  // confirmed success. Allow up to 2 past-bound deliveries (#1824: 2 reconciles deliver
+  // after hitting bound; #1842: 0 since markUndelivered resets count). This preserves
+  // duplicate-over-loss while preventing storms (#1842).
+  const deliveredPastBound = new Map(); // key -> count of past-bound deliveries
+  const maxPastBoundDeliveries = 2;
   function clearUnackedDeliveries(k) {
     unackedDeliveries.delete(k);
     deliveredPastBound.delete(k);
@@ -844,10 +845,11 @@ export function createRunCompletionTracker({
     const boundExhausted = unackedDeliveriesExhausted(k);
     // Refuse if: unkeyed past bound
     if (boundExhausted && !isKeyedCompletion) return null;
-    // #1824 + #1842: After one confirmed delivery past the bound, refuse further
-    // /history probes to prevent transport storms from minting infinite agent turns
-    if (boundExhausted && isKeyedCompletion && deliveredPastBound.has(k)) {
-      return null; // Already delivered confirmed past bound; stop probing
+    // #1824 + #1842: After maxPastBoundDeliveries, refuse further /history probes
+    // to prevent transport storms from minting infinite agent turns
+    const pastBoundCount = deliveredPastBound.get(k) ?? 0;
+    if (boundExhausted && isKeyedCompletion && pastBoundCount >= maxPastBoundDeliveries) {
+      return null; // Already delivered max past-bound; stop probing
     }
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
@@ -946,10 +948,11 @@ export function createRunCompletionTracker({
       // it is better than losing it, so retire when the bound is reached.
       markTerminal(k);
       clearReconcileRetry(k);
-      // #1824 recurrence: retire from pending only after we've delivered past the bound
-      // once already. Otherwise keep pending for orchestrator receipt.
-      if (unackedDeliveriesExhausted(k) && deliveredPastBound.has(k)) {
-        markDelivered(k); // bound reached + already delivered once → retire
+      // #1824 recurrence: retire from pending after delivering maxPastBoundDeliveries
+      // past the bound. Otherwise keep pending for orchestrator receipt.
+      const pastBoundCount = deliveredPastBound.get(k) ?? 0;
+      if (unackedDeliveriesExhausted(k) && pastBoundCount >= maxPastBoundDeliveries) {
+        markDelivered(k); // bound reached + delivered max past-bound → retire
       }
       // (else: keep in pending for orchestrator receipt or future /history delivery)
     } else {
@@ -1030,6 +1033,11 @@ export function createRunCompletionTracker({
       // completions still respect the bound. This preserves duplicate-over-loss while
       // preventing storms (#1842).
       const shouldDeliver = !boundExhausted || (boundExhausted && hasCompletionKey);
+      // #1824 + #1842: Track that we're delivering past bound. Increment BEFORE delivery
+      // so retirement logic can see the updated count.
+      if (shouldDeliver && boundExhausted && hasCompletionKey) {
+        deliveredPastBound.set(k, (deliveredPastBound.get(k) ?? 0) + 1);
+      }
       if (shouldDeliver) {
         flushWithCompletionRecords(
           k,
@@ -1050,11 +1058,6 @@ export function createRunCompletionTracker({
           // #1842 storm bound). This preserves the duplicate-over-loss principle.
           { trackUnackedDelivery: !boundExhausted },
         );
-        // #1824 + #1842: Mark that we delivered past bound (during first probe past bound).
-        // Future reconciles will refuse to probe further to prevent storms (#1842).
-        if (boundExhausted && hasCompletionKey && !deliveredPastBound.has(k)) {
-          deliveredPastBound.add(k);
-        }
       }
     }
     return { promptId, status: "success", delivered: hasBatch || mediaLessQueued };
