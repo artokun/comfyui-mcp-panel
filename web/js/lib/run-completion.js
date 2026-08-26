@@ -844,6 +844,11 @@ export function createRunCompletionTracker({
     const boundExhausted = unackedDeliveriesExhausted(k);
     // Refuse if: unkeyed past bound
     if (boundExhausted && !isKeyedCompletion) return null;
+    // #1824 + #1842: After one confirmed delivery past the bound, refuse further
+    // /history probes to prevent transport storms from minting infinite agent turns
+    if (boundExhausted && isKeyedCompletion && deliveredPastBound.has(k)) {
+      return null; // Already delivered confirmed past bound; stop probing
+    }
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
@@ -941,12 +946,12 @@ export function createRunCompletionTracker({
       // it is better than losing it, so retire when the bound is reached.
       markTerminal(k);
       clearReconcileRetry(k);
-      // #1824 recurrence: retire from pending only after we've delivered the /history
-      // confirmation once past the bound. Otherwise keep pending for orchestrator receipt.
+      // #1824 recurrence: retire from pending only after we've delivered past the bound
+      // once already. Otherwise keep pending for orchestrator receipt.
       if (unackedDeliveriesExhausted(k) && deliveredPastBound.has(k)) {
-        markDelivered(k); // bound reached + already delivered → retire
+        markDelivered(k); // bound reached + already delivered once → retire
       }
-      // (else: keep in pending for orchestrator receipt or /history-confirmed delivery)
+      // (else: keep in pending for orchestrator receipt or future /history delivery)
     } else {
       markDelivered(k); // also clears any scheduled retry for this key
     }
@@ -1020,12 +1025,11 @@ export function createRunCompletionTracker({
       deduper.record({ signature: mediaSignature(parsed.images, parsed.videos), promptId });
       // #1824 recurrence: bound prevents frame EMISSIONS (#1842), not truth-seeking.
       // Normal replays within the bound are emitted normally. After the bound is
-      // exhausted, /history-confirmed keyed completions may deliver EXACTLY ONCE (with
+      // exhausted, /history-confirmed keyed completions deliver past-bound (with
       // trackUnackedDelivery=false to not count as emissions). Unconfirmed keyed
       // completions still respect the bound. This preserves duplicate-over-loss while
       // preventing storms (#1842).
-      const hasDeliveredConfirmed = deliveredPastBound.has(k);
-      const shouldDeliver = !boundExhausted || (boundExhausted && hasCompletionKey && !hasDeliveredConfirmed);
+      const shouldDeliver = !boundExhausted || (boundExhausted && hasCompletionKey);
       if (shouldDeliver) {
         flushWithCompletionRecords(
           k,
@@ -1046,10 +1050,9 @@ export function createRunCompletionTracker({
           // #1842 storm bound). This preserves the duplicate-over-loss principle.
           { trackUnackedDelivery: !boundExhausted },
         );
-        // #1824 recurrence: Mark that we've delivered this confirmed completion past
-        // the bound. Future reconciles will refuse all further probes (alreadyDeliveredConfirmed
-        // check prevents re-entry). This allows exactly ONE confirmed delivery past the bound.
-        if (boundExhausted && hasCompletionKey) {
+        // #1824 + #1842: Mark that we delivered past bound (during first probe past bound).
+        // Future reconciles will refuse to probe further to prevent storms (#1842).
+        if (boundExhausted && hasCompletionKey && !deliveredPastBound.has(k)) {
           deliveredPastBound.add(k);
         }
       }
