@@ -193,6 +193,7 @@ export async function composeRunCompletionFrame(
         durationMs,
         finishedClock,
         finishedAt,
+        promptId,
         stillsMetadataTimeoutMs,
         setTimer,
         clearTimer,
@@ -303,6 +304,16 @@ export async function composeRunCompletionFrame(
 // harness clock, a duration, 0). Sep 2001; every real Date.now() clears it.
 const MIN_PLAUSIBLE_EPOCH_MS = 1_000_000_000_000;
 
+/** Append a cache-bust parameter to an image /view URL using the prompt_id. */
+function appendImageCacheBust(url, promptId) {
+  if (typeof url !== "string" || !url || typeof promptId !== "string" || !promptId) return url;
+  const hashAt = url.indexOf("#");
+  const beforeHash = hashAt >= 0 ? url.slice(0, hashAt) : url;
+  const hash = hashAt >= 0 ? url.slice(hashAt) : "";
+  const separator = beforeHash.includes("?") ? (/[?&]$/.test(beforeHash) ? "" : "&") : "?";
+  return `${beforeHash}${separator}cmcp_prompt=${encodeURIComponent(promptId)}${hash}`;
+}
+
 /** Epoch ms → Date, or null when the value isn't a plausible wall clock (#1199). */
 function epochToDate(ms) {
   if (typeof ms !== "number" || !Number.isFinite(ms) || ms < MIN_PLAUSIBLE_EPOCH_MS) return null;
@@ -395,6 +406,7 @@ async function buildStillsSegment(bufImages, deps) {
     durationMs,
     finishedClock,
     finishedAt,
+    promptId,
     stillsMetadataTimeoutMs = STILLS_METADATA_TIMEOUT_MS,
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = (t) => clearTimeout(t),
@@ -454,7 +466,7 @@ async function buildStillsSegment(bufImages, deps) {
           const filename = coerceMessageText(m?.filename) || "(unknown)";
           const subfolder = coerceMessageText(m?.subfolder);
           const path = subfolder ? `${subfolder}/${filename}` : filename;
-          const url = imageViewUrl(m);
+          const url = appendImageCacheBust(imageViewUrl(m), promptId);
           const [sizeRes, dimRes] = await Promise.allSettled([
             fetchImageBytes(url),
             fetchImageDimensions(url),
