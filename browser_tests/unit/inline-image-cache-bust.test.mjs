@@ -27,6 +27,7 @@ import { readFileSync } from "node:fs";
 
 import { appendImageCacheBust } from "../../web/js/lib/storyboard-cache-identity.js";
 import { composeShowMediaReply } from "../../web/js/lib/media-preview.js";
+import { NO_PROMPT_KEY } from "../../web/js/lib/run-completion.js";
 
 const panelSrc = readFileSync(
   new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
@@ -75,6 +76,33 @@ function productionOnExecuted() {
 
 const SAME_FILE = { filename: "test_face_00005_.png", type: "output" };
 
+/** The same /view URL the harness's injected `imageViewUrl` builds. */
+const rawViewUrl = (m) =>
+  `/view?filename=${m.filename}&subfolder=${m.subfolder ?? ""}&type=${m.type || "output"}`;
+
+// Mirrors of the completion tracker's private normalisers — they are not
+// exported, so the source lines are pinned by the test below. A mirror that
+// drifts would leave this file agreeing with itself instead of with production.
+const key = (id) => (id == null ? NO_PROMPT_KEY : String(id));
+const promptIdOf = (k) => (k === NO_PROMPT_KEY ? null : k);
+
+test("#1834: the mirrored tracker normalisers still match the tracker", () => {
+  const src = readFileSync(
+    new URL("../../web/js/lib/run-completion.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    src,
+    /const key = \(id\) => \(id == null \? NO_PROMPT_KEY : String\(id\)\);/,
+    "the card's cache key is normalised to match this line — see the numeric-id test",
+  );
+  assert.match(
+    src,
+    /const promptIdOf = \(k\) => \(k === NO_PROMPT_KEY \? null : k\);/,
+    "this is what decides the promptId the completion frame's probes bust with",
+  );
+});
+
 test("#1834: two runs reusing one filename paint two DIFFERENT card URLs", () => {
   const { onExecuted, painted } = productionOnExecuted();
 
@@ -117,6 +145,24 @@ test("#1834: the card and the completion frame's probes address ONE url", () => 
   // image blocks are resolved by the orchestrator, not from this URL.
   assert.deepEqual(buffered[0].output.images, [SAME_FILE]);
   assert.equal(buffered[0].promptId, "run-a");
+});
+
+test("#1834: a NON-STRING prompt id is normalised the way the tracker does", () => {
+  // The tracker stringifies: `key = (id) => id == null ? NO_PROMPT_KEY :
+  // String(id)`, and `promptIdOf` hands that string to the completion frame. So
+  // a numeric prompt id reaches the frame's probes as "7". A card keyed on the
+  // raw `7` would fail the helper's string check and be left unbusted — stale
+  // pixels, AND a note describing a file the card never fetched. Parity with
+  // `key()` is the assertion, not merely "something was appended".
+  const { onExecuted, painted } = productionOnExecuted();
+  onExecuted({ detail: { prompt_id: 7, output: { images: [SAME_FILE] } } });
+  onExecuted({ detail: { prompt_id: 8, output: { images: [SAME_FILE] } } });
+
+  assert.equal(painted.length, 2);
+  assert.equal(painted[0].url, appendImageCacheBust(rawViewUrl(SAME_FILE), promptIdOf(key(7))));
+  assert.equal(painted[1].url, appendImageCacheBust(rawViewUrl(SAME_FILE), promptIdOf(key(8))));
+  assert.match(painted[0].url, /[?&]cmcp_prompt=7(?:&|$)/);
+  assert.notEqual(painted[0].url, painted[1].url);
 });
 
 test("#1834: an id-less run is left UNBUSTED rather than given a local key", () => {

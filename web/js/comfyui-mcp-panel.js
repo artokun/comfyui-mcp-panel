@@ -39187,6 +39187,14 @@ function buildPanel() {
     // storyboard delivered asynchronously below.
     const inlineImages = [];
     const videos = [];
+    // #1834 — the still cards' cache key, normalised EXACTLY as the completion
+    // tracker normalises the same id (`key = (id) => id == null ? NO_PROMPT_KEY
+    // : String(id)`, and `promptIdOf` hands that string to the frame). Mirroring
+    // it is the whole point: a numeric prompt id reaches the frame's probes as
+    // "7", so a card keyed on the raw `7` would be left unbusted while the probe
+    // busted — stale pixels AND a note describing a file the card never fetched.
+    // `null` when there is no id at all, which deliberately busts nothing.
+    const runCacheKey = d.prompt_id == null ? null : String(d.prompt_id);
     for (const m of media) {
       if (!m || !m.filename) continue;
       const url = imageViewUrl(m);
@@ -39217,14 +39225,15 @@ function buildPanel() {
         // matches the key the completion frame's size/dimension probes use, so
         // both surfaces address ONE URL and share ONE download.
         //
-        // The prompt id is passed through AS IS — no local fallback when it is
-        // missing. An id-less run (#224, legacy; a current ComfyUI `executed`
-        // always carries one) then keeps the stale-card exposure, and that is
-        // the lesser evil: a key minted here would not be the key the frame's
-        // probe mints, so the note's size and dimensions could describe a
-        // different file from the one on screen. Closing it properly means
-        // threading a per-run identity through the completion tracker.
-        paintImage(appendImageCacheBust(url, d.prompt_id), m.filename);
+        // There is no local FALLBACK when the id is missing. An id-less run
+        // (#224, legacy; a current ComfyUI `executed` always carries one) then
+        // keeps the stale-card exposure, and that is the lesser evil: the
+        // tracker collapses every id-less run onto the shared NO_PROMPT_KEY and
+        // `promptIdOf` hands the frame `null`, so there is no per-run value the
+        // probe could agree with — a key minted here would just make the note
+        // describe a different file from the one on screen. Closing it needs a
+        // per-run identity threaded through the tracker's buffer and flush.
+        paintImage(appendImageCacheBust(url, runCacheKey), m.filename);
         inlineImages.push(m);
       }
     }
