@@ -142,7 +142,8 @@ test("WIRING #847: the filter's key set carries the PRIOR tmp: id", () => {
   // The helper accepting a priorRouteId proves nothing if the panel never passes
   // one. This is the whole fix: `_priorTempWorkflowIds` already retains that id for
   // the live workflow object's lifetime, and `workflowRecordMatchesSelector` already
-  // honours it — the history filter was the one reader that did not.
+  // honours it — the history filter was the one reader that did not. The accessor
+  // normalizes Vue proxies to the same raw object as the route cache.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const site = src.slice(
     src.indexOf("const currentWorkflowKeys = currentWorkflowIdentityKeys({"),
@@ -150,11 +151,11 @@ test("WIRING #847: the filter's key set carries the PRIOR tmp: id", () => {
   );
   assert.ok(site.length > 0, "the filter must build its key set through the shared builder");
   assert.ok(site.includes("priorRouteId:"), "it must pass a prior route id");
-  assert.ok(site.includes("_priorTempWorkflowIds.get(activeWf)"), "…read from the map that retains it");
+  assert.ok(site.includes("priorTempWorkflowId(activeWf)"), "…read from the map that retains it");
   // Guarded: activeWorkflowRef() is null with no canvas, and a WeakMap.get(null)
   // throws. A history pane that crashes on an empty canvas would be a worse bug
   // than the one being fixed.
-  assert.ok(site.includes("activeWf ? _priorTempWorkflowIds.get(activeWf) : null"), "the lookup must be guarded");
+  assert.ok(site.includes("activeWf ? priorTempWorkflowId(activeWf) : null"), "the lookup must be guarded");
 });
 
 // ── #847: a first SAVE moves both identity forms at once ───────────────────
