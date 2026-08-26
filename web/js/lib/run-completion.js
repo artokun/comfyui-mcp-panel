@@ -839,13 +839,16 @@ export function createRunCompletionTracker({
     // #1824 recurrence — the bound prevents FRAME EMISSIONS, not TRUTH-SEEKING.
     // For legacy unkeyed runs, enforce the bound strictly (no emissions permitted).
     // For keyed panel_run completions awaiting orchestrator receipt: proceed to
-    // /history to confirm completion, up to maxPastBoundDeliveries times. This allows
-    // the /history confirmation and a possible update (e.g., on receipt), while
-    // preventing ComfyUI query storms (#1842).
+    // /history to confirm completion, up to maxPastBoundDeliveries times. Once the
+    // limit is reached, refuse all further probes regardless of current unacked state
+    // (markUndelivered can lower it back below the bound). This allows the /history
+    // confirmation and a possible update (e.g., on receipt), while preventing ComfyUI
+    // query storms (#1842).
     const isKeyedCompletion = hasCompletionRecords(k);
     const boundExhausted = unackedDeliveriesExhausted(k);
     const pastBoundCount = deliveredPastBound.get(k) ?? 0;
-    if (boundExhausted && (!isKeyedCompletion || pastBoundCount >= maxPastBoundDeliveries)) return null;
+    const hasReachedPastBoundLimit = isKeyedCompletion && pastBoundCount >= maxPastBoundDeliveries;
+    if ((boundExhausted && !isKeyedCompletion) || hasReachedPastBoundLimit) return null;
     // A timeout-released panel_run already owns the exact media batch, but its
     // delayed /prompt identity has not supplied the completion key yet. Do not
     // replace that recoverable record with an unkeyed /history delivery: the
