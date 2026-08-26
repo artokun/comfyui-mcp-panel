@@ -5390,6 +5390,41 @@ function readRunCompletionMetadata() {
   }
 }
 
+/**
+ * #1839 — the SAME read, but able to say "I could not read it": `[]` when the
+ * ledger is genuinely empty, `null` when it could not be read.
+ *
+ * readRunCompletionMetadata() cannot make that distinction. ssGet swallows a
+ * throwing sessionStorage (private-mode quota, a blocked origin) and returns
+ * null, and a malformed value is caught and returned as `[]` — so "no rows" and
+ * "no answer" are byte-identical to every caller.
+ *
+ * That matters because ADOPTING a route/session context is irreversible for the
+ * life of the mount: it marks the context this tracker's, so later polls skip it
+ * AND the next persist stops treating its rows as foreign — dropping rows the
+ * read never saw. Adoption must therefore be taken on an answer, never on a
+ * silence; callers refuse on null and retry on the next poll tick.
+ *
+ * Unparseable bytes ARE an answer — nothing recoverable is in there and no
+ * future read will change that — so they normalize to `[]` like any other row
+ * that fails the cross-check. Only a THROWING store, which may hold rows we
+ * simply cannot see right now, is "unknown".
+ */
+function readRunCompletionMetadataOrUnknown() {
+  let raw = null;
+  try {
+    raw = window.sessionStorage.getItem(RUN_COMPLETION_META_KEY) || null;
+  } catch {
+    return null; // storage unreadable — NOT an empty ledger
+  }
+  if (!raw) return [];
+  try {
+    return normalizeRunCompletionMetadata(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
 function persistRunCompletionMetadata(entries) {
   const safe = normalizeRunCompletionMetadata(entries);
   if (!safe.length) {
@@ -38080,8 +38115,13 @@ function buildPanel() {
     completionRestoreRoute = bridgeRouteId();
   } catch {}
   const completionRestoreSession = ssGet(SESSION_KEY);
+  // `null` here means the ledger could not be READ, which is not the same answer
+  // as an empty one — see readRunCompletionMetadataOrUnknown. Partitioning an
+  // unreadable ledger yields two empty halves, and on the old wiring the first
+  // persist then overwrote the key with them.
+  const completionRestoreStored = readRunCompletionMetadataOrUnknown();
   const completionRestore = partitionRunCompletionMetadata(
-    readRunCompletionMetadata(),
+    completionRestoreStored ?? [],
     completionRestoreRoute,
     completionRestoreSession,
   );
@@ -38108,20 +38148,38 @@ function buildPanel() {
     adoptedRunCompletionContexts.add(contextKey);
     return true;
   };
-  adoptRunCompletionContext(completionRestoreRoute, completionRestoreSession);
+  // The cheap half of the question, asked BEFORE any storage work: the
+  // overwhelming majority of the 600 ms ticks that reach the rehydrate below are
+  // already-adopted contexts and must not pay a ledger parse to learn that.
+  const runCompletionContextNeedsAdoption = (routeId, sessionId) => {
+    const route = typeof routeId === "string" ? routeId.trim() : "";
+    if (!route) return false;
+    return !adoptedRunCompletionContexts.has(runCompletionContextKey(route, sessionId));
+  };
+  // Claim the mount's own context only if the ledger was actually READ. On an
+  // unreadable store the rehydrate below retries on the next poll tick instead of
+  // permanently marking these rows as this tracker's and dropping them.
+  if (completionRestoreStored !== null) {
+    adoptRunCompletionContext(completionRestoreRoute, completionRestoreSession);
+  }
   const persistOwnedRunCompletionMetadata = (entries) => {
     // Async composition from a torn-down mount can settle after its replacement
     // has already acknowledged and cleared a completion. Never let that stale
     // frontend instance resurrect its old pending snapshot.
     if (panelRunOwnerRef.current !== mountOwner) return;
+    // Re-read at PERSIST time, never a value closed over at mount.
+    const stored = readRunCompletionMetadataOrUnknown();
+    // An unreadable ledger cannot say which rows belong to another route, and
+    // writing without them would DELETE every foreign row — a completion nobody
+    // ever delivers, which is the failure this whole ledger exists to prevent.
+    // The tracker stays authoritative in memory and the next state change
+    // re-attempts the write. Deliberately the same trade the delivery path
+    // makes: a duplicate turn beats a lost render.
+    if (stored === null) return;
     persistRunCompletionMetadata(
       mergeRunCompletionMetadata(
         entries,
-        // Re-read at PERSIST time, never a value closed over at mount.
-        selectDeferredRunCompletionMetadata(
-          readRunCompletionMetadata(),
-          adoptedRunCompletionContexts,
-        ),
+        selectDeferredRunCompletionMetadata(stored, adoptedRunCompletionContexts),
       ),
     );
   };
@@ -38429,12 +38487,22 @@ function buildPanel() {
       liveRoute = bridgeRouteId();
     } catch {}
     const liveSession = ssGet(SESSION_KEY);
-    // Already this mount's — one Set lookup on the overwhelming majority of the
-    // 600 ms ticks that reach this line, and no storage read at all.
+    // Already this mount's, or not routable — one Set lookup on the overwhelming
+    // majority of the 600 ms ticks that reach this line, and no storage read.
+    if (!runCompletionContextNeedsAdoption(liveRoute, liveSession)) return 0;
+    // READ BEFORE ADOPTING, and refuse on an unreadable ledger. Adoption is
+    // irreversible for the life of the mount: it marks the context this
+    // tracker's, so every later tick skips it AND the next persist stops
+    // treating its rows as foreign and drops them. A transient sessionStorage
+    // failure is indistinguishable from an empty ledger through
+    // readRunCompletionMetadata(), so adopting on that answer would strand — and
+    // then delete — rows that were there all along. Returning retries next tick.
+    const stored = readRunCompletionMetadataOrUnknown();
+    if (stored === null) return 0;
     if (!adoptRunCompletionContext(liveRoute, liveSession)) return 0;
     const restored = restoreRunCompletionMetadata(
       runCompletion,
-      partitionRunCompletionMetadata(readRunCompletionMetadata(), liveRoute, liveSession).current,
+      partitionRunCompletionMetadata(stored, liveRoute, liveSession).current,
     );
     // Adopted rows are pending-but-unswept until something arms the sweep: the
     // run they name finished while this panel was not listening, so no lifecycle
