@@ -21687,9 +21687,37 @@ const GRAPH_TOOL_EXECUTORS = {
             pointerMovedThisOpen,
           });
           if (captureDecision.disclose) pointerWatchUnavailable = true;
+          // #1215 (2026-08-27 recurrence) — DISTINCT from #1911. The Pinia watch
+          // proves the POINTER moved; it does not prove the canvas swapped. A stale
+          // or shared root UUID still answers "bound" while app.graph is the outgoing
+          // tab, and checkState() then serializes that previous canvas into TARGET.
+          // Related workflows (same node ids/types, different widgets) are the shape
+          // that then publishes TARGET's fence over SOURCE's values.
+          // proven/presentationOnly only: normalizedOnly would treat those related
+          // graphs as a match, which is the silent serve this closes.
+          const sourceStateForSwitch = pointerMovedThisOpen
+            ? (activeBefore?.changeTracker?.activeState ?? activeBefore?.activeState)
+            : null;
+          const liveCanvasStillSource = (rootGraph) => {
+            if (!pointerMovedThisOpen) return false;
+            if (!sourceStateForSwitch || !Array.isArray(sourceStateForSwitch.nodes)) return false;
+            try {
+              // Call through an alias so the presentation restore stays ahead of
+              // the content-proof call site (#1618).
+              const reproducesOutgoing = graphRootReproducesStateContent;
+              const proof = reproducesOutgoing({
+                rootGraph,
+                state: sourceStateForSwitch,
+              });
+              return proof?.proven === true || proof?.presentationOnly === true;
+            } catch {
+              return false;
+            }
+          };
           if (
             openSettled?.loaded !== true &&
-            captureDecision.capture
+            captureDecision.capture &&
+            !liveCanvasStillSource(app?.graph)
           ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
@@ -21966,6 +21994,17 @@ const GRAPH_TOOL_EXECUTORS = {
               // reply instead of vouching for them.
               const contentMatches =
                 contentProof.proven || contentProof.presentationOnly || contentProof.normalizedOnly;
+              // #1215 — normalizedOnly licenses widget-value drift on a completed load
+              // of THIS graph. After a tab switch it also licenses leftover widgets
+              // from the PREVIOUS graph (related workflows share ids/types). If the
+              // live root still reproduces SOURCE, that is not target normalization.
+              // Keep `contentMatches` as the three-ground expression the #721/#1623
+              // wiring pins; the SOURCE leftover is a separate admit.
+              const leftoverPreviousCanvas =
+                !contentProof.proven &&
+                !contentProof.presentationOnly &&
+                liveCanvasStillSource(rootGraph);
+              const contentAdmitted = contentMatches && !leftoverPreviousCanvas;
               if (contentProof.proven && !contentProof.exact) {
                 openGeometryRewritten = contentProof.fields;
               }
@@ -21981,7 +22020,10 @@ const GRAPH_TOOL_EXECUTORS = {
               // contradiction #1623 was reported for. `proven` cannot collide: every branch
               // that returns it returns `normalizedOnly: false`.
               if (contentProof.normalizedOnly && !contentProof.presentationOnly) {
-                openContentNormalized = contentProof.normalizedFields;
+                // #1215 — leftover SOURCE widgets are not target-graph normalization.
+                if (!leftoverPreviousCanvas) {
+                  openContentNormalized = contentProof.normalizedFields;
+                }
               }
               // panel#1283 (the 2026-08-21 recurrence) — the completed-load ground carried
               // this open over a `definitions` difference as well as a `nodes` one, so the
@@ -21996,13 +22038,13 @@ const GRAPH_TOOL_EXECUTORS = {
                 instanceStillTarget,
                 markerMatches,
                 identityMatches,
-                contentMatches,
+                contentMatches: contentAdmitted,
               });
               if (verdict.status !== OPEN_REBIND_STATUS.PROVEN) {
                 // Only once something has already failed: this re-serializes the root,
                 // which is the expensive part of the whole proof. It feeds the MESSAGE
                 // only — it decides nothing.
-                const contentDiff = contentMatches
+                const contentDiff = contentAdmitted
                   ? { comparable: true, surfaces: [], accountedSurfaces: [], nodeDifference: null }
                   : describeGraphStateDifference({ rootGraph, state: repaintState });
                 // #1898 — a graph can still be normalizing after the store has
@@ -22069,9 +22111,14 @@ const GRAPH_TOOL_EXECUTORS = {
                         loadRanToCompletion,
                       });
                       const recoveredContentMatches =
-                        recoveredContentProof.proven ||
-                        recoveredContentProof.presentationOnly ||
-                        recoveredContentProof.normalizedOnly;
+                        (recoveredContentProof.proven ||
+                          recoveredContentProof.presentationOnly ||
+                          recoveredContentProof.normalizedOnly) &&
+                        !(
+                          !recoveredContentProof.proven &&
+                          !recoveredContentProof.presentationOnly &&
+                          liveCanvasStillSource(recoveredRootGraph)
+                        );
                       const recoveredActive = activeWorkflowRef();
                       const recoveredBindingMatches =
                         sameWorkflowObject(recoveredActive, target) &&
