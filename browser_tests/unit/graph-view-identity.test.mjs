@@ -74,3 +74,46 @@ test("production graph read callers publish the live viewing identity", () => {
   assert.ok(queryStart >= 0 && queryEnd > queryStart);
   assert.match(PANEL_SRC.slice(queryStart, queryEnd), /viewing: describeActiveGraph\(graph\)/);
 });
+
+test("#1925 production graph replies restock a parseable viewing witness", () => {
+  assert.match(PANEL_SRC, /function withViewingWitness\(/);
+  assert.match(PANEL_SRC, /result: withViewingWitness\(result\)/);
+  assert.match(PANEL_SRC, /viewing: liveParseableViewingWitness\(\) \?\? undefined/);
+});
+
+test("#1925 withViewingWitness keeps parseable viewing, replaces malformed, attaches missing", () => {
+  const start = PANEL_SRC.indexOf("function parseableViewingWitness");
+  const end = PANEL_SRC.indexOf("\nfunction canonicalExpectedPromotedOwner", start);
+  assert.ok(start >= 0 && end > start, "viewing-witness helpers not found");
+  const live = {
+    scope: "root",
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph:root",
+  };
+  const withViewingWitness = new Function(
+    "getGraphCtx",
+    "describeActiveGraph",
+    `${PANEL_SRC.slice(start, end)}; return withViewingWitness;`,
+  )(
+    () => ({ graph: {} }),
+    () => live,
+  );
+
+  assert.deepEqual(withViewingWitness({ ok: true, viewing: live }), { ok: true, viewing: live });
+  assert.deepEqual(withViewingWitness({ applied: true }), { applied: true, viewing: live });
+  assert.deepEqual(
+    withViewingWitness({ viewing: null, applied: true }),
+    { applied: true, viewing: live },
+    "malformed viewing must be replaced, not recorded as unverifiable",
+  );
+  assert.equal(withViewingWitness("plain"), "plain");
+});
+
+test("#1925 pinpoint detail publishes a structured is_subgraph row", () => {
+  const queryStart = PANEL_SRC.indexOf("graph_query({");
+  const queryEnd = PANEL_SRC.indexOf("graph_find_nodes({", queryStart);
+  const query = PANEL_SRC.slice(queryStart, queryEnd);
+  assert.match(query, /pinpointNodes/);
+  assert.match(query, /is_subgraph: !!matched\[0\]\.subgraph/);
+  assert.match(query, /\.\.\.\(pinpointNodes \? \{ nodes: pinpointNodes \} : \{\}\)/);
+});

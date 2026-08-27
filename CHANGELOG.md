@@ -12,6 +12,7 @@ All notable changes to this project are documented here. This project adheres to
 - panel_run no longer reports CompareFrames temp images as "no media": unrecognised `*images` outputs are counted and named, and none of them are attached (#1934)
 - panel_set_widget rebuilds generated custom-widget rows after a hidden backend write, so Deno Multi LoRA (and the same pattern) updates visible rows and height without leaving and re-entering (#1932)
 - panel_set_widget no longer reports success when a just-added primitive's frontend init later clears the value (#1922)
+- panel_set_widget dispatches a promoted-widget write when the live canvas is a verified-stable root, instead of refusing with "scope became unverifiable" (#1925, artokun/comfyui-mcp#2435)
 
 ## [0.15.118] - 2026-08-27
 

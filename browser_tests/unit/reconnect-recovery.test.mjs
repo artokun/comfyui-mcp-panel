@@ -531,7 +531,7 @@ test("#1529 wiring: the reply builder publishes `refusal` and leaves `error` alo
   // toasts among them — and the first occurrence is a workflow_new journal write,
   // not this. An anchor that matched the wrong one passed its assertions against
   // unrelated text, which is how a wiring test goes vacuous.
-  const start = SRC.indexOf("reply = { rid: msg.rid, ok: true, result };\n        } catch (err) {");
+  const start = SRC.indexOf("reply = { rid: msg.rid, ok: true, result: withViewingWitness(result) };\n        } catch (err) {");
   assert.notEqual(start, -1, "the acknowledged-error WIRE reply builder is still recognisable");
   const block = SRC.slice(start, start + 1800);
   assert.match(block, /reply = \{\n\s+rid: msg\.rid,\n\s+ok: false,/, "…and this is its failure branch");

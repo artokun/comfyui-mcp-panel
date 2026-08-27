@@ -753,6 +753,7 @@ export function buildHelloPayload({
   resume,
   workflowUuid,
   lostReplies,
+  viewing,
 } = {}) {
   const frame = {
     type: "hello",
@@ -858,6 +859,17 @@ export function buildHelloPayload({
   // supported here for any caller whose timing is already post-handshake.
   if (Array.isArray(lostReplies) && lostReplies.length) {
     frame.lost_replies = lostReplies;
+  }
+  // #1925 — hello clears the orchestrator's promoted-scope cache. A parseable
+  // current-view witness on this frame is the only way a reconnect/tab-switch
+  // hello can restock that cache without waiting for a later graph read.
+  if (
+    viewing &&
+    typeof viewing === "object" &&
+    !Array.isArray(viewing) &&
+    (viewing.scope === "root" || viewing.scope === "subgraph")
+  ) {
+    frame.viewing = viewing;
   }
   return frame;
 }

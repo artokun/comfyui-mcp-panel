@@ -233,8 +233,11 @@ test("#2314 detail rows explicitly classify ordinary and promoted nodes", () => 
   };
   graph._nodes.push(promoted);
   try {
-    const row = detailRows(query({ ids: [83], fields: "detail" }))[0];
+    const result = query({ ids: [83], fields: "detail" });
+    const row = detailRows(result)[0];
     assert.equal(row.is_subgraph, true);
+    assert.equal(result.nodes?.[0]?.is_subgraph, true, "#1925 pinpoint detail must publish a structured subgraph row");
+    assert.equal(result.nodes?.[0]?.id, 83);
   } finally {
     graph._nodes.pop();
   }

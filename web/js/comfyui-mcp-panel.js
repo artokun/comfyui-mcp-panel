@@ -10216,6 +10216,64 @@ function describeActiveGraph(graph) {
   return withLiveIdentity({ scope: "root" });
 }
 
+/** #1925 — a parseable current-view witness for the orchestrator's promoted-write
+ *  cache. Malformed `viewing` is recorded as known:false ("scope became
+ *  unverifiable"); omit rather than send that. A successful graph command that
+ *  never published `viewing` also left the cache cold after hello/reconnect. */
+function parseableViewingWitness(viewing) {
+  if (!viewing || typeof viewing !== "object" || Array.isArray(viewing)) return null;
+  if (viewing.scope !== "root" && viewing.scope !== "subgraph") return null;
+  const rawOwner = viewing.owner_node_id;
+  if (rawOwner !== undefined && rawOwner !== null) {
+    if (
+      (typeof rawOwner !== "number" || !Number.isSafeInteger(rawOwner)) &&
+      (typeof rawOwner !== "string" || rawOwner.length === 0)
+    ) {
+      return null;
+    }
+  }
+  const rawWorkflowUuid = viewing.workflow_uuid;
+  if (
+    rawWorkflowUuid !== undefined &&
+    (typeof rawWorkflowUuid !== "string" || rawWorkflowUuid.length === 0)
+  ) {
+    return null;
+  }
+  const rawGraphIdentity = viewing.graph_identity;
+  if (
+    rawGraphIdentity !== undefined &&
+    (typeof rawGraphIdentity !== "string" ||
+      rawGraphIdentity.length === 0 ||
+      rawGraphIdentity.length > 256)
+  ) {
+    return null;
+  }
+  return viewing;
+}
+
+function liveParseableViewingWitness() {
+  try {
+    return parseableViewingWitness(describeActiveGraph(getGraphCtx().graph));
+  } catch {
+    return null;
+  }
+}
+
+function withViewingWitness(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const existing = Object.prototype.hasOwnProperty.call(result, "viewing")
+    ? parseableViewingWitness(result.viewing)
+    : null;
+  if (existing) return result;
+  const live = liveParseableViewingWitness();
+  if (!live) {
+    if (!Object.prototype.hasOwnProperty.call(result, "viewing")) return result;
+    const { viewing: _dropped, ...rest } = result;
+    return rest;
+  }
+  return { ...result, viewing: live };
+}
+
 /** #2314 — validate the promoted receiver at the synchronous mutation boundary.
  * The MCP-side graph_query is only a classification read; navigation can replace
  * the viewed graph before the write resumes. The expected scope is therefore an
@@ -10228,14 +10286,27 @@ function canonicalExpectedPromotedOwner(value) {
   return Number.isSafeInteger(parsed) ? String(parsed) : null;
 }
 
+function findLiveSubgraphInstance(current, ownerId) {
+  if (!ownerId) return null;
+  const seen = new Set();
+  for (const graph of [current?.graph, current?.rootGraph]) {
+    if (!graph || seen.has(graph)) continue;
+    seen.add(graph);
+    for (const node of graph._nodes ?? []) {
+      if (canonicalExpectedPromotedOwner(node?.id) === ownerId && node?.subgraph) return node;
+    }
+  }
+  return null;
+}
+
 function assertExpectedPromotedScope(current, expectedScope, resolveTerminal) {
   if (expectedScope === undefined) return;
   if (!expectedScope || typeof expectedScope !== "object" || Array.isArray(expectedScope)) {
     throw new Error("graph_set_widget expected_scope must be a structured subgraph witness");
   }
   const expected = expectedScope;
-  if (expected.scope !== "subgraph") {
-    throw new Error("graph_set_widget expected_scope.scope must be \"subgraph\"");
+  if (expected.scope !== "subgraph" && expected.scope !== "root") {
+    throw new Error("graph_set_widget expected_scope.scope must be \"subgraph\" or \"root\"");
   }
   const expectedOwner = canonicalExpectedPromotedOwner(expected.owner_node_id);
   if (!expectedOwner) {
@@ -10256,20 +10327,49 @@ function assertExpectedPromotedScope(current, expectedScope, resolveTerminal) {
   }
 
   const liveViewing = describeActiveGraph(current.graph);
-  const liveOwner = findSubgraphOwner(current.rootGraph, current.graph);
-  const liveOwnerId = canonicalExpectedPromotedOwner(liveOwner?.id);
-  if (
+  const liveOwnerFromView = findSubgraphOwner(current.rootGraph, current.graph);
+  const liveOwnerIdFromView = canonicalExpectedPromotedOwner(liveOwnerFromView?.id);
+  const workflowMatches =
+    expected.workflow_uuid === undefined || liveViewing.workflow_uuid === expected.workflow_uuid;
+  const describeLiveOwner = () =>
+    liveOwnerIdFromView ??
+    (liveViewing.scope === "root" ? "root (no subgraph owner)" : "missing subgraph owner");
+  const describeLive = () =>
+    `${liveViewing.scope} owner ${describeLiveOwner()}` +
+    `${liveViewing.workflow_uuid ? ` in workflow ${liveViewing.workflow_uuid}` : ""}` +
+    `${liveViewing.graph_identity ? ` graph ${liveViewing.graph_identity}` : ""}`;
+
+  let liveOwner = liveOwnerFromView;
+  if (liveViewing.scope === "root" && workflowMatches) {
+    // #1925 — a promoted write addressed at a subgraph INSTANCE is issued from
+    // the verified-stable root (the wrapper is on the root canvas). The
+    // expected envelope still names that instance as owner; expected.graph_identity
+    // is the CHILD graph, so it must not be compared to the live ROOT identity.
+    const instance = findLiveSubgraphInstance(current, expectedOwner);
+    if (!instance) {
+      throw new Error(
+        `graph_set_widget promoted receiver changed before dispatch: expected subgraph instance owner ${expectedOwner}` +
+          `${expected.workflow_uuid ? ` in workflow ${expected.workflow_uuid}` : ""} on the live root, ` +
+          `found ${describeLive()}. Nothing was applied.`,
+      );
+    }
+    if (expected.scope === "root" && liveViewing.graph_identity !== expected.graph_identity) {
+      throw new Error(
+        `graph_set_widget promoted receiver changed before dispatch: expected root graph ${expected.graph_identity}, ` +
+          `found ${describeLive()}. Nothing was applied.`,
+      );
+    }
+    liveOwner = { id: instance.id, node: instance, title: instance.title };
+  } else if (
     liveViewing.scope !== "subgraph" ||
-    liveOwnerId !== expectedOwner ||
-    (expected.workflow_uuid !== undefined && liveViewing.workflow_uuid !== expected.workflow_uuid) ||
+    liveOwnerIdFromView !== expectedOwner ||
+    !workflowMatches ||
     liveViewing.graph_identity !== expected.graph_identity
   ) {
     throw new Error(
       `graph_set_widget promoted receiver changed before dispatch: expected subgraph owner ${expectedOwner}` +
         `${expected.workflow_uuid ? ` in workflow ${expected.workflow_uuid}` : ""}, ` +
-        `found ${liveViewing.scope} owner ${liveOwnerId ?? "unverifiable"}` +
-        `${liveViewing.workflow_uuid ? ` in workflow ${liveViewing.workflow_uuid}` : ""}. ` +
-      "Nothing was applied.",
+        `found ${describeLive()}. Nothing was applied.`,
     );
   }
 
@@ -10321,7 +10421,9 @@ function assertExpectedPromotedScope(current, expectedScope, resolveTerminal) {
       (expectedRail.widget_id !== undefined && liveWidgetId !== expectedRail.widget_id)
     ) {
       throw new Error(
-        "graph_set_widget promoted parent rail changed or became unverifiable before dispatch. Nothing was applied.",
+        ownerNode
+          ? "graph_set_widget promoted parent rail changed or became unverifiable before dispatch. Nothing was applied."
+          : "graph_set_widget promoted parent rail is missing: the subgraph instance owner is not on the live canvas. Nothing was applied.",
       );
     }
   }
@@ -14694,12 +14796,26 @@ const GRAPH_TOOL_EXECUTORS = {
       truncatedBy = "max_chars";
       text = assemble();
     }
+    // #1925 — a pinpoint detail read is the orchestrator's promoted-scope probe.
+    // That classifier prefers a structured `nodes` row with a boolean
+    // `is_subgraph`; `text` alone is a fallback. Publish the row beside the
+    // survey line so a verified-stable root subgraph instance is classifiable.
+    const pinpointNodes =
+      pinpoint && proj === "detail" && shown === 1 && matched[0]
+        ? [
+            {
+              ...capSummaryWidgets(summarizeNode(matched[0]), detailWidgetCap, maxChars),
+              is_subgraph: !!matched[0].subgraph,
+            },
+          ]
+        : null;
     return {
       ...meta, total, candidates: candidates.length, matched: matched.length, shown, truncated,
       // #809: expose the CAUSE structurally too, so a caller that reads fields rather
       // than prose still learns which lever applies.
       truncated_by: truncatedBy,
       text,
+      ...(pinpointNodes ? { nodes: pinpointNodes } : {}),
     };
   },
 
@@ -27919,7 +28035,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // until after the correlated reply is delivered (#581).
             changeTrackerToSnapshot = app.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null;
           }
-          reply = { rid: msg.rid, ok: true, result };
+          reply = { rid: msg.rid, ok: true, result: withViewingWitness(result) };
         } catch (err) {
           const reconnectRefusal = readReconnectRefusal(err);
           const workflowListReadiness = readWorkflowListReadinessRefusal(err);
@@ -28389,6 +28505,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // the orchestrator can resume an UNSAVED workflow's conversation without
             // cross-resuming a DIFFERENT same-title unsaved workflow.
             workflowUuid: (advertisedWorkflowUuid = workflowStableUuid()),
+            // #1925 — restock the promoted-scope cache that this hello is about to clear.
+            viewing: liveParseableViewingWitness() ?? undefined,
             // #508/#694 — NO lostReplies summaries here: the hello fires at
             // socket-open, BEFORE the models handshake stamps this socket's session
             // epoch, so any summary computed now is filtered with an unknown epoch

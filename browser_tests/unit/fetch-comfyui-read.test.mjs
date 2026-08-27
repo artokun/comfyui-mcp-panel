@@ -240,7 +240,7 @@ test("#2283: the command remains on the authenticated rid executor/reply path", 
   assert.match(source, /"ui_render", "ui_update", "fetch_image", "fetch_comfyui_read"/);
   assert.match(source, /const isCommandFrame = msg && typeof msg\.rid === "string" && typeof msg\.cmd === "string"/);
   assert.match(source, /const executor = GRAPH_TOOL_EXECUTORS\[msg\.cmd\]/);
-  assert.match(source, /reply = \{ rid: msg\.rid, ok: true, result \}/);
+  assert.match(source, /reply = \{ rid: msg\.rid, ok: true, result: withViewingWitness\(result\) \}/);
   assert.match(source, /deliverReply\(reply, msg\.cmd, superseded, inFlightMark\)/);
   assert.equal(commandIsCanvasIndependent("fetch_comfyui_read"), true);
   assert.equal(commandIsCanvasTargetless("fetch_comfyui_read"), true);

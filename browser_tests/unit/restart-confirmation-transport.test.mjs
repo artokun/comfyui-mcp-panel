@@ -157,7 +157,7 @@ test("#1764 the real question painter settles the command before history persist
 test("#1764 production caller path keeps the original ask rid on the answer", () => {
   const bridge = namedFunctionSource(source, "createBridgeClient");
   assert.match(bridge, /result = await onAsk\(msg, thisSock\.__cmcpSocketId \?\? null\)/);
-  assert.match(bridge, /reply = \{ rid: msg\.rid, ok: true, result \}/);
+  assert.match(bridge, /reply = \{ rid: msg\.rid, ok: true, result: withViewingWitness\(result\) \}/);
   assert.match(bridge, /thisSock\["send"\]\(JSON\.stringify\(reply\)\)/);
   assert.match(bridge, /settleRid\(reply\)/);
 });
