@@ -803,10 +803,10 @@ test("#1709: a direct schema response crossing refresh cannot authorize a later 
   await directStarted.promise;
 
   // This is the same state transition registerComfyNodeDefs performs at refresh start:
-  // old whole-schema membership and verified per-class proof are both retired before the
-  // refresh fetch is allowed to establish new authority.
-  snapshot.clear();
-  built.verifiedNodeDefCache.clear();
+  // old whole-schema membership and verified per-class proof are fenced, not destroyed,
+  // so an in-flight probe cannot authorize after the refresh has begun.
+  snapshot.beginReplacement();
+  built.verifiedNodeDefCache.beginReplacement();
   const afterRefreshGeneration = built.verifiedNodeDefCache.generation();
   assert.ok(afterRefreshGeneration > beforeRefreshGeneration);
 
@@ -817,7 +817,7 @@ test("#1709: a direct schema response crossing refresh cannot authorize a later 
     "the old direct response cannot authorize after refresh; the timeout fallback refuses",
   );
   assert.equal(comfy.graph._nodes.length, 1, "the stale response did not mutate the graph");
-  assert.equal(snapshot.peek().held, false, "the old whole-schema snapshot stayed retired");
+  assert.equal(snapshot.isReplacementPending(), true, "the old whole-schema snapshot stayed fenced");
   assert.equal(
     built.verifiedNodeDefCache.get("ExistingNode", {
       epoch: 0,
@@ -825,7 +825,7 @@ test("#1709: a direct schema response crossing refresh cannot authorize a later 
       generation: afterRefreshGeneration,
     }),
     undefined,
-    "the old direct response did not repopulate verified proof",
+    "the old direct response did not repopulate verified proof while replacement is pending",
   );
   assert.deepEqual(
     calls,
@@ -916,6 +916,181 @@ test("#2249: an empty refresh response retires the old whole snapshot instead of
     null,
     "a later silent probe cannot resurrect a type absent from the empty replacement",
   );
+});
+
+test("#1709: timeout-starved repeated add fails without proof and reuses verified schema after a failed refresh", async () => {
+  const comfy = makeComfy();
+  const defs = backendObjectInfo();
+  comfy.app.registerNodesFromDefs(defs);
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const objectInfoCache = createObjectInfoCache();
+  assert.equal(
+    snapshot.record(defs, {
+      observedAtEpoch: 0,
+      currentEpoch: 0,
+      observedAtGeneration: 0,
+      currentGeneration: 0,
+      whole: true,
+    }),
+    true,
+  );
+
+  const calls = [];
+  let unavailable = false;
+  const api = {
+    async fetchApi(route) {
+      calls.push(route);
+      if (unavailable) return { status: 503, json: async () => ({}) };
+      const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+      return {
+        status: 200,
+        json: async () =>
+          Object.prototype.hasOwnProperty.call(defs, classType) ? { [classType]: defs[classType] } : {},
+      };
+    },
+    async getNodeDefs() {
+      calls.push("/object_info");
+      if (unavailable) return NODE_DEFS_NO_ANSWER;
+      return defs;
+    },
+  };
+
+  const built = realGraphAddNode({
+    comfy,
+    overrides: {
+      api,
+      objectInfoCache,
+      objectInfoSnapshot: snapshot,
+      verifiedNodeDefCache,
+      objectInfoHistory: { wasTypeEverDefined: () => true },
+    },
+  });
+
+  unavailable = true;
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "ExistingNode" }),
+    /cannot verify node type|object_info is unavailable|Refusing to add/i,
+    "a timeout-starved first add of a never-verified class still fails closed",
+  );
+  assert.equal(comfy.graph._nodes.length, 0, "the never-verified timeout add did not mutate the graph");
+
+  unavailable = false;
+  const first = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(first.added.type, "ExistingNode");
+  const proofGeneration = verifiedNodeDefCache.generation();
+  assert.ok(
+    verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: proofGeneration,
+    }),
+    "the first production add established reusable proof",
+  );
+
+  const register = realRegisterComfyNodeDefs({
+    app: comfy.app,
+    api: {
+      async getNodeDefs() {
+        return NODE_DEFS_NO_ANSWER;
+      },
+      async fetchApi() {
+        return { ok: false, status: 503, json: async () => ({}) };
+      },
+    },
+    objectInfoCache,
+    objectInfoSnapshot: snapshot,
+    verifiedNodeDefCache,
+  });
+  const verdict = await register(undefined, { runBudgetMs: 100 });
+  assert.equal(verdict.refreshed, false, "the timeout-starved refresh does not claim freshness");
+  assert.equal(verifiedNodeDefCache.isReplacementPending(), false, "the failed refresh settles the proof fence");
+  assert.ok(
+    verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: verifiedNodeDefCache.generation(),
+    }),
+    "verified proof survives a refresh that never obtained a whole map",
+  );
+
+  unavailable = true;
+  const reused = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(reused.added.type, "ExistingNode", "the later silent add reuses the verified schema");
+  assert.equal(comfy.graph._nodes.length, 2);
+
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "NewNode" }),
+    /cannot verify node type|object_info is unavailable|Refusing to add/i,
+    "a never-verified class still fails closed after the same silent probes",
+  );
+  assert.equal(comfy.graph._nodes.length, 2, "the never-verified timeout add still did not mutate the graph");
+});
+
+test("#1709: a successful whole refresh retires verified add-node proof before a later timeout", async () => {
+  const comfy = makeComfy();
+  const defs = backendObjectInfo();
+  comfy.app.registerNodesFromDefs(defs);
+  const snapshot = createObjectInfoSnapshot();
+  const verifiedNodeDefCache = createVerifiedNodeDefCache();
+  const objectInfoCache = createObjectInfoCache();
+  const api = {
+    async fetchApi(route) {
+      if (route.startsWith("/object_info/")) {
+        const classType = decodeURIComponent(String(route).replace("/object_info/", ""));
+        return {
+          status: 200,
+          json: async () =>
+            Object.prototype.hasOwnProperty.call(defs, classType) ? { [classType]: defs[classType] } : {},
+        };
+      }
+      return { status: 503, json: async () => ({}) };
+    },
+    async getNodeDefs() {
+      return defs;
+    },
+  };
+  const built = realGraphAddNode({
+    comfy,
+    overrides: {
+      api,
+      objectInfoCache,
+      objectInfoSnapshot: snapshot,
+      verifiedNodeDefCache,
+      objectInfoHistory: { wasTypeEverDefined: () => true },
+    },
+  });
+  const first = await built.graph_add_node({ class_type: "ExistingNode" });
+  assert.equal(first.added.type, "ExistingNode");
+
+  comfy.app.refreshComboInNodes = async () => {};
+  const register = realRegisterComfyNodeDefs({
+    app: comfy.app,
+    api,
+    objectInfoCache,
+    objectInfoSnapshot: snapshot,
+    verifiedNodeDefCache,
+  });
+  const verdict = await register(undefined, { runBudgetMs: 1000 });
+  assert.equal(verdict.refreshed, true, "the current whole map still refreshes");
+  assert.equal(
+    verifiedNodeDefCache.get("ExistingNode", {
+      epoch: 0,
+      context: built.verifiedSchemaContext,
+      generation: verifiedNodeDefCache.generation(),
+    }),
+    undefined,
+    "an authoritative whole refresh retires per-class proof",
+  );
+
+  api.getNodeDefs = async () => NODE_DEFS_NO_ANSWER;
+  api.fetchApi = async () => ({ status: 503, json: async () => ({}) });
+  await assert.rejects(
+    () => built.graph_add_node({ class_type: "ExistingNode" }),
+    /cannot verify node type|object_info is unavailable|Refusing to add/i,
+    "a later timeout cannot reuse proof retired by the successful refresh",
+  );
+  assert.equal(comfy.graph._nodes.length, 1, "the refused timeout fallback did not add a node");
 });
 
 test("#1709: graph_add_node replaces the old whole cache and snapshot on a changed response", async () => {
