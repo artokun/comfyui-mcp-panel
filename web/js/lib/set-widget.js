@@ -15,9 +15,11 @@
 //      on a genuinely-resolved direct node (never a placeholder).
 //   3. applyWidgetWrite with the resolved-target registry guard, which runs
 //      BEFORE value coercion and any mutation/callback.
-// Post-write, inside the same synchronous boundary (#1282): refresh the node's
-// dynamic input slots via its own "Update inputs"-style control when it exposes
-// one — disclosed on the success result, never thrown over a verified write.
+// Post-write, inside the same synchronous boundary (#1282, #1932): refresh the
+// node's dynamic input slots via its own "Update inputs"-style control when it
+// exposes one, and rebuild generated custom-widget rows that view hidden
+// backend widgets — disclosed on the success result, never thrown over a
+// verified write.
 
 import {
   applyWidgetWrite,
@@ -40,6 +42,7 @@ import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-af
 import { isTypeScopedObjectInfo } from "./scoped-object-info.js";
 import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
 import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
+import { refreshCustomGeneratedWidgetsAfterWrite } from "./custom-generated-widgets-refresh.js";
 import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
 import {
   uploadInputConfig,
@@ -839,21 +842,48 @@ export async function runSetWidget(
       // never thrown over a verified write. The press runs inside its own
       // before/afterChange bracket so the slot changes join the command's undo
       // history.
-      const refresh = refreshDynamicInputsAfterWrite(resolvedTargetNode ?? node, {
+      const targetNode = resolvedTargetNode ?? node;
+      const refresh = refreshDynamicInputsAfterWrite(targetNode, {
         canvas,
         beforeChange,
         afterChange,
         setDirty,
       });
-      if (!refresh) return set;
-      if (refresh.failed) {
-        return {
-          ...set,
+      // #1932 — REBUILD GENERATED CUSTOM WIDGETS after the write. Deno Multi LoRA
+      // (and the LTX sibling) hide the backend widgets panel_set_widget writes and
+      // draw serialize:false custom rows on top. Their redraw() only dirties the
+      // canvas, so active_loras 1→3 reported success while the visible rows/height
+      // stayed at 1 until the subgraph was left and re-entered. Keyed on that
+      // pattern, not a node-type list — see lib/custom-generated-widgets-refresh.js.
+      // Same containment as the #1282 press: a rebuild failure is DISCLOSED on
+      // the success result, never thrown over a verified write.
+      const generated = refreshCustomGeneratedWidgetsAfterWrite(targetNode, {
+        canvas,
+        beforeChange,
+        afterChange,
+        setDirty,
+      });
+      let out = set;
+      if (refresh?.failed) {
+        out = {
+          ...out,
           dynamic_inputs_refresh_failed: refresh.failed,
           ...(refresh.inputs ? { dynamic_inputs: refresh.inputs } : {}),
         };
+      } else if (refresh?.refreshed) {
+        out = { ...out, dynamic_inputs_refreshed: true, dynamic_inputs: refresh.inputs };
       }
-      return { ...set, dynamic_inputs_refreshed: true, dynamic_inputs: refresh.inputs };
+      if (generated?.failed) {
+        return {
+          ...out,
+          generated_widgets_refresh_failed: generated.failed,
+          ...(generated.widgets ? { generated_widgets: generated.widgets } : {}),
+        };
+      }
+      if (generated?.refreshed) {
+        return { ...out, generated_widgets_refreshed: true, generated_widgets: generated.widgets };
+      }
+      return out;
     } catch (err) {
       // The write refused over a target this attempt had just created. Undo it in the same
       // synchronous stretch, so the graph the refusal is reported over is the graph the
