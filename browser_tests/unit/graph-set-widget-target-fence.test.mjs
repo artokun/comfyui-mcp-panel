@@ -429,3 +429,186 @@ test("#2314 terminal endpoint is part of the shipped receiver fence", () => {
     /could not verify the terminal promotion endpoint/,
   );
 });
+
+function loadPromotedScopeHelper() {
+  const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
+  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "production scope helper boundary not found");
+  return PANEL_SRC.slice(helperStart, helperEnd);
+}
+
+test("#1925 verified-stable root dispatches a promoted write on a subgraph instance", () => {
+  const childGraph = { name: "Video Generation" };
+  const wrapper = { id: 340, subgraph: childGraph, widgets: [], title: "LTX" };
+  const rootGraph = { _nodes: [wrapper], name: "root" };
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    `${loadPromotedScopeHelper()}; return assertExpectedPromotedScope;`,
+  )(
+    (graph) =>
+      graph === childGraph
+        ? {
+            scope: "subgraph",
+            owner_node_id: 340,
+            workflow_uuid: "workflow-a",
+            graph_identity: "graph:child",
+          }
+        : { scope: "root", workflow_uuid: "workflow-a", graph_identity: "graph:root" },
+    (_root, graph) => (graph === childGraph ? { id: 340, node: wrapper } : null),
+  );
+
+  const expected = {
+    scope: "subgraph",
+    owner_node_id: 340,
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph:child",
+  };
+  assert.doesNotThrow(
+    () => assertScope({ graph: rootGraph, rootGraph }, expected),
+    "a verified-stable root must dispatch a promoted write aimed at a root-visible subgraph instance",
+  );
+});
+
+test("#1925 root expected_scope matches the live root graph identity", () => {
+  const wrapper = { id: 92, subgraph: { name: "klein" }, widgets: [] };
+  const rootGraph = { _nodes: [wrapper] };
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    `${loadPromotedScopeHelper()}; return assertExpectedPromotedScope;`,
+  )(
+    () => ({ scope: "root", workflow_uuid: "workflow-a", graph_identity: "graph:root" }),
+    () => null,
+  );
+  assert.doesNotThrow(() =>
+    assertScope({ graph: rootGraph, rootGraph }, {
+      scope: "root",
+      owner_node_id: 92,
+      workflow_uuid: "workflow-a",
+      graph_identity: "graph:root",
+    }),
+  );
+  assert.throws(
+    () =>
+      assertScope({ graph: rootGraph, rootGraph }, {
+        scope: "root",
+        owner_node_id: 92,
+        workflow_uuid: "workflow-a",
+        graph_identity: "graph:other-root",
+      }),
+    /expected root graph graph:other-root/,
+  );
+  assert.doesNotMatch(
+    (() => {
+      try {
+        assertScope({ graph: rootGraph, rootGraph }, {
+          scope: "root",
+          owner_node_id: 92,
+          workflow_uuid: "workflow-a",
+          graph_identity: "graph:other-root",
+        });
+        return "";
+      } catch (err) {
+        return String(err.message);
+      }
+    })(),
+    /unverifiable/,
+    "a mismatched but readable root must name the live identity, not 'unverifiable'",
+  );
+});
+
+test("#1925 a verified-stable root still refuses when the subgraph instance is gone", () => {
+  const rootGraph = { _nodes: [{ id: 1, type: "SaveVideo" }] };
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    `${loadPromotedScopeHelper()}; return assertExpectedPromotedScope;`,
+  )(
+    () => ({ scope: "root", workflow_uuid: "workflow-a", graph_identity: "graph:root" }),
+    () => null,
+  );
+  assert.throws(
+    () =>
+      assertScope({ graph: rootGraph, rootGraph }, {
+        scope: "subgraph",
+        owner_node_id: 340,
+        workflow_uuid: "workflow-a",
+        graph_identity: "graph:child",
+      }),
+    /expected subgraph instance owner 340/,
+  );
+});
+
+test("#1925 parent-rail check resolves the wrapper on the live root", () => {
+  const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
+  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const promotionStart = PANEL_SRC.indexOf("function resolveSubgraphLink(");
+  const promotionEnd = PANEL_SRC.indexOf("\nfunction findPromotedHostInput", promotionStart);
+  const sourceForSubgraphInput = new Function(
+    `${PANEL_SRC.slice(promotionStart, promotionEnd)}; return sourceForSubgraphInput;`,
+  )();
+  const assertScope = new Function(
+    "describeActiveGraph",
+    "findSubgraphOwner",
+    "resolvePromotedInnerTarget",
+    "sourceForSubgraphInput",
+    `${PANEL_SRC.slice(helperStart, helperEnd)}; return assertExpectedPromotedScope;`,
+  );
+
+  const rail = { name: "value_5", value: true };
+  const innerWidget = { name: "value", value: true };
+  const innerInput = { name: "value", widget: { name: "value" } };
+  const inner = {
+    id: 12,
+    type: "PrimitiveBoolean",
+    inputs: [innerInput],
+    widgets: [innerWidget],
+  };
+  const childGraph = {
+    _nodes: [inner],
+    getNodeById: (id) => (String(id) === "12" ? inner : null),
+    getLink: (id) => (id === 1 ? { origin_id: 12, target_id: 12, target_slot: 0 } : null),
+  };
+  const hostInput = {
+    name: "value_5",
+    widget: rail,
+    _widget: rail,
+    widgetId: "root:340:value_5",
+    _subgraphSlot: { name: "value_5", linkIds: [1] },
+  };
+  const wrapper = { id: 340, widgets: [rail], inputs: [hostInput], subgraph: childGraph };
+  const rootGraph = { _nodes: [wrapper] };
+  const describeActiveGraph = () => ({
+    scope: "root",
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph:root",
+  });
+  const fence = assertScope(
+    describeActiveGraph,
+    findSubgraphOwner,
+    resolvePromotedInnerTarget,
+    sourceForSubgraphInput,
+  );
+  const expected = {
+    scope: "subgraph",
+    owner_node_id: 340,
+    workflow_uuid: "workflow-a",
+    graph_identity: "graph:child",
+    promoted_widget: "value_5",
+    parent_rail: {
+      authoritative: true,
+      widget: "value_5",
+      widget_id: "root:340:value_5",
+    },
+  };
+  assert.doesNotThrow(
+    () => fence({ graph: rootGraph, rootGraph }, expected),
+    "the root-visible wrapper's promoted rail must be writable without entering",
+  );
+  hostInput.link = 99;
+  assert.throws(
+    () => fence({ graph: rootGraph, rootGraph }, expected),
+    /promoted parent rail changed or became unverifiable/,
+  );
+});

@@ -265,6 +265,19 @@ test("#296: resume rides the hello only when present", () => {
   assert.equal(buildHelloPayload({ tabId: "t", resume: "sess-1" }).resume, "sess-1");
 });
 
+test("#1925: hello carries a parseable current-view witness when the canvas is known", () => {
+  const viewing = {
+    scope: "root",
+    workflow_uuid: "e14c8786-dbbd-49ee-b19f-84c0032bb9bc",
+    graph_identity: "graph:f157b6b5-0ed3-4e58-a4b7-52619cb9150e",
+  };
+  const frame = buildHelloPayload({ tabId: "t", viewing });
+  assert.deepEqual(frame.viewing, viewing);
+  assert.equal("viewing" in buildHelloPayload({ tabId: "t" }), false);
+  assert.equal("viewing" in buildHelloPayload({ tabId: "t", viewing: { scope: "other" } }), false);
+  assert.equal("viewing" in buildHelloPayload({ tabId: "t", viewing: null }), false);
+});
+
 test("#570/#718: hello ALWAYS advertises both workflow-stamp fences so the orchestrator can safely allow graph edits", () => {
   // A current build fences at dispatch AND immediately before an async graph write.
   // Both flags must ride every hello (not gated behind optional fields), so the
