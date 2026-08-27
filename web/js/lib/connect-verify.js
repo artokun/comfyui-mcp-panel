@@ -378,7 +378,18 @@ export function verifyConnect(graph, before, { intendedLinkIds = [], replacedLin
     Number(a.target_slot) === Number(b.target_slot);
   const collateralMovedLinks = [];
   for (const [id, was] of before?.links ?? []) {
-    if (id === replacedId || intended.has(id)) continue;
+    // `replacedId` is exempt: connect displaces that wire by design and the reply names it.
+    // `intended` is deliberately NOT exempt here, and that is the second gate P1 on this
+    // fix. Exempting it by id meant an id REUSE — LiteGraph handing the new link an id a
+    // different wire already held — silently destroyed that wire while the verdict read
+    // ok:true. Executed proof: before `7: 99->1`, after `7: 2->3`, intendedLinkIds [7];
+    // the old 99->1 simply vanished with nothing disclosed. That is the link-id-reuse
+    // hypothesis #2380's reporter raised, and the exemption was hiding exactly it.
+    //
+    // A genuinely NEW link cannot appear in `before`, so declining to exempt intended ids
+    // here costs a correct connect nothing: the only way an intended id is already present
+    // is that it was reused, and then the previous occupant really is gone.
+    if (id === replacedId) continue;
     const now = after.links.get(id);
     if (now && !sameEndpoints(was, now)) collateralMovedLinks.push({ before: was, after: now });
   }

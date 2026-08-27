@@ -207,16 +207,31 @@ test("#2380 in-place endpoint rewrite is COLLATERAL, not invisible", () => {
   assert.match(bullets[0], /1282/);
 });
 
-test("#2380 the intended and replaced links may move without being called collateral", () => {
-  // A dynamic pack re-slotting the wire this connect just made is expected, and the
-  // displaced wire is already reported as replaced_link.
+test("#2380 an intended id ALREADY PRESENT is id REUSE — the old wire's loss is reported", () => {
+  // This test previously asserted the opposite, and it was wrong: exempting an intended
+  // id from the before-side analysis is what let a reused id destroy an unrelated wire
+  // silently. A genuinely new link cannot be in `before`, so an intended id that IS
+  // present means LiteGraph handed the new link an id another wire already held.
   const g = reproGraph();
   const before = snapshotGraphState(g);
-  g.links[11] = { id: 11, origin_id: 1273, origin_slot: 0, target_id: 1282, target_slot: 1 };
-  g.links[12] = { id: 12, origin_id: 1235, origin_slot: 0, target_id: 1282, target_slot: 0 };
-  assert.equal(verifyConnect(g, before, { intendedLinkIds: [11], replacedLinkId: 12 }).ok, true);
+  // Link 11 was 1273 -> 1282. connect() returns id 11 for a completely different wire.
+  g.links[11] = { id: 11, origin_id: 1280, origin_slot: 0, target_id: 1283, target_slot: 0 };
+
+  const v = verifyConnect(g, before, { intendedLinkIds: [11], replacedLinkId: null });
+  assert.equal(v.ok, false, "the wire that held this id is gone and must be disclosed");
+  assert.equal(v.collateralMovedLinks.length, 1);
+  assert.equal(String(v.collateralMovedLinks[0].before.target_id), "1282");
+  assert.equal(String(v.collateralMovedLinks[0].after.target_id), "1283");
 });
 
+test("#2380 the REPLACED link may still be displaced without being called collateral", () => {
+  // replacedLinkId stays exempt: connect drops that wire by design and the reply already
+  // names it as replaced_link. Only the intended exemption was too broad.
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  g.links[12] = { id: 12, origin_id: 1283, origin_slot: 0, target_id: 1282, target_slot: 1 };
+  assert.equal(verifyConnect(g, before, { replacedLinkId: 12 }).ok, true);
+});
 test("#2380 an unmoved link is not reported — no false positive on a quiet connect", () => {
   const g = reproGraph();
   const before = snapshotGraphState(g);
