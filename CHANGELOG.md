@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.119] - 2026-08-27
+
 ### Fixed
 - panel_set_widget refuses MiniMaxH3Director `timeline_data` and `builder_state` writes that leave the derived prompt stale (#1935)
 - SaveVideo keeps nested `format.codec` and drops the orphan top-level `codec`, so add and load stay queueable (#1931)
