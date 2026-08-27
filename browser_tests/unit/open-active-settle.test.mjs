@@ -851,6 +851,293 @@ test("#1639 production workflow_open preserves proven-bound capture after a legi
   assert.equal(panel.guard(), null, "the production open releases its reload guard");
 });
 
+test("#1215 production workflow_open does not capture a still-mounted previous canvas even when the Pinia watch proves the tab move", async () => {
+  const uuid = "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+  const previousState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  const targetState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["target-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  let active;
+  let captured = 0;
+  let loadedValue;
+  const subscribers = [];
+  const workflowStore = {
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  };
+  const root = {
+    _nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  const previous = {
+    path: "workflows/previous.json",
+    changeTracker: { activeState: structuredClone(previousState) },
+  };
+  active = previous;
+  const target = {
+    path: "workflows/target.json",
+    filename: "target.json",
+    isModified: false,
+    changeTracker: {
+      activeState: structuredClone(targetState),
+      checkState() {
+        captured += 1;
+        this.activeState = structuredClone(previousState);
+      },
+    },
+  };
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: { graph: root },
+    loadGraphData: async (state) => {
+      loadedValue = state?.nodes?.[0]?.widgets_values?.[0];
+      root.extra = state.extra;
+      root._nodes = state.nodes.map((node) => ({ ...node }));
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const status = { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" };
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app,
+    document: workflowPiniaDocument(workflowStore),
+    activeWorkflowRef: () => active,
+    sameWorkflowObject: (a, b) => a === b,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    WORKFLOW_PATH_FIELD: "workflow_path",
+    OPEN_PROOF_FIELD: "open_proof",
+    workflowObjectUuid: () => uuid,
+    workflowStableUuid: () => uuid,
+    workflowOwnsRootUuidTag: () => false,
+    workflowUuidOwner: () => null,
+    getWorkflowTitle: () => "Target",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => null,
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+    settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+    workflowRecordMatchesSelector: () => true,
+    installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+    installGraphConfigureWatch: () => ({ restore: () => {} }),
+    loadRestoreCompleted: () => true,
+    retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+    liteGraphGlobal: () => null,
+    getGraphCtx: () => ({ graph: root, rootGraph: root }),
+    describeLiveCanvasBinding: () => "bound",
+    applySavedNodePresentation: () => {},
+    applySavedSubgraphHostWidgets: () => {},
+    decideOpenStaleness: () => ({ stale: false, reload: false }),
+    describeRepaintSourceBinding: () => "unknown",
+    graphRootCarriesOpenProof: () => true,
+    graphRootWorkflowUuidMatches: () => true,
+    graphRootReproducesStateContent: ({ rootGraph, state }) => ({
+      proven: rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0],
+      presentationOnly: false,
+      normalizedOnly: false,
+    }),
+    describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
+    openContentDifferenceIsDefinitionsOnly: () => false,
+    resolveOpenRebindVerdict: ({ contentMatches }) =>
+      contentMatches ? { status: status.PROVEN } : { status: status.CONTENT_UNVERIFIED },
+    describeOpenRebindOutcome: () => "content could not be verified",
+    OPEN_REBIND_STATUS: status,
+    GRAPH_TOOL_EXECUTORS: { graph_outline: () => ({ node_count: 1, outline: "1 KSampler", detail_level: "full" }) },
+    settleOpenedWorkflowReadable,
+    settleOwnedOpenedWorkflowActive,
+    noteOpenAttempt: () => ({ seq: 1 }),
+    backendSocketReplyFields: () => ({}),
+    activeWorkflowUuidForOpenReply: () => uuid,
+    describeOpenActiveBinding: () => ({ active_matches_target: true }),
+    canvasFileDivergenceNote: () => null,
+    failOpenRebindUnknown: (error) => error,
+    coerceMessageText: (value) => String(value),
+  });
+
+  const result = await panel.method({ path: "target.json", rid: "still-mounted-source" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captured, 0, "a proven pointer move is not proof the still-mounted canvas belongs to TARGET");
+  assert.equal(loadedValue, "target-value", "the repaint must use TARGET's tracker, not the previous canvas");
+  assert.equal(root._nodes[0].widgets_values[0], "target-value");
+  assert.equal(panel.guard(), null, "the production open releases its reload guard");
+});
+
+test("#1215 production workflow_open refuses when the load leaves the previous tab's widgets on the canvas", async () => {
+  const uuid = "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+  const previousState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  const targetState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["target-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  let active;
+  const subscribers = [];
+  const workflowStore = {
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  };
+  const root = {
+    _nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+  };
+  const previous = {
+    path: "workflows/previous.json",
+    changeTracker: { activeState: structuredClone(previousState) },
+  };
+  active = previous;
+  const target = {
+    path: "workflows/target.json",
+    filename: "target.json",
+    isModified: false,
+    changeTracker: { activeState: structuredClone(targetState), checkState() {} },
+  };
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: { graph: root },
+    loadGraphData: async () => {
+      // Related-workflow merge: same ids/types, previous widgets survive.
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const status = { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" };
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app,
+    document: workflowPiniaDocument(workflowStore),
+    activeWorkflowRef: () => active,
+    sameWorkflowObject: (a, b) => a === b,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    WORKFLOW_PATH_FIELD: "workflow_path",
+    OPEN_PROOF_FIELD: "open_proof",
+    workflowObjectUuid: () => uuid,
+    workflowStableUuid: () => uuid,
+    workflowOwnsRootUuidTag: () => false,
+    workflowUuidOwner: () => null,
+    getWorkflowTitle: () => "Target",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => null,
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+    settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+    workflowRecordMatchesSelector: () => true,
+    installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+    installGraphConfigureWatch: () => ({ restore: () => {} }),
+    loadRestoreCompleted: () => true,
+    retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+    liteGraphGlobal: () => null,
+    getGraphCtx: () => ({ graph: root, rootGraph: root }),
+    describeLiveCanvasBinding: () => "bound",
+    applySavedNodePresentation: () => {},
+    applySavedSubgraphHostWidgets: () => {},
+    decideOpenStaleness: () => ({ stale: false, reload: false }),
+    describeRepaintSourceBinding: () => "unknown",
+    graphRootCarriesOpenProof: () => true,
+    graphRootWorkflowUuidMatches: () => true,
+    graphRootReproducesStateContent: ({ rootGraph, state }) => {
+      const liveValue = rootGraph?._nodes?.[0]?.widgets_values?.[0];
+      const requestedValue = state?.nodes?.[0]?.widgets_values?.[0];
+      const proven = liveValue === requestedValue;
+      return {
+        proven,
+        presentationOnly: false,
+        normalizedOnly: !proven,
+        normalizedFields: proven ? [] : ["widgets_values"],
+      };
+    },
+    describeGraphStateDifference: () => ({
+      comparable: true,
+      surfaces: ["nodes"],
+      accountedSurfaces: [],
+      nodeDifference: { comparable: true, sameNodeSet: true, fields: ["widgets_values"] },
+    }),
+    openContentDifferenceIsDefinitionsOnly: () => false,
+    resolveOpenRebindVerdict: ({ contentMatches }) =>
+      contentMatches ? { status: status.PROVEN } : { status: status.CONTENT_UNVERIFIED },
+    describeOpenRebindOutcome: () => "content could not be verified",
+    OPEN_REBIND_STATUS: status,
+    GRAPH_TOOL_EXECUTORS: { graph_outline: () => null },
+    settleOpenedWorkflowReadable,
+    settleOwnedOpenedWorkflowActive,
+    noteOpenAttempt: () => ({ seq: 1 }),
+    backendSocketReplyFields: () => ({}),
+    activeWorkflowUuidForOpenReply: () => uuid,
+    describeOpenActiveBinding: () => ({ active_matches_target: true }),
+    canvasFileDivergenceNote: () => null,
+    failOpenRebindUnknown: (error) => error,
+    coerceMessageText: (value) => String(value),
+  });
+
+  await assert.rejects(
+    panel.method({ path: "target.json", rid: "leftover-source-widgets" }),
+    /content could not be verified/,
+    "normalizedOnly must not publish TARGET's fence over the previous tab's widgets",
+  );
+  assert.equal(root._nodes[0].widgets_values[0], "previous-value", "the leftover canvas is still SOURCE");
+  assert.equal(panel.guard(), null, "the refused open still releases its reload guard");
+});
+
 test("#1639 production workflow_open remembers a switch-away-and-back during an awaited open step", async () => {
   const uuid = "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
   const previous = { path: "workflows/previous.json" };

@@ -21687,9 +21687,34 @@ const GRAPH_TOOL_EXECUTORS = {
             pointerMovedThisOpen,
           });
           if (captureDecision.disclose) pointerWatchUnavailable = true;
+          // #1215 (2026-08-27 recurrence) — DISTINCT from #1911. The Pinia watch
+          // proves the POINTER moved; it does not prove the canvas swapped. A stale
+          // or shared root UUID still answers "bound" while app.graph is the outgoing
+          // tab, and checkState() then serializes that previous canvas into TARGET.
+          // Related workflows (same node ids/types, different widgets) are the shape
+          // that then publishes TARGET's fence over SOURCE's values.
+          // proven/presentationOnly only: normalizedOnly would treat those related
+          // graphs as a match, which is the silent serve this closes.
+          const sourceStateForSwitch = pointerMovedThisOpen
+            ? (activeBefore?.changeTracker?.activeState ?? activeBefore?.activeState)
+            : null;
+          const liveCanvasStillSource = (rootGraph) => {
+            if (!pointerMovedThisOpen) return false;
+            if (!sourceStateForSwitch || !Array.isArray(sourceStateForSwitch.nodes)) return false;
+            try {
+              const proof = graphRootReproducesStateContent({
+                rootGraph,
+                state: sourceStateForSwitch,
+              });
+              return proof?.proven === true || proof?.presentationOnly === true;
+            } catch {
+              return false;
+            }
+          };
           if (
             openSettled?.loaded !== true &&
-            captureDecision.capture
+            captureDecision.capture &&
+            !liveCanvasStillSource(app?.graph)
           ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
@@ -21964,8 +21989,20 @@ const GRAPH_TOOL_EXECUTORS = {
               // that the restore did not stop early, which REFUTES the one mechanism
               // this refusal was ever justified by. It names the differing fields on the
               // reply instead of vouching for them.
-              const contentMatches =
+              let contentMatches =
                 contentProof.proven || contentProof.presentationOnly || contentProof.normalizedOnly;
+              // #1215 — normalizedOnly licenses widget-value drift on a completed load
+              // of THIS graph. After a tab switch it also licenses leftover widgets
+              // from the PREVIOUS graph (related workflows share ids/types). If the
+              // live root still reproduces SOURCE, that is not target normalization.
+              if (
+                contentMatches &&
+                !contentProof.proven &&
+                !contentProof.presentationOnly &&
+                liveCanvasStillSource(rootGraph)
+              ) {
+                contentMatches = false;
+              }
               if (contentProof.proven && !contentProof.exact) {
                 openGeometryRewritten = contentProof.fields;
               }
@@ -22068,10 +22105,18 @@ const GRAPH_TOOL_EXECUTORS = {
                         state: repaintState,
                         loadRanToCompletion,
                       });
-                      const recoveredContentMatches =
+                      let recoveredContentMatches =
                         recoveredContentProof.proven ||
                         recoveredContentProof.presentationOnly ||
                         recoveredContentProof.normalizedOnly;
+                      if (
+                        recoveredContentMatches &&
+                        !recoveredContentProof.proven &&
+                        !recoveredContentProof.presentationOnly &&
+                        liveCanvasStillSource(recoveredRootGraph)
+                      ) {
+                        recoveredContentMatches = false;
+                      }
                       const recoveredActive = activeWorkflowRef();
                       const recoveredBindingMatches =
                         sameWorkflowObject(recoveredActive, target) &&

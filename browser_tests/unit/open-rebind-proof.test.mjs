@@ -1149,6 +1149,11 @@ test("#1215: an untagged root admits the capture only in the already-current cas
     /if \(captureBinding !== "foreign"\)/,
     '"not foreign" alone was the #1215 hole — it must not come back',
   );
+  assert.match(
+    gate,
+    /!liveCanvasStillSource\(app\?\.graph\)/,
+    "a still-mounted SOURCE canvas must not be captured into TARGET even when bound",
+  );
 });
 
 test("#1215: an untagged repaint source on a tab switch is DISCLOSED, not silently served", () => {

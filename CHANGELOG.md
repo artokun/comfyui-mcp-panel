@@ -15,6 +15,7 @@ All notable changes to this project are documented here. This project adheres to
 - live-canvas capture no longer skips silently when Pinia `$subscribe` is missing (#1911)
 - disclose connect changes on nodes the command never named (#1928)
 
+- workflow_open no longer paints or admits the previous tab's graph after a switch, even when the live canvas still carries the target UUID (#1215)
 
 ## [0.15.115] - 2026-08-27
 
