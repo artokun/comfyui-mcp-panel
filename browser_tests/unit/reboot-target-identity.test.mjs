@@ -23,20 +23,21 @@ const reboot = (() => {
   return PANEL.slice(at, PANEL.indexOf("  async free_vram()", at));
 })();
 
-test("the target comes from the SAME value handed to the orchestrator in hello", () => {
-  // If this used its own notion of the ComfyUI URL, the identity a caller
-  // compares against its own target could drift from the one it was told to
-  // target — which is the entire failure being fixed.
+test("the target is the bound canvas origin — the host that actually goes down", () => {
+  // #851 named a host. #1913 says which host: the page origin, not the hello
+  // Remote-URL override. Naming the override while `api.fetchApi` hits the page
+  // is a confident wrong answer (panel 8189, boot/override 8188).
   const fn = PANEL.slice(
     PANEL.indexOf("function rebootTargetFields() {"),
     PANEL.indexOf("const GRAPH_TOOL_EXECUTORS = {"),
   );
   assert.ok(fn.length > 0, "the helper must precede the executors table");
-  assert.ok(fn.includes("comfyuiUrlForAgent()"), "it must reuse the hello identity");
+  assert.ok(fn.includes("rebootBoundOrigin()"), "it must name the bound canvas");
+  assert.ok(!fn.includes("comfyuiUrlForAgent()"), "hello override is not the reboot target");
 });
 
 test("an unknown target is OMITTED, never guessed", () => {
-  // `comfyuiUrlForAgent()` returns "" when it cannot read the location. Emitting
+  // `rebootBoundOrigin()` returns "" when it cannot read the location. Emitting
   // `target: ""` would be worse than saying nothing: a caller comparing hosts
   // would read it as a real, different one.
   const fn = PANEL.slice(
@@ -57,11 +58,12 @@ test("it is a plain function, not a method on the executors table", () => {
 
 // ── every branch, including the ones that failed ───────────────────────────
 
-test("all six reply branches name the target", () => {
+test("all seven reply branches name the target", () => {
   // The failures matter most: "which server refused?" is the whole question when
   // the panel and the headless tool disagree about what they are pointing at.
+  // #1913 adds the bound-identity refusal as a seventh named branch.
   const spread = (reboot.match(/\.\.\.rebootTargetFields\(\)/g) || []).length;
-  assert.equal(spread, 6, `expected 6 branches to carry the target, found ${spread}`);
+  assert.equal(spread, 7, `expected 7 branches to carry the target, found ${spread}`);
 });
 
 test("the successful reboot says which server is going down", () => {
@@ -153,7 +155,7 @@ test("the label appends nothing when the target is unknown", () => {
     PANEL.indexOf("function rebootTargetFields() {"),
   );
   assert.ok(fn.length > 0, "the label helper must exist");
-  assert.ok(fn.includes("comfyuiUrlForAgent()"), "it must reuse the hello identity too");
+  assert.ok(fn.includes("rebootBoundOrigin()"), "it must name the bound canvas too");
   assert.ok(fn.includes("target ? prefix"), "an unknown target must yield the bare prefix");
   assert.ok(fn.includes(": prefix;"), "…and nothing appended to it");
 });

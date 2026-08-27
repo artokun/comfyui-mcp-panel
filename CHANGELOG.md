@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_restart_comfyui restarts the ComfyUI bound to the live canvas, not the orchestrator's boot target (#1913)
+
 ## [0.15.117] - 2026-08-27
 
 ### Fixed
