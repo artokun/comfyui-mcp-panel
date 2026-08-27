@@ -18,6 +18,7 @@
 // onActivate(), onDeactivate(), teardown(), escapeBlocked() }`.
 
 import { isImeComposing } from "./lib/ime.js";
+import { closeSidePanelHandle } from "./lib/resident-ui-close.js";
 import { createCivitaiContent } from "./cmcp-civitai-ui.js";
 import { createAppsContent } from "./cmcp-apps-ui.js";
 import { createTrainingContent } from "./cmcp-training-ui.js";
@@ -353,6 +354,15 @@ export function openSidePanel(ctx = {}, opts = {}) {
     }
     return c.drive[method](...args);
   }
+  // close() is the WHOLE panel, not the active tab: training/civitai content
+  // stays resident in `contents` until the shell tears down. Gating close on
+  // the active tab (via _driveOf) would leave the other surface's grids/polls
+  // in the renderer — the accumulation #1952/#1960 exist to shed.
+  const closeResident = () => closeSidePanelHandle({
+    close,
+    isOpen: () => isOpen,
+    activeTab: () => activeKey,
+  });
   const civitai = {
     getResults: (a) => _driveOf("civitai", "civitai browser not open", "getResults", [a]),
     highlight: (ids, o) => _driveOf("civitai", "civitai browser not open", "highlight", [ids, o]),
@@ -361,6 +371,7 @@ export function openSidePanel(ctx = {}, opts = {}) {
     search: (a) => _driveOf("civitai", "civitai browser not open", "search", [a]),
     openLightbox: (id, o) => _driveOf("civitai", "civitai browser not open", "openLightbox", [id, o]),
     getState: () => _driveOf("civitai", "civitai browser not open", "getState", []),
+    close: closeResident,
   };
   const training = {
     getState: () => _driveOf("training", "training wizard not open", "getState", []),
@@ -369,6 +380,7 @@ export function openSidePanel(ctx = {}, opts = {}) {
     setTarget: (t) => _driveOf("training", "training wizard not open", "setTarget", [t]),
     highlight: (r) => _driveOf("training", "training wizard not open", "highlight", [r]),
     clearHighlight: () => _driveOf("training", "training wizard not open", "clearHighlight", []),
+    close: closeResident,
   };
 
   return {

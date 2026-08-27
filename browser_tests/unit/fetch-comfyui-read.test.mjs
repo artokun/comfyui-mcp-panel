@@ -237,7 +237,7 @@ test("#2283: the command remains on the authenticated rid executor/reply path", 
   const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(source, /fetch_comfyui_read\(args = \{\}\)/);
   assert.match(source, /return fetchComfyUIReadForMcp\(args, \{ api \}\)/);
-  assert.match(source, /"ui_render", "ui_update", "fetch_image", "fetch_comfyui_read"/);
+  assert.match(source, /"ui_render", "ui_update", "ui_dismiss", "fetch_image", "fetch_comfyui_read"/);
   assert.match(source, /const isCommandFrame = msg && typeof msg\.rid === "string" && typeof msg\.cmd === "string"/);
   assert.match(source, /const executor = GRAPH_TOOL_EXECUTORS\[msg\.cmd\]/);
   assert.match(source, /reply = \{ rid: msg\.rid, ok: true, result: withViewingWitness\(result\) \}/);

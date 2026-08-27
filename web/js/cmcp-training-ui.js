@@ -1777,6 +1777,13 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     for (const c of modal.querySelectorAll(".cmcp-agent-glow")) c.classList.remove("cmcp-agent-glow");
     return { ok: true };
   }
+  // The user-facing ✕ already called this; exposing it on drive is the agent
+  // inverse of open_training (#1952). Idempotent — already-closed is success.
+  function driveClose() {
+    if (closed) return { ok: true, closed: false };
+    close();
+    return { ok: true, closed: true };
+  }
 
   // ── content provider (the shell owns the chrome; this owns the body) ──────
   return {
@@ -1812,6 +1819,7 @@ export function createTrainingContent(ctx = {}, shell, opts = {}) {
     drive: {
       getState: driveGetState, setField: driveSetField, gotoStep: driveGotoStep,
       setTarget: driveSetTarget, highlight: driveHighlight, clearHighlight: driveClearHighlight,
+      close: driveClose,
     },
   };
 }

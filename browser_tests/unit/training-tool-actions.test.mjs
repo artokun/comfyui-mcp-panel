@@ -370,3 +370,35 @@ test("every train_* call carries a non-empty action, and names only the three su
     assert.notEqual(c.args.action, "", "an empty action is not a dispatchable action");
   }
 });
+
+test("#1952 drive.close is the unused ✕ path, now agent-callable and idempotent", async (t) => {
+  const restore = installDom();
+  t.after(restore);
+  const { createTrainingContent } = await import("../../web/js/cmcp-training-ui.js");
+  let shellCloses = 0;
+  const modal = new El("div");
+  modal.querySelectorAll = () => [];
+  modal.querySelector = () => null;
+  const shell = {
+    modal,
+    close() {
+      shellCloses += 1;
+      view.teardown();
+    },
+    syncSearch() {},
+  };
+  const view = createTrainingContent(
+    { callTool: () => Promise.reject(new Error("unscripted")), api: null },
+    shell,
+    {},
+  );
+  const root = new El("div");
+  view.mount(root);
+  assert.equal(typeof view.drive.close, "function", "close must be on the agent-drive surface");
+  const first = view.drive.close();
+  assert.deepEqual(first, { ok: true, closed: true });
+  assert.equal(shellCloses, 1, "close must reach the shell that owns the overlay");
+  const second = view.drive.close();
+  assert.deepEqual(second, { ok: true, closed: false });
+  assert.equal(shellCloses, 1, "a second close must not re-enter the shell");
+});
