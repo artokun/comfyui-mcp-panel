@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.110] - 2026-08-27
+
+### Fixed
+- gate releases on rendered changelog version (#1902)
+
+### Changed
+- Fix workflow open normalization race (#1898) (#1904)
+
+
 ## [0.15.109] - 2026-08-26
 
 ### Fixed
