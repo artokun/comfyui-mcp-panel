@@ -29,13 +29,36 @@ const JSON_RELEASES = JSON.parse(
   readFileSync(fileURLToPath(new URL("../../web/changelog.json", import.meta.url)), "utf8"),
 ).releases;
 
-function assertArtifactMatches(markdown, message = "web/changelog.json is stale") {
+function assertArtifactMatches(
+  markdown,
+  artifactReleases = JSON_RELEASES,
+  message = "web/changelog.json is stale",
+) {
   assert.deepEqual(
-    JSON_RELEASES,
+    artifactReleases,
     parseChangelog(markdown),
     `${message} — re-run \`node scripts/gen-changelog-json.mjs\` after editing CHANGELOG.md`,
   );
 }
+
+// Keep transform-level drift fixtures independent of the live changelog's prose and heading
+// layout. The shipped artifact below is the exact output generated from this small source; the
+// tests then mutate only one source property at a time and compare it to that unchanged output.
+const FIXTURE_CHANGELOG = [
+  "# Changelog",
+  "",
+  "## [9.8.7] - 2026-08-25",
+  "",
+  "### Fixed",
+  "",
+  "- released fixture entry.",
+  "",
+  "### Changed",
+  "",
+  "- second released fixture entry.",
+  "",
+].join("\n");
+const FIXTURE_ARTIFACT = parseChangelog(FIXTURE_CHANGELOG);
 
 /** Every `## [x.y.z] - date` heading, in file order. */
 function versionHeadings(markdown = MD) {
@@ -156,29 +179,47 @@ test("changelog.json: the rendered artefact matches CHANGELOG.md", () => {
 });
 
 test("changelog.json: a same-version date drift fails the sync assertion", () => {
-  const release = JSON_RELEASES[0];
-  const heading = `## [${release.version}] - ${release.date}`;
-  const fixture = MD.replace(heading, `## [${release.version}] - 2099-01-01`);
+  const fixture = FIXTURE_CHANGELOG.replace(
+    /^(## \[[^\]]+\] - )\S+$/m,
+    "$12099-01-01",
+  );
 
-  assert.notEqual(fixture, MD, "date-drift fixture did not change CHANGELOG.md");
-  assert.throws(() => assertArtifactMatches(fixture), /web\/changelog\.json is stale/);
+  assert.notEqual(fixture, FIXTURE_CHANGELOG, "date-drift fixture did not change CHANGELOG.md");
+  assert.throws(
+    () => assertArtifactMatches(fixture, FIXTURE_ARTIFACT),
+    /web\/changelog\.json is stale/,
+  );
 });
 
 test("changelog.json: same-version release content drift fails the sync assertion", () => {
-  const original = "- reconcile generated changelog sections and release-history guards (#1891, #1894)";
-  const fixture = MD.replace(original, "- stale release content drift fixture (#1891, #1894)");
+  const fixture = FIXTURE_CHANGELOG.replace(
+    "- released fixture entry.",
+    "- changed fixture entry.",
+  );
 
-  assert.notEqual(fixture, MD, "content-drift fixture did not change CHANGELOG.md");
-  assert.throws(() => assertArtifactMatches(fixture), /web\/changelog\.json is stale/);
+  assert.notEqual(fixture, FIXTURE_CHANGELOG, "content-drift fixture did not change CHANGELOG.md");
+  assert.throws(
+    () => assertArtifactMatches(fixture, FIXTURE_ARTIFACT),
+    /web\/changelog\.json is stale/,
+  );
 });
 
 test("changelog.json: Unreleased content remains outside released records", () => {
-  const fixture = MD.replace(
-    "## [Unreleased]\n",
-    "## [Unreleased]\n\n### Fixed\n- unreleased-only fixture content\n",
-  );
+  const fixture = [
+    "## [Unreleased]",
+    "",
+    "### Fixed",
+    "",
+    "- unreleased-only fixture content.",
+    "",
+    FIXTURE_CHANGELOG,
+  ].join("\n");
 
-  assert.notEqual(fixture, MD, "Unreleased fixture did not change CHANGELOG.md");
-  assert.deepEqual(parseChangelog(fixture), parseChangelog(MD));
-  assertArtifactMatches(fixture, "Unreleased content changed released records");
+  assert.notEqual(fixture, FIXTURE_CHANGELOG, "Unreleased fixture did not change CHANGELOG.md");
+  assert.deepEqual(parseChangelog(fixture), FIXTURE_ARTIFACT);
+  assertArtifactMatches(
+    fixture,
+    FIXTURE_ARTIFACT,
+    "Unreleased content changed released records",
+  );
 });
