@@ -360,7 +360,13 @@ export function snapshotInputSlotLinks(graph) {
       if (n?.id == null) continue;
       const path = prefix + String(n.id);
       (n.inputs ?? []).forEach((inp, i) => {
-        if (inp?.link != null) out.set(`${path}#${i}`, String(inp.link));
+        // RAW, not String()-normalised (gate P1). litegraph's `_links` is a NUMBER-keyed
+        // Map and its `links` proxy binds Map.prototype.get straight through, so a key of
+        // "7" MISSES a record stored under 7 (#1425). Normalising here made `7` and "7"
+        // compare equal, so a hook that retyped an untargeted slot's id left the wire
+        // unresolvable while the verdict read ok:true. Identity against the intended and
+        // replaced ids is normalised at the comparison instead, where it is needed.
+        if (inp?.link != null) out.set(`${path}#${i}`, inp.link);
       });
       if (n?.subgraph && Array.isArray(n.subgraph._nodes)) walk(n.subgraph, `${path}>`);
     }
@@ -451,6 +457,9 @@ export function verifyConnect(
     for (const slot of slotKeys) {
       const wasLink = beforeSlots.get(slot) ?? null;
       const nowLink = afterSlots.get(slot) ?? null;
+      // Strict, so a retype (7 -> "7") reads as the change it is. Nothing legitimately
+      // retypes an untargeted slot across a single connect, so this cannot false-positive
+      // on a bystander the connect never touched.
       if (nowLink === wasLink) continue;
       // The link this connect made (or the one it displaced) landing on a slot is the
       // expected outcome, not bystander damage.
@@ -463,11 +472,11 @@ export function verifyConnect(
         if (
           nowLink !== null &&
           isAddressedSlot &&
-          (intended.has(nowLink) || nowLink === replacedId)
+          (intended.has(String(nowLink)) || String(nowLink) === replacedId)
         ) {
           continue;
         }
-      if (wasLink !== null && wasLink === replacedId) continue;
+      if (wasLink !== null && String(wasLink) === replacedId) continue;
       collateralReslottedInputs.push({ slot, before: wasLink, after: nowLink });
     }
   }

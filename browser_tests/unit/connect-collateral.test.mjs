@@ -383,3 +383,44 @@ test("#2380 a replaced link that is GONE stays exempt (the ordinary case)", () =
   delete g.links[11];
   assert.equal(verifyConnect(g, before, { replacedLinkId: 11 }).ok, true);
 });
+
+test('#2380 an untargeted input RETYPED (11 -> "11") is collateral', () => {
+  // The wire is not merely different, it is BROKEN: litegraph's `_links` is a NUMBER-keyed
+  // Map whose `links` proxy binds Map.prototype.get through, so get("11") misses a record
+  // stored under 11 (#1425). String()-normalising the slot snapshot made the two compare
+  // equal, so this read ok:true with nothing disclosed (gate P1).
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  assert.equal(
+    typeof g.getNodeById(1282).inputs[0].link,
+    "number",
+    "premise: the slot starts NUMBER-typed, or this pin proves nothing",
+  );
+  g.getNodeById(1282).inputs[0].link = "11"; // same id, other type — record untouched
+
+  const v = verifyConnect(g, before, { intendedLinkIds: [], beforeSlots });
+  assert.deepEqual(v.collateralRemovedLinks, [], "no record changed");
+  assert.equal(v.ok, false, "yet 1282#0 can no longer resolve its own link");
+  assert.deepEqual(
+    v.collateralReslottedInputs.map((r) => r.slot),
+    ["1282#0"],
+  );
+});
+
+test("#2380 identity across types still holds where it is NEEDED — the addressed slot", () => {
+  // The normalisation was not wrong, only misplaced. A caller naming its intended id as a
+  // string while the slot lands it as a number must still be exempt, or every connect
+  // whose id types disagree with the caller's reads as damage.
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  g.getNodeById(1282).inputs[0].link = 12;
+
+  const v = verifyConnect(g, before, {
+    intendedLinkIds: ["12"], // string, while the slot holds the number
+    intendedSlots: new Set(["1282#0"]),
+    beforeSlots,
+  });
+  assert.deepEqual(v.collateralReslottedInputs, [], "the addressed slot got what was asked for");
+});
