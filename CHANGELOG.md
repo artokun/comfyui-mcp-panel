@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_widget refuses MiniMaxH3Director `timeline_data` and `builder_state` writes that leave the derived prompt stale (#1935)
+
 ## [0.15.118] - 2026-08-27
 
 ### Fixed

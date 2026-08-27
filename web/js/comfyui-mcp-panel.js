@@ -17040,9 +17040,11 @@ const GRAPH_TOOL_EXECUTORS = {
     const budget = makeCommandBudget(SET_WIDGET_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, LG, rootGraph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
-    // #1679 — keep derived MiniMax prompt writes refused before the first
-    // await, including when a caller asks for deferral. Deferral must never
-    // become a side door around an existing production safety refusal.
+    // #1679 / #1935 — keep derived MiniMax prompt / builder_state / timeline_data
+    // writes refused before the first await, including when a caller asks for
+    // deferral. Deferral must never become a side door around an existing
+    // production safety refusal. A successful timeline_data write is the #1935
+    // silent-stale: query_graph shows the new JSON while prompt stays old.
     if (classifyMiniMaxH3DirectorWrite(node, widget) === "derived") {
       throw new Error(miniMaxH3DirectorPromptRefusal(widget, node.id));
     }
