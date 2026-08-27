@@ -211,15 +211,17 @@ jobs:
       # scripts/check-registry-yara.mjs (added in #1874) does model that family; it had
       # simply never been wired to anything, so it only ran when someone remembered.
       #
-      # Wired as a RATCHET, not a hard zero. Three shipped files match today and cannot
-      # be cleared by refactoring: two match on third-party verbs (WebSocket, litegraph)
-      # that we do not own and cannot rename, and the third is a plain socket READ in the
-      # orchestrator probe — a liveness probe has to read the response. Allowing exactly
-      # today's count means this job goes RED the moment a FOURTH shipped file gains
-      # socket traffic, which is the regression actually worth catching. Lower the number
-      # whenever a finding is genuinely cleared; never raise it to make a build pass.
+      # Wired as a RATCHET, not a hard zero. TWO shipped files match today, and both
+      # match on third-party verbs (WebSocket, litegraph) that we neither own nor can
+      # rename. Allowing exactly today's count means this job goes RED the moment a
+      # THIRD shipped file gains socket traffic, which is the regression actually worth
+      # catching. Lower the number whenever a finding is genuinely cleared; never raise
+      # it to make a build pass.
+      #
+      # Ratcheted 3 -> 2: the orchestrator probe's socket read moved onto a buffered
+      # file wrapper, so __init__.py no longer matches at all.
       - name: Security scan (Comfy Registry parity — network rules)
-        run: node scripts/check-registry-yara.mjs --allow 3
+        run: node scripts/check-registry-yara.mjs --allow 2
 
       # The registry applies .comfyignore with gitignore semantics: a bare
       # `vendor/` matches a vendor dir at ANY depth, so the exclusion meant for
