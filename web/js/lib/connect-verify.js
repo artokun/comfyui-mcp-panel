@@ -339,7 +339,41 @@ export function landedAfterThrowWarning(err, extra = "") {
  * Returns { ok, missingNodes, addedNodes, collateralRemovedLinks, collateralAddedLinks }.
  * Pure: the graph is passed in, so production and unit test drive the same check.
  */
-export function verifyConnect(graph, before, { intendedLinkIds = [], replacedLinkId } = {}) {
+/**
+ * #2380 — the node-side view of the wiring: which link id each input slot names.
+ *
+ * A third merge-gate P1. `snapshotGraphState` records the LINK STORE, and the store and
+ * the node slots are two independent views: a pack can leave every link record byte-
+ * identical while swapping `inputs[i].link` on a bystander node, and execution then
+ * follows the slot, not the store. The verdict read ok:true on a graph wired to the
+ * wrong source — which is the report's own symptom, an input fed from somewhere nobody
+ * named.
+ *
+ * Captured separately rather than by widening snapshotGraphState, which graph_disconnect
+ * has shipped against since #668; changing what that returns would alter a verified
+ * path this fix has no business touching.
+ */
+export function snapshotInputSlotLinks(graph) {
+  const out = new Map();
+  const walk = (g, prefix) => {
+    for (const n of g?._nodes ?? []) {
+      if (n?.id == null) continue;
+      const path = prefix + String(n.id);
+      (n.inputs ?? []).forEach((inp, i) => {
+        if (inp?.link != null) out.set(`${path}#${i}`, String(inp.link));
+      });
+      if (n?.subgraph && Array.isArray(n.subgraph._nodes)) walk(n.subgraph, `${path}>`);
+    }
+  };
+  walk(graph, "");
+  return out;
+}
+
+export function verifyConnect(
+  graph,
+  before,
+  { intendedLinkIds = [], replacedLinkId, beforeSlots } = {},
+) {
   const after = snapshotGraphState(graph);
   const replacedId = replacedLinkId != null ? String(replacedLinkId) : null;
   const intended = new Set(
@@ -394,7 +428,22 @@ export function verifyConnect(graph, before, { intendedLinkIds = [], replacedLin
     if (now && !sameEndpoints(was, now)) collateralMovedLinks.push({ before: was, after: now });
   }
 
+  // #2380 — the node-side comparison. Only meaningful when the caller captured slots
+  // alongside the store; an older call site that did not passes `beforeSlots` undefined
+  // and this contributes nothing rather than inventing a finding.
+  const collateralReslottedInputs = [];
+  if (beforeSlots instanceof Map) {
+    const afterSlots = snapshotInputSlotLinks(graph);
+    for (const [slot, wasLink] of beforeSlots) {
+      const nowLink = afterSlots.get(slot);
+      if (nowLink === undefined || nowLink === wasLink) continue;
+      if (intended.has(nowLink) || nowLink === replacedId) continue;
+      collateralReslottedInputs.push({ slot, before: wasLink, after: nowLink });
+    }
+  }
+
   const ok =
+    collateralReslottedInputs.length === 0 &&
     missingNodes.length === 0 &&
     addedNodes.length === 0 &&
     collateralRemovedLinks.length === 0 &&
@@ -407,6 +456,7 @@ export function verifyConnect(graph, before, { intendedLinkIds = [], replacedLin
     collateralRemovedLinks,
     collateralAddedLinks,
     collateralMovedLinks,
+    collateralReslottedInputs,
   };
 }
 
@@ -428,6 +478,13 @@ export function connectCollateralBullets(verdict) {
     lines.push(
       `- a link this connect did not target was REMOVED: node ${l.origin_id} output ${l.origin_slot} ` +
         `-> node ${l.target_id} input ${l.target_slot}`,
+    );
+  }
+  for (const r of verdict.collateralReslottedInputs ?? []) {
+    lines.push(
+      `- an input this connect did not target now names a DIFFERENT link: ${r.slot} ` +
+        `was link ${r.before}, is now link ${r.after} (the link records may be unchanged; ` +
+        `execution follows the slot)`,
     );
   }
   for (const m of verdict.collateralMovedLinks ?? []) {

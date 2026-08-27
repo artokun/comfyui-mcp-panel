@@ -53,6 +53,7 @@ import {
   isRailLinkPersisted,
   landedAfterThrowWarning,
   verifyConnect,
+  snapshotInputSlotLinks,
   connectCollateralBullets,
   connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
@@ -158,6 +159,7 @@ function buildConnect(graph, overrides = {}) {
     isRailLinkPersisted,
     landedAfterThrowWarning,
     snapshotGraphState,
+    snapshotInputSlotLinks,
     verifyConnect,
     connectCollateralBullets,
     connectCollateralWarning,

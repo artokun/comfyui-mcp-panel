@@ -538,6 +538,7 @@ import {
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic, loopbackRefusalReason } from "./lib/connect-match.js";
 import {
+  snapshotInputSlotLinks,
   isLinkPersisted,
   removePhantomLink,
   isWidgetBackedInput,
@@ -16251,6 +16252,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // -10/-20 or alias "input"/"output"/..), route to the boundary I/O logic
     // instead of throwing "No node with id". Normal node-to-node connect below
     // is unchanged.
+    // #2380 — captured at the TOP so the subgraph-RAIL returns below are covered too.
+    // A merge-gate P1: those returns sit above the node-to-node path and were exiting
+    // without any collateral verdict, so an onConnectionsChange hook could rewire or
+    // delete a bystander during a rail connect and still report a clean `connected`.
+    // A snapshot is a read; taking it unconditionally costs an ordinary connect nothing.
+    const graphBefore = snapshotGraphState(graph);
+    const inputLinksBefore = snapshotInputSlotLinks(graph);
+
     const fromRail = resolveRail(graph, from_node_id);
     const toRail = resolveRail(graph, to_node_id);
 
@@ -16318,12 +16327,33 @@ const GRAPH_TOOL_EXECUTORS = {
           );
         }
         findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
+                // #2380 — the rail paths returned with no collateral verdict at all, so a hook
+        // firing during a rail connect could rewire a bystander and still report clean.
+        const railVerdict = verifyConnect(graph, graphBefore, {
+          intendedLinkIds: [link?.id],
+          beforeSlots: inputLinksBefore,
+        });
+        const railCollateral = railVerdict.ok ? [] : connectCollateralBullets(railVerdict);
         return {
           connected: {
             from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
             to: { subgraph_output: existing.name },
           },
-          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+          ...(railCollateral.length ? { collateral_changes: railCollateral } : {}),
+          // ONE `warning` key. Two spreads each carrying `warning` let the later one
+          // silently clobber the earlier, so a throw-after-wiring would erase the
+          // collateral sentence — the non-composing-rider defect this file already
+          // fixed for titles and slots on the node path.
+          ...(railCollateral.length || railConnectErr
+            ? {
+                warning: [
+                  railCollateral.length ? connectCollateralWarning(railCollateral) : "",
+                  railConnectErr ? landedAfterThrowWarning(railConnectErr) : "",
+                ]
+                  .filter(Boolean)
+                  .join(" "),
+              }
+            : {}),
         };
       }
       return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
@@ -16391,12 +16421,33 @@ const GRAPH_TOOL_EXECUTORS = {
           );
         }
         findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
+                // #2380 — the rail paths returned with no collateral verdict at all, so a hook
+        // firing during a rail connect could rewire a bystander and still report clean.
+        const railVerdict = verifyConnect(graph, graphBefore, {
+          intendedLinkIds: [link?.id],
+          beforeSlots: inputLinksBefore,
+        });
+        const railCollateral = railVerdict.ok ? [] : connectCollateralBullets(railVerdict);
         return {
           connected: {
             from: { subgraph_input: existing.name },
             to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
           },
-          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+          ...(railCollateral.length ? { collateral_changes: railCollateral } : {}),
+          // ONE `warning` key. Two spreads each carrying `warning` let the later one
+          // silently clobber the earlier, so a throw-after-wiring would erase the
+          // collateral sentence — the non-composing-rider defect this file already
+          // fixed for titles and slots on the node path.
+          ...(railCollateral.length || railConnectErr
+            ? {
+                warning: [
+                  railCollateral.length ? connectCollateralWarning(railCollateral) : "",
+                  railConnectErr ? landedAfterThrowWarning(railConnectErr) : "",
+                ]
+                  .filter(Boolean)
+                  .join(" "),
+              }
+            : {}),
         };
       }
       return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
@@ -16494,7 +16545,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // caller only found out in a later panel_query_graph. graph_disconnect has
     // snapshotted for exactly this since #668, where a disconnect on a SubgraphNode
     // deleted two unrelated nodes while reporting plain success; connect never did.
-    const graphBefore = snapshotGraphState(graph);
+    // #2380 — graphBefore / inputLinksBefore are captured at the top of graph_connect.
     graph.beforeChange();
     let link;
     let connectErr = null;
@@ -16562,6 +16613,7 @@ const GRAPH_TOOL_EXECUTORS = {
       const landedVerdict = verifyConnect(graph, graphBefore, {
         intendedLinkIds: [link?.id, landed.linkId],
         replacedLinkId: prevLinkId,
+        beforeSlots: inputLinksBefore,
       });
       const landedCollateral = landedVerdict.ok ? [] : connectCollateralBullets(landedVerdict);
       return {
@@ -16662,6 +16714,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const verdict = verifyConnect(graph, graphBefore, {
       intendedLinkIds: [link?.id],
       replacedLinkId: prevLinkId,
+      beforeSlots: inputLinksBefore,
     });
     const collateral = verdict.ok ? [] : connectCollateralBullets(verdict);
     return {

@@ -51,8 +51,9 @@ test("BOTH return paths compute a verdict — the success path is the reported o
   );
   assert.equal(
     CONNECT_BODY.match(/verifyConnect\(/g).length,
-    2,
-    "expected exactly one verdict per return path",
+    4,
+    "one verdict per return path: two node-to-node, two subgraph-rail (gate P1 — the rail " +
+      "returns sit above the node path and were exiting with no collateral check at all)",
   );
 });
 
@@ -84,8 +85,20 @@ test("both paths surface the verdict to the caller", () => {
   );
   assert.equal(
     (CONNECT_BODY.match(/connectCollateralWarning\(/g) ?? []).length,
+    4,
+    "each of the four return paths must carry the warning sentence, not just the bullets",
+  );
+  // The rail returns already carried a `warning` for a throw-after-wiring. Two spreads
+  // each supplying `warning` would let the later clobber the earlier, so they compose.
+  assert.ok(
+    !/\.\.\.\(railCollateral\.length\s*\?\s*\{ warning:/.test(CONNECT_BODY),
+    "rail collateral must not be spread as its own `warning` key alongside another",
+  );
+  assert.equal(
+    (CONNECT_BODY.match(/railConnectErr \? landedAfterThrowWarning\(railConnectErr\) : ""/g) ?? [])
+      .length,
     2,
-    "each path must carry the warning sentence, not just the bullets",
+    "both rail paths compose their two warnings into one key",
   );
 });
 

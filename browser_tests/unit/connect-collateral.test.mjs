@@ -23,6 +23,7 @@ import assert from "node:assert/strict";
 import { snapshotGraphState } from "../../web/js/lib/disconnect-verify.js";
 import {
   verifyConnect,
+  snapshotInputSlotLinks,
   connectCollateralBullets,
   connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
@@ -239,4 +240,44 @@ test("#2380 an unmoved link is not reported — no false positive on a quiet con
   const v = verifyConnect(g, before, { intendedLinkIds: [13] });
   assert.equal(v.ok, true);
   assert.deepEqual(v.collateralMovedLinks, []);
+});
+
+// Third gate P1: the link STORE and the node SLOTS are independent views. A hook can
+// leave every link record byte-identical while repointing a bystander's inputs[i].link,
+// and execution follows the slot — the report's own symptom, an input fed from a source
+// nobody named.
+test("#2380 a bystander input RESLOTTED to another link is collateral", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  // Records untouched. Only 1282's first input is repointed from link 11 to link 12.
+  g.getNodeById(1282).inputs[0].link = 12;
+
+  const v = verifyConnect(g, before, { intendedLinkIds: [], beforeSlots });
+  assert.deepEqual(v.collateralRemovedLinks, [], "no record was removed");
+  assert.deepEqual(v.collateralMovedLinks, [], "and none moved");
+  assert.equal(v.ok, false, "yet the graph is wired differently");
+  assert.equal(v.collateralReslottedInputs.length, 1);
+  assert.match(connectCollateralBullets(v)[0], /DIFFERENT link/);
+});
+
+test("#2380 the slot comparison is opt-in — an older call site is unaffected", () => {
+  // Omitting beforeSlots must contribute nothing rather than invent a finding.
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  g.getNodeById(1282).inputs[0].link = 12;
+  const v = verifyConnect(g, before, { intendedLinkIds: [] });
+  assert.equal(v.ok, true);
+  assert.deepEqual(v.collateralReslottedInputs, []);
+});
+
+test("#2380 an input reslotted to the INTENDED link is not collateral", () => {
+  // A dynamic pack landing this connect on a different slot is the #1873 path, already
+  // disclosed as slots_rewritten; it must not also read as bystander damage.
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  g.links[13] = { id: 13, origin_id: 1280, origin_slot: 0, target_id: 1282, target_slot: 0 };
+  g.getNodeById(1282).inputs[0].link = 13;
+  assert.equal(verifyConnect(g, before, { intendedLinkIds: [13], beforeSlots }).ok, true);
 });
