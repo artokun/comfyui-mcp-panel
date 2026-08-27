@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.117] - 2026-08-27
+
+### Fixed
+- do not capture or admit the previous tab's graph after a switch (#1951)
+
+
 ## [0.15.116] - 2026-08-27
 
 ### Fixed
