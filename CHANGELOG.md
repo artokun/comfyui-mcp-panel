@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.121] - 2026-08-27
+
 ### Fixed
 - panel_set_widget no longer refuses a root-level ordinary node as an unclassifiable promoted container: graph_get_subgraph throws the definitive "is not a subgraph" line, and pinpoint detail keeps a bounded `is_subgraph:false` row (#1941)
 ### Added
