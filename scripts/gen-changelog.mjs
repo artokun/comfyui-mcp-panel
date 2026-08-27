@@ -4,10 +4,11 @@
 //   node scripts/gen-changelog.mjs <version>
 //
 // It stamps a dated section for <version> at the top of CHANGELOG.md by:
-//   1. Promoting whatever you hand-wrote under "## [Unreleased]" VERBATIM
-//      (your highlights — the rich prose we care about), then
+//   1. Promoting whatever you hand-wrote under "## [Unreleased]" (your
+//      highlights — the rich prose we care about), merging repeated headings
+//      and issue/PR aliases, then
 //   2. Appending anything in the git history since the last tag that your
-//      highlights didn't already mention (deduped by PR number), grouped into
+//      highlights didn't already mention (deduped by issue/PR identity), grouped into
 //      COMPONENT sections (MCP / RunPod image) and Keep-a-Changelog buckets
 //      (Added / Fixed / Changed) from the conventional-commit type.
 //   3. Resetting "## [Unreleased]" to an empty stub.
@@ -21,10 +22,18 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { isReleaseSubject, pickReleaseSha } from "./lib/changelog-match.mjs";
+import {
+  ambiguousReferences,
+  canonicalReference,
+  commitReferences,
+  coveredByReferences,
+  referenceAliases,
+  referenceNumbers,
+} from "./lib/changelog-refs.mjs";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const ROOT = resolve(process.env.CHANGELOG_ROOT || join(dirname(fileURLToPath(import.meta.url)), ".."));
 const CHANGELOG = join(ROOT, "CHANGELOG.md");
 
 // ── Repo config ─────────────────────────────────────────────────────────────
@@ -195,21 +204,18 @@ function parseCommits(range) {
   for (const subject of raw.split("\n")) {
     if (isReleaseSubject(subject)) continue; // release commits describe themselves
     const m = subject.match(/^(\w+)(?:\(([^)]+)\))?(!)?:\s*(.+)$/);
-    // The LAST `(#N)`, not the first: GitHub appends the PR reference at the end of a
-    // squash subject, so anything earlier is an ISSUE the author cited. Both shapes occur —
-    // `fix(#584): … (#596)` puts the issue in the scope, and
-    // `fix(panel): … (#291) (#633)` puts it inline — and taking the first match attributes
-    // the entry to the issue. That also breaks the dedupe against hand-written highlights,
-    // which is keyed on the PR number, so a hand-written entry would be duplicated by the
-    // auto-generated one instead of suppressed.
+    // GitHub appends the PR reference at the end of a squash subject, while an earlier
+    // reference is often the tracked issue: `fix(1882): ... (#1885)`. Keep both references so
+    // the release generator can treat them as one identity when reconciling hand-written notes.
+    const refs = commitReferences(subject);
     const prIn = (s) => {
-      const all = [...s.matchAll(/\(#(\d+)\)/g)];
-      return all.length ? all[all.length - 1][1] : null;
+      const all = referenceNumbers(s);
+      return all.length ? all[all.length - 1] : null;
     };
     if (!m) {
       const pr = prIn(subject);
       if (pr) {
-        out.push({ type: "", scope: "", desc: subject.trim(), section: "Changed", pr });
+        out.push({ type: "", scope: "", desc: subject.trim(), section: "Changed", pr, refs });
       } else {
         skipped.push(subject); // a local commit with no PR; a squash supersedes it
       }
@@ -224,7 +230,7 @@ function parseCommits(range) {
       skipped.push(subject);
       continue;
     }
-    out.push({ type, scope: scope || "", desc: desc.trim(), section, pr });
+    out.push({ type, scope: scope || "", desc: desc.trim(), section, pr, refs });
   }
   if (skipped.length) {
     process.stderr.write(
@@ -236,14 +242,23 @@ function parseCommits(range) {
   return out;
 }
 
+function allHistoryReferences() {
+  const raw = git("log --all --no-merges --pretty=format:%s");
+  return raw
+    ? raw.split("\n").map((subject) => ({ subject, refs: commitReferences(subject) }))
+    : [];
+}
+
 function componentOf(scope) {
   return (COMPONENTS.find((c) => c.match(scope)) || COMPONENTS[COMPONENTS.length - 1]).name;
 }
 
 /** Build the auto-generated component/section body for commits not already
- *  covered by the hand-written highlights (deduped by PR number). */
-function autoBody(commits, coveredPRs) {
-  const fresh = commits.filter((c) => !(c.pr && coveredPRs.has(c.pr)));
+ *  covered by the hand-written highlights (deduped by issue/PR identity). */
+function autoBody(commits, coveredRefs, identityCommits = commits) {
+  const aliases = referenceAliases(identityCommits);
+  const ambiguous = ambiguousReferences(identityCommits);
+  const fresh = commits.filter((c) => !coveredByReferences(c.refs, coveredRefs, aliases, ambiguous));
   if (fresh.length === 0) return "";
   // component -> section -> bullets[]
   const byComp = new Map();
@@ -269,6 +284,90 @@ function autoBody(commits, coveredPRs) {
     }
   }
   return lines.join("\n").trimEnd();
+}
+
+/**
+ * Reconcile the two inputs to a release body before writing it. In particular,
+ * append-generated `### Fixed` content belongs under the hand-written heading,
+ * not in a second heading beside it. The same identity map removes an issue
+ * spelling and its PR spelling as duplicate bullets.
+ */
+function normalizeBody(body, aliases) {
+  const blocks = [];
+  let current = { heading: null, lines: [] };
+  const flush = () => {
+    if (current.heading || current.lines.some((line) => line.trim())) blocks.push(current);
+    current = { heading: null, lines: [] };
+  };
+  for (const line of String(body ?? "").split("\n")) {
+    if (/^#{3,6}\s+/.test(line)) {
+      flush();
+      current = { heading: line.trimEnd(), lines: [] };
+    } else {
+      current.lines.push(line);
+    }
+  }
+  flush();
+
+  const merged = [];
+  const byHeading = new Map();
+  for (const block of blocks) {
+    if (!block.heading) {
+      merged.push(block);
+      continue;
+    }
+    const key = block.heading.toLowerCase();
+    const existing = byHeading.get(key);
+    if (!existing) {
+      byHeading.set(key, block);
+      merged.push(block);
+    } else {
+      while (existing.lines.at(-1) === "") existing.lines.pop();
+      const incoming = [...block.lines];
+      while (incoming[0] === "") incoming.shift();
+      if (existing.lines.length && incoming.length) existing.lines.push("");
+      existing.lines.push(...incoming);
+    }
+  }
+
+  const seen = new Set();
+  const dedupeBullets = (lines) => {
+    const out = [];
+    let item = null;
+    const flushItem = () => {
+      if (!item) return;
+      const refs = referenceNumbers(item.join("\n"));
+      const keys = refs.length
+        ? [...new Set(refs.map((ref) => canonicalReference(ref, aliases)))]
+        : [`text:${item.join(" ").replace(/\s+/g, " ").trim()}`];
+      if (!refs.length || !keys.some((key) => seen.has(key))) {
+        out.push(...item);
+        keys.forEach((key) => seen.add(key));
+      }
+      item = null;
+    };
+    for (const line of lines) {
+      if (/^[-*]\s+/.test(line)) {
+        flushItem();
+        item = [line];
+      } else if (item && (line.trim() === "" || /^\s+\S/.test(line))) {
+        item.push(line);
+      } else {
+        flushItem();
+        out.push(line);
+      }
+    }
+    flushItem();
+    return out;
+  };
+
+  return merged
+    .map((block) => ({ ...block, lines: dedupeBullets(block.lines) }))
+    .map((block) => [block.heading, ...block.lines].filter((line, index) => index === 0 || line !== undefined))
+    .flat()
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /**
@@ -303,37 +402,19 @@ const EOL = rawMd.includes("\r\n") ? "\r\n" : "\n";
 const writeChangelog = (s) => writeFileSync(CHANGELOG, EOL === "\r\n" ? s.replace(/\n/g, "\r\n") : s);
 
 /** Build a dated entry string for `ver` from commits in `range`, folding in any
- *  hand-written highlights (deduped by PR). */
+ *  hand-written highlights (deduped by issue/PR identity). */
 function buildEntry(ver, range, highlights = "") {
-  // BARE `#N` ONLY, deliberately — this set is compared against PANEL PR numbers.
-  //
-  // A first attempt at #1219 widened this to `/\((?:[\w.-]+)?#(\d+)\)/g` so it would also see
-  // `(comfyui-mcp#1478)`, on the theory that upstream-first descriptions were failing to
-  // suppress their commits. That is wrong twice over. The two ids are different numbers in
-  // different namespaces — panel PR #1211 and mcp issue #1478 name the same change — so
-  // capturing the upstream number cannot match anything here. And it would be actively
-  // dangerous: an upstream issue number that happens to equal an unrelated panel PR number
-  // would suppress that PR's commit from the auto body, silently dropping shipped work.
-  //
-  // Cross-namespace dedupe is not solvable by number, and NOTHING here replaces it. An
-  // earlier version of this comment pointed at "the post-write assertion at the bottom of
-  // this file" — an assertion that was removed in the same change as unreachable, so the
-  // comment claimed a protection that did not exist.
-  //
-  // Stated accurately: a highlight citing `comfyui-mcp#1478` and a commit carrying panel PR
-  // `#1211` for the same change will BOTH be listed, as two bullets in one section.
-  // `changelog-integrity.test.mjs` catches duplicate version HEADINGS; it does not compare
-  // bullet text, so this particular redundancy is unguarded and is caught only by a human
-  // reading the release notes. That is a smaller problem than the duplicate sections this
-  // issue was about — a reader sees one release saying a thing twice, not two releases — and
-  // fixing it needs an identifier map the repo does not have.
-  const covered = new Set([...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]));
+  const covered = new Set(referenceNumbers(highlights));
   const commits = parseCommits(range);
-  const auto = autoBody(commits, covered);
+  const identityCommits = [...commits, ...allHistoryReferences()];
+  const auto = autoBody(commits, covered, identityCommits);
   const parts = [`## [${ver}] - ${today()}`, ""];
-  if (highlights) parts.push(highlights, "");
-  if (auto) parts.push(auto, "");
-  if (!highlights && !auto) parts.push("_No user-facing changes._", "");
+  const body = normalizeBody(
+    [highlights, auto].filter(Boolean).join("\n\n"),
+    referenceAliases(identityCommits),
+  );
+  if (body) parts.push(body, "");
+  if (!body) parts.push("_No user-facing changes._", "");
   return { text: parts.join("\n").trimEnd(), commits };
 }
 
@@ -392,11 +473,15 @@ if (!version) {
   // [Unreleased] without stamping a version — keeps the changelog warm between
   // releases (e.g. after a runpod:release). Idempotent: items already present
   // (by PR number or exact text) are not re-added.
-  const covered = new Set([...highlights.matchAll(/\(#(\d+)\)/g)].map((m) => m[1]));
-  const commits = parseCommits(`${prevTag()}..HEAD`).filter(
-    (c) => !(c.pr && covered.has(c.pr)) && !highlights.includes(c.desc),
+  const covered = new Set(referenceNumbers(highlights));
+  const candidates = parseCommits(`${prevTag()}..HEAD`);
+  const identityCommits = [...candidates, ...allHistoryReferences()];
+  const aliases = referenceAliases(identityCommits);
+  const ambiguous = ambiguousReferences(identityCommits);
+  const commits = candidates.filter(
+    (c) => !coveredByReferences(c.refs, covered, aliases, ambiguous) && !highlights.includes(c.desc),
   );
-  const auto = autoBody(commits, new Set());
+  const auto = autoBody(commits, new Set(), identityCommits);
   if (!auto) {
     console.log("changelog: [Unreleased] already covers every commit since " + prevTag());
     process.exit(0);

@@ -58,3 +58,8 @@ jobs:
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: node scripts/check-release-tag.mjs "$TAG"
+
+      - name: Audit the tagged changelog
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: node scripts/check-changelog.mjs "${TAG#v}" --ref "$TAG"

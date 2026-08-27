@@ -13,6 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       # ---- Gate: never publish a broken pack to the Registry. -------------
       # web/js is served live and a broken save crashes the whole ComfyUI
@@ -21,6 +24,11 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+
+      - name: Changelog release guard
+        env:
+          RELEASE_REF: ${{ github.sha }}
+        run: node scripts/check-changelog.mjs --ref "$RELEASE_REF"
 
       - name: JS syntax check (web/js)
         shell: bash
