@@ -17,10 +17,11 @@ function git(cwd, ...args) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 }
 
-function runGuard(cwd, version = "1.1.0", ref = "v1.1.0") {
+function runGuard(cwd, version = "1.1.0", ref = "v1.1.0", extraArgs = []) {
   const args = [GUARD];
   if (version) args.push(version);
   if (ref) args.push("--ref", ref);
+  args.push(...extraArgs);
   return spawnSync(process.execPath, args, {
     cwd,
     encoding: "utf8",
@@ -107,7 +108,7 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
     writeFileSync(cwd + "/CHANGELOG.md", generated, "utf8");
     const candidate = generated.replace("[1.1.0]", "[1.2.0]");
     writeFileSync(cwd + "/CHANGELOG.md", candidate, "utf8");
-    const workingTree = runGuard(cwd, "1.2.0", null);
+    const workingTree = runGuard(cwd, "1.2.0", null, ["--working-tree"]);
     assert.equal(workingTree.status, 0, workingTree.stderr);
     writeFileSync(cwd + "/CHANGELOG.md", generated, "utf8");
 
@@ -116,17 +117,17 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
       generated.replace("- an independent fix (#102)", "- duplicate alias (#101)\n- an independent fix (#102)"),
       "utf8",
     );
-    const duplicateAlias = runGuard(cwd, "1.1.0", null);
+    const duplicateAlias = runGuard(cwd, "1.1.0", null, ["--working-tree"]);
     assert.notEqual(duplicateAlias.status, 0);
     assert.match(duplicateAlias.stderr, /repeats issue\/PR identity/);
 
     writeFileSync(cwd + "/CHANGELOG.md", generated.replace("### Fixed\n", "### Fixed\n\n### Fixed\n"), "utf8");
-    const duplicateHeading = runGuard(cwd, "1.1.0", null);
+    const duplicateHeading = runGuard(cwd, "1.1.0", null, ["--working-tree"]);
     assert.notEqual(duplicateHeading.status, 0);
     assert.match(duplicateHeading.stderr, /repeats heading/);
 
     writeFileSync(cwd + "/CHANGELOG.md", generated.replace("#102", "#999"), "utf8");
-    const unreachableEntry = runGuard(cwd, "1.1.0", null);
+    const unreachableEntry = runGuard(cwd, "1.1.0", null, ["--working-tree"]);
     assert.notEqual(unreachableEntry.status, 0);
     assert.match(unreachableEntry.stderr, /no reachable commit subject/);
   } finally {

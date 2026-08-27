@@ -2,7 +2,7 @@
 /**
  * Check the release section that is about to ship.
  *
- *   node scripts/check-changelog.mjs [version] [--ref v0.15.108]
+ *   node scripts/check-changelog.mjs [version] [--ref v0.15.108] [--working-tree]
  *
  * The release generator is deliberately allowed to start from hand-written
  * notes, but the resulting section has one mechanical source of truth: the
@@ -22,6 +22,7 @@ const CHANGELOG = join(ROOT, "CHANGELOG.md");
 const args = process.argv.slice(2);
 const refIndex = args.indexOf("--ref");
 const explicitRef = refIndex >= 0 ? args[refIndex + 1] : null;
+const workingTree = args.includes("--working-tree");
 const versionArg = args.find(
   (arg, index) => (refIndex < 0 || index !== refIndex + 1) && /^v?\d+\.\d+\.\d+(?:[-+].+)?$/.test(arg),
 );
@@ -232,10 +233,10 @@ function main() {
     versionArg || parseReleaseSections(markdown).find((section) => /^\d+\.\d+\.\d+(?:[-+].+)?$/.test(section.version))?.version,
   );
   if (!version) {
-    console.error("usage: node scripts/check-changelog.mjs [version] [--ref <git-ref>]");
+    console.error("usage: node scripts/check-changelog.mjs [version] [--ref <git-ref>] [--working-tree]");
     process.exit(2);
   }
-  targetRef ||= targetRefFor(version, null);
+  targetRef ||= workingTree ? "HEAD" : targetRefFor(version, null);
   try {
     git("rev-parse", "--verify", `${targetRef}^{commit}`);
   } catch (error) {
