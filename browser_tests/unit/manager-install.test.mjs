@@ -1647,8 +1647,9 @@ test("#1908 the production nodes_search handler answers a stalled Manager inside
       // AbortSignal.timeout() uses an unref'd timer in Node. Keep this mock's
       // worker alive with a short ref'd fallback, but clear it as soon as the
       // production budget signal aborts so the test does not leave a timer
-      // behind. This fallback is only for event-loop liveness; the normal
-      // assertion still exercises the handler's 25ms AbortSignal timeout.
+      // behind. If the production budget is not wired, fail with a DISTINCT
+      // non-abort error; otherwise a generic AbortError-to-timeout conversion
+      // could make this test pass without the internal budget firing.
       let fallbackTimer;
       const abort = () => {
         clearTimeout(fallbackTimer);
@@ -1656,7 +1657,10 @@ test("#1908 the production nodes_search handler answers a stalled Manager inside
       };
       if (signal?.aborted) return abort();
       signal?.addEventListener("abort", abort, { once: true });
-      fallbackTimer = setTimeout(abort, 250);
+      fallbackTimer = setTimeout(
+        () => reject(new Error("test fallback fired before the internal budget")),
+        250,
+      );
     });
   const managerCall = async () => {
     managerCallUsed = true;
@@ -1704,6 +1708,73 @@ test("#1908 searchNodesVia forwards one caller signal through the legacy fallbac
   assert.equal(receivedSignal, controller.signal);
   assert.equal(result.count, 1);
   assert.equal(result.results[0].title, "ComfyUI-RMBG");
+});
+
+test("#1908 caller cancellation rejects instead of becoming the internal timeout result", async () => {
+  const controller = new AbortController();
+  const abortError = () =>
+    Object.assign(new Error("caller stopped the node search"), { name: "AbortError" });
+  const managerGet = async (_route, { signal } = {}) =>
+    new Promise((_, reject) => {
+      const abort = () => reject(signal?.reason ?? abortError());
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  const managerCall = async () => {
+    throw new Error("legacy fallback must not run after caller cancellation");
+  };
+
+  const pending = searchNodesVia(managerGet, managerCall, {
+    query: "caller-cancelled",
+    signal: controller.signal,
+    timeoutMs: 25,
+  });
+  controller.abort(abortError());
+
+  await assert.rejects(
+    pending,
+    (err) => {
+      assert.equal(err.name, "AbortError");
+      assert.match(err.message, /caller stopped/);
+      assert.equal(err.managerSearchTimedOut, undefined);
+      return true;
+    },
+    "caller cancellation must remain a rejection",
+  );
+});
+
+test("#1908 caller cancellation through /object_info fallback rejects instead of timing out", async () => {
+  const controller = new AbortController();
+  const abortError = () =>
+    Object.assign(new Error("caller stopped the installed-node fallback"), { name: "AbortError" });
+  const unreachable = async () => {
+    throw UNREACHABLE;
+  };
+  const objectInfoGet = async ({ signal } = {}) =>
+    new Promise((_, reject) => {
+      const abort = () => reject(signal?.reason ?? abortError());
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+
+  const pending = searchNodesVia(unreachable, unreachable, {
+    query: "caller-cancelled-installed-fallback",
+    objectInfoGet,
+    signal: controller.signal,
+    timeoutMs: 25,
+  });
+  controller.abort(abortError());
+
+  await assert.rejects(
+    pending,
+    (err) => {
+      assert.equal(err.name, "AbortError");
+      assert.match(err.message, /installed-node fallback/);
+      assert.equal(err.managerSearchTimedOut, undefined);
+      return true;
+    },
+    "caller cancellation must remain a rejection through object_info",
+  );
 });
 
 test("parseNodeMappings handles array + map shapes and caps the limit", () => {

@@ -806,21 +806,27 @@ export async function objectInfoSearchFallback(
   query,
   limit,
   err,
-  signal,
+  requestSignal,
   timeoutMs,
+  budgetSignal,
+  callerSignal,
 ) {
-  if (managerSearchWasAborted(signal, err)) return managerSearchTimedOutResult(query, timeoutMs);
+  const effectiveCallerSignal = callerSignal ?? (budgetSignal ? undefined : requestSignal);
+  throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+  if (isAbortLikeError(err)) throw err;
   if (typeof objectInfoGet !== "function") return managerUnavailableResult(query, err);
   let info;
   try {
-    info = await objectInfoGet(signal ? { signal } : undefined);
+    info = await objectInfoGet(requestSignal ? { signal: requestSignal } : undefined);
   } catch (fallbackErr) {
-    if (managerSearchWasAborted(signal, fallbackErr)) {
-      return managerSearchTimedOutResult(query, timeoutMs);
-    }
+    throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+    if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+    if (isAbortLikeError(fallbackErr)) throw fallbackErr;
     return managerUnavailableResult(query, err);
   }
-  if (signal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+  throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
   const parsed = parseObjectInfoSearch(info, query, limit);
   if (!parsed.count) return managerUnavailableResult(query, err);
   const result = {
@@ -875,9 +881,10 @@ export function managerUnavailableResult(query, err) {
 }
 
 /** #1908 — Manager search is a canvas-independent read, but its command still
- * returns through the browser tab that received it. Treat an aborted Manager
- * request as a bounded, actionable result instead of allowing the relay to
- * report that the bound canvas tab never replied. */
+ * returns through the browser tab that received it. Only the explicit internal
+ * budget is converted into a bounded, actionable result. Caller cancellation
+ * remains an AbortError so callers can stop the operation without it looking like
+ * a successful, structured Manager timeout. */
 function managerSearchTimedOutResult(query, timeoutMs) {
   const err = new Error(
     `ComfyUI-Manager node search timed out after ${timeoutMs ?? 15000} ms; no reply arrived.`,
@@ -886,10 +893,40 @@ function managerSearchTimedOutResult(query, timeoutMs) {
   return managerUnavailableResult(query, err);
 }
 
-function managerSearchWasAborted(signal, err) {
-  return Boolean(
-    signal?.aborted || err?.name === "AbortError" || err?.name === "TimeoutError",
-  );
+function isAbortLikeError(err) {
+  return err?.name === "AbortError" || err?.name === "TimeoutError";
+}
+
+function managerSearchAbortError() {
+  return Object.assign(new Error("The Manager node search was cancelled"), {
+    name: "AbortError",
+  });
+}
+
+function throwIfManagerSearchCallerAborted(signal) {
+  if (signal?.aborted) throw signal.reason ?? managerSearchAbortError();
+}
+
+/** Compose the caller's cancellation with the internal budget for transport, while
+ * keeping the two source signals separate for result classification. */
+function managerSearchRequestSignal(callerSignal, budgetSignal) {
+  if (!callerSignal) return budgetSignal;
+  if (!budgetSignal) return callerSignal;
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") {
+    return AbortSignal.any([callerSignal, budgetSignal]);
+  }
+  const controller = new AbortController();
+  const forward = (source) => {
+    if (source.aborted) {
+      controller.abort(source.reason);
+      return true;
+    }
+    source.addEventListener("abort", () => controller.abort(source.reason), { once: true });
+    return false;
+  };
+  if (forward(callerSignal)) return controller.signal;
+  forward(budgetSignal);
+  return controller.signal;
 }
 
 /**
@@ -1024,30 +1061,42 @@ export function emptyCatalogueResult(query) {
 export async function searchNodesVia(
   managerGet,
   managerCall,
-  { query, limit, objectInfoGet, signal, timeoutMs } = {},
+  { query, limit, objectInfoGet, signal, budgetSignal, timeoutMs } = {},
 ) {
   const route = "customnode/getmappings?mode=cache";
-  const requestOptions = signal ? { signal } : undefined;
+  const requestSignal = managerSearchRequestSignal(signal, budgetSignal);
+  const requestOptions = requestSignal ? { signal: requestSignal } : undefined;
+  throwIfManagerSearchCallerAborted(signal);
   let data;
   try {
     data = await managerGet(route, requestOptions);
   } catch (err) {
-    if (managerSearchWasAborted(signal, err)) {
-      return managerSearchTimedOutResult(query, timeoutMs);
-    }
+    throwIfManagerSearchCallerAborted(signal);
+    if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+    if (isAbortLikeError(err)) throw err;
     if (!isManagerUnreachable(err)) throw err;
     try {
       data = await managerCall(route, requestOptions);
     } catch (err2) {
-      if (managerSearchWasAborted(signal, err2)) {
-        return managerSearchTimedOutResult(query, timeoutMs);
-      }
+      throwIfManagerSearchCallerAborted(signal);
+      if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+      if (isAbortLikeError(err2)) throw err2;
       if (isManagerUnreachable(err2))
-        return objectInfoSearchFallback(objectInfoGet, query, limit, err2, signal, timeoutMs);
+        return objectInfoSearchFallback(
+          objectInfoGet,
+          query,
+          limit,
+          err2,
+          requestSignal,
+          timeoutMs,
+          budgetSignal,
+          signal,
+        );
       throw err2;
     }
   }
-  if (signal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+  throwIfManagerSearchCallerAborted(signal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
   const parsed = parseNodeMappings(data, query, limit);
   // #808 — an EMPTY catalogue is not a no-match, and only this branch can tell the
   // caller so. Checked on `catalogue_size` (packs the payload carried) rather than

@@ -25364,11 +25364,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // ComfyUI's /object_info (#426) so a legacy/disabled Manager still returns
     // usable, already-installed matches; on a miss it returns the structured
     // {supported:false,…} capability result.
-    const signal = AbortSignal.timeout(NODES_SEARCH_COMMAND_BUDGET_MS);
+    const budgetSignal = AbortSignal.timeout(NODES_SEARCH_COMMAND_BUDGET_MS);
     return searchNodesVia(managerGet, managerCall, {
       query,
       limit,
-      signal,
+      budgetSignal,
       timeoutMs: NODES_SEARCH_COMMAND_BUDGET_MS,
       objectInfoGet: fetchObjectInfo,
     });
