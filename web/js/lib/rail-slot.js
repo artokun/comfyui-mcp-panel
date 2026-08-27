@@ -145,3 +145,105 @@ export function countHostRailLinks(rootGraph, subgraph, side, slotIndex) {
   }
   return count;
 }
+
+/**
+ * #1969 — after subgraph.removeInput/removeOutput splices a non-last rail slot,
+ * host SubgraphNode slots shift in lockstep but remaining parent-graph links
+ * keep the OLD origin_slot/target_slot. Readers (query/outline) look at
+ * `node.inputs[i].link` and still see a wire; graphToPrompt uses the link
+ * record's slot index and reports `Required input is missing`.
+ *
+ * Sync survivors to the live positional index. Do NOT disconnect/reconnect:
+ * #668 saw a SubgraphNode disconnect cascade delete unrelated nodes. Idempotent
+ * if the frontend already reindexed. Never throws — the unexpose has landed.
+ */
+export function reindexHostRailLinks(rootGraph, subgraph, side, removedIndex) {
+  if (!rootGraph || !subgraph || (side !== "input" && side !== "output")) return;
+  if (!Number.isInteger(removedIndex) || removedIndex < 0) return;
+  try {
+    const stack = [{ graph: rootGraph, nodes: rootGraph._nodes ?? [] }];
+    while (stack.length) {
+      const frame = stack.pop();
+      const graph = frame?.graph;
+      for (const node of frame?.nodes ?? []) {
+        if (!node) continue;
+        if (node.subgraph === subgraph) {
+          if (side === "input") reindexHostInputLinks(node, graph, removedIndex);
+          else reindexHostOutputLinks(node, graph, removedIndex);
+        }
+        if (node.subgraph?._nodes?.length) {
+          stack.push({ graph: node.subgraph, nodes: node.subgraph._nodes });
+        }
+      }
+    }
+  } catch {
+    /* a landed unexpose must not become a throw because a host walk failed */
+  }
+}
+
+function readHostGraphLink(node, graph, linkId) {
+  if (linkId == null) return null;
+  const stores = [node?.graph, graph];
+  for (const g of stores) {
+    if (!g) continue;
+    try {
+      if (typeof g.getLink === "function") {
+        const stored = g.getLink(linkId);
+        if (stored != null) return stored;
+      }
+      const links = g.links;
+      if (!links) continue;
+      const stored = typeof links.get === "function" ? links.get(linkId) : links[linkId];
+      if (stored != null) return stored;
+    } catch {
+      /* try the next store */
+    }
+  }
+  return null;
+}
+
+function linkEndpointId(link, role) {
+  if (link == null) return null;
+  if (Array.isArray(link)) return role === "origin" ? link[1] : link[3];
+  return role === "origin" ? (link.origin_id ?? link.originId) : (link.target_id ?? link.targetId);
+}
+
+function setLinkSlotIndex(link, role, index) {
+  const prop = role === "origin" ? "origin_slot" : "target_slot";
+  const arrIdx = role === "origin" ? 2 : 4;
+  if (Array.isArray(link)) {
+    if (link.length > arrIdx) link[arrIdx] = index;
+    if (Object.prototype.hasOwnProperty.call(link, prop)) link[prop] = index;
+    return;
+  }
+  if (link && typeof link === "object") link[prop] = index;
+}
+
+function reindexHostInputLinks(node, graph, removedIndex) {
+  const inputs = node?.inputs;
+  if (!Array.isArray(inputs)) return;
+  for (let i = removedIndex; i < inputs.length; i++) {
+    const linkId = inputs[i]?.link;
+    if (linkId == null) continue;
+    const link = readHostGraphLink(node, graph, linkId);
+    if (!link) continue;
+    const targetId = linkEndpointId(link, "target");
+    if (targetId == null || String(targetId) !== String(node.id)) continue;
+    setLinkSlotIndex(link, "target", i);
+  }
+}
+
+function reindexHostOutputLinks(node, graph, removedIndex) {
+  const outputs = node?.outputs;
+  if (!Array.isArray(outputs)) return;
+  for (let i = removedIndex; i < outputs.length; i++) {
+    for (const linkId of outputs[i]?.links ?? []) {
+      if (linkId == null) continue;
+      const link = readHostGraphLink(node, graph, linkId);
+      if (!link) continue;
+      const originId = linkEndpointId(link, "origin");
+      if (originId == null || String(originId) !== String(node.id)) continue;
+      setLinkSlotIndex(link, "origin", i);
+    }
+  }
+}

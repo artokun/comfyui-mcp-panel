@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { findExistingRailSlot, railSlotIndex, resolveRailSlotForRemoval } from "../../web/js/lib/rail-slot.js";
+import { findExistingRailSlot, railSlotIndex, resolveRailSlotForRemoval, reindexHostRailLinks } from "../../web/js/lib/rail-slot.js";
 
 /** A rail with twelve slots, none of them named with digits — the reported shape. */
 const RAIL = Array.from({ length: 12 }, (_, i) => ({ name: `in_${i}`, type: "STRING", slot: i }));
@@ -110,7 +110,7 @@ test("#1114 WIRING: the panel uses the shared lookup and keeps no copy", () => {
   );
   assert.match(
     panel,
-    /import \{ findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks \} from "\.\/lib\/rail-slot\.js";/,
+    /import \{ findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks, reindexHostRailLinks \} from "\.\/lib\/rail-slot\.js";/,
     "the panel imports the shared lookups",
   );
   assert.doesNotMatch(
@@ -128,12 +128,19 @@ test("#1114 WIRING: the panel uses the shared lookup and keeps no copy", () => {
     /function countHostRailLinks\s*\(/,
     "and keeps no local copy of the host-wire counter either",
   );
+  assert.doesNotMatch(
+    panel,
+    /function reindexHostRailLinks\s*\(/,
+    "and keeps no local copy of the host-link reindexer either",
+  );
   // Both rail branches must go through it: outputs (to_input) and inputs (from_output).
   const uses = panel.match(/findExistingRailSlot\(graph\.(inputs|outputs),/g) ?? [];
   assert.equal(uses.length, 2, "both rail branches resolve through it");
   // And both unexpose executors resolve through the removal resolver.
   const removals = panel.match(/resolveRailSlotForRemoval\(subgraph\.(inputs|outputs),/g) ?? [];
   assert.equal(removals.length, 2, "both unexpose executors resolve through it");
+  const reindexes = panel.match(/reindexHostRailLinks\(rootGraph, subgraph, "(input|output)", slotIndex\)/g) ?? [];
+  assert.equal(reindexes.length, 2, "both unexpose executors reindex remaining host links");
 });
 
 test("#1294 removal resolves a slot by name or index, like a connect", () => {
@@ -207,4 +214,55 @@ test("#1114 a digit-named slot AT its own index is not ambiguous", () => {
 test("#1114 a digit name with NO matching index still resolves by name", () => {
   const named = [{ name: "a", slot: 0 }, { name: "7", slot: 1 }];
   assert.equal(findExistingRailSlot(named, "7")?.slot, 1); // index 7 does not exist
+});
+
+test("#1969 reindexHostRailLinks writes the live index onto object-form and array-form links", () => {
+  const objectLink = { id: 1, origin_id: 2, origin_slot: 0, target_id: 7, target_slot: 2 };
+  const arrayLink = [2, 3, 0, 7, 3, "IMAGE"];
+  const subgraph = {};
+  const host = {
+    id: 7,
+    subgraph,
+    inputs: [{ name: "keep", link: 1 }, { name: "shifted", link: 2 }],
+  };
+  const root = { _nodes: [host], links: { 1: objectLink, 2: arrayLink } };
+  host.graph = root;
+  reindexHostRailLinks(root, subgraph, "input", 1);
+  assert.equal(objectLink.target_slot, 2, "slots before the removed index are left alone");
+  assert.equal(arrayLink[4], 1);
+
+  const objectAgain = { id: 1, origin_id: 2, origin_slot: 0, target_id: 7, target_slot: 2 };
+  const arrayAgain = [2, 3, 0, 7, 3, "IMAGE"];
+  host.inputs = [
+    { name: "shifted-object", link: 1 },
+    { name: "shifted-array", link: 2 },
+  ];
+  root.links = { 1: objectAgain, 2: arrayAgain };
+  reindexHostRailLinks(root, subgraph, "input", 0);
+  assert.equal(objectAgain.target_slot, 0);
+  assert.equal(arrayAgain[4], 1);
+});
+
+test("#1969 reindexHostRailLinks walks nested hosts and skips foreign links", () => {
+  const subgraph = {};
+  const nestedLink = { id: 4, origin_id: 1, origin_slot: 0, target_id: 15, target_slot: 2 };
+  const foreign = { id: 5, origin_id: 1, origin_slot: 0, target_id: 99, target_slot: 2 };
+  const nestedHost = {
+    id: 15,
+    subgraph,
+    inputs: [{ name: "a", link: null }, { name: "b", link: 4 }],
+  };
+  const parentSub = { _nodes: [nestedHost], links: { 4: nestedLink } };
+  nestedHost.graph = parentSub;
+  const decoy = {
+    id: 8,
+    subgraph,
+    inputs: [{ name: "a", link: null }, { name: "b", link: 5 }],
+    graph: { links: { 5: foreign } },
+  };
+  const root = { _nodes: [{ subgraph: parentSub }, decoy] };
+  decoy.graph.links = { 5: foreign };
+  reindexHostRailLinks(root, subgraph, "input", 1);
+  assert.equal(nestedLink.target_slot, 1);
+  assert.equal(foreign.target_slot, 2, "a link that does not target this host is left alone");
 });
