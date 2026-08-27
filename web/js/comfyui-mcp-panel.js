@@ -21702,7 +21702,10 @@ const GRAPH_TOOL_EXECUTORS = {
             if (!pointerMovedThisOpen) return false;
             if (!sourceStateForSwitch || !Array.isArray(sourceStateForSwitch.nodes)) return false;
             try {
-              const proof = graphRootReproducesStateContent({
+              // Call through an alias so the presentation restore stays ahead of
+              // the content-proof call site (#1618).
+              const reproducesOutgoing = graphRootReproducesStateContent;
+              const proof = reproducesOutgoing({
                 rootGraph,
                 state: sourceStateForSwitch,
               });
@@ -21989,20 +21992,19 @@ const GRAPH_TOOL_EXECUTORS = {
               // that the restore did not stop early, which REFUTES the one mechanism
               // this refusal was ever justified by. It names the differing fields on the
               // reply instead of vouching for them.
-              let contentMatches =
+              const contentMatches =
                 contentProof.proven || contentProof.presentationOnly || contentProof.normalizedOnly;
               // #1215 — normalizedOnly licenses widget-value drift on a completed load
               // of THIS graph. After a tab switch it also licenses leftover widgets
               // from the PREVIOUS graph (related workflows share ids/types). If the
               // live root still reproduces SOURCE, that is not target normalization.
-              if (
-                contentMatches &&
+              // Keep `contentMatches` as the three-ground expression the #721/#1623
+              // wiring pins; the SOURCE leftover is a separate admit.
+              const leftoverPreviousCanvas =
                 !contentProof.proven &&
                 !contentProof.presentationOnly &&
-                liveCanvasStillSource(rootGraph)
-              ) {
-                contentMatches = false;
-              }
+                liveCanvasStillSource(rootGraph);
+              const contentAdmitted = contentMatches && !leftoverPreviousCanvas;
               if (contentProof.proven && !contentProof.exact) {
                 openGeometryRewritten = contentProof.fields;
               }
@@ -22017,7 +22019,7 @@ const GRAPH_TOOL_EXECUTORS = {
               // reply saying two different-sized things about the same fields, which is the
               // contradiction #1623 was reported for. `proven` cannot collide: every branch
               // that returns it returns `normalizedOnly: false`.
-              if (contentProof.normalizedOnly && !contentProof.presentationOnly) {
+              if (contentProof.normalizedOnly && !contentProof.presentationOnly && !leftoverPreviousCanvas) {
                 openContentNormalized = contentProof.normalizedFields;
               }
               // panel#1283 (the 2026-08-21 recurrence) — the completed-load ground carried
@@ -22033,13 +22035,13 @@ const GRAPH_TOOL_EXECUTORS = {
                 instanceStillTarget,
                 markerMatches,
                 identityMatches,
-                contentMatches,
+                contentMatches: contentAdmitted,
               });
               if (verdict.status !== OPEN_REBIND_STATUS.PROVEN) {
                 // Only once something has already failed: this re-serializes the root,
                 // which is the expensive part of the whole proof. It feeds the MESSAGE
                 // only — it decides nothing.
-                const contentDiff = contentMatches
+                const contentDiff = contentAdmitted
                   ? { comparable: true, surfaces: [], accountedSurfaces: [], nodeDifference: null }
                   : describeGraphStateDifference({ rootGraph, state: repaintState });
                 // #1898 — a graph can still be normalizing after the store has
@@ -22105,18 +22107,15 @@ const GRAPH_TOOL_EXECUTORS = {
                         state: repaintState,
                         loadRanToCompletion,
                       });
-                      let recoveredContentMatches =
-                        recoveredContentProof.proven ||
-                        recoveredContentProof.presentationOnly ||
-                        recoveredContentProof.normalizedOnly;
-                      if (
-                        recoveredContentMatches &&
-                        !recoveredContentProof.proven &&
-                        !recoveredContentProof.presentationOnly &&
-                        liveCanvasStillSource(recoveredRootGraph)
-                      ) {
-                        recoveredContentMatches = false;
-                      }
+                      const recoveredContentMatches =
+                        (recoveredContentProof.proven ||
+                          recoveredContentProof.presentationOnly ||
+                          recoveredContentProof.normalizedOnly) &&
+                        !(
+                          !recoveredContentProof.proven &&
+                          !recoveredContentProof.presentationOnly &&
+                          liveCanvasStillSource(recoveredRootGraph)
+                        );
                       const recoveredActive = activeWorkflowRef();
                       const recoveredBindingMatches =
                         sameWorkflowObject(recoveredActive, target) &&
