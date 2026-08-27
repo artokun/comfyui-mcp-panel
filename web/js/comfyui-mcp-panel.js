@@ -576,6 +576,7 @@ import {
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
 import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
+import { settleOpenedWorkflowReadable } from "./lib/settle-open-readable.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import {
   applyCurrentDefWidgetValues,
@@ -21739,53 +21740,111 @@ const GRAPH_TOOL_EXECUTORS = {
                 const contentDiff = contentMatches
                   ? { comparable: true, surfaces: [], accountedSurfaces: [], nodeDifference: null }
                   : describeGraphStateDifference({ rootGraph, state: repaintState });
-                // #1477 — binding proven, and the only differing surface is
-                // `definitions`. That is not a previous-workflow graph (#1111/#1089
-                // disagree on nodes/links). Throwing here skipped the workflow_uuid
-                // publish and left the session fenced to the prior workflow, so
-                // panel_graph_outline then failed until panel_list_workflows
-                // republished the identity. Publish the fence; disclose; still fail
-                // closed when any other surface disagrees.
+                // #1898 — a graph can still be normalizing after the store has
+                // switched identity and `loadGraphData` has resolved. If the
+                // requested identity is already proven, let a real graph_outline
+                // probe settle that race; an unreadable probe gets exactly one
+                // normalization retry. The probe remains fail-closed: identity,
+                // readability and the final active settlement must all be proven.
                 if (
                   verdict.status === OPEN_REBIND_STATUS.CONTENT_UNVERIFIED &&
-                  openContentDifferenceIsDefinitionsOnly({
+                  // #1283/#1089/#1215 — the readable-outline recovery is only
+                  // for a completed, comparable normalization race. A partial
+                  // restore, an unreadable comparison, or a foreign/untagged
+                  // source remains outcome-unknown even if a graph read happens
+                  // to be possible afterward.
+                  loadRanToCompletion === true &&
+                  contentDiff.comparable === true &&
+                  Array.isArray(openRestoreFailures) &&
+                  openRestoreFailures[0] == null &&
+                  !openContentDifferenceIsDefinitionsOnly({
                     comparable: contentDiff.comparable,
                     surfaces: contentDiff.surfaces,
-                  })
+                  }) &&
+                  !sourceForeign &&
+                  !sourceUnproven
                 ) {
-                  openDefinitionsUnverified = true;
-                } else {
-                  rebindFailed = new Error(
-                    describeOpenRebindOutcome(verdict, {
-                      targetLabel: target.filename || target.path || "the requested workflow",
-                      activeLabel: activeNow ? activeNow.filename || activeNow.path || "another tab" : "no active tab",
-                      expectedMarker: openProofMarker,
-                      observedMarker: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[OPEN_PROOF_FIELD] ?? null,
-                      expectedUuid: targetUuid,
-                      observedUuid: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] ?? null,
-                      contentComparable: contentDiff.comparable,
-                      contentSurfaces: contentDiff.surfaces,
-                      // #1588 — which of those the panel has already fully characterised
-                      // (today: a `definitions` difference that is pure RENUMBERING — link ids,
-                      // and comfyui-mcp#1706 subgraph node ids — which a load of a workflow
-                      // containing subgraphs routinely produces).
-                      // Without this the disclosure counts an explained surface as a
-                      // second unexplained one and drops to the maximal-alarm wording.
-                      contentAccountedSurfaces: contentDiff.accountedSurfaces,
-                      // panel#1283 family — whether the restore ABORTED. `false` is the one
-                      // case where a content difference has a known cause other than the
-                      // frontend rewriting its own fields, and it is the case the reader
-                      // most needs named. `null` (the load could not be watched) is passed
-                      // through as null and says nothing, which is the pre-existing state
-                      // of knowledge.
-                      contentLoadRanToCompletion: loadRanToCompletion,
-                      contentRestoreFailures: openRestoreFailures,
-                      // #825 — within the `nodes` surface, whether anything was LOST
-                      // or the frontend merely re-measured the boxes. Same three
-                      // words otherwise, opposite meanings for the reader.
-                      contentNodeDifference: contentDiff.nodeDifference,
-                    }),
-                  );
+                  const readableRecovery = await settleOpenedWorkflowReadable({
+                    settleActive: () =>
+                      settleOwnedOpenedWorkflowActive({
+                        target,
+                        readActive: activeWorkflowRef,
+                        sameWorkflowObject,
+                        beginStep: () => beginWorkflowReloadStep(reloadGuardToken),
+                        ownsStep: () => ownsWorkflowReloadGuard(reloadGuardToken),
+                        endStep: () => endWorkflowReloadStep(reloadGuardToken),
+                      }),
+                    readGraphOutline: () => GRAPH_TOOL_EXECUTORS.graph_outline({}),
+                    retryNormalization: async () => {
+                      if (!beginWorkflowReloadStep(reloadGuardToken)) return false;
+                      try {
+                        if (!sameWorkflowObject(activeWorkflowRef(), target)) return false;
+                        await app.loadGraphData(repaintState, true, true, target);
+                        return (
+                          ownsWorkflowReloadGuard(reloadGuardToken) &&
+                          sameWorkflowObject(activeWorkflowRef(), target)
+                        );
+                      } catch {
+                        return false;
+                      } finally {
+                        endWorkflowReloadStep(reloadGuardToken);
+                      }
+                    },
+                  });
+                  if (readableRecovery.status === "settled-readable") {
+                    verdict.status = OPEN_REBIND_STATUS.PROVEN;
+                    verdict.unproven = [];
+                  }
+                }
+                if (verdict.status !== OPEN_REBIND_STATUS.PROVEN) {
+                  // #1477 — binding proven, and the only differing surface is
+                  // `definitions`. That is not a previous-workflow graph (#1111/#1089
+                  // disagree on nodes/links). Throwing here skipped the workflow_uuid
+                  // publish and left the session fenced to the prior workflow, so
+                  // panel_graph_outline then failed until panel_list_workflows
+                  // republished the identity. Publish the fence; disclose; still fail
+                  // closed when any other surface disagrees.
+                  if (
+                    verdict.status === OPEN_REBIND_STATUS.CONTENT_UNVERIFIED &&
+                    openContentDifferenceIsDefinitionsOnly({
+                      comparable: contentDiff.comparable,
+                      surfaces: contentDiff.surfaces,
+                    })
+                  ) {
+                    openDefinitionsUnverified = true;
+                  } else {
+                    rebindFailed = new Error(
+                      describeOpenRebindOutcome(verdict, {
+                        targetLabel: target.filename || target.path || "the requested workflow",
+                        activeLabel: activeNow ? activeNow.filename || activeNow.path || "another tab" : "no active tab",
+                        expectedMarker: openProofMarker,
+                        observedMarker: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[OPEN_PROOF_FIELD] ?? null,
+                        expectedUuid: targetUuid,
+                        observedUuid: rootGraph?.extra?.[WORKFLOW_META_NAMESPACE]?.[WORKFLOW_UUID_FIELD] ?? null,
+                        contentComparable: contentDiff.comparable,
+                        contentSurfaces: contentDiff.surfaces,
+                        // #1588 — which of those the panel has already fully characterised
+                        // (today: a `definitions` difference that is pure RENUMBERING — link ids,
+                        // and comfyui-mcp#1706 subgraph node ids — which a load of a workflow
+                        // containing subgraphs routinely produces).
+                        // Without this the disclosure counts an explained surface as a
+                        // second unexplained one and drops to the maximal-alarm wording.
+                        contentAccountedSurfaces: contentDiff.accountedSurfaces,
+                        // panel#1283 family — whether the restore ABORTED. `false` is the one
+                        // case where a content difference has a known cause other than the
+                        // frontend rewriting its own fields, and it is the case the reader
+                        // most needs named. `null` (the load could not be watched) is passed
+                        // through as null and says nothing, which is the pre-existing state
+                        // of knowledge.
+                        contentLoadRanToCompletion: loadRanToCompletion,
+                        contentRestoreFailures: openRestoreFailures,
+                        // #825 — within the `nodes` surface, whether anything was LOST
+                        // or the frontend merely re-measured the boxes. Same three
+                        // words otherwise, opposite meanings for the reader.
+                        contentNodeDifference: contentDiff.nodeDifference,
+                      }),
+                    );
+                  }
                 }
               }
             } finally {

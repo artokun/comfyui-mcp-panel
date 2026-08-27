@@ -7,6 +7,7 @@ import {
   settleOpenedWorkflowActive,
   settleOwnedOpenedWorkflowActive,
 } from "../../web/js/lib/settle-open-active.js";
+import { settleOpenedWorkflowReadable } from "../../web/js/lib/settle-open-readable.js";
 import { graphMutationReconnectGate } from "../../web/js/lib/reconnect-recovery.js";
 import { activeWorkflowPossiblyStale } from "../../web/js/lib/reconnect-staleness.js";
 import { classifyPinnedTarget } from "../../web/js/lib/workflow-chat-identity.js";
@@ -107,6 +108,118 @@ function productionExecutor(methodName, environment) {
   return factory(scope);
 }
 
+function productionReadableOpenEnvironment({ readableAfterRetry }) {
+  const previous = { path: "workflows/previous.json" };
+  const target = {
+    path: "workflows/target.json",
+    filename: "target.json",
+    isModified: false,
+    activeState: {
+      nodes: [{ id: 1, type: "KSampler" }],
+      links: [],
+      groups: [],
+      last_node_id: 1,
+      extra: { comfyui_mcp: { workflow_uuid: "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95" } },
+    },
+  };
+  const root = { _nodes: [], extra: {} };
+  const uuid = "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+  let active = previous;
+  let loads = 0;
+  let outlines = 0;
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: {},
+    loadGraphData: async (state) => {
+      loads += 1;
+      root.extra = state.extra;
+      root._nodes = [{ id: 1, type: "KSampler" }];
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const status = { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" };
+  return {
+    target,
+    counters: () => ({ loads, outlines }),
+    environment: {
+      backendReconnectEpoch: 4,
+      activeWorkflowResyncEpoch: 4,
+      postReconnectBindingProofEpoch: 4,
+      app,
+      activeWorkflowRef: () => active,
+      sameWorkflowObject: (a, b) => a === b,
+      workflowTabId: (workflow) => `wf:${workflow.path}`,
+      WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+      WORKFLOW_UUID_FIELD: "workflow_uuid",
+      WORKFLOW_PATH_FIELD: "workflow_path",
+      OPEN_PROOF_FIELD: "open_proof",
+      workflowObjectUuid: () => uuid,
+      workflowStableUuid: () => uuid,
+      workflowOwnsRootUuidTag: () => false,
+      workflowUuidOwner: () => null,
+      getWorkflowTitle: () => "Target",
+      waitForReconnectHandshakeBeforeOpen: async () => {},
+      comfyBackendIsDown: () => false,
+      postReconnectBindingSettleWindow: () => false,
+      nodeDefRefreshInFlight: null,
+      flushSourceCanvasBeforeSwitch: async () => {},
+      claimActiveWorkflowMove: () => {},
+      acquireCanvasInteractionLock: () => null,
+      releaseCanvasInteractionLock: () => {},
+      MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+      settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+      workflowRecordMatchesSelector: () => true,
+      installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+      installGraphConfigureWatch: () => ({ restore: () => {} }),
+      loadRestoreCompleted: () => true,
+      retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+      liteGraphGlobal: () => null,
+      getGraphCtx: () => ({ graph: root, rootGraph: root }),
+      describeLiveCanvasBinding: () => "unknown",
+      applySavedNodePresentation: () => {},
+      applySavedSubgraphHostWidgets: () => {},
+      decideOpenStaleness: () => ({ stale: false, reload: false }),
+      describeRepaintSourceBinding: () => "unknown",
+      graphRootCarriesOpenProof: () => true,
+      graphRootWorkflowUuidMatches: () => true,
+      graphRootReproducesStateContent: () => ({ proven: false, presentationOnly: false, normalizedOnly: false }),
+      describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
+      openContentDifferenceIsDefinitionsOnly: () => false,
+      resolveOpenRebindVerdict: ({ contentMatches }) =>
+        contentMatches ? { status: status.PROVEN } : { status: status.CONTENT_UNVERIFIED },
+      describeOpenRebindOutcome: () => "content could not be verified",
+      OPEN_REBIND_STATUS: status,
+      GRAPH_TOOL_EXECUTORS: {
+        graph_outline: () => {
+          outlines += 1;
+          return readableAfterRetry && loads > 1
+            ? { node_count: 1, outline: "1 KSampler", detail_level: "full" }
+            : null;
+        },
+      },
+      settleOpenedWorkflowReadable,
+      settleOwnedOpenedWorkflowActive,
+      noteOpenAttempt: () => ({ seq: 1 }),
+      backendSocketReplyFields: () => ({}),
+      activeWorkflowUuidForOpenReply: () => uuid,
+      describeOpenActiveBinding: () => ({ active_matches_target: true }),
+      canvasFileDivergenceNote: () => null,
+      failOpenRebindUnknown: (error) => error,
+      coerceMessageText: (value) => String(value),
+    },
+  };
+}
+
 function fakeClock() {
   let time = 0;
   return {
@@ -188,6 +301,62 @@ test("#887 unreadable active state stays unknown", async () => {
   });
 
   assert.equal(result.status, "unknown");
+});
+
+test("#1898 settles a readable outline after one normalization retry", async () => {
+  const target = { path: "workflows/target.json" };
+  let settleCalls = 0;
+  let outlineCalls = 0;
+  let retries = 0;
+
+  const result = await settleOpenedWorkflowReadable({
+    settleActive: async () => {
+      settleCalls += 1;
+      return { status: "settled", active: target };
+    },
+    readGraphOutline: async () => {
+      outlineCalls += 1;
+      return outlineCalls === 1 ? null : { node_count: 1, outline: "1 KSampler", detail_level: "full" };
+    },
+    retryNormalization: async () => {
+      retries += 1;
+      return true;
+    },
+  });
+
+  assert.equal(result.status, "settled-readable");
+  assert.equal(result.retried, true);
+  assert.equal(retries, 1, "normalization is retried once");
+  assert.equal(outlineCalls, 2, "the readable graph is re-probed after retry");
+  assert.equal(settleCalls, 4, "identity is settled before retry and after the final probe");
+});
+
+test("#1898 keeps an unreadable or unproven graph outcome unknown", async () => {
+  const target = { path: "workflows/target.json" };
+  let retries = 0;
+  const result = await settleOpenedWorkflowReadable({
+    settleActive: async () => ({ status: "settled", active: target }),
+    readGraphOutline: async () => null,
+    retryNormalization: async () => {
+      retries += 1;
+      return true;
+    },
+  });
+
+  assert.equal(result.status, "unknown");
+  assert.equal(retries, 1, "an unreadable graph gets only the bounded retry");
+
+  let identityRetries = 0;
+  const identityUnknown = await settleOpenedWorkflowReadable({
+    settleActive: async () => ({ status: "unknown", reason: "active workflow was unreadable" }),
+    readGraphOutline: async () => ({ node_count: 1, outline: "1 KSampler", detail_level: "full" }),
+    retryNormalization: async () => {
+      identityRetries += 1;
+      return true;
+    },
+  });
+  assert.equal(identityUnknown.status, "unknown");
+  assert.equal(identityRetries, 0, "an unreadable identity never authorizes normalization");
 });
 
 test("#887 a superseding open cannot turn an old settle result into success", async () => {
@@ -344,6 +513,27 @@ test("#887 production workflow_open native failure retires proof before its nega
   assert.equal(panel.guard(), null, "native failure must release the production reload guard");
   assert.equal(journal.at(-1)?.applied, false, "the native failure remains a clean negative reply");
   assert.match(journal.at(-1)?.error ?? "", /native switch rejected/);
+});
+
+test("#1898 production workflow_open accepts a settled readable outline after normalization races", async () => {
+  const { target, counters, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  const panel = productionExecutor("workflow_open", environment);
+
+  const result = await panel.method({ path: target.path, rid: "readable-race" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(result.workflow_uuid, "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95");
+  assert.deepEqual(counters(), { loads: 2, outlines: 2 }, "the production handler probes, retries once, and re-probes");
+  assert.equal(panel.guard(), null, "the readable outcome releases the production reload guard");
+});
+
+test("#1898 production workflow_open keeps outcome unknown when the settled graph remains unreadable", async () => {
+  const { target, counters, environment } = productionReadableOpenEnvironment({ readableAfterRetry: false });
+  const panel = productionExecutor("workflow_open", environment);
+
+  await assert.rejects(panel.method({ path: target.path, rid: "unreadable-race" }), /content could not be verified/);
+  assert.deepEqual(counters(), { loads: 2, outlines: 2 }, "an unreadable graph is retried once, never indefinitely");
+  assert.equal(panel.guard(), null, "the unknown outcome releases the production reload guard");
 });
 
 test("#887 production workflow_new unknown result retires proof before returning", async () => {
