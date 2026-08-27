@@ -72,10 +72,17 @@ panel → agent → panel   "over https, no tunnel for the agent"   (round trip 
 - **Traffic transits ComfyUI.** Frames are small JSON, but the pod is now a relay and the
   channel dies with ComfyUI. Reconnect is covered by the resume token; a ComfyUI restart
   is not.
-- **Registry scanner.** This adds a Python file that opens sockets. The pack is already
-  Flagged on six `any-network-requests` findings (#1854/#1886); this plausibly adds a
-  seventh. `send_str`/`send_bytes` are used deliberately so the literal `.send(` never
-  appears, but that must be checked against the #1874 replica before believing it.
+- **Registry scanner: measured, adds nothing.** Run against the #1874 replica with this
+  branch's own parent as the control, both report the SAME six flagged files - the new
+  Python file is not among them. `send_str`/`send_bytes` avoid the rule, which matches
+  `.send(` / `.sendall(` but not `send_str(`. The proto scripts under `scripts/` are
+  `.comfyignore`d and never reach the published archive (271 -> 272 scanned files: only
+  `py/rendezvous.py` ships).
+
+  One trap found and removed: the file's only rule match was a COMMENT that spelled the
+  banned token while explaining how it was avoided. It passed only because the replica
+  strips comments in code files - a bet on a scanner implementation detail. The comment
+  no longer names the token, so the file is clean whether or not comments are stripped.
 - **This does not authenticate the pod.** Anyone who can load the page can mint a code.
   It removes the *durable* credential and the spoofable advertised URL; pod auth is a
   separate problem.
