@@ -27,4 +27,4 @@
  * GENERATED VALUE — do not hand-edit. Re-vendor and run `npm run check:tool-vocabulary`,
  * which prints the replacement line when this goes stale.
  */
-export const VENDORED_VOCABULARY_HASH = "23ca43f48ed05fe2e611d6ba1a6c522ca93410667d8e09ad90bf5c79d0f6c6ec";
+export const VENDORED_VOCABULARY_HASH = "184e53142944516b15294367c7fefcd8869aeb451d0de4744cee96a8764b7693";
