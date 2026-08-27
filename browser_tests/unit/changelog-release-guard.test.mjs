@@ -176,6 +176,46 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
   }
 });
 
+test("#1882: changelog generation bounds at an untagged `chore: release` commit", () => {
+  // Tags lag this repo's cuts. If the generator only recognises `chore(release):` /
+  // `release:` / a bare version, prevTag() falls back to the previous TAG and the
+  // next cut re-lists everything since — the 0.15.111–0.15.113 shape in #1882.
+  const cwd = mkdtempSync(join(tmpdir(), "panel-changelog-untagged-"));
+  try {
+    git(cwd, "init", "-b", "main");
+    git(cwd, "config", "user.email", "test@example.invalid");
+    git(cwd, "config", "user.name", "Changelog Test");
+    writeFileSync(
+      cwd + "/CHANGELOG.md",
+      ["# Changelog", "", "## [Unreleased]", "", "## [1.0.0] - 2026-08-26", "", "### Fixed", "- initial fix (#90)", ""].join(
+        "\n",
+      ),
+      "utf8",
+    );
+    git(cwd, "add", "CHANGELOG.md");
+    git(cwd, "commit", "-m", "1.0.0 — initial release");
+    git(cwd, "tag", "v1.0.0");
+    git(cwd, "commit", "--allow-empty", "-m", "fix: shipped only in 1.1.0 (#201)");
+    git(cwd, "commit", "--allow-empty", "-m", "chore: release v1.1.0 (#202)");
+    git(cwd, "commit", "--allow-empty", "-m", "fix: shipped only in 1.2.0 (#203)");
+
+    execFileSync(process.execPath, [GENERATOR, "1.2.0"], {
+      cwd,
+      encoding: "utf8",
+      env: { ...process.env, CHANGELOG_ROOT: cwd },
+    });
+    const generated = readFileSync(cwd + "/CHANGELOG.md", "utf8");
+    const section12 = generated.slice(generated.indexOf("## [1.2.0]"));
+    const nextRelease = section12.search(/\n## \[/);
+    const body12 = nextRelease >= 0 ? section12.slice(0, nextRelease) : section12;
+    assert.match(body12, /#203/, "the new cut must include its own commit");
+    assert.doesNotMatch(body12, /#201/, "an untagged previous release must still bound the range");
+    assert.doesNotMatch(body12, /#202/, "the previous release commit is not filed as a change");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("#1891: publish guard receives pyproject version before checking changelog", () => {
   const workflow = readFileSync(PUBLISH_WORKFLOW, "utf8");
   const versionStep = workflow.indexOf("id: release-version");

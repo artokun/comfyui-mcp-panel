@@ -29,12 +29,18 @@ on:
   push:
     tags:
       - "v*"
-  # So a historical tag can be audited on demand without pushing anything.
+  # A tag-push trigger cannot see a release that never got a tag. Audit HEAD's
+  # declared version daily so a published-but-untagged tree is a red build
+  # within a day rather than at the next tag (#1882).
+  schedule:
+    - cron: "17 6 * * *"
+  # So a historical tag — or HEAD's published version — can be audited on
+  # demand without pushing anything.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to audit (e.g. v0.15.104)"
-        required: true
+        description: "Tag to audit (e.g. v0.15.104). Leave empty to audit HEAD's published version."
+        required: false
         type: string
 
 permissions:
@@ -55,11 +61,17 @@ jobs:
           fetch-tags: true
 
       - name: Audit the release tag
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '') }}
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: node scripts/check-release-tag.mjs "$TAG"
 
       - name: Audit the tagged changelog
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '') }}
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: node scripts/check-changelog.mjs "${TAG#v}" --ref "$TAG"
+
+      - name: Audit the published tree's version has a tag
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '') }}
+        run: node scripts/check-release-tag.mjs --published

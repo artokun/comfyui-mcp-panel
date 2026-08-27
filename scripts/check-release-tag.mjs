@@ -65,6 +65,22 @@
  *      so this never re-litigates the whole history and cannot become
  *      permanently red over a historical gap nobody intends to backfill.
  *
+ * THE TAG-PUSH TRIGGER CANNOT SEE A RELEASE THAT NEVER GOT A TAG. 0.15.111,
+ * 0.15.112 and 0.15.113 all reached the Registry after this file shipped, and
+ * none of them has a tag — there was no tag-push event, so nothing ran. Rule 2
+ * would have named them on the *next* tag push, but that is too late: the
+ * operand is already wrong, and a later tagged cut (v0.15.115) bounds at
+ * v0.15.114 and never looks back. The inverse trigger is the publish job,
+ * which DID run. After a successful Registry publish of `<X>`:
+ *
+ *   3. THE PUBLISHED VERSION IS LABELLED. Tag `v<X>` must exist and resolve to
+ *      the first-parent commit that cut `<X>`, not merely to HEAD (a later
+ *      same-version commit is not the release). `--ensure` creates that
+ *      annotated tag when it is missing so the path cannot ship a version and
+ *      leave it untagged; it will not move a tag that already points elsewhere.
+ *      `--published` is also what the scheduled run of release-tag-guard.yml
+ *      audits, so a gap is a red build within a day rather than at the next tag.
+ *
  * IT FAILS CLOSED, AT EVERY GRAIN. Every git lookup this needs can fail — a
  * shallow clone, tags that were never fetched, an unreadable blob on one commit.
  * The first draft turned each of those into "nothing to see": a missing range, or
@@ -227,6 +243,62 @@ export function auditTag({ tag, treeAtTag, range = [], tagTargetFor, historyErro
   return violations;
 }
 
+/**
+ * Rule 3. The tree's declared version must be labelled by a tag on the commit
+ * that cut it — independent of whether a later tag push ever happens.
+ *
+ * @param {object} o
+ * @param {string|null} o.version  pyproject version at the audited rev
+ * @param {string|null} o.cutSha   first-parent commit that changed pyproject to `version`
+ * @param {string} [o.cutSubject]
+ * @param {(version:string)=>(string|null)} o.tagTargetFor
+ * @param {string|null} [o.historyError]
+ * @returns {string[]}
+ */
+export function auditPublishedVersion({
+  version,
+  cutSha,
+  cutSubject = "",
+  tagTargetFor,
+  historyError = null,
+}) {
+  if (historyError) {
+    return [
+      `published version: the tag check could not run — ${historyError}. Refusing to ` +
+        `report this release as tagged on a check that did not execute (#1882).`,
+    ];
+  }
+  if (!version) {
+    return [`published version: could not read [project].version from the audited tree.`];
+  }
+  if (!cutSha) {
+    return [
+      `${version}: could not find the first-parent commit that cut this version, so the ` +
+        `tag cannot be checked against the build the Registry publishes (#1882).`,
+    ];
+  }
+
+  const target = typeof tagTargetFor === "function" ? tagTargetFor(version) : null;
+  const quoted = cutSubject ? ` ("${cutSubject}")` : "";
+  if (!target) {
+    return [
+      `${version} was cut by ${short(cutSha)}${quoted} and is what publish_action.yml ` +
+        `ships, but no v${version} tag exists. "Was this released?" answers from git ` +
+        `tag, so an untagged Registry publish is a silent wrong operand (#1882). ` +
+        `git tag -a v${version} ${short(cutSha)} -m "release v${version}" && ` +
+        `git push origin v${version} (a tag push cannot re-trigger the publish workflow).`,
+    ];
+  }
+  if (target !== cutSha) {
+    return [
+      `v${version} resolves to ${short(target)}, but ${version} was cut by ${short(cutSha)}${quoted}. ` +
+        `The tag does not label the commit that changed pyproject.toml to ${version}, so it ` +
+        `points at a different build than the one the Registry publishes (#1882).`,
+    ];
+  }
+  return [];
+}
+
 // ---------------------------------------------------------------------------
 // git-backed shell
 // ---------------------------------------------------------------------------
@@ -239,14 +311,83 @@ export function auditTag({ tag, treeAtTag, range = [], tagTargetFor, historyErro
  * green here.
  */
 const gitIn =
-  (cwd) =>
+  (cwd, extraEnv) =>
   (...args) =>
     execFileSync("git", cwd ? ["-C", cwd, ...args] : args, {
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
+      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
     });
 
 const git = gitIn(null);
+
+const TAG_IDENTITY_ENV = {
+  GIT_AUTHOR_NAME: "github-actions[bot]",
+  GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com",
+  GIT_COMMITTER_NAME: "github-actions[bot]",
+  GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com",
+};
+
+function shallowRepoError(runGit) {
+  try {
+    if (runGit("rev-parse", "--is-shallow-repository").trim() === "true") {
+      return "this is a shallow clone, so the range cannot be walked (checkout needs fetch-depth: 0)";
+    }
+  } catch (e) {
+    return `git rev-parse --is-shallow-repository failed: ${e.message}`;
+  }
+  return null;
+}
+
+function readVersionTagTargets(runGit) {
+  const tagTargets = new Map();
+  try {
+    for (const line of runGit(
+      "for-each-ref",
+      "--format=%(refname:short)%00%(objectname)%00%(*objectname)",
+      "refs/tags/v*",
+    ).split("\n")) {
+      if (!line.trim()) continue;
+      const [name, objectname, peeled] = line.split("\0");
+      tagTargets.set(name.trim(), (peeled || objectname || "").trim());
+    }
+    return { tagTargets, error: null };
+  } catch (e) {
+    return { tagTargets, error: `listing v* tags failed: ${e.message}` };
+  }
+}
+
+/**
+ * Walk first-parent from `startSha` until the parent's pyproject version differs.
+ * That commit is the cut — the SHA `publish_action.yml` actually shipped, and the
+ * only SHA a `v<version>` tag may label.
+ *
+ * @param {string} startSha
+ * @param {string} version
+ * @param {{
+ *   readVersion: (rev:string)=>{version:string|null, error:string|null},
+ *   firstParent: (rev:string)=>{parent:string|null, error:string|null},
+ * }} deps
+ * @returns {{cutSha:string|null, error:string|null}}
+ */
+export function findVersionCut(startSha, version, { readVersion, firstParent }) {
+  let cursor = startSha;
+  const seen = new Set();
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor);
+    const parentRef = firstParent(cursor);
+    if (parentRef.error) return { cutSha: null, error: parentRef.error };
+    if (!parentRef.parent) return { cutSha: cursor, error: null };
+    const parent = readVersion(parentRef.parent);
+    if (parent.error) return { cutSha: null, error: parent.error };
+    if (parent.version !== version) return { cutSha: cursor, error: null };
+    cursor = parentRef.parent;
+  }
+  return {
+    cutSha: null,
+    error: `version-cut walk for ${short(startSha)} did not terminate`,
+  };
+}
 
 const showOrNull = (rev, path, runGit = git) => {
   try {
@@ -357,34 +498,20 @@ export function collectFromGit(
   let range = [];
   const tagTargets = new Map();
 
-  try {
-    if (runGit("rev-parse", "--is-shallow-repository").trim() === "true") {
-      historyError =
-        "this is a shallow clone, so the range cannot be walked (checkout needs fetch-depth: 0)";
-    }
-  } catch (e) {
-    historyError = `git rev-parse --is-shallow-repository failed: ${e.message}`;
-  }
+  historyError = shallowRepoError(runGit);
 
   if (!historyError) {
-    try {
-      // `%(*objectname)` is the peeled target and is non-empty only for annotated
-      // tags; lightweight tags report the commit in `%(objectname)`.
-      for (const line of runGit(
-        "for-each-ref",
-        "--format=%(refname:short)%00%(objectname)%00%(*objectname)",
-        "refs/tags/v*",
-      ).split("\n")) {
-        if (!line.trim()) continue;
-        const [name, objectname, peeled] = line.split("\0");
-        tagTargets.set(name.trim(), (peeled || objectname || "").trim());
-      }
+    // `%(*objectname)` is the peeled target and is non-empty only for annotated
+    // tags; lightweight tags report the commit in `%(objectname)`.
+    const listed = readVersionTagTargets(runGit);
+    if (listed.error) {
+      historyError = listed.error;
+    } else {
+      for (const [name, sha] of listed.tagTargets) tagTargets.set(name, sha);
       if (tagTargets.size === 0) {
         historyError =
           "no v* tags are visible, so no prior release can be credited (checkout needs fetch-tags: true)";
       }
-    } catch (e) {
-      historyError = `listing v* tags failed: ${e.message}`;
     }
   }
 
@@ -442,14 +569,166 @@ export function collectFromGit(
   };
 }
 
+/**
+ * Facts needed to audit (and optionally create) the tag for the version the
+ * tree at `rev` declares. `cwd` / injected readers exist for the same reason
+ * as collectFromGit: CI is a shallow checkout of THIS repo.
+ *
+ * @param {string} [rev]
+ * @param {{
+ *   readVersionAt?: (rev:string)=>{version:string|null, error:string|null},
+ *   firstParentAt?: (rev:string)=>{parent:string|null, error:string|null},
+ *   cwd?: string,
+ * }} [deps]
+ */
+export function collectPublishedFromGit(rev = "HEAD", { readVersionAt, firstParentAt, cwd } = {}) {
+  const runGit = cwd ? gitIn(cwd) : git;
+  const readVersion = readVersionAt ?? ((r) => versionAtRev(r, runGit));
+  const firstParent = firstParentAt ?? ((r) => firstParentAtRev(r, runGit));
+
+  let historyError = shallowRepoError(runGit);
+  let sha = null;
+  if (!historyError) {
+    try {
+      sha = runGit("rev-parse", "--verify", `${rev}^{commit}`).trim();
+    } catch (e) {
+      historyError = `could not resolve ${rev}: ${e.message.split("\n")[0]}`;
+    }
+  }
+
+  const own = sha && !historyError ? readVersion(sha) : { version: null, error: null };
+  if (!historyError && own.error) historyError = own.error;
+
+  let cutSha = null;
+  let cutSubject = "";
+  if (!historyError && sha && own.version) {
+    const cut = findVersionCut(sha, own.version, { readVersion, firstParent });
+    if (cut.error) historyError = cut.error;
+    else cutSha = cut.cutSha;
+  }
+  if (cutSha) {
+    try {
+      cutSubject = runGit("log", "-1", "--format=%s", cutSha).trim();
+    } catch {
+      cutSubject = "";
+    }
+  }
+
+  const listed = historyError ? { tagTargets: new Map(), error: null } : readVersionTagTargets(runGit);
+  if (!historyError && listed.error) historyError = listed.error;
+  const tagTargets = listed.tagTargets;
+
+  return {
+    version: own.version,
+    cutSha,
+    cutSubject,
+    historyError,
+    tagTargetFor: (v) => tagTargets.get(`v${v}`) ?? null,
+    cwd,
+  };
+}
+
+/**
+ * Create an annotated `v<version>` tag on the cut commit when none exists.
+ * Will not move a tag that already points at a different commit.
+ *
+ * @param {{version:string|null, cutSha:string|null, tagTargetFor?: Function, cwd?: string}} collected
+ * @param {{push?: boolean, cwd?: string}} [opts]
+ * @returns {{created:boolean, pushed:boolean, error:string|null}}
+ */
+export function ensurePublishedTag(collected, { push = false, cwd } = {}) {
+  const version = collected?.version;
+  const cutSha = collected?.cutSha;
+  if (!version || !cutSha) {
+    return { created: false, pushed: false, error: "cannot create a release tag without a version and a cut commit" };
+  }
+  const tag = `v${version}`;
+  const existing = typeof collected.tagTargetFor === "function" ? collected.tagTargetFor(version) : null;
+  if (existing) {
+    if (existing === cutSha) return { created: false, pushed: false, error: null };
+    return {
+      created: false,
+      pushed: false,
+      error:
+        `${tag} already exists at ${short(existing)}, not at ${short(cutSha)} that cut ${version}. ` +
+        `Refusing to move a release tag (#1882).`,
+    };
+  }
+
+  const dir = cwd ?? collected.cwd;
+  const tagGit = gitIn(dir, TAG_IDENTITY_ENV);
+  try {
+    tagGit("tag", "-a", tag, cutSha, "-m", `release ${tag}`);
+  } catch (e) {
+    return {
+      created: false,
+      pushed: false,
+      error: `failed to create ${tag} at ${short(cutSha)}: ${e.message.split("\n")[0]}`,
+    };
+  }
+  if (!push) return { created: true, pushed: false, error: null };
+  try {
+    tagGit("push", "origin", `refs/tags/${tag}`);
+  } catch (e) {
+    return {
+      created: true,
+      pushed: false,
+      error: `created ${tag} locally but pushing it failed: ${e.message.split("\n")[0]}`,
+    };
+  }
+  return { created: true, pushed: true, error: null };
+}
+
 const invokedDirectly =
   typeof process.argv[1] === "string" &&
   process.argv[1].replace(/\\/g, "/").endsWith("scripts/check-release-tag.mjs");
 
 if (invokedDirectly) {
-  const tag = (process.argv[2] || process.env.GITHUB_REF_NAME || "").trim();
+  const args = process.argv.slice(2);
+  const published = args.includes("--published");
+  const ensure = args.includes("--ensure");
+  const push = args.includes("--push");
+  const positional = args.filter((a) => !a.startsWith("--"));
+
+  if (published) {
+    const rev = (positional[0] || process.env.GITHUB_SHA || "HEAD").trim();
+    let collected = collectPublishedFromGit(rev);
+    if (ensure) {
+      const ensured = ensurePublishedTag(collected, { push });
+      if (ensured.error) {
+        console.log(`::error::${ensured.error}`);
+        process.exit(1);
+      }
+      if (ensured.created) {
+        console.error(
+          `created annotated tag v${collected.version} at ${short(collected.cutSha)}` +
+            (ensured.pushed ? " and pushed it" : " (not pushed)"),
+        );
+        collected = collectPublishedFromGit(rev, { cwd: collected.cwd });
+      }
+    }
+    const violations = auditPublishedVersion(collected);
+    console.error(
+      `auditing published ${collected.version ?? "(unknown version)"} cut by ` +
+        `${short(collected.cutSha) || "(unknown sha)"}` +
+        (collected.historyError ? ` — HISTORY UNAVAILABLE: ${collected.historyError}` : ""),
+    );
+    for (const v of violations) console.log(`::error::${v}`);
+    if (!violations.length) {
+      console.log(
+        `published ${collected.version} is tagged at ${short(collected.cutSha)} — ` +
+          `tree, cut and tag agree.`,
+      );
+    }
+    process.exit(violations.length ? 1 : 0);
+  }
+
+  const tag = (positional[0] || process.env.GITHUB_REF_NAME || "").trim();
   if (!tag) {
-    console.error("usage: node scripts/check-release-tag.mjs <tag>   (or set GITHUB_REF_NAME)");
+    console.error(
+      "usage: node scripts/check-release-tag.mjs <tag> | --published [--ensure] [--push] [rev]\n" +
+        "       (or set GITHUB_REF_NAME / GITHUB_SHA)",
+    );
     process.exit(2);
   }
   const collected = collectFromGit(tag);

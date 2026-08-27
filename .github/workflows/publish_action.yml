@@ -8,6 +8,13 @@ on:
     paths:
       - "pyproject.toml"
 
+# After a successful Registry publish, --ensure --push writes the archival
+# `v<X>` tag. contents: write is that push; the job still cannot trigger a
+# second publish — GitHub does not run a branches-filtered workflow for a tag
+# ref, and GITHUB_TOKEN pushes do not re-fire workflows anyway (#1882).
+permissions:
+  contents: write
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -373,3 +380,11 @@ jobs:
             echo "::warning::Registry publish with --changelog-file failed — retrying WITHOUT the changelog so the release still ships."
           fi
           comfy node publish --token "$REGISTRY_TOKEN"
+
+      # Inverse of release-tag-guard.yml: that workflow hangs off the tag push,
+      # so a publish that never gets a tag (0.15.97, 0.15.111–0.15.113) is
+      # silent. This runs because the publish ran. --ensure creates the
+      # annotated tag on the commit that cut the version when it is missing;
+      # --push is what makes the operand visible to `git tag` afterwards.
+      - name: Published version must have a git tag
+        run: node scripts/check-release-tag.mjs --published --ensure --push
