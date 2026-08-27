@@ -11,6 +11,10 @@ All notable changes to this project are documented here. This project adheres to
 - panel_connect to a raw rail id (`-20`/`-10`) refuses instead of silently auto-exposing a subgraph boundary slot (#1953)
 ### Added
 - the Training / CivitAI side panel and live UI/media cards can now be closed/dismissed over the same bridge path the agent uses to open them, so a long session can shed resident renderer state (#1952, #1960)
+- panel_set_widget on an rgthree Fast Groups property (`matchTitle`/`matchColors`/`sort`/`toggleRestriction`) names `panel_set_property` instead of a pressable-widget dead end, and lists each available widget name once (#1956)
+- panel_add_node of a non-allowlisted frontend-only type (`Bookmark (rgthree)`) no longer claims the pack is missing; the allowlist is named (#1956)
+- panel_audit_prompt_director no longer emits HTTP 404 as a warning when the graph has zero director nodes (#1956)
+- panel_free_vram reports occupancy MB and which branch ran (`verified_system_stats` vs `bare_free_receipt`) instead of a bare `{freed:true}` receipt (#1956)
 
 ## [0.15.119] - 2026-08-27
 

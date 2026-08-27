@@ -144,20 +144,18 @@ test("#757 several buttons read as plural, and all are named", () => {
   assert.equal(pressableWidgets(node).length, 2);
 });
 
-test("#757 WIRING: both missing-widget refusals carry the hint", () => {
-  // A pure helper nobody calls is not a fix. Two distinct refusal sites exist and
-  // the report's exact text came from the widget-write one.
+test("#757 WIRING: both missing-widget refusals still carry the hint (#1956 via missingWidgetMessage)", () => {
+  // The shipped refusals now go through missingWidgetMessage, which appends this
+  // hint unless the requested name is a node PROPERTY (#1956). A helper nobody
+  // calls is not a fix — pin the production import and the ordinary (non-property)
+  // path that still names the button.
+  const missing = readFileSync(join(HERE, "../../web/js/lib/missing-widget.js"), "utf8");
+  assert.match(missing, /import \{ pressableWidgetHint \} from "\.\/pressable-widget\.js"/);
+  assert.match(missing, /pressableWidgetHint\(node, widgetName\)/);
+
   const ww = readFileSync(WIDGET_WRITE, "utf8");
-  assert.match(ww, /import \{ pressableWidgetHint \} from "\.\/pressable-widget\.js"/);
-  assert.ok(
-    /has no widget "\$\{widgetName\}"[\s\S]{0,400}?pressableWidgetHint\(targetNode, widgetName\)/.test(ww),
-    "widget-write.js refusal must append the hint",
-  );
+  assert.match(ww, /missingWidgetMessage\(targetNode, widgetName\)/);
 
   const panel = readFileSync(PANEL_JS, "utf8");
-  assert.match(panel, /import \{ pressableWidgetHint \} from "\.\/lib\/pressable-widget\.js"/);
-  assert.ok(
-    /has no widget "\$\{widget\}"[\s\S]{0,400}?pressableWidgetHint\(node, widget\)/.test(panel),
-    "comfyui-mcp-panel.js refusal must append the hint",
-  );
+  assert.match(panel, /missingWidgetMessage\(node, widget\)/);
 });

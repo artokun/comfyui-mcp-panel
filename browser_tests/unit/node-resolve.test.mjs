@@ -34,6 +34,7 @@ import {
   isSubgraphUuidType,
   subgraphTypeIsLoaded,
   subgraphUuidAddRefusal,
+  frontendOnlyNotAllowlistedRefusal,
 } from "../../web/js/lib/node-resolve.js";
 import { createObjectInfoHistory } from "../../web/js/lib/object-info-history.js";
 // The PRODUCTION graph_set_widget handler body — the executor and these tests
@@ -1479,6 +1480,69 @@ test("#1296 add_node: the reload diagnosis is scoped — provenance-bearing husk
       assert.doesNotMatch(err.message, /RELOAD the ComfyUI tab/);
       return true;
     },
+  );
+});
+
+// ---- #1956: a registered frontend-virtual type that is NOT on the addable
+//      allowlist (Bookmark (rgthree)) fails closed — correct — but must not
+//      claim the pack is missing. rgthree is installed; the type is absent
+//      from /object_info BY DESIGN. ------------------------------------------
+
+/** rgthree-style virtual class: base ctor throws on the default title. */
+class BookmarkRgthree {
+  constructor(title = "__NEED_CLASS_TITLE__") {
+    if (title === "__NEED_CLASS_TITLE__") throw new Error("needs overrides");
+    this.title = title;
+    this.isVirtualNode = true;
+  }
+}
+
+test('#1956 add_node: "Bookmark (rgthree)" is refused as frontend-only not-addable, not as a missing pack', async () => {
+  const fresh = objectInfo();
+  const reg = loadedRegistry();
+  reg["Bookmark (rgthree)"] = BookmarkRgthree;
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "Bookmark (rgthree)", ADD_OPTS(fresh)),
+    (err) => {
+      assert.match(err.message, /frontend-only type/);
+      assert.match(err.message, /deliberately not addable/);
+      assert.match(err.message, /Fast Groups Bypasser \(rgthree\)/);
+      assert.match(err.message, /Fast Groups Muter \(rgthree\)/);
+      assert.match(err.message, /Label \(rgthree\)/);
+      assert.match(err.message, /Reroute \(rgthree\)/);
+      assert.match(err.message, /Node Collector \(rgthree\)/);
+      assert.doesNotMatch(err.message, /Unknown node type/);
+      assert.doesNotMatch(err.message, /not installed, its pack was removed/);
+      assert.doesNotMatch(err.message, /failed to import/);
+      assert.doesNotMatch(err.message, /create_workflow \(action:"node_info"\)/);
+      return true;
+    },
+  );
+});
+
+test("#1956 add_node: the not-allowlisted refusal still fails closed — Bookmark is not added", async () => {
+  const msg = frontendOnlyNotAllowlistedRefusal("Bookmark (rgthree)");
+  assert.match(msg, /Cannot add "Bookmark \(rgthree\)"/);
+  assert.match(msg, /deliberately not addable/);
+  assert.doesNotMatch(msg, /Unknown node type|not installed|failed to import/);
+});
+
+test("#1956 add_node: a defless husk WITHOUT isVirtualNode keeps the generic unknown-type refusal", async () => {
+  // The #458 hole stays closed: a leftover class that does not prove virtual
+  // is not re-diagnosed as frontend-only.
+  const fresh = objectInfo();
+  const reg = loadedRegistry([], ["RemovedBackendNode"]);
+  await assert.rejects(
+    () => assertAddNodeResolvableRefreshing(() => reg, "RemovedBackendNode", ADD_OPTS(fresh)),
+    /Unknown node type "RemovedBackendNode"|backend does not provide/i,
+  );
+});
+
+test("#1956 add_node: allowlisted Fast Groups Bypasser stays addable", async () => {
+  const fresh = objectInfo();
+  const reg = loadedRegistry([], ["Fast Groups Bypasser (rgthree)"]);
+  await assert.doesNotReject(() =>
+    assertAddNodeResolvableRefreshing(() => reg, "Fast Groups Bypasser (rgthree)", ADD_OPTS(fresh)),
   );
 });
 

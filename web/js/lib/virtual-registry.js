@@ -53,6 +53,44 @@
 import { hasBackendProvenance } from "./node-resolve.js";
 
 /**
+ * True when THIS registered class proves frontend-virtual: no backend provenance,
+ * and a discarded probe instance carries `isVirtualNode === true`. Fail-closed
+ * on anything unreadable — a throwing ctor, a provenance marker, a loose flag.
+ *
+ * The title argument is the TYPE, not the display title: rgthree's base
+ * constructor throws on its unset "__NEED_CLASS_TITLE__" default, so a
+ * no-arg probe would refuse every rgthree class for a cosmetic reason.
+ */
+export function isFrontendVirtualRegisteredType(registry, type) {
+  if (!registry || typeof registry !== "object" || typeof type !== "string" || !type) return false;
+  let ctor;
+  try {
+    ctor = registry[type];
+  } catch {
+    return false;
+  }
+  if (typeof ctor !== "function") return false;
+  let backend = true;
+  try {
+    backend = hasBackendProvenance(ctor);
+  } catch {
+    return false;
+  }
+  if (backend) return false;
+  let probe;
+  try {
+    probe = new ctor(type);
+  } catch {
+    return false;
+  }
+  try {
+    return !!probe && probe.isVirtualNode === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The registered node types this page PROVES frontend-virtual, sorted.
  *
  * `registry` is LiteGraph.registered_node_types (type name → node class).
@@ -70,39 +108,7 @@ export function collectFrontendVirtualTypes(registry) {
     return [];
   }
   for (const type of names) {
-    let ctor;
-    try {
-      ctor = registry[type];
-    } catch {
-      continue; // a throwing getter exempts nothing
-    }
-    if (typeof ctor !== "function") continue;
-    // The server's own classes are never probed: a backend-derived (or stale
-    // backend husk) class is /object_info's question, not this registry's.
-    let backend = true;
-    try {
-      backend = hasBackendProvenance(ctor);
-    } catch {
-      continue; // a verdict we cannot read is not "frontend-only"
-    }
-    if (backend) continue;
-    let probe;
-    try {
-      // The title argument is the TYPE, not the display title: rgthree's base
-      // constructor throws on its unset "__NEED_CLASS_TITLE__" default, so a
-      // no-arg probe would refuse every rgthree class for a cosmetic reason.
-      // The probe is discarded; its title is never shown anywhere.
-      probe = new ctor(type);
-    } catch {
-      continue; // a class that cannot be bare-constructed proves nothing
-    }
-    let virtual = false;
-    try {
-      virtual = !!probe && probe.isVirtualNode === true;
-    } catch {
-      virtual = false;
-    }
-    if (virtual) out.add(type);
+    if (isFrontendVirtualRegisteredType(registry, type)) out.add(type);
   }
   return [...out].sort();
 }

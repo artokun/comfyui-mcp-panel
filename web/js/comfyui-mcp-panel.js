@@ -70,6 +70,8 @@ import {
   promotedInputAliases,
   resolvePromotedInnerTarget,
 } from "./lib/widget-write.js";
+import { missingWidgetMessage } from "./lib/missing-widget.js";
+import { freeVramSuccessResult, readVramOccupancy } from "./lib/vram-occupancy.js";
 import { describeVoiceError } from "./lib/voice-error.js";
 import { voiceRecognitionLang } from "./lib/voice-language.js";
 import { isEmbeddedDesktopShell, voiceInputSupport } from "./lib/voice-support.js";
@@ -106,7 +108,6 @@ import {
   PANEL_EXTENSION_NAME,
 } from "./lib/duplicate-panel-guard.js";
 import { tryRegisterWhenReady } from "./lib/resolve-comfy-app.js";
-import { pressableWidgetHint } from "./lib/pressable-widget.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { sanitizeNodeAuxId, sanitizeNodesAuxId } from "./lib/aux-id-sanitize.js";
 import {
@@ -14865,9 +14866,14 @@ const GRAPH_TOOL_EXECUTORS = {
     try {
       const response = await fetch("/prompt_director/inspection");
       if (response.ok) runtimePayload = await response.json();
-      else addObservation("warning", "inspection_unavailable", `Prompt Director inspection returned HTTP ${response.status}.`);
+      else if (directorNodes.length) {
+        // #1956 — HTTP 404 is expected when the graph has zero director nodes.
+        addObservation("warning", "inspection_unavailable", `Prompt Director inspection returned HTTP ${response.status}.`);
+      }
     } catch (error) {
-      addObservation("warning", "inspection_unavailable", String(error?.message ?? error));
+      if (directorNodes.length) {
+        addObservation("warning", "inspection_unavailable", String(error?.message ?? error));
+      }
     }
     const runtimeByNode = new Map(
       (runtimePayload.inspections ?? []).map((item) => [String(item.node_id), item]),
@@ -25664,13 +25670,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const widgets = node.widgets ?? [];
     const w = widgets.find((x) => x && x.name === widget);
     if (!w) {
-      const names = widgets.map((x) => x?.name).filter(Boolean);
-      throw new Error(
-        `Node ${node.id} (${node.type}) has no widget "${widget}". Available: ${names.join(", ") || "(none)"}` +
-          // #757 — same disclosure as the widget-write path: a button the panel
-          // cannot press may be what creates the missing slot.
-          pressableWidgetHint(node, widget),
-      );
+      throw new Error(missingWidgetMessage(node, widget));
     }
     // The parent SubgraphNode instance(s) embedding this subgraph. For a nested
     // subgraph (root → node 142 → node 133), walk ALL graphs in the hierarchy
@@ -26501,6 +26501,9 @@ const GRAPH_TOOL_EXECUTORS = {
     // Unload all resident models + free cached VRAM via ComfyUI's standard /free
     // endpoint (the same one the "Unload Models"/"Free memory" menu uses). Used to
     // unwedge a stuck/OOM ComfyUI when a cancel left memory pinned — no restart.
+    // Occupancy is best-effort: a /system_stats miss must not fail a /free that
+    // already landed (#1956).
+    const before = await readVramOccupancy((path, init) => api.fetchApi(path, init));
     const res = await api.fetchApi("/free", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -26537,7 +26540,8 @@ const GRAPH_TOOL_EXECUTORS = {
         }),
       );
     }
-    return { freed: true, unload_models: true, free_memory: true };
+    const after = await readVramOccupancy((path, init) => api.fetchApi(path, init));
+    return freeVramSuccessResult({ before, after });
   },
 };
 
