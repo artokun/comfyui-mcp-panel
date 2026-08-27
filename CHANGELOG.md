@@ -6,13 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.122] - 2026-08-27
+
 ### Fixed
 - remote, tunnelled, and mobile clients never see the in-app update prompt or one-click install+restart; those stay deferred until the next local host session (#1943, #1944)
+
+- defer host-mutating update UI on remote clients (#1984)
 ### Added
 - panel_civitai_results reports the live CivitAI lightbox (open model, version ladder + selection, files, creator note, download target) so "Ask agent to download" is no longer a request about a screen the agent cannot see (#1964)
 - CivitAI pane: Upscaler/Embeddings/Poses are real tabs (empty grids name types the current tab cannot see); sample URLs are the fetchable `/comfyui_mcp_panel/civitai/media` path plus a civitai.com pageUrl; open/clear echo applied tab/query/docked/cleared-count (#1958)
 - read-surface accuracy: query/view detail rows always include `mode` (including `active`) and surface writable `pinned`/`shape`; paste replies document that internal wires among the copied set are preserved; graph_serialize is one JSON `{workflow, node_count}` rather than two text blocks; auto-layout re-fit excludes pinned outliers so a skipped member cannot stretch a group over the canvas (#1957)
 - the agent can read what the live CivitAI pane is actually showing (painted grid cards, query, dock, overlay presence, optional contact-sheet of already-decoded thumbs) from the pane itself — not by re-fetching the public API, which never serves CivitAI RED — and can dock or undock the unified side panel after #1952's close (#1961, #1962)
+
+- read the live CivitAI pane and dock it
+
 
 ## [0.15.121] - 2026-08-27
 
