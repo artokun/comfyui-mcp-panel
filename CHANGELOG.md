@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.111] - 2026-08-27
+
+### Fixed
+- cut the registry network findings from six files to two (#1909)
+- reject stale canvas capture after tab switch
+
+
 ## [0.15.110] - 2026-08-27
 
 ### Fixed
