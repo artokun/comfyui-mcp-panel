@@ -242,13 +242,6 @@ function parseCommits(range) {
   return out;
 }
 
-function allHistoryReferences() {
-  const raw = git("log --all --no-merges --pretty=format:%s");
-  return raw
-    ? raw.split("\n").map((subject) => ({ subject, refs: commitReferences(subject) }))
-    : [];
-}
-
 function componentOf(scope) {
   return (COMPONENTS.find((c) => c.match(scope)) || COMPONENTS[COMPONENTS.length - 1]).name;
 }
@@ -406,7 +399,10 @@ const writeChangelog = (s) => writeFileSync(CHANGELOG, EOL === "\r\n" ? s.replac
 function buildEntry(ver, range, highlights = "") {
   const covered = new Set(referenceNumbers(highlights));
   const commits = parseCommits(range);
-  const identityCommits = [...commits, ...allHistoryReferences()];
+  // Alias identity is release-local: commits reachable through this range are the only
+  // evidence that two references belong to this release. Looking at --all lets an
+  // unmerged/future branch suppress a real entry or deduplicate unrelated notes.
+  const identityCommits = commits;
   const auto = autoBody(commits, covered, identityCommits);
   const parts = [`## [${ver}] - ${today()}`, ""];
   const body = normalizeBody(
@@ -475,7 +471,9 @@ if (!version) {
   // (by PR number or exact text) are not re-added.
   const covered = new Set(referenceNumbers(highlights));
   const candidates = parseCommits(`${prevTag()}..HEAD`);
-  const identityCommits = [...candidates, ...allHistoryReferences()];
+  // Refresh mode has the same scope as a release: only commits since the previous tag
+  // can establish issue/PR aliases for the current [Unreleased] notes.
+  const identityCommits = candidates;
   const aliases = referenceAliases(identityCommits);
   const ambiguous = ambiguousReferences(identityCommits);
   const commits = candidates.filter(

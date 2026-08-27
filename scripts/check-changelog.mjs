@@ -21,12 +21,16 @@ const CHANGELOG = join(ROOT, "CHANGELOG.md");
 
 const args = process.argv.slice(2);
 const refIndex = args.indexOf("--ref");
-const explicitRef = refIndex >= 0 ? args[refIndex + 1] : null;
+const refValueIndex = refIndex >= 0 ? refIndex + 1 : -1;
+const explicitRef = refIndex >= 0 ? args[refValueIndex] : null;
 const workingTree = args.includes("--working-tree");
-const versionArg = args.find(
-  (arg, index) =>
-    (refIndex < 0 || index !== refIndex + 1) && arg !== "--working-tree" && !arg.startsWith("--"),
+// Remove only the two supported control flags before selecting the optional version. Keep
+// option-shaped values in the candidate list so `--bad-version` is rejected as an invalid
+// version instead of being ignored and causing a different changelog section to be inferred.
+const versionArgs = args.filter(
+  (arg, index) => index !== refIndex && index !== refValueIndex && arg !== "--working-tree",
 );
+const versionArg = versionArgs.length === 1 ? versionArgs[0] : undefined;
 
 const git = (...gitArgs) =>
   execFileSync("git", ["-C", ROOT, ...gitArgs], {
@@ -151,11 +155,31 @@ function changelogAtRef(ref) {
 
 export function auditReleaseSection({ markdown, version, commits, targetRef, isAncestor }) {
   const normalizedVersion = releaseVersion(version);
-  const section = parseReleaseSections(markdown).find((item) => item.version === normalizedVersion);
-  if (!section) return [`CHANGELOG.md has no [${normalizedVersion}] release section.`];
+  const sections = parseReleaseSections(markdown);
+  const violations = [];
+  const seenReleaseSections = new Map();
+  for (const item of sections) {
+    const itemVersion = releaseVersion(item.version);
+    if (!isStrictSemver(itemVersion)) continue;
+    const line = item.start + 1;
+    if (seenReleaseSections.has(itemVersion)) {
+      violations.push(
+        `CHANGELOG.md repeats [${itemVersion}] release section at lines ` +
+          `${seenReleaseSections.get(itemVersion)} and ${line}. Keep one top-level section.`,
+      );
+    } else {
+      seenReleaseSections.set(itemVersion, line);
+    }
+    if (!item.lines.some((lineText) => lineText.trim())) {
+      violations.push(`CHANGELOG.md [${itemVersion}] release section is empty.`);
+    }
+  }
+
+  const section = sections.find((item) => releaseVersion(item.version) === normalizedVersion);
+  if (!section) return [...violations, `CHANGELOG.md has no [${normalizedVersion}] release section.`];
+  if (!section.lines.some((lineText) => lineText.trim())) return violations;
 
   const { headings, entries } = parseReleaseBody(section.lines);
-  const violations = [];
 
   const seenHeadings = new Map();
   for (const heading of headings) {
@@ -224,6 +248,10 @@ export function checkChangelog({ markdown, version, commits, targetRef, isAncest
 function main() {
   let markdown;
   let targetRef = explicitRef;
+  if (versionArgs.length > 1) {
+    console.error("changelog: expected at most one release version argument");
+    process.exit(2);
+  }
   if (refIndex >= 0 && !explicitRef) {
     console.error("changelog: --ref requires a Git commit ref");
     process.exit(2);

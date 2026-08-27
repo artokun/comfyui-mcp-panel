@@ -57,13 +57,16 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
     git(cwd, "commit", "--allow-empty", "-m", "fix: second fix (#91)");
     git(cwd, "tag", "v1.0.0");
 
-    // A future branch must not feed alias discovery for an older audited tag.
+    // A future branch must not feed alias discovery for the current release either. Its
+    // #200/#103 spelling is intentionally related to a current PR so an unscoped `git
+    // log --all` would incorrectly deduplicate the current change.
     git(cwd, "checkout", "-b", "future");
-    git(cwd, "commit", "--allow-empty", "-m", "fix(90): unrelated future alias (#91)");
+    git(cwd, "commit", "--allow-empty", "-m", "fix(200): unrelated future alias (#103)");
     git(cwd, "checkout", "main");
 
     git(cwd, "commit", "--allow-empty", "-m", "fix(100): one change, issue spelling (#101)");
-    git(cwd, "commit", "--allow-empty", "-m", "fix: an independent fix (#102)");
+    git(cwd, "commit", "--allow-empty", "-m", "fix: a supporting fix (#102)");
+    git(cwd, "commit", "--allow-empty", "-m", "fix: an independent fix (#103)");
     writeFileSync(
       cwd + "/CHANGELOG.md",
       [
@@ -76,6 +79,7 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
         "",
         "### Fixed",
         "- hand-written PR spelling (#101)",
+        "- hand-written future issue (#200) (#102)",
         "",
       ].join("\n"),
       "utf8",
@@ -91,6 +95,8 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
     assert.equal((generated.match(/#100/g) ?? []).length, 1);
     assert.equal((generated.match(/#101/g) ?? []).length, 0);
     assert.equal((generated.match(/#102/g) ?? []).length, 1);
+    assert.equal((generated.match(/#103/g) ?? []).length, 1);
+    assert.equal((generated.match(/#200/g) ?? []).length, 1);
 
     git(cwd, "add", "CHANGELOG.md");
     git(cwd, "commit", "-m", "1.1.0 — release");
@@ -106,7 +112,7 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
     const inferredHistoricalTag = runGuard(cwd, null, "v1.0.0");
     assert.equal(inferredHistoricalTag.status, 0, inferredHistoricalTag.stderr);
 
-    for (const malformed of ["1.1", "1.1.0; touch pwned", "1.1.0\ninjected"]) {
+    for (const malformed of ["1.1", "1.1.0; touch pwned", "1.1.0\ninjected", "--bad-version"]) {
       const result = runGuard(cwd, malformed, "v1.0.0");
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /invalid release version/);
@@ -129,7 +135,7 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
 
     writeFileSync(
       cwd + "/CHANGELOG.md",
-      generated.replace("- an independent fix (#102)", "- duplicate alias (#101)\n- an independent fix (#102)"),
+      generated.replace("- an independent fix (#103)", "- duplicate alias (#101)\n- an independent fix (#103)"),
       "utf8",
     );
     const duplicateAlias = runGuard(cwd, "1.1.0", null, ["--working-tree"]);
@@ -140,6 +146,26 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
     const duplicateHeading = runGuard(cwd, "1.1.0", null, ["--working-tree"]);
     assert.notEqual(duplicateHeading.status, 0);
     assert.match(duplicateHeading.stderr, /repeats heading/);
+
+    const releaseIndex = generated.indexOf("## [1.1.0]");
+    const releaseBlock = generated.slice(releaseIndex).trimEnd();
+    writeFileSync(
+      cwd + "/CHANGELOG.md",
+      `${generated.slice(0, releaseIndex)}${releaseBlock}\n\n${releaseBlock}\n`,
+      "utf8",
+    );
+    const duplicateRelease = runGuard(cwd, "1.1.0", null, ["--working-tree"]);
+    assert.notEqual(duplicateRelease.status, 0);
+    assert.match(duplicateRelease.stderr, /repeats \[1\.1\.0\] release section/);
+
+    writeFileSync(
+      cwd + "/CHANGELOG.md",
+      ["# Changelog", "", "## [Unreleased]", "", "## [1.1.0] - 2026-08-26", ""].join("\n"),
+      "utf8",
+    );
+    const emptyRelease = runGuard(cwd, "1.1.0", null, ["--working-tree"]);
+    assert.notEqual(emptyRelease.status, 0);
+    assert.match(emptyRelease.stderr, /\[1\.1\.0\] release section is empty/);
 
     writeFileSync(cwd + "/CHANGELOG.md", generated.replace("#102", "#999"), "utf8");
     const unreachableEntry = runGuard(cwd, "1.1.0", null, ["--working-tree"]);
