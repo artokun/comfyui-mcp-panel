@@ -1140,11 +1140,10 @@ test("#1215: an untagged root admits the capture only in the already-current cas
   assert.notEqual(captureAt, -1);
   const gate = src.slice(gateAt, captureAt);
   assert.match(gate, /pointerMovedThisOpen = !sameWorkflowObject\(activeBefore, target\)/);
-  // "bound" captures outright — the #604/#708 divergence's node-written values
-  // ride on it — and a proven-foreign root still skips. "unknown" no longer
-  // suffices on its own: the pointer must NOT have moved.
-  assert.match(gate, /captureBinding === "bound"/);
-  assert.match(gate, /captureBinding !== "foreign" && !pointerMovedThisOpen/);
+  // A capture is allowed only when the active pointer did not move. A stale root
+  // carrying the target UUID is not independent canvas proof after a tab switch.
+  assert.match(gate, /!pointerMovedThisOpen/);
+  assert.match(gate, /captureBinding !== "foreign"/);
   assert.doesNotMatch(
     gate,
     /if \(captureBinding !== "foreign"\)/,

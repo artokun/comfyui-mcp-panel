@@ -20836,6 +20836,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // #433 TOCTOU: snapshot the reconnect epoch BEFORE the async open (see
     // workflow_new) so a reconnect landing mid-operation is not masked by our stamp.
     const openedForEpoch = backendReconnectEpoch;
+    let target = null;
     // #402 — journal the FAILURE side too. Every early throw below is a real "this open
     // did NOT apply" fact, and a caller whose reply was lost mid-command needs that
     // negative just as much as the positive: without it the only remaining evidence is
@@ -20887,7 +20888,72 @@ const GRAPH_TOOL_EXECUTORS = {
         all.find((w) => workflowRecordMatchesSelector(w, path))
       );
     };
-    let target = find();
+    // #1639 — install the synchronous pointer watch BEFORE any await in this open.
+    // A switch away and back during workflow-list refresh, the disk probe, or the
+    // reconnect handshake must remain visible to the later canvas-capture gate.
+    const activeBefore = activeWorkflowRef();
+    let activePointerEpoch = 0;
+    let activePointerLast = activeBefore;
+    const activePointerHistory = [];
+    let activePointerWatchStop = null;
+    let activePointerWatchAvailable = false;
+    const observeActivePointer = () => {
+      let current;
+      try {
+        current = activeWorkflowRef();
+      } catch {
+        activePointerEpoch += 1;
+        activePointerLast = null;
+        activePointerHistory.push(null);
+        return;
+      }
+      let unchanged = false;
+      try {
+        unchanged = sameWorkflowObject(current, activePointerLast) === true;
+      } catch {
+        unchanged = false;
+      }
+      if (!unchanged) {
+        activePointerEpoch += 1;
+        activePointerLast = current;
+        activePointerHistory.push(current);
+      }
+    };
+    const stopActivePointerWatch = () => {
+      const stop = activePointerWatchStop;
+      activePointerWatchStop = null;
+      activePointerWatchAvailable = false;
+      if (typeof stop === "function") {
+        try {
+          stop();
+        } catch {
+          // Subscription cleanup is best-effort; the open's other guards remain owner-checked.
+        }
+      }
+    };
+    try {
+      // The workflow service is a Pinia store, but it is also the strict
+      // frontend-contract surface. Reach Pinia through the panel's supported
+      // store lookup so `$subscribe` is not mistaken for a workflow-service
+      // member by the contract scanner.
+      const workflowPiniaStore = getPiniaStore("workflow");
+      if (typeof workflowPiniaStore?.$subscribe === "function") {
+        const stop = workflowPiniaStore.$subscribe(observeActivePointer, { detached: true, flush: "sync" });
+        if (typeof stop === "function") {
+          activePointerWatchStop = stop;
+          activePointerWatchAvailable = true;
+        }
+      }
+    } catch {
+      // Older workflow stores may not expose a usable synchronous subscription.
+    }
+    // The outer try/finally below covers failed lookup, refresh, probe, handshake,
+    // lock acquisition, and every later return. The watch must never outlive this open.
+    let activePointerEpochAtOpen = null;
+    let activePointerOpenTransitionProven = false;
+    try {
+    try {
+      target = find();
     // The frontend's workflow list is CACHED, so a just-saved/staged file (e.g. a
     // downloaded example) won't appear until the store re-reads the workflows dir.
     // If the first search misses, REFRESH the store and search again so a freshly
@@ -21050,6 +21116,13 @@ const GRAPH_TOOL_EXECUTORS = {
         return true;
       },
     });
+    } catch (err) {
+      // The reload guard below owns the normal-operation cleanup. Before it is
+      // acquired, however, lookup/probe/handshake failures still have to retire
+      // this operation's pointer subscription before they escape.
+      stopActivePointerWatch();
+      throw failOpen(err);
+    }
     // #442 — an ALREADY-OPEN tab is repainted from its OWN in-memory buffer below,
     // never re-read from disk. If the .json changed on disk out-of-band the canvas
     // would silently keep the pre-edit graph and this open would report a bland
@@ -21072,13 +21145,6 @@ const GRAPH_TOOL_EXECUTORS = {
     // That erased signal is what would authorize the destructive re-read to
     // discard the user's work.
     const wasDirty = !!target.isModified;
-    // #1215 — WHO was active before this open moves the pointer, snapshotted now:
-    // `s.openWorkflow(target)` below changes the answer. The #874 canvas capture's
-    // own precondition is "the mounted canvas is the target's", and on an UNTAGGED
-    // root — where describeLiveCanvasBinding can only answer "unknown" — whether
-    // the pointer just moved is the only evidence left bearing on that. Consumed
-    // by the capture gate below.
-    const activeBefore = activeWorkflowRef();
     // Bound to a local whose name does NOT end in "s": the #268 frontend-contract scanner
     // captures members off the workflow-service alias `s` with an unanchored `s\.` pattern,
     // so `canvas.<member>` would be misread as a new workflow-SERVICE dependency. This is a
@@ -21182,6 +21248,8 @@ const GRAPH_TOOL_EXECUTORS = {
         // captureCanvasIntoTracker no-ops on a non-active tracker, so this has to
         // happen BEFORE openWorkflow moves the pointer. Best-effort: a failed
         // flush must not block the switch.
+        const pointerTransitionsBeforeNativeOpen = activePointerHistory.length;
+        const activePointerEpochBeforeSourceFlush = activePointerEpoch;
         await flushSourceCanvasBeforeSwitch({
           source: activeBefore,
           target,
@@ -21189,11 +21257,32 @@ const GRAPH_TOOL_EXECUTORS = {
           describeLiveCanvasBinding,
           captureCanvasIntoTracker,
         });
+        // The source flush is awaited and can yield to an external tab switch. Its
+        // transition must not be mistaken for the native move below: the native move
+        // claim is deliberately made only after this proof point. A switch away and
+        // back is caught too, because the synchronous Pinia watcher advances the epoch
+        // for every identity transition.
+        const sourceFlushPointerStable =
+          activePointerWatchAvailable && activePointerEpoch === activePointerEpochBeforeSourceFlush;
         // #968 — claim this move BEFORE it happens, so the observer attributes it to this
         // command rather than reporting it as a move nobody made. A claim that is never
         // followed by a move is discarded by the next observation.
         claimActiveWorkflowMove(MOVE_CAUSES.OPEN_EXECUTOR, `workflow_open ${workflowTabId(target) || ""}`.trim());
         await s.openWorkflow(target);
+        // The native open may legitimately move the pointer from the workflow that
+        // was active at entry to `target`. Treat exactly that one transition as the
+        // command's expected move; every transition observed before or beyond it is
+        // an intervening switch and must invalidate even a bound-root capture.
+        observeActivePointer();
+        const nativeOpenHistory = activePointerHistory.slice(pointerTransitionsBeforeNativeOpen);
+        activePointerOpenTransitionProven =
+          sourceFlushPointerStable &&
+          pointerTransitionsBeforeNativeOpen === 0 &&
+          (nativeOpenHistory.length === 0
+            ? sameWorkflowObject(activeBefore, target) === true
+            : nativeOpenHistory.length === 1 &&
+              sameWorkflowObject(nativeOpenHistory[0], target) === true);
+        activePointerEpochAtOpen = activePointerEpoch;
       } catch (err) {
         // The native switch itself failed — nothing was applied. Recorded, then rethrown
         // through failOpen below (outside the freeze) so the negative is journaled.
@@ -21416,15 +21505,41 @@ const GRAPH_TOOL_EXECUTORS = {
           // reporting a bland success.
           const captureBinding = describeLiveCanvasBinding(target);
           pointerMovedThisOpen = !sameWorkflowObject(activeBefore, target);
+          observeActivePointer();
+          let activeAtCapture = null;
+          try {
+            activeAtCapture = activeWorkflowRef();
+          } catch {
+            activeAtCapture = null;
+          }
+          let activeIdentityAtCapture = false;
+          try {
+            activeIdentityAtCapture = sameWorkflowObject(activeAtCapture, target) === true;
+          } catch {
+            activeIdentityAtCapture = false;
+          }
+          const activePointerProof =
+            activePointerWatchAvailable &&
+            activePointerOpenTransitionProven &&
+            activePointerEpochAtOpen !== null &&
+            activePointerEpoch === activePointerEpochAtOpen &&
+            activeIdentityAtCapture;
+          const captureSourceProof =
+            captureBinding === "bound" || (captureBinding !== "foreign" && !pointerMovedThisOpen);
           if (
             // #1575 — a state THIS command just read off disk is authoritative, and the
             // canvas mounted behind it is whatever the closed tab left there. Serializing
             // that over the fresh state is the #1215/#968 poisoning through a new entry
             // point, and it can preserve nothing: nothing has run against a just-loaded
             // tracker, so it holds no node-written values (#874) for the capture to save.
+            // A moved active pointer is the same uncertainty even when the stale root
+            // carries this target's UUID: that tag is not independent canvas proof. Use
+            // the target tracker's own state after a tab switch and fail closed on the
+            // unproven capture rather than turning the previous canvas into this tab's
+            // state (#1639).
             openSettled?.loaded !== true &&
-            (captureBinding === "bound" ||
-              (captureBinding !== "foreign" && !pointerMovedThisOpen))
+            activePointerProof &&
+            captureSourceProof
           ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
@@ -22218,6 +22333,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // a frozen graph or the tab refusing every command. The canvas lock is owner-checked:
       // if a concurrent section still holds it, this release leaves it alone and the last
       // holder reopens the canvas.
+      stopActivePointerWatch();
       releaseWorkflowReloadGuard(reloadGuardToken);
       releaseCanvasInteractionLock(priorInteraction, canvasView);
     }
@@ -22580,6 +22696,11 @@ const GRAPH_TOOL_EXECUTORS = {
           }
         : {}),
     };
+    } finally {
+      // Covers every early return and every failure, including the lookup/probe
+      // section before the reload guard is acquired.
+      stopActivePointerWatch();
+    }
   },
 
   // #1299 — apply an out-of-band saved workflow onto the ACTIVE canvas, and
