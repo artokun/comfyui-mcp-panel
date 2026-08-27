@@ -16356,11 +16356,31 @@ const GRAPH_TOOL_EXECUTORS = {
             : {}),
         };
       }
-      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
+      const exposed = GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
         from_node_id,
         from_output,
         name: typeof to_input === "string" && !isEmptyRailSlotRef(to_input) ? to_input : undefined,
       });
+      // #2380 — the missing-rail fallback DELEGATES to a mutating executor and used to
+      // return its result untouched, so a hook firing during that expose could rewire or
+      // delete a bystander and still come back clean. The snapshot at the top of
+      // graph_connect predates the delegated mutation, so the same verdict applies.
+      const exposedVerdict = verifyConnect(graph, graphBefore, {
+        beforeSlots: inputLinksBefore,
+      });
+      const exposedCollateral = exposedVerdict.ok
+        ? []
+        : connectCollateralBullets(exposedVerdict);
+      if (!exposedCollateral.length) return exposed;
+      // Compose rather than overwrite: the delegate may already carry a warning of its
+      // own, and dropping it to report ours would trade one silence for another.
+      return {
+        ...exposed,
+        collateral_changes: exposedCollateral,
+        warning: [exposed?.warning, connectCollateralWarning(exposedCollateral)]
+          .filter(Boolean)
+          .join(" "),
+      };
     }
 
     if (fromRail?.rail === "input") {
@@ -16450,12 +16470,32 @@ const GRAPH_TOOL_EXECUTORS = {
             : {}),
         };
       }
-      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
+      const exposed = GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
         to_node_id,
         to_input,
         name:
           typeof from_output === "string" && !isEmptyRailSlotRef(from_output) ? from_output : undefined,
       });
+      // #2380 — the missing-rail fallback DELEGATES to a mutating executor and used to
+      // return its result untouched, so a hook firing during that expose could rewire or
+      // delete a bystander and still come back clean. The snapshot at the top of
+      // graph_connect predates the delegated mutation, so the same verdict applies.
+      const exposedVerdict = verifyConnect(graph, graphBefore, {
+        beforeSlots: inputLinksBefore,
+      });
+      const exposedCollateral = exposedVerdict.ok
+        ? []
+        : connectCollateralBullets(exposedVerdict);
+      if (!exposedCollateral.length) return exposed;
+      // Compose rather than overwrite: the delegate may already carry a warning of its
+      // own, and dropping it to report ours would trade one silence for another.
+      return {
+        ...exposed,
+        collateral_changes: exposedCollateral,
+        warning: [exposed?.warning, connectCollateralWarning(exposedCollateral)]
+          .filter(Boolean)
+          .join(" "),
+      };
     }
 
     if (fromRail?.rail === "output") {

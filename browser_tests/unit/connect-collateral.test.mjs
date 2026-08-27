@@ -281,3 +281,37 @@ test("#2380 an input reslotted to the INTENDED link is not collateral", () => {
   g.getNodeById(1282).inputs[0].link = 13;
   assert.equal(verifyConnect(g, before, { intendedLinkIds: [13], beforeSlots }).ok, true);
 });
+
+// Fifth gate P1: the first slot comparison only walked `beforeSlots` and skipped a slot
+// that was absent afterwards, so two of the three transitions were invisible.
+test("#2380 an untargeted input EMPTIED (link -> null) is collateral", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  g.getNodeById(1282).inputs[0].link = null;
+  const v = verifyConnect(g, before, { intendedLinkIds: [], beforeSlots });
+  assert.equal(v.ok, false, "an input that lost its wire must be disclosed");
+  assert.equal(v.collateralReslottedInputs.length, 1);
+  assert.equal(v.collateralReslottedInputs[0].after, null);
+});
+
+test("#2380 an untargeted input FILLED (null -> link) is collateral", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  // 1283.image was empty; something wires it without this connect naming it.
+  g.getNodeById(1283).inputs[0].link = 12;
+  const v = verifyConnect(g, before, { intendedLinkIds: [], beforeSlots });
+  assert.equal(v.ok, false, "an input that gained a wire must be disclosed");
+  assert.equal(v.collateralReslottedInputs[0].before, null);
+  assert.equal(String(v.collateralReslottedInputs[0].after), "12");
+});
+
+test("#2380 the INTENDED link filling its own target is not collateral", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  g.links[13] = { id: 13, origin_id: 1280, origin_slot: 0, target_id: 1283, target_slot: 0 };
+  g.getNodeById(1283).inputs[0].link = 13;
+  assert.equal(verifyConnect(g, before, { intendedLinkIds: [13], beforeSlots }).ok, true);
+});

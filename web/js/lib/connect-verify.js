@@ -434,10 +434,19 @@ export function verifyConnect(
   const collateralReslottedInputs = [];
   if (beforeSlots instanceof Map) {
     const afterSlots = snapshotInputSlotLinks(graph);
-    for (const [slot, wasLink] of beforeSlots) {
-      const nowLink = afterSlots.get(slot);
-      if (nowLink === undefined || nowLink === wasLink) continue;
-      if (intended.has(nowLink) || nowLink === replacedId) continue;
+    // Every slot named by EITHER snapshot, so the three transitions are covered:
+    // link->link (a reslot), link->null (an input emptied) and null->link (an input
+    // filled). Iterating only `beforeSlots` and skipping an absent `now` missed the
+    // last two entirely — a fifth gate P1, and a hole in code this same change added.
+    const slotKeys = new Set([...beforeSlots.keys(), ...afterSlots.keys()]);
+    for (const slot of slotKeys) {
+      const wasLink = beforeSlots.get(slot) ?? null;
+      const nowLink = afterSlots.get(slot) ?? null;
+      if (nowLink === wasLink) continue;
+      // The link this connect made (or the one it displaced) landing on a slot is the
+      // expected outcome, not bystander damage.
+      if (nowLink !== null && (intended.has(nowLink) || nowLink === replacedId)) continue;
+      if (wasLink !== null && wasLink === replacedId) continue;
       collateralReslottedInputs.push({ slot, before: wasLink, after: nowLink });
     }
   }

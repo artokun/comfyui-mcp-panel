@@ -51,9 +51,10 @@ test("BOTH return paths compute a verdict — the success path is the reported o
   );
   assert.equal(
     CONNECT_BODY.match(/verifyConnect\(/g).length,
-    4,
-    "one verdict per return path: two node-to-node, two subgraph-rail (gate P1 — the rail " +
-      "returns sit above the node path and were exiting with no collateral check at all)",
+    6,
+    "one verdict per return path: two node-to-node, two subgraph-rail, and two " +
+      "missing-rail fallbacks that DELEGATE to a mutating expose executor (gate P1s — all " +
+      "four of those sat above the node path and returned with no collateral check)",
   );
 });
 
@@ -85,8 +86,8 @@ test("both paths surface the verdict to the caller", () => {
   );
   assert.equal(
     (CONNECT_BODY.match(/connectCollateralWarning\(/g) ?? []).length,
-    4,
-    "each of the four return paths must carry the warning sentence, not just the bullets",
+    6,
+    "each of the six return paths must carry the warning sentence, not just the bullets",
   );
   // The rail returns already carried a `warning` for a throw-after-wiring. Two spreads
   // each supplying `warning` would let the later clobber the earlier, so they compose.
@@ -100,6 +101,15 @@ test("both paths surface the verdict to the caller", () => {
     2,
     "both rail paths compose their two warnings into one key",
   );
+  // The delegated fallbacks return another executor's result. Spreading it and adding our
+  // own `warning` key would drop whatever that executor already said, so they compose.
+  assert.equal(
+    (CONNECT_BODY.match(/\[exposed\?\.warning, connectCollateralWarning\(exposedCollateral\)\]/g) ?? [])
+      .length,
+    2,
+    "delegated fallbacks must compose the delegate's own warning with ours",
+  );
+
 });
 
 test("the verdict never REFUSES — the mutation has already happened", () => {
