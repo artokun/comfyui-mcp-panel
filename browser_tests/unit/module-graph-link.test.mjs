@@ -41,6 +41,8 @@ import { confirmCanvasNavigation } from "../../web/js/lib/canvas-navigation.js";
 import {
   watchPostReconnectSettle,
   waitForReconnectHandshakeBeforeOpen,
+  workflowOpenReadinessRefusalError,
+  readWorkflowOpenReadinessRefusal,
   graphMutationReconnectGate,
 } from "../../web/js/lib/reconnect-recovery.js";
 import {
@@ -96,11 +98,13 @@ test("panel ↔ media-preview.js / run-completion-frame.js ↔ bounded-step.js e
   assert.equal(typeof withTimeout, "function");
 });
 
-test("panel ↔ node-def-refresh.js / canvas-navigation.js / reconnect-recovery.js edges link (#635/#619/#663/#646/#1641)", () => {
+test("panel ↔ node-def-refresh.js / canvas-navigation.js / reconnect-recovery.js edges link (#635/#619/#663/#646/#1641/#1914)", () => {
   assert.equal(typeof describeNodeDefRefresh, "function");
   assert.equal(typeof confirmCanvasNavigation, "function");
   assert.equal(typeof watchPostReconnectSettle, "function");
   assert.equal(typeof waitForReconnectHandshakeBeforeOpen, "function");
+  assert.equal(typeof workflowOpenReadinessRefusalError, "function");
+  assert.equal(typeof readWorkflowOpenReadinessRefusal, "function");
   assert.equal(typeof graphMutationReconnectGate, "function");
 });
 

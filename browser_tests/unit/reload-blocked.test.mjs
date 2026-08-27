@@ -194,6 +194,7 @@ function buildCommandReplyClient(onReload) {
       abandonedInteractiveError: () => "abandoned",
       readReconnectRefusal: () => null,
       readWorkflowListReadinessRefusal: () => null,
+      readWorkflowOpenReadinessRefusal: () => null,
       readRouteRegistrationReadinessRefusal: () => null,
       markOpenReceiptReplySent: noop,
       openReceipts: [],

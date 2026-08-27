@@ -350,6 +350,8 @@ import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import {
   watchPostReconnectSettle,
   waitForReconnectHandshakeBeforeOpen,
+  workflowOpenReadinessRefusalError,
+  readWorkflowOpenReadinessRefusal,
   graphMutationReconnectGate,
   reconnectRefusalError,
   readReconnectRefusal,
@@ -21237,10 +21239,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // no fence — so the orchestrator answers "FENCE: NOT cleared (active identity
     // UNCONFIRMED after reconnect handshake)". A retry a moment later succeeds
     // without changing the workflow. Wait here, BEFORE the freeze and the load,
-    // so the first open is the one that succeeds. If the handshake never lands
-    // the open still proceeds: it is the #646 recovery for a restore that never
-    // settles. Bounded (~2.9s); a healthy already-settled tab returns immediately.
-    await waitForReconnectHandshakeBeforeOpen({
+    // so the first open is the one that succeeds. Bounded (~2.9s); a healthy
+    // already-settled tab returns immediately.
+    //
+    // #1914 — if that bounded wait still times out, REFUSE. Proceeding is the
+    // timeout-after-delivered-open: the command was already handed to the tab,
+    // freeze/load never replies, and the orchestrator reports undetermined with
+    // no rid-correlated receipt. `applied: false` is true because this throw is
+    // still before freeze/load. After the settle window closes, `needsWait` is
+    // false, the waiter returns "ready", and the open proceeds as the #646
+    // recovery for a restore that never settles.
+    const readiness = await waitForReconnectHandshakeBeforeOpen({
       needsWait: () =>
         comfyBackendIsDown() ||
         postReconnectBindingSettleWindow() ||
@@ -21258,6 +21267,14 @@ const GRAPH_TOOL_EXECUTORS = {
         return true;
       },
     });
+    if (readiness === "timeout") {
+      const reason = comfyBackendIsDown()
+        ? "the backend socket is still reconnecting"
+        : nodeDefRefreshInFlight != null
+          ? "the post-reconnect node-definition refresh is still running"
+          : "the restored canvas binding is not yet proven";
+      throw failOpen(workflowOpenReadinessRefusalError(reason));
+    }
     } catch (err) {
       // The reload guard below owns the normal-operation cleanup. Before it is
       // acquired, however, lookup/probe/handshake failures still have to retire
@@ -27874,6 +27891,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         } catch (err) {
           const reconnectRefusal = readReconnectRefusal(err);
           const workflowListReadiness = readWorkflowListReadinessRefusal(err);
+          const workflowOpenReadiness = readWorkflowOpenReadinessRefusal(err);
           const routeRegistrationReadiness = readRouteRegistrationReadinessRefusal(err);
           reply = {
             rid: msg.rid,
@@ -27899,6 +27917,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // cannot confuse a workflow-list readiness miss with a graph
             // command blocked by a different fence.
             ...(workflowListReadiness ? { workflow_list_readiness: workflowListReadiness } : {}),
+            // #1914 — mutator, but still pre-open: freeze/load have not run.
+            // Keep it out of the graph-mutation `refusal` field so a caller
+            // cannot treat an unsettled open as a gated graph write.
+            ...(workflowOpenReadiness ? { workflow_open_readiness: workflowOpenReadiness } : {}),
             // #1787 — this is a read-only, pre-refresh refusal. The route handoff
             // did not settle, so no node definitions were fetched or registered.
             ...(routeRegistrationReadiness

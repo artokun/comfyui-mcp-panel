@@ -35,7 +35,10 @@ import { fileURLToPath } from "node:url";
 import {
   OPEN_RECONNECT_HANDSHAKE_STEPS_MS,
   waitForReconnectHandshakeBeforeOpen,
+  workflowOpenReadinessRefusalError,
+  readWorkflowOpenReadinessRefusal,
 } from "../../web/js/lib/reconnect-recovery.js";
+import { installActivePointerWatch } from "../../web/js/lib/live-canvas-capture-gate.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
@@ -236,5 +239,241 @@ test("#1641 wiring: the panel imports the shipped helper, not a local copy", () 
   assert.match(
     SRC,
     /import \{[\s\S]*?waitForReconnectHandshakeBeforeOpen,[\s\S]*?\} from "\.\/lib\/reconnect-recovery\.js"/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #1914 — a handshake miss must refuse, not proceed into a delivered hang.
+// ---------------------------------------------------------------------------
+
+test("#1914 minted open-readiness refusal is applied:false and unforgeable", () => {
+  const err = workflowOpenReadinessRefusalError("the restored canvas binding is not yet proven");
+  const refusal = readWorkflowOpenReadinessRefusal(err);
+  assert.deepEqual(refusal, {
+    code: "reconnect-not-ready",
+    ready: false,
+    applied: false,
+    stage: "pre-open",
+    retryable: true,
+  });
+  assert.match(err.message, /did not start because the restored canvas binding is not yet proven/);
+  assert.match(err.message, /canvas is unchanged/);
+  assert.equal(
+    readWorkflowOpenReadinessRefusal(new Error(err.message)),
+    null,
+    "a lookalike sentence is not a minted refusal",
+  );
+  assert.equal(readWorkflowOpenReadinessRefusal({ message: err.message }), null);
+});
+
+test("#1914 wiring: handshake timeout throws the shipped open-readiness refusal", () => {
+  assert.match(
+    OPEN_BODY,
+    /const readiness = await waitForReconnectHandshakeBeforeOpen\(\{/,
+    "workflow_open must observe the wait's ready/timeout verdict",
+  );
+  assert.match(
+    OPEN_BODY,
+    /if \(readiness === "timeout"\)[\s\S]*?throw failOpen\(workflowOpenReadinessRefusalError\(/,
+    "a timeout must be a journaled retryable refusal, not freeze/load",
+  );
+  const waitAt = OPEN_BODY.indexOf("const readiness = await waitForReconnectHandshakeBeforeOpen({");
+  const refuseAt = OPEN_BODY.indexOf("throw failOpen(workflowOpenReadinessRefusalError(");
+  const freezeAt = OPEN_BODY.indexOf("acquireCanvasInteractionLock(canvasView)");
+  const openAt = OPEN_BODY.indexOf("await s.openWorkflow(target);");
+  assert.ok(waitAt < refuseAt, "the verdict is checked before any mutator step");
+  assert.ok(refuseAt < freezeAt, "do not freeze a canvas the reconnect has not settled");
+  assert.ok(refuseAt < openAt, "do not switch tabs after a handshake miss");
+});
+
+test("#1914 wiring: the refusal is separate structured pre-open evidence", () => {
+  assert.match(SRC, /readWorkflowOpenReadinessRefusal\(err\)/);
+  assert.match(
+    SRC,
+    /\.\.\.\(workflowOpenReadiness \? \{ workflow_open_readiness: workflowOpenReadiness \} : \{\}\)/,
+    "the bridge must publish the open-readiness refusal without treating it as a graph refusal",
+  );
+  assert.match(
+    SRC,
+    /import \{[\s\S]*?workflowOpenReadinessRefusalError,[\s\S]*?readWorkflowOpenReadinessRefusal,[\s\S]*?\} from "\.\/lib\/reconnect-recovery\.js"/,
+  );
+});
+
+function balancedFrom(src, marker, openAt = null) {
+  const start = src.indexOf(marker);
+  assert.notEqual(start, -1, `missing marker: ${marker}`);
+  const open = openAt ?? src.indexOf("{", start + marker.length);
+  let depth = 0;
+  for (let i = open; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "/" && src[i + 1] === "/") {
+      i = src.indexOf("\n", i + 2);
+      if (i < 0) break;
+      continue;
+    }
+    if (ch === "/" && src[i + 1] === "*") {
+      i = src.indexOf("*/", i + 2);
+      if (i < 0) break;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < src.length; i += 1) {
+        if (src[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (src[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}" && --depth === 0) return src.slice(start, i + 1);
+  }
+  throw new Error(`unterminated block: ${marker}`);
+}
+
+const RELOAD_GUARD_SOURCE = SRC.match(
+  /let workflowReloadGuard = null;[\s\S]*?function activeWorkflowReloadGuard\(\) \{[\s\S]*?\n\}/,
+);
+assert.ok(RELOAD_GUARD_SOURCE, "could not locate the production reload guard block");
+const PINIA_STORE_HELPER_SOURCE = balancedFrom(SRC, "function getPiniaStore(id)");
+
+function productionOpen(environment) {
+  const signature = "async workflow_open({";
+  const sigStart = SRC.indexOf(signature);
+  assert.notEqual(sigStart, -1, "workflow_open not found");
+  const bodyBrace = SRC.indexOf(") {", sigStart) + 1;
+  const methodSource = balancedFrom(SRC, signature, bodyBrace).replace(
+    /^async workflow_open\(/,
+    "async function workflow_open(",
+  );
+  const factory = new Function(
+    "sandbox",
+    `with (sandbox) {\n${RELOAD_GUARD_SOURCE[0]}\n${PINIA_STORE_HELPER_SOURCE}\n${methodSource}\n` +
+      `return workflow_open;\n}`,
+  );
+  const sandbox = {
+    installActivePointerWatch,
+    workflowOpenReadinessRefusalError,
+    readWorkflowOpenReadinessRefusal,
+    ...environment,
+  };
+  const scope = new Proxy(sandbox, {
+    has: () => true,
+    get(target, key) {
+      if (key === Symbol.unscopables) return undefined;
+      return Object.prototype.hasOwnProperty.call(target, key) ? target[key] : globalThis[key];
+    },
+  });
+  return factory(scope);
+}
+
+function deliveredOpenHangEnvironment({ handshake }) {
+  const target = {
+    path: "workflows/LTX-2.5_Director_CHUNKS_MODULAR_DEBUG.json",
+    filename: "LTX-2.5_Director_CHUNKS_MODULAR_DEBUG.json",
+    isModified: false,
+    changeTracker: { activeState: { nodes: [], links: [] } },
+  };
+  const receipts = [];
+  let opened = 0;
+  let frozen = 0;
+  const hang = () => new Promise(() => {});
+  const app = {
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          opened += 1;
+          return hang();
+        },
+      },
+    },
+  };
+  return {
+    target,
+    receipts,
+    counters: () => ({ opened, frozen }),
+    environment: {
+      backendReconnectEpoch: 4,
+      app,
+      activeWorkflowRef: () => target,
+      sameWorkflowObject: (a, b) => a === b,
+      workflowTabId: (workflow) => `wf:${workflow.path}`,
+      workflowRecordMatchesSelector: () => true,
+      waitForReconnectHandshakeBeforeOpen: async () => handshake,
+      workflowOpenReadinessRefusalError,
+      comfyBackendIsDown: () => false,
+      postReconnectBindingSettleWindow: () => true,
+      nodeDefRefreshInFlight: null,
+      noteOpenAttempt: (entry) => {
+        receipts.push(entry);
+        return { seq: receipts.length, ...entry };
+      },
+      coerceMessageText: (value) => String(value ?? ""),
+      acquireCanvasInteractionLock: () => {
+        frozen += 1;
+        return "lock-token";
+      },
+      flushSourceCanvasBeforeSwitch: hang,
+      installActivePointerWatch,
+    },
+  };
+}
+
+test(
+  "#1914 production workflow_open refuses a handshake miss instead of hanging after delivery",
+  { timeout: 1500 },
+  async () => {
+    const { target, receipts, counters, environment } = deliveredOpenHangEnvironment({
+      handshake: "timeout",
+    });
+    const workflow_open = productionOpen(environment);
+    let err;
+    try {
+      await Promise.race([
+        workflow_open({ path: target.path, rid: "rid-1914-timeout" }),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("timeout-after-delivered-open")), 1000);
+        }),
+      ]);
+    } catch (caught) {
+      err = caught;
+    }
+    assert.ok(err, "an unsettled reconnect must not report a successful open");
+    assert.notEqual(
+      err.message,
+      "timeout-after-delivered-open",
+      "the shipped open must reply before the orchestrator's 15s delivery timeout",
+    );
+    assert.notEqual(err.message, "proceeded past handshake into freeze");
+    const refusal = readWorkflowOpenReadinessRefusal(err);
+    assert.equal(refusal?.code, "reconnect-not-ready");
+    assert.equal(refusal?.applied, false, "nothing was frozen, switched, or loaded");
+    assert.equal(refusal?.retryable, true);
+    assert.equal(refusal?.stage, "pre-open");
+    assert.equal(counters().opened, 0, "openWorkflow must not run after a handshake miss");
+    assert.equal(counters().frozen, 0, "the canvas lock must not be taken after a handshake miss");
+    assert.ok(receipts.length >= 1, "failOpen journals a rid-correlated negative receipt");
+    assert.ok(receipts.every((entry) => entry.applied === false));
+    assert.equal(receipts[0].rid, "rid-1914-timeout");
+    assert.equal(receipts[0].cmd, "workflow_open");
+  },
+);
+
+test("#1914 production workflow_open still proceeds once the handshake is ready", async () => {
+  const { target, environment } = deliveredOpenHangEnvironment({ handshake: "ready" });
+  environment.acquireCanvasInteractionLock = () => {
+    throw new Error("proceeded past handshake into freeze");
+  };
+  const workflow_open = productionOpen(environment);
+  await assert.rejects(
+    () => workflow_open({ path: target.path, rid: "rid-1914-ready" }),
+    /proceeded past handshake into freeze/,
+    "a ready handshake must not be turned into a false refusal",
   );
 });

@@ -106,10 +106,18 @@ export async function watchPostReconnectSettle({
  * `FENCE: NOT cleared (active identity UNCONFIRMED after reconnect handshake)`.
  * A retry a moment later succeeds without changing the workflow.
  *
- * This wait is NOT a binding proof and does not repaint. If the handshake never
- * lands, the open proceeds: it is the documented recovery for a restore that
- * never settles (#646). The wait only buys a settled canvas for the common
- * case so the first open is the one that succeeds.
+ * This wait is NOT a binding proof and does not repaint. It only buys a
+ * settled canvas for the common case so the first open is the one that
+ * succeeds. Callers decide what a `"timeout"` means:
+ *
+ *   - `workflow_list` refuses (#1785): a read must not publish a pre-reconnect
+ *     active pointer as targeting success.
+ *   - `workflow_open` refuses (#1914): proceeding into freeze/load after a
+ *     miss is the timeout-after-delivered-open — the command was already
+ *     handed to the tab, no receipt is written, and the orchestrator reports
+ *     undetermined. After the settle window closes, `needsWait` is false, this
+ *     waiter returns `"ready"`, and the open proceeds as the #646 recovery
+ *     for a restore that never settles.
  *
  * Cadence matches the orchestrator's post-open handshake ([400, 900, 1600] ms)
  * so a caller that already waited there is not waiting a second, longer budget
@@ -157,6 +165,52 @@ export async function waitForReconnectHandshakeBeforeOpen({
     if (ready() || !pending()) return "ready";
   }
   return ready() ? "ready" : "timeout";
+}
+
+/**
+ * #1914 — typed readiness refusal for `workflow_open` after a reconnect
+ * handshake miss.
+ *
+ * Distinct from `workflow_list`'s pre-probe refusal (#1785): this is a mutator,
+ * but it has not yet frozen, switched, or loaded anything, so `applied: false`
+ * is a claim this throw is entitled to make. That is the load-bearing part —
+ * it converts "command was already delivered; outcome undetermined" into
+ * "nothing happened, retry".
+ *
+ * Authority lives in a WeakSet of the Error objects this function minted, the
+ * same unforgeable shape as the graph-mutation gate. A property on the Error
+ * would be inherited and settable; membership here is not.
+ */
+const OPEN_READINESS_REFUSALS = new WeakSet();
+
+export function workflowOpenReadinessRefusalError(reason) {
+  const detail =
+    typeof reason === "string" && reason.trim()
+      ? reason.trim()
+      : "the reconnect handshake is still settling";
+  const error = new Error(
+    "workflow_open did not start because " +
+      detail +
+      " within the bounded readiness window. Nothing was opened, reloaded, or rebound — " +
+      "the canvas is unchanged — so this is safe to retry in a moment.",
+  );
+  OPEN_READINESS_REFUSALS.add(error);
+  return error;
+}
+
+/**
+ * @returns {{code: "reconnect-not-ready", ready: false, applied: false,
+ *   stage: "pre-open", retryable: true}|null}
+ */
+export function readWorkflowOpenReadinessRefusal(error) {
+  if (!error || typeof error !== "object" || !OPEN_READINESS_REFUSALS.has(error)) return null;
+  return {
+    code: "reconnect-not-ready",
+    ready: false,
+    applied: false,
+    stage: "pre-open",
+    retryable: true,
+  };
 }
 
 /**

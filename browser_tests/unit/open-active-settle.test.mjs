@@ -8,7 +8,11 @@ import {
   settleOwnedOpenedWorkflowActive,
 } from "../../web/js/lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "../../web/js/lib/settle-open-readable.js";
-import { graphMutationReconnectGate } from "../../web/js/lib/reconnect-recovery.js";
+import {
+  graphMutationReconnectGate,
+  workflowOpenReadinessRefusalError,
+  readWorkflowOpenReadinessRefusal,
+} from "../../web/js/lib/reconnect-recovery.js";
 import { activeWorkflowPossiblyStale } from "../../web/js/lib/reconnect-staleness.js";
 import { classifyPinnedTarget } from "../../web/js/lib/workflow-chat-identity.js";
 import {
@@ -111,6 +115,8 @@ function productionExecutor(methodName, environment) {
     decideLiveCanvasCapture,
     installActivePointerWatch,
     POINTER_WATCH_UNAVAILABLE_NOTICE,
+    workflowOpenReadinessRefusalError,
+    readWorkflowOpenReadinessRefusal,
     ...environment,
   };
   const scope = new Proxy(sandbox, {
