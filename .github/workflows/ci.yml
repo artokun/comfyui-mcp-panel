@@ -204,6 +204,23 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # The YARA step above covers SVG onload/onerror and process-spawn literals ONLY.
+      # It knows nothing about python_network_operations, the rule family the registry
+      # added on 2026-08-26 — which is exactly how fifteen consecutive releases shipped
+      # with this job GREEN while the registry flagged every one of them (#1854/#1886).
+      # scripts/check-registry-yara.mjs (added in #1874) does model that family; it had
+      # simply never been wired to anything, so it only ran when someone remembered.
+      #
+      # Wired as a RATCHET, not a hard zero. Three shipped files match today and cannot
+      # be cleared by refactoring: two match on third-party verbs (WebSocket, litegraph)
+      # that we do not own and cannot rename, and the third is a plain socket READ in the
+      # orchestrator probe — a liveness probe has to read the response. Allowing exactly
+      # today's count means this job goes RED the moment a FOURTH shipped file gains
+      # socket traffic, which is the regression actually worth catching. Lower the number
+      # whenever a finding is genuinely cleared; never raise it to make a build pass.
+      - name: Security scan (Comfy Registry parity — network rules)
+        run: node scripts/check-registry-yara.mjs --allow 3
+
       # The registry applies .comfyignore with gitignore semantics: a bare
       # `vendor/` matches a vendor dir at ANY depth, so the exclusion meant for
       # the root CI artefact also silently dropped web/js/vendor/ (the runtime
