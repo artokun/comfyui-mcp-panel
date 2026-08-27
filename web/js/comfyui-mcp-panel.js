@@ -14813,15 +14813,34 @@ const GRAPH_TOOL_EXECUTORS = {
     // That classifier prefers a structured `nodes` row with a boolean
     // `is_subgraph`; `text` alone is a fallback. Publish the row beside the
     // survey line so a verified-stable root subgraph instance is classifiable.
-    const pinpointNodes =
-      pinpoint && proj === "detail" && shown === 1 && matched[0]
-        ? [
-            {
-              ...capSummaryWidgets(summarizeNode(matched[0]), detailWidgetCap, maxChars),
-              is_subgraph: !!matched[0].subgraph,
-            },
-          ]
-        : null;
+    // #1941 — fit the structured row the same way as the survey line. An
+    // uncapped VHS/high-fan-in summary used to dwarf `max_chars` while the
+    // text stub stayed bounded; a timed-out/truncated probe then fell through
+    // to graph_get_subgraph and refused a root node as an unclassifiable
+    // promoted container.
+    const pinpointNodes = (() => {
+      if (!(pinpoint && proj === "detail" && shown === 1 && matched[0])) return null;
+      const summary = {
+        ...capSummaryWidgets(summarizeNode(matched[0]), detailWidgetCap, maxChars),
+        is_subgraph: !!matched[0].subgraph,
+      };
+      const fitted = fitDetailLine(
+        JSON.stringify(summary),
+        { id: summary.id, type: summary.type, title: summary.title, is_subgraph: summary.is_subgraph },
+        maxChars,
+      );
+      try {
+        return [JSON.parse(fitted)];
+      } catch {
+        return [
+          {
+            id: summary.id,
+            type: summary.type,
+            is_subgraph: !!matched[0].subgraph,
+          },
+        ];
+      }
+    })();
     return {
       ...meta, total, candidates: candidates.length, matched: matched.length, shown, truncated,
       // #809: expose the CAUSE structurally too, so a caller that reads fields rather
@@ -15229,7 +15248,23 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
     const sub = node.subgraph;
-    if (!sub) throw new Error(`Node ${node.id} (${node.type}) is not a subgraph`);
+    // #1941 — MCP's promoted-write probe treats anything other than this exact
+    // "is not a subgraph" line as indeterminate and refuses the write. A root
+    // node is not a promoted container: only a live inner graph (nodes list or
+    // getNodeById) is one. A truthy leftover `subgraph` used to skip the throw
+    // and look like an unclassifiable container. Nested parentheses in `type`
+    // also made the orchestrator miss its own definitive form, so flatten them.
+    const isContainer =
+      !!sub &&
+      typeof sub === "object" &&
+      (Array.isArray(sub._nodes) || Array.isArray(sub.nodes) || typeof sub.getNodeById === "function");
+    if (!isContainer) {
+      const rawType = typeof node.type === "string" ? node.type : "";
+      const type = rawType.replace(/[()]/g, " ").replace(/\s+/g, " ").trim();
+      throw new Error(
+        type ? `Node ${node.id} (${type}) is not a subgraph` : `Node ${node.id} is not a subgraph`,
+      );
+    }
     const inner = [...(sub._nodes ?? sub.nodes ?? [])];
     const promotedTerminals = promotedTerminalWitnesses(node);
     // #1729 — provenance is a second structured-read path: its raw instance_widgets
