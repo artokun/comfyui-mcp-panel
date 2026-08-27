@@ -22,7 +22,9 @@ const CHANGELOG = join(ROOT, "CHANGELOG.md");
 const args = process.argv.slice(2);
 const refIndex = args.indexOf("--ref");
 const explicitRef = refIndex >= 0 ? args[refIndex + 1] : null;
-const versionArg = args.find((arg) => /^v?\d+\.\d+\.\d+(?:[-+].+)?$/.test(arg));
+const versionArg = args.find(
+  (arg, index) => (refIndex < 0 || index !== refIndex + 1) && /^v?\d+\.\d+\.\d+(?:[-+].+)?$/.test(arg),
+);
 
 const git = (...gitArgs) =>
   execFileSync("git", ["-C", ROOT, ...gitArgs], {
@@ -131,6 +133,10 @@ function allCommits() {
   return parseCommitSubjects(git("log", "--all", "--format=%H%x1f%s%x1e"));
 }
 
+function changelogAtRef(ref) {
+  return git("show", `${ref}:CHANGELOG.md`);
+}
+
 export function auditReleaseSection({ markdown, version, commits, targetRef, isAncestor }) {
   const normalizedVersion = releaseVersion(version);
   const section = parseReleaseSections(markdown).find((item) => item.version === normalizedVersion);
@@ -204,7 +210,24 @@ export function checkChangelog({ markdown, version, commits, targetRef, isAncest
 }
 
 function main() {
-  const markdown = readFileSync(CHANGELOG, "utf8");
+  let markdown;
+  let targetRef = explicitRef;
+  if (explicitRef) {
+    try {
+      git("rev-parse", "--verify", `${explicitRef}^{commit}`);
+    } catch (error) {
+      console.error(`changelog: could not read ${explicitRef}: ${error.message.split("\n")[0]}`);
+      process.exit(1);
+    }
+    try {
+      markdown = changelogAtRef(explicitRef);
+    } catch (error) {
+      console.error(`changelog: could not read CHANGELOG.md at ${explicitRef}: ${error.message.split("\n")[0]}`);
+      process.exit(1);
+    }
+  } else {
+    markdown = readFileSync(CHANGELOG, "utf8");
+  }
   const version = releaseVersion(
     versionArg || parseReleaseSections(markdown).find((section) => /^\d+\.\d+\.\d+(?:[-+].+)?$/.test(section.version))?.version,
   );
@@ -212,15 +235,14 @@ function main() {
     console.error("usage: node scripts/check-changelog.mjs [version] [--ref <git-ref>]");
     process.exit(2);
   }
-  const targetRef = targetRefFor(version, explicitRef);
-  let commits;
+  targetRef ||= targetRefFor(version, null);
   try {
     git("rev-parse", "--verify", `${targetRef}^{commit}`);
-    commits = allCommits();
   } catch (error) {
     console.error(`changelog: could not read ${targetRef}: ${error.message.split("\n")[0]}`);
     process.exit(1);
   }
+  const commits = allCommits();
   const violations = checkChangelog({
     markdown,
     version,

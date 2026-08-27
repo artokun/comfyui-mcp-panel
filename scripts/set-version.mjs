@@ -62,7 +62,7 @@ try {
 // duplicate issue/PR identities, or notes for unreachable changes fail here.
 execFileSync(
   "node",
-  [join(root, "scripts", "check-changelog.mjs"), version, "--ref", "HEAD"],
+  [join(root, "scripts", "check-changelog.mjs"), version],
   { stdio: "inherit" },
 );
 

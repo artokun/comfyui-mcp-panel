@@ -25,10 +25,35 @@ jobs:
         with:
           node-version: 22
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Read authoritative release version
+        id: release-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          try:
+              version = tomllib.load(Path("pyproject.toml").open("rb"))["project"]["version"]
+          except (KeyError, TypeError):
+              raise SystemExit("pyproject.toml [project].version is required")
+          if not isinstance(version, str) or not version.strip():
+              raise SystemExit("pyproject.toml [project].version must be a non-empty string")
+          print(version)
+          PY
+          )"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Changelog release guard
         env:
           RELEASE_REF: ${{ github.sha }}
-        run: node scripts/check-changelog.mjs --ref "$RELEASE_REF"
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: node scripts/check-changelog.mjs "$RELEASE_VERSION" --ref "$RELEASE_REF"
 
       - name: JS syntax check (web/js)
         shell: bash
@@ -163,10 +188,6 @@ jobs:
       # absent — silently skipped its bundle assertions here while being mandatory in CI.
       # A publish path where a test quietly downgrades itself to a no-op is worse than one
       # that omits the test, because the summary still says it ran.
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
       - name: Install comfyui_frontend_package (for the frontend-contract test)
         shell: bash
         run: |
@@ -253,23 +274,22 @@ jobs:
       # is the honest source. Same underlying gap as comfyui-mcp's GitHub
       # Release fix (mcp#1138); this is its Registry twin.
       #
+      # The authoritative version and its non-empty changelog section are required
+      # by the release guard above. This extraction remains fail-open only for the
+      # Registry's optional --changelog-file convenience.
       # THIS STEP CANNOT FAIL THE JOB, BY CONSTRUCTION. Release notes are a
       # nicety; the release itself is not. There is deliberately no `set -e`
       # and the step ends in `exit 0`, so every way this can go wrong — no
-      # python, no tomllib, a pyproject without `[project].version`, a missing
-      # or empty CHANGELOG section — lands in the same place: `path=` empty,
-      # and the publish step below ships with no changelog.
+      # an extraction failure — lands in the same place: `path=` empty, and the
+      # publish step below ships without optional changelog notes. A missing or
+      # empty current-version section cannot reach this step because the guard above
+      # already fails the job.
       #
-      # The previous shape had `set -euo pipefail` with the version read on a
-      # bare assignment. Only the `node scripts/changelog-section.mjs` call was
-      # fail-open (an `if` condition is exempt from errexit); a non-zero
-      # `python -c` would have aborted the job BEFORE the publish step ran, so
-      # a release could have been lost over notes it was not going to use.
       - name: Extract this version's changelog for the Registry
         id: changelog
         run: |
           set -uo pipefail
-          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' 2>/dev/null || true)"
+          version="${{ steps.release-version.outputs.version }}"
           if [ -n "$version" ] && node scripts/changelog-section.mjs "$version" > registry-changelog.md; then
             echo "path=registry-changelog.md" >> "$GITHUB_OUTPUT"
             echo "changelog for $version ($(wc -c < registry-changelog.md) chars):"
