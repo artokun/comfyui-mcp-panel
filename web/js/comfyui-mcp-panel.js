@@ -1681,7 +1681,15 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // run has conclusively failed. Reconnect handlers still clear it outright because a new
   // backend process is the one event that can change the type set.
   objectInfoSnapshot.beginReplacement?.();
-  if (typeof verifiedNodeDefCache !== "undefined") verifiedNodeDefCache.clear();
+  // #1709 — fence verified per-class proofs the same way. A timeout here is not evidence
+  // the type set moved; destroying them at refresh start turned a busy /object_info into a
+  // #458 refusal of a class this session already added on this connection. Generation still
+  // advances, so an in-flight probe cannot reuse or repopulate under the new fence.
+  if (typeof verifiedNodeDefCache?.beginReplacement === "function") {
+    verifiedNodeDefCache.beginReplacement();
+  } else if (typeof verifiedNodeDefCache !== "undefined") {
+    verifiedNodeDefCache.clear();
+  }
   // #1223 — the epoch this run STARTED on, captured before any fetch. The recording below
   // is refused if a reconnect lands while the fetch is in flight, so a pre-restart schema
   // can never be filed under post-restart provenance.
@@ -2098,6 +2106,9 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       // `{}` or an unreadable object is an authoritative non-schema response for this
       // refresh, not a failed replacement that can resurrect the prior membership map.
       if (!snapshotRecorded) objectInfoSnapshot.clear();
+      // The new whole map is authority for every class. Drop per-class proofs without
+      // advancing generation again — this run is still current.
+      verifiedNodeDefCache.acceptReplacement?.();
     }
     // #1275 — snapshot the live graph BEFORE the first mutating phase. Everything
     // from here to the combo phase calls into frontend and extension code
@@ -2389,6 +2400,20 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       objectInfoSnapshot.isReplacementPending?.() === true
     ) {
       objectInfoSnapshot.retainAfterReplacementFailure({
+        epoch: backendReconnectEpoch,
+        generation: verifiedNodeDefCache.generation(),
+        socketDown: comfyBackendSocketDown,
+      });
+    }
+    // #1709 — a timeout-starved refresh is not an authoritative type-set change. Restore
+    // per-class proofs so a later add of a class this session already verified can reuse
+    // them after both live routes go silent. A successful whole answer already called
+    // acceptReplacement, so this only runs when the replacement never landed.
+    if (
+      typeof verifiedNodeDefCache?.retainAfterReplacementFailure === "function" &&
+      verifiedNodeDefCache.isReplacementPending?.() === true
+    ) {
+      verifiedNodeDefCache.retainAfterReplacementFailure({
         epoch: backendReconnectEpoch,
         generation: verifiedNodeDefCache.generation(),
         socketDown: comfyBackendSocketDown,
