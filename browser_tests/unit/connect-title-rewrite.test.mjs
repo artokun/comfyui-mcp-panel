@@ -42,7 +42,11 @@ import {
   findLandedRailLink,
   isRailLinkPersisted,
   landedAfterThrowWarning,
+  verifyConnect,
+  connectCollateralBullets,
+  connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
+import { snapshotGraphState } from "../../web/js/lib/disconnect-verify.js";
 import { findExistingRailSlot } from "../../web/js/lib/rail-slot.js";
 import {
   captureNodeTitles,
@@ -169,6 +173,10 @@ function buildConnect(graph, titleDeps = {}) {
     findLandedRailLink,
     isRailLinkPersisted,
     landedAfterThrowWarning,
+    snapshotGraphState,
+    verifyConnect,
+    connectCollateralBullets,
+    connectCollateralWarning,
     captureNodeTitles,
     describeTitleRewrites,
     titleRewriteWarning,

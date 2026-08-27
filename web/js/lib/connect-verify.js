@@ -14,6 +14,8 @@
 // pure (no DOM / no ComfyUI globals — the graph + nodes are passed in) so it drives
 // the SAME check under unit test that production runs.
 
+import { snapshotGraphState } from "./disconnect-verify.js";
+
 /**
  * True only when `link` is a REAL, persisted connection on `graph`:
  *   - the link object carries an id AND
@@ -304,5 +306,107 @@ export function landedAfterThrowWarning(err, extra = "") {
     `Do NOT retry this connect — a retry would duplicate or tear down wiring that is already ` +
     `correct. The node that threw may have been left mid-reshape, so re-read it with ` +
     `panel_query_graph before wiring anything else to it.`
+  );
+}
+
+/**
+ * Collateral-damage verdict for graph_connect (artokun/comfyui-mcp#2380).
+ *
+ * Every other check on the connect path is scoped to the TWO endpoints the command
+ * named: findLandedInboundLink scans the target inbound links, isLinkPersisted reads
+ * the target slot, describeTitleRewrites covers origin and target. So a connect that
+ * displaces wiring on a THIRD node returned a clean {connected: ...} payload and the
+ * caller only discovered it in a later panel_query_graph. #2380 reports exactly that,
+ * with two inputs on an untargeted node re-pointed and nothing in any reply saying so.
+ *
+ * graph_disconnect has carried this check since #668, where a disconnect on a
+ * SubgraphNode DELETED two unrelated nodes while reporting plain success. Same class,
+ * same remedy: snapshot before, compare after, DISCLOSE what actually changed.
+ *
+ * Two changes are legitimate and must not be reported as collateral:
+ *   - replacedLinkId: the wire that was on the target input. LiteGraph drops it on
+ *     reconnect by design, and the reply already names it as replaced_link.
+ *   - intendedLinkIds: the link this connect created. A dynamic-input pack can
+ *     re-slot it during onConnectionsChange, and the re-slotted wire may carry a
+ *     DIFFERENT id than the one connect() returned, so the caller passes both the
+ *     returned id and whatever findLandedInboundLink actually found.
+ *
+ * Everything else that appeared or vanished is collateral. This states observed facts
+ * only and never narrates a cause: a pack removing one of its own input slots from
+ * inside onConnectionsChange legitimately drops a link, and that is still something
+ * the caller needs told rather than something this module can attribute.
+ *
+ * Returns { ok, missingNodes, addedNodes, collateralRemovedLinks, collateralAddedLinks }.
+ * Pure: the graph is passed in, so production and unit test drive the same check.
+ */
+export function verifyConnect(graph, before, { intendedLinkIds = [], replacedLinkId } = {}) {
+  const after = snapshotGraphState(graph);
+  const replacedId = replacedLinkId != null ? String(replacedLinkId) : null;
+  const intended = new Set(
+    (Array.isArray(intendedLinkIds) ? intendedLinkIds : [intendedLinkIds])
+      .filter((id) => id != null)
+      .map((id) => String(id)),
+  );
+
+  const missingNodes = [...(before?.nodeIds ?? [])].filter((id) => !after.nodeIds.has(id));
+  const addedNodes = [...after.nodeIds].filter((id) => !(before?.nodeIds?.has(id) ?? false));
+
+  const collateralRemovedLinks = [];
+  for (const [id, view] of before?.links ?? []) {
+    if (!after.links.has(id) && id !== replacedId) collateralRemovedLinks.push(view);
+  }
+  const collateralAddedLinks = [];
+  for (const [id, view] of after.links) {
+    if (!(before?.links?.has(id) ?? false) && !intended.has(id)) collateralAddedLinks.push(view);
+  }
+
+  const ok =
+    missingNodes.length === 0 &&
+    addedNodes.length === 0 &&
+    collateralRemovedLinks.length === 0 &&
+    collateralAddedLinks.length === 0;
+  return { ok, missingNodes, addedNodes, collateralRemovedLinks, collateralAddedLinks };
+}
+
+/**
+ * Disclosure bullets for a not-ok verifyConnect verdict. Observed post-state facts
+ * only, phrased the way the #668 disconnect bullets are so the two read alike.
+ */
+export function connectCollateralBullets(verdict) {
+  const lines = [];
+  if (verdict.missingNodes.length) {
+    lines.push(
+      `- node(s) ${verdict.missingNodes.join(", ")} were REMOVED from the graph during this connect`,
+    );
+  }
+  if (verdict.addedNodes.length) {
+    lines.push(`- node(s) ${verdict.addedNodes.join(", ")} APPEARED that were not there before`);
+  }
+  for (const l of verdict.collateralRemovedLinks) {
+    lines.push(
+      `- a link this connect did not target was REMOVED: node ${l.origin_id} output ${l.origin_slot} ` +
+        `-> node ${l.target_id} input ${l.target_slot}`,
+    );
+  }
+  for (const l of verdict.collateralAddedLinks) {
+    lines.push(
+      `- a link APPEARED that this connect did not create: node ${l.origin_id} output ${l.origin_slot} ` +
+        `-> node ${l.target_id} input ${l.target_slot}`,
+    );
+  }
+  return lines;
+}
+
+/** Warning sentence carrying the bullets. The wire the caller asked for DID land, so
+ *  this must not read as a failed connect. */
+export function connectCollateralWarning(bullets) {
+  return (
+    `this connect landed, but the live graph shows changes it did not ask for (#2380):` +
+    `\n${bullets.join("\n")}\n` +
+    `These are observed facts about the post-state, not a diagnosis: a node pack is free to ` +
+    `re-wire its own slots from inside onConnectionsChange, and the panel cannot stop it. Do NOT ` +
+    `restore anything from a stale picture: re-read with panel_graph_outline first, because ` +
+    `correcting from a pre-connect mental model is itself a mutation. Ctrl+Z in the ComfyUI tab ` +
+    `reverts this connect if you would rather start over.`
   );
 }

@@ -52,7 +52,11 @@ import {
   findLandedRailLink,
   isRailLinkPersisted,
   landedAfterThrowWarning,
+  verifyConnect,
+  connectCollateralBullets,
+  connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
+import { snapshotGraphState } from "../../web/js/lib/disconnect-verify.js";
 import { findExistingRailSlot } from "../../web/js/lib/rail-slot.js";
 import {
   captureNodeTitles,
@@ -153,6 +157,10 @@ function buildConnect(graph, overrides = {}) {
     findLandedRailLink,
     isRailLinkPersisted,
     landedAfterThrowWarning,
+    snapshotGraphState,
+    verifyConnect,
+    connectCollateralBullets,
+    connectCollateralWarning,
     captureNodeTitles,
     describeTitleRewrites,
     titleRewriteWarning,
@@ -596,4 +604,130 @@ test("#1873 a connect that changes nothing addressable stays byte-identical", ()
   assert.equal(res.slots_rewritten, undefined);
   assert.equal(res.title_rewritten, undefined);
   assert.equal(res.warning, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// artokun/comfyui-mcp#2380 — collateral changes on nodes the command never named.
+//
+// These drive the SHIPPED graph_connect through the same eval harness above, so
+// they prove the verdict actually runs in production code. connect-collateral.test.mjs
+// proves the verdict is correct; connect-collateral-wiring.test.mjs proves the call
+// sites exist; only these prove the disclosure comes out the other end.
+// ---------------------------------------------------------------------------
+
+/**
+ * The reported shape: a hook that re-points an input on a THIRD node.
+ *
+ * #2380 wired 1280 -> 1283 and found 1282 (which no command named) holding two new
+ * inputs. Modelled here as a hook that, on connect, steals an unrelated node's input.
+ */
+function collateralFixture() {
+  const graph = mkGraph();
+  const src = mkNodeWithOutput(graph, 1280, "ColorMatchV2");
+  const bystanderSrc = mkNodeWithOutput(graph, 1273, "MVEx_SubjectUncrop");
+  const bystander = {
+    id: 1282,
+    title: "ColorMatchV2 (final)",
+    graph,
+    inputs: [{ name: "image_target", type: "IMAGE", link: null }],
+    outputs: [{ name: "image", type: "IMAGE", links: [] }],
+  };
+  const dst = {
+    id: 1283,
+    title: "HDRPreviewKJ",
+    graph,
+    inputs: [{ name: "image", type: "IMAGE", link: null }],
+    outputs: [{ name: "image", type: "IMAGE", links: [] }],
+  };
+  graph.nodes.push(bystander, dst);
+
+  // Pre-existing, unrelated wire: 1273 -> 1282.image_target.
+  const pre = ++graph.lastLinkId;
+  graph._links.set(pre, {
+    id: pre, origin_id: 1273, origin_slot: 0, target_id: 1282, target_slot: 0,
+  });
+  bystanderSrc.outputs[0].links.push(pre);
+  bystander.inputs[0].link = pre;
+
+  return { graph, src, dst, bystander, preLinkId: pre };
+}
+
+test("#2380 shipped graph_connect: a link torn off an UNTARGETED node is disclosed", () => {
+  const { graph, src, dst, bystander, preLinkId } = collateralFixture();
+  attachConnect(src, {
+    onChange: ({ connected }) => {
+      if (!connected) return;
+      // The pack re-points a node this command never mentioned.
+      graph._links.delete(preLinkId);
+      bystander.inputs[0].link = null;
+    },
+  });
+
+  const graph_connect = buildConnect(graph);
+  const res = graph_connect({ from_node_id: 1280, from_output: 0, to_node_id: 1283, to_input: 0 });
+
+  // The wire the caller asked for DID land — this is a disclosure, not a failure.
+  assert.equal(res.connected.to.node_id, 1283);
+  // ...and the thing that used to be invisible is now in the payload.
+  assert.ok(res.collateral_changes, "the reported bug: this key was absent and the reply read clean");
+  assert.equal(res.collateral_changes.length, 1);
+  assert.match(res.collateral_changes[0], /REMOVED/);
+  assert.match(res.collateral_changes[0], /1282/);
+  assert.match(res.warning, /#2380/);
+  assert.match(res.warning, /panel_graph_outline/);
+});
+
+test("#2380 an ordinary connect stays byte-identical — no collateral key, no warning", () => {
+  const { graph, src, dst } = collateralFixture();
+  attachConnect(src);
+
+  const graph_connect = buildConnect(graph);
+  const res = graph_connect({ from_node_id: 1280, from_output: 0, to_node_id: 1283, to_input: 0 });
+
+  assert.equal(res.connected.to.node_id, 1283);
+  assert.ok(!("collateral_changes" in res), "a clean connect must not grow a rider");
+  assert.ok(!("warning" in res), "nor a warning key");
+});
+
+test("#2380 a pack RENAMING its own slots is not collateral (false-positive guard)", () => {
+  // The #1873 path: ImpactSwitch renumbers every input and appends a trailing slot on
+  // each connect. That is the pack behaving normally and is already disclosed as
+  // slots_rewritten. If it also tripped the collateral verdict, every dynamic-input
+  // connect would carry a scary warning and callers would learn to ignore it.
+  const { graph, sw } = loadedSwitchFixture();
+  const graph_connect = buildConnect(graph);
+
+  const res = graph_connect({ from_node_id: 1, from_output: 0, to_node_id: 2, to_input: "input3" });
+
+  assert.ok(res.slots_rewritten, "the #1873 disclosure still fires");
+  assert.ok(
+    !("collateral_changes" in res),
+    "a rename+append is the pack working as designed, not collateral",
+  );
+  assert.ok(!/#2380/.test(res.warning ?? ""), "and the #2380 sentence must not appear");
+});
+
+test("#2380 the disclosure is produced by the FIX, not by the fixture", () => {
+  const { graph, src, bystander, preLinkId } = collateralFixture();
+  attachConnect(src, {
+    onChange: ({ connected }) => {
+      if (!connected) return;
+      graph._links.delete(preLinkId);
+      bystander.inputs[0].link = null;
+    },
+  });
+
+  // Same fixture, same tear-off — but with a verdict that can never report anything.
+  const graph_connect = buildConnect(graph, {
+    verifyConnect: () => ({
+      ok: true, missingNodes: [], addedNodes: [],
+      collateralRemovedLinks: [], collateralAddedLinks: [],
+    }),
+  });
+  const res = graph_connect({ from_node_id: 1280, from_output: 0, to_node_id: 1283, to_input: 0 });
+
+  assert.ok(
+    !("collateral_changes" in res),
+    "the assertions above must be pinned to verifyConnect, not to the fixture",
+  );
 });
