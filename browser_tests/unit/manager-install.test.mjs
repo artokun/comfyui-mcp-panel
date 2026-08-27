@@ -1644,9 +1644,19 @@ test("#1908 the production nodes_search handler answers a stalled Manager inside
   const abortError = () => Object.assign(new Error("Manager request aborted"), { name: "AbortError" });
   const managerGet = async (_route, { signal } = {}) =>
     new Promise((_, reject) => {
-      const abort = () => reject(abortError());
+      // AbortSignal.timeout() uses an unref'd timer in Node. Keep this mock's
+      // worker alive with a short ref'd fallback, but clear it as soon as the
+      // production budget signal aborts so the test does not leave a timer
+      // behind. This fallback is only for event-loop liveness; the normal
+      // assertion still exercises the handler's 25ms AbortSignal timeout.
+      let fallbackTimer;
+      const abort = () => {
+        clearTimeout(fallbackTimer);
+        reject(abortError());
+      };
       if (signal?.aborted) return abort();
       signal?.addEventListener("abort", abort, { once: true });
+      fallbackTimer = setTimeout(abort, 250);
     });
   const managerCall = async () => {
     managerCallUsed = true;
