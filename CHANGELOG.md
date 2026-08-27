@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.112] - 2026-08-27
+
+### Fixed
+- bound panel_search_nodes Manager replies and preserved caller cancellation (#1908, #1912)
+
 ## [0.15.111] - 2026-08-27
 
 ### Fixed
