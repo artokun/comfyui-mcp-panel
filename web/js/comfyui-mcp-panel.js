@@ -452,7 +452,7 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
-import { findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks } from "./lib/rail-slot.js";
+import { findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks, reindexHostRailLinks } from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import { withoutFrontendVirtualTypes } from "./lib/frontend-virtual-nodes.js";
@@ -23652,6 +23652,12 @@ const GRAPH_TOOL_EXECUTORS = {
       // slot may be gone anyway. The live rail below is the only reading.
       removeErr = err;
     } finally {
+      // #1969 — remaining host links keep the OLD origin_slot after a non-last
+      // splice. Re-point them inside the same change group; do not disconnect
+      // (#668 cascade). A canceled remove leaves the slot on the rail and skips.
+      if (!(subgraph.outputs ?? []).includes(slot)) {
+        reindexHostRailLinks(rootGraph, subgraph, "output", slotIndex);
+      }
       subgraph.afterChange?.();
     }
     // OBSERVED, not "the call returned": LGraph.removeOutput dispatches a
@@ -23707,6 +23713,11 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch (err) {
       removeErr = err;
     } finally {
+      // #1969 — same host-link shift as the output twin: remaining later
+      // target_slot values stay at the pre-splice index unless we re-point.
+      if (!(subgraph.inputs ?? []).includes(slot)) {
+        reindexHostRailLinks(rootGraph, subgraph, "input", slotIndex);
+      }
       subgraph.afterChange?.();
     }
     // See the output twin: a cancelable "removing-input" event means a clean

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- graph_unexpose_subgraph_input / _output re-point remaining host SubgraphNode links after a non-last boundary slot is removed, so later host wires stay valid at queue (#1969, artokun/comfyui-mcp#2437)
+
 ## [0.15.119] - 2026-08-27
 
 ### Fixed
