@@ -869,17 +869,33 @@ export class CivitaiClient {
     const examples = (v.images || [])
       .filter((img) => (((img.nsfwLevel || 1) & mask) !== 0))
       .map((img) => this._fromRest({ ...img, url: img.url }));
+    const cfg = v.earlyAccessConfig && typeof v.earlyAccessConfig === "object"
+      ? v.earlyAccessConfig : null;
     return {
       id: v.id, name: v.name || null, baseModel: v.baseModel || null,
       descriptionHtml: v.description || null,
       trainedWords: v.trainedWords || [], examples,
       downloadCount: v.stats?.downloadCount,
       fileName: this._primaryFile(v),
-      // Downloadable files, kept for the Workflows "load onto canvas" path.
+      // Early Access / buzz wall — load-bearing for the lightbox read (#1964).
+      // Kept from the pane's already-fetched model detail, not a second API call.
+      availability: v.availability || null,
+      earlyAccessEndsAt: v.earlyAccessEndsAt || null,
+      earlyAccessConfig: cfg ? {
+        timeframe: cfg.timeframe ?? null,
+        chargeForDownload: cfg.chargeForDownload ?? null,
+        downloadPrice: cfg.downloadPrice ?? null,
+      } : null,
+      // Downloadable files, kept for the Workflows "load onto canvas" path
+      // and the lightbox read (name / size / format / scan / hashes).
       // `format` rides in metadata (live shape: type:"Archive", metadata:{format:"Other"}).
       files: (v.files || []).map((f) => ({
         id: f.id, name: f.name || "", sizeKB: f.sizeKB ?? null,
         type: f.type || null, format: f.metadata?.format ?? null,
+        primary: f.primary === true,
+        pickleScanResult: f.pickleScanResult || null,
+        virusScanResult: f.virusScanResult || null,
+        hashes: f.hashes && typeof f.hashes === "object" ? { ...f.hashes } : null,
       })),
     };
   }

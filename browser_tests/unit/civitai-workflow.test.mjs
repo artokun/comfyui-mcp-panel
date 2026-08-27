@@ -160,7 +160,37 @@ test("_versionFromJson carries the files list (id/name/size/type/format)", () =>
   const v = client._versionFromJson({
     id: 9, files: [{ id: 5, name: "wf.zip", sizeKB: 4.9, type: "Archive", metadata: { format: "Other" } }],
   }, [1]);
-  assert.deepEqual(v.files, [{ id: 5, name: "wf.zip", sizeKB: 4.9, type: "Archive", format: "Other" }]);
+  assert.deepEqual(v.files, [{
+    id: 5, name: "wf.zip", sizeKB: 4.9, type: "Archive", format: "Other",
+    primary: false, pickleScanResult: null, virusScanResult: null, hashes: null,
+  }]);
+});
+
+test("#1964: _versionFromJson keeps Early Access + file verification from the pane fetch", () => {
+  // The lightbox read serializes these off the already-fetched version object.
+  // Dropping them here would force a public-API re-fetch, which cannot see RED.
+  const client = new CivitaiClient({ apiURL: (p) => p });
+  const v = client._versionFromJson({
+    id: 11, name: "V4.0 INT8 CONVROT",
+    availability: "EarlyAccess",
+    earlyAccessEndsAt: "2026-09-01T00:00:00.000Z",
+    earlyAccessConfig: { timeframe: 7, chargeForDownload: true, downloadPrice: 500, extra: "drop-me" },
+    files: [{
+      id: 7, name: "model.safetensors", sizeKB: 4200, type: "Model",
+      primary: true, pickleScanResult: "Success", virusScanResult: "Success",
+      hashes: { SHA256: "abc", AutoV2: "def" },
+      metadata: { format: "SafeTensor" },
+    }],
+  }, [1]);
+  assert.equal(v.availability, "EarlyAccess");
+  assert.equal(v.earlyAccessEndsAt, "2026-09-01T00:00:00.000Z");
+  assert.deepEqual(v.earlyAccessConfig, {
+    timeframe: 7, chargeForDownload: true, downloadPrice: 500,
+  });
+  assert.equal(v.files[0].primary, true);
+  assert.equal(v.files[0].pickleScanResult, "Success");
+  assert.equal(v.files[0].virusScanResult, "Success");
+  assert.deepEqual(v.files[0].hashes, { SHA256: "abc", AutoV2: "def" });
 });
 
 // ── zip reader ──────────────────────────────────────────────────────────────

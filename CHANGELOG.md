@@ -8,6 +8,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - remote, tunnelled, and mobile clients never see the in-app update prompt or one-click install+restart; those stay deferred until the next local host session (#1943, #1944)
+### Added
+- panel_civitai_results reports the live CivitAI lightbox (open model, version ladder + selection, files, creator note, download target) so "Ask agent to download" is no longer a request about a screen the agent cannot see (#1964)
 
 ## [0.15.121] - 2026-08-27
 

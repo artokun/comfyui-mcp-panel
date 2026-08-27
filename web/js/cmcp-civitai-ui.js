@@ -16,6 +16,7 @@ import {
   filtersDirty, bitmask, parseCreatorQuery, levelLabel,
 } from "./cmcp-civitai.js";
 import { summarizeSearchFilters } from "./lib/civitai-search-echo.js";
+import { serializeCivitaiLightbox } from "./lib/civitai-lightbox-read.js";
 import {
   awaitReloadWithin,
   classifyHighlightOutcome,
@@ -392,6 +393,19 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   let isOpen = true;
   let _oauthPollIv = null;         // sign-in completion poll (accountFlow)
   let _activeLightboxClose = null; // openViewer's teardown (owns its own doc keydown listener)
+  // Live lightbox snapshot for panel_civitai_results (#1964). A function so
+  // version-pill clicks / media paging are visible without a second write —
+  // the reader closes over the same `let version` / `let idx` the UI mutates.
+  // Epoch so a later open's close cannot blank a newer lightbox.
+  let _lightboxEpoch = 0;
+  let _readLightbox = () => ({ open: false });
+  function setLightboxReader(fn) {
+    const epoch = ++_lightboxEpoch;
+    _readLightbox = typeof fn === "function" ? fn : () => ({ open: false });
+    return () => {
+      if (_lightboxEpoch === epoch) _readLightbox = () => ({ open: false });
+    };
+  }
   let searchTimer = null;
   const close = () => { try { shell.close(); } catch { /* already gone */ } };
   function teardown() {
@@ -406,6 +420,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     // it down through this one path (codex finding).
     if (_activeLightboxClose) { try { _activeLightboxClose(); } catch { /* already gone */ } _activeLightboxClose = null; }
     try { closeSubModals(); } catch { /* already gone */ }
+    _lightboxEpoch++;
+    _readLightbox = () => ({ open: false });
   }
 
   // The search box is the shell's single input (aliased `search`). The debounce +
@@ -932,10 +948,19 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       const b = el("button", "cmcp-cv-iconbtn"); b.innerHTML = `<i class="pi ${icon}"></i>`;
       if (title) b.title = title; b.addEventListener("click", fn); return b;
     };
+    const releaseLightbox = setLightboxReader(() => {
+      const it = state.items[idx];
+      if (!it) return { open: true, kind: "media", loading: true, id: null, item: null };
+      return {
+        open: true, kind: "media", item: it,
+        index: idx, total: state.items.length, done: !!state.done,
+      };
+    });
     const closeLb = () => {
       lb.remove();
       document.removeEventListener("keydown", onKey, true);
       if (_activeLightboxClose === closeLb) _activeLightboxClose = null;
+      releaseLightbox();
     };
     // Track the live lightbox so the modal's unified close() can dismiss it (and
     // remove its listener) on a programmatic reopen (codex finding).
@@ -1405,9 +1430,19 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
 
   // ── model detail ─────────────────────────────────────────────────────
   async function openModelDetail(m) {
-    const sheet = openSubModal(m.name);
-    sheet.body.appendChild(el("div", "cmcp-cv-loading", tr("civitai_ui.loading", "Loading…")));
     let detail;
+    let version;
+    const releaseLightbox = setLightboxReader(() => {
+      if (!detail) {
+        return {
+          open: true, kind: "model", loading: true,
+          id: m.id, title: m.name || null, creator: m.creator || null, type: m.type || null,
+        };
+      }
+      return { open: true, kind: "model", loading: false, detail, version };
+    });
+    const sheet = openSubModal(m.name, releaseLightbox);
+    sheet.body.appendChild(el("div", "cmcp-cv-loading", tr("civitai_ui.loading", "Loading…")));
     try { detail = await client.fetchModelDetail(m.id, { levels: state.filters.browsingLevels }); }
     catch (e) {
       sheet.body.innerHTML = "";
@@ -1415,7 +1450,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       return;
     }
     sheet.body.innerHTML = "";
-    let version = detail.versions[0];
+    version = detail.versions[0];
 
     const versionRow = el("div", "cmcp-cv-frow");
     const renderBody = () => {
@@ -1549,10 +1584,15 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     } else {
       // The request itself stays English — see buildCaption: it is a prompt for the
       // agent, carrying wire ids and the API's own `detail.type` ("Checkpoint"/"LORA").
+      const live = serializeCivitaiLightbox(
+        { open: true, kind: "model", loading: false, detail, version },
+        { forDownload: true },
+      );
       ctx.sendUserMessage(
         `Please download the CivitAI ${detail.type} "${detail.name}"` +
         (version.name ? ` (version "${version.name}")` : "") +
-        ` — model_id ${detail.id}, version ${version.id} — into ${subfolder}, then we'll use it.`);
+        ` — model_id ${detail.id}, version ${version.id} — into ${subfolder}, then we'll use it.` +
+        `\n\nLive CivitAI lightbox (what I'm looking at):\n${JSON.stringify(live)}`);
       ctx.bringChatForward();
       toast(tr("civitai_ui.asked_the_agent_to_download_it", "Asked the agent to download it."));
     }
@@ -2212,6 +2252,9 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     const ser = serializeCivitaiResults(source, { model, limit, loading: state.loading });
     return {
       ...ser, // { items, total, loading }
+      // Live lightbox — what the user is looking at, copied from pane state.
+      // Not a CivitAI re-fetch (#1962): RED content only exists on this surface.
+      lightbox: serializeCivitaiLightbox(_readLightbox()),
       count: ser.items.length,
       done: !!state.done,
       renderRev: state.renderRev,
