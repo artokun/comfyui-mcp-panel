@@ -16329,8 +16329,17 @@ const GRAPH_TOOL_EXECUTORS = {
         findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
                 // #2380 — the rail paths returned with no collateral verdict at all, so a hook
         // firing during a rail connect could rewire a bystander and still report clean.
+        // The rail path needs the SAME two exemptions the node path already had, and
+        // omitting them made this cry collateral on correct connects (gate P1 x2):
+        //   * railLanded.linkId — a rail connect that WROTE and then threw has its landed
+        //     link on the graph; without naming it, the wire it just made reads as damage.
+        //   * railReplacedId — reconnecting an OCCUPIED rail removes the old link by
+        //     design (SubgraphOutput's documented contract), so that removal is expected.
+        // An OUTPUT rail slot fans out — this connect displaces nothing on it.
+        const railReplacedId = null;
         const railVerdict = verifyConnect(graph, graphBefore, {
-          intendedLinkIds: [link?.id],
+          intendedLinkIds: [link?.id, railLanded?.linkId],
+          replacedLinkId: railReplacedId,
           beforeSlots: inputLinksBefore,
         });
         const railCollateral = railVerdict.ok ? [] : connectCollateralBullets(railVerdict);
@@ -16395,6 +16404,10 @@ const GRAPH_TOOL_EXECUTORS = {
         // #1272 — see the OUTPUT rail branch above: pre-existing rail links are
         // excluded so the throw path cannot credit this call with someone else's wire.
         const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
+        // #2380 — the wire this reconnect will DISPLACE, captured before the mutation.
+        // A rail->input reconnect drops the input's previous link by design, so without
+        // this the verdict cried collateral on a correct connect (gate P1).
+        const railPrevInputLinkId = node.inputs?.[inIdx]?.link ?? null;
         graph.beforeChange?.();
         let link;
         let railConnectErr = null;
@@ -16443,8 +16456,18 @@ const GRAPH_TOOL_EXECUTORS = {
         findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
                 // #2380 — the rail paths returned with no collateral verdict at all, so a hook
         // firing during a rail connect could rewire a bystander and still report clean.
+        // The rail path needs the SAME two exemptions the node path already had, and
+        // omitting them made this cry collateral on correct connects (gate P1 x2):
+        //   * railLanded.linkId — a rail connect that WROTE and then threw has its landed
+        //     link on the graph; without naming it, the wire it just made reads as damage.
+        //   * railReplacedId — reconnecting an OCCUPIED rail removes the old link by
+        //     design (SubgraphOutput's documented contract), so that removal is expected.
+        // Reconnecting an OCCUPIED input drops its previous wire by design, which is
+        // the frontend's documented SubgraphOutput contract, not collateral.
+        const railReplacedId = railPrevInputLinkId ?? null;
         const railVerdict = verifyConnect(graph, graphBefore, {
-          intendedLinkIds: [link?.id],
+          intendedLinkIds: [link?.id, railLanded?.linkId],
+          replacedLinkId: railReplacedId,
           beforeSlots: inputLinksBefore,
         });
         const railCollateral = railVerdict.ok ? [] : connectCollateralBullets(railVerdict);
@@ -16654,6 +16677,8 @@ const GRAPH_TOOL_EXECUTORS = {
         intendedLinkIds: [link?.id, landed.linkId],
         replacedLinkId: prevLinkId,
         beforeSlots: inputLinksBefore,
+        // Both the requested slot and the one a dynamic pack re-slotted it onto.
+        intendedSlots: new Set([`${target.id}#${inIdx}`, `${target.id}#${landed.inputIndex}`]),
       });
       const landedCollateral = landedVerdict.ok ? [] : connectCollateralBullets(landedVerdict);
       return {
@@ -16755,6 +16780,9 @@ const GRAPH_TOOL_EXECUTORS = {
       intendedLinkIds: [link?.id],
       replacedLinkId: prevLinkId,
       beforeSlots: inputLinksBefore,
+      // #2380 — the slot this connect actually addressed. Without it the intended-id
+      // exemption is global, and the same id landing on an untargeted input is hidden.
+      intendedSlots: new Set([`${target.id}#${inIdx}`]),
     });
     const collateral = verdict.ok ? [] : connectCollateralBullets(verdict);
     return {

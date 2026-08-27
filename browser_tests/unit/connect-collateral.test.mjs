@@ -315,3 +315,35 @@ test("#2380 the INTENDED link filling its own target is not collateral", () => {
   g.getNodeById(1283).inputs[0].link = 13;
   assert.equal(verifyConnect(g, before, { intendedLinkIds: [13], beforeSlots }).ok, true);
 });
+
+// Gate P1: the intended-id exemption was global, so a hook assigning that id to an
+// UNTARGETED input was exempt — hiding the exact rewiring this verifier exists to catch.
+test("#2380 the intended link landing on an UNTARGETED slot is still collateral", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  // The connect addressed 1283#0, but link 13 ends up on 1282#0 as well.
+  g.links[13] = { id: 13, origin_id: 1280, origin_slot: 0, target_id: 1283, target_slot: 0 };
+  g.getNodeById(1283).inputs[0].link = 13;
+  g.getNodeById(1282).inputs[0].link = 13;
+
+  const v = verifyConnect(g, before, {
+    intendedLinkIds: [13],
+    beforeSlots,
+    intendedSlots: new Set(["1283#0"]),
+  });
+  assert.equal(v.ok, false, "the intended id is only exempt where it was addressed");
+  assert.ok(v.collateralReslottedInputs.some((r) => r.slot === "1282#0"));
+  assert.ok(!v.collateralReslottedInputs.some((r) => r.slot === "1283#0"));
+});
+
+test("#2380 omitting intendedSlots keeps the previous id-only behaviour", () => {
+  // Back-compat: a caller that cannot name the addressed slot must not start seeing
+  // its own intended link reported as damage.
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  g.links[13] = { id: 13, origin_id: 1280, origin_slot: 0, target_id: 1283, target_slot: 0 };
+  g.getNodeById(1283).inputs[0].link = 13;
+  assert.equal(verifyConnect(g, before, { intendedLinkIds: [13], beforeSlots }).ok, true);
+});

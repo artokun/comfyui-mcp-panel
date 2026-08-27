@@ -372,7 +372,7 @@ export function snapshotInputSlotLinks(graph) {
 export function verifyConnect(
   graph,
   before,
-  { intendedLinkIds = [], replacedLinkId, beforeSlots } = {},
+  { intendedLinkIds = [], replacedLinkId, beforeSlots, intendedSlots } = {},
 ) {
   const after = snapshotGraphState(graph);
   const replacedId = replacedLinkId != null ? String(replacedLinkId) : null;
@@ -445,7 +445,19 @@ export function verifyConnect(
       if (nowLink === wasLink) continue;
       // The link this connect made (or the one it displaced) landing on a slot is the
       // expected outcome, not bystander damage.
-      if (nowLink !== null && (intended.has(nowLink) || nowLink === replacedId)) continue;
+            // Location-aware, not id-only (gate P1). Exempting an intended id wherever it
+        // appeared meant a hook could assign that id to an UNTARGETED node's input and
+        // the verdict stayed ok:true — hiding the very rewiring this exists to catch.
+        // The exemption now applies only on the slot the connect actually addressed;
+        // an intended id landing anywhere else is collateral.
+        const isAddressedSlot = intendedSlots === undefined || intendedSlots.has(slot);
+        if (
+          nowLink !== null &&
+          isAddressedSlot &&
+          (intended.has(nowLink) || nowLink === replacedId)
+        ) {
+          continue;
+        }
       if (wasLink !== null && wasLink === replacedId) continue;
       collateralReslottedInputs.push({ slot, before: wasLink, after: nowLink });
     }
