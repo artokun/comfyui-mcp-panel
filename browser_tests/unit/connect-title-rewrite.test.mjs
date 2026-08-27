@@ -48,7 +48,7 @@ import {
   connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
 import { snapshotGraphState } from "../../web/js/lib/disconnect-verify.js";
-import { findExistingRailSlot } from "../../web/js/lib/rail-slot.js";
+import { findExistingRailSlot, refuseConnectToRawRail } from "../../web/js/lib/rail-slot.js";
 import {
   captureNodeTitles,
   describeTitleRewrites,
@@ -158,6 +158,7 @@ function buildConnect(graph, titleDeps = {}) {
     railIntent,
     isEmptyRailSlotRef,
     findExistingRailSlot,
+    refuseConnectToRawRail,
     findSubgraphHostNode,
     autoMatchSlots,
     slotDiagnostic,
