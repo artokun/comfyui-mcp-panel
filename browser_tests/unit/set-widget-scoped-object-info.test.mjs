@@ -581,7 +581,7 @@ test("#1560/#2249: the panel wires scoped authority after a non-definitive whole
   assert.match(src, /if \(!scopedReadLicensed\) \{/, "an authoritative whole answer is never overruled");
   assert.match(src, /let scopedReadLicensed = false;/, "and it licenses nothing until a read establishes it");
   assert.match(src, /fetchTypeScopedObjectInfo\(types, \{/, "the panel calls the type-scoped reader");
-  assert.match(src, /deadlineMs: budget\.bounded\(SCOPED_OBJECT_INFO_DEADLINE_MS\)/, "bounded by what the command has left");
+  assert.match(src, /deadlineMs: budget\.remaining\(\)/, "the scoped check gets the command's entire remaining time");
   assert.match(src, /const scopedGeneration = verifiedNodeDefCache\.generation\(\)/, "fences the scoped request at issuance");
   assert.match(src, /scopedGeneration !== verifiedNodeDefCache\.generation\(\)/, "rejects a scoped answer after schema invalidation");
   assert.match(src, /setWidgetSchemaProvenance = \(\) => "scoped"/, "the reply is told which route answered");

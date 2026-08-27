@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_widget no longer queues a second whole `/object_info` behind a timed-out `api.getNodeDefs()`, so the type-scoped fallback can use the remaining command time on a large install (#1739)
+
 ## [0.15.115] - 2026-08-27
 
 ### Fixed

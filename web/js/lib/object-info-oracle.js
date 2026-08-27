@@ -444,6 +444,12 @@ export async function fetchWholeObjectInfo({
   timers,
   // MONOTONIC BY DEFAULT, and that is the whole reason a clock is admissible here again.
   now,
+  // #1739/#1920 — `graph_set_widget`'s next fallback is type-scoped, not another whole map.
+  // A silent `api.getNodeDefs()` already occupies ComfyUI's single event loop (there is no
+  // `await` in `get_object_info`), and that call takes no AbortSignal, so a second
+  // GET /object_info queued behind it cannot answer and can only starve `/object_info/<Type>`.
+  // Other callers still try both whole-schema transports: they have no narrower fallback.
+  skipHttpAfterClientNoAnswer = false,
 } = {}) {
   // WHY THIS READS `performance.now()` AND NOT `Date.now()`.
   //
@@ -636,6 +642,7 @@ export async function fetchWholeObjectInfo({
   // and a tag list that silently omits an attempt would license the snapshot fallback on
   // evidence that route never gave.
   const outcomes = [];
+  let clientDidNotAnswer = false;
   // The route is passed, never DERIVED FROM THE SENTENCE. Sniffing the prose for a prefix
   // is the very coupling the tags exist to remove — it would re-break the moment a message
   // is reworded, which is a thing this file's history shows happening.
@@ -670,6 +677,7 @@ export async function fetchWholeObjectInfo({
         TRANSPORT_OUTCOME.NO_ANSWER,
         `api.getNodeDefs() did not answer within its ${Math.round(clientMs)}ms share of the ${budget}ms budget`,
       );
+      clientDidNotAnswer = true;
     } else if (kind === "threw") {
       record("client", TRANSPORT_OUTCOME.THREW, describeFailure("api.getNodeDefs() threw", outcome.err));
     } else {
@@ -705,6 +713,12 @@ export async function fetchWholeObjectInfo({
     // route that was never asked. Tagging an absent client as though it had answered would
     // make "no transport is wired" read as evidence the backend responded (#1223).
     record("client", TRANSPORT_OUTCOME.NOT_ATTEMPTED, "api.getNodeDefs is not a function on this frontend");
+  }
+
+  // The set-widget path has a narrower fallback. Do not queue the same whole-map request
+  // behind the uncancellable client request and starve that type-scoped check.
+  if (clientDidNotAnswer && skipHttpAfterClientNoAnswer) {
+    return { [CACHE_OUTCOME]: true, defs: null, failures, outcomes };
   }
 
   // SECOND TRANSPORT, same question. The reporter proved this route answers when the

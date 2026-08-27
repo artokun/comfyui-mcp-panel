@@ -329,6 +329,31 @@ test("#1739 both whole-map routes still report SILENCE, so the scoped read stays
   );
 });
 
+test("#1739 a timed-out client read does not enqueue a redundant second whole-map read", async () => {
+  const clock = makeVirtualClock();
+  const backend = singleLaneComfyUI(clock);
+  const result = await drive(
+    clock,
+    fetchWholeObjectInfo({
+      getNodeDefs: () => backend.getNodeDefs(),
+      fetchApi: (route, init) => backend.fetchApi(route, init),
+      deadlineMs: OBJECT_INFO_DEADLINE_MS,
+      timers: clock.timers,
+      now: clock.now,
+      skipHttpAfterClientNoAnswer: true,
+    }),
+  );
+
+  assert.equal(result.defs, null, "the unanswered whole-map read still fails closed");
+  assert.deepEqual(
+    result.outcomes.map((o) => o.kind),
+    [TRANSPORT_OUTCOME.NO_ANSWER],
+    "only the client read ran; the type-scoped caller gets the next request slot",
+  );
+  assert.deepEqual(backend.dropped, [], "no second whole-map request was queued and then abandoned");
+  assert.deepEqual(backend.served, ["/object_info"]);
+});
+
 test("#1739 an AbortError from the cancelled route never escapes the oracle", async () => {
   // The oracle documents that every failure path returns `defs: null`, and two callers await
   // it with no catch of their own. Cancelling introduces a NEW rejection into that path.
@@ -405,4 +430,9 @@ test("#1739 the PANEL forwards the init at every whole-map wiring, or the cancel
   );
   const forwarded = src.split(forwards).length - 1;
   assert.ok(forwarded >= 5, `expected every oracle/scoped wiring to forward the init, found ${forwarded}`);
+  assert.match(
+    src,
+    /fetchWholeObjectInfo\(\{[\s\S]*?skipHttpAfterClientNoAnswer:\s*true[\s\S]*?\}\);/,
+    "set_widget must not queue the raw whole-map fallback after its client read timed out",
+  );
 });

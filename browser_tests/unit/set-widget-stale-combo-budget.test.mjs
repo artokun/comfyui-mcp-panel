@@ -1197,8 +1197,8 @@ test("#1709: a definitive per-class absence retires cached whole proof before gr
 //    can catch the constants drifting.
 // ---------------------------------------------------------------------------
 
-test("#1413 the shipped budget mirrors add_node's against the same 30s relay window", () => {
-  assert.equal(SET_WIDGET_COMMAND_BUDGET_MS, 25000, "25s budget + 5s slack against the 30s relay");
+test("#1413 the shipped budget uses the enlarged schema-command relay window", () => {
+  assert.equal(SET_WIDGET_COMMAND_BUDGET_MS, 80000, "80s budget + 10s slack against the 90s relay");
   assert.ok(
     SET_WIDGET_POST_REFRESH_RESERVE_MS > 0 && SET_WIDGET_POST_REFRESH_RESERVE_MS < SET_WIDGET_COMMAND_BUDGET_MS,
     "a reserve that is nothing protects nothing; one that is everything refuses everything",
@@ -1232,7 +1232,7 @@ test("#1418 the seed wait and the oracle read are capped by the command budget",
   );
   assert.match(
     body,
-    /deadlineMs:\s*budget\.bounded\([\s\S]{0,260}OBJECT_INFO_DEADLINE_MS/,
+    /fetchWholeObjectInfo\(\{[\s\S]*?deadlineMs:\s*budget\.bounded\([\s\S]*?OBJECT_INFO_DEADLINE_MS/,
     "the flat 20000ms oracle deadline is capped by what the command has left",
   );
   assert.match(
