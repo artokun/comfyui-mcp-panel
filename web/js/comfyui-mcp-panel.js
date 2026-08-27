@@ -232,6 +232,17 @@ import { saveReplyIdentity, shouldEstablishIdentityAfterSave } from "./lib/save-
 import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
 import {
+  UPDATE_NOTICE_DISMISS_KEY,
+  classifyClientContext,
+  dismissToken,
+  fetchPublishedPanelVersions,
+  isDismissed,
+  resolveUpdateState,
+  shouldOfferHostMutation,
+  shouldSurfaceUpdateNotice,
+  summarizePendingVersions,
+} from "./lib/update-notify.js";
+import {
   scanComboAvailability,
   comboAvailabilityNote,
   uncheckedNodesNote,
@@ -30110,6 +30121,48 @@ const PANEL_CSS = `
 /* #758 — the update notice. Sits in the transcript as a system line, so it inherits
    the panel's scale and scroll rather than becoming a modal the user must dismiss. */
 .cmcp-whatsnew { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
+/* #1942 — pending-update badge + transcript card. Hidden on remote/mobile (#1944). */
+.cmcp-update-badge {
+  display: inline-flex; align-items: center; flex: none;
+  margin-left: 0.35rem;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--p-primary-color, #3b82f6);
+  background: transparent;
+  color: var(--p-primary-color, #3b82f6);
+  font: inherit;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7138);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.cmcp-update-badge[hidden] { display: none !important; }
+.cmcp-update-notice { border-left: 2px solid var(--p-primary-color, #3b82f6); padding-left: 0.55rem; }
+.cmcp-update-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.45rem; align-items: center; }
+.cmcp-update-btn {
+  display: inline-flex; align-items: center;
+  padding: 0.28rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--p-primary-color, #8b5cf6);
+  background: var(--p-primary-color, #8b5cf6);
+  color: #fff;
+  font: inherit;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
+  cursor: pointer;
+}
+.cmcp-update-btn[disabled] { opacity: 0.55; cursor: default; }
+.cmcp-update-dismiss {
+  display: inline-flex; align-items: center;
+  padding: 0.28rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--p-surface-500, #555);
+  background: transparent;
+  color: var(--p-text-muted-color, #a1a1aa);
+  font: inherit;
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9231);
+  cursor: pointer;
+}
 .cmcp-whatsnew-head { font-weight: 600; margin-bottom: 0.3rem; }
 .cmcp-whatsnew-list { margin: 0; padding-left: 0.9rem; display: flex; flex-direction: column; gap: 0.25rem; }
 .cmcp-whatsnew-list li { line-height: 1.45; }
@@ -31381,6 +31434,23 @@ function buildPanel() {
     logo.dataset.fellBack = "1";
     logo.src = LOGO_SERVED_PATH;
   }
+  // #1942 — unobtrusive "Update" chip. Hidden until a local host session is
+  // behind a published cut (or the running bundle does not match disk).
+  const updateBadge = document.createElement("button");
+  updateBadge.type = "button";
+  updateBadge.className = "cmcp-update-badge";
+  updateBadge.hidden = true;
+  updateBadge.dataset.testid = "panel-update-badge";
+  updateBadge.textContent = tr("panel.update", "Update");
+  updateBadge.title = tr("panel.an_update_is_available", "An update is available");
+  updateBadge.addEventListener("click", () => {
+    const existing = log.querySelector('[data-testid="panel-update-available"]');
+    if (existing) {
+      try { existing.scrollIntoView({ block: "nearest" }); } catch {}
+      return;
+    }
+    void notifyAvailablePanelUpdate({ force: true });
+  });
   const status = document.createElement("button");
   status.type = "button";
   status.className = "cmcp-status cmcp-status-btn";
@@ -31431,7 +31501,7 @@ function buildPanel() {
   const histPop = document.createElement("div");
   histPop.className = "cmcp-popover cmcp-popover--down cmcp-history-pop";
   histPop.hidden = true;
-  header.append(logo, actions, status, histPop);
+  header.append(logo, updateBadge, actions, status, histPop);
   root.appendChild(header);
 
   // ── Utility strip (row 2): agent-feed gates now live here instead of
@@ -36999,6 +37069,209 @@ function buildPanel() {
     }
   }
 
+  /**
+   * #1942 — one-click install+restart, only on a local host client (#1943).
+   *
+   * Reuses the existing Manager update + reboot executors rather than a new
+   * installer. A remote/mobile caller is a no-op even if a button somehow
+   * existed — the notice itself is not painted there (#1944).
+   */
+  async function applyPanelUpdate({ kind, clientContext, button } = {}) {
+    if (!shouldOfferHostMutation(clientContext)) return;
+    const installLabel = tr("panel.install_and_restart", "Install and restart");
+    const restartLabel = tr("panel.restart_comfyui", "Restart ComfyUI");
+    const restore = () => {
+      if (!button) return;
+      button.disabled = false;
+      button.textContent = kind === "update" ? installLabel : restartLabel;
+    };
+    const setBusy = (label) => {
+      if (!button) return;
+      button.disabled = true;
+      button.textContent = label;
+    };
+    try {
+      if (kind === "update") {
+        setBusy(tr("panel.installing_the_update", "Installing the update…"));
+        const result = await GRAPH_TOOL_EXECUTORS.graph_update_node({
+          id: "comfyui-agent-panel",
+        });
+        if (result?.unmanaged_pack) {
+          restore();
+          appendSystem(
+            result.note ||
+              tr(
+                "panel.could_not_queue_the_pack_update_from_this_checkout",
+                "Could not queue the pack update from this checkout.",
+              ),
+          );
+          return;
+        }
+      }
+      setBusy(tr("panel.restarting_comfyui", "Restarting ComfyUI…"));
+      const reboot = await GRAPH_TOOL_EXECUTORS.comfy_reboot({ force: false });
+      if (reboot?.blocked_busy) {
+        restore();
+        appendSystem(
+          tr(
+            "panel.comfyui_is_busy_wait_for_the_current_render",
+            "ComfyUI is busy — wait for the current render, then retry the restart.",
+          ),
+        );
+        return;
+      }
+      if (reboot?.refused) {
+        restore();
+        appendSystem(
+          reboot.error || tr("panel.restart_was_refused", "Restart was refused."),
+        );
+        return;
+      }
+    } catch (err) {
+      restore();
+      appendSystem(
+        tr("panel.could_not_apply_the_update", "Could not apply the update: {error}", {
+          error: err instanceof Error ? err.message : String(err ?? "unknown"),
+        }),
+      );
+    }
+  }
+
+  /**
+   * #1942 — if a newer pack is published (or disk already moved), tell a LOCAL
+   * host session what it fixes and offer install+restart.
+   *
+   * #1944 — remote/tunnelled/mobile clients return before anything is painted.
+   * The check itself still runs so a later local session has fresh evidence.
+   */
+  async function notifyAvailablePanelUpdate({ force = false } = {}) {
+    try {
+      const clientContext = classifyClientContext({
+        hostname: typeof location !== "undefined" ? location.hostname : "",
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
+      });
+      if (!shouldSurfaceUpdateNotice(clientContext)) return;
+
+      const probeInstalled = (async () => {
+        if (typeof api?.fetchApi !== "function") return "";
+        const res = await api.fetchApi("/comfyui_mcp_panel/version", { cache: "no-store" });
+        if (!res || !res.ok) return "";
+        const body = await res.json().catch(() => null);
+        return typeof body?.version === "string" ? body.version : "";
+      })();
+      const installed = await Promise.race([
+        probeInstalled,
+        new Promise((resolve) => setTimeout(() => resolve(""), 2000)),
+      ]);
+      const published = await fetchPublishedPanelVersions({
+        fetchImpl: (url, opts) => fetch(url, opts),
+      });
+      const latest = published.latest?.version || "";
+      const state = resolveUpdateState({
+        running: PANEL_VERSION,
+        installed,
+        latest,
+      });
+      if (state.kind === "none") {
+        updateBadge.hidden = true;
+        return;
+      }
+      if (!force && isDismissed(lsGet(UPDATE_NOTICE_DISMISS_KEY), state.kind, state.targetVersion)) {
+        return;
+      }
+      if (client !== liveBridgeClient || !log.isConnected) return;
+
+      const entries = summarizePendingVersions(published.versions, {
+        from: PANEL_VERSION,
+        to: state.targetVersion,
+        maxEntries: 8,
+      });
+      updateBadge.hidden = false;
+      updateBadge.title =
+        state.kind === "restart"
+          ? tr(
+              "panel.restart_to_load_version",
+              "Restart to load {version}",
+              { version: state.targetVersion },
+            )
+          : tr(
+              "panel.version_is_available",
+              "{version} is available",
+              { version: state.targetVersion },
+            );
+
+      const existing = log.querySelector('[data-testid="panel-update-available"]');
+      if (existing) existing.remove();
+
+      const box = document.createElement("div");
+      box.className = "cmcp-sys cmcp-whatsnew cmcp-update-notice";
+      box.dataset.testid = "panel-update-available";
+      const head = document.createElement("div");
+      head.className = "cmcp-whatsnew-head";
+      head.textContent =
+        state.kind === "restart"
+          ? tr(
+              "panel.this_tab_is_running_but_the_pack_on_disk_is",
+              "This tab is running {running} but the pack on disk is {installed}. Restart ComfyUI to load it.",
+              { running: state.running, installed: state.installed || state.targetVersion },
+            )
+          : tr(
+              "panel.version_available_you_are_on",
+              "Panel {version} is available (you are on {running}).",
+              { version: state.targetVersion, running: state.running },
+            );
+      box.appendChild(head);
+      if (entries.length) {
+        const sub = document.createElement("div");
+        sub.textContent = tr("panel.what_this_update_fixes", "What this update fixes:");
+        box.appendChild(sub);
+        const list = document.createElement("ul");
+        list.className = "cmcp-whatsnew-list";
+        for (const entry of entries) {
+          const li = document.createElement("li");
+          const tag = document.createElement("span");
+          tag.className = "cmcp-whatsnew-tag";
+          tag.textContent = entry.section;
+          li.appendChild(tag);
+          li.appendChild(document.createTextNode(" " + entry.text));
+          list.appendChild(li);
+        }
+        box.appendChild(list);
+      }
+      const actionsRow = document.createElement("div");
+      actionsRow.className = "cmcp-update-actions";
+      if (shouldOfferHostMutation(clientContext)) {
+        const go = document.createElement("button");
+        go.type = "button";
+        go.className = "cmcp-update-btn";
+        go.dataset.testid = "panel-update-install";
+        go.textContent =
+          state.kind === "update"
+            ? tr("panel.install_and_restart", "Install and restart")
+            : tr("panel.restart_comfyui", "Restart ComfyUI");
+        go.addEventListener("click", () => {
+          void applyPanelUpdate({ kind: state.kind, clientContext, button: go });
+        });
+        actionsRow.appendChild(go);
+      }
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "cmcp-update-dismiss";
+      dismiss.textContent = tr("panel.dismiss", "Dismiss");
+      dismiss.addEventListener("click", () => {
+        lsSet(UPDATE_NOTICE_DISMISS_KEY, dismissToken(state.kind, state.targetVersion));
+        box.remove();
+        updateBadge.hidden = true;
+      });
+      actionsRow.appendChild(dismiss);
+      box.appendChild(actionsRow);
+      log.appendChild(box);
+      scrollLog();
+    } catch {
+      // A pending-update check is never worth breaking the panel over.
+    }
+  }
+
   function appendActivity(cmd, msg, reply) {
     const { icon, text, detail } = describeCommand(cmd, msg, reply);
     const card = { icon, text, detail, error: !reply.ok };
@@ -39468,6 +39741,9 @@ function buildPanel() {
   // #758 — announce an update once the transcript exists to receive it. Deliberately
   // NOT awaited: a release note must never sit in front of the panel becoming usable.
   announcePanelUpdate();
+  // #1942 — and, separately, whether a NEWER pack is sitting unpublished-to-this-tab
+  // on the Registry or already on disk. Same "don't block usability" rule.
+  void notifyAvailablePanelUpdate();
   // #758 — and keep it REACHABLE. The Discord ask was for somewhere to reference what
   // changed; a line in the transcript scrolls away, is cleared with the chat, and is
   // gone entirely if the user was not looking (codex). Settings → About re-paints it on
