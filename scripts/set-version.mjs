@@ -21,7 +21,11 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const version = process.argv[2];
-if (!version || !/^\d+\.\d+\.\d+([-.].+)?$/.test(version)) {
+const semverIdentifier = "(?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)";
+const strictSemver = new RegExp(
+  `^(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-${semverIdentifier}(?:\\.${semverIdentifier})*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`,
+);
+if (!version || !strictSemver.test(version)) {
   console.error(`usage: node scripts/set-version.mjs <version>  (got: ${version ?? "nothing"})`);
   process.exit(1);
 }
@@ -48,13 +52,23 @@ writeFileSync(jsPath, js2);
 console.log(`set version ${version} in pyproject.toml + PANEL_VERSION (web/js/comfyui-mcp-panel.js)`);
 
 // Stamp the changelog for this version (hybrid: keeps hand-written [Unreleased]
-// highlights, appends commits since the last release, deduped by PR). Best-effort
-// — a bump must not fail because the changelog gen hiccuped.
+// highlights, appends commits since the last release, and reconciles issue/PR
+// aliases). Generation remains best-effort for the initial write, but the
+// release guard below must pass before a version bump can proceed.
 try {
   execFileSync("node", [join(root, "scripts", "gen-changelog.mjs"), version], { stdio: "inherit" });
 } catch (err) {
   console.warn(`changelog generation skipped: ${err instanceof Error ? err.message : String(err)}`);
 }
+
+// #1891 — the generated section is the release record. Check it against the
+// candidate tree before deriving the shipped JSON, so duplicate headings,
+// duplicate issue/PR identities, or notes for unreachable changes fail here.
+execFileSync(
+  "node",
+  [join(root, "scripts", "check-changelog.mjs"), version, "--working-tree"],
+  { stdio: "inherit" },
+);
 
 // #758 — the panel-readable copy, OUTSIDE that catch on purpose.
 //
