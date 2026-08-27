@@ -19,6 +19,15 @@ import { fileURLToPath } from "node:url";
 const MD = readFileSync(fileURLToPath(new URL("../../CHANGELOG.md", import.meta.url)), "utf8")
   .replace(/\r\n/g, "\n");
 
+// web/changelog.json is the artefact the PANEL actually renders; CHANGELOG.md is only its
+// source. Every assertion above this line reads the source, which is how #1891 came to be
+// closed with the user-visible half still broken: the markdown was de-duplicated and the
+// generated JSON was not regenerated, so the pack kept shipping 307 releases with 0.4.1,
+// 0.4.0, 0.3.0 and 0.2.0 each listed twice. Assert on the rendered file too.
+const JSON_RELEASES = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../../web/changelog.json", import.meta.url)), "utf8"),
+).releases;
+
 /** Every `## [x.y.z] - date` heading, in file order. */
 function versionHeadings(markdown = MD) {
   return [...markdown.matchAll(/^## \[(\d+\.\d+\.\d+)\](?:\s*-\s*(\S+))?/gm)].map((m) => ({
@@ -115,4 +124,32 @@ test("CHANGELOG: versions run newest-first, with no ordering breaks", () => {
     if (cmp(vs[i - 1], vs[i]) < 0) breaks.push(`${vs[i - 1]} precedes ${vs[i]}`);
   }
   assert.deepEqual(breaks, [], `ordering breaks:\n  ${breaks.join("\n  ")}`);
+});
+
+test("changelog.json: no version appears twice in the rendered artefact", () => {
+  const seen = new Set();
+  const duplicates = [];
+  for (const release of JSON_RELEASES) {
+    if (seen.has(release.version)) duplicates.push(release.version);
+    else seen.add(release.version);
+  }
+  assert.deepEqual(
+    duplicates,
+    [],
+    `web/changelog.json lists a version twice, so the panel renders it twice: ${duplicates.join(", ")}`,
+  );
+});
+
+test("changelog.json: the rendered artefact matches CHANGELOG.md", () => {
+  // The two files drift only in one direction that matters — the markdown is repaired and the
+  // JSON is left stale, because the JSON is regenerated at release time rather than on the
+  // commit that repaired it. Compare the version LISTS, in order, so drift fails on the commit
+  // that introduces it instead of surviving until the next cut.
+  const fromMarkdown = versionHeadings().map((h) => h.version);
+  const fromJson = JSON_RELEASES.map((r) => r.version);
+  assert.deepEqual(
+    fromJson,
+    fromMarkdown,
+    "web/changelog.json is stale — re-run `node scripts/gen-changelog-json.mjs` after editing CHANGELOG.md",
+  );
 });
