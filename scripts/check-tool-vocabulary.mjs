@@ -35,10 +35,11 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+// VOCABULARY_ROOT points the first two hash checks at a fixture tree (#1927). Unset in CI.
+const root = resolve(process.env.VOCABULARY_ROOT || join(dirname(fileURLToPath(import.meta.url)), ".."));
 const vocab = JSON.parse(readFileSync(join(root, "vendor", "tool-vocabulary.json"), "utf8"));
 
 /**
