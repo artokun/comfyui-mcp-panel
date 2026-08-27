@@ -918,10 +918,10 @@ test("#1582 SHIPPED: the reported case — a held snapshot shortens hung probes"
   const defs = await o.getFreshObjectInfo();
   assert.ok(defs && Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "the edit is no longer refused");
   assert.equal(clientCalls, 1, "the client route is still probed so an answered error can refuse");
-  assert.equal(httpCalls, 1, "the raw route is still probed so the fallback transport can answer");
+  assert.equal(httpCalls, 0, "the redundant raw whole-map request does not queue behind the hung client request");
   assert.deepEqual(deadlines, [2000], "the reusable snapshot caps the serial oracle before the 15s stall");
   assert.match(o.readNote(), /did not answer/);
-  assert.equal(o.readFailures().length, 2, "the fallback still discloses both silent routes");
+  assert.equal(o.readFailures().length, 1, "the refusal names only the route that actually ran");
 });
 
 test("#1734 SHIPPED set_widget: a remote high-latency schema gets the larger bounded probe", async () => {
@@ -1062,14 +1062,14 @@ test("#1582 SHIPPED: a second ordinary read does not re-wait on probes that alre
   });
   assert.ok(await o.getFreshObjectInfo(), "the first write still discovers silence");
   assert.equal(clientCalls, 1);
-  assert.equal(httpCalls, 1);
+  assert.equal(httpCalls, 0);
 
   const started = performance.now();
   const defs = await o.getFreshObjectInfo();
   const elapsed = performance.now() - started;
   assert.ok(defs && Object.prototype.hasOwnProperty.call(defs, "H3Keyframes"), "the second write is still authorized");
   assert.equal(clientCalls, 1, "getNodeDefs is not contacted again");
-  assert.equal(httpCalls, 1, "GET /object_info is not contacted again");
+  assert.equal(httpCalls, 0, "GET /object_info is never queued behind the hung client request");
   assert.ok(elapsed < 50, `second read stalled ${elapsed}ms on probes that were already silent`);
   assert.match(o.readNote(), /#1582/);
 });
@@ -1189,8 +1189,8 @@ test("#1223 SHIPPED: the ineligibility reason is NOT counted as a transport rout
   // defect (a refusal asserting something that did not happen).
   const o = buildShippedOracle({ api: hungApi, snapshot: createObjectInfoSnapshot(), epoch: 5 });
   assert.equal(await o.getFreshObjectInfo(), null);
-  assert.equal(o.readFailures().length, 2, "two transports were tried");
-  assert.match(objectInfoOracleFailureNote(o.readFailures()), /Tried 2 routes/);
+  assert.equal(o.readFailures().length, 1, "only the client transport was tried");
+  assert.match(objectInfoOracleFailureNote(o.readFailures()), /Tried one route/);
   assert.match(o.readIneligibility(), /no whole \/object_info has been observed/i);
 });
 

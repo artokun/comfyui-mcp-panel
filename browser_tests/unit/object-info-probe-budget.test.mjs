@@ -55,7 +55,7 @@ test("#1734 production wiring selects from the page origin and keeps command bou
     PANEL_SRC,
     /const OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS = objectInfoSnapshotProbeDeadline\(pageComfyOrigin\(\)\);/,
   );
-  assert.match(PANEL_SRC, /const SET_WIDGET_COMMAND_BUDGET_MS = 25000;/);
+  assert.match(PANEL_SRC, /const SET_WIDGET_COMMAND_BUDGET_MS = 80000;/);
   assert.match(
     PANEL_SRC,
     /deadlineMs: budget\.bounded\([\s\S]*?OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS/,

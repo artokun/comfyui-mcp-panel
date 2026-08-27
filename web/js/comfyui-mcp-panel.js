@@ -343,7 +343,7 @@ import {
   snapshotAuthorizationNote,
   noBackendAnswerEstablished,
 } from "./lib/object-info-snapshot.js";
-import { fetchTypeScopedObjectInfo, SCOPED_OBJECT_INFO_DEADLINE_MS } from "./lib/scoped-object-info.js";
+import { fetchTypeScopedObjectInfo } from "./lib/scoped-object-info.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
@@ -12914,24 +12914,21 @@ function widenSocketProofBudget(deadlineMs) {
  * #1413 — `graph_set_widget`'s whole-command deadline, taken on the handler's first line.
  *
  * The fourth instance of the defect #1192 fixed for `graph_add_node` and #1404/#1409 for
- * `refresh_nodes`: a wait relayed inside the orchestrator's 30,000 ms window
- * (`OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS` in comfyui-mcp's panel-tools.ts — the same relay
- * constant add_node is measured against) that never took a command budget. Here it is the
- * stale-combo recovery's `refreshComfyNodeDefs()` fallback: a plain join of a run someone
- * else started, under a deadline this command never stated. One run is ~14.5 s of wall
- * clock (NODE_DEFS_RUN_BUDGET_MS deliberately stops its clock across
- * registerNodesFromDefs/reapplyDefsToLiveNodes), and the recovery is reached only AFTER
- * the authorization /object_info has already spent part of the window — so an unbounded
- * join can outlive the relay even with every other step on the path bounded, and the
- * reply is then the bare `did not reply to "graph_set_widget" within 30000 ms` that names
- * nothing, instead of the worded, retryable refusal below.
+ * `refresh_nodes`: a wait relayed inside the orchestrator's schema-command window
+ * (`OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS` in comfyui-mcp's panel-tools.ts) that never took a
+ * command budget. Here it is the stale-combo recovery's `refreshComfyNodeDefs()` fallback:
+ * a plain join of a run someone else started, under a deadline this command never stated.
+ * One run is ~14.5 s of wall clock (NODE_DEFS_RUN_BUDGET_MS deliberately stops its clock
+ * across registerNodesFromDefs/reapplyDefsToLiveNodes), and the recovery is reached only
+ * AFTER the authorization /object_info has already spent part of the window — so an
+ * unbounded join can outlive the relay even with every other step on the path bounded, and
+ * the reply is then the bare `did not reply to "graph_set_widget"` that names nothing,
+ * instead of the worded, retryable refusal below.
  *
- * 25,000 ms, mirroring ADD_NODE_COMMAND_BUDGET_MS against the same 30,000 ms window for
- * the same reason: 5,000 ms of slack for composing the reply, serialising it, and the
- * websocket hop. Mirrored rather than derived for the same reason too — the relay
- * constant lives in the OTHER repo, and a derived copy here could not be kept true.
+ * 80,000 ms leaves 10,000 ms against the schema command's 90,000 ms relay for composing
+ * the reply, serialising it, and the websocket hop.
  */
-const SET_WIDGET_COMMAND_BUDGET_MS = 25000;
+const SET_WIDGET_COMMAND_BUDGET_MS = 80000;
 
 /**
  * #1565 — `graph_run` was the one mutating command on this list with NO command budget at
@@ -17358,6 +17355,7 @@ const GRAPH_TOOL_EXECUTORS = {
                   ? OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS
                   : OBJECT_INFO_DEADLINE_MS,
               ),
+              skipHttpAfterClientNoAnswer: true,
             });
           },
           { stamp: () => backendReconnectEpoch },
@@ -17502,10 +17500,9 @@ const GRAPH_TOOL_EXECUTORS = {
       //      class unanswered; the exact type-scoped route may establish it. An
       //      answered-unusable or thrown route remains refused, and an unwired or
       //      never-attempted oracle licenses nothing.
-      //   2. WHAT THE COMMAND HAS LEFT. The whole-map attempt has already spent most of the
-      //      budget by the time this runs (measured on the reported shape: 15,015 ms of a 20s
-      //      oracle deadline), so this takes `budget.bounded` like every other step and
-      //      cannot push the reply past the bridge's own timeout.
+      //   2. WHAT THE COMMAND HAS LEFT. The timed-out client request cannot be cancelled and
+      //      still owns ComfyUI's request lane, so this narrow check needs the full remainder
+      //      instead of another fixed cap.
       //
       // NEVER recorded into the #1223 snapshot — object-info-snapshot.js requires an explicit
       // `whole: true` claim precisely so a per-class payload cannot make every OTHER type read
@@ -17530,7 +17527,7 @@ const GRAPH_TOOL_EXECUTORS = {
         const scopedGeneration = verifiedNodeDefCache.generation();
         const scoped = await fetchTypeScopedObjectInfo(types, {
           fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
-          deadlineMs: budget.bounded(SCOPED_OBJECT_INFO_DEADLINE_MS),
+          deadlineMs: budget.remaining(),
         });
         // The per-class route is authoritative only for the backend connection that
         // answered it. A reconnect, schema invalidation, or a down socket during this await
