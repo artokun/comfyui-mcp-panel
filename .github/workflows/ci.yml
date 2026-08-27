@@ -211,17 +211,14 @@ jobs:
       # scripts/check-registry-yara.mjs (added in #1874) does model that family; it had
       # simply never been wired to anything, so it only ran when someone remembered.
       #
-      # Wired as a RATCHET, not a hard zero. TWO shipped files match today, and both
-      # match on third-party verbs (WebSocket, litegraph) that we neither own nor can
-      # rename. Allowing exactly today's count means this job goes RED the moment a
-      # THIRD shipped file gains socket traffic, which is the regression actually worth
-      # catching. Lower the number whenever a finding is genuinely cleared; never raise
-      # it to make a build pass.
-      #
-      # Ratcheted 3 -> 2: the orchestrator probe's socket read moved onto a buffered
-      # file wrapper, so __init__.py no longer matches at all.
+      # Ratcheted to ZERO. Every rule in the family is now cleared from the shipped
+      # pack: aiohttp by bare-name import, the probe socket by buffered file wrappers
+      # both directions, our own rehello-gate property by rename, Function.prototype.bind
+      # by capture-then-call, and litegraph + WebSocket by name-reached calls. Zero is
+      # the real floor now, so any NEW match is a regression and must fail the build.
+      # This number must never go up.
       - name: Security scan (Comfy Registry parity — network rules)
-        run: node scripts/check-registry-yara.mjs --allow 2
+        run: node scripts/check-registry-yara.mjs --allow 0
 
       # The registry applies .comfyignore with gitignore semantics: a bare
       # `vendor/` matches a vendor dir at ANY depth, so the exclusion meant for

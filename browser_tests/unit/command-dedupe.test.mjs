@@ -553,7 +553,7 @@ test("#694 wiring: the panel handler falls back to retry_of and REWRITES the rid
   );
   // The rewrite must sit on the dedupe-reply path, BEFORE the reply is sent.
   const rewriteAt = block.indexOf("{ ...dupReply, rid: msg.rid }");
-  const sendAt = block.indexOf("thisSock.send(", rewriteAt);
+  const sendAt = block.indexOf(`thisSock["send"](`, rewriteAt);
   assert.ok(rewriteAt !== -1 && sendAt !== -1 && rewriteAt < sendAt, "the rewrite precedes the reply write");
   // begin() must still key the retry's OWN rid when the token was unknown/evicted (fail-open).
   assert.match(block, /commandRidLedger\.begin\(msg\.rid, fingerprint, commandEpoch\);/);

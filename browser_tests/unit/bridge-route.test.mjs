@@ -446,7 +446,7 @@ test("#640 wiring: every outbound frame site reads bridgeRouteId() and refuses o
   assert.match(src, /tabId: routeId,/, "the hello payload must carry the established route");
   // sendFrame — every control/agent frame.
   assert.match(src, /const routeId = bridgeRouteId\(\);\s*\n\s*if \(!routeId\) return false;/);
-  assert.match(src, /sock\.send\(JSON\.stringify\(\{ tab_id: routeId, \.\.\.frame \}\)\);/);
+  assert.match(src, /sock\["send"\]\(JSON\.stringify\(\{ tab_id: routeId, \.\.\.frame \}\)\);/);
   // callTool / uploadMedia — refuse before dispatch, with the reason.
   assert.match(src, /const callRouteId = bridgeRouteId\(\);\s*\n\s*if \(!callRouteId\) \{\s*\n\s*return Promise\.reject\(new Error\(describeRefusedRoute\(/);
   assert.match(src, /const uploadRouteId = bridgeRouteId\(\);\s*\n\s*if \(!uploadRouteId\) throw new Error\(describeRefusedRoute\(/);
@@ -457,7 +457,7 @@ test("#640 wiring: every outbound frame site reads bridgeRouteId() and refuses o
   // leave it unrecorded and the next title mutation retries.
   assert.match(
     src,
-    /const routeId = bridgeRouteId\(\);\s*\n\s*if \(!routeId\) return;\s*\n\s*try \{\s*\n\s*sock\.send\(JSON\.stringify\(\{ type: "title", tab_id: routeId, title: t \}\)\);\s*\n\s*lastSentTitle = t;/,
+    /const routeId = bridgeRouteId\(\);\s*\n\s*if \(!routeId\) return;\s*\n\s*try \{(?:\s*\n\s*\/\/[^\n]*)*\s*\n\s*sock\["send"\]\(JSON\.stringify\(\{ type: "title", tab_id: routeId, title: t \}\)\);\s*\n\s*lastSentTitle = t;/,
     "a title frame must be recorded as sent only once it actually left — recording earlier suppresses the retry",
   );
   // lost_replies — advisory: omit the field rather than name an unestablished route.
