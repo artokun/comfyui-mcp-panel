@@ -38899,16 +38899,29 @@ function buildPanel() {
     // The agent called panel_open_civitai — open the CivitAI browser pre-seeded
     // with a query + suggested filters so the user can visually pick a resource.
     onOpenCivitai(msg) {
-      openCivitai({
+      const dock = msg.dock !== false;
+      const handle = openCivitai({
         query: typeof msg.query === "string" ? msg.query : "",
         tab: msg.tab,
         filters: msg.filters,
         browsingLevels: msg.browsingLevels,
         // Agent-opened → side-dock by default (chat stays visible) unless the
         // agent explicitly passes dock:false.
-        dock: msg.dock !== false,
+        dock,
       });
-      return { ok: true };
+      // #1958 — echo the applied tab/query/filters/dock the way search already
+      // does. A bare {ok:true} left the agent unable to tell which tab opened
+      // or whether the query landed.
+      try {
+        const st = handle?.civitai?.getState?.();
+        if (st && typeof st === "object") return { ok: true, ...st };
+      } catch { /* fall through to the request echo */ }
+      return {
+        ok: true,
+        tab: msg.tab || "images",
+        query: typeof msg.query === "string" ? msg.query : "",
+        docked: dock,
+      };
     },
     // The agent DRIVES the already-open CivitAI browser tab (switch sub-tab,
     // re-search, read results, glow-highlight). Routes to the unified side-panel

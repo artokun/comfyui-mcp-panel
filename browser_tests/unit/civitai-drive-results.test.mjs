@@ -43,6 +43,7 @@ test("media serialization matches the contract shape", () => {
     baseModel: "FLUX.1-dev", type: "image",
     stats: { reactions: 42 }, prompt: "a cat astronaut",
     urls: ["/proxy/thumb/101.jpeg", "/proxy/full/101.jpeg"],
+    pageUrl: "https://civitai.com/images/101",
     gated: false, // has a thumbnail + not flagged → visible
   });
   assert.equal(b.kind, "video"); // type:"video" → kind:"video"
@@ -59,6 +60,7 @@ test("model serialization matches the contract shape", () => {
     baseModel: "SDXL 1.0", type: "LORA",
     stats: { downloadCount: 1234, thumbsUp: 88 },
     prompt: null, urls: ["/proxy/cover/5.jpeg"],
+    pageUrl: "https://civitai.com/models/5",
     gated: false, // has a cover + not flagged → visible
   });
 });

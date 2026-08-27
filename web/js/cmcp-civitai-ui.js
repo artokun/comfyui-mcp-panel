@@ -18,6 +18,16 @@ import {
 import { summarizeSearchFilters } from "./lib/civitai-search-echo.js";
 import { serializeCivitaiLightbox } from "./lib/civitai-lightbox-read.js";
 import {
+  CIVITAI_TAB_DEFS,
+  civitaiTabCatalog,
+  civitaiTypeNote,
+  civitaiUnseenTypes,
+  civitaiVisibleType,
+  resolveCivitaiTab,
+  summarizeClearHighlight,
+} from "./lib/civitai-tabs.js";
+import { civitaiPageUrl, normalizeCivitaiResultUrls } from "./lib/civitai-sample-urls.js";
+import {
   awaitReloadWithin,
   classifyHighlightOutcome,
   RELOAD_WAIT_BUDGET_MS,
@@ -38,6 +48,9 @@ const TABS = [
   { key: "videos", get label() { return tr("civitai_ui.videos", "Videos"); }, icon: "pi-video", media: "video" },
   { key: "checkpoints", get label() { return tr("civitai_ui.checkpoints", "Checkpoints"); }, icon: "pi-box", model: "Checkpoint" },
   { key: "loras", get label() { return tr("civitai_ui.loras", "LoRAs"); }, icon: "pi-sliders-h", model: "LORA" },
+  { key: "upscalers", get label() { return tr("civitai_ui.upscalers", "Upscalers"); }, icon: "pi-search-plus", model: "Upscaler" },
+  { key: "embeddings", get label() { return tr("civitai_ui.embeddings", "Embeddings"); }, icon: "pi-bookmark", model: "TextualInversion" },
+  { key: "poses", get label() { return tr("civitai_ui.poses", "Poses"); }, icon: "pi-user", model: "Poses" },
   { key: "workflows", get label() { return tr("civitai_ui.workflows", "Workflows"); }, icon: "pi-share-alt", model: "Workflows" },
   { key: "favorites", get label() { return tr("civitai_ui.favorites", "Favorites"); }, icon: "pi-heart", media: "image", fav: true },
 ];
@@ -45,6 +58,7 @@ const TABS = [
 const SUBFOLDER = {
   LORA: "loras", Workflows: "workflows", TextualInversion: "embeddings",
   VAE: "vae", Controlnet: "controlnet", Checkpoint: "checkpoints",
+  Upscaler: "upscale_models", Poses: "poses",
 };
 
 // The "default likes folder": a CivitAI collection every like is also saved
@@ -287,24 +301,36 @@ export function serializeCivitaiResults(source, { model = false, limit = 20, loa
   const n = Number(limit);
   const lim = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 200) : 20;
   const rows = Array.isArray(source) ? source : [];
-  const items = rows.slice(0, lim).map((x) => model ? {
-    id: x.id, kind: "model", title: x.name || null, creator: x.creator || null,
-    baseModel: x.baseModel || null, type: x.type || null,
-    stats: { downloadCount: x.downloadCount ?? null, thumbsUp: x.thumbsUp ?? null },
-    prompt: null, urls: x.coverUrl ? [x.coverUrl] : [],
-    // `gated` mirrors the grid's blur decision (mediaCard/lightbox: `x.gated ===
-    // true || !<cover/thumb>`), so an agent-vision consumer (mcp#623) can withhold
-    // the sample image for anything the human-facing UI renders as a blurred
-    // placeholder — the NSFW/browsing-level gate is never bypassed downstream.
-    gated: x.gated === true || !x.coverUrl,
-  } : {
-    id: x.id, kind: x.type === "video" ? "video" : "image",
-    title: null, creator: x.author || null,
-    baseModel: x.modelName || null, type: x.type || null,
-    stats: { reactions: x.reactions ?? null },
-    prompt: _capPrompt(x.prompt), // bounded — token budget (audit item 3)
-    urls: [x.thumbnailUrl, x.fullUrl].filter(Boolean),
-    gated: x.gated === true || !x.thumbnailUrl,
+  const items = rows.slice(0, lim).map((x) => {
+    if (model) {
+      const kind = "model";
+      return {
+        id: x.id, kind, title: x.name || null, creator: x.creator || null,
+        baseModel: x.baseModel || null, type: x.type || null,
+        stats: { downloadCount: x.downloadCount ?? null, thumbsUp: x.thumbsUp ?? null },
+        prompt: null,
+        // Strip origin + /api so panel_civitai_results can fetch sample pixels
+        // (#1958 / #623). Pass-through for non-proxy thumbs.
+        urls: normalizeCivitaiResultUrls(x.coverUrl ? [x.coverUrl] : []),
+        pageUrl: civitaiPageUrl({ kind, id: x.id }),
+        // `gated` mirrors the grid's blur decision (mediaCard/lightbox: `x.gated ===
+        // true || !<cover/thumb>`), so an agent-vision consumer (mcp#623) can withhold
+        // the sample image for anything the human-facing UI renders as a blurred
+        // placeholder — the NSFW/browsing-level gate is never bypassed downstream.
+        gated: x.gated === true || !x.coverUrl,
+      };
+    }
+    const kind = x.type === "video" ? "video" : "image";
+    return {
+      id: x.id, kind,
+      title: null, creator: x.author || null,
+      baseModel: x.modelName || null, type: x.type || null,
+      stats: { reactions: x.reactions ?? null },
+      prompt: _capPrompt(x.prompt), // bounded — token budget (audit item 3)
+      urls: normalizeCivitaiResultUrls([x.thumbnailUrl, x.fullUrl].filter(Boolean)),
+      pageUrl: civitaiPageUrl({ kind, id: x.id }),
+      gated: x.gated === true || !x.thumbnailUrl,
+    };
   });
   return { items, total: rows.length, loading: !!loading };
 }
@@ -344,7 +370,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
 
   // ── state ────────────────────────────────────────────────────────────────
   const state = {
-    tab: opts.tab && TABS.some((t) => t.key === opts.tab) ? opts.tab : "images",
+    tab: resolveCivitaiTab(opts.tab) || "images",
     query: opts.query || "",
     // Deep-copy the array fields: DEFAULT_FILTERS is frozen but freeze is
     // shallow — spreading shares its arrays, and the level/base-model toggles
@@ -2148,9 +2174,14 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   function _assertOpen() { if (!isOpen) throw new Error("civitai browser not open"); }
   function driveSwitchTab(key) {
     _assertOpen();
-    if (!TABS.some((t) => t.key === key)) throw new Error(`unknown tab "${key}"`);
-    if (state.tab !== key) {
-      state.tab = key; syncTabs();
+    const resolved = resolveCivitaiTab(key);
+    if (!resolved) {
+      throw new Error(
+        `unknown tab "${key}" (known: ${CIVITAI_TAB_DEFS.map((t) => t.key).join(", ")})`,
+      );
+    }
+    if (state.tab !== resolved) {
+      state.tab = resolved; syncTabs();
       // Resolve on DISPATCH, not on fetch completion (#173): awaiting the full
       // reload (a cold first fetch, possibly while the ComfyUI tab is backgrounded)
       // blew the 10s ctx.call bridge timeout, so a tab switch that actually
@@ -2160,10 +2191,16 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       // first await, so state.renderRev below is already the new generation. The
       // agent reads the loaded data via panel_civitai_results (loading/done flags).
       void reload();
-      return { tab: state.tab, renderRev: state.renderRev, dispatched: true };
+      return {
+        tab: state.tab, renderRev: state.renderRev, dispatched: true,
+        visibleType: civitaiVisibleType(state.tab), tabs: civitaiTabCatalog(),
+      };
     }
     syncTabs();
-    return { tab: state.tab, renderRev: state.renderRev, dispatched: false };
+    return {
+      tab: state.tab, renderRev: state.renderRev, dispatched: false,
+      visibleType: civitaiVisibleType(state.tab), tabs: civitaiTabCatalog(),
+    };
   }
   async function driveSearch({ query, filters, browsingLevels } = {}) {
     _assertOpen();
@@ -2222,6 +2259,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         query: state.query,
         modelTab: !!tabDef().model,
       }),
+      visibleType: civitaiVisibleType(state.tab),
+      tabs: civitaiTabCatalog(),
       renderRev: state.renderRev,
       dispatched: true,
     };
@@ -2250,12 +2289,21 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     const model = isModelTab();
     const source = model ? state.models : state.items;
     const ser = serializeCivitaiResults(source, { model, limit, loading: state.loading });
+    const typeNote = civitaiTypeNote({
+      tab: state.tab, total: ser.total, error: state.error, loading: !!state.loading,
+    });
     return {
       ...ser, // { items, total, loading }
       // Live lightbox — what the user is looking at, copied from pane state.
       // Not a CivitAI re-fetch (#1962): RED content only exists on this surface.
       lightbox: serializeCivitaiLightbox(_readLightbox()),
       count: ser.items.length,
+      tab: state.tab,
+      visibleType: civitaiVisibleType(state.tab),
+      tabs: civitaiTabCatalog(),
+      ...(typeNote
+        ? { typeNote, unseenTypes: civitaiUnseenTypes(state.tab) }
+        : {}),
       done: !!state.done,
       renderRev: state.renderRev,
       truncated: source.length > ser.items.length,
@@ -2341,10 +2389,11 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   }
   function driveClearHighlight() {
     _assertOpen();
+    const cleared = state.highlightOrder.length;
     state.highlightSet = new Set();
     state.highlightOrder = [];
     for (const c of grid.querySelectorAll(".cmcp-cv-card.cmcp-agent-glow")) c.classList.remove("cmcp-agent-glow");
-    return { ok: true };
+    return summarizeClearHighlight({ cleared, renderRev: state.renderRev });
   }
   /** Open the lightbox for a card. Dispatch by KIND: media → openViewer(index)
    *  (index-addressed); model → openModelDetail (model tabs leave state.items
@@ -2365,9 +2414,18 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   }
   function driveGetState() {
     return {
-      isOpen, tab: state.tab, loading: !!state.loading, done: !!state.done,
+      isOpen, tab: state.tab, query: state.query,
+      creator: state.filters.username || null,
+      loading: !!state.loading, done: !!state.done,
       renderRev: state.renderRev, docked: shell.isDocked(),
       highlighted: state.highlightOrder.slice(),
+      visibleType: civitaiVisibleType(state.tab),
+      tabs: civitaiTabCatalog(),
+      ...summarizeSearchFilters({
+        filters: state.filters,
+        query: state.query,
+        modelTab: !!tabDef().model,
+      }),
     };
   }
   // The user-facing ✕ already called this (and teardown tears down the lightbox);
