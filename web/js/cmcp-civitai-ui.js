@@ -38,6 +38,7 @@ import { chipRow as filterChipRow, makeFilterButton } from "./cmcp-filter.js";
 import { coerceMessageText } from "./lib/chat-serialize.js";
 import { isImeComposing } from "./lib/ime.js";
 import { tr } from "./lib/i18n.js";
+import { readLiveCivitaiPane } from "./lib/pane-read.js";
 
 // `label` is a GETTER: this array is built at module scope, which runs at IMPORT time —
 // before setup() awaits loadCatalog() — so a plain value would freeze the English fallback
@@ -2428,6 +2429,28 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       }),
     };
   }
+  // Live pane observation (#1961/#1962): the painted grid, not a CivitAI refetch.
+  // `open`/`showing` come from the shell so a training-active unified panel still
+  // reports honestly (showing:false) instead of throwing "not open".
+  function driveRead(opts = {}) {
+    const open = opts.open ?? isOpen;
+    const showing = opts.showing ?? (open && isOpen && grid.isConnected);
+    return readLiveCivitaiPane({
+      open,
+      showing,
+      shellTab: opts.shellTab ?? "civitai",
+      docked: shell.isDocked(),
+      grid,
+      searchEl: search,
+      overlay: shell.overlay,
+      document: typeof document !== "undefined" ? document : null,
+      state,
+      limit: opts.limit,
+      includePreview: opts.includePreview === true,
+      blind: opts.blind === true,
+      createElement: opts.createElement,
+    });
+  }
   // The user-facing ✕ already called this (and teardown tears down the lightbox);
   // exposing it on drive is the agent inverse of open_civitai (#1952). Idempotent.
   function driveClose() {
@@ -2475,6 +2498,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       switchTab: driveSwitchTab, search: driveSearch, getResults: driveGetResults,
       highlight: driveHighlight, clearHighlight: driveClearHighlight,
       openLightbox: driveOpenLightbox, getState: driveGetState,
+      read: driveRead,
       close: driveClose,
     },
   };
