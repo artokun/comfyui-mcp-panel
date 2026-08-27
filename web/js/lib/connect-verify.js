@@ -14,6 +14,8 @@
 // pure (no DOM / no ComfyUI globals — the graph + nodes are passed in) so it drives
 // the SAME check under unit test that production runs.
 
+import { snapshotGraphState } from "./disconnect-verify.js";
+
 /**
  * True only when `link` is a REAL, persisted connection on `graph`:
  *   - the link object carries an id AND
@@ -304,5 +306,256 @@ export function landedAfterThrowWarning(err, extra = "") {
     `Do NOT retry this connect — a retry would duplicate or tear down wiring that is already ` +
     `correct. The node that threw may have been left mid-reshape, so re-read it with ` +
     `panel_query_graph before wiring anything else to it.`
+  );
+}
+
+/**
+ * Collateral-damage verdict for graph_connect (artokun/comfyui-mcp#2380).
+ *
+ * Every other check on the connect path is scoped to the TWO endpoints the command
+ * named: findLandedInboundLink scans the target inbound links, isLinkPersisted reads
+ * the target slot, describeTitleRewrites covers origin and target. So a connect that
+ * displaces wiring on a THIRD node returned a clean {connected: ...} payload and the
+ * caller only discovered it in a later panel_query_graph. #2380 reports exactly that,
+ * with two inputs on an untargeted node re-pointed and nothing in any reply saying so.
+ *
+ * graph_disconnect has carried this check since #668, where a disconnect on a
+ * SubgraphNode DELETED two unrelated nodes while reporting plain success. Same class,
+ * same remedy: snapshot before, compare after, DISCLOSE what actually changed.
+ *
+ * Two changes are legitimate and must not be reported as collateral:
+ *   - replacedLinkId: the wire that was on the target input. LiteGraph drops it on
+ *     reconnect by design, and the reply already names it as replaced_link.
+ *   - intendedLinkIds: the link this connect created. A dynamic-input pack can
+ *     re-slot it during onConnectionsChange, and the re-slotted wire may carry a
+ *     DIFFERENT id than the one connect() returned, so the caller passes both the
+ *     returned id and whatever findLandedInboundLink actually found.
+ *
+ * Everything else that appeared or vanished is collateral. This states observed facts
+ * only and never narrates a cause: a pack removing one of its own input slots from
+ * inside onConnectionsChange legitimately drops a link, and that is still something
+ * the caller needs told rather than something this module can attribute.
+ *
+ * Returns { ok, missingNodes, addedNodes, collateralRemovedLinks, collateralAddedLinks }.
+ * Pure: the graph is passed in, so production and unit test drive the same check.
+ */
+/**
+ * #2380 — the node-side view of the wiring: which link id each input slot names.
+ *
+ * A third merge-gate P1. `snapshotGraphState` records the LINK STORE, and the store and
+ * the node slots are two independent views: a pack can leave every link record byte-
+ * identical while swapping `inputs[i].link` on a bystander node, and execution then
+ * follows the slot, not the store. The verdict read ok:true on a graph wired to the
+ * wrong source — which is the report's own symptom, an input fed from somewhere nobody
+ * named.
+ *
+ * Captured separately rather than by widening snapshotGraphState, which graph_disconnect
+ * has shipped against since #668; changing what that returns would alter a verified
+ * path this fix has no business touching.
+ */
+export function snapshotInputSlotLinks(graph) {
+  const out = new Map();
+  const walk = (g, prefix) => {
+    for (const n of g?._nodes ?? []) {
+      if (n?.id == null) continue;
+      const path = prefix + String(n.id);
+      (n.inputs ?? []).forEach((inp, i) => {
+        // RAW, not String()-normalised (gate P1). litegraph's `_links` is a NUMBER-keyed
+        // Map and its `links` proxy binds Map.prototype.get straight through, so a key of
+        // "7" MISSES a record stored under 7 (#1425). Normalising here made `7` and "7"
+        // compare equal, so a hook that retyped an untargeted slot's id left the wire
+        // unresolvable while the verdict read ok:true. Identity against the intended and
+        // replaced ids is normalised at the comparison instead, where it is needed.
+        if (inp?.link != null) out.set(`${path}#${i}`, inp.link);
+      });
+      if (n?.subgraph && Array.isArray(n.subgraph._nodes)) walk(n.subgraph, `${path}>`);
+    }
+  };
+  walk(graph, "");
+  return out;
+}
+
+export function verifyConnect(
+  graph,
+  before,
+  { intendedLinkIds = [], replacedLinkId, beforeSlots, intendedSlots } = {},
+) {
+  const after = snapshotGraphState(graph);
+  const replacedId = replacedLinkId != null ? String(replacedLinkId) : null;
+  const intended = new Set(
+    (Array.isArray(intendedLinkIds) ? intendedLinkIds : [intendedLinkIds])
+      .filter((id) => id != null)
+      .map((id) => String(id)),
+  );
+
+  const missingNodes = [...(before?.nodeIds ?? [])].filter((id) => !after.nodeIds.has(id));
+  const addedNodes = [...after.nodeIds].filter((id) => !(before?.nodeIds?.has(id) ?? false));
+
+  const collateralRemovedLinks = [];
+  for (const [id, view] of before?.links ?? []) {
+    if (!after.links.has(id) && id !== replacedId) collateralRemovedLinks.push(view);
+  }
+  const collateralAddedLinks = [];
+  for (const [id, view] of after.links) {
+    if (!(before?.links?.has(id) ?? false) && !intended.has(id)) collateralAddedLinks.push(view);
+  }
+
+  // A link that keeps its ID but MOVES is invisible to the two set comparisons above,
+  // and it is the shape artokun/comfyui-mcp#2380 actually reports: two inputs on an
+  // untargeted node ended up fed from different sources. If LiteGraph (or a pack's
+  // onConnectionsChange) rewrites a link record in place, `before` and `after` both
+  // contain that id, so neither the removed nor the added list sees it and the verdict
+  // came back ok:true with nothing to disclose — the verifier missing the very defect it
+  // was written for. Compare the ENDPOINTS of every surviving link, not just the id set.
+  //
+  // The intended and replaced ids are exempt for the same reasons they are above: the
+  // link this connect created may be re-slotted by a dynamic pack, and the wire it
+  // displaced is already reported as `replaced_link`.
+  const sameEndpoints = (a, b) =>
+    String(a.origin_id) === String(b.origin_id) &&
+    Number(a.origin_slot) === Number(b.origin_slot) &&
+    String(a.target_id) === String(b.target_id) &&
+    Number(a.target_slot) === Number(b.target_slot);
+  const collateralMovedLinks = [];
+  for (const [id, was] of before?.links ?? []) {
+    // `replacedId` is exempt: connect displaces that wire by design and the reply names it.
+    // `intended` is deliberately NOT exempt here, and that is the second gate P1 on this
+    // fix. Exempting it by id meant an id REUSE — LiteGraph handing the new link an id a
+    // different wire already held — silently destroyed that wire while the verdict read
+    // ok:true. Executed proof: before `7: 99->1`, after `7: 2->3`, intendedLinkIds [7];
+    // the old 99->1 simply vanished with nothing disclosed. That is the link-id-reuse
+    // hypothesis #2380's reporter raised, and the exemption was hiding exactly it.
+    //
+    // A genuinely NEW link cannot appear in `before`, so declining to exempt intended ids
+    // here costs a correct connect nothing: the only way an intended id is already present
+    // is that it was reused, and then the previous occupant really is gone.
+    // The replaced wire is exempt because connect DROPS it. If it did not drop — the id
+    // survives with new endpoints — then it was REUSED, and exempting it unconditionally
+    // hid an endpoint reassignment onto an untargeted node (gate P1). Exempt it only
+    // where it actually landed on the slot this connect addressed.
+    const survivor = after.links.get(id);
+    if (id === replacedId) {
+      if (!survivor) continue;
+      const landedOn = `${survivor.target_id}#${survivor.target_slot}`;
+      if (intendedSlots === undefined || intendedSlots.has(landedOn)) continue;
+    }
+    const now = after.links.get(id);
+    if (now && !sameEndpoints(was, now)) collateralMovedLinks.push({ before: was, after: now });
+  }
+
+  // #2380 — the node-side comparison. Only meaningful when the caller captured slots
+  // alongside the store; an older call site that did not passes `beforeSlots` undefined
+  // and this contributes nothing rather than inventing a finding.
+  const collateralReslottedInputs = [];
+  if (beforeSlots instanceof Map) {
+    const afterSlots = snapshotInputSlotLinks(graph);
+    // Every slot named by EITHER snapshot, so the three transitions are covered:
+    // link->link (a reslot), link->null (an input emptied) and null->link (an input
+    // filled). Iterating only `beforeSlots` and skipping an absent `now` missed the
+    // last two entirely — a fifth gate P1, and a hole in code this same change added.
+    const slotKeys = new Set([...beforeSlots.keys(), ...afterSlots.keys()]);
+    for (const slot of slotKeys) {
+      const wasLink = beforeSlots.get(slot) ?? null;
+      const nowLink = afterSlots.get(slot) ?? null;
+      // Strict, so a retype (7 -> "7") reads as the change it is. Nothing legitimately
+      // retypes an untargeted slot across a single connect, so this cannot false-positive
+      // on a bystander the connect never touched.
+      if (nowLink === wasLink) continue;
+      // The link this connect made (or the one it displaced) landing on a slot is the
+      // expected outcome, not bystander damage.
+            // Location-aware, not id-only (gate P1). Exempting an intended id wherever it
+        // appeared meant a hook could assign that id to an UNTARGETED node's input and
+        // the verdict stayed ok:true — hiding the very rewiring this exists to catch.
+        // The exemption now applies only on the slot the connect actually addressed;
+        // an intended id landing anywhere else is collateral.
+        const isAddressedSlot = intendedSlots === undefined || intendedSlots.has(slot);
+        if (
+          nowLink !== null &&
+          isAddressedSlot &&
+          (intended.has(String(nowLink)) || String(nowLink) === replacedId)
+        ) {
+          continue;
+        }
+      if (wasLink !== null && String(wasLink) === replacedId) continue;
+      collateralReslottedInputs.push({ slot, before: wasLink, after: nowLink });
+    }
+  }
+
+  const ok =
+    collateralReslottedInputs.length === 0 &&
+    missingNodes.length === 0 &&
+    addedNodes.length === 0 &&
+    collateralRemovedLinks.length === 0 &&
+    collateralAddedLinks.length === 0 &&
+    collateralMovedLinks.length === 0;
+  return {
+    ok,
+    missingNodes,
+    addedNodes,
+    collateralRemovedLinks,
+    collateralAddedLinks,
+    collateralMovedLinks,
+    collateralReslottedInputs,
+  };
+}
+
+/**
+ * Disclosure bullets for a not-ok verifyConnect verdict. Observed post-state facts
+ * only, phrased the way the #668 disconnect bullets are so the two read alike.
+ */
+export function connectCollateralBullets(verdict) {
+  const lines = [];
+  if (verdict.missingNodes.length) {
+    lines.push(
+      `- node(s) ${verdict.missingNodes.join(", ")} were REMOVED from the graph during this connect`,
+    );
+  }
+  if (verdict.addedNodes.length) {
+    lines.push(`- node(s) ${verdict.addedNodes.join(", ")} APPEARED that were not there before`);
+  }
+  for (const l of verdict.collateralRemovedLinks) {
+    lines.push(
+      `- a link this connect did not target was REMOVED: node ${l.origin_id} output ${l.origin_slot} ` +
+        `-> node ${l.target_id} input ${l.target_slot}`,
+    );
+  }
+  for (const r of verdict.collateralReslottedInputs ?? []) {
+    lines.push(
+      `- an input this connect did not target now names a DIFFERENT link: ${r.slot} ` +
+        `was link ${r.before}, is now link ${r.after} (the link records may be unchanged; ` +
+        `execution follows the slot)`,
+    );
+  }
+  for (const m of verdict.collateralMovedLinks ?? []) {
+    // Reported as a MOVE rather than a remove+add pair: the id is the same record, and
+    // saying "removed" of a link that is still there would send the reader looking for a
+    // wire that exists (#2380).
+    lines.push(
+      `- a link this connect did not target was MOVED: node ${m.before.origin_id} output ` +
+        `${m.before.origin_slot} -> node ${m.before.target_id} input ${m.before.target_slot} ` +
+        `is now node ${m.after.origin_id} output ${m.after.origin_slot} -> node ` +
+        `${m.after.target_id} input ${m.after.target_slot}`,
+    );
+  }
+  for (const l of verdict.collateralAddedLinks) {
+    lines.push(
+      `- a link APPEARED that this connect did not create: node ${l.origin_id} output ${l.origin_slot} ` +
+        `-> node ${l.target_id} input ${l.target_slot}`,
+    );
+  }
+  return lines;
+}
+
+/** Warning sentence carrying the bullets. The wire the caller asked for DID land, so
+ *  this must not read as a failed connect. */
+export function connectCollateralWarning(bullets) {
+  return (
+    `this connect landed, but the live graph shows changes it did not ask for (#2380):` +
+    `\n${bullets.join("\n")}\n` +
+    `These are observed facts about the post-state, not a diagnosis: a node pack is free to ` +
+    `re-wire its own slots from inside onConnectionsChange, and the panel cannot stop it. Do NOT ` +
+    `restore anything from a stale picture: re-read with panel_graph_outline first, because ` +
+    `correcting from a pre-connect mental model is itself a mutation. Ctrl+Z in the ComfyUI tab ` +
+    `reverts this connect if you would rather start over.`
   );
 }

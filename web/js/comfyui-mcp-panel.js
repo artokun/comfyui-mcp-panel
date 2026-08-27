@@ -538,6 +538,7 @@ import {
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic, loopbackRefusalReason } from "./lib/connect-match.js";
 import {
+  snapshotInputSlotLinks,
   isLinkPersisted,
   removePhantomLink,
   isWidgetBackedInput,
@@ -549,6 +550,9 @@ import {
   isRailLinkPersisted,
   landedAfterThrowWarning,
   readStoredLink,
+  verifyConnect,
+  connectCollateralBullets,
+  connectCollateralWarning,
 } from "./lib/connect-verify.js";
 import {
   captureNodeTitles,
@@ -16507,6 +16511,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // time. Captured alongside the titles, for the same reason: the rename
     // happens on the throw path and the success path alike.
     const slotsBefore = captureSlotNames([origin, target]);
+    // #2380 — the whole-graph state, captured BEFORE the wire is made. Every other
+    // check on this path is scoped to the two endpoints the command NAMED, so a
+    // connect that displaced wiring on a THIRD node returned a clean payload and the
+    // caller only found out in a later panel_query_graph. graph_disconnect has
+    // snapshotted for exactly this since #668, where a disconnect on a SubgraphNode
+    // deleted two unrelated nodes while reporting plain success; connect never did.
+    const graphBefore = snapshotGraphState(graph);
+    // #2380 — the node-side view too. The link store and the node slots are independent:
+    // a hook can leave every record byte-identical while repointing a bystander's
+    // inputs[i].link, and execution follows the SLOT.
+    const inputLinksBefore = snapshotInputSlotLinks(graph);
     graph.beforeChange();
     let link;
     let connectErr = null;
@@ -16568,6 +16583,19 @@ const GRAPH_TOOL_EXECUTORS = {
         );
       }
       const landedSlot = target.inputs?.[landed.inputIndex];
+      // #2380 — the link that actually landed can carry a DIFFERENT id than the one
+      // connect() returned, because a dynamic-input pack may re-slot it. Both are
+      // named as intended so neither is mistaken for collateral.
+      const landedVerdict = verifyConnect(graph, graphBefore, {
+        intendedLinkIds: [link?.id, landed.linkId],
+        replacedLinkId: prevLinkId,
+        beforeSlots: inputLinksBefore,
+        // Both the requested slot and the one a dynamic pack re-slotted onto. Without
+        // naming them the intended-id exemption is global, and the same id landing on an
+        // untargeted input would be hidden (gate P1).
+        intendedSlots: new Set([`${target.id}#${inIdx}`, `${target.id}#${landed.inputIndex}`]),
+      });
+      const landedCollateral = landedVerdict.ok ? [] : connectCollateralBullets(landedVerdict);
       return {
         connected: {
           from: {
@@ -16599,6 +16627,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // most likely to have been left re-addressed, so this path needs the
         // disclosure at least as much as the clean one.
         ...(slotRewrites.length ? { slots_rewritten: slotRewrites } : {}),
+        ...(landedCollateral.length ? { collateral_changes: landedCollateral } : {}),
         warning: [
           landedAfterThrowWarning(
             connectErr,
@@ -16610,6 +16639,7 @@ const GRAPH_TOOL_EXECUTORS = {
           ),
           titleRewriteWarning(titleRewrites),
           slotRewriteWarning(slotRewrites),
+          landedCollateral.length ? connectCollateralWarning(landedCollateral) : "",
         ]
           .filter(Boolean)
           .join(" "),
@@ -16657,6 +16687,17 @@ const GRAPH_TOOL_EXECUTORS = {
           widgetHint,
       );
     }
+    // #2380 — the REPORTED case: a connect that fully succeeded on both endpoints it
+    // named, while an untargeted node was left re-wired. Disclose, never refuse — the
+    // mutation has already happened, and refusing after the fact is what invites the
+    // destructive retry #1272 exists to prevent.
+    const verdict = verifyConnect(graph, graphBefore, {
+      intendedLinkIds: [link?.id],
+      replacedLinkId: prevLinkId,
+      beforeSlots: inputLinksBefore,
+      intendedSlots: new Set([`${target.id}#${inIdx}`]),
+    });
+    const collateral = verdict.ok ? [] : connectCollateralBullets(verdict);
     return {
       connected: {
         from: {
@@ -16683,11 +16724,18 @@ const GRAPH_TOOL_EXECUTORS = {
       // behaviour of every dynamic-input node and is never reported, so an
       // ordinary connect's payload stays byte-identical to before.
       ...(slotRewrites.length ? { slots_rewritten: slotRewrites } : {}),
-      // Both riders share the single `warning` key, so neither can drop the
-      // other's sentence when one connect does both at once.
-      ...(titleRewrites.length || slotRewrites.length
+      // #2380 — what moved on nodes this command never named. A third rider on the
+      // same key, for the same reason the first two share it.
+      ...(collateral.length ? { collateral_changes: collateral } : {}),
+      // All three riders share the single `warning` key, so none can drop the
+      // others' sentence when one connect does more than one at once.
+      ...(titleRewrites.length || slotRewrites.length || collateral.length
         ? {
-            warning: [titleRewriteWarning(titleRewrites), slotRewriteWarning(slotRewrites)]
+            warning: [
+              collateral.length ? connectCollateralWarning(collateral) : "",
+              titleRewriteWarning(titleRewrites),
+              slotRewriteWarning(slotRewrites),
+            ]
               .filter(Boolean)
               .join(" "),
           }
