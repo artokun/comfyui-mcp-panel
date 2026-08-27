@@ -23546,6 +23546,29 @@ const GRAPH_TOOL_EXECUTORS = {
     // verified afterwards instead of trusted. litegraph's unpackSubgraph silently
     // drops links whose targets are widget-converted or dynamic inputs and leaves
     // one-sided ghosts behind; a bare success over that is silent graph corruption.
+    // artokun/comfyui-mcp-panel#1938 — NORMALISE duplicate boundary link ids before
+    // anything reads them. The bundled anima-inpaint subgraph serialises link id 1883
+    // twice on one IMAGE output rail; the frontend's unpackSubgraph removes the link on
+    // its first visit and then dereferences the now-missing record on the duplicate,
+    // throwing "Cannot read properties of undefined (reading 'target_id')". The #405
+    // rollback below caught it, so the graph was never corrupted — the operation simply
+    // could not run at all on that workflow.
+    //
+    // Semantics-preserving by construction: a link id resolves to ONE record with one
+    // origin and one target, so two entries carrying the same id cannot be distinct
+    // edges. The panel never writes linkIds (it only reads them), so this normalises
+    // data that arrives already malformed rather than papering over our own mutation.
+    //
+    // Placed BEFORE snapshotExternalLinks so the #1665 verification and the unpack see
+    // the same state — a snapshot taken over the duplicates would expect a consumer
+    // count the unpack can never produce.
+    for (const slots of [node.subgraph?.inputs, node.subgraph?.outputs]) {
+      for (const slot of slots ?? []) {
+        if (!Array.isArray(slot?.linkIds) || slot.linkIds.length < 2) continue;
+        const deduped = [...new Set(slot.linkIds)];
+        if (deduped.length !== slot.linkIds.length) slot.linkIds = deduped;
+      }
+    }
     const externalLinks = snapshotExternalLinks(graph, node);
     try {
       graph.unpackSubgraph(node, { skipMissingNodes: true });
