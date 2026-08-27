@@ -105,3 +105,90 @@ test("#1729 preserves aliases and cycles within one redaction context", () => {
   assert.strictEqual(safe.left, safe.right, "same-context aliases remain aliases");
   assert.strictEqual(safe.cycle.self, safe.cycle, "same-context cycles remain finite and cyclic");
 });
+
+// ---------------------------------------------------------------------------
+// #1919 — a token COUNT is a generation control, not a credential.
+//
+// `max_tokens` normalizes to `max_tokens`, which the #1729 TOKEN name pattern matches
+// on its `_tokens` ending, so an ordinary numeric setting came back as [REDACTED] and
+// could not be inspected or validated.
+//
+// The relaxation is keyed on the NAME, not the value's type, and is an allow-list of
+// quantity qualifiers so it fails CLOSED. Both properties are pinned below, because
+// both are ways this fix could have gone wrong in the direction that leaks.
+// ---------------------------------------------------------------------------
+
+test("#1919 token COUNT widgets are visible, whatever type they hold", () => {
+  for (const name of [
+    "max_tokens",
+    "maxTokens",
+    "max_new_tokens",
+    "min_tokens",
+    "num_tokens",
+    "n_tokens",
+    "total_tokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "context_tokens",
+    "budget_tokens",
+  ]) {
+    assert.equal(redactWidgetValue(name, 256), 256, `${name} (number) must stay visible`);
+    // The reported fix keyed on the value being numeric, which left this case redacted.
+    assert.equal(redactWidgetValue(name, "256"), "256", `${name} (string) must stay visible`);
+  }
+});
+
+test("#1919 FAILS CLOSED: an unqualified token name is still redacted", () => {
+  // The qualifier list is an allow-list. A token field it does not name stays secret --
+  // including one holding a bare number, which a type-based rule would have revealed.
+  for (const [name, value] of [
+    ["token", 12345],
+    ["token", "sk-abc"],
+    ["tokens", 100],
+    ["token_value", 5],
+    ["token_header", 7],
+    ["session_tokens", 42],
+  ]) {
+    assert.equal(
+      redactWidgetValue(name, value),
+      REDACTED_WIDGET_VALUE,
+      `${name} is not a counted quantity and must stay redacted`,
+    );
+  }
+});
+
+test("#1919 credential names are redacted no matter what qualifies them", () => {
+  // SENSITIVE_WIDGET_NAME_RE is tested FIRST and is never relaxed, so a qualifier that
+  // would otherwise read as a count cannot unlock a real credential.
+  for (const [name, value] of [
+    ["access_token", 12345],
+    ["refresh_token", 1],
+    ["auth_token", 999],
+    ["max_access_token", 5],
+    ["num_auth_tokens", 3],
+    // These match the COUNT allow-list AND the credential list at the same time
+    // (`max_token_...` satisfies `<qualifier>_token`). 1152 such names exist over this
+    // module`s own vocabulary. They are the ONLY thing that proves the credential check
+    // runs FIRST: with the two clauses swapped every one of them is revealed, and every
+    // other case in this file passes unchanged.
+    ["max_token_api_key", "s3cret"],
+    ["max_token_access_token", "s3cret"],
+    ["num_tokens_password", "s3cret"],
+    ["limit_token_client_secret", "s3cret"],
+    ["api_key", 42],
+    ["password", 1234],
+    ["client_secret", 7],
+  ]) {
+    assert.equal(
+      redactWidgetValue(name, value),
+      REDACTED_WIDGET_VALUE,
+      `${name} must stay redacted`,
+    );
+  }
+});
+
+test("#1919 ordinary widgets are untouched", () => {
+  assert.equal(redactWidgetValue("seed", 12345), 12345);
+  assert.equal(redactWidgetValue("steps", 20), 20);
+  assert.equal(redactWidgetValue("text", "a prompt about tokens"), "a prompt about tokens");
+});

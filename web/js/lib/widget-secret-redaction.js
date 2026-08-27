@@ -8,6 +8,23 @@ const SENSITIVE_WIDGET_NAME_RE =
   /(?:^|_)(?:credentials?|secret(?:_keys?)?|private_keys?|api_keys?|apikeys?|access_token|refresh_token|auth_token|authentication_token|authorization|bearer|password|passwd|client_secrets?)(?:_|$)/;
 const TOKEN_WIDGET_NAME_RE = /(?:^|_)tokens?(?:$|_(?:value|values|string|header|headers))/;
 
+// #1919 — a token COUNT is a generation control, not a credential. `max_tokens` matches
+// TOKEN_WIDGET_NAME_RE above (`_tokens` at end of name), so an ordinary numeric setting
+// came back as [REDACTED] and could not be inspected or validated. Same for maxTokens,
+// min_tokens, num_tokens, n_tokens and max_new_tokens.
+//
+// This is an ALLOW-LIST of quantity qualifiers, so it fails CLOSED: a token field whose
+// qualifier is not listed here stays redacted. The reported fix keyed on the VALUE being
+// numeric instead, which fails OPEN — a credential named exactly `token` holding a number
+// would have been revealed — and it also left `max_tokens: "256"` redacted, since a
+// string is not a number. Deciding by NAME fixes both directions: what makes `max_tokens`
+// safe is that it counts tokens, which is true whatever type the widget stores it as.
+//
+// SENSITIVE_WIDGET_NAME_RE is unaffected and still matches first, so `access_token`,
+// `refresh_token` and `auth_token` are redacted no matter what precedes them.
+const TOKEN_COUNT_WIDGET_NAME_RE =
+  /(?:^|_)(?:max|min|num|n|total|count|limit|budget|new|target|input|output|prompt|completion|context|response|remaining|used)_(?:new_)?tokens?(?:$|_)/;
+
 // Value-based coverage is intentionally limited to formats that are useful to catch
 // without treating arbitrary prose as a credential. The field-name checks above cover
 // provider-specific API-key widgets; these patterns catch an unhelpfully named field.
@@ -25,7 +42,11 @@ function normalizeWidgetName(name) {
 
 function isSensitiveName(name) {
   const normalized = normalizeWidgetName(name);
-  return SENSITIVE_WIDGET_NAME_RE.test(normalized) || TOKEN_WIDGET_NAME_RE.test(normalized);
+  // Checked first and never relaxed: these names are credentials whatever qualifies them.
+  if (SENSITIVE_WIDGET_NAME_RE.test(normalized)) return true;
+  if (!TOKEN_WIDGET_NAME_RE.test(normalized)) return false;
+  // #1919 — a counted quantity of tokens is not a token.
+  return !TOKEN_COUNT_WIDGET_NAME_RE.test(normalized);
 }
 
 function isPlainObject(value) {
