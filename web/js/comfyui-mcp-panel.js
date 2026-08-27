@@ -339,6 +339,12 @@ import {
   dismissAllLiveA2uiCards,
   unloadChatMediaCards,
 } from "./lib/resident-ui-close.js";
+import {
+  readCivitaiPaneHandle,
+} from "./lib/pane-read.js";
+import {
+  setSidePanelDocked,
+} from "./lib/pane-lifecycle.js";
 // #1184 — the ORDER a backend switch commits in. A module because the defect is an
 // ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
 import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
@@ -27857,7 +27863,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             msg.cmd === "civitai_results" || msg.cmd === "civitai_highlight" ||
             msg.cmd === "civitai_clear_highlight" || msg.cmd === "civitai_switch_tab" ||
             msg.cmd === "civitai_search" || msg.cmd === "civitai_open_lightbox" ||
-            msg.cmd === "civitai_close"
+            msg.cmd === "civitai_close" || msg.cmd === "civitai_read" ||
+            msg.cmd === "civitai_set_dock"
           ) {
             // Agent DRIVES the already-open CivitAI browser. onCivitaiCmd throws
             // an honest "civitai browser not open" when the modal isn't live, which
@@ -27868,7 +27875,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             msg.cmd === "open_training" || msg.cmd === "training_get_state" ||
             msg.cmd === "training_set_field" || msg.cmd === "training_goto_step" ||
             msg.cmd === "training_set_target" || msg.cmd === "training_highlight" ||
-            msg.cmd === "training_close"
+            msg.cmd === "training_close" || msg.cmd === "training_set_dock"
           ) {
             if (!onTrainingCmd) throw new Error("This panel build can't drive the training wizard.");
             result = await onTrainingCmd(msg);
@@ -28228,10 +28235,10 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           "ui_render", "ui_update", "ui_dismiss", "fetch_image", "fetch_comfyui_read",
           "civitai_results", "civitai_highlight", "civitai_clear_highlight",
           "civitai_switch_tab", "civitai_search", "civitai_open_lightbox",
-          "civitai_close",
+          "civitai_close", "civitai_read", "civitai_set_dock",
           "open_training", "training_get_state", "training_set_field",
           "training_goto_step", "training_set_target", "training_highlight",
-          "training_close",
+          "training_close", "training_set_dock",
         ]);
         if (!SILENT_CMDS.has(msg.cmd)) {
           onCommand?.(msg.cmd, msg, reply);
@@ -38971,6 +38978,12 @@ function buildPanel() {
     // (guard here, plus the facade re-checks the active tab).
     onCivitaiCmd(msg) {
       if (msg.cmd === "civitai_close") return closeSidePanelHandle(_sidePanelHandle);
+      if (msg.cmd === "civitai_read") return readCivitaiPaneHandle(_sidePanelHandle, {
+        limit: msg.limit,
+        includePreview: msg.include_preview === true,
+        blind: AGENT_BLIND,
+      });
+      if (msg.cmd === "civitai_set_dock") return setSidePanelDocked(_sidePanelHandle, msg.docked);
       const h = _sidePanelHandle;
       if (!h) throw new Error("civitai browser not open");
       switch (msg.cmd) {
@@ -38990,6 +39003,7 @@ function buildPanel() {
         return { ok: true };
       }
       if (msg.cmd === "training_close") return closeSidePanelHandle(_sidePanelHandle);
+      if (msg.cmd === "training_set_dock") return setSidePanelDocked(_sidePanelHandle, msg.docked);
       const h = _sidePanelHandle;
       if (!h) throw new Error("training wizard not open");
       switch (msg.cmd) {
