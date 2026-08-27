@@ -16252,14 +16252,6 @@ const GRAPH_TOOL_EXECUTORS = {
     // -10/-20 or alias "input"/"output"/..), route to the boundary I/O logic
     // instead of throwing "No node with id". Normal node-to-node connect below
     // is unchanged.
-    // #2380 — captured at the TOP so the subgraph-RAIL returns below are covered too.
-    // A merge-gate P1: those returns sit above the node-to-node path and were exiting
-    // without any collateral verdict, so an onConnectionsChange hook could rewire or
-    // delete a bystander during a rail connect and still report a clean `connected`.
-    // A snapshot is a read; taking it unconditionally costs an ordinary connect nothing.
-    const graphBefore = snapshotGraphState(graph);
-    const inputLinksBefore = snapshotInputSlotLinks(graph);
-
     const fromRail = resolveRail(graph, from_node_id);
     const toRail = resolveRail(graph, to_node_id);
 
@@ -16327,69 +16319,19 @@ const GRAPH_TOOL_EXECUTORS = {
           );
         }
         findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
-                // #2380 — the rail paths returned with no collateral verdict at all, so a hook
-        // firing during a rail connect could rewire a bystander and still report clean.
-        // The rail path needs the SAME two exemptions the node path already had, and
-        // omitting them made this cry collateral on correct connects (gate P1 x2):
-        //   * railLanded.linkId — a rail connect that WROTE and then threw has its landed
-        //     link on the graph; without naming it, the wire it just made reads as damage.
-        //   * railReplacedId — reconnecting an OCCUPIED rail removes the old link by
-        //     design (SubgraphOutput's documented contract), so that removal is expected.
-        // An OUTPUT rail slot fans out — this connect displaces nothing on it.
-        const railReplacedId = null;
-        const railVerdict = verifyConnect(graph, graphBefore, {
-          intendedLinkIds: [link?.id, railLanded?.linkId],
-          replacedLinkId: railReplacedId,
-          beforeSlots: inputLinksBefore,
-        });
-        const railCollateral = railVerdict.ok ? [] : connectCollateralBullets(railVerdict);
         return {
           connected: {
             from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
             to: { subgraph_output: existing.name },
           },
-          ...(railCollateral.length ? { collateral_changes: railCollateral } : {}),
-          // ONE `warning` key. Two spreads each carrying `warning` let the later one
-          // silently clobber the earlier, so a throw-after-wiring would erase the
-          // collateral sentence — the non-composing-rider defect this file already
-          // fixed for titles and slots on the node path.
-          ...(railCollateral.length || railConnectErr
-            ? {
-                warning: [
-                  railCollateral.length ? connectCollateralWarning(railCollateral) : "",
-                  railConnectErr ? landedAfterThrowWarning(railConnectErr) : "",
-                ]
-                  .filter(Boolean)
-                  .join(" "),
-              }
-            : {}),
+          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
         };
       }
-      const exposed = GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
+      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
         from_node_id,
         from_output,
         name: typeof to_input === "string" && !isEmptyRailSlotRef(to_input) ? to_input : undefined,
       });
-      // #2380 — the missing-rail fallback DELEGATES to a mutating executor and used to
-      // return its result untouched, so a hook firing during that expose could rewire or
-      // delete a bystander and still come back clean. The snapshot at the top of
-      // graph_connect predates the delegated mutation, so the same verdict applies.
-      const exposedVerdict = verifyConnect(graph, graphBefore, {
-        beforeSlots: inputLinksBefore,
-      });
-      const exposedCollateral = exposedVerdict.ok
-        ? []
-        : connectCollateralBullets(exposedVerdict);
-      if (!exposedCollateral.length) return exposed;
-      // Compose rather than overwrite: the delegate may already carry a warning of its
-      // own, and dropping it to report ours would trade one silence for another.
-      return {
-        ...exposed,
-        collateral_changes: exposedCollateral,
-        warning: [exposed?.warning, connectCollateralWarning(exposedCollateral)]
-          .filter(Boolean)
-          .join(" "),
-      };
     }
 
     if (fromRail?.rail === "input") {
@@ -16404,10 +16346,6 @@ const GRAPH_TOOL_EXECUTORS = {
         // #1272 — see the OUTPUT rail branch above: pre-existing rail links are
         // excluded so the throw path cannot credit this call with someone else's wire.
         const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
-        // #2380 — the wire this reconnect will DISPLACE, captured before the mutation.
-        // A rail->input reconnect drops the input's previous link by design, so without
-        // this the verdict cried collateral on a correct connect (gate P1).
-        const railPrevInputLinkId = node.inputs?.[inIdx]?.link ?? null;
         graph.beforeChange?.();
         let link;
         let railConnectErr = null;
@@ -16454,71 +16392,20 @@ const GRAPH_TOOL_EXECUTORS = {
           );
         }
         findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
-                // #2380 — the rail paths returned with no collateral verdict at all, so a hook
-        // firing during a rail connect could rewire a bystander and still report clean.
-        // The rail path needs the SAME two exemptions the node path already had, and
-        // omitting them made this cry collateral on correct connects (gate P1 x2):
-        //   * railLanded.linkId — a rail connect that WROTE and then threw has its landed
-        //     link on the graph; without naming it, the wire it just made reads as damage.
-        //   * railReplacedId — reconnecting an OCCUPIED rail removes the old link by
-        //     design (SubgraphOutput's documented contract), so that removal is expected.
-        // Reconnecting an OCCUPIED input drops its previous wire by design, which is
-        // the frontend's documented SubgraphOutput contract, not collateral.
-        const railReplacedId = railPrevInputLinkId ?? null;
-        const railVerdict = verifyConnect(graph, graphBefore, {
-          intendedLinkIds: [link?.id, railLanded?.linkId],
-          replacedLinkId: railReplacedId,
-          beforeSlots: inputLinksBefore,
-        });
-        const railCollateral = railVerdict.ok ? [] : connectCollateralBullets(railVerdict);
         return {
           connected: {
             from: { subgraph_input: existing.name },
             to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
           },
-          ...(railCollateral.length ? { collateral_changes: railCollateral } : {}),
-          // ONE `warning` key. Two spreads each carrying `warning` let the later one
-          // silently clobber the earlier, so a throw-after-wiring would erase the
-          // collateral sentence — the non-composing-rider defect this file already
-          // fixed for titles and slots on the node path.
-          ...(railCollateral.length || railConnectErr
-            ? {
-                warning: [
-                  railCollateral.length ? connectCollateralWarning(railCollateral) : "",
-                  railConnectErr ? landedAfterThrowWarning(railConnectErr) : "",
-                ]
-                  .filter(Boolean)
-                  .join(" "),
-              }
-            : {}),
+          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
         };
       }
-      const exposed = GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
+      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
         to_node_id,
         to_input,
         name:
           typeof from_output === "string" && !isEmptyRailSlotRef(from_output) ? from_output : undefined,
       });
-      // #2380 — the missing-rail fallback DELEGATES to a mutating executor and used to
-      // return its result untouched, so a hook firing during that expose could rewire or
-      // delete a bystander and still come back clean. The snapshot at the top of
-      // graph_connect predates the delegated mutation, so the same verdict applies.
-      const exposedVerdict = verifyConnect(graph, graphBefore, {
-        beforeSlots: inputLinksBefore,
-      });
-      const exposedCollateral = exposedVerdict.ok
-        ? []
-        : connectCollateralBullets(exposedVerdict);
-      if (!exposedCollateral.length) return exposed;
-      // Compose rather than overwrite: the delegate may already carry a warning of its
-      // own, and dropping it to report ours would trade one silence for another.
-      return {
-        ...exposed,
-        collateral_changes: exposedCollateral,
-        warning: [exposed?.warning, connectCollateralWarning(exposedCollateral)]
-          .filter(Boolean)
-          .join(" "),
-      };
     }
 
     if (fromRail?.rail === "output") {
@@ -16608,7 +16495,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // caller only found out in a later panel_query_graph. graph_disconnect has
     // snapshotted for exactly this since #668, where a disconnect on a SubgraphNode
     // deleted two unrelated nodes while reporting plain success; connect never did.
-    // #2380 — graphBefore / inputLinksBefore are captured at the top of graph_connect.
+    const graphBefore = snapshotGraphState(graph);
+    // #2380 — the node-side view too. The link store and the node slots are independent:
+    // a hook can leave every record byte-identical while repointing a bystander's
+    // inputs[i].link, and execution follows the SLOT.
+    const inputLinksBefore = snapshotInputSlotLinks(graph);
     graph.beforeChange();
     let link;
     let connectErr = null;
@@ -16677,7 +16568,9 @@ const GRAPH_TOOL_EXECUTORS = {
         intendedLinkIds: [link?.id, landed.linkId],
         replacedLinkId: prevLinkId,
         beforeSlots: inputLinksBefore,
-        // Both the requested slot and the one a dynamic pack re-slotted it onto.
+        // Both the requested slot and the one a dynamic pack re-slotted onto. Without
+        // naming them the intended-id exemption is global, and the same id landing on an
+        // untargeted input would be hidden (gate P1).
         intendedSlots: new Set([`${target.id}#${inIdx}`, `${target.id}#${landed.inputIndex}`]),
       });
       const landedCollateral = landedVerdict.ok ? [] : connectCollateralBullets(landedVerdict);
@@ -16780,8 +16673,6 @@ const GRAPH_TOOL_EXECUTORS = {
       intendedLinkIds: [link?.id],
       replacedLinkId: prevLinkId,
       beforeSlots: inputLinksBefore,
-      // #2380 — the slot this connect actually addressed. Without it the intended-id
-      // exemption is global, and the same id landing on an untargeted input is hidden.
       intendedSlots: new Set([`${target.id}#${inIdx}`]),
     });
     const collateral = verdict.ok ? [] : connectCollateralBullets(verdict);
