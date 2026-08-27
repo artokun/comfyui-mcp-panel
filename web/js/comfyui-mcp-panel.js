@@ -4037,7 +4037,12 @@ let _loadGraphDataForkInstalled = false;
 function installCreateBoundaryFork(appRef) {
   try {
     if (_loadGraphDataForkInstalled || !appRef || typeof appRef.loadGraphData !== "function") return;
-    const orig = appRef.loadGraphData.bind(appRef);
+    // Capture the current implementation, then call it with an explicit receiver.
+    // NOT an arrow that re-reads appRef.loadGraphData: this fork REPLACES that
+    // property one line below, so a late lookup would find the replacement and
+    // recurse forever. Capturing first is what makes the indirection safe.
+    const origLoadGraphData = appRef.loadGraphData;
+    const orig = (...args) => origLoadGraphData.call(appRef, ...args);
     appRef.loadGraphData = function (graphData, clean, restoreView, workflow, options = {}) {
       // Set when a CREATION mints a stamp without a workflow object to key on —
       // registered against the tab the load activates, after orig (below).
@@ -4352,7 +4357,10 @@ function installSavePathGuard(appRef) {
       );
       return;
     }
-    const orig = svc.saveWorkflow.bind(svc);
+    // Capture first, then call with an explicit receiver — svc.saveWorkflow is
+    // replaced just below, so a late property lookup would recurse.
+    const origSaveWorkflow = svc.saveWorkflow;
+    const orig = (...args) => origSaveWorkflow.call(svc, ...args);
     svc.saveWorkflow = async function (wf, ...rest) {
       let verdict = { allow: true };
       try {
@@ -4422,7 +4430,10 @@ function installSavePathGuard(appRef) {
     // asked of the SOURCE — and it throws before `saveAs` returns a record, so no file
     // is created and the canvas is left exactly as the user has it.
     if (typeof svc.saveAs === "function") {
-      const origSaveAs = svc.saveAs.bind(svc);
+      // Capture first, then call with an explicit receiver — svc.saveAs is replaced
+      // just below, so a late property lookup would recurse.
+      const origSaveAsFn = svc.saveAs;
+      const origSaveAs = (...args) => origSaveAsFn.call(svc, ...args);
       svc.saveAs = function (sourceWf, destPath, ...rest) {
         let verdict = { allow: true };
         try {
@@ -19005,7 +19016,9 @@ const GRAPH_TOOL_EXECUTORS = {
     const queuedPromptIds = [];
     const prevFetchApi =
       typeof api?.fetchApi === "function" ? api.fetchApi : null;
-    const origFetchApi = prevFetchApi ? prevFetchApi.bind(api) : null;
+    // prevFetchApi is already captured in a local, so an arrow is safe here — there
+    // is no property lookup to go stale when api.fetchApi is replaced below.
+    const origFetchApi = prevFetchApi ? (...args) => prevFetchApi.call(api, ...args) : null;
     const captureRejection = (r) => {
       // Capture the FIRST top-level rejection only (see above).
       if (promptRejection == null) promptRejection = r;
