@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.109] - 2026-08-26
+
+### Fixed
+- verify the rendered changelog artifact stays synchronized with the source (#1891, #1900)
+
 ## [0.15.108] - 2026-08-26
 
 ### Fixed
