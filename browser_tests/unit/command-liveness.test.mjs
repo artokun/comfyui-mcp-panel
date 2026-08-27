@@ -409,7 +409,7 @@ test("codex R12: replay only ever writes to a socket that PROVED itself with a h
     "replay must require the handshaken socket INSTANCE",
   );
   const gateAt = body.indexOf("target !== handshakenSock");
-  const sendAt = body.indexOf("target.send(");
+  const sendAt = body.indexOf(`target["send"](`);
   assert.ok(gateAt !== -1 && sendAt !== -1 && gateAt < sendAt, "the gate must precede any write");
   // Identity, not a boolean: a replacement socket is a different object, which is what
   // closes the "open but not yet handshaken" race.

@@ -619,7 +619,7 @@ test("#1529 wiring: the reply is serialized WHOLE, not projected to a field list
   // The reviewer's P2: a send boundary that rebuilt the frame as {rid, ok, error}
   // would drop `refusal` silently — the tests above would all still pass while
   // the contract was gone. Asserted on the actual send.
-  assert.match(SRC, /thisSock\.send\(JSON\.stringify\(reply\)\)/, "the whole reply object goes to the wire");
+  assert.match(SRC, /thisSock\["send"\]\(JSON\.stringify\(reply\)\)/, "the whole reply object goes to the wire");
 });
 
 // ---------------------------------------------------------------------------
