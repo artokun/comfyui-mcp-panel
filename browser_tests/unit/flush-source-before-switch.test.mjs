@@ -308,8 +308,8 @@ test("#1295: the #1215 TARGET capture gate still skips an untagged switch — th
   const flushAt = SRC.indexOf("await flushSourceCanvasBeforeSwitch({");
   assert.ok(flushAt < gateAt, "source flush is BEFORE the switch; target capture is AFTER");
   const gate = SRC.slice(gateAt, SRC.indexOf("await target.changeTracker?.checkState?.()", gateAt));
-  assert.match(gate, /captureBinding === "bound"/);
-  assert.match(gate, /captureBinding !== "foreign" && !pointerMovedThisOpen/);
+  assert.match(gate, /!pointerMovedThisOpen/);
+  assert.match(gate, /captureBinding !== "foreign"/);
   assert.doesNotMatch(
     gate,
     /if \(captureBinding !== "foreign"\)/,

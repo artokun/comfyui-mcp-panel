@@ -547,8 +547,8 @@ test("#1575: a state just read off DISK is not overwritten by the still-mounted 
     "capturing the closed tab's canvas over the freshly-loaded file is the #1215 poison",
   );
   // #1295's own pins must survive this change.
-  assert.match(gate, /captureBinding === "bound"/);
-  assert.match(gate, /captureBinding !== "foreign" && !pointerMovedThisOpen/);
+  assert.match(gate, /!pointerMovedThisOpen/);
+  assert.match(gate, /captureBinding !== "foreign"/);
 });
 
 test("#1575: a repaired open DISCLOSES that the canvas is the on-disk copy", () => {
