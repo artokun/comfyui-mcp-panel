@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { collectFrontendVirtualTypes } from "../../web/js/lib/virtual-registry.js";
+import { collectFrontendVirtualTypes, isFrontendVirtualRegisteredType } from "../../web/js/lib/virtual-registry.js";
 import { commandIsCanvasIndependent } from "../../web/js/lib/workflow-chat-identity.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -82,6 +82,25 @@ class NeedsContextNode {
 test("#1400 a constructor-flagged class is reported virtual", () => {
   const registry = { GetNode: KjStyleBusNode, "Label (rgthree)": RgthreeStyleVirtualNode };
   assert.deepEqual(collectFrontendVirtualTypes(registry), ["GetNode", "Label (rgthree)"]);
+});
+
+test("#1956 isFrontendVirtualRegisteredType proves Bookmark (rgthree) and rejects a defless husk", () => {
+  class BookmarkRgthree {
+    constructor(title = "__NEED_CLASS_TITLE__") {
+      if (title === "__NEED_CLASS_TITLE__") throw new Error("needs overrides");
+      this.isVirtualNode = true;
+    }
+  }
+  function DeflessHusk() {}
+  const registry = {
+    "Bookmark (rgthree)": BookmarkRgthree,
+    RemovedBackendNode: DeflessHusk,
+    GetNode: KjStyleBusNode,
+  };
+  assert.equal(isFrontendVirtualRegisteredType(registry, "Bookmark (rgthree)"), true);
+  assert.equal(isFrontendVirtualRegisteredType(registry, "RemovedBackendNode"), false);
+  assert.equal(isFrontendVirtualRegisteredType(registry, "GetNode"), true);
+  assert.equal(isFrontendVirtualRegisteredType(registry, "NotRegistered"), false);
 });
 
 test("#1400 the probe passes a title — an rgthree-style sentinel-throwing ctor is covered", () => {

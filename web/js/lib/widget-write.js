@@ -1,5 +1,5 @@
 import { fireNodeWidgetChanged } from "./node-widget-changed.js";
-import { pressableWidgetHint } from "./pressable-widget.js";
+import { missingWidgetMessage } from "./missing-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
 import {
@@ -1735,14 +1735,11 @@ export function resolveWidgetWrite(
     }
   }
   if (!widget) {
-    const names = (targetNode.widgets ?? []).map((cand) => cand?.name).join(", ");
-    throw new WidgetWriteError(
-      `Node ${targetNode.id} (${targetNode.type}) has no widget "${widgetName}" (available: ${names || "none"}).` +
-        // #757 — the available list may already contain the answer without saying
-        // so: a button that CREATES the missing slot. Empty for a node with no
-        // pressable widget, which is the ordinary typo case.
-        pressableWidgetHint(targetNode, widgetName),
-    );
+    // #757 — pressable-widget hint for a button that CREATES the missing slot.
+    // #1956 — if the name is a node PROPERTY (rgthree Fast Groups matchTitle/…),
+    // point at panel_set_property instead of a click dead-end, and list each
+    // available widget name once (Fast Groups repeats RGTHREE_TOGGLE_AND_NAV).
+    throw new WidgetWriteError(missingWidgetMessage(targetNode, widgetName));
   }
 
   // Gate on the RESOLVED target BEFORE coercion (#458). coerceWidgetValue reads —

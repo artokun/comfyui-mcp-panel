@@ -29,6 +29,7 @@ export const COMFY_CORE_SENTINEL_TYPES = [
 ];
 
 import { importFailureNote, relevantPackImportFailures } from "./pack-import-failures.js";
+import { isFrontendVirtualRegisteredType } from "./virtual-registry.js";
 
 /** True when `type` is registered in the live LiteGraph registry object
  *  (LG.registered_node_types). */
@@ -181,6 +182,25 @@ export const FRONTEND_ONLY_NODE_TYPES = new Set([
   "SetNode",
   "GetNode",
 ]);
+
+/**
+ * #1956 — refusal for a registered frontend-virtual type that is deliberately
+ * outside FRONTEND_ONLY_NODE_TYPES. Fail-closed (not addable); do not claim the
+ * pack is missing. The rgthree names are derived from the allowlist so this
+ * cannot drift from FRONTEND_ONLY_NODE_TYPES.
+ */
+export function frontendOnlyNotAllowlistedRefusal(class_type) {
+  const allowlisted = [...FRONTEND_ONLY_NODE_TYPES]
+    .filter((t) => t.endsWith("(rgthree)"))
+    .sort();
+  return (
+    `Cannot add "${class_type}": it is a frontend-only type — the ComfyUI backend never ` +
+    `provides it, so its absence from /object_info is expected (not a missing, removed, or ` +
+    `failed-to-import pack) — but it is deliberately not addable. The panel's frontend-only ` +
+    `allowlist covers ${allowlisted.join(", ")}. Refusing to add rather than mint a node ` +
+    `the panel cannot drive.`
+  );
+}
 
 /**
  * True for a genuinely FRONTEND-ONLY / native node type — one that is registered in
@@ -728,6 +748,19 @@ export async function assertAddNodeResolvableRefreshing(getRegistry, class_type,
             `it is not installed (or its frontend JS failed to load). Refusing to add rather than ` +
             `let LiteGraph mint an unresolved placeholder node (#458).`,
         );
+      }
+      // #1956 — a type the live registry PROVES frontend-virtual (isVirtualNode on a
+      // probe instance) that is NOT on FRONTEND_ONLY_NODE_TYPES. The refusal is
+      // correct — the allowlist is the only addable frontend-only set — but the
+      // generic "Unknown node type / not installed / pack removed" below sends the
+      // agent to reinstall a healthy pack. Bookmark (rgthree) is the reported case:
+      // rgthree is installed, the type is absent from /object_info BY DESIGN.
+      if (
+        verdict === "never-seen" &&
+        isFrontendVirtualRegisteredType(readRegistry(), class_type) &&
+        !FRONTEND_ONLY_NODE_TYPES.has(class_type)
+      ) {
+        throw new Error(frontendOnlyNotAllowlistedRefusal(class_type));
       }
       // #1523 — a subgraph UUID is never in /object_info (registerSubgraphNodeDef
       // synthesizes the class locally from the workflow's definitions). Treating
