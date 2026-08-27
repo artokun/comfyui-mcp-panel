@@ -1,8 +1,9 @@
 /**
- * #1898 — finish an open only after the requested workflow is stable AND its
+ * #1898 — coordinate the open until the requested workflow is stable AND its
  * bound graph can be read. A store-level identity switch can settle before
  * graph normalization finishes, so give that normalization one retry when the
- * first outline probe is not readable.
+ * first outline probe is not readable. Callers must still verify graph content
+ * before treating a readable result as proven.
  */
 
 function readableGraphOutline(value) {

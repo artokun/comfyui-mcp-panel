@@ -108,14 +108,14 @@ function productionExecutor(methodName, environment) {
   return factory(scope);
 }
 
-function productionReadableOpenEnvironment({ readableAfterRetry }) {
+function productionReadableOpenEnvironment({ readableAfterRetry, readableButMismatched = false }) {
   const previous = { path: "workflows/previous.json" };
   const target = {
     path: "workflows/target.json",
     filename: "target.json",
     isModified: false,
     activeState: {
-      nodes: [{ id: 1, type: "KSampler" }],
+      nodes: [{ id: 1, type: "KSampler", widgets_values: ["target-value"] }],
       links: [],
       groups: [],
       last_node_id: 1,
@@ -127,6 +127,7 @@ function productionReadableOpenEnvironment({ readableAfterRetry }) {
   let active = previous;
   let loads = 0;
   let outlines = 0;
+  let contentProofs = 0;
   const app = {
     rootGraph: root,
     graph: root,
@@ -134,7 +135,13 @@ function productionReadableOpenEnvironment({ readableAfterRetry }) {
     loadGraphData: async (state) => {
       loads += 1;
       root.extra = state.extra;
-      root._nodes = [{ id: 1, type: "KSampler" }];
+      root._nodes = [
+        {
+          id: 1,
+          type: "KSampler",
+          widgets_values: [readableButMismatched ? "stale-value" : "target-value"],
+        },
+      ];
     },
     extensionManager: {
       workflow: {
@@ -150,7 +157,7 @@ function productionReadableOpenEnvironment({ readableAfterRetry }) {
   const status = { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" };
   return {
     target,
-    counters: () => ({ loads, outlines }),
+    counters: () => ({ loads, outlines, contentProofs }),
     environment: {
       backendReconnectEpoch: 4,
       activeWorkflowResyncEpoch: 4,
@@ -192,7 +199,16 @@ function productionReadableOpenEnvironment({ readableAfterRetry }) {
       describeRepaintSourceBinding: () => "unknown",
       graphRootCarriesOpenProof: () => true,
       graphRootWorkflowUuidMatches: () => true,
-      graphRootReproducesStateContent: () => ({ proven: false, presentationOnly: false, normalizedOnly: false }),
+      graphRootReproducesStateContent: ({ rootGraph, state }) => {
+        contentProofs += 1;
+        const liveValue = rootGraph?._nodes?.[0]?.widgets_values?.[0];
+        const requestedValue = state?.nodes?.[0]?.widgets_values?.[0];
+        return {
+          proven: loads > 1 && liveValue === requestedValue,
+          presentationOnly: false,
+          normalizedOnly: false,
+        };
+      },
       describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
       openContentDifferenceIsDefinitionsOnly: () => false,
       resolveOpenRebindVerdict: ({ contentMatches }) =>
@@ -202,7 +218,7 @@ function productionReadableOpenEnvironment({ readableAfterRetry }) {
       GRAPH_TOOL_EXECUTORS: {
         graph_outline: () => {
           outlines += 1;
-          return readableAfterRetry && loads > 1
+          return readableButMismatched || (readableAfterRetry && loads > 1)
             ? { node_count: 1, outline: "1 KSampler", detail_level: "full" }
             : null;
         },
@@ -523,16 +539,27 @@ test("#1898 production workflow_open accepts a settled readable outline after no
 
   assert.equal(result.opened.path, target.path);
   assert.equal(result.workflow_uuid, "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95");
-  assert.deepEqual(counters(), { loads: 2, outlines: 2 }, "the production handler probes, retries once, and re-probes");
+  assert.deepEqual(
+    counters(),
+    { loads: 2, outlines: 2, contentProofs: 2 },
+    "the production handler retries once, re-probes, and re-verifies graph content",
+  );
   assert.equal(panel.guard(), null, "the readable outcome releases the production reload guard");
 });
 
-test("#1898 production workflow_open keeps outcome unknown when the settled graph remains unreadable", async () => {
-  const { target, counters, environment } = productionReadableOpenEnvironment({ readableAfterRetry: false });
+test("#1898 production workflow_open keeps a readable but mismatched graph unknown", async () => {
+  const { target, counters, environment } = productionReadableOpenEnvironment({
+    readableAfterRetry: false,
+    readableButMismatched: true,
+  });
   const panel = productionExecutor("workflow_open", environment);
 
-  await assert.rejects(panel.method({ path: target.path, rid: "unreadable-race" }), /content could not be verified/);
-  assert.deepEqual(counters(), { loads: 2, outlines: 2 }, "an unreadable graph is retried once, never indefinitely");
+  await assert.rejects(panel.method({ path: target.path, rid: "mismatched-readable-race" }), /content could not be verified/);
+  assert.deepEqual(
+    counters(),
+    { loads: 1, outlines: 1, contentProofs: 2 },
+    "readability cannot replace the final normalized node/value content proof",
+  );
   assert.equal(panel.guard(), null, "the unknown outcome releases the production reload guard");
 });
 

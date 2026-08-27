@@ -21792,8 +21792,40 @@ const GRAPH_TOOL_EXECUTORS = {
                     },
                   });
                   if (readableRecovery.status === "settled-readable") {
-                    verdict.status = OPEN_REBIND_STATUS.PROVEN;
-                    verdict.unproven = [];
+                    // A readable outline proves only that some graph is readable.
+                    // Re-read the live root and compare its normalized node/value
+                    // content with the state captured for this requested workflow;
+                    // otherwise a readable stale graph becomes a false success.
+                    try {
+                      const { rootGraph: recoveredRootGraph } = getGraphCtx();
+                      const recoveredContentProof = graphRootReproducesStateContent({
+                        rootGraph: recoveredRootGraph,
+                        state: repaintState,
+                        loadRanToCompletion,
+                      });
+                      const recoveredContentMatches =
+                        recoveredContentProof.proven ||
+                        recoveredContentProof.presentationOnly ||
+                        recoveredContentProof.normalizedOnly;
+                      const recoveredActive = activeWorkflowRef();
+                      const recoveredBindingMatches =
+                        sameWorkflowObject(recoveredActive, target) &&
+                        graphRootCarriesOpenProof({
+                          rootGraph: recoveredRootGraph,
+                          proofMarker: openProofMarker,
+                        }) &&
+                        graphRootWorkflowUuidMatches({
+                          rootGraph: recoveredRootGraph,
+                          activeWorkflowUuid: targetUuid,
+                        });
+                      if (recoveredBindingMatches && recoveredContentMatches) {
+                        verdict.status = OPEN_REBIND_STATUS.PROVEN;
+                        verdict.unproven = [];
+                      }
+                    } catch {
+                      // Keep the original CONTENT_UNVERIFIED verdict when the
+                      // post-probe content or binding proof cannot be recomputed.
+                    }
                   }
                 }
                 if (verdict.status !== OPEN_REBIND_STATUS.PROVEN) {
