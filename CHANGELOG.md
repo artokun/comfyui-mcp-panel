@@ -11,6 +11,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Added
 - panel_civitai_results reports the live CivitAI lightbox (open model, version ladder + selection, files, creator note, download target) so "Ask agent to download" is no longer a request about a screen the agent cannot see (#1964)
 - CivitAI pane: Upscaler/Embeddings/Poses are real tabs (empty grids name types the current tab cannot see); sample URLs are the fetchable `/comfyui_mcp_panel/civitai/media` path plus a civitai.com pageUrl; open/clear echo applied tab/query/docked/cleared-count (#1958)
+- read-surface accuracy: query/view detail rows always include `mode` (including `active`) and surface writable `pinned`/`shape`; paste replies document that internal wires among the copied set are preserved; graph_serialize is one JSON `{workflow, node_count}` rather than two text blocks; auto-layout re-fit excludes pinned outliers so a skipped member cannot stretch a group over the canvas (#1957)
 
 ## [0.15.121] - 2026-08-27
 

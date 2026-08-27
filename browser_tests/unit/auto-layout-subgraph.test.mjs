@@ -193,6 +193,59 @@ test("#1328 a root-only apply with no captured subgraph still rearranges the roo
   assert.equal(moved, true);
 });
 
+test("#1957 group re-fit excludes a pinned outlier so the box cannot swallow the canvas", () => {
+  // Compact group at x=2000 with one PINNED member. Layout with anchor:"origin"
+  // moves the unpinned members to the origin and honestly skips the pin.
+  // Unfixed re-fit then wrapped the pin (still at 2000) AND the moved members
+  // into a ~2000px band that swallowed the unrelated node sitting in between.
+  const a = node(1, [2000, 0]);
+  const b = node(2, [2000, 150]);
+  const pinned = node(3, [2000, 300]);
+  pinned.flags = { pinned: true };
+  const outsider = node(4, [1000, 80]);
+  const g = {
+    id: 10,
+    title: "Sampler",
+    _bounding: boundsAroundNodes([a, b, pinned]),
+    recomputeInsideNodes() {},
+  };
+  const graph = attachGraphApi({
+    _nodes: [a, b, pinned, outsider],
+    _groups: [g],
+    links: { 1: { origin_id: 1, target_id: 2 } },
+  });
+  const canvas = { graph, setGraph() {}, setDirty() {} };
+  const layout = realAutoLayout(() => ({ graph, rootGraph: graph, canvas }));
+
+  const beforeMembers = groupMemberNodes(graph, g).map((n) => n.id).sort((x, y) => x - y);
+  assert.deepEqual(beforeMembers, [1, 2, 3], "the fixture starts as a compact group, not a canvas-wide band");
+  assert.equal(groupMemberNodes(graph, g).some((n) => n.id === 4), false, "the in-between node is not yet a member");
+
+  const opts = { node_ids: [1, 2, 3], mode: "flow_horizontal", groups: "preserve", anchor: "origin" };
+  const dry = layout({ ...opts, dry_run: true });
+  const dryBox = dry.groups?.find((row) => row.group_id === 10);
+  assert.ok(dryBox, "preserve mode reports the group");
+  assert.deepEqual(dryBox.re_fit_excluded_pinned, [3]);
+  assert.ok(
+    dryBox.bounds[2] < 800,
+    `dry_run re-fit must not span the pinned outlier at x=2000; got width ${dryBox.bounds[2]}`,
+  );
+
+  const applied = layout(opts);
+  const box = applied.groups?.find((row) => row.group_id === 10);
+  assert.ok(box);
+  assert.deepEqual(box.re_fit_excluded_pinned, [3]);
+  assert.ok(
+    box.bounds[2] < 800,
+    `applied re-fit must not keep the ~2000px band; got width ${box.bounds[2]}`,
+  );
+  const afterIds = groupMemberNodes(graph, g).map((n) => n.id);
+  assert.ok(!afterIds.includes(4), "an unrelated node must not be swallowed by re-fit");
+  assert.ok(!afterIds.includes(3), "the skipped pinned outlier is no longer a geometric member");
+  assert.ok(afterIds.includes(1) && afterIds.includes(2), "moved unpinned members stay in the group");
+  assert.ok(applied.skipped?.some((s) => s.node_id === 3 && s.reason === "pinned"));
+});
+
 test("#1328 apply refuses rather than writing root when the subgraph node count drifted", () => {
   const { inner, sub, root, rootNodes, canvas } = fixture();
   const originals = inner.slice();

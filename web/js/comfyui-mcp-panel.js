@@ -12215,8 +12215,10 @@ async function revertGraphSnapshotByMid(mid) {
 }
 
 /** Summarize one LiteGraph node for the agent — id, type, title, widget
- *  values, and input link sources. Deliberately NOT the full serialization
- *  (positions, colors, internal state) to keep token cost low. */
+ *  values, input link sources, and the presentation fields panel_edit_node
+ *  can write (mode always; pinned/shape/collapsed when not default).
+ *  Deliberately NOT the full serialization (positions, colors, internal
+ *  state beyond those) to keep token cost low. */
 function summarizeNode(node) {
   const widgets = {};
   for (const w of node.widgets ?? []) {
@@ -12328,9 +12330,22 @@ function summarizeNode(node) {
     size: node.size ? [Math.round(node.size[0]), Math.round(node.size[1])] : null,
     ...(fullHeight != null ? { full_height: fullHeight } : {}),
     ...(node.flags && node.flags.collapsed ? { collapsed: true } : {}),
-    // Execution mode — only emitted when NOT active so bypassed/muted nodes are
-    // clearly visible to the agent (LiteGraph: 2 = mute, 4 = bypass, 0 = active).
-    ...(node.mode ? { mode: { 2: "mute", 4: "bypass" }[node.mode] ?? `mode_${node.mode}` } : {}),
+    ...(node.flags && node.flags.pinned ? { pinned: true } : {}),
+    // Execution mode — ALWAYS emitted, including "active". Omitted-as-default
+    // for mode 0 made every ordinary node look like the field did not exist
+    // (#1957). LiteGraph: 0 = active, 2 = mute, 4 = bypass.
+    mode: { 0: "active", 2: "mute", 4: "bypass" }[Number(node.mode) || 0] ?? `mode_${node.mode}`,
+    // Shape is writeable via panel_edit_node; emit the named form when set so a
+    // round-trip does not require a screenshot. Numeric LiteGraph constants
+    // (BOX=1 ROUND=2 CIRCLE=3 CARD=4) map to the same names the write path
+    // accepts; unset/"default"/0 is omitted like collapsed:false.
+    ...(() => {
+      const s = node.shape;
+      if (s == null || s === "" || s === "default" || s === 0) return {};
+      if (s === "box" || s === "round" || s === "card" || s === "circle") return { shape: s };
+      const named = { 1: "box", 2: "round", 3: "circle", 4: "card" }[s];
+      return named ? { shape: named } : {};
+    })(),
     ...(node.color ? { color: node.color } : {}),
     ...(node.bgcolor ? { bgcolor: node.bgcolor } : {}),
     // OUTPUT nodes (SaveImage/PreviewImage/SaveVideo/…) are the only valid
@@ -13685,10 +13700,12 @@ const GRAPH_TOOL_EXECUTORS = {
         "The refresh did not complete and the panel could not determine why. Retry; if it persists, reload the ComfyUI tab.",
     };
   },
-  // Full-fidelity capture of the live canvas — the ROOT graph's serialized UI
-  // JSON (the same shape ComfyUI writes to disk on save), so the orchestrator
-  // can strip/slice/save what the user ACTUALLY has open without asking them to
-  // save to a file first. Read-only; subgraph defs ride along in `definitions`.
+  // Full-fidelity capture of the live canvas — ONE JSON object
+  // `{ workflow, node_count }` (the same UI-graph shape ComfyUI writes to disk
+  // on save). Not two blocks (summary then graph): this command is the capture
+  // panel_strip_workflow converts; that tool's own structuredContent.graph is
+  // the combined summary+graph form, not a second block from here. Read-only;
+  // subgraph defs ride along in workflow.definitions.
   graph_serialize() {
     const { rootGraph } = getGraphCtx();
     const workflow = rootGraph.serialize();
@@ -14162,7 +14179,8 @@ const GRAPH_TOOL_EXECUTORS = {
       // not doubled — and the closing quote cannot be swallowed by a trailing backslash.
       return `"${clipped.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
     };
-    const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
+    const modeTag = (n) =>
+      ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "") + (n.flags && n.flags.pinned ? " [pinned]" : "");
     const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
 
     // #809: render the node block at ONE rung of the detail ladder. Every rung emits a
@@ -14713,7 +14731,8 @@ const GRAPH_TOOL_EXECUTORS = {
       const s = String(typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
       return s.length > n ? s.slice(0, n - 1) + "…" : s;
     };
-    const modeTag = (n) => ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "");
+    const modeTag = (n) =>
+      ({ 2: " [mute]", 4: " [bypass]" }[n.mode] ?? "") + (n.flags && n.flags.pinned ? " [pinned]" : "");
     const outTag = (n) => (n.constructor?.nodeData?.output_node ? " [OUTPUT]" : "");
     const header =
       `${matched.length} match(es) of ${candidates.length} in scope (viewing: ${total} nodes)` +
@@ -18695,7 +18714,9 @@ const GRAPH_TOOL_EXECUTORS = {
   // (unless dry_run) applies every position write in ONE beforeChange/afterChange
   // pair so a single Ctrl+Z restores the prior arrangement. Groups are re-fit
   // (preserve), moved rigidly (cluster), or left alone (ignore). Pinned nodes are
-  // never moved; the subgraph boundary rails (-10/-20) are excluded.
+  // never moved and are excluded from group re-fit so a skipped outlier cannot
+  // stretch the box over unrelated nodes. The subgraph boundary rails (-10/-20)
+  // are excluded.
   graph_auto_layout({
     node_ids,
     mode = "flow_horizontal",
@@ -18827,26 +18848,42 @@ const GRAPH_TOOL_EXECUTORS = {
     const predictGroupBounds = (memberIds) => {
       const members = memberIds
         .map((id) => nodeById.get(id))
-        .filter(Boolean)
-        .map((n) => {
-          const p = layout.positions.get(n.id);
-          return {
-            pos: p ? [p[0], p[1]] : [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0],
-            size: [n.size?.[0] ?? 200, n.size?.[1] ?? 100],
-          };
-        });
-      return boundsAroundNodes(members);
+        .filter(Boolean);
+      // Pinned members are skipped by layout; including them in the re-fit
+      // stretches the box across the skipped outlier and any nodes that box
+      // now geometrically swallows (#1957). If every member is pinned, nothing
+      // moved, so keep the existing membership footprint.
+      const movable = members.filter((n) => !(n.flags && n.flags.pinned));
+      const fit = (movable.length ? movable : members).map((n) => {
+        const p = layout.positions.get(n.id);
+        return {
+          pos: p ? [p[0], p[1]] : [n.pos?.[0] ?? 0, n.pos?.[1] ?? 0],
+          size: [n.size?.[0] ?? 200, n.size?.[1] ?? 100],
+        };
+      });
+      return boundsAroundNodes(fit);
     };
     const groupResults =
       groups === "ignore"
         ? []
         : groupBoxes
             .filter((gb) => gb.memberIds.length)
-            .map((gb) => ({
-              group_id: gb.g.id != null ? gb.g.id : (graph._groups ?? []).indexOf(gb.g),
-              title: gb.g.title ?? "",
-              bounds: predictGroupBounds(gb.memberIds).map(Math.round),
-            }));
+            .map((gb) => {
+              const pinnedIds = gb.memberIds.filter((id) => {
+                const n = nodeById.get(id);
+                return n && n.flags && n.flags.pinned;
+              });
+              // Disclose only when the re-fit actually dropped a pinned member
+              // (a mixed group). An all-pinned group is a no-op footprint.
+              const excludedPinned =
+                pinnedIds.length && pinnedIds.length < gb.memberIds.length ? pinnedIds : [];
+              return {
+                group_id: gb.g.id != null ? gb.g.id : (graph._groups ?? []).indexOf(gb.g),
+                title: gb.g.title ?? "",
+                bounds: predictGroupBounds(gb.memberIds).map(Math.round),
+                ...(excludedPinned.length ? { re_fit_excluded_pinned: excludedPinned } : {}),
+              };
+            });
 
     if (dry_run) {
       return {
@@ -24137,8 +24174,10 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   // Paste the litegraph clipboard onto the CURRENT graph. Snapshots node ids
-  // before/after so the freshly-pasted node ids can be returned. connect_inputs
-  // false (default) drops a disconnected copy; pos places the paste anchor.
+  // before/after so the freshly-pasted node ids can be returned. Internal wires
+  // among the copied nodes are preserved. connect_inputs:false (default) drops
+  // only external feeds from nodes outside the copied set; pass true to also
+  // reconnect those. pos places the paste anchor.
   graph_paste_nodes({ pos, connect_inputs } = {}) {
     const { graph, canvas, LG } = getGraphCtx();
     if (!canvas) throw new Error("canvas unavailable");
@@ -24245,6 +24284,9 @@ const GRAPH_TOOL_EXECUTORS = {
       pasted,
       copied_groups: layout.groups.length,
       pasted_groups: groupsNow.length,
+      connect_inputs: connect_inputs === true,
+      note:
+        "Internal wires among the copied nodes are preserved. connect_inputs:false (default) drops only external feeds; pass true to also reconnect those.",
       ...(auxIdSanitizedCount ? { aux_id_sanitized: auxIdSanitizedCount } : {}),
     };
     if (groupsNow.length) {

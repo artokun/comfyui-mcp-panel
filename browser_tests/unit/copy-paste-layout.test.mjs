@@ -584,6 +584,12 @@ test("#1294 shipped copy+paste keeps groups and distinct branch y-positions", ()
   assert.equal(result.pasted_count, 10);
   assert.equal(result.copied_groups, 5);
   assert.equal(result.pasted_groups, 5, "groups survived paste");
+  assert.equal(result.connect_inputs, false);
+  assert.match(
+    result.note,
+    /Internal wires among the copied nodes are preserved/,
+    "#1957 the paste reply must document that internals survived, not promise a disconnected copy",
+  );
   assert.equal(dst.graph._groups.length, 5);
 
   const loraYs = result.pasted.filter((n) => n.type === LORA).map((n) => n.pos[1]);
