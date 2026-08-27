@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_restart_comfyui restarts the ComfyUI bound to the live canvas, not the orchestrator's boot target (#1913)
+- panel_open_workflow no longer times out undetermined after a restart: an unsettled reconnect is a retryable refusal (`applied: false`) instead of a delivered command with no receipt (#1914)
 
 ## [0.15.117] - 2026-08-27
 
