@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_set_widget no longer queues a second whole `/object_info` behind a timed-out `api.getNodeDefs()`, so the type-scoped fallback can use the remaining command time on a large install (#1739)
 - retain verified add-node schema across a timed-out refresh (#1709)
+- a Registry publish of version X leaves tag vX on the commit that cut it, and changelog generation recognises `chore: release vX.Y.Z` so an untagged previous cut still bounds the next entry (#1882)
 
 ## [0.15.115] - 2026-08-27
 

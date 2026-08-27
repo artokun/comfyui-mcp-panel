@@ -26,8 +26,11 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  auditPublishedVersion,
   auditTag,
   collectFromGit,
+  collectPublishedFromGit,
+  ensurePublishedTag,
   firstParentAtRev,
   packageJsonVersion,
   panelVersion,
@@ -407,6 +410,112 @@ test("#1882 the tag being pushed is not exempt from the target check", () => {
   assert.deepEqual(inPlace, []);
 });
 
+test("#1882 a published version with no tag is a violation, not a later-tag problem", () => {
+  const violations = auditPublishedVersion({
+    version: "0.15.111",
+    cutSha: "48d655db00",
+    cutSubject: "chore: release v0.15.111",
+    tagTargetFor: noTags,
+  });
+  assert.equal(violations.length, 1, violations.join("\n"));
+  assert.match(violations[0], /^0\.15\.111 was cut by 48d655db /);
+  assert.match(violations[0], /no v0\.15\.111 tag exists/);
+  assert.match(violations[0], /git tag -a v0\.15\.111 48d655db/);
+  assert.match(violations[0], /cannot re-trigger the publish workflow/);
+});
+
+test("#1882 a published-version tag is credited only when it labels the cut", () => {
+  const cut = "86fee2f800";
+  const wrong = auditPublishedVersion({
+    version: "0.15.111",
+    cutSha: cut,
+    tagTargetFor: tagsAt({ "0.15.111": "deadbeef00" }),
+  });
+  assert.equal(wrong.length, 1, wrong.join("\n"));
+  assert.match(wrong[0], /v0\.15\.111 resolves to deadbeef/);
+  assert.match(wrong[0], /was cut by 86fee2f8/);
+
+  const right = auditPublishedVersion({
+    version: "0.15.111",
+    cutSha: cut,
+    tagTargetFor: tagsAt({ "0.15.111": cut }),
+  });
+  assert.deepEqual(right, []);
+});
+
+test("#1882 an unrunnable published-version scan is a violation, not a pass", () => {
+  const violations = auditPublishedVersion({
+    version: "0.15.115",
+    cutSha: "6d08afd900",
+    tagTargetFor: noTags,
+    historyError: "this is a shallow clone, so the range cannot be walked",
+  });
+  assert.equal(violations.length, 1, violations.join("\n"));
+  assert.match(violations[0], /tag check could not run/);
+  assert.match(violations[0], /shallow clone/);
+});
+
+test("#1882 collectPublishedFromGit walks back to the cut, not HEAD", () => {
+  withReleaseHistory((cwd) => {
+    writeFileSync(join(cwd, "note.txt"), "later same version\n");
+    execFileSync("git", ["-C", cwd, "add", "note.txt"]);
+    execFileSync("git", ["-C", cwd, "commit", "-m", "docs: a later commit at 0.15.104"]);
+    const head = execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const cut = execFileSync("git", ["-C", cwd, "rev-parse", "v0.15.104^{commit}"], { encoding: "utf8" }).trim();
+    assert.notEqual(head, cut);
+
+    const collected = collectPublishedFromGit("HEAD", { cwd });
+    assert.equal(collected.historyError, null, collected.historyError);
+    assert.equal(collected.version, "0.15.104");
+    assert.equal(collected.cutSha, cut);
+    assert.deepEqual(auditPublishedVersion(collected), []);
+  });
+});
+
+test("#1882 collectPublishedFromGit reports the 0.15.111 shape: tree shipped, no tag", () => {
+  withReleaseHistory((cwd) => {
+    execFileSync("git", ["-C", cwd, "tag", "-d", "v0.15.104"]);
+    const collected = collectPublishedFromGit("HEAD", { cwd });
+    assert.equal(collected.historyError, null, collected.historyError);
+    assert.equal(collected.version, "0.15.104");
+    const violations = auditPublishedVersion(collected);
+    assert.equal(violations.length, 1, violations.join("\n"));
+    assert.match(violations[0], /no v0\.15\.104 tag exists/);
+  });
+});
+
+test("#1882 --ensure creates the missing tag on the commit that cut the version", () => {
+  withReleaseHistory((cwd) => {
+    execFileSync("git", ["-C", cwd, "tag", "-d", "v0.15.104"]);
+    const missing = collectPublishedFromGit("HEAD", { cwd });
+    const ensured = ensurePublishedTag(missing, { cwd });
+    assert.equal(ensured.error, null, ensured.error);
+    assert.equal(ensured.created, true);
+    assert.equal(ensured.pushed, false);
+
+    const after = collectPublishedFromGit("HEAD", { cwd });
+    assert.deepEqual(auditPublishedVersion(after), []);
+    const target = execFileSync("git", ["-C", cwd, "rev-parse", "v0.15.104^{commit}"], { encoding: "utf8" }).trim();
+    assert.equal(target, missing.cutSha);
+  });
+});
+
+test("#1882 --ensure will not move a tag that already points at a different commit", () => {
+  withReleaseHistory((cwd) => {
+    const cut = execFileSync("git", ["-C", cwd, "rev-parse", "v0.15.104^{commit}"], { encoding: "utf8" }).trim();
+    const other = execFileSync("git", ["-C", cwd, "rev-parse", "v0.15.103^{commit}"], { encoding: "utf8" }).trim();
+    execFileSync("git", ["-C", cwd, "tag", "-d", "v0.15.104"]);
+    execFileSync("git", ["-C", cwd, "tag", "v0.15.104", other]);
+    const collected = collectPublishedFromGit("HEAD", { cwd });
+    const ensured = ensurePublishedTag(collected, { cwd });
+    assert.equal(ensured.created, false);
+    assert.match(ensured.error ?? "", /Refusing to move a release tag/);
+    const still = execFileSync("git", ["-C", cwd, "rev-parse", "v0.15.104^{commit}"], { encoding: "utf8" }).trim();
+    assert.equal(still, other);
+    assert.notEqual(still, cut);
+  });
+});
+
 test("#1882 a history failure still reports the tree-vs-tag mismatch it could check", () => {
   const violations = auditTag({
     tag: "v0.15.90",
@@ -444,6 +553,12 @@ test("#1882 the tag guard must not adopt a branch trigger — that is what would
   assert.ok(!/\bbranches:/.test(onBlock), "the tag guard must stay tag-triggered only");
 });
 
+test("#1882 the tag guard also audits HEAD on a schedule, because no tag push may ever come", () => {
+  const wf = read(".github/workflows/release-tag-guard.yml");
+  assert.match(wf, /schedule:\s*\n\s*- cron:/, "a published-but-untagged tree must not wait for the next tag");
+  assert.match(wf, /node scripts\/check-release-tag\.mjs --published/, "the schedule must run the published-version check");
+});
+
 test("#1882 publish_action.yml stays branches-filtered, so a tag push cannot republish", () => {
   // The whole reason a missing historical tag can be created safely. If someone
   // adds a `tags:` filter here, backfilling a tag would re-publish to the Registry.
@@ -451,6 +566,18 @@ test("#1882 publish_action.yml stays branches-filtered, so a tag push cannot rep
   const onBlock = wf.slice(wf.indexOf("\non:"), wf.indexOf("\njobs:"));
   assert.match(onBlock, /branches:\s*\n\s*- main/);
   assert.ok(!/\btags:/.test(onBlock), "publish must never trigger on a tag push");
+});
+
+test("#1882 the publish job tags the cut AFTER a successful Registry publish", () => {
+  const wf = read(".github/workflows/publish_action.yml");
+  const publish = wf.indexOf("- name: Publish custom node");
+  const guard = wf.indexOf("scripts/check-release-tag.mjs --published");
+  assert.notEqual(publish, -1, "the publish step is missing");
+  assert.notEqual(guard, -1, "the published-version check is missing");
+  assert.ok(guard > publish, "tagging a version that failed to publish recreates the stale-tag operand");
+  assert.match(wf, /--ensure/, "the path must create the missing tag, not only complain");
+  assert.match(wf, /--push/, "a local tag is not the operand `git tag` on a clone sees");
+  assert.match(wf, /contents:\s*write/, "pushing the archival tag needs contents: write");
 });
 
 // ---------------------------------------------------------------------------

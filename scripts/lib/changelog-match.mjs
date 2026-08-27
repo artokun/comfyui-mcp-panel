@@ -49,6 +49,14 @@ export const SEP = "\x1f";
  * Verified: 78 newly matched subjects, every one of them a `chore(release):`, and zero new
  * matches anywhere else in history.
  *
+ * #1882 — THE SHAPE THIS REPO CUTS TODAY is `chore: release v0.15.115 (#1945)`, not
+ * `chore(release):`. Measured on main at 0.15.115: every release from 0.15.97 through
+ * 0.15.115 uses that subject, and the three-arm predicate matched ZERO of them. Tags lag
+ * those cuts (0.15.97, 0.15.111, 0.15.112, 0.15.113 shipped with no tag), so `prevTag()`
+ * cannot fall back to the release commit and bounds at the previous TAG instead — the next
+ * cut then re-lists everything since. The arm is `chore: release <version>`, not a bare
+ * `^chore: release`, so `chore: release notes` and `chore: bump deps` stay ordinary commits.
+ *
  * Deliberately anchored at the start and followed by a non-digit, so ordinary commits that
  * merely CONTAIN a version — `docs(changelog): 0.11.75 said the wrong thing`, `feat:
  * support 1.2.3 style ids` — are not swallowed. That direction is the dangerous one: it
@@ -58,6 +66,7 @@ export const SEP = "\x1f";
 export const isReleaseSubject = (s) =>
   /^release:/i.test(String(s ?? "")) ||
   /^chore\(release\):\s*(?:[a-z0-9-]*panel\s+)?v?\d+\.\d+\.\d+([^0-9]|$)/i.test(String(s ?? "")) ||
+  /^chore:\s+release\s+v?\d+\.\d+\.\d+([^0-9]|$)/i.test(String(s ?? "")) ||
   /^v?\d+\.\d+\.\d+([^0-9]|$)/.test(String(s ?? ""));
 
 /**

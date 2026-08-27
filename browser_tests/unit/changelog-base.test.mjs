@@ -158,3 +158,48 @@ test("#1191: release commits are excluded from the entry they announce", () => {
   // the releases that preceded them.
   assert.equal(isReleaseSubject("chore(release): 0.14.25 (#1182)"), true, "…so the parser skips it");
 });
+
+// ---------------------------------------------------------------------------
+// #1882 — the CURRENT cut shape is `chore: release v0.15.115`, and tags lag it.
+//
+// #1191 taught the predicate `chore(release):` and then the repo changed spelling
+// again. Every release from 0.15.97 through 0.15.115 uses `chore: release vX.Y.Z`,
+// which matched none of the three arms. Combined with missing tags (0.15.97,
+// 0.15.111–0.15.113), prevTag() cannot fall back to the release commit and bounds
+// at the previous tag — the next cut re-lists everything in between.
+// ---------------------------------------------------------------------------
+
+test("#1882: the CURRENT release shape is recognised — `chore: release vX.Y.Z`", () => {
+  for (const s of [
+    "chore: release v0.15.115 (#1945)",
+    "chore: release v0.15.114 (#1940)",
+    "chore: release v0.15.113 — first release at ZERO registry findings",
+    "chore: release v0.15.112 — bound panel search replies (#1908)",
+    "chore: release v0.15.111",
+    "chore: release 0.15.97",
+  ]) {
+    assert.equal(isReleaseSubject(s), true, JSON.stringify(s));
+  }
+});
+
+test("#1882: `chore: release` without a version is not a release boundary", () => {
+  for (const s of [
+    "chore: release notes for later",
+    "chore: release the kraken",
+    "chore: bump deps",
+    "fix: chore: release v0.15.115 is quoted in the body",
+  ]) {
+    assert.equal(isReleaseSubject(s), false, JSON.stringify(s));
+  }
+});
+
+test("#1882: a `chore: release` commit beats an older tagged `chore(release):` as the base", () => {
+  const sha = pickReleaseSha(
+    [
+      logLine("aaaaaaaa", "fix(1927): re-vendor the tool vocabulary (#1930)"),
+      logLine("bbbbbbbb", "chore: release v0.15.115 (#1945)"),
+      logLine("cccccccc", "chore(release): 0.14.28 (#1195)"),
+    ].join("\n"),
+  );
+  assert.equal(sha, "bbbbbbbb", "the newest release is the untagged chore: release commit");
+});
