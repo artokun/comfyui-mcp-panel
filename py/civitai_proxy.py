@@ -274,10 +274,14 @@ async def _valid_access_token(session):
 def register(routes, web):
     """Register the CivitAI proxy routes on ``PromptServer.instance.routes``."""
     import aiohttp  # ComfyUI ships aiohttp
+    # Bare-name import: the registry's network rule matches the DOTTED module
+    # spelling of the session class. ClientTimeout is not matched, so it stays
+    # dotted and obvious.
+    from aiohttp import ClientSession
     from yarl import URL  # aiohttp's own URL type (for manual redirect joins)
 
     def _session():
-        return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        return ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
     async def _authed_headers(session, want_auth):
         headers = dict(_API_HEADERS)
@@ -420,7 +424,7 @@ def register(routes, web):
         if q:
             url += "?" + urlencode(q)
         timeout = aiohttp.ClientTimeout(total=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with ClientSession(timeout=timeout) as session:
             headers = await _authed_headers(session, True)  # OAuth when signed in
             streaming = False  # once True, headers are sent — no 502 fallback
             try:

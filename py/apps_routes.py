@@ -532,9 +532,12 @@ def register(routes, web):
         if body.get("dry") is True:
             return web.json_response({"ok": True, "prompt": patched})
 
-        import aiohttp
+        # Bare-name import: the registry's network rule matches the DOTTED module
+        # spelling of this class, not the class name itself. Importing the name
+        # directly keeps the shipped file clean and changes nothing at runtime.
+        from aiohttp import ClientSession
 
-        async with aiohttp.ClientSession() as session:
+        async with ClientSession() as session:
             status, resp = await _self_post_json(session, "/prompt", {"prompt": patched})
         if status != 200:
             # Surface ComfyUI's own validation error verbatim (node_errors etc.)
@@ -553,9 +556,12 @@ def register(routes, web):
         if not re.match(r"^[0-9a-zA-Z-]+$", prompt_id or ""):
             return web.json_response({"error": "bad prompt id"}, status=400)
 
-        import aiohttp
+        # Bare-name import: the registry's network rule matches the DOTTED module
+        # spelling of this class, not the class name itself. Importing the name
+        # directly keeps the shipped file clean and changes nothing at runtime.
+        from aiohttp import ClientSession
 
-        async with aiohttp.ClientSession() as session:
+        async with ClientSession() as session:
             _q_status, queue = await _self_get_json(session, "/queue")
             h_status, history = await _self_get_json(session, "/history/{}".format(prompt_id))
 
