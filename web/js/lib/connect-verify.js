@@ -360,12 +360,43 @@ export function verifyConnect(graph, before, { intendedLinkIds = [], replacedLin
     if (!(before?.links?.has(id) ?? false) && !intended.has(id)) collateralAddedLinks.push(view);
   }
 
+  // A link that keeps its ID but MOVES is invisible to the two set comparisons above,
+  // and it is the shape artokun/comfyui-mcp#2380 actually reports: two inputs on an
+  // untargeted node ended up fed from different sources. If LiteGraph (or a pack's
+  // onConnectionsChange) rewrites a link record in place, `before` and `after` both
+  // contain that id, so neither the removed nor the added list sees it and the verdict
+  // came back ok:true with nothing to disclose — the verifier missing the very defect it
+  // was written for. Compare the ENDPOINTS of every surviving link, not just the id set.
+  //
+  // The intended and replaced ids are exempt for the same reasons they are above: the
+  // link this connect created may be re-slotted by a dynamic pack, and the wire it
+  // displaced is already reported as `replaced_link`.
+  const sameEndpoints = (a, b) =>
+    String(a.origin_id) === String(b.origin_id) &&
+    Number(a.origin_slot) === Number(b.origin_slot) &&
+    String(a.target_id) === String(b.target_id) &&
+    Number(a.target_slot) === Number(b.target_slot);
+  const collateralMovedLinks = [];
+  for (const [id, was] of before?.links ?? []) {
+    if (id === replacedId || intended.has(id)) continue;
+    const now = after.links.get(id);
+    if (now && !sameEndpoints(was, now)) collateralMovedLinks.push({ before: was, after: now });
+  }
+
   const ok =
     missingNodes.length === 0 &&
     addedNodes.length === 0 &&
     collateralRemovedLinks.length === 0 &&
-    collateralAddedLinks.length === 0;
-  return { ok, missingNodes, addedNodes, collateralRemovedLinks, collateralAddedLinks };
+    collateralAddedLinks.length === 0 &&
+    collateralMovedLinks.length === 0;
+  return {
+    ok,
+    missingNodes,
+    addedNodes,
+    collateralRemovedLinks,
+    collateralAddedLinks,
+    collateralMovedLinks,
+  };
 }
 
 /**
@@ -386,6 +417,17 @@ export function connectCollateralBullets(verdict) {
     lines.push(
       `- a link this connect did not target was REMOVED: node ${l.origin_id} output ${l.origin_slot} ` +
         `-> node ${l.target_id} input ${l.target_slot}`,
+    );
+  }
+  for (const m of verdict.collateralMovedLinks ?? []) {
+    // Reported as a MOVE rather than a remove+add pair: the id is the same record, and
+    // saying "removed" of a link that is still there would send the reader looking for a
+    // wire that exists (#2380).
+    lines.push(
+      `- a link this connect did not target was MOVED: node ${m.before.origin_id} output ` +
+        `${m.before.origin_slot} -> node ${m.before.target_id} input ${m.before.target_slot} ` +
+        `is now node ${m.after.origin_id} output ${m.after.origin_slot} -> node ` +
+        `${m.after.target_id} input ${m.after.target_slot}`,
     );
   }
   for (const l of verdict.collateralAddedLinks) {

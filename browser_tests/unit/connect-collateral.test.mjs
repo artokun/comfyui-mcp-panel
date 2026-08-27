@@ -178,3 +178,50 @@ test("the warning does not read as a failed connect, and cites the issue", () =>
   );
   assert.ok(!/\bfailed\b/i.test(w), "must not describe itself as a failure");
 });
+
+// The gate's P1 on the first version of this fix. Both set comparisons above are keyed
+// on link ID, so a record whose id SURVIVES while its endpoints are rewritten in place
+// appears in `before` and `after` alike — neither removed nor added — and the verdict
+// came back ok:true with nothing disclosed. That is the shape #2380 actually reports:
+// two inputs on an untargeted node fed from different sources afterwards.
+test("#2380 in-place endpoint rewrite is COLLATERAL, not invisible", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  // The command: 1280.image -> 1283.image (legitimate).
+  g.links[13] = { id: 13, origin_id: 1280, origin_slot: 0, target_id: 1283, target_slot: 0 };
+  g.getNodeById(1283).inputs[0].link = 13;
+  // AND link 11 is REWRITTEN IN PLACE — same id, new source — on a node nothing named.
+  g.links[11] = { id: 11, origin_id: 1280, origin_slot: 0, target_id: 1282, target_slot: 0 };
+
+  const v = verifyConnect(g, before, { intendedLinkIds: [13], replacedLinkId: null });
+  assert.equal(v.ok, false, "an id that survives a move must not read as untouched");
+  assert.deepEqual(v.collateralRemovedLinks, [], "it was not removed");
+  assert.deepEqual(v.collateralAddedLinks, [], "nor added");
+  assert.equal(v.collateralMovedLinks.length, 1);
+  assert.equal(String(v.collateralMovedLinks[0].before.origin_id), "1273");
+  assert.equal(String(v.collateralMovedLinks[0].after.origin_id), "1280");
+
+  const bullets = connectCollateralBullets(v);
+  assert.equal(bullets.length, 1);
+  assert.match(bullets[0], /MOVED/);
+  assert.match(bullets[0], /1282/);
+});
+
+test("#2380 the intended and replaced links may move without being called collateral", () => {
+  // A dynamic pack re-slotting the wire this connect just made is expected, and the
+  // displaced wire is already reported as replaced_link.
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  g.links[11] = { id: 11, origin_id: 1273, origin_slot: 0, target_id: 1282, target_slot: 1 };
+  g.links[12] = { id: 12, origin_id: 1235, origin_slot: 0, target_id: 1282, target_slot: 0 };
+  assert.equal(verifyConnect(g, before, { intendedLinkIds: [11], replacedLinkId: 12 }).ok, true);
+});
+
+test("#2380 an unmoved link is not reported — no false positive on a quiet connect", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  g.links[13] = { id: 13, origin_id: 1280, origin_slot: 0, target_id: 1283, target_slot: 0 };
+  const v = verifyConnect(g, before, { intendedLinkIds: [13] });
+  assert.equal(v.ok, true);
+  assert.deepEqual(v.collateralMovedLinks, []);
+});
