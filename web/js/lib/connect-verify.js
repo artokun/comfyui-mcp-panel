@@ -423,7 +423,16 @@ export function verifyConnect(
     // A genuinely NEW link cannot appear in `before`, so declining to exempt intended ids
     // here costs a correct connect nothing: the only way an intended id is already present
     // is that it was reused, and then the previous occupant really is gone.
-    if (id === replacedId) continue;
+    // The replaced wire is exempt because connect DROPS it. If it did not drop — the id
+    // survives with new endpoints — then it was REUSED, and exempting it unconditionally
+    // hid an endpoint reassignment onto an untargeted node (gate P1). Exempt it only
+    // where it actually landed on the slot this connect addressed.
+    const survivor = after.links.get(id);
+    if (id === replacedId) {
+      if (!survivor) continue;
+      const landedOn = `${survivor.target_id}#${survivor.target_slot}`;
+      if (intendedSlots === undefined || intendedSlots.has(landedOn)) continue;
+    }
     const now = after.links.get(id);
     if (now && !sameEndpoints(was, now)) collateralMovedLinks.push({ before: was, after: now });
   }

@@ -347,3 +347,39 @@ test("#2380 omitting intendedSlots keeps the previous id-only behaviour", () => 
   g.getNodeById(1283).inputs[0].link = 13;
   assert.equal(verifyConnect(g, before, { intendedLinkIds: [13], beforeSlots }).ok, true);
 });
+
+// Gate P1: an id that is BOTH the replaced link and the reused intended id was exempt
+// unconditionally, so a reassignment onto an untargeted node was invisible.
+test("#2380 an id both replaced AND reused is checked by where it LANDED", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  // Link 11 fed 1282#0. The connect reuses id 11 but it ends up on 1283 — not the
+  // slot addressed — so the wire 1282#0 relied on is gone with nothing disclosed.
+  g.links[11] = { id: 11, origin_id: 1280, origin_slot: 0, target_id: 1283, target_slot: 0 };
+  const v = verifyConnect(g, before, {
+    intendedLinkIds: [11],
+    replacedLinkId: 11,
+    intendedSlots: new Set(["1282#0"]),
+  });
+  assert.equal(v.ok, false, "it did not land where the connect addressed");
+  assert.equal(v.collateralMovedLinks.length, 1);
+});
+
+test("#2380 a replaced id reused ON the addressed slot stays exempt", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  g.links[11] = { id: 11, origin_id: 1283, origin_slot: 0, target_id: 1282, target_slot: 0 };
+  const v = verifyConnect(g, before, {
+    intendedLinkIds: [11],
+    replacedLinkId: 11,
+    intendedSlots: new Set(["1282#0"]),
+  });
+  assert.equal(v.ok, true, "reconnecting the addressed input is the whole point");
+});
+
+test("#2380 a replaced link that is GONE stays exempt (the ordinary case)", () => {
+  const g = reproGraph();
+  const before = snapshotGraphState(g);
+  delete g.links[11];
+  assert.equal(verifyConnect(g, before, { replacedLinkId: 11 }).ok, true);
+});
