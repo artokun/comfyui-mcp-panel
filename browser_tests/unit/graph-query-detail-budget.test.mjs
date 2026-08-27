@@ -218,6 +218,36 @@ test("#2436 shipped graph_query keeps is_subgraph on an oversized-node stub", ()
   }
 });
 
+test("#1941 pinpoint structured nodes row stays bounded on a wide root node", () => {
+  // The orchestrator's ordinary-root fast path reads `result.nodes[0]`, not the
+  // survey text. That structured row used to be the uncapped summary, so a
+  // VHS_VideoCombine-shaped node could time out the probe and fall through to
+  // an indeterminate graph_get_subgraph refusal.
+  const wide = {
+    id: 74,
+    type: "VHS_VideoCombine",
+    title: "VHS_VideoCombine",
+    widgets: [{ name: "filename_prefix", value: "video/ComfyUI" }],
+    inputs: Array.from({ length: 4000 }, (_, i) => ({ name: `in${i}`, type: "INT" })),
+    outputs: [],
+  };
+  graph._nodes.push(wide);
+  try {
+    const result = query({ ids: [74], fields: "detail", max_chars: 300 });
+    const row = result.nodes?.[0];
+    assert.ok(row, "pinpoint detail must publish a structured nodes row");
+    assert.equal(row.id, 74);
+    assert.equal(typeof row.is_subgraph, "boolean");
+    assert.equal(row.is_subgraph, false);
+    assert.ok(
+      JSON.stringify(row).length <= 300,
+      `structured row must respect max_chars; got ${JSON.stringify(row).length}`,
+    );
+  } finally {
+    graph._nodes.pop();
+  }
+});
+
 test("#2314 detail rows explicitly classify ordinary and promoted nodes", () => {
   const ordinary = detailRows(query({ ids: [78], fields: "detail" }))[0];
   assert.equal(ordinary.is_subgraph, false);
