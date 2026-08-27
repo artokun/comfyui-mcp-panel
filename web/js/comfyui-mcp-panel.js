@@ -452,7 +452,13 @@ import {
 } from "./lib/thread-workflow-match.js";
 import { subgraphValueProvenance } from "./lib/subgraph-value-provenance.js";
 import { describeMissingNode, describeRailNodeTarget } from "./lib/node-scope-locator.js";
-import { findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks, reindexHostRailLinks } from "./lib/rail-slot.js";
+import {
+  findExistingRailSlot,
+  resolveRailSlotForRemoval,
+  countHostRailLinks,
+  reindexHostRailLinks,
+  refuseConnectToRawRail,
+} from "./lib/rail-slot.js";
 import { VENDORED_VOCABULARY_HASH } from "./lib/vocabulary-hash.js";
 import { managerFetchFailureMessage } from "./lib/manager-fetch-failure.js";
 import { withoutFrontendVirtualTypes } from "./lib/frontend-virtual-nodes.js";
@@ -16430,163 +16436,156 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph } = getGraphCtx();
 
     // Rail tolerance: when an endpoint is a subgraph boundary rail (by real id
-    // -10/-20 or alias "input"/"output"/..), route to the boundary I/O logic
-    // instead of throwing "No node with id". Normal node-to-node connect below
-    // is unchanged.
+    // -10/-20 or alias "input"/"output"/..), route to the EXISTING-slot I/O
+    // logic instead of throwing "No node with id". A raw rail id with no
+    // matching slot REFUSES rather than auto-exposing (#1953) — that is
+    // panel_expose_subgraph_output / panel_expose_subgraph_input. Normal
+    // node-to-node connect below is unchanged.
     const fromRail = resolveRail(graph, from_node_id);
     const toRail = resolveRail(graph, to_node_id);
 
     if (toRail?.rail === "output") {
-      // internal node OUTPUT -> subgraph OUTPUT rail.
-      const node = resolveNode(graph, from_node_id);
-      const outIdx = resolveSlot(node.outputs, from_output ?? 0, "output");
-      const outputSlot = node.outputs[outIdx];
+      // internal node OUTPUT -> existing subgraph OUTPUT rail slot.
       const existing = isEmptyRailSlotRef(to_input)
         ? null
         : findExistingRailSlot(graph.outputs, to_input);
-      if (existing && typeof existing.connect === "function") {
-        // #1272 — the rail slot's own link ids BEFORE the mutation, so a wire that
-        // pre-dated this call can never be credited to it on the throw path below.
-        const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
-        graph.beforeChange?.();
-        let link;
-        let railConnectErr = null;
-        try {
-          link = existing["connect"](outputSlot, node);
-        } catch (err) {
-          // #1272 — SubgraphOutput.connect writes subgraph._links, the rail slot's
-          // linkIds and the node output's links, and only THEN calls
-          // node.onConnectionsChange. So a throw carries no information about
-          // whether the wire exists. This is the issue's SECOND repro
-          // (to_node_id: -20): it threw, and panel_graph_outline then showed the
-          // link. Decide on the observed post-state instead of on the exception.
-          railConnectErr = err;
-        } finally {
-          graph.afterChange?.();
-        }
-        graph.setDirtyCanvas?.(true, true);
-        // #397 adopted at THIS call site — it had only ever been applied to the
-        // node-to-node branch, so this branch reported success on LiteGraph's
-        // truthy return alone. Ask the live graph on BOTH paths: with the link
-        // connect() returned when there is one, by scanning the rail slot for a
-        // NEW link when it threw instead.
-        const railLanded = railConnectErr
-          ? findLandedRailLink(graph, existing, node, outIdx, "output", railLinkIdsBefore)
-          : isRailLinkPersisted(graph, existing, node, outIdx, "output", link)
-            ? { linkId: String(link.id) }
-            : null;
-        if (!railLanded) {
-          if (railConnectErr) {
-            throw new Error(
-              `panel_connect from node ${node.id} output "${outputSlot?.name ?? outIdx}" to subgraph ` +
-                `output "${existing.name}" threw and NOTHING landed (#1272): ` +
-                `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
-                `this call left no new link from that output on the rail slot. Re-read with ` +
-                `panel_graph_outline ` +
-                `before retrying.`,
-            );
-          }
-          if (!link) {
-            throw new Error(
-              `connect refused — node ${node.id} output "${outputSlot?.name ?? outIdx}" ` +
-                `(${outputSlot?.type}) is not compatible with subgraph output "${existing.name}" (${existing.type})`,
-            );
-          }
+      if (!(existing && typeof existing.connect === "function")) {
+        refuseConnectToRawRail(to_node_id, "output");
+      }
+      const node = resolveNode(graph, from_node_id);
+      const outIdx = resolveSlot(node.outputs, from_output ?? 0, "output");
+      const outputSlot = node.outputs[outIdx];
+      // #1272 — the rail slot's own link ids BEFORE the mutation, so a wire that
+      // pre-dated this call can never be credited to it on the throw path below.
+      const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
+      graph.beforeChange?.();
+      let link;
+      let railConnectErr = null;
+      try {
+        link = existing["connect"](outputSlot, node);
+      } catch (err) {
+        // #1272 — SubgraphOutput.connect writes subgraph._links, the rail slot's
+        // linkIds and the node output's links, and only THEN calls
+        // node.onConnectionsChange. So a throw carries no information about
+        // whether the wire exists. This is the issue's SECOND repro
+        // (to_node_id: -20): it threw, and panel_graph_outline then showed the
+        // link. Decide on the observed post-state instead of on the exception.
+        railConnectErr = err;
+      } finally {
+        graph.afterChange?.();
+      }
+      graph.setDirtyCanvas?.(true, true);
+      // #397 adopted at THIS call site — it had only ever been applied to the
+      // node-to-node branch, so this branch reported success on LiteGraph's
+      // truthy return alone. Ask the live graph on BOTH paths: with the link
+      // connect() returned when there is one, by scanning the rail slot for a
+      // NEW link when it threw instead.
+      const railLanded = railConnectErr
+        ? findLandedRailLink(graph, existing, node, outIdx, "output", railLinkIdsBefore)
+        : isRailLinkPersisted(graph, existing, node, outIdx, "output", link)
+          ? { linkId: String(link.id) }
+          : null;
+      if (!railLanded) {
+        if (railConnectErr) {
           throw new Error(
-            `panel_connect reported no persisted link: node ${node.id} output ` +
-              `"${outputSlot?.name ?? outIdx}" (${outputSlot?.type}) → subgraph output ` +
-              `"${existing.name}" (${existing.type}). LiteGraph accepted the connection but the rail ` +
-              `slot does not carry it, so refusing to report a false success (#397).`,
+            `panel_connect from node ${node.id} output "${outputSlot?.name ?? outIdx}" to subgraph ` +
+              `output "${existing.name}" threw and NOTHING landed (#1272): ` +
+              `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
+              `this call left no new link from that output on the rail slot. Re-read with ` +
+              `panel_graph_outline ` +
+              `before retrying.`,
           );
         }
-        findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
-        return {
-          connected: {
-            from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
-            to: { subgraph_output: existing.name },
-          },
-          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
-        };
+        if (!link) {
+          throw new Error(
+            `connect refused — node ${node.id} output "${outputSlot?.name ?? outIdx}" ` +
+              `(${outputSlot?.type}) is not compatible with subgraph output "${existing.name}" (${existing.type})`,
+          );
+        }
+        throw new Error(
+          `panel_connect reported no persisted link: node ${node.id} output ` +
+            `"${outputSlot?.name ?? outIdx}" (${outputSlot?.type}) → subgraph output ` +
+            `"${existing.name}" (${existing.type}). LiteGraph accepted the connection but the rail ` +
+            `slot does not carry it, so refusing to report a false success (#397).`,
+        );
       }
-      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_output({
-        from_node_id,
-        from_output,
-        name: typeof to_input === "string" && !isEmptyRailSlotRef(to_input) ? to_input : undefined,
-      });
+      findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
+      return {
+        connected: {
+          from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
+          to: { subgraph_output: existing.name },
+        },
+        ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+      };
     }
 
     if (fromRail?.rail === "input") {
-      // subgraph INPUT rail -> internal node INPUT.
-      const node = resolveNode(graph, to_node_id);
-      const inIdx = resolveSlot(node.inputs, to_input ?? 0, "input");
-      const inputSlot = node.inputs[inIdx];
+      // subgraph INPUT rail slot -> internal node INPUT.
       const existing = isEmptyRailSlotRef(from_output)
         ? null
         : findExistingRailSlot(graph.inputs, from_output);
-      if (existing && typeof existing.connect === "function") {
-        // #1272 — see the OUTPUT rail branch above: pre-existing rail links are
-        // excluded so the throw path cannot credit this call with someone else's wire.
-        const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
-        graph.beforeChange?.();
-        let link;
-        let railConnectErr = null;
-        try {
-          link = existing["connect"](inputSlot, node);
-        } catch (err) {
-          // #1272 — SubgraphInput.connect has the same ordering as its output
-          // twin: the link is written to subgraph._links / linkIds / slot.link
-          // before node.onConnectionsChange runs, so a throw does not mean the
-          // wire is absent.
-          railConnectErr = err;
-        } finally {
-          graph.afterChange?.();
-        }
-        graph.setDirtyCanvas?.(true, true);
-        // #397 adopted at THIS call site too (see the output rail above).
-        const railLanded = railConnectErr
-          ? findLandedRailLink(graph, existing, node, inIdx, "input", railLinkIdsBefore)
-          : isRailLinkPersisted(graph, existing, node, inIdx, "input", link)
-            ? { linkId: String(link.id) }
-            : null;
-        if (!railLanded) {
-          if (railConnectErr) {
-            throw new Error(
-              `panel_connect from subgraph input "${existing.name}" to node ${node.id} input ` +
-                `"${inputSlot?.name ?? inIdx}" threw and NOTHING landed (#1272): ` +
-                `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
-                `this call left no new link to that input on the rail slot. Re-read with ` +
-                `panel_graph_outline ` +
-                `before retrying.`,
-            );
-          }
-          if (!link) {
-            throw new Error(
-              `connect refused — subgraph input "${existing.name}" (${existing.type}) is not ` +
-                `compatible with node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputSlot?.type})`,
-            );
-          }
+      if (!(existing && typeof existing.connect === "function")) {
+        refuseConnectToRawRail(from_node_id, "input");
+      }
+      const node = resolveNode(graph, to_node_id);
+      const inIdx = resolveSlot(node.inputs, to_input ?? 0, "input");
+      const inputSlot = node.inputs[inIdx];
+      // #1272 — see the OUTPUT rail branch above: pre-existing rail links are
+      // excluded so the throw path cannot credit this call with someone else's wire.
+      const railLinkIdsBefore = linkIdExclusionSet(railSlotLinkIds(existing));
+      graph.beforeChange?.();
+      let link;
+      let railConnectErr = null;
+      try {
+        link = existing["connect"](inputSlot, node);
+      } catch (err) {
+        // #1272 — SubgraphInput.connect has the same ordering as its output
+        // twin: the link is written to subgraph._links / linkIds / slot.link
+        // before node.onConnectionsChange runs, so a throw does not mean the
+        // wire is absent.
+        railConnectErr = err;
+      } finally {
+        graph.afterChange?.();
+      }
+      graph.setDirtyCanvas?.(true, true);
+      // #397 adopted at THIS call site too (see the output rail above).
+      const railLanded = railConnectErr
+        ? findLandedRailLink(graph, existing, node, inIdx, "input", railLinkIdsBefore)
+        : isRailLinkPersisted(graph, existing, node, inIdx, "input", link)
+          ? { linkId: String(link.id) }
+          : null;
+      if (!railLanded) {
+        if (railConnectErr) {
           throw new Error(
-            `panel_connect reported no persisted link: subgraph input "${existing.name}" ` +
-              `(${existing.type}) → node ${node.id} input "${inputSlot?.name ?? inIdx}" ` +
-              `(${inputSlot?.type}). LiteGraph accepted the connection but the rail slot does not ` +
-              `carry it, so refusing to report a false success (#397).`,
+            `panel_connect from subgraph input "${existing.name}" to node ${node.id} input ` +
+              `"${inputSlot?.name ?? inIdx}" threw and NOTHING landed (#1272): ` +
+              `${railConnectErr?.message ?? railConnectErr}. Observed post-state of the live graph: ` +
+              `this call left no new link to that input on the rail slot. Re-read with ` +
+              `panel_graph_outline ` +
+              `before retrying.`,
           );
         }
-        findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
-        return {
-          connected: {
-            from: { subgraph_input: existing.name },
-            to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
-          },
-          ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
-        };
+        if (!link) {
+          throw new Error(
+            `connect refused — subgraph input "${existing.name}" (${existing.type}) is not ` +
+              `compatible with node ${node.id} input "${inputSlot?.name ?? inIdx}" (${inputSlot?.type})`,
+          );
+        }
+        throw new Error(
+          `panel_connect reported no persisted link: subgraph input "${existing.name}" ` +
+            `(${existing.type}) → node ${node.id} input "${inputSlot?.name ?? inIdx}" ` +
+            `(${inputSlot?.type}). LiteGraph accepted the connection but the rail slot does not ` +
+            `carry it, so refusing to report a false success (#397).`,
+        );
       }
-      return GRAPH_TOOL_EXECUTORS.graph_expose_subgraph_input({
-        to_node_id,
-        to_input,
-        name:
-          typeof from_output === "string" && !isEmptyRailSlotRef(from_output) ? from_output : undefined,
-      });
+      findSubgraphHostNode(graph)?.invalidatePromotedViews?.();
+      return {
+        connected: {
+          from: { subgraph_input: existing.name },
+          to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
+        },
+        ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+      };
     }
 
     if (fromRail?.rail === "output") {

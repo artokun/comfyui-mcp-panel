@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - graph_unexpose_subgraph_input / _output re-point remaining host SubgraphNode links after a non-last boundary slot is removed, so later host wires stay valid at queue (#1969, artokun/comfyui-mcp#2437)
+- panel_connect to a raw rail id (`-20`/`-10`) refuses instead of silently auto-exposing a subgraph boundary slot (#1953)
 
 ## [0.15.119] - 2026-08-27
 

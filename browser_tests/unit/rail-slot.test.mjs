@@ -17,7 +17,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { findExistingRailSlot, railSlotIndex, resolveRailSlotForRemoval, reindexHostRailLinks } from "../../web/js/lib/rail-slot.js";
+import {
+  findExistingRailSlot,
+  railSlotIndex,
+  refuseConnectToRawRail,
+  resolveRailSlotForRemoval,
+  reindexHostRailLinks,
+} from "../../web/js/lib/rail-slot.js";
 
 /** A rail with twelve slots, none of them named with digits — the reported shape. */
 const RAIL = Array.from({ length: 12 }, (_, i) => ({ name: `in_${i}`, type: "STRING", slot: i }));
@@ -110,7 +116,7 @@ test("#1114 WIRING: the panel uses the shared lookup and keeps no copy", () => {
   );
   assert.match(
     panel,
-    /import \{ findExistingRailSlot, resolveRailSlotForRemoval, countHostRailLinks, reindexHostRailLinks \} from "\.\/lib\/rail-slot\.js";/,
+    /import \{\s*findExistingRailSlot,\s*resolveRailSlotForRemoval,\s*countHostRailLinks,\s*reindexHostRailLinks,\s*refuseConnectToRawRail,\s*\} from "\.\/lib\/rail-slot\.js";/,
     "the panel imports the shared lookups",
   );
   assert.doesNotMatch(
@@ -133,6 +139,11 @@ test("#1114 WIRING: the panel uses the shared lookup and keeps no copy", () => {
     /function reindexHostRailLinks\s*\(/,
     "and keeps no local copy of the host-link reindexer either",
   );
+  assert.doesNotMatch(
+    panel,
+    /function refuseConnectToRawRail\s*\(/,
+    "and keeps no local copy of the raw-rail connect refusal either",
+  );
   // Both rail branches must go through it: outputs (to_input) and inputs (from_output).
   const uses = panel.match(/findExistingRailSlot\(graph\.(inputs|outputs),/g) ?? [];
   assert.equal(uses.length, 2, "both rail branches resolve through it");
@@ -141,6 +152,36 @@ test("#1114 WIRING: the panel uses the shared lookup and keeps no copy", () => {
   assert.equal(removals.length, 2, "both unexpose executors resolve through it");
   const reindexes = panel.match(/reindexHostRailLinks\(rootGraph, subgraph, "(input|output)", slotIndex\)/g) ?? [];
   assert.equal(reindexes.length, 2, "both unexpose executors reindex remaining host links");
+  // Both connect-to-rail auto-expose fallthroughs refuse through the shared helper.
+  const refusals = panel.match(/refuseConnectToRawRail\((?:to_node_id|from_node_id),/g) ?? [];
+  assert.equal(refusals.length, 2, "both raw-rail connect fallthroughs refuse through it");
+});
+
+test("#1953 a raw output rail id uses the documented connect refusal wording", () => {
+  assert.throws(
+    () => refuseConnectToRawRail(-20, "output"),
+    (err) => {
+      assert.match(err.message, /do NOT panel_connect to a guessed rail node id/);
+      assert.match(err.message, /panel_connect REFUSES it/);
+      assert.match(err.message, /panel_expose_subgraph_output/);
+      assert.match(err.message, /rail_node_id/);
+      assert.match(err.message, /Nothing was exposed/);
+      assert.doesNotMatch(err.message, /graph_expose_subgraph_output/);
+      return true;
+    },
+  );
+});
+
+test("#1953 a raw input rail id names panel_expose_subgraph_input, not the output twin", () => {
+  assert.throws(
+    () => refuseConnectToRawRail(-10, "input"),
+    (err) => {
+      assert.match(err.message, /do NOT panel_connect to a guessed rail node id/);
+      assert.match(err.message, /panel_expose_subgraph_input/);
+      assert.doesNotMatch(err.message, /panel_expose_subgraph_output/);
+      return true;
+    },
+  );
 });
 
 test("#1294 removal resolves a slot by name or index, like a connect", () => {

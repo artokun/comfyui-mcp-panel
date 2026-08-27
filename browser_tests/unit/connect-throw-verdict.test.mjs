@@ -60,7 +60,7 @@ import {
   describeSlotRewrites,
   slotRewriteWarning,
 } from "../../web/js/lib/slot-rename-disclosure.js";
-import { findExistingRailSlot } from "../../web/js/lib/rail-slot.js";
+import { findExistingRailSlot, refuseConnectToRawRail } from "../../web/js/lib/rail-slot.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -138,6 +138,7 @@ function buildExecutors(graph, canvas = {}) {
     "railIntent",
     "isEmptyRailSlotRef",
     "findExistingRailSlot",
+    "refuseConnectToRawRail",
     "findSubgraphHostNode",
     "autoMatchSlots",
     "slotDiagnostic",
@@ -180,6 +181,7 @@ return GRAPH_TOOL_EXECUTORS;`,
     railIntent,
     isEmptyRailSlotRef,
     findExistingRailSlot,
+    refuseConnectToRawRail,
     findSubgraphHostNode,
     autoMatchSlots,
     slotDiagnostic,

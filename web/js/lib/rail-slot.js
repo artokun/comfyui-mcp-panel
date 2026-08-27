@@ -127,6 +127,39 @@ export function resolveRailSlotForRemoval(slots, ref, side) {
  * the reply can say what was dropped; the same subgraph can be instanced by
  * several host nodes (and nested), so the walk collects ALL of them.
  */
+/**
+ * #1953 — panel_connect to a raw rail id used to silently AUTO-EXPOSE.
+ *
+ * `panel_connect({ from_node_id: 2, from_output: "LATENT", to_node_id: -20 })`
+ * inside a subgraph returned `{ exposed: { name: "LATENT", … } }` and minted a
+ * new boundary slot. panel_expose_subgraph_output documents "do NOT
+ * panel_connect to a guessed rail node id"; panel_unexpose_subgraph_output
+ * documents that a rail_node_id "is forwarded to the panel, which REFUSES it".
+ * The refusal did not exist — a typo'd to_node_id that happened to hit a rail
+ * mutated the subgraph's public interface with no error.
+ *
+ * Connecting to an EXISTING named rail slot is still a connect (the slot is
+ * already on the boundary). This refusal is only the fallthrough that used to
+ * call graph_expose_subgraph_* — the caller must use the expose tool instead.
+ *
+ * Throws rather than returning a message: a fallthrough that "handles" the
+ * Error object would re-introduce the silent mutate.
+ *
+ * @param {number|string} ref  the to_node_id / from_node_id that resolved as a rail
+ * @param {"input"|"output"} side
+ * @returns {never}
+ */
+export function refuseConnectToRawRail(ref, side) {
+  const tool =
+    side === "input" ? "panel_expose_subgraph_input" : "panel_expose_subgraph_output";
+  const what = side === "input" ? "input" : "output";
+  throw new Error(
+    `Id ${ref} is a rail_node_id — the synthetic id of the WHOLE ${side} RAIL, not of a ` +
+      `slot on it. panel_connect REFUSES it: do NOT panel_connect to a guessed rail node id. ` +
+      `Use ${tool} with the interior node + the ${what} you want exposed. Nothing was exposed.`,
+  );
+}
+
 export function countHostRailLinks(rootGraph, subgraph, side, slotIndex) {
   if (!rootGraph || !subgraph) return 0;
   let count = 0;
