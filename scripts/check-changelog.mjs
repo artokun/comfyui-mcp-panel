@@ -24,7 +24,8 @@ const refIndex = args.indexOf("--ref");
 const explicitRef = refIndex >= 0 ? args[refIndex + 1] : null;
 const workingTree = args.includes("--working-tree");
 const versionArg = args.find(
-  (arg, index) => (refIndex < 0 || index !== refIndex + 1) && /^v?\d+\.\d+\.\d+(?:[-+].+)?$/.test(arg),
+  (arg, index) =>
+    (refIndex < 0 || index !== refIndex + 1) && arg !== "--working-tree" && !arg.startsWith("--"),
 );
 
 const git = (...gitArgs) =>
@@ -114,8 +115,17 @@ export function parseCommitSubjects(output) {
     });
 }
 
+const semverIdentifier = "(?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)";
+const strictSemver = new RegExp(
+  `^(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-${semverIdentifier}(?:\\.${semverIdentifier})*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`,
+);
+
 function releaseVersion(version) {
   return String(version ?? "").replace(/^v/, "");
+}
+
+function isStrictSemver(version) {
+  return strictSemver.test(releaseVersion(version));
 }
 
 function targetRefFor(version, requestedRef) {
@@ -130,8 +140,9 @@ function targetRefFor(version, requestedRef) {
   }
 }
 
-function allCommits() {
-  return parseCommitSubjects(git("log", "--all", "--format=%H%x1f%s%x1e"));
+function commitsAtRef(ref) {
+  const commit = git("rev-parse", "--verify", `${ref}^{commit}`);
+  return parseCommitSubjects(git("log", "--format=%H%x1f%s%x1e", commit));
 }
 
 function changelogAtRef(ref) {
@@ -213,6 +224,10 @@ export function checkChangelog({ markdown, version, commits, targetRef, isAncest
 function main() {
   let markdown;
   let targetRef = explicitRef;
+  if (refIndex >= 0 && !explicitRef) {
+    console.error("changelog: --ref requires a Git commit ref");
+    process.exit(2);
+  }
   if (explicitRef) {
     try {
       git("rev-parse", "--verify", `${explicitRef}^{commit}`);
@@ -229,9 +244,18 @@ function main() {
   } else {
     markdown = readFileSync(CHANGELOG, "utf8");
   }
-  const version = releaseVersion(
-    versionArg || parseReleaseSections(markdown).find((section) => /^\d+\.\d+\.\d+(?:[-+].+)?$/.test(section.version))?.version,
-  );
+  let version;
+  if (versionArg !== undefined) {
+    version = releaseVersion(versionArg);
+    if (!isStrictSemver(version)) {
+      console.error(`changelog: invalid release version "${versionArg}"; expected strict SemVer`);
+      process.exit(2);
+    }
+  } else {
+    version = releaseVersion(
+      parseReleaseSections(markdown).find((section) => isStrictSemver(section.version))?.version,
+    );
+  }
   if (!version) {
     console.error("usage: node scripts/check-changelog.mjs [version] [--ref <git-ref>] [--working-tree]");
     process.exit(2);
@@ -243,7 +267,7 @@ function main() {
     console.error(`changelog: could not read ${targetRef}: ${error.message.split("\n")[0]}`);
     process.exit(1);
   }
-  const commits = allCommits();
+  const commits = commitsAtRef(targetRef);
   const violations = checkChangelog({
     markdown,
     version,

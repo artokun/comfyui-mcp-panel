@@ -31,23 +31,31 @@ jobs:
 
       - name: Read authoritative release version
         id: release-version
-        shell: bash
+        shell: python
         run: |
-          set -euo pipefail
-          version="$(python - <<'PY'
+          import os
+          import re
           import tomllib
           from pathlib import Path
 
+          semver = re.compile(
+              r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+              r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+              r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+          )
           try:
-              version = tomllib.load(Path("pyproject.toml").open("rb"))["project"]["version"]
+              with Path("pyproject.toml").open("rb") as pyproject:
+                  version = tomllib.load(pyproject)["project"]["version"]
           except (KeyError, TypeError):
               raise SystemExit("pyproject.toml [project].version is required")
-          if not isinstance(version, str) or not version.strip():
-              raise SystemExit("pyproject.toml [project].version must be a non-empty string")
-          print(version)
-          PY
-          )"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if not isinstance(version, str) or semver.fullmatch(version) is None:
+              raise SystemExit("pyproject.toml [project].version must be strict SemVer")
+          output = os.environ.get("GITHUB_OUTPUT")
+          if not output:
+              raise SystemExit("GITHUB_OUTPUT is required")
+          with Path(output).open("a", encoding="utf-8", newline="") as output_file:
+              output_file.write(f"version={version}\n")
 
       - name: Changelog release guard
         env:
@@ -280,16 +288,18 @@ jobs:
       # THIS STEP CANNOT FAIL THE JOB, BY CONSTRUCTION. Release notes are a
       # nicety; the release itself is not. There is deliberately no `set -e`
       # and the step ends in `exit 0`, so every way this can go wrong — no
-      # an extraction failure — lands in the same place: `path=` empty, and the
+      # an extraction failure lands in the same place: `path=` empty, and the
       # publish step below ships without optional changelog notes. A missing or
       # empty current-version section cannot reach this step because the guard above
       # already fails the job.
       #
       - name: Extract this version's changelog for the Registry
         id: changelog
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
         run: |
           set -uo pipefail
-          version="${{ steps.release-version.outputs.version }}"
+          version="$RELEASE_VERSION"
           if [ -n "$version" ] && node scripts/changelog-section.mjs "$version" > registry-changelog.md; then
             echo "path=registry-changelog.md" >> "$GITHUB_OUTPUT"
             echo "changelog for $version ($(wc -c < registry-changelog.md) chars):"

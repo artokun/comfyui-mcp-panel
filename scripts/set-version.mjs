@@ -21,7 +21,11 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const version = process.argv[2];
-if (!version || !/^\d+\.\d+\.\d+([-.].+)?$/.test(version)) {
+const semverIdentifier = "(?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)";
+const strictSemver = new RegExp(
+  `^(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-${semverIdentifier}(?:\\.${semverIdentifier})*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`,
+);
+if (!version || !strictSemver.test(version)) {
   console.error(`usage: node scripts/set-version.mjs <version>  (got: ${version ?? "nothing"})`);
   process.exit(1);
 }

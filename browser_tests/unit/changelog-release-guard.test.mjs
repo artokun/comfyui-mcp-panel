@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -46,6 +46,7 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
         "",
         "### Fixed",
         "- initial fix (#90)",
+        "- second fix (#91)",
         "",
       ].join("\n"),
       "utf8",
@@ -53,7 +54,13 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
     git(cwd, "add", "CHANGELOG.md");
     git(cwd, "commit", "-m", "0.1.0 — initial release");
     git(cwd, "commit", "--allow-empty", "-m", "fix: initial fix (#90)");
+    git(cwd, "commit", "--allow-empty", "-m", "fix: second fix (#91)");
     git(cwd, "tag", "v1.0.0");
+
+    // A future branch must not feed alias discovery for an older audited tag.
+    git(cwd, "checkout", "-b", "future");
+    git(cwd, "commit", "--allow-empty", "-m", "fix(90): unrelated future alias (#91)");
+    git(cwd, "checkout", "main");
 
     git(cwd, "commit", "--allow-empty", "-m", "fix(100): one change, issue spelling (#101)");
     git(cwd, "commit", "--allow-empty", "-m", "fix: an independent fix (#102)");
@@ -99,6 +106,14 @@ test("#1891: release generation merges headings and issue/PR aliases", () => {
     const inferredHistoricalTag = runGuard(cwd, null, "v1.0.0");
     assert.equal(inferredHistoricalTag.status, 0, inferredHistoricalTag.stderr);
 
+    for (const malformed of ["1.1", "1.1.0; touch pwned", "1.1.0\ninjected"]) {
+      const result = runGuard(cwd, malformed, "v1.0.0");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /invalid release version/);
+      assert.doesNotMatch(result.stderr, /has no \[/);
+    }
+    assert.equal(existsSync(join(cwd, "pwned")), false);
+
     // Passing a version explicitly makes a missing current-version section fatal;
     // inference from another section must not let a publish proceed.
     const missingVersion = runGuard(cwd, "1.1.0", "v1.0.0");
@@ -139,10 +154,19 @@ test("#1891: publish guard receives pyproject version before checking changelog"
   const workflow = readFileSync(PUBLISH_WORKFLOW, "utf8");
   const versionStep = workflow.indexOf("id: release-version");
   const guardStep = workflow.indexOf('node scripts/check-changelog.mjs "$RELEASE_VERSION" --ref "$RELEASE_REF"');
+  const versionValidation = workflow.indexOf("semver.fullmatch(version) is None");
+  const outputWrite = workflow.indexOf('Path(output).open("a", encoding="utf-8", newline="")');
   assert.notEqual(versionStep, -1);
   assert.notEqual(guardStep, -1);
+  assert.notEqual(versionValidation, -1);
+  assert.notEqual(outputWrite, -1);
   assert.ok(versionStep < guardStep);
+  assert.ok(versionValidation < outputWrite);
   assert.ok(guardStep < workflow.indexOf("- name: Publish custom node"));
-  assert.match(workflow, /tomllib\.load\(Path\("pyproject\.toml"\)\.open\("rb"\)\)/);
+  assert.match(workflow, /shell: python/);
+  assert.match(workflow, /re\.compile\(/);
   assert.match(workflow, /RELEASE_VERSION: \$\{\{ steps\.release-version\.outputs\.version \}\}/);
+  assert.match(workflow, /version="\$RELEASE_VERSION"/);
+  assert.doesNotMatch(workflow, /version="\$\{\{ steps\.release-version\.outputs\.version \}\}"/);
+  assert.doesNotMatch(workflow, /echo "version=\$version"/);
 });
