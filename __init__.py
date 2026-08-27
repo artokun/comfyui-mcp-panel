@@ -1155,6 +1155,16 @@ def _register_routes():
     except Exception as _e:  # pragma: no cover - never block panel load
         _log("apps routes not registered: {}".format(_e))
 
+    # PROTOTYPE (A+D): rendezvous transport - both the panel and the agent dial
+    # OUT to this ComfyUI and it brokers the pair, instead of the panel dialing an
+    # agent that had to make itself publicly reachable via a cloudflared tunnel.
+    try:
+        from .py import rendezvous
+
+        rendezvous.register(routes, web)
+    except Exception as _e:  # pragma: no cover - never block panel load
+        _log("rendezvous routes not registered: {}".format(_e))
+
     @routes.get("/comfyui_mcp_panel/version")
     async def _pack_version(_request):
         # #584/#611 — the INSTALLED pack version, read from pyproject.toml at
