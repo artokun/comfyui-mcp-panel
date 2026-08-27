@@ -22019,8 +22019,11 @@ const GRAPH_TOOL_EXECUTORS = {
               // reply saying two different-sized things about the same fields, which is the
               // contradiction #1623 was reported for. `proven` cannot collide: every branch
               // that returns it returns `normalizedOnly: false`.
-              if (contentProof.normalizedOnly && !contentProof.presentationOnly && !leftoverPreviousCanvas) {
-                openContentNormalized = contentProof.normalizedFields;
+              if (contentProof.normalizedOnly && !contentProof.presentationOnly) {
+                // #1215 — leftover SOURCE widgets are not target-graph normalization.
+                if (!leftoverPreviousCanvas) {
+                  openContentNormalized = contentProof.normalizedFields;
+                }
               }
               // panel#1283 (the 2026-08-21 recurrence) — the completed-load ground carried
               // this open over a `definitions` difference as well as a `nodes` one, so the
