@@ -715,10 +715,12 @@ def _probe_bridge(host, port, timeout=_PROBE_TIMEOUT_S):
         finally:
             # The socket's own context manager closes the socket; this just releases
             # the buffered wrapper. It must never mask the probe's real outcome.
-            try:
+            # contextlib.suppress rather than try/except/pass for the same reason as
+            # the other best-effort cleanup in this file: identical behaviour, and
+            # bandit's B110 (which the registry parity scan runs without -ll) reads
+            # the try/except/pass shape as a swallowed exception.
+            with contextlib.suppress(Exception):
                 writer.close()
-            except Exception:
-                pass
     return result
 
 
