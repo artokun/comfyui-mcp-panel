@@ -112,7 +112,13 @@ test("#1681 only an explicit detail query can raise the per-widget cap", () => {
   assert.match(body, /fields === "detail" && Array\.isArray\(ids\) && ids\.length === 1/);
   assert.match(body, /clampDetailWidgetCap\(widget_max_chars\)/);
   assert.match(body, /capSummaryWidgets\(summarizeNode\(n\), detailWidgetCap, maxChars\)/);
-  assert.match(body, /fitDetailLine\(line, \{ id: summary\.id, type: summary\.type, title: summary\.title \}, maxChars\)/);
+  // artokun/comfyui-mcp#2436 — the stub now also carries `is_subgraph`, which is
+  // LOAD-BEARING: the orchestrator refuses an ordinary write on any node it cannot
+  // classify, so dropping it made every wide node unwritable. Pinned by the fields
+  // that MATTER rather than by the whole literal, which froze incidental field order
+  // and broke on a change that was correct.
+  assert.match(body, /fitDetailLine\(line, \{[^}]*\}, maxChars\)/);
+  assert.match(body, /fitDetailLine\(line, \{[^}]*is_subgraph: summary\.is_subgraph[^}]*\}/);
 });
 
 // The `groups`/`rails` riders sit OUTSIDE the max_chars accounting (#807 owns that fix).

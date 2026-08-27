@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- keep `is_subgraph` on oversized-node detail stubs so wide root nodes stay writable (artokun/comfyui-mcp#2436)
+
 ## [0.15.114] - 2026-08-27
 
 ### Fixed

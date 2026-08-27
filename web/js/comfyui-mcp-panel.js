@@ -14574,7 +14574,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // very many/large slots, which capSummaryWidgets doesn't touch), degrade the
         // protected line to a bounded valid-JSON stub so it's never dropped yet can't
         // flood — every rendered detail line ends up ≤ max_chars.
-        line = fitDetailLine(line, { id: summary.id, type: summary.type, title: summary.title }, maxChars);
+        line = fitDetailLine(line, { id: summary.id, type: summary.type, title: summary.title, is_subgraph: summary.is_subgraph }, maxChars);
       } else {
         // #607: flag link-driven widgets in the compact line too.
         const driven = drivenWidgetsFor(n, (n.widgets ?? []).map((w) => w?.name).filter(Boolean));

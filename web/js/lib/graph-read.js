@@ -311,6 +311,15 @@ export function fitDetailLine(line, stub, maxChars) {
     id: clipF(stub?.id),
     type: clipF(stub?.type),
     ...(stub?.title != null ? { title: clipF(stub.title) } : {}),
+    // artokun/comfyui-mcp#2436 — a BOOLEAN classification survives the degrade.
+    // #2314 gave the detail projection an always-boolean `is_subgraph` precisely so a
+    // consumer could tell ordinary-node from cannot-classify. This stub then dropped it,
+    // reintroducing the same absence one layer down. The orchestrator requires
+    // `typeof is_subgraph === "boolean"` and treats anything else as INDETERMINATE, so a
+    // node wide enough to degrade became unwritable: every ordinary panel_set_widget on
+    // it was refused by the promoted-write fence (KSampler (Efficient) in the report).
+    // Costs ~18 chars, is bounded by construction, and cannot flood.
+    ...(typeof stub?.is_subgraph === "boolean" ? { is_subgraph: stub.is_subgraph } : {}),
   };
   const s = JSON.stringify({
     ...safe,
