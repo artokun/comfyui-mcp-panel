@@ -269,8 +269,8 @@ test("WIRING: Ask agent to download carries the current lightbox (items 1–4)",
 });
 
 test("WIRING: the shipped cmd is civitai_results, not a new tool name", async () => {
-  // Vocabulary is vendored; a new panel_civitai_lightbox would not exist on the
-  // orchestrator. The read has to ride the already-shipped results path.
+  // Vocabulary is vendored; a new lightbox-named panel tool would not exist on
+  // the orchestrator. The read has to ride the already-shipped results path.
   const panel = await readFile(PANEL, "utf8");
   const start = panel.indexOf("onCivitaiCmd(msg) {");
   assert.ok(start >= 0, "onCivitaiCmd handler must exist");
