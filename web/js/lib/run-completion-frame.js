@@ -25,6 +25,7 @@
 import { duplicateCompletionNote } from "./completion-dedupe.js";
 import { withTimeout } from "./bounded-step.js";
 import { completionCompositionDiagnostic } from "./completion-delivery-diagnostics.js";
+import { formatWithheldMediaNote } from "./node-output-media.js";
 import {
   appendImageCacheBust,
   appendStoryboardCacheBust,
@@ -51,7 +52,8 @@ export const STILLS_METADATA_TIMEOUT_MS = 1000;
  * batch was empty (no frame emitted).
  *
  * @param {{promptId:(string|null), images?:any[], videos?:any[], durationMs:(number|null),
- *   finishedAt?:(number|null), reconciled?:boolean}} payload
+ *   finishedAt?:(number|null), reconciled?:boolean,
+ *   withheld?:({ count:number, keys:string[], types:string[] }|null)}} payload
  *   `finishedAt` is epoch ms of the run's REAL finish; `reconciled` marks a
  *   completion recovered from /history rather than observed live (#1199).
  * @param {object} deps  Injected presentation helpers (see call site).
@@ -68,6 +70,7 @@ export async function composeRunCompletionFrame(
     looksCached = false,
     finishedAt: finishedAtMs = null,
     reconciled = false,
+    withheld = null,
   },
   deps,
 ) {
@@ -245,6 +248,22 @@ export async function composeRunCompletionFrame(
     if (note) noteSections.push(note);
   }
 
+  // #1934 — CompareFrames (and similar) produce media under unrecognised keys.
+  // Count and name them; do not attach. A withheld note is content, so it also
+  // keeps a no-images flush from falling through to "produced no media".
+  const withheldSummary = withheld?.count > 0 ? withheld : null;
+  const took = durationMs != null ? ` in ${formatDuration(durationMs)}` : "";
+  if (withheldSummary) {
+    noteSections.push(
+      formatWithheldMediaNote({
+        withheld: withheldSummary,
+        promptId,
+        durationSuffix: took,
+        attached: outImages.length > 0,
+      }),
+    );
+  }
+
   // #356 Bug 2 — a run that finished with no image and no video still has to be
   // REPORTED when the agent was told to wait for it. panel_run's reply says "you
   // will be notified automatically — do NOT poll — end your turn now and wait", so
@@ -258,7 +277,6 @@ export async function composeRunCompletionFrame(
   // relied on it.
   if (!outImages.length && noteSections.length <= leadingSectionCount) {
     if (!noMedia) return null;
-    const took = durationMs != null ? ` in ${formatDuration(durationMs)}` : "";
     const frame = {
       type: "agent_event",
       kind: "executed",
@@ -286,7 +304,16 @@ export async function composeRunCompletionFrame(
     kind: "executed",
     images: outImages,
     note: noteSections.join("\n\n"),
-    metadata,
+    metadata: withheldSummary && !outImages.length
+      ? [{
+          outputs: "withheld",
+          reason: "media_budget",
+          count: withheldSummary.count,
+          keys: withheldSummary.keys,
+          types: withheldSummary.types,
+          ...recoveryMetadata(),
+        }]
+      : metadata,
     completion_diagnostics: completionDiagnostics(),
     // Machine-readable attribution: which prompt this completion belongs to, so
     // a delayed prior-run flush can never be mistaken for the current run (#224).

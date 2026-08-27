@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_set_widget refuses MiniMaxH3Director `timeline_data` and `builder_state` writes that leave the derived prompt stale (#1935)
 - SaveVideo keeps nested `format.codec` and drops the orphan top-level `codec`, so add and load stay queueable (#1931)
+- panel_run no longer reports CompareFrames temp images as "no media": unrecognised `*images` outputs are counted and named, and none of them are attached (#1934)
 
 ## [0.15.118] - 2026-08-27
 

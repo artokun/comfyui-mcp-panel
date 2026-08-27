@@ -800,6 +800,7 @@ import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-re
 import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
 import { prunedRetryNote } from "./lib/partial-run-prune.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
+import { collectNodeOutputMedia } from "./lib/node-output-media.js";
 import {
   normalizeModels,
   presentableModels,
@@ -40433,9 +40434,11 @@ function buildPanel() {
     const out = d.output || {};
     // ComfyUI groups a node's outputs by kind: `images`, plus `gifs`/`videos` for
     // VHS-style video nodes (e.g. LTX → VHS_VideoCombine). Render each by type so a
-    // video isn't shown as a broken <img>.
-    const media = [...(out.images || []), ...(out.gifs || []), ...(out.videos || [])];
-    if (!media.length) return;
+    // video isn't shown as a broken <img>. CompareFrames (and similar) write
+    // `a_images` / `b_images` instead — those are counted as withheld, never
+    // attached, so a 768-temp dump cannot flood the completion frame (#1934).
+    const { deliverable: media, withheld } = collectNodeOutputMedia(out);
+    if (!media.length && !withheld) return;
     const nodeId = d.node ?? d.display_node ?? null;
     // Viewable images (incl. animated gifs) go inline to the agent as-is. Video
     // refs are EXCLUDED here — the agent can't decode them — and instead get a
@@ -40508,8 +40511,8 @@ function buildPanel() {
     // deferred+grouped. Routing videos through the SAME lifecycle (rather than a
     // per-node timer) is what gives a video its real start→finish duration and
     // guarantees exactly one completion per prompt (#269/#468).
-    if (inlineImages.length || videos.length) {
-      runCompletion.onExecuted(d.prompt_id, { images: inlineImages, videos });
+    if (inlineImages.length || videos.length || withheld) {
+      runCompletion.onExecuted(d.prompt_id, { images: inlineImages, videos, withheld });
     }
     // #1286 — ComfyUI keys preview images by node id and will plant
     // $$canvas-image-preview on whatever node now holds that id (a freshly

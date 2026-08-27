@@ -54,6 +54,7 @@ export function createRunCompletionFlushHandler({
     looksCached,
     finishedAt,
     reconciled,
+    withheld,
   }) => {
     // #370/#1824: track whether the composed completion frame reached the
     // orchestrator. A route-scoped completion key means sendFrame returning true
@@ -90,6 +91,7 @@ export function createRunCompletionFlushHandler({
         looksCached,
         finishedAt,
         reconciled,
+        withheld,
       },
       {
         sendFrame: (frame) => {

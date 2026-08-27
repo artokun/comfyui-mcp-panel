@@ -1,3 +1,5 @@
+import { collectNodeOutputMedia, mergeWithheldMedia } from "./node-output-media.js";
+
 // Parse a ComfyUI `/history/<prompt_id>` entry into a terminal completion batch.
 //
 // The run-completion tracker keys delivery on live WS lifecycle events
@@ -15,8 +17,10 @@
 
 /**
  * @param {object|null} entry  The per-prompt value from `/history/<id>` — i.e.
- *   `historyResponse[promptId]`, shape `{ outputs:{[nodeId]:{images?,gifs?,videos?}},
- *   status:{status_str?, completed?} }`. Pass `null` when absent.
+ *   `historyResponse[promptId]`, shape `{ outputs:{[nodeId]:{images?,gifs?,videos?,…}},
+ *   status:{status_str?, completed?} }`. Pass `null` when absent. Extra keys
+ *   ending in images/gifs/videos (CompareFrames `a_images`/`b_images`) are
+ *   counted on `withheld` and never copied into `images`/`videos` (#1934).
  * @param {object}   [opts]
  * @param {(m:object)=>boolean} [opts.isVideo]  Classifies an output ref as video
  *   (else still image), matching the live path's classification.
@@ -24,6 +28,7 @@
  *   timestamp implausibly far in the future. Injectable for tests.
  * @returns {null | { terminal:boolean, status:("success"|"error"|"interrupted"|"unknown"),
  *   images:object[], videos:{m:object,nodeId:string}[],
+ *   withheld:({ count:number, keys:string[], types:string[] }|null),
  *   startedAt:(number|null), finishedAt:(number|null) }}
  *   `null` when there's no usable entry. `startedAt`/`finishedAt` are epoch ms
  *   recovered from the entry's own lifecycle messages, or null when this entry
@@ -58,16 +63,13 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
 
   const images = [];
   const videos = [];
+  let withheld = null;
   const outputs = entry.outputs && typeof entry.outputs === "object" ? entry.outputs : {};
   for (const [nodeId, out] of Object.entries(outputs)) {
     if (!out || typeof out !== "object") continue;
-    const media = [
-      ...(Array.isArray(out.images) ? out.images : []),
-      ...(Array.isArray(out.gifs) ? out.gifs : []),
-      ...(Array.isArray(out.videos) ? out.videos : []),
-    ];
-    for (const m of media) {
-      if (!m || !m.filename) continue;
+    const collected = collectNodeOutputMedia(out);
+    withheld = mergeWithheldMedia(withheld, collected.withheld);
+    for (const m of collected.deliverable) {
       if (typeof isVideo === "function" && isVideo(m)) videos.push({ m, nodeId: String(nodeId) });
       else images.push(m);
     }
@@ -85,6 +87,7 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
     status: isError ? "error" : isInterrupted ? "interrupted" : isSuccess ? "success" : "unknown",
     images,
     videos,
+    withheld,
     startedAt,
     finishedAt,
   };
