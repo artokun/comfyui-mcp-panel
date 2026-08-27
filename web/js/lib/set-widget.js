@@ -20,6 +20,11 @@
 // exposes one, and rebuild generated custom-widget rows that view hidden
 // backend widgets — disclosed on the success result, never thrown over a
 // verified write.
+// After that stretch returns, #1922 waits for a frontend flush (microtask + rAF)
+// and re-reads the written widget: a just-added primitive can pass the immediate
+// check and then be cleared by Vue mount / widget-store init. The first write is
+// re-applied once after that overwrite; if it still does not hold, the call
+// refuses instead of reporting success.
 
 import {
   applyWidgetWrite,
@@ -95,6 +100,46 @@ function coerceAdvisoryMessage(err) {
  * call so the two can never disagree.
  */
 export const COMBO_REFRESH_NEVER_RAN = Symbol("combo-refresh-never-ran");
+
+/**
+ * #1922 — wait until a just-added node's frontend widget store has had a chance
+ * to initialize.
+ *
+ * Vue DOM widgets (PrimitiveStringMultiline `value` is one) capture their empty
+ * default at setup and write it back on mount, which lands on a microtask plus
+ * the next animation frame. The immediate post-write check in applyWidgetWrite
+ * therefore reports success, and a later init replaces the value with "".
+ *
+ * This is the smallest wait that observes that overwrite: one microtask, then
+ * one animation frame when the host has rAF, then another microtask so a mount
+ * that itself queues work is visible. No rAF in Node tests → two microtasks,
+ * so existing runSetWidget tests do not hang or grow a timer.
+ */
+export function awaitFrontendWidgetFlush() {
+  return new Promise((resolve) => {
+    queueMicrotask(() => {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => queueMicrotask(resolve));
+      } else {
+        queueMicrotask(resolve);
+      }
+    });
+  });
+}
+
+function widgetValuesMatch(expected, actual) {
+  if (
+    (expected !== null && typeof expected === "object") ||
+    (actual !== null && typeof actual === "object")
+  ) {
+    try {
+      return JSON.stringify(expected) === JSON.stringify(actual);
+    } catch {
+      return false;
+    }
+  }
+  return Object.is(expected, actual);
+}
 
 /**
  * #1413/#1418 — the refusal for a stale-combo recovery that never revalidated the value.
@@ -284,6 +329,10 @@ export async function runSetWidget(
     // than done by the caller before this function, so the mutation lands at the write
     // boundary below where NO await follows it — see the note at `write`.
     prepareWriteTarget,
+    // #1922 — wait for the frontend widget store / Vue mount to finish before
+    // treating a verified write as retained. Production uses awaitFrontendWidgetFlush;
+    // unit tests inject a flush that reproduces the later empty overwrite.
+    awaitFrontendWidgetFlush: awaitFrontendWidgetFlushInjected,
   } = {},
 ) {
   // Never re-derived, and never cached: the oracle may not have run yet when this closure is
@@ -920,6 +969,56 @@ export async function runSetWidget(
     }
   };
 
+  const flushFrontendWidgets =
+    typeof awaitFrontendWidgetFlushInjected === "function"
+      ? awaitFrontendWidgetFlushInjected
+      : awaitFrontendWidgetFlush;
+
+  function readLiveWritten(set) {
+    const hosts = [node, resolvedTargetNode, authTarget].filter(Boolean);
+    const prefer = hosts.filter((host) => host.id === set?.node_id);
+    const rest = hosts.filter((host) => host.id !== set?.node_id);
+    for (const host of [...prefer, ...rest]) {
+      const live = host.widgets?.find((candidate) => candidate?.name === set?.widget);
+      if (live) return { found: true, value: live.value };
+    }
+    return { found: false, value: undefined };
+  }
+
+  function widgetStillHolds(set) {
+    const live = readLiveWritten(set);
+    return live.found && widgetValuesMatch(set?.value, live.value);
+  }
+
+  /**
+   * #1922 — applyWidgetWrite verifies synchronously. A just-added primitive's
+   * Vue/widget-store init can still replace the value on the next frame, so a
+   * success here would be a lie. Wait for that flush; if the value vanished,
+   * write once more (the init has now run, which is why the reporter's second
+   * call stuck); if it still does not hold, refuse.
+   */
+  async function retainVerifiedWrite(set, rewrite) {
+    await flushFrontendWidgets();
+    assertTargetStillCurrentNow();
+    if (widgetStillHolds(set)) return set;
+    const retried = rewrite();
+    await flushFrontendWidgets();
+    assertTargetStillCurrentNow();
+    if (widgetStillHolds(retried)) return retried;
+    const live = readLiveWritten(retried);
+    throw new WidgetWriteError(
+      `Widget "${retried?.widget}" on node ${retried?.node_id} (${node?.type}) did not retain the ` +
+        `requested value after the frontend widget store initialized: wrote ${JSON.stringify(retried?.value)} ` +
+        `but it became ${JSON.stringify(live.found ? live.value : undefined)}. ` +
+        `Nothing is being reported as success. Retry panel_set_widget now that the node is on the canvas.`,
+    );
+  }
+
+  async function succeedWrite(extra = {}, extraResult = {}) {
+    const set = await retainVerifiedWrite(write(extra), () => write(extra));
+    return withWarning({ set, ...extraResult });
+  }
+
   // #558: the value widget being written may be governed by a non-`fixed`
   // control_after_generate (seed randomize/increment/…), which SILENTLY overwrites
   // it after the next generation. Warn HONESTLY on success — the write "took", but it
@@ -1084,7 +1183,7 @@ export async function runSetWidget(
   };
 
   try {
-    return withWarning({ set: write() });
+    return await succeedWrite();
   } catch (err) {
     // Only a COMBO rejection is EVER retryable — every other WidgetWriteError
     // (numeric/boolean/promotion/composite/stuck-check) fails closed immediately.
@@ -1146,7 +1245,7 @@ export async function runSetWidget(
         );
       }
       try {
-        return withWarning({ set: write(), refreshed: true });
+        return await succeedWrite({}, { refreshed: true });
       } catch (retryErr) {
         if (!(retryErr instanceof WidgetWriteError)) throw retryErr;
         // A NON-combo failure on the retry is terminal — fail closed loudly.
@@ -1162,7 +1261,7 @@ export async function runSetWidget(
     // #387: server-confirmed upload asset (e.g. a subfolder-nested LoadImage image).
     if (await tryUploadAssetAccept()) {
       try {
-        return withWarning({ set: write(), refreshed: true, server_confirmed: true });
+        return await succeedWrite({}, { refreshed: true, server_confirmed: true });
       } catch (confErr) {
         if (confErr instanceof WidgetWriteError) {
           throw refusalFrame(confErr, " after confirming the uploaded asset exists on the server");
@@ -1208,11 +1307,13 @@ export async function runSetWidget(
         concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
       )
     ) {
-      return withWarning({
-        set: write({ acceptEmptyComboOptions: true }),
-        ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
-        empty_option_list: true,
-      });
+      return await succeedWrite(
+        { acceptEmptyComboOptions: true },
+        {
+          ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
+          empty_option_list: true,
+        },
+      );
     }
 
     // #1126 UNREADABLE OPTION LIST — the sibling of the #507 branch above, and decided
@@ -1435,7 +1536,10 @@ export async function runSetWidget(
           // this call hoped for: an empty final read discloses `empty_option_list` (and carries
           // #507's rail label-adoption rule, correctly, because an empty list really does admit
           // any scalar), an unreadable one discloses `option_list_unreadable`.
-          set = write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true });
+          set = await retainVerifiedWrite(
+            write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true }),
+            () => write({ acceptUnreadableComboOptions: true, acceptEmptyComboOptions: true }),
+          );
         } catch (unreadableErr) {
           // A validation refusal from THIS attempt (a non-string value, a rail whose own
           // list is real and lacks the value) must arrive framed like every other refusal:

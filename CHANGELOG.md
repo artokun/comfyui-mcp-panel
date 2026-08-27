@@ -11,6 +11,7 @@ All notable changes to this project are documented here. This project adheres to
 - SaveVideo keeps nested `format.codec` and drops the orphan top-level `codec`, so add and load stay queueable (#1931)
 - panel_run no longer reports CompareFrames temp images as "no media": unrecognised `*images` outputs are counted and named, and none of them are attached (#1934)
 - panel_set_widget rebuilds generated custom-widget rows after a hidden backend write, so Deno Multi LoRA (and the same pattern) updates visible rows and height without leaving and re-entering (#1932)
+- panel_set_widget no longer reports success when a just-added primitive's frontend init later clears the value (#1922)
 
 ## [0.15.118] - 2026-08-27
 
