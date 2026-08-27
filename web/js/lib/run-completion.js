@@ -47,6 +47,7 @@
 
 import { mediaSignature, createCompletionDeduper } from "./completion-dedupe.js";
 import { parseHistoryEntry } from "./history-reconcile.js";
+import { mergeWithheldMedia } from "./node-output-media.js";
 
 export const NO_PROMPT_KEY = "__no_prompt__";
 
@@ -758,6 +759,7 @@ export function createRunCompletionTracker({
       videos: buf.videos,
       durationMs,
       finishedAt: now(),
+      ...(buf.withheld ? { withheld: buf.withheld } : {}),
       // #986 — the agent is TOLD this output was already announced, never denied it.
       // Which of a replay or a fast re-render it is cannot be proven, so the panel
       // reports what it observed and lets the reader decide.
@@ -809,7 +811,7 @@ export function createRunCompletionTracker({
   function ensureBuffer(k) {
     let buf = buffers.get(k);
     if (!buf) {
-      buf = { images: [], videos: [], timer: null, rearms: 0 };
+      buf = { images: [], videos: [], withheld: null, timer: null, rearms: 0 };
       buffers.set(k, buf);
     }
     return buf;
@@ -1002,6 +1004,7 @@ export function createRunCompletionTracker({
         // Epoch ms of the REAL finish, or null when history records none (#1199).
         finishedAt: historyFinishedAt,
         reconciled: true,
+        ...(parsed.withheld ? { withheld: parsed.withheld } : {}),
         ...(mediaLessQueued ? { noMedia: true } : {}),
       });
     }
@@ -1142,10 +1145,11 @@ export function createRunCompletionTracker({
     /**
      * ComfyUI `executed` (per output node) — buffer this prompt's outputs.
      * @param {string|null} id
-     * @param {{images?: any[], videos?: any[]}} outputs
+     * @param {{images?: any[], videos?: any[], withheld?: { count:number, keys:string[], types:string[] }|null}} outputs
      */
-    onExecuted(id, { images = [], videos = [] } = {}) {
-      if (!images.length && !videos.length) return;
+    onExecuted(id, { images = [], videos = [], withheld = null } = {}) {
+      const extra = withheld?.count > 0 ? withheld : null;
+      if (!images.length && !videos.length && !extra) return;
       // Idempotency fence: if this prompt already reached TERMINAL (a /history
       // reconcile beat the live WS, which then replayed a late `executed`), do NOT
       // re-buffer it — otherwise the trailing execution_success would flush a
@@ -1164,7 +1168,11 @@ export function createRunCompletionTracker({
       const buf = ensureBuffer(k);
       if (images.length) buf.images.push(...images);
       if (videos.length) buf.videos.push(...videos);
-      arm(k);
+      if (extra) buf.withheld = mergeWithheldMedia(buf.withheld, extra);
+      // Withheld-only must not arm the orphan timer: flush() of an empty
+      // images/videos batch deletes the buffer and would drop the count
+      // before execution_success can report it.
+      if (images.length || videos.length) arm(k);
     },
 
     /** ComfyUI `execution_success` — the authoritative flush for THIS prompt. */
@@ -1197,8 +1205,12 @@ export function createRunCompletionTracker({
       // the duration start. A keyed panel_run remains pending until its receipt.
       // Snapshot this before flush(): flush() consumes the media buffers, so
       // checking hasBufferedMedia(k) afterwards would misclassify a media run
-      // as a late media-less success.
+      // as a late media-less success. Withheld CompareFrames bags live on the
+      // same buffer and must be read here too — flush() of an empty images/
+      // videos batch returns without emitting, which is what we want (attach
+      // none) but would otherwise drop the count (#1934).
       const hasMedia = hasBufferedMedia(k);
+      const withheld = buffers.get(k)?.withheld ?? null;
       const mediaLess = !hasMedia && panelQueued.has(k);
       const mediaLessStart = mediaLess ? starts.get(k) : null;
       flush(k);
@@ -1226,6 +1238,7 @@ export function createRunCompletionTracker({
           durationMs: mediaLessStart != null ? now() - mediaLessStart : null,
           finishedAt: now(),
           noMedia: true,
+          ...(withheld ? { withheld } : {}),
         });
         terminalNoMediaSuccess.delete(k);
       } else if (!hasMedia) {
@@ -1238,6 +1251,7 @@ export function createRunCompletionTracker({
           durationMs: starts.has(k) ? finishedAt - starts.get(k) : null,
           finishedAt,
           at: finishedAt,
+          ...(withheld ? { withheld } : {}),
         });
       }
       // Retire start for runs that buffered nothing (flush early-returns then).
@@ -1392,6 +1406,7 @@ export function createRunCompletionTracker({
           durationMs: lateSuccess.durationMs,
           finishedAt: lateSuccess.finishedAt,
           noMedia: true,
+          ...(lateSuccess.withheld ? { withheld: lateSuccess.withheld } : {}),
         });
       }
       return nextKey;
