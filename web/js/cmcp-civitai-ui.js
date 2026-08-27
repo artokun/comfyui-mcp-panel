@@ -2327,6 +2327,13 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       highlighted: state.highlightOrder.slice(),
     };
   }
+  // The user-facing ✕ already called this (and teardown tears down the lightbox);
+  // exposing it on drive is the agent inverse of open_civitai (#1952). Idempotent.
+  function driveClose() {
+    if (!isOpen) return { ok: true, closed: false };
+    close();
+    return { ok: true, closed: true };
+  }
 
   // ── content provider (the shell owns the chrome; this owns the body) ──────
   let _started = false;
@@ -2367,6 +2374,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       switchTab: driveSwitchTab, search: driveSearch, getResults: driveGetResults,
       highlight: driveHighlight, clearHighlight: driveClearHighlight,
       openLightbox: driveOpenLightbox, getState: driveGetState,
+      close: driveClose,
     },
   };
 }

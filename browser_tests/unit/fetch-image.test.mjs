@@ -268,7 +268,7 @@ test("#2149: fetch_image is wired as a canvas-independent dispatcher command", (
   const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(source, /fetch_image\(args = \{\}\)/);
   assert.match(source, /return fetchImageForMcp\(args, \{ api \}\)/);
-  assert.match(source, /"ui_render", "ui_update", "fetch_image"/);
+  assert.match(source, /"ui_render", "ui_update", "ui_dismiss", "fetch_image"/);
   assert.equal(commandIsCanvasIndependent("fetch_image"), true);
   assert.equal(commandIsCanvasTargetless("fetch_image"), true);
 });

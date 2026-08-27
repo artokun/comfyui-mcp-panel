@@ -320,6 +320,12 @@ import { recordSkillFromGraph, persistRecordedSkill } from "./lib/record-skill.j
 import { makeCommandBudget } from "./lib/command-budget.js";
 import { fetchImageForMcp } from "./lib/fetch-image.js";
 import { fetchComfyUIReadForMcp } from "./lib/fetch-comfyui-read.js";
+import {
+  closeSidePanelHandle,
+  dismissLiveA2uiCard,
+  dismissAllLiveA2uiCards,
+  unloadChatMediaCards,
+} from "./lib/resident-ui-close.js";
 // #1184 — the ORDER a backend switch commits in. A module because the defect is an
 // ordering property, and order cannot be asserted against the 1.7MB panel IIFE.
 import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
@@ -26905,7 +26911,7 @@ function noteActiveWorkflowMove() {
   }
 }
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert, onHelloLanded }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onUiDismiss, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert, onHelloLanded }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -27757,7 +27763,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else if (
             msg.cmd === "civitai_results" || msg.cmd === "civitai_highlight" ||
             msg.cmd === "civitai_clear_highlight" || msg.cmd === "civitai_switch_tab" ||
-            msg.cmd === "civitai_search" || msg.cmd === "civitai_open_lightbox"
+            msg.cmd === "civitai_search" || msg.cmd === "civitai_open_lightbox" ||
+            msg.cmd === "civitai_close"
           ) {
             // Agent DRIVES the already-open CivitAI browser. onCivitaiCmd throws
             // an honest "civitai browser not open" when the modal isn't live, which
@@ -27767,7 +27774,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else if (
             msg.cmd === "open_training" || msg.cmd === "training_get_state" ||
             msg.cmd === "training_set_field" || msg.cmd === "training_goto_step" ||
-            msg.cmd === "training_set_target" || msg.cmd === "training_highlight"
+            msg.cmd === "training_set_target" || msg.cmd === "training_highlight" ||
+            msg.cmd === "training_close"
           ) {
             if (!onTrainingCmd) throw new Error("This panel build can't drive the training wizard.");
             result = await onTrainingCmd(msg);
@@ -27779,6 +27787,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           } else if (msg.cmd === "ui_update") {
             if (!onUiUpdate) throw new Error("This panel build can't render UI cards.");
             result = await onUiUpdate(msg);
+          } else if (msg.cmd === "ui_dismiss") {
+            if (!onUiDismiss) throw new Error("This panel build can't dismiss UI cards.");
+            result = await onUiDismiss(msg);
           } else {
             const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];
             if (!executor) throw new Error(`Unknown command "${msg.cmd}"`);
@@ -28121,11 +28132,13 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // commands get the normal activity card.
         const SILENT_CMDS = new Set([
           "ask_user", "request_secret", "set_todo", "show_media", "open_civitai",
-          "ui_render", "ui_update", "fetch_image", "fetch_comfyui_read",
+          "ui_render", "ui_update", "ui_dismiss", "fetch_image", "fetch_comfyui_read",
           "civitai_results", "civitai_highlight", "civitai_clear_highlight",
           "civitai_switch_tab", "civitai_search", "civitai_open_lightbox",
+          "civitai_close",
           "open_training", "training_get_state", "training_set_field",
           "training_goto_step", "training_set_target", "training_highlight",
+          "training_close",
         ]);
         if (!SILENT_CMDS.has(msg.cmd)) {
           onCommand?.(msg.cmd, msg, reply);
@@ -38579,6 +38592,7 @@ function buildPanel() {
     // handle's civitai facade; throws an honest "civitai browser not open" error
     // (guard here, plus the facade re-checks the active tab).
     onCivitaiCmd(msg) {
+      if (msg.cmd === "civitai_close") return closeSidePanelHandle(_sidePanelHandle);
       const h = _sidePanelHandle;
       if (!h) throw new Error("civitai browser not open");
       switch (msg.cmd) {
@@ -38597,6 +38611,7 @@ function buildPanel() {
         openTraining({ dock: msg.dock !== false });
         return { ok: true };
       }
+      if (msg.cmd === "training_close") return closeSidePanelHandle(_sidePanelHandle);
       const h = _sidePanelHandle;
       if (!h) throw new Error("training wizard not open");
       switch (msg.cmd) {
@@ -38641,6 +38656,36 @@ function buildPanel() {
       persistThreads();
       setChatSurfaceForCards();
       return { ok: true };
+    },
+    // Inverse of ui_render / show_media: retire live cards so a long session can
+    // shed renderer state (#1952). A named card_id dismisses that A2UI card the
+    // same way the user ✕ does. Omitting it dismisses every live A2UI card and
+    // unloads painted media cards from the live log.
+    onUiDismiss(msg) {
+      const persistRec = (rec) => {
+        if (!rec) return;
+        try { historyStore.touchMessage(rec); persistThreads(); } catch { /* bookkeeping */ }
+      };
+      if (msg.card_id != null && String(msg.card_id).trim() !== "") {
+        const r = dismissLiveA2uiCard(liveA2uiCards, msg.card_id, { removeEl: true });
+        persistRec(r.rec);
+        setChatSurfaceForCards();
+        return { ok: true, dismissed: r.dismissed ? 1 : 0, card_ids: [r.card_id] };
+      }
+      const cards = dismissAllLiveA2uiCards(liveA2uiCards, { removeEl: true });
+      for (const rec of cards.recs) persistRec(rec);
+      if (_activeLightboxClose) {
+        try { _activeLightboxClose(); } catch { /* already gone */ }
+        _activeLightboxClose = null;
+      }
+      const media = unloadChatMediaCards(log);
+      setChatSurfaceForCards();
+      return {
+        ok: true,
+        dismissed: cards.dismissed,
+        card_ids: cards.card_ids,
+        media_unloaded: media.unloaded,
+      };
     },
     // Orchestrator pushed live download progress → render rows in the tray.
     onDownloads(list) {
