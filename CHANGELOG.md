@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- remote, tunnelled, and mobile clients never see the in-app update prompt or one-click install+restart; those stay deferred until the next local host session (#1943, #1944)
+
 ## [0.15.121] - 2026-08-27
 
 ### Fixed

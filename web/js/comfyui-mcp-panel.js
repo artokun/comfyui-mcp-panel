@@ -233,10 +233,11 @@ import { describeOpenActiveBinding } from "./lib/open-active-binding.js";
 import { compareVersions, releasesSince, summarizeReleases, updateAnnouncement } from "./lib/changelog-delta.js";
 import {
   UPDATE_NOTICE_DISMISS_KEY,
-  classifyClientContext,
+  decideUpdateNoticeAffordance,
   dismissToken,
   fetchPublishedPanelVersions,
   isDismissed,
+  readBrowserClientContext,
   resolveUpdateState,
   shouldOfferHostMutation,
   shouldSurfaceUpdateNotice,
@@ -37073,10 +37074,14 @@ function buildPanel() {
    * #1942 — one-click install+restart, only on a local host client (#1943).
    *
    * Reuses the existing Manager update + reboot executors rather than a new
-   * installer. A remote/mobile caller is a no-op even if a button somehow
-   * existed — the notice itself is not painted there (#1944).
+   * installer. Re-classifies from this tab's location/UA at click time so a
+   * captured "local" from notify cannot authorize a remote caller. Fail closed.
    */
-  async function applyPanelUpdate({ kind, clientContext, button } = {}) {
+  async function applyPanelUpdate({ kind, button } = {}) {
+    const clientContext = readBrowserClientContext({
+      location: typeof location !== "undefined" ? location : undefined,
+      navigator: typeof navigator !== "undefined" ? navigator : undefined,
+    });
     if (!shouldOfferHostMutation(clientContext)) return;
     const installLabel = tr("panel.install_and_restart", "Install and restart");
     const restartLabel = tr("panel.restart_comfyui", "Restart ComfyUI");
@@ -37142,15 +37147,18 @@ function buildPanel() {
    * host session what it fixes and offer install+restart.
    *
    * #1944 — remote/tunnelled/mobile clients return before anything is painted.
-   * The check itself still runs so a later local session has fresh evidence.
+   * No badge, no banner, no "install it on the host" copy. The Registry probe
+   * is skipped here too: its result is not persisted, so running it would not
+   * inform the next local session.
    */
   async function notifyAvailablePanelUpdate({ force = false } = {}) {
     try {
-      const clientContext = classifyClientContext({
-        hostname: typeof location !== "undefined" ? location.hostname : "",
-        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
-      });
-      if (!shouldSurfaceUpdateNotice(clientContext)) return;
+      const hostname = typeof location !== "undefined" ? location.hostname : "";
+      const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
+      if (!shouldSurfaceUpdateNotice(readBrowserClientContext({
+        location: typeof location !== "undefined" ? location : undefined,
+        navigator: typeof navigator !== "undefined" ? navigator : undefined,
+      }))) return;
 
       const probeInstalled = (async () => {
         if (typeof api?.fetchApi !== "function") return "";
@@ -37172,7 +37180,12 @@ function buildPanel() {
         installed,
         latest,
       });
-      if (state.kind === "none") {
+      const affordance = decideUpdateNoticeAffordance({
+        hostname,
+        userAgent,
+        kind: state.kind,
+      });
+      if (!affordance.surfaceNotice) {
         updateBadge.hidden = true;
         return;
       }
@@ -37240,20 +37253,18 @@ function buildPanel() {
       }
       const actionsRow = document.createElement("div");
       actionsRow.className = "cmcp-update-actions";
-      if (shouldOfferHostMutation(clientContext)) {
-        const go = document.createElement("button");
-        go.type = "button";
-        go.className = "cmcp-update-btn";
-        go.dataset.testid = "panel-update-install";
-        go.textContent =
-          state.kind === "update"
-            ? tr("panel.install_and_restart", "Install and restart")
-            : tr("panel.restart_comfyui", "Restart ComfyUI");
-        go.addEventListener("click", () => {
-          void applyPanelUpdate({ kind: state.kind, clientContext, button: go });
-        });
-        actionsRow.appendChild(go);
-      }
+      // Always the host action when we surface. No inform-without-button path (#1944).
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = "cmcp-update-btn";
+      go.dataset.testid = "panel-update-install";
+      go.textContent = affordance.offerInstall
+        ? tr("panel.install_and_restart", "Install and restart")
+        : tr("panel.restart_comfyui", "Restart ComfyUI");
+      go.addEventListener("click", () => {
+        void applyPanelUpdate({ kind: state.kind, button: go });
+      });
+      actionsRow.appendChild(go);
       const dismiss = document.createElement("button");
       dismiss.type = "button";
       dismiss.className = "cmcp-update-dismiss";
