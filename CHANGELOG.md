@@ -6,11 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.116] - 2026-08-27
+
 ### Fixed
 - panel_set_widget no longer queues a second whole `/object_info` behind a timed-out `api.getNodeDefs()`, so the type-scoped fallback can use the remaining command time on a large install (#1739)
 - retain verified add-node schema across a timed-out refresh (#1709)
 - a Registry publish of version X leaves tag vX on the commit that cut it, and changelog generation recognises `chore: release vX.Y.Z` so an untagged previous cut still bounds the next entry (#1882)
 - live-canvas capture no longer skips silently when Pinia `$subscribe` is missing (#1911)
+- disclose connect changes on nodes the command never named (#1928)
+
 
 ## [0.15.115] - 2026-08-27
 
