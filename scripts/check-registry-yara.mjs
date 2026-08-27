@@ -12,7 +12,7 @@
 //
 //   $socket3            .connect(            litegraph slot wiring
 //   $socket4            .bind(               JavaScript Function.prototype.bind
-//   $socket_stage_recv  .send( / .sendall(   WebSocket sends, loopback probe
+//   $socket_stage_recv  .send( / .sendall( / .recv(   socket traffic, EITHER DIRECTION
 //   $http5              aiohttp.ClientSession
 //
 // WHITESPACE IS ALLOWED BEFORE THE PAREN: web/changelog.json was flagged on the prose
@@ -41,7 +41,13 @@ const ALLOW = allowIdx >= 0 ? Number(process.argv[allowIdx + 1]) : 0;
 const RULES = [
   { id: "$socket3", re: /\.connect\s*\(/ },
   { id: "$socket4", re: /\.bind\s*\(/ },
-  { id: "$socket_stage_recv", re: /\.send(?:all)?\s*\(/ },
+  // READS COUNT TOO. v0.15.111 flagged __init__.py on this rule anchored at
+  // `chunk = probe.recv(4096)` — after the only .sendall( calls in that file had been
+  // refactored away. The rule's own NAME says recv; we all read it as "send" and the
+  // replica under-reported for it. `send`/`sendall`/`recv` are evidenced by real
+  // verdicts; `sendto`/`recvfrom`/`recv_into` are included as the conservative
+  // superset, because this gate must fail CLOSED — a miss ships a flagged release.
+  { id: "$socket_stage_recv", re: /\.(?:send(?:all|to)?|recv(?:from|_into)?)\s*\(/ },
   { id: "$http5", re: /aiohttp\s*\.\s*ClientSession/ },
 ];
 
