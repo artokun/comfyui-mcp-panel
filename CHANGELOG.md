@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.108] - 2026-08-26
+
+### Fixed
+- reconcile generated changelog sections and release-history guards (#1891, #1894)
+
 ## [0.15.107] - 2026-08-26
 
 ### Fixed
