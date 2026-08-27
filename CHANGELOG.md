@@ -6,9 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.115] - 2026-08-27
+
 ### Fixed
 - keep `is_subgraph` on oversized-node detail stubs so wide root nodes stay writable (artokun/comfyui-mcp#2436)
 - panel_unpack_subgraph no longer crashes when a subgraph rail serialises the same link id twice (#1938)
+
 
 ## [0.15.114] - 2026-08-27
 
