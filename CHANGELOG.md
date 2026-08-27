@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- re-vendor the tool vocabulary so connect no longer permanently warns about a hash no comfyui-mcp build produces (#1927)
+
 ## [0.15.113] - 2026-08-27
 
 ### Fixed
