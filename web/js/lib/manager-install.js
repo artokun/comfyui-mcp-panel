@@ -801,14 +801,32 @@ export function parseObjectInfoSearch(objectInfo, query, limit) {
  * (the panel wires the live /object_info fetch) so this stays unit-testable, and
  * NEVER throws — any /object_info failure degrades to managerUnavailableResult.
  */
-export async function objectInfoSearchFallback(objectInfoGet, query, limit, err) {
+export async function objectInfoSearchFallback(
+  objectInfoGet,
+  query,
+  limit,
+  err,
+  requestSignal,
+  timeoutMs,
+  budgetSignal,
+  callerSignal,
+) {
+  const effectiveCallerSignal = callerSignal ?? (budgetSignal ? undefined : requestSignal);
+  throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+  if (isAbortLikeError(err)) throw err;
   if (typeof objectInfoGet !== "function") return managerUnavailableResult(query, err);
   let info;
   try {
-    info = await objectInfoGet();
-  } catch {
+    info = await objectInfoGet(requestSignal ? { signal: requestSignal } : undefined);
+  } catch (fallbackErr) {
+    throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+    if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+    if (isAbortLikeError(fallbackErr)) throw fallbackErr;
     return managerUnavailableResult(query, err);
   }
+  throwIfManagerSearchCallerAborted(effectiveCallerSignal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
   const parsed = parseObjectInfoSearch(info, query, limit);
   if (!parsed.count) return managerUnavailableResult(query, err);
   const result = {
@@ -840,6 +858,7 @@ export async function objectInfoSearchFallback(objectInfoGet, query, limit, err)
  * result the caller can branch on. Issues #251/#255.
  */
 export function managerUnavailableResult(query, err) {
+  const timedOut = err?.managerSearchTimedOut === true;
   return {
     supported: false,
     managerReachable: false,
@@ -847,13 +866,67 @@ export function managerUnavailableResult(query, err) {
     results: [],
     query: query == null ? "" : String(query),
     reason: String(err?.message ?? err ?? "ComfyUI-Manager not reachable"),
-    message:
-      "Node-registry search is unavailable: the built-in ComfyUI-Manager could not " +
-      "be reached on this ComfyUI (it may be disabled, or a legacy/partial Manager " +
-      "build without the search endpoint). Enable the built-in Manager to search the " +
-      "registry, or continue with the nodes already installed — inspect them with " +
-      "panel_list_nodes and the current graph with panel_query_graph.",
+    message: timedOut
+      ? "Node-registry search timed out before ComfyUI-Manager replied. No canvas " +
+        "workflow was changed. Retry the search; if the Manager remains slow or " +
+        "unresponsive, enable/check the built-in Manager and continue with nodes " +
+        "already installed via panel_list_nodes or the current graph via " +
+        "panel_query_graph."
+      : "Node-registry search is unavailable: the built-in ComfyUI-Manager could not " +
+        "be reached on this ComfyUI (it may be disabled, or a legacy/partial Manager " +
+        "build without the search endpoint). Enable the built-in Manager to search the " +
+        "registry, or continue with the nodes already installed — inspect them with " +
+        "panel_list_nodes and the current graph with panel_query_graph.",
   };
+}
+
+/** #1908 — Manager search is a canvas-independent read, but its command still
+ * returns through the browser tab that received it. Only the explicit internal
+ * budget is converted into a bounded, actionable result. Caller cancellation
+ * remains an AbortError so callers can stop the operation without it looking like
+ * a successful, structured Manager timeout. */
+function managerSearchTimedOutResult(query, timeoutMs) {
+  const err = new Error(
+    `ComfyUI-Manager node search timed out after ${timeoutMs ?? 15000} ms; no reply arrived.`,
+  );
+  err.managerSearchTimedOut = true;
+  return managerUnavailableResult(query, err);
+}
+
+function isAbortLikeError(err) {
+  return err?.name === "AbortError" || err?.name === "TimeoutError";
+}
+
+function managerSearchAbortError() {
+  return Object.assign(new Error("The Manager node search was cancelled"), {
+    name: "AbortError",
+  });
+}
+
+function throwIfManagerSearchCallerAborted(signal) {
+  if (signal?.aborted) throw signal.reason ?? managerSearchAbortError();
+}
+
+/** Compose the caller's cancellation with the internal budget for transport, while
+ * keeping the two source signals separate for result classification. */
+function managerSearchRequestSignal(callerSignal, budgetSignal) {
+  if (!callerSignal) return budgetSignal;
+  if (!budgetSignal) return callerSignal;
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") {
+    return AbortSignal.any([callerSignal, budgetSignal]);
+  }
+  const controller = new AbortController();
+  const forward = (source) => {
+    if (source.aborted) {
+      controller.abort(source.reason);
+      return true;
+    }
+    source.addEventListener("abort", () => controller.abort(source.reason), { once: true });
+    return false;
+  };
+  if (forward(callerSignal)) return controller.signal;
+  forward(budgetSignal);
+  return controller.signal;
 }
 
 /**
@@ -988,22 +1061,42 @@ export function emptyCatalogueResult(query) {
 export async function searchNodesVia(
   managerGet,
   managerCall,
-  { query, limit, objectInfoGet } = {},
+  { query, limit, objectInfoGet, signal, budgetSignal, timeoutMs } = {},
 ) {
   const route = "customnode/getmappings?mode=cache";
+  const requestSignal = managerSearchRequestSignal(signal, budgetSignal);
+  const requestOptions = requestSignal ? { signal: requestSignal } : undefined;
+  throwIfManagerSearchCallerAborted(signal);
   let data;
   try {
-    data = await managerGet(route);
+    data = await managerGet(route, requestOptions);
   } catch (err) {
+    throwIfManagerSearchCallerAborted(signal);
+    if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+    if (isAbortLikeError(err)) throw err;
     if (!isManagerUnreachable(err)) throw err;
     try {
-      data = await managerCall(route);
+      data = await managerCall(route, requestOptions);
     } catch (err2) {
+      throwIfManagerSearchCallerAborted(signal);
+      if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+      if (isAbortLikeError(err2)) throw err2;
       if (isManagerUnreachable(err2))
-        return objectInfoSearchFallback(objectInfoGet, query, limit, err2);
+        return objectInfoSearchFallback(
+          objectInfoGet,
+          query,
+          limit,
+          err2,
+          requestSignal,
+          timeoutMs,
+          budgetSignal,
+          signal,
+        );
       throw err2;
     }
   }
+  throwIfManagerSearchCallerAborted(signal);
+  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
   const parsed = parseNodeMappings(data, query, limit);
   // #808 — an EMPTY catalogue is not a no-match, and only this branch can tell the
   // caller so. Checked on `catalogue_size` (packs the payload carried) rather than

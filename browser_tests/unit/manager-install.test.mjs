@@ -1603,6 +1603,180 @@ test("#251/#255 a non-unreachable error from the absolute fallback also propagat
   );
 });
 
+// ---------------------------------------------------------------------------
+// #1908 — nodes_search is a canvas-independent read, but its reply still has
+// to travel through the panel tab that received the command. The production
+// handler therefore gives the complete Manager probe/fallback ladder one
+// budget below the bridge's 20s read deadline and passes its AbortSignal down
+// to every request. A stalled Manager must become a structured answer, not a
+// misleading "bound canvas tab did not reply" timeout.
+// ---------------------------------------------------------------------------
+
+function loadNodesSearchHandler({ budgetMs, managerGet, managerCall, fetchObjectInfo }) {
+  const panelPath = fileURLToPath(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+  );
+  const src = readFileSync(panelPath, "utf8");
+  const fnMatch = src.match(/async nodes_search\(\{ query, limit \}\) \{[\s\S]*?\n  \},/);
+  assert.ok(fnMatch, "could not locate the production nodes_search handler");
+  const body = fnMatch[0].replace(/,\s*$/, "");
+  const factory = new Function(
+    "searchNodesVia",
+    "managerGet",
+    "managerCall",
+    "fetchObjectInfo",
+    "AbortSignal",
+    "NODES_SEARCH_COMMAND_BUDGET_MS",
+    `const handler = { ${body} }; return handler.nodes_search;`,
+  );
+  return factory(
+    searchNodesVia,
+    managerGet,
+    managerCall,
+    fetchObjectInfo,
+    AbortSignal,
+    budgetMs,
+  );
+}
+
+test("#1908 the production nodes_search handler answers a stalled Manager inside the bridge window", async () => {
+  let managerCallUsed = false;
+  const abortError = () => Object.assign(new Error("Manager request aborted"), { name: "AbortError" });
+  const managerGet = async (_route, { signal } = {}) =>
+    new Promise((_, reject) => {
+      // AbortSignal.timeout() uses an unref'd timer in Node. Keep this mock's
+      // worker alive with a short ref'd fallback, but clear it as soon as the
+      // production budget signal aborts so the test does not leave a timer
+      // behind. If the production budget is not wired, fail with a DISTINCT
+      // non-abort error; otherwise a generic AbortError-to-timeout conversion
+      // could make this test pass without the internal budget firing.
+      let fallbackTimer;
+      const abort = () => {
+        clearTimeout(fallbackTimer);
+        reject(abortError());
+      };
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+      fallbackTimer = setTimeout(
+        () => reject(new Error("test fallback fired before the internal budget")),
+        250,
+      );
+    });
+  const managerCall = async () => {
+    managerCallUsed = true;
+    throw new Error("legacy fallback must not run after the search budget aborts");
+  };
+  const nodesSearch = loadNodesSearchHandler({
+    budgetMs: 25,
+    managerGet,
+    managerCall,
+    fetchObjectInfo: async () => {
+      throw new Error("object_info fallback must not run after the search budget aborts");
+    },
+  });
+
+  const started = Date.now();
+  const result = await nodesSearch({ query: "MiniMaxH3UnifiedToVideo" });
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 1000, `stalled search must settle promptly, took ${elapsed} ms`);
+  assert.equal(managerCallUsed, false, "an exhausted search budget must not start another route");
+  assert.equal(result.supported, false);
+  assert.equal(result.managerReachable, false);
+  assert.equal(result.query, "MiniMaxH3UnifiedToVideo");
+  assert.match(result.reason, /timed out/i);
+  assert.match(result.message, /No canvas workflow was changed/i);
+  assert.match(result.message, /Retry/i);
+});
+
+test("#1908 searchNodesVia forwards one caller signal through the legacy fallback", async () => {
+  const controller = new AbortController();
+  let receivedSignal;
+  const managerGet = async () => {
+    throw UNREACHABLE;
+  };
+  const managerCall = async (_route, { signal } = {}) => {
+    receivedSignal = signal;
+    return GETMAPPINGS_MAP;
+  };
+  const result = await searchNodesVia(managerGet, managerCall, {
+    query: "BiRefNet",
+    signal: controller.signal,
+    timeoutMs: 15000,
+  });
+
+  assert.equal(receivedSignal, controller.signal);
+  assert.equal(result.count, 1);
+  assert.equal(result.results[0].title, "ComfyUI-RMBG");
+});
+
+test("#1908 caller cancellation rejects instead of becoming the internal timeout result", async () => {
+  const controller = new AbortController();
+  const abortError = () =>
+    Object.assign(new Error("caller stopped the node search"), { name: "AbortError" });
+  const managerGet = async (_route, { signal } = {}) =>
+    new Promise((_, reject) => {
+      const abort = () => reject(signal?.reason ?? abortError());
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  const managerCall = async () => {
+    throw new Error("legacy fallback must not run after caller cancellation");
+  };
+
+  const pending = searchNodesVia(managerGet, managerCall, {
+    query: "caller-cancelled",
+    signal: controller.signal,
+    timeoutMs: 25,
+  });
+  controller.abort(abortError());
+
+  await assert.rejects(
+    pending,
+    (err) => {
+      assert.equal(err.name, "AbortError");
+      assert.match(err.message, /caller stopped/);
+      assert.equal(err.managerSearchTimedOut, undefined);
+      return true;
+    },
+    "caller cancellation must remain a rejection",
+  );
+});
+
+test("#1908 caller cancellation through /object_info fallback rejects instead of timing out", async () => {
+  const controller = new AbortController();
+  const abortError = () =>
+    Object.assign(new Error("caller stopped the installed-node fallback"), { name: "AbortError" });
+  const unreachable = async () => {
+    throw UNREACHABLE;
+  };
+  const objectInfoGet = async ({ signal } = {}) =>
+    new Promise((_, reject) => {
+      const abort = () => reject(signal?.reason ?? abortError());
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+
+  const pending = searchNodesVia(unreachable, unreachable, {
+    query: "caller-cancelled-installed-fallback",
+    objectInfoGet,
+    signal: controller.signal,
+    timeoutMs: 25,
+  });
+  controller.abort(abortError());
+
+  await assert.rejects(
+    pending,
+    (err) => {
+      assert.equal(err.name, "AbortError");
+      assert.match(err.message, /installed-node fallback/);
+      assert.equal(err.managerSearchTimedOut, undefined);
+      return true;
+    },
+    "caller cancellation must remain a rejection through object_info",
+  );
+});
+
 test("parseNodeMappings handles array + map shapes and caps the limit", () => {
   const arr = [
     { id: "a/one", title: "One", description: "first" },
