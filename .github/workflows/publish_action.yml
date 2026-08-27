@@ -264,14 +264,36 @@ jobs:
           js = open("web/js/comfyui-mcp-panel.js", encoding="utf-8").read()
           m = re.search(r'const PANEL_VERSION = "([^"]+)"', js)
           assert m, "PANEL_VERSION constant not found in web/js/comfyui-mcp-panel.js"
-          # Three-way, for the reason spelled out in ci.yml: pyproject and PANEL_VERSION are
-          # written by the same script, so comparing just those two cannot detect that the
-          # script never ran. package.json is the independent witness.
+          # The three original witnesses have the reason spelled out in ci.yml: pyproject and
+          # PANEL_VERSION are written by the same script, so comparing just those two cannot
+          # detect that the script never ran. package.json is the independent witness, and the
+          # rendered changelog is the fourth witness because it is what the panel displays.
           pkg = json.load(open("package.json", encoding="utf-8")).get("version")
-          seen = {"package.json": pkg, "pyproject.toml": proj["version"], "PANEL_VERSION": m.group(1)}
+          try:
+              rendered = json.load(open("web/changelog.json", encoding="utf-8"))
+          except (OSError, ValueError) as error:
+              sys.exit(f"VERSION MISMATCH: web/changelog.json is unreadable — {error}")
+          releases = rendered.get("releases") if isinstance(rendered, dict) else None
+          rendered_version = (
+              releases[0].get("version")
+              if isinstance(releases, list)
+              and releases
+              and isinstance(releases[0], dict)
+              and isinstance(releases[0].get("version"), str)
+              else None
+          )
+          # web/changelog.json is the rendered artefact the panel actually ships and displays.
+          # Its newest record is a fourth witness: a release can leave all three version files
+          # coherent while still shipping notes that stop one version short (#1899).
+          seen = {
+              "package.json": pkg,
+              "pyproject.toml": proj["version"],
+              "PANEL_VERSION": m.group(1),
+              "web/changelog.json": rendered_version,
+          }
           if len(set(seen.values())) != 1:
               sys.exit("VERSION MISMATCH: " + ", ".join(f"{k}={v}" for k, v in seen.items()) + " — run scripts/set-version.mjs")
-          print(f"publishing {proj['name']} {proj['version']} (package.json + JS PANEL_VERSION match)")
+          print(f"publishing {proj['name']} {proj['version']} (all four release version witnesses match)")
           PY
       # --------------------------------------------------------------------
 
