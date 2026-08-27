@@ -583,6 +583,7 @@ import {
   installActivePointerWatch,
   POINTER_WATCH_UNAVAILABLE_NOTICE,
 } from "./lib/live-canvas-capture-gate.js";
+import { decideBoundRestart, normalizeBoundOrigin } from "./lib/bound-restart-witness.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
 import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "./lib/settle-open-readable.js";
@@ -13215,16 +13216,21 @@ let repaintHistoryList = null;
  * two were different.
  *
  * The panel is the one component that knows this for certain: it runs INSIDE the
- * ComfyUI it reboots. `comfyuiUrlForAgent()` is deliberately the SAME value handed to
- * the orchestrator in `hello`, so the identity a caller compares against its own
- * target cannot drift from the one it was told to target.
+ * ComfyUI it reboots. #1913: the host it names is the bound canvas origin (the
+ * page that is about to go down), NOT the hello / Remote-URL override — that
+ * override is what the orchestrator should *talk to*, and naming it on a reboot
+ * of a different origin is a confident wrong answer (panel 8189, boot 8188).
  *
  * A plain function, NOT a method on the executors table: dispatch invokes
  * `executor(msg)` with no receiver, so `this` is undefined in a module and a method
  * call here would throw instead of rebooting.
  */
+function rebootBoundOrigin() {
+  return normalizeBoundOrigin(pageComfyOrigin());
+}
+
 /**
- * The same identity, for prose (#851).
+ * The same identity, for prose (#851 / #1913).
  *
  * `target` is for a caller comparing hosts; these strings are what a HUMAN reads,
  * and "could not reach any reboot endpoint" that cannot say WHICH server it failed
@@ -13232,12 +13238,12 @@ let repaintHistoryList = null;
  * unknown, rather than naming a blank one.
  */
 function rebootTargetLabel(prefix) {
-  const target = comfyuiUrlForAgent();
+  const target = rebootBoundOrigin();
   return target ? prefix + " on " + target : prefix;
 }
 
 function rebootTargetFields() {
-  const target = comfyuiUrlForAgent();
+  const target = rebootBoundOrigin();
   return target ? { target } : {};
 }
 
@@ -26181,6 +26187,24 @@ const GRAPH_TOOL_EXECUTORS = {
   async comfy_reboot({ force } = {}) {
     // Restart the ComfyUI server (to load newly installed nodes). ComfyUI and the
     // orchestrator go down briefly; the panel auto-reconnects + resumes after.
+    // #1913 — route through the origin bound to THIS canvas. A live bridge
+    // (this command arrived on it) or an open backend socket is the instance
+    // witness; without one, bound ≠ boot is not dispatched. The POST below
+    // stays relative to the page host, never the boot URL.
+    const boundDecision = decideBoundRestart({
+      boundOrigin: rebootBoundOrigin(),
+      bootTarget: remoteUrlSetting(),
+      bridgeConnected: true,
+      witnessAlive: comfyBackendSocketReadyState() === 1,
+    });
+    if (boundDecision.kind !== "reboot_bound") {
+      return {
+        rebooting: false,
+        refused: true,
+        ...rebootTargetFields(),
+        error: boundDecision.note,
+      };
+    }
     // GUARD: a reboot ABORTS any in-progress/queued generation. Don't silently kill
     // a render the user is waiting on — check the queue first and refuse (with a
     // clear message the agent relays) unless force:true.
