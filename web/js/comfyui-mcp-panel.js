@@ -7958,7 +7958,10 @@ async function managerV2(route, { method = "GET", body, signal } = {}) {
   try {
     res = await api.fetchApi(`/v2/${route}`, {
       method,
-      ...(signal ? { signal } : {}),
+      // #1908 — keep every Manager request inside both its per-fetch cap and
+      // the caller's overall search budget. Otherwise a legacy fallback can
+      // outlive the bridge reply window while the panel handler is awaiting it.
+      signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]),
       ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
     });
   } catch (err) {
@@ -8037,7 +8040,10 @@ async function managerCall(route, { method = "GET", body, signal } = {}) {
   try {
     res = await api.fetchApi(`/${route}`, {
       method,
-      ...(signal ? { signal } : {}),
+      // #1908 — the absolute legacy retry needs the same bounded transport as
+      // the dialect-routed request; a missing signal here can leave nodes_search
+      // waiting after the panel bridge has given up.
+      signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]),
       ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
     });
   } catch (err) {
@@ -8162,6 +8168,11 @@ async function reProbeManagerDialect({ signal } = {}) {
  *  never hang the install path (codex round 2 #5 — probes, install, start,
  *  status, list are ALL bounded). */
 const MANAGER_FETCH_TIMEOUT_MS = 15000;
+
+// #1908 — the bridge's default read reply window is 20s. Settle nodes_search
+// before that deadline even when Manager does not answer, leaving room for the
+// structured result to travel back over the same socket.
+const NODES_SEARCH_COMMAND_BUDGET_MS = 15000;
 
 /** #671 — ONE budget for the WHOLE nodes_install command (dialect detect →
  *  submit → queue/start → verify). The orchestrator relays nodes_install with a
@@ -8349,10 +8360,10 @@ async function resolveManagerUpdateTarget(requestedId) {
  *  for nodes_list when Manager is unreachable. Bounded by the shared Manager
  *  timeout; throws on any non-ok / parse failure (the Via fallbacks swallow it
  *  and degrade). */
-async function fetchObjectInfo() {
+async function fetchObjectInfo({ signal } = {}) {
   const res = await api.fetchApi("/object_info", {
     method: "GET",
-    signal: AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS),
+    signal: anyAbortSignal([AbortSignal.timeout(MANAGER_FETCH_TIMEOUT_MS), signal]),
   });
   if (!res || !res.ok) throw new Error(`/object_info HTTP ${res ? res.status : "no response"}`);
   const txt = await res.text();
@@ -25337,6 +25348,12 @@ const GRAPH_TOOL_EXECUTORS = {
 
   // --- Custom-node management via the BUILT-IN ComfyUI Manager (/v2 API) ----
   async nodes_search({ query, limit }) {
+    // #1908: Manager search is a canvas-independent read, but its reply still
+    // travels through the browser tab that received this command. Bound the
+    // complete probe/fallback ladder below the bridge's 20s read deadline so a
+    // missing Manager response becomes an actionable result instead of a
+    // misleading "bound canvas tab did not reply" timeout.
+    //
     // #251/#255: degrade gracefully against an unreachable / legacy Manager
     // instead of surfacing a raw throw that blocks the whole install-discovery
     // flow. searchNodesVia tries the dialect-routed GET, retries the ABSOLUTE
@@ -25347,7 +25364,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // ComfyUI's /object_info (#426) so a legacy/disabled Manager still returns
     // usable, already-installed matches; on a miss it returns the structured
     // {supported:false,…} capability result.
-    return searchNodesVia(managerGet, managerCall, { query, limit, objectInfoGet: fetchObjectInfo });
+    const signal = AbortSignal.timeout(NODES_SEARCH_COMMAND_BUDGET_MS);
+    return searchNodesVia(managerGet, managerCall, {
+      query,
+      limit,
+      signal,
+      timeoutMs: NODES_SEARCH_COMMAND_BUDGET_MS,
+      objectInfoGet: fetchObjectInfo,
+    });
   },
 
   async nodes_list(args = {}) {
