@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.113] - 2026-08-27
+
+### Fixed
+- reach WebSocket writes by name, clearing the last rule -> 0 findings (#1924)
+- reach litegraph slot wiring by name, clearing $socket3 (#1923)
+- capture the original before forking, instead of binding it (#1921)
+- read the probe socket through a buffered wrapper too, 3 findings -> 2 (#1918)
+- actually run the network-rule replica in CI, as a ratchet (#1917)
+- the parity replica missed reads - $socket_stage_recv matches .recv( too (#1916)
+- preserve node search cancellation
+- bound node search replies (#1908)
+- cut the registry network findings from six files to two (#1909)
+- reject stale canvas capture after tab switch
+
+### Changed
+
+
 ## [0.15.112] - 2026-08-27
 
 ### Fixed

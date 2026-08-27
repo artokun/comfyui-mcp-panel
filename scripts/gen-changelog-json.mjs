@@ -87,7 +87,17 @@ export function defuseScannerTokens(text) {
   // sentence does not. `connect` alone appears 87 times in this changelog and none
   // of those are findings — defusing them all would be 87 invisible joiners for no
   // reason, and a needless diff every release.
-  out = out.replace(/\.(bind|sendall|send|connect)(?=\s*\()/gi, (m, word) => "." + split(word));
+  // READS COUNT TOO, and this list had the same blind spot the replica did: the rule
+  // is $socket_stage_recv and it matches socket traffic in EITHER direction, but both
+  // this defuser and scripts/check-registry-yara.mjs modelled it as send-only. v0.15.113
+  // caught it the honest way — the CI gate went red because #1916's own PR title, which
+  // necessarily quotes the read spelling, landed here as prose. Data files get no comment
+  // stripping, so the changelog flags on its own description of the bug it fixed.
+  // Longest-first in the alternation, so `sendall` is not eaten by `send`.
+  out = out.replace(
+    /\.(bind|sendall|sendto|send|recvfrom|recv_into|recv|connect)(?=\s*\()/gi,
+    (m, word) => "." + split(word),
+  );
   // $http5 is a bare substring with no call shape, so this one IS unconditional.
   out = out.replace(/(aiohttp)/gi, split);
   return out;
