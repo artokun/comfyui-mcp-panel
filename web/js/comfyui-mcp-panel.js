@@ -386,7 +386,7 @@ import {
   releaseReconnectScopePin,
 } from "./lib/reconnect-scope-fence.js";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
-import { reconcileFreshDynamicWidgets } from "./lib/dynamic-widget-reconcile.js";
+import { reconcileFreshDynamicWidgets, reconcileGraphDynamicWidgets } from "./lib/dynamic-widget-reconcile.js";
 import {
   createDeferredWidgetEditQueue,
   deferredWidgetQueueCounts,
@@ -4192,6 +4192,22 @@ function installCreateBoundaryFork(appRef) {
         // Never let disclosure bookkeeping break a graph load either.
       }
       const result = orig(graphData, clean, restoreView, workflow, options);
+      // #1931 — SaveVideo (and any other nested DynamicCombo) can land from a saved
+      // workflow already carrying a bare orphan next to the real dotted child
+      // (`codec` AND `format.codec`). add_node and load share the same materialiser;
+      // run it after the graph is live. `typeof` keeps extracted-fork tests, which
+      // do not bind this helper, from throwing on an unresolved identifier.
+      const reconcileLoaded = () => {
+        try {
+          if (typeof reconcileGraphDynamicWidgets === "function") {
+            reconcileGraphDynamicWidgets(appRef?.graph);
+          }
+        } catch {
+          // Post-load dynamic-widget cleanup must never break a graph load.
+        }
+      };
+      if (result && typeof result.then === "function") result.then(reconcileLoaded, () => {});
+      else reconcileLoaded();
       if (ownerlessStampUuid) {
         // #349 r3/r6 P0 — a creation-minted tag must NEVER float ownerless when
         // its receiving tab can be PROVEN — but registration must never guess.
@@ -15691,9 +15707,10 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.add(node);
       // COMFY_DYNAMICCOMBO_V3 first runs its value setter while LG.createNode is still
       // detached from a graph. Replay it after registration so the widget-value store and
-      // dynamic rows match the fresh node. A schema-verified stale path such as
-      // `format.codec` is routed through the current `codec` root so the frontend's own
-      // widget/store cleanup removes it.
+      // dynamic rows match the fresh node. Nested children stay on their dotted path
+      // (`format.codec`); a bare name that duplicates one (`codec`) and a schema-verified
+      // stale dotted residue are routed through the current dynamic root so the frontend's
+      // own widget/store cleanup removes them.
       const dynamicReconciliation = reconcileFreshDynamicWidgets(node, currentDef);
       if (dynamicReconciliation.failures.length) {
         const storeCleanup = dynamicReconciliation.cleanupStore?.() ?? { cleaned: true };
@@ -16064,6 +16081,11 @@ const GRAPH_TOOL_EXECUTORS = {
         // canvas too, and must be as undoable as any other graph edit this turn.
         captureGraphSnapshot(null, "before loading an API-format workflow");
         await app.loadApiJson(apiClone, "graph_load.json");
+        try {
+          reconcileGraphDynamicWidgets(app?.graph);
+        } catch {
+          // Post-load dynamic-widget cleanup must never break a graph load.
+        }
         if (typeof markWorkflowGraphProvenanceUnknown === "function") {
           markWorkflowGraphProvenanceUnknown(apiTargetWorkflow);
         }
@@ -16226,6 +16248,13 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error(
         "graph_load target workflow changed while restore retry was settling; the retry was skipped",
       );
+    }
+    // #1931 — a saved SaveVideo can restore both `format.codec` and a bare `codec`.
+    // Run after the configure retry so a late-built widget set is cleaned too.
+    try {
+      reconcileGraphDynamicWidgets(app?.graph);
+    } catch {
+      // Post-load dynamic-widget cleanup must never break a graph load.
     }
     // #874 remaining load path — SubgraphNode.configure seeds host rails from
     // INNER definition widgets, so a saved subgraph host lands at defaults
