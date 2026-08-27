@@ -11,6 +11,11 @@ import { settleOpenedWorkflowReadable } from "../../web/js/lib/settle-open-reada
 import { graphMutationReconnectGate } from "../../web/js/lib/reconnect-recovery.js";
 import { activeWorkflowPossiblyStale } from "../../web/js/lib/reconnect-staleness.js";
 import { classifyPinnedTarget } from "../../web/js/lib/workflow-chat-identity.js";
+import {
+  decideLiveCanvasCapture,
+  installActivePointerWatch,
+  POINTER_WATCH_UNAVAILABLE_NOTICE,
+} from "../../web/js/lib/live-canvas-capture-gate.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
@@ -100,7 +105,15 @@ function productionExecutor(methodName, environment) {
       `return { method: ${methodName}, guard: () => activeWorkflowReloadGuard(), ` +
       `proofs: () => ({ active: activeWorkflowResyncEpoch, post: postReconnectBindingProofEpoch }) };\n}`,
   );
-  const scope = new Proxy(environment, {
+  // Shipped #1911 helpers are the default so a production open eval drives the
+  // same gate the panel imports. A test may still override them.
+  const sandbox = {
+    decideLiveCanvasCapture,
+    installActivePointerWatch,
+    POINTER_WATCH_UNAVAILABLE_NOTICE,
+    ...environment,
+  };
+  const scope = new Proxy(sandbox, {
     has: () => true,
     get(target, key) {
       if (key === Symbol.unscopables) return undefined;
@@ -1120,4 +1133,103 @@ test("#887 workflow_open wires the settle probe before releasing its guards", ()
     /rebindFailed = new Error\([\s\S]*active canvas/,
     "an unstable result follows the fail-closed rebind path",
   );
+});
+
+test("#1911 production workflow_open without $subscribe captures already-current and discloses", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  let captures = 0;
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+    },
+  };
+  environment.activeWorkflowRef = () => target;
+  environment.app.extensionManager.workflow.openWorkflow = async () => {};
+  environment.describeLiveCanvasBinding = () => "bound";
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "no-subscribe-already-current" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(
+    captures,
+    1,
+    "already-current without a watcher still captures via the pre-watch proof — silent skip is the bug",
+  );
+  assert.equal(result.pointer_watch_unavailable, POINTER_WATCH_UNAVAILABLE_NOTICE);
+  assert.equal(panel.guard(), null);
+});
+
+test("#1911 production workflow_open without $subscribe skips switch capture, still flushes SOURCE, and discloses", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  let captures = 0;
+  let flushed = 0;
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+      throw new Error("switch capture without a watcher would be the #1215 poison");
+    },
+  };
+  environment.flushSourceCanvasBeforeSwitch = async () => {
+    flushed += 1;
+  };
+  environment.describeLiveCanvasBinding = () => "bound";
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "no-subscribe-switch" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(
+    flushed,
+    1,
+    "#1295 SOURCE flush must still run when the watcher cannot be installed",
+  );
+  assert.equal(
+    captures,
+    0,
+    "a tab switch without a pointer watch must not capture TARGET from SOURCE's canvas",
+  );
+  assert.equal(result.pointer_watch_unavailable, POINTER_WATCH_UNAVAILABLE_NOTICE);
+  assert.equal(panel.guard(), null);
+});
+
+test("#1911 production workflow_open uses the workflow service as $subscribe fallback", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  const previous = { path: "workflows/previous.json" };
+  let active = previous;
+  let captures = 0;
+  const subscribers = [];
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+    },
+  };
+  environment.activeWorkflowRef = () => active;
+  environment.describeLiveCanvasBinding = () => "bound";
+  environment.app.extensionManager.workflow.$subscribe = (subscriber) => {
+    subscribers.push(subscriber);
+    return () => {
+      const index = subscribers.indexOf(subscriber);
+      if (index >= 0) subscribers.splice(index, 1);
+    };
+  };
+  environment.app.extensionManager.workflow.openWorkflow = async () => {
+    active = target;
+  };
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "service-subscribe-fallback" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(
+    captures,
+    1,
+    "the workflow service $subscribe is a proven watch when Pinia lookup misses",
+  );
+  assert.equal(result.pointer_watch_unavailable, undefined);
+  assert.equal(subscribers.length, 0, "the fallback watch is cleaned up after the open");
+  assert.equal(panel.guard(), null);
 });
