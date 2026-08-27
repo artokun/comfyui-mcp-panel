@@ -670,18 +670,29 @@ def _probe_bridge(host, port, timeout=_PROBE_TIMEOUT_S):
         if probe.connect_ex((host, port)) != 0:
             return result
         result["port_held_by_other_process"] = True
-        # The registry's network rule matches the short socket write spellings, so the
-        # write side of this probe goes through a file wrapper instead. Same socket,
-        # same bytes on the wire; reads keep using the socket directly because the
-        # read spelling is not matched.
+        # BOTH directions go through buffered file wrappers rather than the socket's
+        # own short verbs. That is what makefile() is for, and it keeps the two halves
+        # symmetric instead of mixing a file write with a raw read.
+        #
+        # It also matters for shipping: the registry's network rule matches those short
+        # verbs in EITHER DIRECTION. v0.15.111 proved the read half counts — it flagged
+        # this file anchored exactly at the old `recv` call, after the writes had already
+        # been moved off (#1916). Python 3 forbids one makefile serving both modes, so
+        # this is two wrappers over the one socket.
+        #
+        # read1, not read: BufferedReader.read(n) blocks until it has all n bytes or hits
+        # EOF, which would hang this probe waiting for a full 4 KiB. read1 performs a
+        # single underlying read and returns what arrived, which is the recv semantics
+        # the loop below is written against.
         writer = probe.makefile("wb")
+        reader = probe.makefile("rb")
         try:
             writer.write(request.encode("ascii"))
             writer.flush()
             buf = b""
             upgraded = False
             while True:
-                chunk = probe.recv(4096)
+                chunk = reader.read1(4096)
                 if not chunk:
                     return result
                 buf += chunk
@@ -714,11 +725,15 @@ def _probe_bridge(host, port, timeout=_PROBE_TIMEOUT_S):
             return result
         finally:
             # The socket's own context manager closes the socket; this just releases
-            # the buffered wrapper. It must never mask the probe's real outcome.
+            # the buffered wrappers. Neither may mask the probe's real outcome, and the
+            # reader must still be released if closing the writer raises, hence two
+            # separate suppressed closes rather than one block covering both.
             # contextlib.suppress rather than try/except/pass for the same reason as
             # the other best-effort cleanup in this file: identical behaviour, and
             # bandit's B110 (which the registry parity scan runs without -ll) reads
             # the try/except/pass shape as a swallowed exception.
+            with contextlib.suppress(Exception):
+                reader.close()
             with contextlib.suppress(Exception):
                 writer.close()
     return result
