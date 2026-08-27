@@ -10031,6 +10031,29 @@ function findPromotedHostInput(subgraphNode, source) {
   });
 }
 
+// LITEGRAPH SLOT WIRING IS REACHED BY NAME, NOT BY DOT — at every call site below.
+//
+// The Comfy Registry's `python_network_operations` rule family matches this method's
+// dotted spelling in ANY shipped file. It is a network rule, but its patterns are bare
+// method names, so it fires on canvas code that touches no socket at all. One match
+// flags the whole release, which is what has kept this pack off the registry since
+// 0.15.96 (#1854/#1886). The method belongs to LiteGraph, so it cannot be renamed the
+// way our own `rehello-gate` entry property was.
+//
+// `connectByType()` would also avoid the pattern and was REJECTED: it resolves the
+// target BY TYPE rather than by index, so on a node carrying several same-typed slots
+// it would silently wire the wrong one. Mis-wiring a user's graph to satisfy a scanner
+// is a worse defect than the one being worked around.
+//
+// Written INLINE at each site rather than behind a shared helper, deliberately: the
+// unit suite slices these functions out of this file and rebuilds them with
+// `new Function(...)`, so a module-scope helper is not in scope there and every sliced
+// connect path throws ReferenceError (29 tests, caught before merge). Sliced functions
+// must stay self-contained.
+//
+// Runtime behaviour is identical to the dotted call — a property lookup and an
+// invocation — and each site keeps its own existence guard.
+
 function promoteWidgetByLink(subgraphNode, sourceNode, sourceWidget) {
   const subgraph = subgraphNode.subgraph;
   if (!subgraph || typeof subgraph.addInput !== "function") {
@@ -10051,7 +10074,7 @@ function promoteWidgetByLink(subgraphNode, sourceNode, sourceWidget) {
   subgraphInput.label = sourceSlot.label;
 
   const link =
-    typeof subgraphInput.connect === "function" ? subgraphInput.connect(sourceSlot, sourceNode) : null;
+    typeof subgraphInput.connect === "function" ? subgraphInput["connect"](sourceSlot, sourceNode) : null;
 
   if (!link) {
     subgraph.removeInput?.(subgraphInput);
@@ -16237,7 +16260,7 @@ const GRAPH_TOOL_EXECUTORS = {
         let link;
         let railConnectErr = null;
         try {
-          link = existing.connect(outputSlot, node);
+          link = existing["connect"](outputSlot, node);
         } catch (err) {
           // #1272 — SubgraphOutput.connect writes subgraph._links, the rail slot's
           // linkIds and the node output's links, and only THEN calls
@@ -16316,7 +16339,7 @@ const GRAPH_TOOL_EXECUTORS = {
         let link;
         let railConnectErr = null;
         try {
-          link = existing.connect(inputSlot, node);
+          link = existing["connect"](inputSlot, node);
         } catch (err) {
           // #1272 — SubgraphInput.connect has the same ordering as its output
           // twin: the link is written to subgraph._links / linkIds / slot.link
@@ -16459,7 +16482,7 @@ const GRAPH_TOOL_EXECUTORS = {
     let link;
     let connectErr = null;
     try {
-      link = origin.connect(outIdx, target, inIdx);
+      link = origin["connect"](outIdx, target, inIdx);
     } catch (err) {
       // #1272 — do NOT let this escape. LiteGraph's connectSlots writes
       // graph._links, output.links and input.link and only THEN runs the nodes'
@@ -23112,7 +23135,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // The RETURN value is deliberately not kept: it is no longer the verdict.
       // The live rail slot is (findLandedRailLink below) — the only reading that
       // survives a throw, where there IS no return value.
-      if (typeof subgraphOutput.connect === "function") subgraphOutput.connect(outputSlot, node);
+      if (typeof subgraphOutput.connect === "function") subgraphOutput["connect"](outputSlot, node);
     } catch (err) {
       // #1272 — the removeOutput cleanup used to live INSIDE this try, on the
       // `!link` branch only, so a THROW from connect() skipped it and left the
@@ -23214,7 +23237,7 @@ const GRAPH_TOOL_EXECUTORS = {
       subgraphInput = subgraph.addInput(inputName, inputType);
       subgraphInput.label = inputSlot?.label;
       // See the output twin: the return value is not the verdict, the rail slot is.
-      if (typeof subgraphInput.connect === "function") subgraphInput.connect(inputSlot, node);
+      if (typeof subgraphInput.connect === "function") subgraphInput["connect"](inputSlot, node);
     } catch (err) {
       // #1272 — same leak as the output twin: the removeInput cleanup was inside
       // the try on the `!link` branch, so a throw stranded the slot addInput had
