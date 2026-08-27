@@ -578,6 +578,11 @@ import {
   trackerCaptureSuppressed,
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
+import {
+  decideLiveCanvasCapture,
+  installActivePointerWatch,
+  POINTER_WATCH_UNAVAILABLE_NOTICE,
+} from "./lib/live-canvas-capture-gate.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
 import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "./lib/settle-open-readable.js";
@@ -21021,6 +21026,10 @@ const GRAPH_TOOL_EXECUTORS = {
     const activePointerHistory = [];
     let activePointerWatchStop = null;
     let activePointerWatchAvailable = false;
+    // #1911 — set the moment the watch cannot be installed, so a success reply
+    // cannot silently omit the missing-capability notice even if the later
+    // capture gate is skipped (loaded-from-disk, rebindFailed, …).
+    let pointerWatchUnavailable = false;
     const observeActivePointer = () => {
       let current;
       try {
@@ -21059,18 +21068,21 @@ const GRAPH_TOOL_EXECUTORS = {
       // The workflow service is a Pinia store, but it is also the strict
       // frontend-contract surface. Reach Pinia through the panel's supported
       // store lookup so `$subscribe` is not mistaken for a workflow-service
-      // member by the contract scanner.
-      const workflowPiniaStore = getPiniaStore("workflow");
-      if (typeof workflowPiniaStore?.$subscribe === "function") {
-        const stop = workflowPiniaStore.$subscribe(observeActivePointer, { detached: true, flush: "sync" });
-        if (typeof stop === "function") {
-          activePointerWatchStop = stop;
-          activePointerWatchAvailable = true;
-        }
+      // member by the contract scanner. If that lookup misses, the helper
+      // tries the service object itself (it IS the store) without the scanner
+      // seeing `s.$subscribe` (#1911).
+      const installed = installActivePointerWatch(observeActivePointer, [
+        getPiniaStore("workflow"),
+        s,
+      ]);
+      if (installed.available) {
+        activePointerWatchStop = installed.stop;
+        activePointerWatchAvailable = true;
       }
     } catch {
       // Older workflow stores may not expose a usable synchronous subscription.
     }
+    if (!activePointerWatchAvailable) pointerWatchUnavailable = true;
     // The outer try/finally below covers failed lookup, refresh, probe, handshake,
     // lock acquisition, and every later return. The watch must never outlive this open.
     let activePointerEpochAtOpen = null;
@@ -21642,28 +21654,42 @@ const GRAPH_TOOL_EXECUTORS = {
           } catch {
             activeIdentityAtCapture = false;
           }
-          const activePointerProof =
-            activePointerWatchAvailable &&
+          // Pointer-stability proof WITHOUT the watch-available conjunct. #1911:
+          // folding "no watcher" into this flag made a missing `$subscribe` look
+          // like "the watcher saw a move" and skipped capture with no other branch.
+          const pointerProof =
             activePointerOpenTransitionProven &&
             activePointerEpochAtOpen !== null &&
             activePointerEpoch === activePointerEpochAtOpen &&
             activeIdentityAtCapture;
           const captureSourceProof =
             captureBinding === "bound" || (captureBinding !== "foreign" && !pointerMovedThisOpen);
+          // #1575 — a state THIS command just read off disk is authoritative, and the
+          // canvas mounted behind it is whatever the closed tab left there. Serializing
+          // that over the fresh state is the #1215/#968 poisoning through a new entry
+          // point, and it can preserve nothing: nothing has run against a just-loaded
+          // tracker, so it holds no node-written values (#874) for the capture to save.
+          // A moved active pointer is the same uncertainty even when the stale root
+          // carries this target's UUID: that tag is not independent canvas proof. Use
+          // the target tracker's own state after a tab switch and fail closed on the
+          // unproven capture rather than turning the previous canvas into this tab's
+          // state (#1639).
+          //
+          // #1911 — `$subscribe` absence is not that unproven capture; it is no
+          // information. The helper either uses the pre-watch already-current proof
+          // or skips a switch capture and DISCLOSES. Silent skip is the remaining
+          // #1215 path (SOURCE widget values surviving onto TARGET).
+          const captureDecision = decideLiveCanvasCapture({
+            watchAvailable: activePointerWatchAvailable,
+            openLoaded: openSettled?.loaded === true,
+            captureSourceProof,
+            pointerProof,
+            pointerMovedThisOpen,
+          });
+          if (captureDecision.disclose) pointerWatchUnavailable = true;
           if (
-            // #1575 — a state THIS command just read off disk is authoritative, and the
-            // canvas mounted behind it is whatever the closed tab left there. Serializing
-            // that over the fresh state is the #1215/#968 poisoning through a new entry
-            // point, and it can preserve nothing: nothing has run against a just-loaded
-            // tracker, so it holds no node-written values (#874) for the capture to save.
-            // A moved active pointer is the same uncertainty even when the stale root
-            // carries this target's UUID: that tag is not independent canvas proof. Use
-            // the target tracker's own state after a tab switch and fail closed on the
-            // unproven capture rather than turning the previous canvas into this tab's
-            // state (#1639).
             openSettled?.loaded !== true &&
-            activePointerProof &&
-            captureSourceProof
+            captureDecision.capture
           ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
@@ -22818,6 +22844,13 @@ const GRAPH_TOOL_EXECUTORS = {
               "you need to a NEW path first: a plain save would write the canvas over the " +
               "workflow you asked for, because the active identity already names that one.",
           }
+        : {}),
+      // #1911 — missing `$subscribe` is a capability gap, not "the watcher saw a
+      // move". Name it on the success reply the same way unproven_source_state
+      // names an untagged switch: a silent skip is how SOURCE widget values
+      // survive onto TARGET (#1215).
+      ...(pointerWatchUnavailable
+        ? { pointer_watch_unavailable: POINTER_WATCH_UNAVAILABLE_NOTICE }
         : {}),
     };
     } finally {
