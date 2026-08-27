@@ -82,49 +82,84 @@ import {
 // `image` combo; the registry this page loaded still holds the OLD shape.
 // ---------------------------------------------------------------------------
 
+const DYNAMIC_COMBO_V3 = "COMFY_DYNAMICCOMBO_V3";
+
+function saveVideoCodecSpec() {
+  return [
+    DYNAMIC_COMBO_V3,
+    {
+      options: [
+        { key: "auto", inputs: {} },
+        {
+          key: "h264",
+          inputs: {
+            required: {
+              encoding: [
+                DYNAMIC_COMBO_V3,
+                {
+                  options: [
+                    { key: "auto", inputs: {} },
+                    { key: "re-encode", inputs: { required: { crf: ["FLOAT", { default: 23 }] } } },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      ],
+    },
+  ];
+}
+
+/** #2254 schema: ordinary `format` plus required DynamicCombo `codec`. */
+function legacySaveVideoDef() {
+  return {
+    name: "SaveVideo",
+    input: {
+      required: {
+        video: ["VIDEO"],
+        filename_prefix: ["STRING", { default: "video/ComfyUI" }],
+        format: [["auto", "mp4"], { default: "auto" }],
+        codec: saveVideoCodecSpec(),
+      },
+    },
+    output: ["VIDEO"],
+  };
+}
+
+/** Current ComfyUI SaveVideo: `format` is the required DynamicCombo; `codec` is nested. */
+function nestedSaveVideoDef() {
+  return {
+    name: "SaveVideo",
+    input: {
+      required: {
+        video: ["VIDEO"],
+        filename_prefix: ["STRING", { default: "video/ComfyUI" }],
+        format: [
+          DYNAMIC_COMBO_V3,
+          {
+            options: [
+              { key: "auto", inputs: { required: { codec: saveVideoCodecSpec() } } },
+              { key: "mp4", inputs: { required: { codec: saveVideoCodecSpec() } } },
+            ],
+          },
+        ],
+      },
+      optional: { codec: saveVideoCodecSpec() },
+    },
+    output: ["VIDEO"],
+  };
+}
+
 /** The live backend /object_info. A fresh object each call, exactly like a fetch. */
-function backendObjectInfo() {
+function backendObjectInfo({ nestedFormat = false } = {}) {
   return {
     LoadImage: {
       name: "LoadImage",
       input: { required: { image: [["a.png", "b.png"], {}] } },
       output: ["IMAGE", "MASK"],
     },
-    SaveVideo: {
-      name: "SaveVideo",
-      input: {
-        required: {
-          video: ["VIDEO"],
-          filename_prefix: ["STRING", { default: "video/ComfyUI" }],
-          format: [["auto", "mp4"], { default: "auto" }],
-          codec: [
-            "COMFY_DYNAMICCOMBO_V3",
-            {
-              options: [
-                { key: "auto", inputs: {} },
-                {
-                  key: "h264",
-                  inputs: {
-                    required: {
-                      encoding: [
-                        "COMFY_DYNAMICCOMBO_V3",
-                        {
-                          options: [
-                            { key: "auto", inputs: {} },
-                            { key: "re-encode", inputs: { required: { crf: ["FLOAT", { default: 23 }] } } },
-                          ],
-                        },
-                      ],
-                    },
-                  },
-                },
-              ],
-            },
-          ],
-        },
-      },
-      output: ["VIDEO"],
-    },
+    SaveVideo: nestedFormat ? nestedSaveVideoDef() : legacySaveVideoDef(),
   };
 }
 
@@ -137,7 +172,7 @@ function staleLoadImageNodeData() {
   };
 }
 
-function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
+function makeComfy({ stale = true, dynamicSetterThrows = false, nestedFormat = false } = {}) {
   const widgetValueStore = new Map();
   const storeEvents = [];
   function widgetStoreKey(nodeId, widget) {
@@ -157,8 +192,39 @@ function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
   }
 
   let throwNextNativeSetter = dynamicSetterThrows;
-  function installNativeDynamicCombo(node, widget) {
+  function installNativeDynamicCombo(node, widget, spec) {
     let value = widget.value;
+    function rebuild() {
+      for (let index = node.widgets.length - 1; index >= 0; index--) {
+        const candidate = node.widgets[index];
+        if (candidate !== widget && candidate.name.startsWith(`${widget.name}.`)) {
+          candidate.onRemove?.();
+          deleteWidget(candidate.widgetId);
+          node.widgets.splice(index, 1);
+        }
+      }
+      for (let index = node.inputs.length - 1; index >= 0; index--) {
+        if (node.inputs[index].name.startsWith(`${widget.name}.`)) node.inputs.splice(index, 1);
+      }
+      const option = spec?.[1]?.options?.find((entry) => entry.key === value) ?? spec?.[1]?.options?.[0];
+      const required = option?.inputs?.required ?? {};
+      for (const [childName, childSpec] of Object.entries(required)) {
+        const childWidgetName = `${widget.name}.${childName}`;
+        const child = node.addWidget(
+          "combo",
+          childWidgetName,
+          Array.isArray(childSpec) && childSpec[0] === DYNAMIC_COMBO_V3
+            ? childSpec[1]?.options?.[0]?.key ?? "auto"
+            : childSpec?.[1]?.default ?? "auto",
+          null,
+          {},
+        );
+        if (Array.isArray(childSpec) && childSpec[0] === DYNAMIC_COMBO_V3) {
+          installNativeDynamicCombo(node, child, childSpec);
+        }
+        node.inputs.push({ name: childWidgetName, type: DYNAMIC_COMBO_V3, link: null });
+      }
+    }
     Object.defineProperty(widget, "value", {
       configurable: true,
       get() {
@@ -169,21 +235,11 @@ function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
         if (state) state.value = next;
         value = next;
         node.dynamicRebuilds.push(widget.name);
-        if (throwNextNativeSetter && node.graph && widget.name === "codec") {
+        if (throwNextNativeSetter && node.graph && (widget.name === "codec" || widget.name === "format")) {
           throwNextNativeSetter = false;
           throw new Error("native codec rebuild failed");
         }
-        for (let index = node.widgets.length - 1; index >= 0; index--) {
-          const candidate = node.widgets[index];
-          if (candidate !== widget && candidate.name.startsWith(`${widget.name}.`)) {
-            candidate.onRemove?.();
-            deleteWidget(candidate.widgetId);
-            node.widgets.splice(index, 1);
-          }
-        }
-        for (let index = node.inputs.length - 1; index >= 0; index--) {
-          if (node.inputs[index].name.startsWith(`${widget.name}.`)) node.inputs.splice(index, 1);
-        }
+        rebuild();
       },
     });
     widget.value = value;
@@ -205,7 +261,7 @@ function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
         null,
         {},
       );
-      installNativeDynamicCombo(node, widget);
+      installNativeDynamicCombo(node, widget, spec);
       return { widget };
     },
   };
@@ -249,6 +305,7 @@ function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
             registerWidget(widget, nodeId);
           };
           node.widgets.push(widget);
+          if (node.graph && node.id != null) widget.setNodeId(node.id);
           return widget;
         },
       };
@@ -259,11 +316,17 @@ function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
         else node.inputs.push({ name, type: declared });
       }
       if (type === "SaveVideo") {
-        // Current SaveVideo has ordinary `format` plus DynamicCombo `codec`. This is
-        // the stale row left by the old dynamic-format construction, before the node
-        // is registered and its current codec store exists.
-        node.addWidget("combo", "format.codec", "auto", null, {});
-        node.inputs.push({ name: "format.codec", type: "COMFY_DYNAMICCOMBO_V3", link: null });
+        if (nestedFormat) {
+          // Hidden/optional top-level `codec` — the #1931 orphan next to `format.codec`.
+          widgets.COMFY_DYNAMICCOMBO_V3(node, "codec", saveVideoCodecSpec());
+          node.inputs.push({ name: "codec", type: DYNAMIC_COMBO_V3, link: null });
+        } else {
+          // #2254: ordinary `format` plus DynamicCombo `codec`. This is the stale row
+          // left by the old dynamic-format construction, before the node is registered
+          // and its current codec store exists.
+          node.addWidget("combo", "format.codec", "auto", null, {});
+          node.inputs.push({ name: "format.codec", type: DYNAMIC_COMBO_V3, link: null });
+        }
       }
       return node;
     },
@@ -285,8 +348,8 @@ function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
   // makes this a DRIFT case rather than a freshly-installed-class case. Whether
   // the entry is the stale page-load one or already current is the scenario knob.
   void app.registerNodesFromDefs({
-    LoadImage: stale ? staleLoadImageNodeData() : backendObjectInfo().LoadImage,
-    SaveVideo: backendObjectInfo().SaveVideo,
+    LoadImage: stale ? staleLoadImageNodeData() : backendObjectInfo({ nestedFormat }).LoadImage,
+    SaveVideo: backendObjectInfo({ nestedFormat }).SaveVideo,
   });
 
   const graph = {
@@ -311,6 +374,31 @@ function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
   app.graphToPrompt = async () => {
     const node = graph._nodes.find((candidate) => candidate.type === "SaveVideo");
     if (!node) return { output: {} };
+    if (nestedFormat) {
+      if (
+        node.widgets.some((widget) => widget.name === "codec") ||
+        node.inputs.some((input) => input.name === "codec")
+      ) {
+        throw new Error("Dynamic widget doesn't exist on node");
+      }
+      const nested = node.widgets.find((widget) => widget.name === "format.codec");
+      if (!nested || !widgetValueStore.has(nested.widgetId)) {
+        throw new Error("format.codec widget store state is missing");
+      }
+      return {
+        output: {
+          [node.id]: {
+            class_type: "SaveVideo",
+            inputs: {
+              video: ["source", 0],
+              filename_prefix: node.widgets.find((widget) => widget.name === "filename_prefix")?.value,
+              format: node.widgets.find((widget) => widget.name === "format")?.value,
+              codec: nested.value,
+            },
+          },
+        },
+      };
+    }
     if (node.widgets.some((widget) => widget.name === "format.codec")) {
       throw new Error("Dynamic widget doesn't exist on node");
     }
@@ -333,7 +421,7 @@ function makeComfy({ stale = true, dynamicSetterThrows = false } = {}) {
     };
   };
 
-  return { app, LG, graph, registry, widgetValueStore, storeEvents };
+  return { app, LG, graph, registry, widgetValueStore, storeEvents, nestedFormat };
 }
 
 /** Build the SHIPPED graph_add_node with its collaborators injected. */
@@ -342,14 +430,15 @@ function realGraphAddNode(comfy, overrides = {}) {
   const context = { app, LG, graph, rootGraph: graph, workflow: { uuid: "wf" } };
   const refreshCalls = [];
 
+  const objectInfo = () => backendObjectInfo({ nestedFormat: comfy.nestedFormat === true });
   const api = {
     async getNodeDefs() {
-      return backendObjectInfo();
+      return objectInfo();
     },
     // ComfyUI's per-class route, faithful to its real shape: absence is `{}` with HTTP 200.
     async fetchApi(route) {
       const cls = decodeURIComponent(String(route).replace("/object_info/", ""));
-      const all = backendObjectInfo();
+      const all = objectInfo();
       const body = Object.prototype.hasOwnProperty.call(all, cls) ? { [cls]: all[cls] } : {};
       return { status: 200, json: async () => body };
     },
@@ -369,7 +458,7 @@ function realGraphAddNode(comfy, overrides = {}) {
     // Tests that need it to fail or to lie pass their own through overrides.
     refreshComfyNodeDefs: async (defs, opts) => {
       refreshCalls.push({ defs, opts });
-      await app.registerNodesFromDefs(defs ?? backendObjectInfo());
+      await app.registerNodesFromDefs(defs ?? objectInfo());
       return { refreshed: true };
     },
     summarizeNode: (node) => ({
@@ -619,4 +708,38 @@ test("#2254: a native dynamic setter throw refuses the add and leaves a retryabl
     true,
     "rollback cleanup deletes the original stale store key too",
   );
+});
+
+test("#1931: adding SaveVideo drops the orphan codec and keeps nested format.codec", async () => {
+  const comfy = makeComfy({ stale: false, nestedFormat: true });
+  const { graph_add_node } = realGraphAddNode(comfy);
+
+  const res = await graph_add_node({ class_type: "SaveVideo" });
+  const node = comfy.graph._nodes[0];
+
+  assert.equal(res.added.type, "SaveVideo");
+  assert.deepEqual(
+    node.widgets.map((widget) => widget.name).filter((name) => !name.includes("__cmcp_")),
+    ["filename_prefix", "format", "format.codec"],
+    "only the nested child exists after add",
+  );
+  assert.equal(node.inputs.some((input) => input.name === "codec"), false);
+  assert.equal(node.inputs.some((input) => input.name === "format.codec"), true);
+  assert.equal(
+    [...comfy.widgetValueStore.keys()].some((key) => /:(codec)$/.test(key)),
+    false,
+    "the orphan codec store entry is gone",
+  );
+  const prompt = await comfy.app.graphToPrompt();
+  assert.equal(prompt.output[node.id].inputs.format, "auto");
+  assert.equal(prompt.output[node.id].inputs.codec, "auto");
+});
+
+test("#1931: a duplicate format.codec AND codec set is not queueable before reconcile", async () => {
+  const comfy = makeComfy({ stale: false, nestedFormat: true });
+  const node = comfy.LG.createNode("SaveVideo");
+  comfy.graph.add(node);
+  assert.ok(node.widgets.some((widget) => widget.name === "format.codec"));
+  assert.ok(node.widgets.some((widget) => widget.name === "codec"));
+  await assert.rejects(comfy.app.graphToPrompt(), /Dynamic widget doesn't exist on node/);
 });
