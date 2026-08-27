@@ -16,6 +16,7 @@ import {
   PANEL_REGISTRY_URL,
   UPDATE_NOTICE_DISMISS_KEY,
   classifyClientContext,
+  decideUpdateNoticeAffordance,
   dismissToken,
   fetchPublishedPanelVersions,
   isDismissed,
@@ -25,6 +26,7 @@ import {
   parseRegistryNode,
   parseRegistryVersions,
   pickInstallableLatest,
+  readBrowserClientContext,
   resolveUpdateState,
   shouldOfferHostMutation,
   shouldSurfaceUpdateNotice,
@@ -45,14 +47,43 @@ const rel = (version, status = "NodeVersionStatusActive", changelog = "") => ({
 });
 
 // ---------------------------------------------------------------------------
-// Client context
+// Client context — #1943 / #1944
 // ---------------------------------------------------------------------------
 
+const DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0";
+const IPHONE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605";
+const ANDROID_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Mobile";
+const IPAD_UA = "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605";
+
+const LOCAL_HOSTS = ["localhost", "127.0.0.1", "127.0.0.2", "[::1]", "::1", "LOCALHOST", "panel.localhost"];
+
+const REMOTE_CLIENTS = [
+  { hostname: "192.168.1.10", userAgent: DESKTOP_UA, why: "LAN" },
+  { hostname: "10.0.0.5", userAgent: DESKTOP_UA, why: "LAN" },
+  { hostname: "172.16.0.2", userAgent: DESKTOP_UA, why: "LAN" },
+  { hostname: "comfy.local", userAgent: DESKTOP_UA, why: "mdns" },
+  { hostname: "gpu-box", userAgent: DESKTOP_UA, why: "hostname" },
+  { hostname: "", userAgent: DESKTOP_UA, why: "empty-origin" },
+  { hostname: "abc.trycloudflare.com", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "x.ngrok-free.app", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "x.ngrok.io", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "x.ngrok.app", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "foo.loca.lt", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "foo.localtunnel.me", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "host.tailscale.net", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "box.ts.net", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "access.cloudflareaccess.com", userAgent: DESKTOP_UA, why: "tunnel" },
+  { hostname: "127.0.0.1", userAgent: IPHONE_UA, why: "mobile-on-loopback" },
+  { hostname: "localhost", userAgent: ANDROID_UA, why: "mobile-on-loopback" },
+  { hostname: "localhost", userAgent: IPAD_UA, why: "mobile-on-loopback" },
+  { hostname: "abc.trycloudflare.com", userAgent: IPHONE_UA, why: "mobile-over-tunnel" },
+];
+
 test("#1943 loopback desktop is the local host client", () => {
-  for (const hostname of ["localhost", "127.0.0.1", "[::1]", "::1", "LOCALHOST"]) {
+  for (const hostname of LOCAL_HOSTS) {
     assert.equal(isLoopbackHostname(hostname), true, hostname);
     assert.equal(
-      classifyClientContext({ hostname, userAgent: "Mozilla/5.0 Chrome/120" }),
+      classifyClientContext({ hostname, userAgent: DESKTOP_UA }),
       "local",
       hostname,
     );
@@ -62,7 +93,7 @@ test("#1943 loopback desktop is the local host client", () => {
 test("#1943 a LAN, hostname, or empty origin is remote", () => {
   for (const hostname of ["192.168.1.10", "10.0.0.5", "172.16.0.2", "comfy.local", "gpu-box", ""]) {
     assert.equal(
-      classifyClientContext({ hostname, userAgent: "Mozilla/5.0 Chrome/120" }),
+      classifyClientContext({ hostname, userAgent: DESKTOP_UA }),
       "remote",
       hostname,
     );
@@ -75,13 +106,16 @@ test("#1943/#1944 a tunnel hostname is remote even on a desktop UA", () => {
     "abc.trycloudflare.com",
     "x.ngrok-free.app",
     "x.ngrok.io",
+    "x.ngrok.app",
     "foo.loca.lt",
+    "foo.localtunnel.me",
     "host.tailscale.net",
     "box.ts.net",
+    "access.cloudflareaccess.com",
   ]) {
     assert.equal(isTunnelHostname(hostname), true, hostname);
     assert.equal(
-      classifyClientContext({ hostname, userAgent: "Mozilla/5.0 Chrome/120" }),
+      classifyClientContext({ hostname, userAgent: DESKTOP_UA }),
       "remote",
       hostname,
     );
@@ -89,25 +123,117 @@ test("#1943/#1944 a tunnel hostname is remote even on a desktop UA", () => {
 });
 
 test("#1944 a mobile UA is remote even on loopback", () => {
-  assert.equal(isMobileUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"), true);
-  assert.equal(isMobileUserAgent("Mozilla/5.0 (Linux; Android 14)"), true);
+  assert.equal(isMobileUserAgent(IPHONE_UA), true);
+  assert.equal(isMobileUserAgent(ANDROID_UA), true);
+  assert.equal(isMobileUserAgent(IPAD_UA), true);
   assert.equal(
-    classifyClientContext({
-      hostname: "127.0.0.1",
-      userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605",
-    }),
+    classifyClientContext({ hostname: "127.0.0.1", userAgent: IPHONE_UA }),
     "remote",
     "a phone pointed at loopback is still not the host session",
   );
 });
 
-test("#1944 remote never surfaces the notice and never offers install+restart", () => {
+test("#1944 surfacing is the same gate as offering — no inform-without-button", () => {
   assert.equal(shouldSurfaceUpdateNotice("remote"), false);
   assert.equal(shouldOfferHostMutation("remote"), false);
   assert.equal(shouldSurfaceUpdateNotice("local"), true);
   assert.equal(shouldOfferHostMutation("local"), true);
-  // No degrade path: informing without the button is the half-measure #1944 rejects.
   assert.equal(shouldSurfaceUpdateNotice("remote"), shouldOfferHostMutation("remote"));
+  assert.equal(shouldSurfaceUpdateNotice("local"), shouldOfferHostMutation("local"));
+});
+
+test("#1943/#1944 remote/tunnelled/mobile never get the update prompt or install+restart", () => {
+  for (const client of REMOTE_CLIENTS) {
+    for (const kind of ["update", "restart", "none"]) {
+      const d = decideUpdateNoticeAffordance({ ...client, kind });
+      assert.equal(d.clientContext, "remote", `${client.why} ${client.hostname}`);
+      assert.equal(d.surfaceNotice, false, `${client.why} ${kind} notice`);
+      assert.equal(d.offerInstall, false, `${client.why} ${kind} install`);
+      assert.equal(d.offerRestart, false, `${client.why} ${kind} restart`);
+    }
+  }
+});
+
+test("#1943/#1944 local host clients still get the notice and the host action", () => {
+  for (const hostname of LOCAL_HOSTS) {
+    const update = decideUpdateNoticeAffordance({
+      hostname,
+      userAgent: DESKTOP_UA,
+      kind: "update",
+    });
+    assert.equal(update.clientContext, "local", hostname);
+    assert.equal(update.surfaceNotice, true, `${hostname} update notice`);
+    assert.equal(update.offerInstall, true, `${hostname} update install`);
+    assert.equal(update.offerRestart, true, `${hostname} update restart`);
+
+    const restart = decideUpdateNoticeAffordance({
+      hostname,
+      userAgent: DESKTOP_UA,
+      kind: "restart",
+    });
+    assert.equal(restart.surfaceNotice, true, `${hostname} restart notice`);
+    assert.equal(restart.offerInstall, false, `${hostname} restart is not an install`);
+    assert.equal(restart.offerRestart, true, `${hostname} restart action`);
+
+    const none = decideUpdateNoticeAffordance({
+      hostname,
+      userAgent: DESKTOP_UA,
+      kind: "none",
+    });
+    assert.equal(none.surfaceNotice, false);
+    assert.equal(none.offerInstall, false);
+    assert.equal(none.offerRestart, false);
+  }
+});
+
+test("#1944 decideUpdateNoticeAffordance never surfaces without a host action", () => {
+  const kinds = ["update", "restart", "none", "", undefined];
+  const clients = [
+    ...LOCAL_HOSTS.map((hostname) => ({ hostname, userAgent: DESKTOP_UA })),
+    ...REMOTE_CLIENTS,
+    {},
+  ];
+  for (const client of clients) {
+    for (const kind of kinds) {
+      const d = decideUpdateNoticeAffordance({ ...client, kind });
+      if (d.surfaceNotice) {
+        assert.equal(
+          d.offerInstall || d.offerRestart,
+          true,
+          "notice without install/restart is the #1944 half-measure",
+        );
+      }
+      if (!d.offerInstall && !d.offerRestart) {
+        assert.equal(d.surfaceNotice, false);
+      }
+    }
+  }
+});
+
+test("#1943 readBrowserClientContext fails closed without location/navigator", () => {
+  assert.equal(readBrowserClientContext({}), "remote");
+  assert.equal(readBrowserClientContext(), "remote");
+  assert.equal(
+    readBrowserClientContext({
+      location: { hostname: "127.0.0.1" },
+      navigator: { userAgent: DESKTOP_UA },
+    }),
+    "local",
+  );
+  assert.equal(
+    readBrowserClientContext({
+      location: { hostname: "abc.trycloudflare.com" },
+      navigator: { userAgent: DESKTOP_UA },
+    }),
+    "remote",
+  );
+  assert.equal(
+    readBrowserClientContext({
+      location: { hostname: "127.0.0.1" },
+      navigator: { userAgent: IPHONE_UA },
+    }),
+    "remote",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -285,7 +411,8 @@ test("#1942 the panel imports the notify helpers and gates on client context", (
     /from "\.\/lib\/update-notify\.js"/,
     "the panel must import the shipped helpers, not a local copy",
   );
-  assert.match(PANEL_SRC, /classifyClientContext\(/);
+  assert.match(PANEL_SRC, /readBrowserClientContext\(/);
+  assert.match(PANEL_SRC, /decideUpdateNoticeAffordance\(/);
   assert.match(PANEL_SRC, /shouldSurfaceUpdateNotice\(/);
   assert.match(PANEL_SRC, /shouldOfferHostMutation\(/);
   assert.match(PANEL_SRC, /resolveUpdateState\(/);
@@ -299,13 +426,24 @@ test("#1944 a remote client returns before the notice is painted", () => {
   const surface = body.indexOf("shouldSurfaceUpdateNotice(");
   const earlyReturn = body.indexOf("return;", surface);
   const paint = body.indexOf("dataset.testid = \"panel-update-available\"");
+  const install = body.indexOf("dataset.testid = \"panel-update-install\"");
   assert.ok(surface !== -1 && earlyReturn !== -1, "the surface gate must be able to return");
   assert.ok(paint > earlyReturn, "the notice is painted only after the remote client has been filtered out");
+  assert.ok(install > paint, "the install+restart button is part of the notice, not a separate path");
+  assert.doesNotMatch(
+    body.slice(paint, install),
+    /shouldOfferHostMutation\(/,
+    "no inner offer-gate after paint — that is the inform-without-button half-measure",
+  );
   assert.doesNotMatch(
     body,
     /Install it from the panel on the host machine/,
     "no degrade-to-info copy — that is the #1944 half-measure",
   );
+  assert.match(body, /decideUpdateNoticeAffordance\(/);
+  const decide = body.indexOf("decideUpdateNoticeAffordance(");
+  const decideReturn = body.indexOf("if (!affordance.surfaceNotice)", decide);
+  assert.ok(decideReturn !== -1 && decideReturn < paint, "kind=none / remote is filtered before paint");
 });
 
 test("#1942 the local action is graph_update_node then comfy_reboot, not a new installer", () => {
@@ -315,10 +453,15 @@ test("#1942 the local action is graph_update_node then comfy_reboot, not a new i
   assert.match(body, /GRAPH_TOOL_EXECUTORS\.graph_update_node/);
   assert.match(body, /GRAPH_TOOL_EXECUTORS\.comfy_reboot/);
   assert.match(body, /comfyui-agent-panel/);
+  assert.match(body, /readBrowserClientContext\(/);
   assert.match(body, /shouldOfferHostMutation\(/);
+  const classify = body.indexOf("readBrowserClientContext(");
+  const gate = body.indexOf("shouldOfferHostMutation(");
   const update = body.indexOf("graph_update_node");
   const reboot = body.indexOf("comfy_reboot");
-  assert.ok(update !== -1 && reboot > update, "install is queued before the restart");
+  assert.ok(classify !== -1 && gate > classify, "click re-classifies this tab before mutating");
+  assert.ok(update !== -1 && update > gate, "the host mutation sits behind the live gate");
+  assert.ok(reboot > update, "install is queued before the restart");
 });
 
 test("#1942 the notice is scheduled on mount the way what's-new is, and is not awaited", () => {

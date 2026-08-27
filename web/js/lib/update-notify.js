@@ -5,8 +5,8 @@
  * #1943/#1944 — host-mutating affordances are gated on client context. A remote,
  * tunnelled, or mobile client never sees the notice at all: telling someone about
  * an action they cannot take, while they are away from the machine, manufactures
- * the motivation to work around the missing button. The check may still run;
- * only the *surfacing* is deferred until the next loopback desktop session.
+ * the motivation to work around the missing button. Only the *surfacing* is
+ * deferred until the next loopback desktop session.
  *
  * Pure / dependency-injected (no DOM, no ComfyUI globals) so the verdict is
  * unit-testable without a browser.
@@ -27,8 +27,6 @@ export const UPDATE_NOTICE_DISMISS_KEY = "comfyui-mcp.panel.updateNoticeDismisse
 /** Registry statuses a user can actually install through Manager. */
 export const INSTALLABLE_VERSION_STATUS = "NodeVersionStatusActive";
 
-const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\]|::1)$/i;
-
 /** Hostnames that are a tunnel in front of the ComfyUI origin, not the host. */
 const TUNNEL_HOST =
   /(?:^|\.)(trycloudflare\.com|cloudflareaccess\.com|ngrok(?:-free)?\.(?:app|io|dev)|loca\.lt|localtunnel\.me|tailscale\.net|ts\.net|github\.dev|gitpod\.io)$/i;
@@ -46,7 +44,11 @@ function normVersion(v) {
 
 export function isLoopbackHostname(hostname) {
   if (typeof hostname !== "string") return false;
-  return LOOPBACK_HOST.test(hostname.trim());
+  const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) return false;
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host === "::1") return true;
+  return /^127(?:\.\d{1,3}){3}$/.test(host);
 }
 
 export function isTunnelHostname(hostname) {
@@ -74,17 +76,58 @@ export function classifyClientContext({ hostname, userAgent } = {}) {
   return "remote";
 }
 
-/** #1944 — surface the notice only on a local host client. */
-export function shouldSurfaceUpdateNotice(clientContext) {
+/**
+ * #1943 — install / restart is a host mutation. Fail closed on anything that
+ * is not a loopback desktop session.
+ */
+export function shouldOfferHostMutation(clientContext) {
   return clientContext === "local";
 }
 
 /**
- * #1943 — install / restart is a host mutation. Same gate as surfacing for
- * this feature: there is no "inform but hide the button" path (#1944).
+ * #1944 — surfacing IS offering. A remote user is not told an update exists
+ * unless they can act on it from this tab.
  */
-export function shouldOfferHostMutation(clientContext) {
-  return clientContext === "local";
+export function shouldSurfaceUpdateNotice(clientContext) {
+  return shouldOfferHostMutation(clientContext);
+}
+
+/**
+ * Classify this tab from the browser globals the panel actually has.
+ * Missing location / navigator is remote: fail closed.
+ */
+export function readBrowserClientContext({ location, navigator } = {}) {
+  const hostname = typeof location?.hostname === "string" ? location.hostname : "";
+  const userAgent = typeof navigator?.userAgent === "string" ? navigator.userAgent : "";
+  return classifyClientContext({ hostname, userAgent });
+}
+
+/**
+ * The whole update-notify UX for this tab, as one verdict.
+ *
+ * Remote / tunnel / mobile: notice, install, and restart are all false — the
+ * #1944 correction. A local host session still gets the #1942 prompt:
+ * update → notice + install + restart; restart-only → notice + restart.
+ * There is no `{ surfaceNotice: true, offerInstall: false, offerRestart: false }`
+ * row; that is the "inform but hide the button" half-measure.
+ */
+export function decideUpdateNoticeAffordance({ hostname, userAgent, kind } = {}) {
+  const clientContext = classifyClientContext({ hostname, userAgent });
+  const hostOk = shouldOfferHostMutation(clientContext);
+  if (!hostOk || (kind !== "update" && kind !== "restart")) {
+    return {
+      clientContext,
+      surfaceNotice: false,
+      offerInstall: false,
+      offerRestart: false,
+    };
+  }
+  return {
+    clientContext,
+    surfaceNotice: true,
+    offerInstall: kind === "update",
+    offerRestart: true,
+  };
 }
 
 export function isInstallableStatus(status) {
