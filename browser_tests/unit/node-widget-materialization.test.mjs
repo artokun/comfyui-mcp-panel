@@ -7,6 +7,8 @@ import {
   driftedRequiredInputNames,
   missingRequiredWidgetMaterializations,
   declaredTypeMembers,
+  inputDeclaredAsSocket,
+  isComfyListSocketType,
   registeredSocketTypes,
   requiredWidgetInputTypes,
   unavailableRequiredCustomWidgetTypes,
@@ -103,28 +105,29 @@ test("a forceInput declaration remains a wireable socket", () => {
   assert.deepEqual(requiredWidgetInputTypes(node), ["ZIPN_STYLE_GALLERY", "ZIPN_SPACER", "CLIP"]);
 });
 
-test("#751: LIST with leftover widget defaults is a core list-socket, not a pending widget", () => {
-  // TextEncodeQwenImageEditPlusCustom_lrzjason.configs is declared LIST (a
-  // link datatype) but INPUT_TYPES still stamps `default: []`. That is not a
-  // widget constructor; waiting 5s for one refuses a node that the stock
-  // frontend adds as a socket.
-  const node = {
-    constructor: {
-      nodeData: {
-        input: {
-          required: {
-            clip: ["CLIP", {}],
-            configs: ["LIST", { default: [] }],
+test("#751: LIST with leftover widget defaults is a list-socket, not a pending widget", () => {
+  // Both leftover shapes packs actually emit: Python `None` (JSON null) and an
+  // empty list stamp. Neither is a widget constructor. LIST is proven as a
+  // list-socket, not by growing SAFE_SOCKET_TYPES' type-only shortcut.
+  for (const config of [{ default: null }, { default: [] }]) {
+    const node = {
+      constructor: {
+        nodeData: {
+          input: {
+            required: {
+              clip: ["CLIP", {}],
+              configs: ["LIST", config],
+            },
           },
         },
       },
-    },
-  };
-  assert.deepEqual(
-    unavailableRequiredCustomWidgetTypes(node, {}),
-    [],
-    "LIST + default must not wait for a widget constructor that will never register",
-  );
+    };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(node, {}),
+      [],
+      `LIST + ${JSON.stringify(config)} must not wait for a widget constructor that will never register`,
+    );
+  }
   // A genuine custom widget with the same leftover-default shape still waits.
   const custom = {
     constructor: {
@@ -1015,6 +1018,134 @@ test("#1062: a core 3D file input declaring a WIDGET value still waits for its c
   assert.deepEqual(unavailableRequiredCustomWidgetTypes(widgetish, {}, new Set(["MESH"]), widgetish), [
     "MESH,FILE_3D_GLB",
   ]);
+});
+
+// ---- #751: LIST sockets with leftover widget-value metadata -----------------------
+//
+// Recurrence of the original socket-vs-widget misread. `TextEncodeQwenImageEditPlusCustom_lrzjason`
+// declares `configs: ("LIST", {"default": None})` — a link datatype with leftover Python
+// `None` that `/object_info` serializes as `{default: null}`. Key presence made
+// `inputDeclaredAsSocket` return false, so `linkProven && socketDeclared` never fired,
+// and the add path waited 5s for a LIST widget constructor that will never register.
+//
+// LIST is NOT added to SAFE_SOCKET_TYPES: that set gets a type-only shortcut that would
+// waive a genuine LIST widget (`{default: [...]}`). The structural split is:
+//   * leftover `default: null` is not a widget declaration
+//   * LIST is a ComfyUI list-socket (link-proven like FILE_3D), still held to socket-shape
+//   * a real default / widgetType / min-max still waits (#580/#626/#788)
+
+/** Verbatim required inputs from the reporter's node (Comfyui-QwenEditUtils). */
+const QWEN_CUSTOM_DEF = {
+  input: {
+    required: {
+      clip: ["CLIP", {}],
+      vae: ["VAE", {}],
+      prompt: ["STRING", { multiline: true, dynamicPrompts: true }],
+      configs: ["LIST", { default: null }],
+    },
+  },
+};
+
+test("#751: leftover default:null does not make a LIST input widget-shaped", () => {
+  assert.equal(inputDeclaredAsSocket(["LIST", { default: null }]), true);
+  assert.equal(inputDeclaredAsSocket(["LIST", { default: null, tooltip: "Configs list" }]), true);
+  assert.equal(inputDeclaredAsSocket(["LIST", {}]), true);
+  assert.equal(inputDeclaredAsSocket(["LIST"]), true);
+  // Leftover empty-list stamp is the same as JSON null — not a widget value.
+  assert.equal(inputDeclaredAsSocket(["LIST", { default: [] }]), true);
+  // A REAL default / range is still a widget declaration — the #626 half.
+  assert.equal(inputDeclaredAsSocket(["LIST", { default: [1, 2] }]), false);
+  assert.equal(inputDeclaredAsSocket(["ACME_VALUE", { default: 3, min: 0, max: 10 }]), false);
+  // Empty object is a real DICT widget default (#1584), not leftover.
+  assert.equal(inputDeclaredAsSocket(["DICT", { default: {} }]), false);
+  assert.equal(isComfyListSocketType("LIST"), true);
+  assert.equal(isComfyListSocketType("list"), false);
+  assert.equal(isComfyListSocketType(" LIST "), false);
+});
+
+test("#751: TextEncodeQwenImageEditPlusCustom configs LIST+default:null is addable", () => {
+  // The reported dead end. No LIST constructor, and no output proof: the add path's
+  // single-class /object_info for this node only lists CONDITIONING/LATENT/ANY, so
+  // knownSocketTypes never contains LIST unless a sibling producer is widened in.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(QWEN_CUSTOM_DEF, { STRING: () => {} }, new Set(), QWEN_CUSTOM_DEF),
+    [],
+    "LIST with leftover default:null must not wait for a widget that never registers",
+  );
+  // The same node after a widen that DID find QwenEditConfigPreparer.output = LIST.
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(
+      QWEN_CUSTOM_DEF,
+      { STRING: () => {} },
+      new Set(["LIST"]),
+      QWEN_CUSTOM_DEF,
+    ),
+    [],
+  );
+});
+
+test("#751: leftover default:null on a proven link type is a socket, not a widget wait", () => {
+  // The general rule, independent of LIST: a type the CURRENT backend outputs, carrying
+  // only JSON-null leftover metadata, is a socket. Presence of `default` used to block it.
+  const def = { input: { required: { configs: ["ACME_LIST", { default: null }] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(["ACME_LIST"]), def), []);
+  // Without output proof it still fails closed — leftover keys do not invert #580.
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def), ["ACME_LIST"]);
+});
+
+test("#751 #626 INTACT: a LIST input that DECLARES a real value still waits", () => {
+  // A pack can register a LIST widget. A populated array default is that widget, and
+  // LIST's list-socket proof must not waive it the way SAFE_SOCKET_TYPES' type-only
+  // shortcut would.
+  const listWidget = { input: { required: { items: ["LIST", { default: [1, 2] }] } } };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(listWidget, {}, new Set(["LIST"]), listWidget),
+    ["LIST"],
+  );
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(listWidget, { LIST: () => {} }, new Set(["LIST"]), listWidget),
+    [],
+  );
+});
+
+test("#751 #626 INTACT: a value-declaring custom widget is still not waived by output proof", () => {
+  const node = {
+    constructor: {
+      nodeData: { input: { required: { amount: ["ACME_VALUE", { default: 3, min: 0, max: 10 }] } } },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(node, {}, new Set(["ACME_VALUE"])),
+    ["ACME_VALUE"],
+  );
+});
+
+test("#751 #788 INTACT: a socket-union with widgetType+default:null still waits", () => {
+  const def = {
+    input: { required: { img: ["IMAGE,MASK", { widgetType: "IMAGE", default: null }] } },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(def, {}, new Set(["IMAGE", "MASK"]), def),
+    ["IMAGE,MASK"],
+  );
+});
+
+test("#751 #580 INTACT: an unproven custom widget with leftover default:null still waits", () => {
+  const def = { input: { required: { gallery: ["ZIPN_STYLE_GALLERY", { default: null }] } } };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def), [
+    "ZIPN_STYLE_GALLERY",
+  ]);
+});
+
+test("#751: a lookalike LIST spelling is not the list-socket", () => {
+  for (const type of ["list", " LIST ", "LISTS", "PyList"]) {
+    const def = { input: { required: { items: [type, { default: null }] } } };
+    assert.deepEqual(
+      unavailableRequiredCustomWidgetTypes(def, {}, new Set(), def),
+      [type],
+      `${JSON.stringify(type)} must not be waived as LIST`,
+    );
+  }
 });
 
 test("#695: the report names the stuck INPUT and which of the two causes it is", () => {

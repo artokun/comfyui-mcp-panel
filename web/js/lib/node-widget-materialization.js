@@ -56,10 +56,7 @@ export function requiredWidgetInputTypes(nodeOrNodeData) {
 const SAFE_SOCKET_TYPES = new Set([
   "*", "ANY", "AUDIO", "BBOX", "CLIP", "CLIP_VISION", "CLIP_VISION_OUTPUT",
   "CONDITIONING", "CONTROL_NET", "GLIGEN", "GUIDER", "HOOKS", "IMAGE",
-  "IPADAPTER", "LATENT", "LATENT_OPERATION",
-  // #751 — LIST is ComfyUI's list-of-items socket. Packs often stamp leftover
-  // INPUT_TYPES `default: []` on it, which is not a widget constructor.
-  "LIST", "MASK", "MESH", "MODEL", "NOISE",
+  "IPADAPTER", "LATENT", "LATENT_OPERATION", "MASK", "MESH", "MODEL", "NOISE",
   "PHOTOMAKER", "SAMPLER", "SCHEDULER", "SIGMAS", "STYLE_MODEL", "UNET",
   "UPSCALE_MODEL", "VAE", "VOXEL",
 ]);
@@ -224,10 +221,15 @@ export function unavailableRequiredWidgetReport(
     // output proof cannot see a core datatype that no INSTALLED node happens to emit; see
     // its own comment. The quantifier is still `every` — a proven member never vouches for
     // an unproven one.
+    // #751 — `isComfyListSocketType` is a FOURTH proof path for the same reason LIST is
+    // missing from SAFE_SOCKET_TYPES: it is a link socket (a Python list passed as one
+    // value), but adding it to the type-only shortcut would waive a genuine LIST widget.
+    // It still has to clear the input-level bar below.
     const linkProven = members.every(
       (member) =>
         SAFE_SOCKET_TYPES.has(member) ||
         isCore3dFileType(member) ||
+        isComfyListSocketType(member) ||
         knownSocketTypes?.has?.(member) === true ||
         wildcardOutputProven,
     );
@@ -491,6 +493,25 @@ export function isCore3dFileType(type) {
 }
 
 /**
+ * #751 — ComfyUI's LIST socket.
+ *
+ * Custom nodes pass a Python list as one link value by declaring type `LIST`. Core ComfyUI
+ * has no LIST widget (it is not in `IO` and not in `ComfyWidgets`); the stock UI renders
+ * `("LIST", {"default": None})` as a socket you wire. That is the shape
+ * `TextEncodeQwenImageEditPlusCustom_lrzjason.configs` and `QwenEditConfigPreparer` emit,
+ * and waiting for a constructor keyed `"LIST"` waits for evidence that cannot arrive.
+ *
+ * This is a link-datatype PROOF, the same role as `isCore3dFileType` — NOT membership in
+ * SAFE_SOCKET_TYPES. That set gets a type-only shortcut that ignores widget-value keys,
+ * and a pack can still register a LIST widget with a real default (an array). Those
+ * inputs stay widget-shaped and still wait (#626). Exact spelling, no normalisation:
+ * `"list"` and `" LIST "` are different identifiers everywhere else in this module.
+ */
+export function isComfyListSocketType(type) {
+  return type === "LIST";
+}
+
+/**
  * Whether a required input DECLARES itself as a link socket rather than a prompt value.
  *
  * This is the input-level half of the #626 waiver, and it is a POSITIVE reading of the
@@ -552,9 +573,27 @@ export function inputDeclaredAsSocket(spec) {
   if (config.forceInput || config.force_input || config.defaultInput || config.widget === false) {
     return true;
   }
-  return !WIDGET_VALUE_CONFIG_KEYS.some((key) =>
-    Object.prototype.hasOwnProperty.call(config, key),
-  );
+  return !WIDGET_VALUE_CONFIG_KEYS.some((key) => configKeyDeclaresWidgetValue(config, key));
+}
+
+/**
+ * #751 — leftover widget-value metadata is not a value a widget can honour.
+ *
+ * Python authors write `("LIST", {"default": None})` (JSON `null`) or stamp an empty
+ * list (`default: []`) on link sockets. Key *presence* used to flip the input to
+ * widget-shaped, so `linkProven && socketDeclared` never fired and the guard waited
+ * 5s for a constructor that will never register.
+ *
+ * A REAL default (`3`, `[1, 2]`, `{}`, `""`, `false`) is unchanged and still
+ * widget-shaped. `widgetType: "IMAGE"` is unchanged. Empty *object* `{}` is a real
+ * DICT widget default (#1584) and is NOT leftover.
+ */
+function configKeyDeclaresWidgetValue(config, key) {
+  if (!Object.prototype.hasOwnProperty.call(config, key)) return false;
+  const value = config[key];
+  if (value === null || value === undefined) return false;
+  if (Array.isArray(value) && value.length === 0) return false;
+  return true;
 }
 
 // Config keys that only a WIDGET can honour — their presence is the input declaring it

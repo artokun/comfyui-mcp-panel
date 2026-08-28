@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_add_node no longer waits 5s then refuses a LIST-typed socket that carries leftover `{default: null}` / `{default: []}` widget metadata (TextEncodeQwenImageEditPlusCustom_lrzjason `configs`) (#751)
+
 ## [0.15.122] - 2026-08-27
 
 ### Fixed
