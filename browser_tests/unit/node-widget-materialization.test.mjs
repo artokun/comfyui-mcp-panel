@@ -103,6 +103,43 @@ test("a forceInput declaration remains a wireable socket", () => {
   assert.deepEqual(requiredWidgetInputTypes(node), ["ZIPN_STYLE_GALLERY", "ZIPN_SPACER", "CLIP"]);
 });
 
+test("#751: LIST with leftover widget defaults is a core list-socket, not a pending widget", () => {
+  // TextEncodeQwenImageEditPlusCustom_lrzjason.configs is declared LIST (a
+  // link datatype) but INPUT_TYPES still stamps `default: []`. That is not a
+  // widget constructor; waiting 5s for one refuses a node that the stock
+  // frontend adds as a socket.
+  const node = {
+    constructor: {
+      nodeData: {
+        input: {
+          required: {
+            clip: ["CLIP", {}],
+            configs: ["LIST", { default: [] }],
+          },
+        },
+      },
+    },
+  };
+  assert.deepEqual(
+    unavailableRequiredCustomWidgetTypes(node, {}),
+    [],
+    "LIST + default must not wait for a widget constructor that will never register",
+  );
+  // A genuine custom widget with the same leftover-default shape still waits.
+  const custom = {
+    constructor: {
+      nodeData: {
+        input: {
+          required: { amount: ["ACME_VALUE", { default: 3 }] },
+        },
+      },
+    },
+  };
+  assert.deepEqual(unavailableRequiredCustomWidgetTypes(custom, {}, new Set(["ACME_VALUE"])), [
+    "ACME_VALUE",
+  ]);
+});
+
 test("core MASK required input is a safe socket (#620 SetLatentNoiseMask)", () => {
   const node = {
     constructor: {
