@@ -56,7 +56,10 @@ export function requiredWidgetInputTypes(nodeOrNodeData) {
 const SAFE_SOCKET_TYPES = new Set([
   "*", "ANY", "AUDIO", "BBOX", "CLIP", "CLIP_VISION", "CLIP_VISION_OUTPUT",
   "CONDITIONING", "CONTROL_NET", "GLIGEN", "GUIDER", "HOOKS", "IMAGE",
-  "IPADAPTER", "LATENT", "LATENT_OPERATION", "MASK", "MESH", "MODEL", "NOISE",
+  "IPADAPTER", "LATENT", "LATENT_OPERATION",
+  // #751 — LIST is ComfyUI's list-of-items socket. Packs often stamp leftover
+  // INPUT_TYPES `default: []` on it, which is not a widget constructor.
+  "LIST", "MASK", "MESH", "MODEL", "NOISE",
   "PHOTOMAKER", "SAMPLER", "SCHEDULER", "SIGMAS", "STYLE_MODEL", "UNET",
   "UPSCALE_MODEL", "VAE", "VOXEL",
 ]);
