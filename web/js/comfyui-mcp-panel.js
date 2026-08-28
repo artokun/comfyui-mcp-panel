@@ -23783,6 +23783,7 @@ const GRAPH_TOOL_EXECUTORS = {
         slot: slotIndex,
         interior_links_dropped: interiorLinks,
         host_links_dropped: hostLinks,
+        host_links_reindexed: true,
       },
       ...(removeErr
         ? {
@@ -23842,6 +23843,7 @@ const GRAPH_TOOL_EXECUTORS = {
         slot: slotIndex,
         interior_links_dropped: interiorLinks,
         host_links_dropped: hostLinks,
+        host_links_reindexed: true,
       },
       ...(removeErr
         ? {

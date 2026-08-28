@@ -203,6 +203,7 @@ test("#1294 unexpose OUTPUT removes the named slot and reports what it dropped",
     slot: 0,
     interior_links_dropped: 1,
     host_links_dropped: 2,
+    host_links_reindexed: true,
   });
   assert.equal(res.warning, undefined);
 });
@@ -278,6 +279,7 @@ test("#1969 unexpose INPUT of a non-last slot reindexes remaining host links", (
   const { subgraph, host, rootGraph, imageLink, image1Link, vaeLink, hostCalls } = mkShiftedInputGraph();
   const res = buildExecutors(subgraph, rootGraph).graph_unexpose_subgraph_input({ name: "text" });
   assert.equal(res.removed.slot, 3);
+  assert.equal(res.removed.host_links_reindexed, true, "#2473 MCP must see that the panel reindexed");
   assert.equal(host.inputs.map((s) => s.name).join(","), "unet_name,clip_name,vae_name,image,image_1,noise_seed");
   // The live backlink still names the same wires — that is what query/outline see.
   assert.equal(host.inputs[3].link, 10);
