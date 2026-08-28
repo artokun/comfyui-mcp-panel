@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.123] - 2026-08-28
+
+### Fixed
+- treat LIST as a core socket even with leftover widget defaults (#751, #1990)
+
+
 ## [0.15.122] - 2026-08-27
 
 ### Fixed
