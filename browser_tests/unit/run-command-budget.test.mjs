@@ -1153,6 +1153,116 @@ test("#1728 CALL SITE: late capture crosses the bridge, arms the real sweep, and
   }
 });
 
+test("#1728 CALL SITE: real scoped dispatch keeps a late accepted prompt correlated", async () => {
+  const stop = keepAlive();
+  let releasePrompt;
+  let promptRequest;
+  let sweep;
+  try {
+    const apiTarget = {
+      fetchApi: async (route, options) => {
+        promptRequest = { route, options };
+        return new Promise((resolve) => {
+          releasePrompt = () => resolve(jsonResponse(200, { prompt_id: "late-real-1728" }));
+        });
+      },
+    };
+    const app = {
+      queueItems: [],
+      graph: { _nodes: [] },
+      graphToPrompt: async () => ({ output: OUR_OUTPUT, workflow: {} }),
+      queuePrompt: async (number, batch) => {
+        // The frontend can report its queue call as handled while the network
+        // request is still awaiting ComfyUI's prompt acknowledgement.
+        void apiTarget.fetchApi("/prompt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: OUR_OUTPUT,
+            client_id: "x",
+            number,
+            partial_execution_targets: ["327"],
+          }),
+        });
+        return false;
+      },
+    };
+    const receiptFrames = [];
+    const outbox = createRunReceiptOutbox({ retryMs: 60000 });
+    outbox.setTransport({
+      routeId: () => "panel-route-1728",
+      ready: () => true,
+      sendFrame: (frame) => {
+        receiptFrames.push(frame);
+        return true;
+      },
+    });
+    const flushes = [];
+    const timers = new Set();
+    const schedule = (fn, ms) => {
+      const timer = { fn, ms };
+      timers.add(timer);
+      return timer;
+    };
+    const cancel = (timer) => timers.delete(timer);
+    const tracker = createRunCompletionTracker({
+      onFlush: (payload) => flushes.push(payload),
+      now: () => 1000,
+      setTimer: schedule,
+      clearTimer: cancel,
+    });
+    sweep = createRunReconcileSweep({
+      hasPending: () => tracker.hasPending(),
+      reconcile: async () => {},
+      setTimer: schedule,
+      clearTimer: cancel,
+      intervalMs: 60000,
+    });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 800,
+      serializeMs: 400,
+      runCompletionRef: tracker,
+      armRunReconcileSweepRef: () => sweep.arm(),
+      runReceiptSender: (rid, promptId, routeId, completionKey) =>
+        outbox.enqueue(rid, promptId, routeId, completionKey),
+      runReceiptRouteRef: () => "panel-route-1728",
+      runReceiptSessionRef: () => "session-1728",
+      dispatch: (args) => dispatchScopedRun({ ...args, verifyTimeoutMs: 100 }),
+    });
+
+    const result = await built.graph_run({ to_node_id: 327, rid: "run-rid-1728-real" });
+    assert.equal(result.queued_unknown, true, "the caller reports an in-flight scoped request honestly");
+    assert.equal(result.prompt_id, undefined, "no prompt id is invented before ComfyUI answers");
+    assert.equal(promptRequest.route, "/prompt");
+    assert.deepEqual(JSON.parse(promptRequest.options.body).partial_execution_targets, ["327"]);
+    assert.equal(receiptFrames.length, 0, "the receipt waits for the late response");
+
+    releasePrompt();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(tracker.hasPending(), true, "the production caller registers the late prompt in the tracker");
+    assert.equal(receiptFrames.length, 1, "the late response emits one bridge receipt");
+    assert.equal(receiptFrames[0].type, "run_receipt");
+    assert.equal(receiptFrames[0].run_rid, "run-rid-1728-real");
+    assert.equal(receiptFrames[0].prompt_id, "late-real-1728");
+    assert.equal(typeof receiptFrames[0].completion_key, "string", "the completion ticket is carried with the receipt");
+    assert.deepEqual(JSON.parse(receiptFrames[0].completion_key).slice(0, 3), [
+      "panel-route-1728",
+      "session-1728",
+      "late-real-1728",
+    ]);
+    assert.equal(outbox.pendingSize(), 0, "the real outbox accepts the ready route receipt");
+    assert.equal(sweep._hasTimer(), true, "the real production callback arms reconciliation");
+    assert.equal(flushes.length, 0, "no completion is flushed before execution events arrive");
+  } finally {
+    sweep?.dispose();
+    stop();
+  }
+});
+
 test("#1824 CALL SITE: a long panel_run completion stays replayable until the orchestrator receipt", async () => {
   const stop = keepAlive();
   let sweep;
