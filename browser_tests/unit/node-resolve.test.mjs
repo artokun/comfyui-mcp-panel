@@ -535,6 +535,65 @@ test("set_widget e2e (keep): real subgraph → REGISTERED inner node ⇒ still s
   assert.equal(inner.widgets.find((w) => w.name === "scheduler").value, "karras");
 });
 
+test("#366 recurrence: production promoted write selects the host rail after a stale inner projection rebind", async () => {
+  const reg = loadedRegistry();
+  const inner = {
+    id: 13,
+    type: "KSampler",
+    widgets: [{ name: "caption", type: "STRING", value: "old" }],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "13" ? inner : null) };
+
+  // During the reported rebind, the input still references the old/link-driven
+  // projection, while the live widget list already contains the host-owned rail.
+  // The two objects deliberately share a display name but have different canonical
+  // widget IDs, so a name/list-order resolver verifies the wrong object.
+  const staleInnerProjection = {
+    name: "caption",
+    widgetId: "root:13:caption",
+    type: "STRING",
+    value: "old",
+  };
+  const parentRail = {
+    name: "caption",
+    widgetId: "root:37:caption",
+    type: "STRING",
+    value: "old",
+  };
+  const displayProxy = {
+    name: "caption",
+    type: "STRING",
+    value: "old",
+  };
+  const hostInput = {
+    name: "caption",
+    widgetId: "root:37:caption",
+    _widget: staleInnerProjection,
+    widget: displayProxy,
+    _subgraphSlot: { name: "caption" },
+  };
+  const parent = {
+    id: 37,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [hostInput],
+    widgets: [staleInnerProjection, parentRail, displayProxy],
+  };
+  const resolveSource = (_node, input) =>
+    input?.name === "caption" ? { sourceNodeId: "13", sourceWidgetName: "caption" } : null;
+
+  const { set } = await setViaHandler(reg, parent, "caption", "new", resolveSource);
+
+  assert.equal(parentRail.value, "new", "the host-owned rail must receive the write");
+  assert.equal(displayProxy.value, "new", "the identity-linked display projection must receive the write");
+  assert.equal(staleInnerProjection.value, "old", "the stale inner projection must not be selected");
+  assert.equal(set.node_id, 37, "the result must identify the root-scope host node");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.equal(set.promoted_from.display_widgets_synced, 1);
+  assert.equal(set.promoted_from.value_scope, "instance");
+});
+
 test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no mutation", async () => {
   const reg = unreachableRegistry();
   const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", type: "text", value: "" }] };

@@ -81,6 +81,19 @@ test("#1925 production graph replies restock a parseable viewing witness", () =>
   assert.match(PANEL_SRC, /viewing: liveParseableViewingWitness\(\) \?\? undefined/);
 });
 
+test("#366 graph_set_widget publishes the scope it dispatched against", () => {
+  const start = PANEL_SRC.indexOf("async graph_set_widget({");
+  const end = PANEL_SRC.indexOf("\n  // artokun/comfyui-mcp#938", start);
+  assert.ok(start >= 0 && end > start, "graph_set_widget handler not found");
+  const handler = PANEL_SRC.slice(start, end);
+  const captured = handler.indexOf("typeof describeActiveGraph === \"function\"");
+  const write = handler.indexOf("await runSetWidget(node, widget, value, setWidgetOpts);");
+  const published = handler.indexOf("viewing: commandViewing");
+  assert.ok(captured >= 0, "graph_set_widget must capture the dispatch viewing scope");
+  assert.ok(write > captured, "the viewing scope must be captured before authorization awaits");
+  assert.ok(published > write, "the completed write must publish the captured scope");
+});
+
 test("#1925 withViewingWitness keeps parseable viewing, replaces malformed, attaches missing", () => {
   const start = PANEL_SRC.indexOf("function parseableViewingWitness");
   const end = PANEL_SRC.indexOf("\nfunction canonicalExpectedPromotedOwner", start);

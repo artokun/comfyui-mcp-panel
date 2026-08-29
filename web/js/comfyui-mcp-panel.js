@@ -17273,6 +17273,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // unbounded until now.
     const budget = makeCommandBudget(SET_WIDGET_COMMAND_BUDGET_MS, monotonicNow);
     const { app, graph, LG, rootGraph } = getGraphCtx();
+    // Capture the receiver scope before the authorization awaits. The bridge adds a
+    // viewing witness after the executor returns; re-reading the live canvas there can
+    // describe a subgraph the command never targeted if navigation/rebinding happens
+    // during the write. A mutation reply must identify the graph captured at dispatch,
+    // which is also the graph used to resolve `node` and to install the write hooks.
+    const commandViewing =
+      typeof describeActiveGraph === "function" ? describeActiveGraph(graph) : null;
     const node = resolveNode(graph, node_id);
     // #1679 / #1935 — keep derived MiniMax prompt / builder_state / timeline_data
     // writes refused before the first await, including when a caller asks for
@@ -18174,10 +18181,15 @@ const GRAPH_TOOL_EXECUTORS = {
     // widget and the panel also GREW the node, which is a structural change to the graph;
     // reporting only the value write would hide it. Its own field, for the same reason the
     // #1223 provenance note has one: `warning` is single-slot and priority-ordered.
-    const withCreation = (r) =>
-      createdLoraRow !== null && r && typeof r === "object"
-        ? { ...r, created_widget: createdLoraRow }
-        : r;
+    const withCreation = (r) => {
+      const withViewing =
+        commandViewing && r && typeof r === "object" && !Array.isArray(r)
+          ? { ...r, viewing: commandViewing }
+          : r;
+      return createdLoraRow !== null && withViewing && typeof withViewing === "object"
+        ? { ...withViewing, created_widget: createdLoraRow }
+        : withViewing;
+    };
     if (setWidgetSchemaFromSnapshot !== null && result && typeof result === "object") {
       return withCreation({ ...result, schema_source: "last-observed", schema_note: snapshotAuthorizationNote(setWidgetSchemaFromSnapshot) });
     }
