@@ -255,7 +255,7 @@ test("#1911: a missing watcher is named on the success reply, not swallowed", ()
   assert.match(SRC, /if \(!activePointerWatchAvailable\) pointerWatchUnavailable = true/);
 });
 
-test("#1911: TARGET capture still requires the #1215 already-current / not-foreign proof", () => {
+test("#1911: TARGET capture still requires independent #1215 proof after a switch", () => {
   const gateAt = SRC.indexOf("const captureBinding = describeLiveCanvasBinding(target);");
   assert.notEqual(gateAt, -1);
   const captureAt = SRC.indexOf("await target.changeTracker?.checkState?.()", gateAt);
@@ -263,11 +263,12 @@ test("#1911: TARGET capture still requires the #1215 already-current / not-forei
   const gate = SRC.slice(gateAt, captureAt);
   assert.match(gate, /pointerMovedThisOpen = !sameWorkflowObject\(activeBefore, target\)/);
   assert.match(gate, /!pointerMovedThisOpen/);
-  assert.match(gate, /captureBinding !== "foreign"/);
+  assert.match(gate, /sourceBinding === "bound"/);
+  assert.match(gate, /graphRootMatchesState\(/);
   assert.match(gate, /decideLiveCanvasCapture/);
   assert.doesNotMatch(
     gate,
-    /if \(captureBinding !== "foreign"\)/,
-    '"not foreign" alone was the #1215 hole — the missing-watch path must not bring it back',
+    /captureBinding === "bound"\s*\|\|/,
+    "a TARGET tag alone must not be treated as independent proof",
   );
 });

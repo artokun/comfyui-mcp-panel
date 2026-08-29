@@ -21,6 +21,7 @@ import {
   POINTER_WATCH_UNAVAILABLE_NOTICE,
 } from "../../web/js/lib/live-canvas-capture-gate.js";
 import {
+  graphRootMatchesState,
   graphRootStructureExtendsActiveWorkflow,
   graphRootWorkflowUuidMatches,
   graphRootWorkflowUuidMismatches,
@@ -147,6 +148,9 @@ function productionExecutor(methodName, environment) {
     POINTER_WATCH_UNAVAILABLE_NOTICE,
     workflowOpenReadinessRefusalError,
     readWorkflowOpenReadinessRefusal,
+    graphRootMatchesState,
+    graphRootWorkflowUuidMatches,
+    graphRootWorkflowUuidMismatches,
     describeLiveCanvasBinding: productionDescribeLiveCanvasBinding(environment),
     ...environment,
   };
@@ -1226,6 +1230,95 @@ test("#1215 production workflow_open does not treat a TARGET graph containing SO
   assert.equal(loadedValue, "target-value");
   assert.equal(root._nodes[0].widgets_values[0], "frontend-normalized");
   assert.equal(root._nodes.some((node) => node.id === 566), true, "the valid TARGET addition must survive the open");
+  assert.equal(panel.guard(), null, "the production open releases its reload guard");
+});
+
+test("#1215 production workflow_open does not capture a SOURCE root carrying the TARGET UUID", async () => {
+  const sourceUuid = "source-3b5f6d7e-6a89-4b9f-a58c-ff48a2eb7e95";
+  const targetUuid = "target-3b5f6d7e-6a89-4b9f-a58c-ff48a2eb7e95";
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  const sourceState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["source-value"] }],
+    links: [],
+    groups: [],
+    last_node_id: 1,
+    extra: { comfyui_mcp: { workflow_uuid: sourceUuid } },
+  };
+  const targetState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["target-value"] }],
+    links: [],
+    groups: [],
+    last_node_id: 1,
+    extra: { comfyui_mcp: { workflow_uuid: targetUuid } },
+  };
+  const source = {
+    path: "workflows/source.json",
+    changeTracker: { activeState: structuredClone(sourceState) },
+  };
+  let active = source;
+  let captures = 0;
+  let captureDecisionInput;
+  const subscribers = [];
+  target.activeState = structuredClone(targetState);
+  target.changeTracker = {
+    activeState: structuredClone(targetState),
+    checkState() {
+      captures += 1;
+    },
+  };
+  const root = environment.app.graph;
+  root._nodes = [
+    { id: 1, type: "KSampler", widgets_values: ["source-value"] },
+    { id: 566, type: "PreviewImage", widgets_values: [] },
+  ];
+  root.extra = { comfyui_mcp: { workflow_uuid: targetUuid } };
+  root.serialize = () => ({
+    nodes: root._nodes.map((node) => ({ ...node })),
+    links: [],
+    groups: [],
+    last_node_id: 566,
+    extra: root.extra,
+  });
+  environment.document = workflowPiniaDocument({
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  });
+  environment.activeWorkflowRef = () => active;
+  environment.workflowObjectUuid = (workflow) => (workflow === source ? sourceUuid : targetUuid);
+  environment.workflowStableUuid = (workflow) => (workflow === source ? sourceUuid : targetUuid);
+  delete environment.describeLiveCanvasBinding;
+  delete environment.graphRootWorkflowUuidMatches;
+  environment.app.extensionManager.workflow.openWorkflow = async () => {
+    active = target;
+  };
+  environment.getGraphCtx = () => ({ graph: root, rootGraph: root });
+  environment.decideLiveCanvasCapture = (input) => {
+    captureDecisionInput = input;
+    return decideLiveCanvasCapture(input);
+  };
+  environment.graphRootReproducesStateContent = ({ rootGraph, state }) => ({
+    // The mounted SOURCE has a user edit beyond the source tracker, so the exact
+    // source-content proof is intentionally unavailable; identity must still fail closed.
+    proven: rootGraph?._nodes?.length === state?.nodes?.length &&
+      rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0],
+    presentationOnly: false,
+    normalizedOnly: false,
+  });
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "target-tagged-source-root" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.captureSourceProof, false, "a TARGET tag on SOURCE is not independent capture proof");
+  assert.equal(captureDecisionInput.sourceCanvasStillMounted, false, "the stale root must reach the fail-closed gate");
+  assert.equal(captures, 0, "the stale SOURCE root must never be serialized into TARGET");
+  assert.equal(environment.app.graph._nodes[0].widgets_values[0], "target-value");
+  assert.equal(environment.app.graph._nodes.some((node) => node.id === 566), false);
   assert.equal(panel.guard(), null, "the production open releases its reload guard");
 });
 

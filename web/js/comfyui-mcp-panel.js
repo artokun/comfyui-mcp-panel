@@ -21952,8 +21952,30 @@ const GRAPH_TOOL_EXECUTORS = {
             activePointerEpochAtOpen !== null &&
             activePointerEpoch === activePointerEpochAtOpen &&
             activeIdentityAtCapture;
+          // A TARGET UUID on the root is not independent proof after a pointer move:
+          // the outgoing SOURCE can retain a stale/shared stamp while the source
+          // classifier correctly answers "foreign". In that shape, capturing would
+          // serialize SOURCE into TARGET. Keep the proven-bound recurrence, and admit
+          // the already-repainted TARGET only when its complete state matches the
+          // target tracker; an unproven or drifted root fails closed.
+          const sourceBinding = pointerMovedThisOpen
+            ? describeLiveCanvasBinding(activeBefore)
+            : "bound";
+          let targetContentProof = false;
+          if (pointerMovedThisOpen && sourceBinding === "foreign") {
+            try {
+              targetContentProof =
+                graphRootMatchesState({
+                  rootGraph: app?.graph,
+                  state: target?.changeTracker?.activeState ?? target?.activeState,
+                }) === true;
+            } catch {
+              targetContentProof = false;
+            }
+          }
           const captureSourceProof =
-            captureBinding === "bound" || (captureBinding !== "foreign" && !pointerMovedThisOpen);
+            captureBinding === "bound" &&
+            (!pointerMovedThisOpen || sourceBinding === "bound" || targetContentProof);
           // #1575 — a state THIS command just read off disk is authoritative, and the
           // canvas mounted behind it is whatever the closed tab left there. Serializing
           // that over the fresh state is the #1215/#968 poisoning through a new entry

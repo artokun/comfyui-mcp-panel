@@ -548,7 +548,8 @@ test("#1575: a state just read off DISK is not overwritten by the still-mounted 
   );
   // #1295's own pins must survive this change.
   assert.match(gate, /!pointerMovedThisOpen/);
-  assert.match(gate, /captureBinding !== "foreign"/);
+  assert.match(gate, /sourceBinding === "bound"/);
+  assert.match(gate, /graphRootMatchesState\(/);
 });
 
 test("#1575: a repaired open DISCLOSES that the canvas is the on-disk copy", () => {
