@@ -6,8 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.124] - 2026-08-29
+
 ### Fixed
-- raise the default render-stall warning to 600 seconds so long sampler, VAE, and video nodes are not mistaken for wedged work (#183)
+- raise the default render-stall warning to 600 seconds so long sampler, VAE, and video nodes are not mistaken for wedged work
+
+- retain keyed promoted display projections
+- sync promoted widget writes from root scope
+- raise default render stall threshold for long nodes
+- report host_links_reindexed on unexpose so MCP can skip the stale warning (#1993)
+
 
 ## [0.15.123] - 2026-08-28
 
