@@ -18,6 +18,7 @@ import { virtualFedInputs } from "../../web/js/lib/virtual-source-promotion.js";
 import { controlAfterGenerateModes } from "../../web/js/lib/control-after-generate.js";
 import { drivenWidgetsFor } from "../../web/js/lib/graph-read.js";
 import { redactWidgetValue } from "../../web/js/lib/widget-secret-redaction.js";
+import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const PANEL_SOURCE = readFileSync(PANEL_JS, "utf8");
@@ -57,6 +58,7 @@ const summarizeNode = (() => {
     "controlAfterGenerateModes",
     "drivenWidgetsFor",
     "redactWidgetValue",
+    "nodeInstanceIdentity",
     `${fn}; return summarizeNode;`,
   )(
     virtualFedInputs,
@@ -67,6 +69,7 @@ const summarizeNode = (() => {
     controlAfterGenerateModes,
     drivenWidgetsFor,
     redactWidgetValue,
+    nodeInstanceIdentity,
   );
 })();
 
