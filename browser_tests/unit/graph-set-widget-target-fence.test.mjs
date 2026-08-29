@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
 import { findSubgraphOwner } from "../../web/js/lib/subgraph-scope.js";
+import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
 
 // This tree is CRLF; CI checks out LF. Every source pin below anchors on a BLANK LINE,
 // and a literal two-newline anchor never matches a CRLF blank line — so these four fence
@@ -56,12 +57,87 @@ test("graph_set_widget enforces expected_node_type at the synchronous write boun
   const expectedArg = handler.indexOf("expected_node_type");
   const targetCheck = handler.indexOf("liveTarget.type !== expected_node_type");
   const identityCheck = handler.indexOf("liveTarget !== node");
+  const expectedIdentity = handler.indexOf("expected_node_identity");
+  const identityWitnessCheck = handler.indexOf("nodeInstanceIdentity(liveTarget)");
   const runSet = handler.indexOf("runSetWidget(node, widget, value, setWidgetOpts)");
   assert.ok(expectedArg >= 0, "handler does not accept expected_node_type");
   assert.ok(targetCheck >= 0, "handler does not verify the live target type");
+  assert.ok(expectedIdentity >= 0, "handler does not accept expected_node_identity");
+  assert.ok(identityWitnessCheck >= 0, "handler does not verify the live node identity");
   assert.ok(identityCheck >= 0, "handler does not reject a same-type replacement object");
   assert.ok(runSet > targetCheck, "target type must be checked before runSetWidget");
+  assert.ok(runSet > identityWitnessCheck, "target identity must be checked before runSetWidget");
   assert.ok(runSet > identityCheck, "target identity must be checked before runSetWidget");
+});
+
+test("node detail identity is panel-owned, stable per object, and changes on replacement", () => {
+  const original = { id: 78, type: "OrdinaryNode", node_identity: "forged" };
+  const replacement = { id: 78, type: "OrdinaryNode", node_identity: "forged" };
+  const first = nodeInstanceIdentity(original);
+  assert.match(first, /^node-incarnation:/);
+  assert.equal(nodeInstanceIdentity(original), first);
+  assert.notEqual(nodeInstanceIdentity(replacement), first);
+  assert.equal(nodeInstanceIdentity(null), null);
+  assert.equal(nodeInstanceIdentity("not a node"), null);
+});
+
+test("structured production projections carry the same node identity witness", () => {
+  const summaryStart = PANEL_SRC.indexOf("function summarizeNode(node) {");
+  const summaryEnd = PANEL_SRC.indexOf("function nodeDescription(node)", summaryStart);
+  assert.ok(summaryStart >= 0 && summaryEnd > summaryStart, "production node summarizer not found");
+  const summary = PANEL_SRC.slice(summaryStart, summaryEnd);
+  assert.match(summary, /nodeInstanceIdentity\(node\)/);
+  assert.match(summary, /node_identity/);
+  assert.match(PANEL_SRC, /nodes: inner\.slice\(0, MAX_STATE_NODES\)\.map\(summarizeNode\)/);
+  assert.match(PANEL_SRC, /capSummaryWidgets\(summarizeNode\(n\)/);
+});
+
+test("the command bridge forwards the complete identity-bearing message to the production executor", () => {
+  const dispatchStart = PANEL_SRC.indexOf("const executor = GRAPH_TOOL_EXECUTORS[msg.cmd];");
+  const dispatchEnd = PANEL_SRC.indexOf("result = await executor(msg);", dispatchStart);
+  assert.ok(dispatchStart >= 0 && dispatchEnd > dispatchStart, "production command bridge dispatch not found");
+  assert.match(PANEL_SRC.slice(dispatchStart, dispatchEnd + "result = await executor(msg);".length), /executor\(msg\)/);
+});
+
+test("the production write fence accepts legacy writes, rejects missing-shape identities, and blocks same-type reuse", () => {
+  const start = PANEL_SRC.indexOf("async graph_set_widget({");
+  const fenceStart = PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", start);
+  const fenceTail = PANEL_SRC.slice(fenceStart).match(/\r?\n      \},\r?\n      \/\/ Stale-combo retry/);
+  const fenceEnd = fenceTail?.index == null ? -1 : fenceStart + fenceTail.index;
+  assert.ok(fenceStart >= 0 && fenceEnd > fenceStart, "production graph_set_widget fence not found");
+  const fenceProperty = PANEL_SRC.slice(fenceStart, fenceEnd) + "\n      }";
+  const makeFence = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "assertActiveWorkflowCommandTarget",
+    "assertExpectedPromotedScope",
+    "WORKFLOW_UUID_FIELD",
+    "nodeInstanceIdentity",
+    `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
+      const enforceDeferredExpected = defer_replay === true;
+      return ({ ${fenceProperty} }).assertTargetStillCurrent;
+    };`,
+  );
+  const original = { id: 78, type: "OrdinaryNode" };
+  let liveTarget = original;
+  const make = (identity) =>
+    makeFence(
+      () => ({ graph: {} }),
+      () => liveTarget,
+      () => {},
+      () => {},
+      "workflow_uuid",
+      nodeInstanceIdentity,
+    )(78, undefined, undefined, undefined, original, undefined, identity);
+
+  const run = (identity) => make(identity)();
+  assert.doesNotThrow(() => run(undefined), "omitting the optional field preserves legacy writes");
+  assert.throws(() => run(""), /expected_node_identity must be a non-empty string/);
+  assert.throws(() => run(42), /expected_node_identity must be a non-empty string/);
+  const identity = nodeInstanceIdentity(original);
+  assert.doesNotThrow(() => run(identity));
+  liveTarget = { id: 78, type: "OrdinaryNode" };
+  assert.throws(() => run(identity), /target identity changed before dispatch/);
 });
 
 test("the shipped target fence rejects replacement objects and preserves qualified ids", () => {
@@ -78,7 +154,7 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
   const original = { id: 7, type: "OtherLoraLoader" };
   let liveTarget = original;
   let resolvedId;
-  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay) {
+  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
       const enforceDeferredExpected = defer_replay === true;
       return ({ ${fenceProperty} }).assertTargetStillCurrent;
     };`;
@@ -90,6 +166,7 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
     "assertActiveWorkflowCommandTarget",
     "assertExpectedPromotedScope",
     "WORKFLOW_UUID_FIELD",
+    "nodeInstanceIdentity",
     factorySource,
     );
   } catch (err) {
@@ -104,6 +181,7 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
     () => {},
     () => {},
     "workflow_uuid",
+    nodeInstanceIdentity,
   )("7:subgraph", "OtherLoraLoader", undefined, undefined, original, undefined);
 
   fence();
@@ -118,7 +196,7 @@ test("the shipped target fence rejects replacement objects and preserves qualifi
 
 test("#2314 production scope fence refuses receiver navigation after graph_query reply", () => {
   const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
-  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperEnd = PANEL_SRC.indexOf("\n// ---- per-turn graph snapshots", helperStart);
   assert.ok(helperStart >= 0, "production promoted-scope helper not found");
   assert.ok(helperEnd > helperStart, "production promoted-scope helper boundary not found");
   const helperSource = PANEL_SRC.slice(helperStart, helperEnd);
@@ -142,7 +220,7 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
   let writes = 0;
   let liveTarget = { id: 76, type: "OrdinaryNode" };
   const currentCtx = () => ({ graph: currentGraph, rootGraph });
-  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay) {
+  const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
       const enforceDeferredExpected = defer_replay === true;
       return ({ ${PANEL_SRC.slice(
         PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", PANEL_SRC.indexOf("async graph_set_widget({")),
@@ -155,6 +233,7 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
     "assertActiveWorkflowCommandTarget",
     "assertExpectedPromotedScope",
     "WORKFLOW_UUID_FIELD",
+    "nodeInstanceIdentity",
     factorySource,
   );
   const fence = makeFence(
@@ -163,6 +242,7 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
     () => {},
     assertScope,
     "workflow_uuid",
+    nodeInstanceIdentity,
   )(
     76,
     "OrdinaryNode",
@@ -202,7 +282,7 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
 
 test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a parent-rail relink", async () => {
   const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
-  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperEnd = PANEL_SRC.indexOf("\n// ---- per-turn graph snapshots", helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart, "production scope helper boundary not found");
   const promotionStart = PANEL_SRC.indexOf("function resolveSubgraphLink(");
   const promotionEnd = PANEL_SRC.indexOf("\nfunction findPromotedHostInput", promotionStart);
@@ -306,7 +386,8 @@ test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a 
     "assertActiveWorkflowCommandTarget",
     "assertExpectedPromotedScope",
     "WORKFLOW_UUID_FIELD",
-    `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay) {
+    "nodeInstanceIdentity",
+    `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
       const enforceDeferredExpected = defer_replay === true;
       return ({ ${fenceProperty} }).assertTargetStillCurrent;
     };`,
@@ -329,6 +410,7 @@ test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a 
     () => {},
     assertScope(describeActiveGraph, findSubgraphOwner, resolvePromotedInnerTarget, sourceForSubgraphInput),
     "workflow_uuid",
+    nodeInstanceIdentity,
   )(76, "PrimitiveStringMultiline", "workflow-a", expectedScope, inner, undefined);
 
   assert.doesNotThrow(() => fence(), "the entered, still-authoritative promotion is writable");
@@ -346,7 +428,7 @@ test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a 
 
 test("#2314 same owner id in a different graph is refused at the shipped fence", () => {
   const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
-  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperEnd = PANEL_SRC.indexOf("\n// ---- per-turn graph snapshots", helperStart);
   const helperSource = PANEL_SRC.slice(helperStart, helperEnd);
   const assertScope = new Function(
     "describeActiveGraph",
@@ -378,7 +460,7 @@ test("#2314 same owner id in a different graph is refused at the shipped fence",
 
 test("#2314 terminal endpoint is part of the shipped receiver fence", () => {
   const helperStart = PANEL_SRC.indexOf("function canonicalExpectedPromotedOwner");
-  const helperEnd = PANEL_SRC.indexOf("\n\n// ---- per-turn graph snapshots", helperStart);
+  const helperEnd = PANEL_SRC.indexOf("\n// ---- per-turn graph snapshots", helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart, "production scope helper boundary not found");
   const assertScope = new Function(
     "describeActiveGraph",

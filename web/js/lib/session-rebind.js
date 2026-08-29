@@ -799,6 +799,9 @@ export function buildHelloPayload({
     // synchronous write boundary, so the orchestrator can fence a node
     // replacement between its final identity probe and mutation.
     enforces_expected_node_type_at_write: true,
+    // #2478: graph_set_widget also honors the opaque per-node incarnation
+    // identity emitted by graph reads at the same synchronous write boundary.
+    enforces_expected_node_identity_at_write: true,
     // #2314: graph_set_widget validates an optional promoted subgraph owner and
     // workflow witness against the LIVE canvas at the same synchronous boundary.
     enforces_expected_scope_at_write: true,

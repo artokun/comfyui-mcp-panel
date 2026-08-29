@@ -72,6 +72,7 @@ import {
 } from "./lib/widget-write.js";
 import { missingWidgetMessage } from "./lib/missing-widget.js";
 import { freeVramSuccessResult, readVramOccupancy } from "./lib/vram-occupancy.js";
+import { nodeInstanceIdentity } from "./lib/node-identity.js";
 import { describeVoiceError } from "./lib/voice-error.js";
 import { voiceRecognitionLang } from "./lib/voice-language.js";
 import { isEmbeddedDesktopShell, voiceInputSupport } from "./lib/voice-support.js";
@@ -12236,6 +12237,7 @@ async function revertGraphSnapshotByMid(mid) {
  *  Deliberately NOT the full serialization (positions, colors, internal
  *  state beyond those) to keep token cost low. */
 function summarizeNode(node) {
+  const nodeIdentity = nodeInstanceIdentity(node);
   const widgets = {};
   for (const w of node.widgets ?? []) {
     if (w && typeof w.name === "string") widgets[w.name] = redactWidgetValue(w.name, w.value);
@@ -12340,6 +12342,10 @@ function summarizeNode(node) {
   }
   const summary = {
     id: node.id,
+    // #2478 — this is an opaque identity of THIS live node object, not a
+    // serialized node field. The MCP preflight carries it to graph_set_widget
+    // so same-id, same-type replacement cannot satisfy a stale write.
+    ...(nodeIdentity ? { node_identity: nodeIdentity } : {}),
     type: node.type,
     title: node.title,
     pos: node.pos ? [Math.round(node.pos[0]), Math.round(node.pos[1])] : null,
@@ -17270,6 +17276,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // positional arguments.
     const expected_scope =
       arguments[0] && typeof arguments[0] === "object" ? arguments[0].expected_scope : undefined;
+    const expected_node_identity =
+      arguments[0] && typeof arguments[0] === "object" ? arguments[0].expected_node_identity : undefined;
     const { defer_until_idle, expected_value, defer_replay } = arguments[0] ?? {};
     // #1413 — ONE deadline for the whole command, taken BEFORE anything awaits, so the
     // bounded steps inside it compose instead of adding (#1192, #671). The step this
@@ -17970,7 +17978,12 @@ const GRAPH_TOOL_EXECUTORS = {
           cmd: "graph_set_widget",
           [WORKFLOW_UUID_FIELD]: workflow_uuid,
         });
-        if (expected_scope === undefined && expected_node_type === undefined && !enforceDeferredExpected) return;
+        if (
+          expected_scope === undefined &&
+          expected_node_type === undefined &&
+          expected_node_identity === undefined &&
+          !enforceDeferredExpected
+        ) return;
         const current = getGraphCtx();
         assertExpectedPromotedScope(current, expected_scope, () => {
           let terminalNode = node;
@@ -18027,6 +18040,24 @@ const GRAPH_TOOL_EXECUTORS = {
           throw new Error(
             `panel_set_widget target changed before dispatch: expected ${expected_node_type}, ` +
               `found ${liveTarget?.type ?? "missing"}`,
+          );
+        }
+        if (
+          expected_node_identity !== undefined &&
+          (typeof expected_node_identity !== "string" ||
+            expected_node_identity.length === 0 ||
+            expected_node_identity.length > 256)
+        ) {
+          throw new Error(
+            "graph_set_widget expected_node_identity must be a non-empty string of at most 256 characters",
+          );
+        }
+        const liveIdentity =
+          expected_node_identity !== undefined ? nodeInstanceIdentity(liveTarget) : null;
+        if (expected_node_identity !== undefined && liveIdentity !== expected_node_identity) {
+          throw new Error(
+            `panel_set_widget target identity changed before dispatch: expected ${expected_node_identity}, ` +
+              `found ${liveIdentity ?? "missing"}`,
           );
         }
         if (enforceDeferredExpected) {
