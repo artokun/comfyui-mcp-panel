@@ -859,18 +859,19 @@ test("#1639 production workflow_open preserves proven-bound capture after a legi
 });
 
 test("#1215 production workflow_open does not capture a still-mounted previous canvas with an uncaptured SOURCE node addition", async () => {
-  const uuid = "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+  const sourceUuid = "source-c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
+  const targetUuid = "target-c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
   const previousState = {
     nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
     links: [],
     groups: [],
-    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+    extra: { comfyui_mcp: { workflow_uuid: sourceUuid } },
   };
   const targetState = {
     nodes: [{ id: 1, type: "KSampler", widgets_values: ["target-value"] }],
     links: [],
     groups: [],
-    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+    extra: { comfyui_mcp: { workflow_uuid: targetUuid } },
   };
   let active;
   let captured = 0;
@@ -893,7 +894,7 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
       { id: 1, type: "KSampler", widgets_values: ["previous-value"] },
       { id: 566, type: "PreviewImage", widgets_values: [] },
     ],
-    extra: { comfyui_mcp: { workflow_uuid: uuid } },
+    extra: { comfyui_mcp: { workflow_uuid: sourceUuid } },
   };
   root.serialize = () => ({
     nodes: root._nodes.map((node) => ({ ...node })),
@@ -952,8 +953,8 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
     WORKFLOW_UUID_FIELD: "workflow_uuid",
     WORKFLOW_PATH_FIELD: "workflow_path",
     OPEN_PROOF_FIELD: "open_proof",
-    workflowObjectUuid: () => uuid,
-    workflowStableUuid: () => uuid,
+    workflowObjectUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowStableUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
     workflowOwnsRootUuidTag: () => false,
     workflowUuidOwner: () => null,
     getWorkflowTitle: () => "Target",
@@ -980,7 +981,8 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
     decideOpenStaleness: () => ({ stale: false, reload: false }),
     describeRepaintSourceBinding: () => "unknown",
     graphRootCarriesOpenProof: () => true,
-    graphRootWorkflowUuidMatches: () => true,
+    graphRootWorkflowUuidMatches: ({ rootGraph, activeWorkflowUuid }) =>
+      rootGraph?.extra?.comfyui_mcp?.workflow_uuid === activeWorkflowUuid,
     graphRootReproducesStateContent: ({ rootGraph, state }) => ({
       proven:
         rootGraph?._nodes?.length === state?.nodes?.length &&
@@ -1000,7 +1002,7 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
     settleOwnedOpenedWorkflowActive,
     noteOpenAttempt: () => ({ seq: 1 }),
     backendSocketReplyFields: () => ({}),
-    activeWorkflowUuidForOpenReply: () => uuid,
+    activeWorkflowUuidForOpenReply: () => targetUuid,
     describeOpenActiveBinding: () => ({ active_matches_target: true }),
     canvasFileDivergenceNote: () => null,
     failOpenRebindUnknown: (error) => error,
@@ -1014,6 +1016,173 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
   assert.equal(loadedValue, "target-value", "the repaint must use TARGET's tracker, not the previous canvas");
   assert.equal(root._nodes[0].widgets_values[0], "target-value");
   assert.equal(root._nodes.some((node) => node.id === 566), false, "the previous tab's added node must not reach TARGET");
+  assert.equal(panel.guard(), null, "the production open releases its reload guard");
+});
+
+test("#1215 production workflow_open does not treat a TARGET graph containing SOURCE plus an added node as SOURCE", async () => {
+  const sourceUuid = "source-9a9b1c2d-6a89-4b9f-a58c-ff48a2eb7e95";
+  const targetUuid = "target-9a9b1c2d-6a89-4b9f-a58c-ff48a2eb7e95";
+  const sourceState = {
+    nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: sourceUuid } },
+  };
+  const targetState = {
+    nodes: [
+      { id: 1, type: "KSampler", widgets_values: ["target-value"] },
+      { id: 566, type: "PreviewImage", widgets_values: [] },
+    ],
+    links: [],
+    groups: [],
+    extra: { comfyui_mcp: { workflow_uuid: targetUuid } },
+  };
+  let active;
+  let captures = 0;
+  let loadedValue;
+  const subscribers = [];
+  const workflowStore = {
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  };
+  const root = {
+    // This is a valid TARGET graph: it contains all SOURCE nodes and one additional
+    // node, but its target identity must prevent the SOURCE-containment heuristic.
+    _nodes: targetState.nodes.map((node) => ({ ...node })),
+    extra: targetState.extra,
+  };
+  root.serialize = () => ({
+    nodes: root._nodes.map((node) => ({ ...node })),
+    links: [],
+    groups: [],
+    extra: root.extra,
+  });
+  const previous = {
+    path: "workflows/previous.json",
+    changeTracker: { activeState: structuredClone(sourceState) },
+  };
+  const target = {
+    path: "workflows/target-with-addition.json",
+    filename: "target-with-addition.json",
+    isModified: false,
+    changeTracker: {
+      activeState: structuredClone(targetState),
+      checkState() {
+        captures += 1;
+        this.activeState = structuredClone(targetState);
+      },
+    },
+  };
+  active = previous;
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: { graph: root },
+    loadGraphData: async (state) => {
+      loadedValue = state?.nodes?.[0]?.widgets_values?.[0];
+      root.extra = state.extra;
+      root._nodes = state.nodes.map((node) => ({ ...node }));
+      // A completed TARGET restore can normalize a widget while retaining its
+      // valid node set. This must not be called leftover SOURCE state.
+      root._nodes[0].widgets_values[0] = "frontend-normalized";
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const status = { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" };
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app,
+    document: workflowPiniaDocument(workflowStore),
+    activeWorkflowRef: () => active,
+    sameWorkflowObject: (a, b) => a === b,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    WORKFLOW_PATH_FIELD: "workflow_path",
+    OPEN_PROOF_FIELD: "open_proof",
+    workflowObjectUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowStableUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowOwnsRootUuidTag: () => false,
+    workflowUuidOwner: () => null,
+    getWorkflowTitle: () => "Target with addition",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => null,
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+    settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+    workflowRecordMatchesSelector: () => true,
+    installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+    installGraphConfigureWatch: () => ({ restore: () => {} }),
+    loadRestoreCompleted: () => true,
+    retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+    liteGraphGlobal: () => null,
+    getGraphCtx: () => ({ graph: root, rootGraph: root }),
+    describeLiveCanvasBinding: () => "bound",
+    applySavedNodePresentation: () => {},
+    applySavedSubgraphHostWidgets: () => {},
+    decideOpenStaleness: () => ({ stale: false, reload: false }),
+    describeRepaintSourceBinding: () => "unknown",
+    graphRootCarriesOpenProof: () => true,
+    graphRootWorkflowUuidMatches: ({ rootGraph, activeWorkflowUuid }) =>
+      rootGraph?.extra?.comfyui_mcp?.workflow_uuid === activeWorkflowUuid,
+    graphRootReproducesStateContent: ({ rootGraph, state }) => {
+      const sameShape = rootGraph?._nodes?.length === state?.nodes?.length;
+      const sameWidget = rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0];
+      const exact = sameShape && sameWidget;
+      return {
+        proven: exact,
+        presentationOnly: false,
+        normalizedOnly: sameShape && !sameWidget,
+        normalizedFields: sameShape && !sameWidget ? ["widgets_values"] : [],
+      };
+    },
+    graphRootStructureExtendsActiveWorkflow,
+    describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
+    openContentDifferenceIsDefinitionsOnly: () => false,
+    resolveOpenRebindVerdict: ({ contentMatches }) =>
+      contentMatches ? { status: status.PROVEN } : { status: status.CONTENT_UNVERIFIED },
+    describeOpenRebindOutcome: () => "content could not be verified",
+    OPEN_REBIND_STATUS: status,
+    GRAPH_TOOL_EXECUTORS: { graph_outline: () => ({ node_count: 2, outline: "1 KSampler, 566 PreviewImage", detail_level: "full" }) },
+    settleOpenedWorkflowReadable,
+    settleOwnedOpenedWorkflowActive,
+    noteOpenAttempt: () => ({ seq: 1 }),
+    backendSocketReplyFields: () => ({}),
+    activeWorkflowUuidForOpenReply: () => targetUuid,
+    describeOpenActiveBinding: () => ({ active_matches_target: true }),
+    canvasFileDivergenceNote: () => null,
+    failOpenRebindUnknown: (error) => error,
+    coerceMessageText: (value) => String(value),
+  });
+
+  const result = await panel.method({ path: target.path, rid: "target-plus-source-addition" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captures, 1, "a target-tagged graph must not bypass TARGET checkState on SOURCE containment alone");
+  assert.equal(loadedValue, "target-value");
+  assert.equal(root._nodes[0].widgets_values[0], "frontend-normalized");
+  assert.equal(root._nodes.some((node) => node.id === 566), true, "the valid TARGET addition must survive the open");
   assert.equal(panel.guard(), null, "the production open releases its reload guard");
 });
 

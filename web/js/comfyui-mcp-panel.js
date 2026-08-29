@@ -22013,6 +22013,32 @@ const GRAPH_TOOL_EXECUTORS = {
               // whose widget values differ, and would regress #1639's proven-bound
               // capture. A count-short graph is deliberately not a source proof
               // because it could already have been rebuilt for TARGET.
+              // Containment is content evidence, not ownership evidence. Resolve both
+              // live workflow objects without consulting the mounted root, then require
+              // the root to carry the SOURCE's exact identity. The identities must also
+              // differ: a duplicate tab with a copied UUID is not an independent source
+              // proof, even if the frontend has temporarily exposed both objects.
+              const sourceWorkflowUuid = workflowObjectUuid(activeBefore) || workflowStableUuid(activeBefore, {
+                embed: false,
+                commit: false,
+              });
+              const targetWorkflowUuid = workflowObjectUuid(target) || workflowStableUuid(target, {
+                embed: false,
+                commit: false,
+              });
+              if (
+                typeof sourceWorkflowUuid !== "string" ||
+                !sourceWorkflowUuid ||
+                typeof targetWorkflowUuid !== "string" ||
+                !targetWorkflowUuid ||
+                sourceWorkflowUuid === targetWorkflowUuid ||
+                !graphRootWorkflowUuidMatches({
+                  rootGraph,
+                  activeWorkflowUuid: sourceWorkflowUuid,
+                })
+              ) {
+                return false;
+              }
               const liveNodes = rootGraph?._nodes;
               const sourceNodeCount = Array.from(sourceStateForSwitch.nodes).length;
               const liveNodeCount = Array.isArray(liveNodes) ? Array.from(liveNodes).length : 0;
