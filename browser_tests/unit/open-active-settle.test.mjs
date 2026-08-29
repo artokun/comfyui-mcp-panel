@@ -20,6 +20,7 @@ import {
   installActivePointerWatch,
   POINTER_WATCH_UNAVAILABLE_NOTICE,
 } from "../../web/js/lib/live-canvas-capture-gate.js";
+import { graphRootStructureExtendsActiveWorkflow } from "../../web/js/lib/graph-binding.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
@@ -857,7 +858,7 @@ test("#1639 production workflow_open preserves proven-bound capture after a legi
   assert.equal(panel.guard(), null, "the production open releases its reload guard");
 });
 
-test("#1215 production workflow_open does not capture a still-mounted previous canvas even when the Pinia watch proves the tab move", async () => {
+test("#1215 production workflow_open does not capture a still-mounted previous canvas with an uncaptured SOURCE node addition", async () => {
   const uuid = "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95";
   const previousState = {
     nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
@@ -885,9 +886,21 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
     },
   };
   const root = {
-    _nodes: [{ id: 1, type: "KSampler", widgets_values: ["previous-value"] }],
+    // The outgoing tab has a live, manually-added node that its tracker has not
+    // captured yet. The exact #1951 source proof must therefore be false even
+    // though this is still visibly the outgoing canvas.
+    _nodes: [
+      { id: 1, type: "KSampler", widgets_values: ["previous-value"] },
+      { id: 566, type: "PreviewImage", widgets_values: [] },
+    ],
     extra: { comfyui_mcp: { workflow_uuid: uuid } },
   };
+  root.serialize = () => ({
+    nodes: root._nodes.map((node) => ({ ...node })),
+    links: [],
+    groups: [],
+    extra: root.extra,
+  });
   const previous = {
     path: "workflows/previous.json",
     changeTracker: { activeState: structuredClone(previousState) },
@@ -969,10 +982,13 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
     graphRootCarriesOpenProof: () => true,
     graphRootWorkflowUuidMatches: () => true,
     graphRootReproducesStateContent: ({ rootGraph, state }) => ({
-      proven: rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0],
+      proven:
+        rootGraph?._nodes?.length === state?.nodes?.length &&
+        rootGraph?._nodes?.[0]?.widgets_values?.[0] === state?.nodes?.[0]?.widgets_values?.[0],
       presentationOnly: false,
       normalizedOnly: false,
     }),
+    graphRootStructureExtendsActiveWorkflow,
     describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
     openContentDifferenceIsDefinitionsOnly: () => false,
     resolveOpenRebindVerdict: ({ contentMatches }) =>
@@ -994,9 +1010,10 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
   const result = await panel.method({ path: "target.json", rid: "still-mounted-source" });
 
   assert.equal(result.opened.path, target.path);
-  assert.equal(captured, 0, "a proven pointer move is not proof the still-mounted canvas belongs to TARGET");
+  assert.equal(captured, 0, "a source edit that the tracker missed is not proof the visible root belongs to TARGET");
   assert.equal(loadedValue, "target-value", "the repaint must use TARGET's tracker, not the previous canvas");
   assert.equal(root._nodes[0].widgets_values[0], "target-value");
+  assert.equal(root._nodes.some((node) => node.id === 566), false, "the previous tab's added node must not reach TARGET");
   assert.equal(panel.guard(), null, "the production open releases its reload guard");
 });
 

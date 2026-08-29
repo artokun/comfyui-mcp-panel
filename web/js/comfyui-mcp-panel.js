@@ -811,6 +811,7 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphRootReproducesStateContent,
+  graphRootStructureExtendsActiveWorkflow,
   applySavedNodePresentation,
   describeRepaintSourceBinding,
   graphCommandBindingBar,
@@ -21982,8 +21983,11 @@ const GRAPH_TOOL_EXECUTORS = {
           // tab, and checkState() then serializes that previous canvas into TARGET.
           // Related workflows (same node ids/types, different widgets) are the shape
           // that then publishes TARGET's fence over SOURCE's values.
-          // proven/presentationOnly only: normalizedOnly would treat those related
-          // graphs as a match, which is the silent serve this closes.
+          // The source probe accepts proven/presentationOnly, plus the narrower
+          // additive-node containment case below: an uncaptured SOURCE edit can
+          // otherwise make the exact proof false while the root is still SOURCE.
+          // normalizedOnly would treat related graphs as a match, which is the
+          // silent serve this closes.
           const sourceStateForSwitch = pointerMovedThisOpen
             ? (activeBefore?.changeTracker?.activeState ?? activeBefore?.activeState)
             : null;
@@ -21998,7 +22002,28 @@ const GRAPH_TOOL_EXECUTORS = {
                 rootGraph,
                 state: sourceStateForSwitch,
               });
-              return proof?.proven === true || proof?.presentationOnly === true;
+              if (proof?.proven === true || proof?.presentationOnly === true) return true;
+              // A user edit can make SOURCE's live graph differ from its last
+              // ChangeTracker capture without making it cease to be SOURCE. In
+              // particular, an added node makes the exact proof above false; the
+              // old #1951 gate then allowed checkState() to copy that still-mounted
+              // graph into TARGET. Only take this fallback for the reported
+              // additive-node shape. Without that positive count increase,
+              // structural containment also matches a correctly-mounted TARGET
+              // whose widget values differ, and would regress #1639's proven-bound
+              // capture. A count-short graph is deliberately not a source proof
+              // because it could already have been rebuilt for TARGET.
+              const liveNodes = rootGraph?._nodes;
+              const sourceNodeCount = Array.from(sourceStateForSwitch.nodes).length;
+              const liveNodeCount = Array.isArray(liveNodes) ? Array.from(liveNodes).length : 0;
+              if (sourceNodeCount === 0 || liveNodeCount <= sourceNodeCount) {
+                return false;
+              }
+              const sourceStructureContainsLive = graphRootStructureExtendsActiveWorkflow({
+                rootGraph,
+                activeWorkflow: activeBefore,
+              });
+              return sourceStructureContainsLive === true;
             } catch {
               return false;
             }

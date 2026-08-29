@@ -1154,6 +1154,11 @@ test("#1215: an untagged root admits the capture only in the already-current cas
     /!liveCanvasStillSource\(app\?\.graph\)/,
     "a still-mounted SOURCE canvas must not be captured into TARGET even when bound",
   );
+  assert.match(
+    gate,
+    /graphRootStructureExtendsActiveWorkflow\(\{[\s\S]*activeWorkflow: activeBefore/,
+    "an uncaptured additive SOURCE edit must still identify the mounted graph as SOURCE",
+  );
 });
 
 test("#1215: an untagged repaint source on a tab switch is DISCLOSED, not silently served", () => {

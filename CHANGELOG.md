@@ -16,7 +16,6 @@ All notable changes to this project are documented here. This project adheres to
 - raise default render stall threshold for long nodes
 - report host_links_reindexed on unexpose so MCP can skip the stale warning (#1993)
 
-
 ## [0.15.123] - 2026-08-28
 
 ### Fixed
