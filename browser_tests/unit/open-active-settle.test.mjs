@@ -20,7 +20,11 @@ import {
   installActivePointerWatch,
   POINTER_WATCH_UNAVAILABLE_NOTICE,
 } from "../../web/js/lib/live-canvas-capture-gate.js";
-import { graphRootStructureExtendsActiveWorkflow } from "../../web/js/lib/graph-binding.js";
+import {
+  graphRootStructureExtendsActiveWorkflow,
+  graphRootWorkflowUuidMatches,
+  graphRootWorkflowUuidMismatches,
+} from "../../web/js/lib/graph-binding.js";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
@@ -91,6 +95,31 @@ function balancedFrom(src, marker, openAt = null) {
 }
 
 const PINIA_STORE_HELPER_SOURCE = balancedFrom(SRC, "function getPiniaStore(id)");
+const LIVE_CANVAS_BINDING_SOURCE = balancedFrom(SRC, "function describeLiveCanvasBinding(wf)");
+
+function productionDescribeLiveCanvasBinding(environment) {
+  const factory = new Function(
+    "app",
+    "workflowObjectUuid",
+    "workflowStableUuid",
+    "graphRootWorkflowUuidMatches",
+    "graphRootWorkflowUuidMismatches",
+    "workflowOwnsRootUuidTag",
+    "WORKFLOW_META_NAMESPACE",
+    "WORKFLOW_UUID_FIELD",
+    `${LIVE_CANVAS_BINDING_SOURCE}\nreturn describeLiveCanvasBinding;`,
+  );
+  return factory(
+    environment.app,
+    environment.workflowObjectUuid,
+    environment.workflowStableUuid,
+    environment.graphRootWorkflowUuidMatches ?? graphRootWorkflowUuidMatches,
+    environment.graphRootWorkflowUuidMismatches ?? graphRootWorkflowUuidMismatches,
+    environment.workflowOwnsRootUuidTag,
+    environment.WORKFLOW_META_NAMESPACE,
+    environment.WORKFLOW_UUID_FIELD,
+  );
+}
 
 // Execute a shipped executor body with the shipped reload guard and proof helper.
 // The frontend-facing services are supplied by each lifecycle test, but the operation
@@ -118,6 +147,7 @@ function productionExecutor(methodName, environment) {
     POINTER_WATCH_UNAVAILABLE_NOTICE,
     workflowOpenReadinessRefusalError,
     readWorkflowOpenReadinessRefusal,
+    describeLiveCanvasBinding: productionDescribeLiveCanvasBinding(environment),
     ...environment,
   };
   const scope = new Proxy(sandbox, {
@@ -875,6 +905,7 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
   };
   let active;
   let captured = 0;
+  let captureDecisionInput;
   let loadedValue;
   const subscribers = [];
   const workflowStore = {
@@ -975,7 +1006,10 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
     retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
     liteGraphGlobal: () => null,
     getGraphCtx: () => ({ graph: root, rootGraph: root }),
-    describeLiveCanvasBinding: () => "bound",
+    decideLiveCanvasCapture: (input) => {
+      captureDecisionInput = input;
+      return decideLiveCanvasCapture(input);
+    },
     applySavedNodePresentation: () => {},
     applySavedSubgraphHostWidgets: () => {},
     decideOpenStaleness: () => ({ stale: false, reload: false }),
@@ -1012,6 +1046,9 @@ test("#1215 production workflow_open does not capture a still-mounted previous c
   const result = await panel.method({ path: "target.json", rid: "still-mounted-source" });
 
   assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.captureSourceProof, false, "the production TARGET classifier must see SOURCE's root as foreign");
+  assert.equal(captureDecisionInput.sourceCanvasStillMounted, true, "the production SOURCE classifier must reach the capture decision");
+  assert.equal(captureDecisionInput.sourceCanvasStillMounted && captureDecisionInput.pointerMovedThisOpen, true);
   assert.equal(captured, 0, "a source edit that the tracker missed is not proof the visible root belongs to TARGET");
   assert.equal(loadedValue, "target-value", "the repaint must use TARGET's tracker, not the previous canvas");
   assert.equal(root._nodes[0].widgets_values[0], "target-value");
@@ -1039,6 +1076,7 @@ test("#1215 production workflow_open does not treat a TARGET graph containing SO
   };
   let active;
   let captures = 0;
+  let captureDecisionInput;
   let loadedValue;
   const subscribers = [];
   const workflowStore = {
@@ -1138,7 +1176,10 @@ test("#1215 production workflow_open does not treat a TARGET graph containing SO
     retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
     liteGraphGlobal: () => null,
     getGraphCtx: () => ({ graph: root, rootGraph: root }),
-    describeLiveCanvasBinding: () => "bound",
+    decideLiveCanvasCapture: (input) => {
+      captureDecisionInput = input;
+      return decideLiveCanvasCapture(input);
+    },
     applySavedNodePresentation: () => {},
     applySavedSubgraphHostWidgets: () => {},
     decideOpenStaleness: () => ({ stale: false, reload: false }),
@@ -1179,6 +1220,8 @@ test("#1215 production workflow_open does not treat a TARGET graph containing SO
   const result = await panel.method({ path: target.path, rid: "target-plus-source-addition" });
 
   assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.captureSourceProof, true, "the production TARGET classifier must see TARGET's root as bound");
+  assert.equal(captureDecisionInput.sourceCanvasStillMounted, false, "the SOURCE proof must not reject a valid TARGET graph");
   assert.equal(captures, 1, "a target-tagged graph must not bypass TARGET checkState on SOURCE containment alone");
   assert.equal(loadedValue, "target-value");
   assert.equal(root._nodes[0].widgets_values[0], "frontend-normalized");

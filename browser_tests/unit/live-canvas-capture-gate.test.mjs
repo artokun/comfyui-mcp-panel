@@ -74,6 +74,19 @@ test("#1911: watch available + unproven pointer skips capture without pretending
   assert.equal(decision.reason, "unproven-pointer");
 });
 
+test("#1215: a positively proven SOURCE canvas blocks capture before TARGET proof", () => {
+  const decision = decideLiveCanvasCapture({
+    watchAvailable: true,
+    captureSourceProof: false,
+    pointerProof: false,
+    pointerMovedThisOpen: true,
+    sourceCanvasStillMounted: true,
+  });
+  assert.equal(decision.capture, false);
+  assert.equal(decision.disclose, false);
+  assert.equal(decision.reason, "source-canvas-still-mounted");
+});
+
 test("#1911: $subscribe absent + tab switch does NOT capture TARGET (that is the #1215 poison) and DISCLOSES", () => {
   const decision = decideLiveCanvasCapture({
     watchAvailable: false,
@@ -208,6 +221,7 @@ test("#1911: workflow_open imports and calls the shipped capture-gate helper", (
   assert.match(SRC, /decideLiveCanvasCapture\(\{/);
   assert.match(SRC, /watchAvailable:\s*activePointerWatchAvailable/);
   assert.match(SRC, /pointerMovedThisOpen/);
+  assert.match(SRC, /sourceCanvasStillMounted/);
 });
 
 test("#1911: SOURCE flush is NOT gated on the Pinia watch — that is the #1215/#1295 invariant", () => {

@@ -1151,8 +1151,8 @@ test("#1215: an untagged root admits the capture only in the already-current cas
   );
   assert.match(
     gate,
-    /!liveCanvasStillSource\(app\?\.graph\)/,
-    "a still-mounted SOURCE canvas must not be captured into TARGET even when bound",
+    /const sourceCanvasStillMounted = liveCanvasStillSource\(app\?\.graph\)/,
+    "a still-mounted SOURCE canvas must be evaluated before the capture decision",
   );
   assert.match(
     gate,
@@ -1161,8 +1161,13 @@ test("#1215: an untagged root admits the capture only in the already-current cas
   );
   assert.match(
     gate,
-    /graphRootWorkflowUuidMatches\(\{[\s\S]*activeWorkflowUuid: sourceWorkflowUuid/,
-    "structural SOURCE containment must be paired with an exact root-blind SOURCE identity",
+    /describeLiveCanvasBinding\(activeBefore\) !== "bound"/,
+    "structural SOURCE containment must use the production classifier for SOURCE identity",
+  );
+  assert.match(
+    gate,
+    /sourceCanvasStillMounted,/,
+    "the SOURCE proof must reach the capture decision instead of being short-circuited",
   );
 });
 

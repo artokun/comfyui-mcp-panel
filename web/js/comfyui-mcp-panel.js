@@ -21969,14 +21969,6 @@ const GRAPH_TOOL_EXECUTORS = {
           // information. The helper either uses the pre-watch already-current proof
           // or skips a switch capture and DISCLOSES. Silent skip is the remaining
           // #1215 path (SOURCE widget values surviving onto TARGET).
-          const captureDecision = decideLiveCanvasCapture({
-            watchAvailable: activePointerWatchAvailable,
-            openLoaded: openSettled?.loaded === true,
-            captureSourceProof,
-            pointerProof,
-            pointerMovedThisOpen,
-          });
-          if (captureDecision.disclose) pointerWatchUnavailable = true;
           // #1215 (2026-08-27 recurrence) — DISTINCT from #1911. The Pinia watch
           // proves the POINTER moved; it does not prove the canvas swapped. A stale
           // or shared root UUID still answers "bound" while app.graph is the outgoing
@@ -21987,7 +21979,10 @@ const GRAPH_TOOL_EXECUTORS = {
           // additive-node containment case below: an uncaptured SOURCE edit can
           // otherwise make the exact proof false while the root is still SOURCE.
           // normalizedOnly would treat related graphs as a match, which is the
-          // silent serve this closes.
+          // silent serve this closes. This probe must run BEFORE
+          // decideLiveCanvasCapture: the production classifier correctly reports
+          // TARGET as foreign while the mounted root is SOURCE, so captureSourceProof
+          // cannot be the only route by which this fact reaches the decision.
           const sourceStateForSwitch = pointerMovedThisOpen
             ? (activeBefore?.changeTracker?.activeState ?? activeBefore?.activeState)
             : null;
@@ -22015,9 +22010,9 @@ const GRAPH_TOOL_EXECUTORS = {
               // because it could already have been rebuilt for TARGET.
               // Containment is content evidence, not ownership evidence. Resolve both
               // live workflow objects without consulting the mounted root, then require
-              // the root to carry the SOURCE's exact identity. The identities must also
-              // differ: a duplicate tab with a copied UUID is not an independent source
-              // proof, even if the frontend has temporarily exposed both objects.
+              // the production classifier to prove that the root belongs to SOURCE.
+              // The identities must also differ: a duplicate tab with a copied UUID is
+              // not an independent source proof, even if both objects are exposed.
               const sourceWorkflowUuid = workflowObjectUuid(activeBefore) || workflowStableUuid(activeBefore, {
                 embed: false,
                 commit: false,
@@ -22032,10 +22027,7 @@ const GRAPH_TOOL_EXECUTORS = {
                 typeof targetWorkflowUuid !== "string" ||
                 !targetWorkflowUuid ||
                 sourceWorkflowUuid === targetWorkflowUuid ||
-                !graphRootWorkflowUuidMatches({
-                  rootGraph,
-                  activeWorkflowUuid: sourceWorkflowUuid,
-                })
+                describeLiveCanvasBinding(activeBefore) !== "bound"
               ) {
                 return false;
               }
@@ -22054,10 +22046,19 @@ const GRAPH_TOOL_EXECUTORS = {
               return false;
             }
           };
+          const sourceCanvasStillMounted = liveCanvasStillSource(app?.graph);
+          const captureDecision = decideLiveCanvasCapture({
+            watchAvailable: activePointerWatchAvailable,
+            openLoaded: openSettled?.loaded === true,
+            captureSourceProof,
+            pointerProof,
+            pointerMovedThisOpen,
+            sourceCanvasStillMounted,
+          });
+          if (captureDecision.disclose) pointerWatchUnavailable = true;
           if (
             openSettled?.loaded !== true &&
-            captureDecision.capture &&
-            !liveCanvasStillSource(app?.graph)
+            captureDecision.capture
           ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would
