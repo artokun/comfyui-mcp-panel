@@ -1337,11 +1337,17 @@ export function resolveHostPromotedWidgets(subgraphNode, hostInput) {
   const keyed = keyedLive;
   if (keyed.length > 1) return [];
   if (keyed.length === 1) {
-    // The canonical host-keyed projection is the only safe target here. An
-    // unkeyed object may be an old display view, but it may also be the stale
-    // link-driven projection that triggered this recurrence; the host store is
-    // authoritative and the canonical projection drives the current render.
-    return [keyed[0].widget];
+    // The canonical host-keyed projection is the primary safe target here. Keep
+    // the other directly identity-linked, unkeyed projections as display views:
+    // #477 requires them to be updated too, or the outer node can still render
+    // the old value. A keyed projection for a different identity is the stale
+    // link-driven view that triggered this recurrence and must not be promoted
+    // to a display target by name or list position.
+    const primary = keyed[0].widget;
+    const displays = described
+      .filter((entry) => entry.widget !== primary && entry.id === null)
+      .map((entry) => entry.widget);
+    return [primary, ...displays];
   }
   // A host key with only mismatched keyed projections is not evidence for any
   // candidate. Legacy unkeyed identity links remain supported only when no

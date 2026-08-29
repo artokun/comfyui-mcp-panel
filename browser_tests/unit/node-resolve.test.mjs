@@ -561,11 +561,16 @@ test("#366 recurrence: production promoted write selects the host rail after a s
     type: "STRING",
     value: "old",
   };
+  const displayProxy = {
+    name: "caption",
+    type: "STRING",
+    value: "old",
+  };
   const hostInput = {
     name: "caption",
     widgetId: "root:37:caption",
     _widget: staleInnerProjection,
-    widget: { name: "caption" },
+    widget: displayProxy,
     _subgraphSlot: { name: "caption" },
   };
   const parent = {
@@ -573,7 +578,7 @@ test("#366 recurrence: production promoted write selects the host rail after a s
     type: "SubgraphNode",
     subgraph,
     inputs: [hostInput],
-    widgets: [staleInnerProjection, parentRail],
+    widgets: [staleInnerProjection, parentRail, displayProxy],
   };
   const resolveSource = (_node, input) =>
     input?.name === "caption" ? { sourceNodeId: "13", sourceWidgetName: "caption" } : null;
@@ -581,9 +586,11 @@ test("#366 recurrence: production promoted write selects the host rail after a s
   const { set } = await setViaHandler(reg, parent, "caption", "new", resolveSource);
 
   assert.equal(parentRail.value, "new", "the host-owned rail must receive the write");
+  assert.equal(displayProxy.value, "new", "the identity-linked display projection must receive the write");
   assert.equal(staleInnerProjection.value, "old", "the stale inner projection must not be selected");
   assert.equal(set.node_id, 37, "the result must identify the root-scope host node");
   assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.equal(set.promoted_from.display_widgets_synced, 1);
   assert.equal(set.promoted_from.value_scope, "instance");
 });
 
