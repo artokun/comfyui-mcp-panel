@@ -111,6 +111,12 @@ import { tryRegisterWhenReady } from "./lib/resolve-comfy-app.js";
 import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { sanitizeNodeAuxId, sanitizeNodesAuxId } from "./lib/aux-id-sanitize.js";
 import {
+  DEFAULT_RENDER_STALL_SECONDS,
+  normalizeRenderStallSeconds,
+  RENDER_STALL_SECONDS_MAX,
+  RENDER_STALL_SECONDS_MIN,
+} from "./lib/render-stall-config.js";
+import {
   installNodeConfigureIsolation,
   retryNodeRestores,
   installGraphConfigureWatch,
@@ -6182,12 +6188,11 @@ function triggerSecret(envKey, friendly) {
 
 // Stall-warning threshold (seconds) from the panel setting, clamped to a sane
 // range — sent on connect so the orchestrator (COMFYUI_MCP_STALL_S) warns the
-// agent once a render has made no progress for this long. null when unset/invalid
-// (the orchestrator then keeps its own 180s default).
+// agent once a render has made no progress for this long. An unset/invalid value
+// uses the Panel's 600s long-node-safe default rather than falling back to the
+// orchestrator's shorter 180s default.
 function stallSettingSeconds() {
-  const v = Number(getSetting(SETTING_STALL_S));
-  if (!Number.isFinite(v) || v <= 0) return null;
-  return Math.min(3600, Math.max(15, Math.round(v)));
+  return normalizeRenderStallSeconds(getSetting(SETTING_STALL_S));
 }
 
 // Optional remote ComfyUI URL (panel setting). Blank → drive the local ComfyUI.
@@ -6923,11 +6928,11 @@ function panelSettingsList() {
       tooltip:
         "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged " +
         "(e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps " +
-        "are legitimately slow, so keep this generous. Default 180s; range 15–3600. Applies when the orchestrator " +
+        "are legitimately slow, so keep this generous. Default 600s; range 15–3600. Applies when the orchestrator " +
         "next starts — Disconnect then Connect (or /restart) to change it for a running agent.",
       type: "number",
-      attrs: { min: 15, max: 3600, step: 5 },
-      defaultValue: 180,
+      attrs: { min: RENDER_STALL_SECONDS_MIN, max: RENDER_STALL_SECONDS_MAX, step: 5 },
+      defaultValue: DEFAULT_RENDER_STALL_SECONDS,
       onChange: () => {
         if (suppressSettingOnChange || !settingsArmed) return;
         // Push the new threshold to a live orchestrator (set_config) so it applies

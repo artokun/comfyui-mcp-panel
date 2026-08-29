@@ -61,7 +61,7 @@
   },
   "comfyui-mcp_stallWarningSeconds": {
     "name": "Alerte de rendu bloqué (secondes)",
-    "tooltip": "Durée pendant laquelle un rendu ComfyUI peut n'enregistrer AUCUNE progression avant que l'agent soit averti que son rendu semble bloqué ou coincé (par ex. une étape d'échantillonnage figée par un dépassement de mémoire) et qu'on lui demande d'annuler ou de relancer plutôt que de lancer une exécution de plus. Les étapes vidéo sont légitimement lentes : restez généreux. 180 s par défaut ; plage 15–3600. S'applique au prochain démarrage de l'orchestrateur — Déconnecter puis Connecter (ou /restart) pour le changer sur un agent en cours."
+    "tooltip": "Durée pendant laquelle un rendu ComfyUI peut n'enregistrer AUCUNE progression avant que l'agent soit averti que son rendu semble bloqué ou coincé (par ex. une étape d'échantillonnage figée par un dépassement de mémoire) et qu'on lui demande d'annuler ou de relancer plutôt que de lancer une exécution de plus. Les étapes vidéo sont légitimement lentes : restez généreux. 600 s par défaut ; plage 15–3600. S'applique au prochain démarrage de l'orchestrateur — Déconnecter puis Connecter (ou /restart) pour le changer sur un agent en cours."
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "URL d'un ComfyUI distant (avancé)",

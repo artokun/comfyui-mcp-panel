@@ -61,7 +61,7 @@
   },
   "comfyui-mcp_stallWarningSeconds": {
     "name": "Render stall warning (seconds)",
-    "tooltip": "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged (e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps are legitimately slow, so keep this generous. Default 180s; range 15–3600. Applies when the orchestrator next starts — Disconnect then Connect (or /restart) to change it for a running agent."
+    "tooltip": "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged (e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps are legitimately slow, so keep this generous. Default 600s; range 15–3600. Applies when the orchestrator next starts — Disconnect then Connect (or /restart) to change it for a running agent."
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "Remote ComfyUI URL (advanced)",

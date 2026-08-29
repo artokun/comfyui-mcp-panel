@@ -61,7 +61,7 @@
   },
   "comfyui-mcp_stallWarningSeconds": {
     "name": "Aviso de render atascado (segundos)",
-    "tooltip": "Cuánto tiempo puede un render de ComfyUI no avanzar NADA antes de avisar al agente de que su render parece atascado o bloqueado (por ejemplo, un paso del sampler colgado por falta de memoria) y pedirle que lo cancele o lo reinicie en lugar de poner otra ejecución en cola. Los pasos de video son legítimamente lentos, así que sé generoso con este valor. Por defecto 180 s; rango 15–3600. Se aplica en el siguiente arranque del orquestador: Desconectar y luego Conectar (o /restart) para cambiarlo en un agente en marcha."
+    "tooltip": "Cuánto tiempo puede un render de ComfyUI no avanzar NADA antes de avisar al agente de que su render parece atascado o bloqueado (por ejemplo, un paso del sampler colgado por falta de memoria) y pedirle que lo cancele o lo reinicie en lugar de poner otra ejecución en cola. Los pasos de video son legítimamente lentos, así que sé generoso con este valor. Por defecto 600 s; rango 15–3600. Se aplica en el siguiente arranque del orquestador: Desconectar y luego Conectar (o /restart) para cambiarlo en un agente en marcha."
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "URL de ComfyUI remoto (avanzado)",
