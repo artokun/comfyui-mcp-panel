@@ -61,7 +61,7 @@
   },
   "comfyui-mcp_stallWarningSeconds": {
     "name": "Aviso de renderização travada (segundos)",
-    "tooltip": "Por quanto tempo uma renderização do ComfyUI pode ficar SEM progresso antes de o agente ser avisado de que a renderização dele parece travada (por exemplo, um passo do sampler preso por falta de memória) e ser orientado a cancelar/reiniciar em vez de enfileirar outra execução. Passos de vídeo são lentos por natureza, então seja generoso aqui. Padrão de 180s; faixa de 15 a 3600. Vale no próximo início do orquestrador — Desconecte e Conecte (ou /restart) para mudar em um agente que já está rodando."
+    "tooltip": "Por quanto tempo uma renderização do ComfyUI pode ficar SEM progresso antes de o agente ser avisado de que a renderização dele parece travada (por exemplo, um passo do sampler preso por falta de memória) e ser orientado a cancelar/reiniciar em vez de enfileirar outra execução. Passos de vídeo são lentos por natureza, então seja generoso aqui. Padrão de 600s; faixa de 15 a 3600. Vale no próximo início do orquestrador — Desconecte e Conecte (ou /restart) para mudar em um agente que já está rodando."
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "URL do ComfyUI remoto (avançado)",

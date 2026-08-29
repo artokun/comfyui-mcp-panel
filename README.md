@@ -297,8 +297,9 @@ identical across providers.
   finalizes synchronously while the tab is hidden and flushes on
   `visibilitychange`, so long pipeline runs render even if you tab away.
 - **Render-stall warning.** A tunable stall threshold (Settings → General;
-  default 180s, range 15–3600) warns when a render wedges; it's pushed **live**,
-  so changing it applies without a reconnect.
+  default 600s, range 15–3600) warns when a render wedges; it's pushed **live**,
+  so changing it applies without a reconnect. The standalone orchestrator fallback
+  remains 180s when no Panel value is supplied.
 
 ## Security notes
 

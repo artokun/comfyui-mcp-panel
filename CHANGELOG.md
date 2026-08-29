@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- raise the default render-stall warning to 600 seconds so long sampler, VAE, and video nodes are not mistaken for wedged work (#183)
+
 ## [0.15.123] - 2026-08-28
 
 ### Fixed

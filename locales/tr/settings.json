@@ -61,7 +61,7 @@
   },
   "comfyui-mcp_stallWarningSeconds": {
     "name": "İşleme takılma uyarısı (saniye)",
-    "tooltip": "Bir ComfyUI işlemesi, ajana işlemenin takılmış/kilitlenmiş göründüğü (örneğin bellek yetersizliğinde sıkışmış bir örnekleyici adımı) uyarısı verilmeden önce ne kadar süre HİÇ ilerlemeyebilir; bu durumda ajana yeni bir çalıştırma kuyruğa almak yerine iptal etmesi/yeniden başlatması söylenir. Video adımları doğası gereği yavaştır, bu yüzden bu değeri cömert tutun. Varsayılan 180 sn; aralık 15–3600. Orkestratör bir sonraki başlayışında geçerli olur — çalışan bir ajan için değiştirmek üzere Bağlantıyı kes, sonra Bağlan (ya da /restart)."
+    "tooltip": "Bir ComfyUI işlemesi, ajana işlemenin takılmış/kilitlenmiş göründüğü (örneğin bellek yetersizliğinde sıkışmış bir örnekleyici adımı) uyarısı verilmeden önce ne kadar süre HİÇ ilerlemeyebilir; bu durumda ajana yeni bir çalıştırma kuyruğa almak yerine iptal etmesi/yeniden başlatması söylenir. Video adımları doğası gereği yavaştır, bu yüzden bu değeri cömert tutun. Varsayılan 600 sn; aralık 15–3600. Orkestratör bir sonraki başlayışında geçerli olur — çalışan bir ajan için değiştirmek üzere Bağlantıyı kes, sonra Bağlan (ya da /restart)."
   },
   "comfyui-mcp_remoteComfyuiUrl": {
     "name": "Uzak ComfyUI adresi (gelişmiş)",
