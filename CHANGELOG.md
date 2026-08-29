@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- preserve and synchronously fence node-incarnation witnesses across deferred replays and custom LTX/PromptRelay/Ideogram/MiniMax writes (#2021, #2478)
+
 ## [0.15.124] - 2026-08-29
 
 ### Fixed
