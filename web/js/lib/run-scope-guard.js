@@ -46,13 +46,32 @@ const QUEUE_PROMPT_ERROR_DETAIL_MAX =
   QUEUE_PROMPT_ERROR_MESSAGE_MAX - QUEUE_PROMPT_ERROR_PREFIX.length;
 const QUEUE_PROMPT_ERROR_TRUNCATION = "\n… [browser stack truncated]";
 const objectToString = Object.prototype.toString;
+const hasOwn = Object.prototype.hasOwnProperty;
+const getPrototypeOf = Object.getPrototypeOf;
+const toStringTag = Symbol.toStringTag;
 
 // `instanceof Error` rejects an Error created by the browser realm when this
 // module runs in another realm. The object tag keeps that existing browser
-// behaviour without walking a hostile Proxy prototype chain.
+// behaviour; the prototype walk rejects inherited toStringTag spoofs while
+// remaining behind the object-tag check for ordinary hostile values.
 function isBrowserError(value) {
   try {
-    return objectToString.call(value) === "[object Error]";
+    // Object.prototype.toString gives objects control over this result through
+    // Symbol.toStringTag. A thrown structured value can therefore impersonate
+    // an Error unless its own tag is excluded before relying on the cross-realm
+    // brand check. Ordinary same- and cross-realm Errors do not define an own
+    // toStringTag and continue through to the existing decoration path.
+    if (hasOwn.call(value, toStringTag)) return false;
+    if (objectToString.call(value) !== "[object Error]") return false;
+
+    // A spoof can put the tag on a custom prototype instead of the thrown
+    // object itself. Genuine Error prototype chains do not define it, so
+    // reject any candidate that does. Proxies and other hostile objects remain
+    // fail-closed through the surrounding catch.
+    for (let prototype = getPrototypeOf(value); prototype !== null; prototype = getPrototypeOf(prototype)) {
+      if (hasOwn.call(prototype, toStringTag)) return false;
+    }
+    return true;
   } catch {
     return false;
   }

@@ -300,6 +300,39 @@ test("#248 a non-Error with a readable stack keeps its identity and message", as
   }
 });
 
+test("#248 a non-Error with a spoofed Error toStringTag keeps its identity and message", async () => {
+  for (const thrown of [
+    {
+      [Symbol.toStringTag]: "Error",
+      name: "SpoofedQueueFailure",
+      message: "structured spoofed queue failure",
+      stack: "SpoofedQueueFailure: structured spoofed queue failure\n    at extension://queue-wrapper.js:23:9",
+    },
+    Object.assign(Object.create({ [Symbol.toStringTag]: "Error" }), {
+      name: "InheritedSpoofedQueueFailure",
+      message: "structured inherited spoofed queue failure",
+      stack: "InheritedSpoofedQueueFailure: structured inherited spoofed queue failure\n    at extension://queue-wrapper.js:29:9",
+    }),
+  ]) {
+    for (const queuePrompt of [
+      () => {
+        throw thrown;
+      },
+      () => Promise.reject(thrown),
+    ]) {
+      await assert.rejects(
+        () => invokeQueuePromptWithBrowserStack({ queuePrompt }),
+        (received) => {
+          assert.equal(received, thrown);
+          assert.equal(received.message, thrown.message);
+          assert.equal(received.stack, thrown.stack);
+          return true;
+        },
+      );
+    }
+  }
+});
+
 test("#248 hostile or non-string stacks cannot mask the original queue failure", async () => {
   for (const stack of [Symbol("hostile stack"), { toString: () => { throw new Error("coercion"); } }]) {
     const error = new TypeError("Cannot convert undefined or null to object");
