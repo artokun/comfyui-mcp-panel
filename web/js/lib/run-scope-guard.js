@@ -49,6 +49,7 @@ const objectToString = Object.prototype.toString;
 const hasOwn = Object.prototype.hasOwnProperty;
 const getPrototypeOf = Object.getPrototypeOf;
 const toStringTag = Symbol.toStringTag;
+const BROWSER_ERROR_PROTO_MAX = 32;
 
 // `instanceof Error` rejects an Error created by the browser realm when this
 // module runs in another realm. The object tag keeps that existing browser
@@ -66,12 +67,18 @@ function isBrowserError(value) {
 
     // A spoof can put the tag on a custom prototype instead of the thrown
     // object itself. Genuine Error prototype chains do not define it, so
-    // reject any candidate that does. Proxies and other hostile objects remain
-    // fail-closed through the surrounding catch.
-    for (let prototype = getPrototypeOf(value); prototype !== null; prototype = getPrototypeOf(prototype)) {
+    // reject any candidate that does. Proxies can return themselves or an
+    // unbounded stream of fresh objects from getPrototypeOf; bound both cases
+    // so classification remains synchronous and fail-closed.
+    const seen = new WeakSet([value]);
+    let prototype = getPrototypeOf(value);
+    for (let depth = 0; prototype !== null && depth < BROWSER_ERROR_PROTO_MAX; depth += 1) {
+      if (seen.has(prototype)) return false;
+      seen.add(prototype);
       if (hasOwn.call(prototype, toStringTag)) return false;
+      prototype = getPrototypeOf(prototype);
     }
-    return true;
+    return prototype === null;
   } catch {
     return false;
   }

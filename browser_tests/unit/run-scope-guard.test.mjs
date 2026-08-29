@@ -387,6 +387,52 @@ test("#248 a Proxy getPrototypeOf trap cannot replace the original thrown value"
   assert.equal(prototypeReads, 0);
 });
 
+test("#248 a Proxy cannot hang or spoof Error classification through a cyclic prototype", async () => {
+  let prototypeReads = 0;
+  let hostile;
+  hostile = new Proxy({}, {
+    get(target, property, receiver) {
+      if (property === Symbol.toStringTag) return "Error";
+      return Reflect.get(target, property, receiver);
+    },
+    getPrototypeOf() {
+      prototypeReads += 1;
+      return hostile;
+    },
+  });
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(hostile) }),
+    (received) => {
+      assert.equal(received, hostile);
+      return true;
+    },
+  );
+  assert.equal(prototypeReads, 1);
+});
+
+test("#248 a Proxy cannot force an unbounded Error prototype scan", async () => {
+  let prototypeReads = 0;
+  const handler = {
+    get(target, property, receiver) {
+      if (property === Symbol.toStringTag) return "Error";
+      return Reflect.get(target, property, receiver);
+    },
+    getPrototypeOf() {
+      prototypeReads += 1;
+      return new Proxy({}, handler);
+    },
+  };
+  const hostile = new Proxy({}, handler);
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(hostile) }),
+    (received) => {
+      assert.equal(received, hostile);
+      return true;
+    },
+  );
+  assert.equal(prototypeReads, 33);
+});
+
 test("#248 cross-realm Error-shaped values retain their browser stack", async () => {
   const crossRealmError = runInNewContext(`(() => {
     const error = new TypeError("Cannot convert undefined or null to object");
