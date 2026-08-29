@@ -975,6 +975,23 @@ export async function runSetWidget(
       : awaitFrontendWidgetFlush;
 
   function readLiveWritten(set) {
+    // For an instance-scoped promoted write, the host rail selected during the
+    // authorization pass is the value the frontend serializes. Do not re-find a
+    // same-named widget by list order: a stale/link-driven projection can remain
+    // in `node.widgets` during a promotion rebind and otherwise make retention
+    // checking validate the wrong value after the real rail was updated (#366).
+    const promotedRail =
+      isResolvedPromotion &&
+      set?.promoted_from?.value_scope === "instance"
+        ? promotedResolution?.target?.parentWidget
+        : null;
+    if (promotedRail) {
+      try {
+        return { found: true, value: promotedRail.value };
+      } catch {
+        return { found: false, value: undefined };
+      }
+    }
     const hosts = [node, resolvedTargetNode, authTarget].filter(Boolean);
     const prefer = hosts.filter((host) => host.id === set?.node_id);
     const rest = hosts.filter((host) => host.id !== set?.node_id);

@@ -1258,6 +1258,15 @@ export function coerceWidgetValue(
  * no authenticated rail object exists. So we accept ONLY a candidate that is an
  * actual widget OBJECT AND is `===` a live member of `node.widgets`, and otherwise
  * FAIL CLOSED (return null) — never write inner or parent on a name-only stub.
+ *
+ * #366 recurrence hardening: during a promoted-input rebind, `_widget` can remain
+ * attached to the old/link-driven projection while the host input's `widgetId` and
+ * the newly materialized parent rail point at another live widget. When the host
+ * carries a key, it is the stronger identity: choose exactly one live projection
+ * whose own `widgetId` is that key before applying the legacy `_widget`/`widget`
+ * order. A mismatched keyed projection is ignored; an ambiguous or keyless set
+ * remains fail-closed unless an unkeyed, directly identity-linked legacy projection
+ * is available. This is still relationship authentication, never a name fallback.
  */
 export function resolveHostPromotedWidgets(subgraphNode, hostInput) {
   if (!subgraphNode || !hostInput) return [];
@@ -1293,7 +1302,53 @@ export function resolveHostPromotedWidgets(subgraphNode, hostInput) {
       out.push(cand);
     }
   }
-  return out;
+
+  // Newer ComfyUI frontends make the host input's widgetId the serialization
+  // binding. A stale `_widget` can still be a live member of node.widgets while
+  // belonging to the link-driven inner projection, so object identity alone is
+  // insufficient to decide which identity-linked member is the parent rail.
+  let hostWidgetId = null;
+  try {
+    const id = hostInput.widgetId;
+    if (typeof id === "string" && id.length > 0) hostWidgetId = id;
+  } catch {
+    // Keep the legacy identity path below; an unreadable optional key is not a
+    // reason to replace a directly linked, otherwise valid projection.
+  }
+  if (!hostWidgetId) return out;
+
+  const readWidgetId = (widget) => {
+    let id = null;
+    try {
+      const candidateId = widget.widgetId;
+      if (typeof candidateId === "string" && candidateId.length > 0) id = candidateId;
+    } catch {
+      // Treat a projection with an unreadable optional key as legacy-unkeyed.
+    }
+    return id;
+  };
+  const described = out.map((widget) => ({ widget, id: readWidgetId(widget) }));
+  // The projection list can be rebuilt independently of the host input object.
+  // Include a newly materialized member by its exact host-owned key so a stale
+  // `_widget` cannot win just because it is still one of the input's references.
+  const keyedLive = inWidgets
+    .map((widget) => ({ widget, id: readWidgetId(widget) }))
+    .filter((entry) => entry.id === hostWidgetId);
+  const keyed = keyedLive;
+  if (keyed.length > 1) return [];
+  if (keyed.length === 1) {
+    // The canonical host-keyed projection is the only safe target here. An
+    // unkeyed object may be an old display view, but it may also be the stale
+    // link-driven projection that triggered this recurrence; the host store is
+    // authoritative and the canonical projection drives the current render.
+    return [keyed[0].widget];
+  }
+  // A host key with only mismatched keyed projections is not evidence for any
+  // candidate. Legacy unkeyed identity links remain supported only when no
+  // competing keyed projection exists; a stale keyed object is never promoted
+  // to the rail by its name or list position.
+  if (described.some((entry) => entry.id !== null)) return [];
+  return described.map((entry) => entry.widget);
 }
 
 /**
