@@ -176,6 +176,71 @@ function makeFrontend({ shape = "shim", defer = false, apiTarget, output = OUR_O
   return app;
 }
 
+// A production-shaped queue chain with the exact #1782 topology: both methods
+// are shadowed by instance properties, while their prototypes carry the native
+// scope plumbing. The forwarding variant proves that shadowing alone is not a
+// Panel defect. The dropping variant models an external wrapper that changes
+// the queue contract; the panel must keep its safe body-repair fallback rather
+// than bypassing that wrapper and silently skipping its queue behavior.
+function makeShadowedQueueFrontend({ dropArgs = false, apiTarget, output = OUR_OUTPUT } = {}) {
+  class NativeApi {
+    async queuePrompt(number, batch, options) {
+      const targets = options?.partialExecutionTargets;
+      const body = frontendBody({
+        output,
+        number,
+        targets: Array.isArray(targets) && targets.length ? targets : null,
+      });
+      api.posted.push(body);
+      await api.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return true;
+    }
+  }
+
+  const api = new NativeApi();
+  api.fetchApi = apiTarget.fetchApi;
+  api.posted = [];
+  const nativeApiQueuePrompt = NativeApi.prototype.queuePrompt;
+  api.queuePrompt = dropArgs
+    ? async function (number, batch) {
+        return nativeApiQueuePrompt.call(api, number, batch);
+      }
+    : async function (...args) {
+        return nativeApiQueuePrompt.apply(api, args);
+      };
+
+  class NativeApp {
+    constructor() {
+      this.api = api;
+      this.graphToPrompt = async () => ({ output, workflow: {} });
+      this.graph = null;
+    }
+
+    async queuePrompt(number, batch, arg) {
+      const queueNodeIds = Array.isArray(arg) ? arg : arg?.queueNodeIds;
+      const options = queueNodeIds?.length
+        ? { partialExecutionTargets: queueNodeIds }
+        : undefined;
+      return this.api.queuePrompt(number, batch, options);
+    }
+  }
+
+  const app = new NativeApp();
+  const nativeAppQueuePrompt = NativeApp.prototype.queuePrompt;
+  app.queuePrompt = dropArgs
+    ? async function (number, batch) {
+        return nativeAppQueuePrompt.call(app, number, batch);
+      }
+    : async function (...args) {
+        return nativeAppQueuePrompt.apply(app, args);
+      };
+  return { app, api };
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -3805,6 +3870,59 @@ test("#1782 frontend 1.49.6 shapes reach /prompt natively and dropped wrappers s
     assert.equal(result.repaired, 1);
     assert.equal(server.calls.length, 1);
     assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1782 actual queue path: shadowed forwarding preserves scope; dropping wrappers stay on repair", async () => {
+  const stop = keepAlive();
+  try {
+    const forwardingServer = makeServer();
+    const forwarding = makeShadowedQueueFrontend({ apiTarget: { fetchApi: forwardingServer } });
+    const native = await dispatchScopedRun({
+      app: forwarding.app,
+      apiTarget: forwarding.api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+
+    assert.equal(Object.prototype.hasOwnProperty.call(forwarding.app, "queuePrompt"), true);
+    assert.equal(Object.prototype.hasOwnProperty.call(forwarding.api, "queuePrompt"), true);
+    assert.equal(native.outcome, "dispatched");
+    assert.equal(native.scopeAppliedBy, "frontend", "shadowing alone does not force repair");
+    assert.equal(native.repaired, 0);
+    assert.equal(forwardingServer.calls.length, 1);
+    assert.deepEqual(
+      JSON.parse(forwardingServer.calls[0].options.body).partial_execution_targets,
+      ["14"],
+    );
+
+    const droppingServer = makeServer();
+    const dropping = makeShadowedQueueFrontend({
+      dropArgs: true,
+      apiTarget: { fetchApi: droppingServer },
+    });
+    const repaired = await dispatchScopedRun({
+      app: dropping.app,
+      apiTarget: dropping.api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+
+    assert.equal(Object.prototype.hasOwnProperty.call(dropping.app, "queuePrompt"), true);
+    assert.equal(Object.prototype.hasOwnProperty.call(dropping.api, "queuePrompt"), true);
+    assert.equal(repaired.outcome, "dispatched");
+    assert.equal(repaired.scopeAppliedBy, "request_body_repair");
+    assert.equal(repaired.repaired, 1);
+    assert.equal(dropping.api.posted.length, 4, "three fenced scope-less attempts, then repair");
+    assert.equal(droppingServer.calls.length, 1);
+    assert.deepEqual(
+      JSON.parse(droppingServer.calls[0].options.body).partial_execution_targets,
+      ["14"],
+    );
   } finally {
     stop();
   }
