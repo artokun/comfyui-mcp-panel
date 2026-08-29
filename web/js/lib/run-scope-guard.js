@@ -32,12 +32,90 @@ import { controlAfterGenerateEntries } from "./control-after-generate.js";
 // timeout helper is how this repo keeps producing near-duplicate bugs (bounded-step's
 // own header), so there is not one.
 import { withTimeout } from "./bounded-step.js";
+import { scrubSecretShapedText } from "./http-failure.js";
 
 // #1854 — the intrinsic captured ONCE at module load. Invoking through a
 // per-call property lookup on the function object would read an overrideable
 // own property, so a shadowed one could throw before the original ran; this
 // reads nothing off the target at call time.
 const rawApply = Reflect.apply;
+
+const QUEUE_PROMPT_ERROR_PREFIX = "app.queuePrompt failed:\n";
+const QUEUE_PROMPT_ERROR_MESSAGE_MAX = 4096;
+const QUEUE_PROMPT_ERROR_DETAIL_MAX =
+  QUEUE_PROMPT_ERROR_MESSAGE_MAX - QUEUE_PROMPT_ERROR_PREFIX.length;
+const QUEUE_PROMPT_ERROR_TRUNCATION = "\n… [browser stack truncated]";
+const objectToString = Object.prototype.toString;
+
+// `instanceof Error` rejects an Error created by the browser realm when this
+// module runs in another realm. The object tag keeps that existing browser
+// behaviour without walking a hostile Proxy prototype chain.
+function isBrowserError(value) {
+  try {
+    return objectToString.call(value) === "[object Error]";
+  } catch {
+    return false;
+  }
+}
+
+function formatQueuePromptStack(stack) {
+  const truncated = stack.length > QUEUE_PROMPT_ERROR_DETAIL_MAX;
+  const raw = truncated
+    ? `${stack.slice(0, QUEUE_PROMPT_ERROR_DETAIL_MAX - QUEUE_PROMPT_ERROR_TRUNCATION.length)}${QUEUE_PROMPT_ERROR_TRUNCATION}`
+    : stack;
+  // Keep stack newlines for source readability, but do not carry control bytes
+  // into the bridge. Redaction runs only after the bounded slice.
+  const clean = raw.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ");
+  const redacted = scrubSecretShapedText(clean);
+  return redacted.length <= QUEUE_PROMPT_ERROR_DETAIL_MAX
+    ? redacted
+    : `${redacted.slice(0, QUEUE_PROMPT_ERROR_DETAIL_MAX - 1)}…`;
+}
+
+/**
+ * #248 — Preserve the browser-side source context when the frontend's queue
+ * wrapper throws. The bridge serializes an executor failure from `message`,
+ * not `stack`, so passing the original Error through loses the extension URL
+ * and line that identify the broken graph serializer. Keep a bounded, redacted
+ * browser stack inside the message for both synchronous throws and rejected
+ * promises.
+ */
+function queuePromptFailureError(error) {
+  // Preserve JavaScript's existing contract for non-Error throws (including
+  // `throw undefined`) and values whose object surface is hostile. In
+  // particular, a frontend can throw a structured non-Error with its own
+  // readable `message` and `stack`; wrapping it would discard that object's
+  // identity and hand the bridge a different message surface.
+  if (error === null || typeof error !== "object" || !isBrowserError(error)) return error;
+  let stack;
+  try {
+    // Some browser Error-like objects expose a hostile or non-string stack
+    // value. Keep native string stacks verbatim; never interpolate arbitrary
+    // values because Symbol() and throwing coercers can mask the queue error.
+    stack = error.stack;
+  } catch {
+    // A throwing stack accessor means the original value is the only safe one.
+    return error;
+  }
+  // A non-string or absent stack is left for the bridge's ordinary message
+  // serializer; there is no safe browser context to add here.
+  if (typeof stack !== "string" || !stack) return error;
+  return new Error(`${QUEUE_PROMPT_ERROR_PREFIX}${formatQueuePromptStack(stack)}`);
+}
+
+/** Invoke the live frontend queue while preserving its browser diagnostics. */
+export function invokeQueuePromptWithBrowserStack(app, ...args) {
+  let result;
+  try {
+    result = app.queuePrompt(...args);
+  } catch (error) {
+    return Promise.reject(queuePromptFailureError(error));
+  }
+  return Promise.resolve(result).catch((error) => {
+    throw queuePromptFailureError(error);
+  });
+}
+
 // #556 — panel_run's to_node_id ("run to node") must NEVER silently fall through
 // to a FULL-graph execution. A scoped run can fail open on two channels:
 //
@@ -2016,8 +2094,12 @@ export async function dispatchScopedRun({
       // is the state the give-up path below already exists for — it cancels the still-
       // pending queue item and, either way, CLOSES this guard, so a post the abandoned
       // queuePrompt emits later still meets the fence and is refused rather than
-      // dispatched scopeless. A throw is re-thrown unchanged (boundedStep keeps it).
-      const queued = await boundedStep(app.queuePrompt(mark, batch, scopeArg), boundedBy(attemptMs));
+      // dispatched scopeless. An Error throw is decorated with its browser stack;
+      // non-Error throws retain their existing identity.
+      const queued = await boundedStep(
+        invokeQueuePromptWithBrowserStack(app, mark, batch, scopeArg),
+        boundedBy(attemptMs),
+      );
       // `"error" in` rather than a truthiness test — a falsy thrown value still throws.
       if (queued !== TIMED_OUT && "error" in queued) throw queued.error;
       if (!guard.verdictReached()) {

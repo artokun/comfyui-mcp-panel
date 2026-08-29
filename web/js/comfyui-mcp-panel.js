@@ -834,7 +834,11 @@ import {
   contentProofExclusiveAmongOpen,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
-import { createRunFetchInterceptor, dispatchScopedRun } from "./lib/run-scope-guard.js";
+import {
+  createRunFetchInterceptor,
+  dispatchScopedRun,
+  invokeQueuePromptWithBrowserStack,
+} from "./lib/run-scope-guard.js";
 import { prunedRetryNote } from "./lib/partial-run-prune.js";
 import { queueMembership, historyEntryFor } from "./lib/history-reconcile.js";
 import { collectNodeOutputMedia } from "./lib/node-output-media.js";
@@ -19559,7 +19563,7 @@ const GRAPH_TOOL_EXECUTORS = {
         const queued = await withTimeout(
           Promise.resolve(
             queuePromptWithGraphToPromptSnapshot(app, promptSnapshotReservation, () =>
-              app.queuePrompt(0, batch, undefined),
+              invokeQueuePromptWithBrowserStack(app, 0, batch, undefined),
             ),
           ).then(
             (value) => ({ value }),
