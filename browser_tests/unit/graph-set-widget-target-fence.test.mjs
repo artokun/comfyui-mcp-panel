@@ -4,6 +4,23 @@ import { readFileSync } from "node:fs";
 import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
 import { findSubgraphOwner } from "../../web/js/lib/subgraph-scope.js";
 import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
+import { classifyLtxTimelineWrite, applyLtxTimelineWrite, derivedTimelineRefusal } from "../../web/js/lib/ltx-director.js";
+import {
+  classifyPromptRelayTimelineWrite,
+  applyPromptRelayTimelineWrite,
+  promptRelayDerivedRefusal,
+} from "../../web/js/lib/prompt-relay-timeline.js";
+import { classifyRgthreeFastGroupsWrite, rgthreeFastGroupsRefusal } from "../../web/js/lib/rgthree-fast-groups.js";
+import {
+  classifyIdeogram4PromptBuilderWrite,
+  applyIdeogram4PromptBuilderWrite,
+  ideogram4PromptBuilderRefusal,
+} from "../../web/js/lib/ideogram4-prompt-builder.js";
+import {
+  classifyMiniMaxH3PromptBuilderWrite,
+  applyMiniMaxH3PromptBuilderWrite,
+} from "../../web/js/lib/minimax-h3-prompt-builder.js";
+import { classifyMiniMaxH3DirectorWrite, miniMaxH3DirectorPromptRefusal } from "../../web/js/lib/minimax-h3-director.js";
 
 // This tree is CRLF; CI checks out LF. Every source pin below anchors on a BLANK LINE,
 // and a literal two-newline anchor never matches a CRLF blank line — so these four fence
@@ -45,6 +62,79 @@ function extractShippingMethod(signature) {
     if (ch === "}" && --depth === 0) return PANEL_SRC.slice(start, i + 1);
   }
   throw new Error(`unterminated method: ${signature}`);
+}
+
+function extractTargetFenceProperty() {
+  const start = PANEL_SRC.indexOf("const assertGraphSetWidgetTargetStillCurrent = () => {");
+  const end = PANEL_SRC.indexOf("\n    // #314:", start);
+  assert.ok(start >= 0 && end > start, "production graph_set_widget fence not found");
+  const bodyStart = PANEL_SRC.indexOf("{", start) + 1;
+  const bodyEnd = PANEL_SRC.lastIndexOf("\n    };", end);
+  assert.ok(bodyStart > 0 && bodyEnd > bodyStart, "production graph_set_widget fence body not found");
+  return `assertTargetStillCurrent: () => {${PANEL_SRC.slice(bodyStart, bodyEnd)}\n      }`;
+}
+
+function makeProductionTargetFence({ node, graph, expectedNodeType, expectedNodeIdentity }) {
+  const fenceProperty = extractTargetFenceProperty();
+  const makeFence = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "assertActiveWorkflowCommandTarget",
+    "assertExpectedPromotedScope",
+    "WORKFLOW_UUID_FIELD",
+    "nodeInstanceIdentity",
+    `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
+      const enforceDeferredExpected = defer_replay === true;
+      return ({ ${fenceProperty} }).assertTargetStillCurrent;
+    };`,
+  );
+  let liveTarget = node;
+  const fence = makeFence(
+    () => ({ graph, rootGraph: graph }),
+    () => liveTarget,
+    () => {},
+    () => {},
+    "workflow_uuid",
+    nodeInstanceIdentity,
+  )(node.id, expectedNodeType, undefined, undefined, node, undefined, expectedNodeIdentity);
+  return {
+    fence,
+    replaceNode: (replacement) => {
+      liveTarget = replacement;
+    },
+  };
+}
+
+function makeProductionCustomRoute() {
+  const start = PANEL_SRC.indexOf("    const ltxKind = classifyLtxTimelineWrite(node, widget);");
+  const end = PANEL_SRC.indexOf("    // #458:", start);
+  assert.ok(start >= 0 && end > start, "production custom graph_set_widget routes not found");
+  return new Function(
+    "node",
+    "widget",
+    "value",
+    "builder_state",
+    "graph",
+    "assertGraphSetWidgetTargetStillCurrent",
+    "classifyLtxTimelineWrite",
+    "applyLtxTimelineWrite",
+    "derivedTimelineRefusal",
+    "classifyPromptRelayTimelineWrite",
+    "applyPromptRelayTimelineWrite",
+    "promptRelayDerivedRefusal",
+    "classifyRgthreeFastGroupsWrite",
+    "rgthreeFastGroupsRefusal",
+    "classifyIdeogram4PromptBuilderWrite",
+    "applyIdeogram4PromptBuilderWrite",
+    "ideogram4PromptBuilderRefusal",
+    "classifyMiniMaxH3PromptBuilderWrite",
+    "applyMiniMaxH3PromptBuilderWrite",
+    "classifyMiniMaxH3DirectorWrite",
+    "miniMaxH3DirectorPromptRefusal",
+    `return async function runCustomRoute() {
+      ${PANEL_SRC.slice(start, end)}
+    };`,
+  );
 }
 
 test("graph_set_widget enforces expected_node_type at the synchronous write boundary", () => {
@@ -99,13 +189,151 @@ test("the command bridge forwards the complete identity-bearing message to the p
   assert.match(PANEL_SRC.slice(dispatchStart, dispatchEnd + "result = await executor(msg);".length), /executor\(msg\)/);
 });
 
+test("#2478 every custom mutation route fences a same-ID same-type replacement before mutation", async () => {
+  const runCustomRoute = makeProductionCustomRoute();
+  const promptRelayTimeline = { segments: [{ prompt: "old", length: 24, color: "#fff" }] };
+  const minimaxState = {
+    version: 1,
+    mode: "T2VA",
+    off: {},
+    duration: 5,
+    p2Shot: 1,
+    lastShot: 1,
+    imd: "old",
+    soundscape: "",
+    music: "N/A",
+    ref: {
+      subjectDefs: [],
+      summaryTypes: ["reference generation"],
+      summaryText: "",
+      retention: [],
+      styleLine: "",
+      detail: "",
+      soundscape: "",
+      music: "N/A",
+    },
+  };
+  const cases = [
+    {
+      label: "LTXDirector",
+      widget: "timeline_data",
+      value: { segments: [{ start: 0, length: 24, prompt: "new", type: "text" }] },
+      makeNode: () => {
+        const node = {
+          id: 7,
+          type: "LTXDirector",
+          _timelineEditor: {
+            timelineDataWidget: { value: JSON.stringify({ segments: [{ start: 0, length: 24, prompt: "old", type: "text" }] }) },
+            _applyLoadedTimeline() {
+              throw new Error("custom mutation was reached");
+            },
+          },
+        };
+        return node;
+      },
+    },
+    {
+      label: "PromptRelayEncodeTimeline",
+      widget: "timeline_data",
+      value: { segments: [{ prompt: "new", length: 24, color: "#fff" }] },
+      makeNode: () => ({
+        id: 7,
+        type: "PromptRelayEncodeTimeline",
+        widgets: [
+          { name: "timeline_data", value: JSON.stringify(promptRelayTimeline) },
+          { name: "local_prompts", value: "old" },
+          { name: "segment_lengths", value: "24" },
+        ],
+      }),
+    },
+    {
+      label: "Ideogram4PromptBuilderKJ",
+      widget: "elements_data",
+      value: [{ x: 0.1, y: 0.2, w: 0.3, h: 0.4, type: "text", text: "new", desc: "new region", palette: ["#abc"] }],
+      makeNode: () => {
+        const currentBoxes = [{ x: 0, y: 0, w: 0.2, h: 0.2, type: "obj", text: "", desc: "old", palette: [] }];
+        const node = {
+          id: 7,
+          type: "Ideogram4PromptBuilderKJ",
+          _boxes: currentBoxes,
+          widgets: [],
+        };
+        node.widgets.push({
+          name: "elements_data",
+          value: JSON.stringify(currentBoxes),
+          serializeValue: () => JSON.stringify(node._boxes),
+        });
+        node.onExecuted = () => {
+          throw new Error("custom mutation was reached");
+        };
+        return node;
+      },
+    },
+    {
+      label: "MiniMaxH3PromptBuilder",
+      widget: "prompt_text",
+      value: "new prompt",
+      makeNode: () => ({
+        id: 7,
+        type: "MiniMaxH3PromptBuilder",
+        widgets: [
+          { name: "prompt_text", value: "old prompt" },
+          { name: "builder_state", value: JSON.stringify(minimaxState) },
+        ],
+      }),
+    },
+  ];
+
+  for (const item of cases) {
+    const node = item.makeNode();
+    const replacement = { id: node.id, type: node.type, widgets: [] };
+    const graph = {
+      beforeChange() {
+        fence.replaceNode(replacement);
+      },
+      afterChange() {},
+      setDirtyCanvas() {},
+    };
+    const fence = makeProductionTargetFence({
+      node,
+      graph,
+      expectedNodeType: node.type,
+      expectedNodeIdentity: nodeInstanceIdentity(node),
+    });
+    await assert.rejects(
+      runCustomRoute(
+        node,
+        item.widget,
+        item.value,
+        undefined,
+        graph,
+        fence.fence,
+        classifyLtxTimelineWrite,
+        applyLtxTimelineWrite,
+        derivedTimelineRefusal,
+        classifyPromptRelayTimelineWrite,
+        applyPromptRelayTimelineWrite,
+        promptRelayDerivedRefusal,
+        classifyRgthreeFastGroupsWrite,
+        rgthreeFastGroupsRefusal,
+        classifyIdeogram4PromptBuilderWrite,
+        applyIdeogram4PromptBuilderWrite,
+        ideogram4PromptBuilderRefusal,
+        classifyMiniMaxH3PromptBuilderWrite,
+        applyMiniMaxH3PromptBuilderWrite,
+        classifyMiniMaxH3DirectorWrite,
+        miniMaxH3DirectorPromptRefusal,
+      ),
+      /target (?:identity )?changed before dispatch/,
+      item.label,
+    );
+    assert.equal(node.id, replacement.id, `${item.label} node remains addressable`);
+    assert.equal(node.type, replacement.type, `${item.label} replacement used the same type`);
+  }
+});
+
 test("the production write fence accepts legacy writes, rejects missing-shape identities, and blocks same-type reuse", () => {
-  const start = PANEL_SRC.indexOf("async graph_set_widget({");
-  const fenceStart = PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", start);
-  const fenceTail = PANEL_SRC.slice(fenceStart).match(/\r?\n      \},\r?\n      \/\/ Stale-combo retry/);
-  const fenceEnd = fenceTail?.index == null ? -1 : fenceStart + fenceTail.index;
-  assert.ok(fenceStart >= 0 && fenceEnd > fenceStart, "production graph_set_widget fence not found");
-  const fenceProperty = PANEL_SRC.slice(fenceStart, fenceEnd) + "\n      }";
+  const fenceProperty = extractTargetFenceProperty();
   const makeFence = new Function(
     "getGraphCtx",
     "resolveNode",
@@ -141,15 +369,7 @@ test("the production write fence accepts legacy writes, rejects missing-shape id
 });
 
 test("the shipped target fence rejects replacement objects and preserves qualified ids", () => {
-  const start = PANEL_SRC.indexOf("async graph_set_widget({");
-  const end = PANEL_SRC.indexOf("\n  // artokun/comfyui-mcp#938", start);
-  const handler = PANEL_SRC.slice(start, end);
-  const fenceStart = handler.indexOf("assertTargetStillCurrent: () => {");
-  const fenceTail = handler.slice(fenceStart).match(/\r?\n      \},\r?\n      \/\/ Stale-combo retry/);
-  const fenceEnd = fenceTail?.index == null ? -1 : fenceStart + fenceTail.index;
-  assert.ok(fenceStart >= 0, "production target fence not found");
-  assert.ok(fenceEnd > fenceStart, "production target fence boundary not found");
-  const fenceProperty = handler.slice(fenceStart, fenceEnd) + "\n      }";
+  const fenceProperty = extractTargetFenceProperty();
 
   const original = { id: 7, type: "OtherLoraLoader" };
   let liveTarget = original;
@@ -220,12 +440,10 @@ test("#2314 production scope fence refuses receiver navigation after graph_query
   let writes = 0;
   let liveTarget = { id: 76, type: "OrdinaryNode" };
   const currentCtx = () => ({ graph: currentGraph, rootGraph });
+  const fenceProperty = extractTargetFenceProperty();
   const factorySource = `return function (node_id, expected_node_type, workflow_uuid, expected_scope, node, defer_replay, expected_node_identity) {
       const enforceDeferredExpected = defer_replay === true;
-      return ({ ${PANEL_SRC.slice(
-        PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", PANEL_SRC.indexOf("async graph_set_widget({")),
-        PANEL_SRC.indexOf("\n      // Stale-combo retry", PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", PANEL_SRC.indexOf("async graph_set_widget({"))),
-      )} }).assertTargetStillCurrent;
+      return ({ ${fenceProperty} }).assertTargetStillCurrent;
     };`;
   const makeFence = new Function(
     "getGraphCtx",
@@ -374,12 +592,7 @@ test("#2314 production graph_enter_subgraph -> graph_set_widget fence refuses a 
   const enterReply = await enter({ node_id: 78 });
   assert.equal(enterReply.settled, true, "the production enter path must settle on the child graph");
 
-  const handlerStart = PANEL_SRC.indexOf("async graph_set_widget({");
-  const fenceStart = PANEL_SRC.indexOf("assertTargetStillCurrent: () => {", handlerStart);
-  const fenceTail = PANEL_SRC.slice(fenceStart).match(/\r?\n      \},\r?\n      \/\/ Stale-combo retry/);
-  const fenceEnd = fenceTail?.index == null ? -1 : fenceStart + fenceTail.index;
-  assert.ok(fenceStart >= 0 && fenceEnd > fenceStart, "production graph_set_widget fence not found");
-  const fenceProperty = PANEL_SRC.slice(fenceStart, fenceEnd) + "\n      }";
+  const fenceProperty = extractTargetFenceProperty();
   const makeFence = new Function(
     "getGraphCtx",
     "resolveNode",

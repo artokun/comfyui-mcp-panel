@@ -17279,6 +17279,16 @@ const GRAPH_TOOL_EXECUTORS = {
     const expected_node_identity =
       arguments[0] && typeof arguments[0] === "object" ? arguments[0].expected_node_identity : undefined;
     const { defer_until_idle, expected_value, defer_replay } = arguments[0] ?? {};
+    if (
+      expected_node_identity !== undefined &&
+      (typeof expected_node_identity !== "string" ||
+        expected_node_identity.length === 0 ||
+        expected_node_identity.length > 256)
+    ) {
+      throw new Error(
+        "graph_set_widget expected_node_identity must be a non-empty string of at most 256 characters",
+      );
+    }
     // #1413 — ONE deadline for the whole command, taken BEFORE anything awaits, so the
     // bounded steps inside it compose instead of adding (#1192, #671). The step this
     // exists for is the stale-combo recovery's refresh join below: reached only after
@@ -17349,6 +17359,7 @@ const GRAPH_TOOL_EXECUTORS = {
           builder_state,
           expected_node_type: node.type,
           expected_scope,
+          ...(expected_node_identity !== undefined ? { expected_node_identity } : {}),
           expected_value,
           defer_replay: true,
         });
@@ -17391,6 +17402,7 @@ const GRAPH_TOOL_EXECUTORS = {
             builder_state,
             expected_node_type: deferredNode.type,
             expected_scope,
+            ...(expected_node_identity !== undefined ? { expected_node_identity } : {}),
             expected_value,
             defer_replay: true,
           }),
@@ -17442,6 +17454,114 @@ const GRAPH_TOOL_EXECUTORS = {
     // refresh and an upload probe between reading the schema and deciding, and a
     // classification computed before those awaits can be superseded during them.
     let setWidgetSchemaProvenance = () => "none";
+    // Every graph_set_widget mutation, including the custom editor routes below, must
+    // cross the same final synchronous boundary. Keep this callback in the handler scope
+    // so custom writers can invoke it after their undo envelope opens but immediately
+    // before their first graph/editor mutation. Optional witnesses remain optional for
+    // legacy callers; when present, all validation is fail-closed and identity is compared
+    // against the live object rather than a serialized node field.
+    const assertGraphSetWidgetTargetStillCurrent = () => {
+      assertActiveWorkflowCommandTarget({
+        cmd: "graph_set_widget",
+        [WORKFLOW_UUID_FIELD]: workflow_uuid,
+      });
+      if (
+        expected_scope === undefined &&
+        expected_node_type === undefined &&
+        expected_node_identity === undefined &&
+        !enforceDeferredExpected
+      ) return;
+      const current = getGraphCtx();
+      assertExpectedPromotedScope(current, expected_scope, () => {
+        let terminalNode = node;
+        let terminalWidget = node?.widgets?.find((candidate) => candidate?.name === widget) ?? null;
+        let depth = 0;
+        if (node?.subgraph) {
+          const resolved = resolvePromotedInnerTarget(node, widget, sourceForSubgraphInput);
+          if (!resolved?.promoted || !resolved.target) return null;
+          const reached = followPromotionToConcrete(resolved.target, sourceForSubgraphInput);
+          if (
+            !reached?.node ||
+            !reached.widget ||
+            reached.cycle ||
+            reached.error ||
+            reached.terminalVirtual ||
+            reached.node.subgraph
+          ) {
+            return null;
+          }
+          terminalNode = reached.node;
+          terminalWidget = reached.widget;
+          depth = reached.depth;
+        }
+        const inputs = terminalPromotionShape(terminalNode);
+        if (
+          !terminalNode ||
+          !terminalWidget ||
+          !inputs ||
+          (typeof terminalNode.id !== "number" && typeof terminalNode.id !== "string") ||
+          typeof terminalNode.type !== "string" ||
+          typeof terminalWidget.name !== "string"
+        ) {
+          return null;
+        }
+        return {
+          node_id: terminalNode.id,
+          type: terminalNode.type,
+          widget: terminalWidget.name,
+          inputs,
+          depth,
+        };
+      });
+      const liveTarget = resolveNode(current.graph, node_id);
+      if (
+        expected_node_type !== undefined &&
+        (typeof expected_node_type !== "string" || !expected_node_type)
+      ) {
+        throw new Error("graph_set_widget expected_node_type must be a non-empty string");
+      }
+      if (
+        expected_node_type !== undefined &&
+        (!liveTarget || liveTarget !== node || liveTarget.type !== expected_node_type)
+      ) {
+        throw new Error(
+          `panel_set_widget target changed before dispatch: expected ${expected_node_type}, ` +
+            `found ${liveTarget?.type ?? "missing"}`,
+        );
+      }
+      if (
+        expected_node_identity !== undefined &&
+        (typeof expected_node_identity !== "string" ||
+          expected_node_identity.length === 0 ||
+          expected_node_identity.length > 256)
+      ) {
+        throw new Error(
+          "graph_set_widget expected_node_identity must be a non-empty string of at most 256 characters",
+        );
+      }
+      const liveIdentity =
+        expected_node_identity !== undefined ? nodeInstanceIdentity(liveTarget) : null;
+      if (expected_node_identity !== undefined && liveIdentity !== expected_node_identity) {
+        throw new Error(
+          `panel_set_widget target identity changed before dispatch: expected ${expected_node_identity}, ` +
+            `found ${liveIdentity ?? "missing"}`,
+        );
+      }
+      if (enforceDeferredExpected) {
+        const liveWidget = liveTarget?.widgets?.find((candidate) => candidate?.name === widget);
+        if (
+          !liveTarget ||
+          liveTarget !== node ||
+          !liveWidget ||
+          !sameDeferredWidgetValue(liveWidget.value, expected_value)
+        ) {
+          throw new Error(
+            `panel_set_widget deferred replay refused "${widget}" on node ${node_id}: ` +
+              "the widget changed before the write boundary; nothing was applied",
+          );
+        }
+      }
+    };
     // #314: the LTXDirector custom node owns its timeline widgets through an in-browser
     // TimelineEditor whose in-memory `this.timeline` is the source of truth. A raw widget
     // write "succeeds" (panel_query_graph shows it) but never reaches the editor/UI and is
@@ -17461,6 +17581,7 @@ const GRAPH_TOOL_EXECUTORS = {
         beforeChange: () => graph.beforeChange(),
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),
+        assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
       });
     }
     // #506: the ComfyUI-PromptRelay "PromptRelayEncodeTimeline" node has the same shape of
@@ -17480,6 +17601,7 @@ const GRAPH_TOOL_EXECUTORS = {
         beforeChange: () => graph.beforeChange(),
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),
+        assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
       });
     }
     // #983: rgthree's Fast Groups Muter toggle rows are DERIVED READOUTS of whether the matched
@@ -17504,6 +17626,7 @@ const GRAPH_TOOL_EXECUTORS = {
           beforeChange: () => graph.beforeChange(),
           afterChange: () => graph.afterChange(),
           setDirty: () => graph.setDirtyCanvas(true, true),
+          assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
         });
       }
       throw new Error(ideogram4PromptBuilderRefusal(widget, node.id));
@@ -17519,6 +17642,7 @@ const GRAPH_TOOL_EXECUTORS = {
         beforeChange: () => graph.beforeChange(),
         afterChange: () => graph.afterChange(),
         setDirty: () => graph.setDirtyCanvas(true, true),
+        assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
       });
     }
     // #458: WAIT for the startup baseline history seed to land before authorizing, so a
@@ -17969,112 +18093,9 @@ const GRAPH_TOOL_EXECUTORS = {
           },
         };
       },
-      // #718: the first command-handler fence ran before awaitObjectInfoHistorySeed()
-      // and the fresh /object_info request. A user can switch workflows while either
-      // promise is pending, so re-read the ACTIVE uuid at the exact shared write
-      // boundary. runSetWidget calls this synchronously before every write path.
-      assertTargetStillCurrent: () => {
-        assertActiveWorkflowCommandTarget({
-          cmd: "graph_set_widget",
-          [WORKFLOW_UUID_FIELD]: workflow_uuid,
-        });
-        if (
-          expected_scope === undefined &&
-          expected_node_type === undefined &&
-          expected_node_identity === undefined &&
-          !enforceDeferredExpected
-        ) return;
-        const current = getGraphCtx();
-        assertExpectedPromotedScope(current, expected_scope, () => {
-          let terminalNode = node;
-          let terminalWidget = node?.widgets?.find((candidate) => candidate?.name === widget) ?? null;
-          let depth = 0;
-          if (node?.subgraph) {
-            const resolved = resolvePromotedInnerTarget(node, widget, sourceForSubgraphInput);
-            if (!resolved?.promoted || !resolved.target) return null;
-            const reached = followPromotionToConcrete(resolved.target, sourceForSubgraphInput);
-            if (
-              !reached?.node ||
-              !reached.widget ||
-              reached.cycle ||
-              reached.error ||
-              reached.terminalVirtual ||
-              reached.node.subgraph
-            ) {
-              return null;
-            }
-            terminalNode = reached.node;
-            terminalWidget = reached.widget;
-            depth = reached.depth;
-          }
-          const inputs = terminalPromotionShape(terminalNode);
-          if (
-            !terminalNode ||
-            !terminalWidget ||
-            !inputs ||
-            (typeof terminalNode.id !== "number" && typeof terminalNode.id !== "string") ||
-            typeof terminalNode.type !== "string" ||
-            typeof terminalWidget.name !== "string"
-          ) {
-            return null;
-          }
-          return {
-            node_id: terminalNode.id,
-            type: terminalNode.type,
-            widget: terminalWidget.name,
-            inputs,
-            depth,
-          };
-        });
-        const liveTarget = resolveNode(current.graph, node_id);
-        if (
-          expected_node_type !== undefined &&
-          (typeof expected_node_type !== "string" || !expected_node_type)
-        ) {
-          throw new Error("graph_set_widget expected_node_type must be a non-empty string");
-        }
-        if (
-          expected_node_type !== undefined &&
-          (!liveTarget || liveTarget !== node || liveTarget.type !== expected_node_type)
-        ) {
-          throw new Error(
-            `panel_set_widget target changed before dispatch: expected ${expected_node_type}, ` +
-              `found ${liveTarget?.type ?? "missing"}`,
-          );
-        }
-        if (
-          expected_node_identity !== undefined &&
-          (typeof expected_node_identity !== "string" ||
-            expected_node_identity.length === 0 ||
-            expected_node_identity.length > 256)
-        ) {
-          throw new Error(
-            "graph_set_widget expected_node_identity must be a non-empty string of at most 256 characters",
-          );
-        }
-        const liveIdentity =
-          expected_node_identity !== undefined ? nodeInstanceIdentity(liveTarget) : null;
-        if (expected_node_identity !== undefined && liveIdentity !== expected_node_identity) {
-          throw new Error(
-            `panel_set_widget target identity changed before dispatch: expected ${expected_node_identity}, ` +
-              `found ${liveIdentity ?? "missing"}`,
-          );
-        }
-        if (enforceDeferredExpected) {
-          const liveWidget = liveTarget?.widgets?.find((candidate) => candidate?.name === widget);
-          if (
-            !liveTarget ||
-            liveTarget !== node ||
-            !liveWidget ||
-            !sameDeferredWidgetValue(liveWidget.value, expected_value)
-          ) {
-            throw new Error(
-              `panel_set_widget deferred replay refused "${widget}" on node ${node_id}: ` +
-                "the widget changed before the write boundary; nothing was applied",
-            );
-          }
-        }
-      },
+      // #718/#2478: the handler's one final workflow/scope/type/identity fence. Custom
+      // editor routes use the same callback at their own synchronous mutation boundary.
+      assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,
       // Stale-combo retry: reuse the /object_info already fetched for authorization
       // (passed by runSetWidget) to refresh THIS target's combo option lists in place
       // — a single fetch total (#458 P2). When a payload IS present we NEVER re-fetch,

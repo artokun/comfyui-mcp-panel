@@ -517,7 +517,7 @@ export function applyMiniMaxH3PromptBuilderWrite(
   node,
   widgetName,
   value,
-  { builder_state: companionState, beforeChange, afterChange, setDirty } = {},
+  { builder_state: companionState, beforeChange, afterChange, setDirty, assertTargetStillCurrent } = {},
 ) {
   const promptWidget = findWidget(node, MINIMAX_H3_PROMPT_TEXT_WIDGET);
   const stateWidget = findWidget(node, MINIMAX_H3_BUILDER_STATE_WIDGET);
@@ -535,6 +535,7 @@ export function applyMiniMaxH3PromptBuilderWrite(
 
   beforeChange?.();
   try {
+    assertTargetStillCurrent?.();
     promptWidget.value = pair.prompt;
     stateWidget.value = serializedState;
     if (node && typeof node === "object") node._mmh3Draft = null;

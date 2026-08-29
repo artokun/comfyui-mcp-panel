@@ -1527,6 +1527,7 @@ test("graph_set_widget routes master → apply, derived → refusal, everything 
       "widget",
       "value",
       "graph",
+      "assertGraphSetWidgetTargetStillCurrent",
       `return () => { ${relayBranch[0]}\n return "fell-through"; };`,
     );
     const fn = factory(
@@ -1540,13 +1541,14 @@ test("graph_set_widget routes master → apply, derived → refusal, everything 
       "timeline_data",
       { segments: [] },
       { beforeChange() {}, afterChange() {}, setDirtyCanvas() {} },
+      () => {},
     );
     return { fn, calls };
   };
 
   const master = run("master");
   assert.deepEqual(master.fn(), { applied: true });
-  assert.deepEqual(master.calls[0].hooks, ["afterChange", "beforeChange", "setDirty"]);
+  assert.deepEqual(master.calls[0].hooks, ["afterChange", "assertTargetStillCurrent", "beforeChange", "setDirty"]);
 
   const derived = run("derived");
   assert.throws(() => derived.fn(), /refused timeline_data on 3/);

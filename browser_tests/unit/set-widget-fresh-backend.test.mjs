@@ -239,8 +239,17 @@ test("#718 wiring: graph_set_widget passes the execution-time workflow fence int
   const body = src.slice(start, end);
   assert.match(
     body,
-    /assertTargetStillCurrent:\s*\(\)\s*=>\s*\{[\s\S]*assertActiveWorkflowCommandTarget\([\s\S]*workflow_uuid/,
-    "the post-await write boundary must recheck the exact command stamp",
+    /assertTargetStillCurrent:\s*assertGraphSetWidgetTargetStillCurrent/,
+    "the post-await write boundary must be wired into the normal write path",
+  );
+  const fenceStart = src.indexOf("const assertGraphSetWidgetTargetStillCurrent = () => {");
+  const fenceEnd = src.indexOf("\n    // #314", fenceStart);
+  assert.notEqual(fenceStart, -1, "the shared graph_set_widget fence must exist");
+  assert.notEqual(fenceEnd, -1, "the shared graph_set_widget fence boundary must exist");
+  assert.match(
+    src.slice(fenceStart, fenceEnd),
+    /assertActiveWorkflowCommandTarget\([\s\S]*workflow_uuid/,
+    "the shared write boundary must recheck the exact command stamp",
   );
 });
 

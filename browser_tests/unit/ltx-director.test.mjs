@@ -584,7 +584,7 @@ const PANEL_SRC = readFileSync(
 ).replace(/\r\n/g, "\n");
 
 const LTX_SET_WIDGET_BRANCH = PANEL_SRC.match(
-  /const ltxKind = classifyLtxTimelineWrite\(node, widget\);\n    if \(ltxKind === "derived"\) \{[\s\S]*?setDirty: \(\) => graph\.setDirtyCanvas\(true, true\),\n      \}\);\n    \}/,
+  /const ltxKind = classifyLtxTimelineWrite\(node, widget\);\n    if \(ltxKind === "derived"\) \{[\s\S]*?assertTargetStillCurrent: assertGraphSetWidgetTargetStillCurrent,\n      \}\);\n    \}/,
 );
 
 test("graph_set_widget still routes LTXDirector timeline_data through applyLtxTimelineWrite", () => {
@@ -619,6 +619,7 @@ test("shipped graph_set_widget authors an LTXDirector timeline without a live ed
     "widget",
     "value",
     "graph",
+    "assertGraphSetWidgetTargetStillCurrent",
     `return (function () { ${LTX_SET_WIDGET_BRANCH[0]} })();`,
   );
   const res = run(
@@ -629,6 +630,7 @@ test("shipped graph_set_widget authors an LTXDirector timeline without a live ed
     LTX_TIMELINE_MASTER_WIDGET,
     { global_prompt: "g", segments: [seg({ prompt: "shipped" })] },
     graph,
+    () => {},
   );
   assert.equal(res.ltx_timeline.fallback, true);
   assert.equal(res.ltx_timeline.driven, true);

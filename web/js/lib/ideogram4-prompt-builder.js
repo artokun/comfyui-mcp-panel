@@ -352,7 +352,7 @@ function readSerializedRegions(elementsWidget) {
 export function applyIdeogram4PromptBuilderWrite(
   node,
   value,
-  { beforeChange, afterChange, setDirty } = {},
+  { beforeChange, afterChange, setDirty, assertTargetStillCurrent } = {},
 ) {
   if (classifyIdeogram4PromptBuilderWrite(node, IDEOGRAM4_ELEMENTS_WIDGET) !== "derived") {
     throw new Error(
@@ -400,6 +400,7 @@ export function applyIdeogram4PromptBuilderWrite(
   const previousSize = Array.isArray(node.size) ? [...node.size] : null;
   beforeChange?.();
   try {
+    assertTargetStillCurrent?.();
     node.onExecuted({ caption: [JSON.stringify(currentCaptionForRegions(node, boxes))] });
     // The callback is the mutation boundary. Verify the exact semantic fields that
     // the caption format carries before reporting success; a callback that exists but
