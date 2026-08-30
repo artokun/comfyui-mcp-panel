@@ -13,10 +13,6 @@ All notable changes to this project are documented here. This project adheres to
 - panel_set_widget clear of an already-empty combo (VHS_LoadVideo video="") succeeds even when the dropdown has no empty option (#2010, #2121)
 - a wildcard-to-wildcard connect refusal is reported as unbound * ports needing a concrete typed producer, not a false type mismatch (#2028, #2120)
 
-- classify truncated tool names as malformed, not unknown (#2122)
-- already-empty combo clear is a no-op success (#2121)
-- explain unresolved wildcard-to-wildcard connect refusals (#2120)
-
 
 ## [0.15.148] - 2026-08-30
 
