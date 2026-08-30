@@ -232,7 +232,10 @@ async function readResponseText(response, maxBytes, timeoutPromise) {
   return { text, bytes };
 }
 
-/** Fetch one fixed ComfyUI read for the MCP fallback path. */
+/** Fetch one fixed ComfyUI read for the MCP fallback path. The bridge dispatcher
+ * may append its standard `viewing` witness to this object result; the
+ * authenticated MCP relay accepts that context metadata and normalizes the
+ * payload back to this four-field transport contract. */
 export async function fetchComfyUIReadForMcp(
   args,
   {

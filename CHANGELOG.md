@@ -48,13 +48,13 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - after reconnect, a queued run is never reported as user-rejected (#1995)
 - panel_set_widget writes DOM-backed multiline editors (StringMultilineTagEditor `text`) through the live input/contenteditable that getValue reads, so a no-op setValue after configure no longer refuses the update (#1997)
+- relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
 
 
 ## [0.15.127] - 2026-08-30
 
 ### Fixed
 - SaveVideo DynamicCombo leftovers are cleaned again at queue time: a bare orphan `codec` next to nested `format.codec` is dropped before graphToPrompt, a first-serialize throw retries once, and the refusal names the node when it still fails (#1931)
-
 
 ## [0.15.126] - 2026-08-30
 
@@ -64,8 +64,6 @@ All notable changes to this project are documented here. This project adheres to
 - promoted widget writes no longer treat a stale inner Primitive handle as the parent rail, so MiniMax H3 duration/value_1, turbo_mode, turbo_steps, and lora_name serialize the new value (#366)
 - scoped run-to-node no longer false-refuses after a finished subgraph edit: the graph stamp waits for pending canvas work to settle and restamps once if the revision moved before queue, without falling through to a full-graph run (#572)
 - resolve the 18+ consent card before the 300s tools/call deadline so an idle user gets a structured timeout instead of a transport hang (#390)
-- relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
-
 - preserve current untagged canvas capture so an already-current untagged root is not treated as the previous tab (#1215, #2038)
 
 
