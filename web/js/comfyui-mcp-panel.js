@@ -595,7 +595,13 @@ import {
   controlAfterGenerateEntries,
   ensureControlAfterGenerateQueueHooks,
 } from "./lib/control-after-generate.js";
-import { autoMatchSlots, slotDiagnostic, loopbackRefusalReason } from "./lib/connect-match.js";
+import {
+  autoMatchSlots,
+  slotDiagnostic,
+  loopbackRefusalReason,
+  unresolvedWildcardPairReason,
+  isWildcardSlotType,
+} from "./lib/connect-match.js";
 import {
   snapshotInputSlotLinks,
   snapshotInputSlotNames,
@@ -17391,11 +17397,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // ("No input on node N accepts type X") is a FALSE type mismatch: the
       // refusal says nothing about the slots' types. Keep the full slot listing
       // but override the tail with the actual restriction.
+      // #2028: the same false tail fires when BOTH selected ports are still
+      // unresolved wildcards (`*`): LiteGraph has no concrete type to bind, so
+      // connect() returns null even though the listing shows `*` inputs. Keep
+      // the refusal; say the ports are unbound and a typed producer must land
+      // first. Loopback wins when both apply — connect() never reached types.
+      const outType = origin.outputs?.[outIdx]?.type;
+      const inType = target.inputs?.[inIdx]?.type;
       throw new Error(
         slotDiagnostic(origin, target, {
           from_output,
           to_input,
-          ...(origin === target ? { reason: loopbackRefusalReason(origin, outIdx, inIdx) } : {}),
+          ...(origin === target
+            ? { reason: loopbackRefusalReason(origin, outIdx, inIdx) }
+            : isWildcardSlotType(outType) && isWildcardSlotType(inType)
+              ? { reason: unresolvedWildcardPairReason(origin, target, outIdx, inIdx) }
+              : {}),
         }),
       );
     }
