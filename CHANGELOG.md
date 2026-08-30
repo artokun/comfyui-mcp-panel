@@ -8,7 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_add_node can add a class from a type-scoped /object_info read when the full dump misses its fixed budget on a large install, without treating a stale whole cache as verified (#2050)
-
+- relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
 
 ## [0.15.133] - 2026-08-30
 

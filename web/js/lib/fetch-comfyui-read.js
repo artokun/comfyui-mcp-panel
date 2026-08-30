@@ -6,13 +6,28 @@
 
 export const FETCH_COMFYUI_READ_TIMEOUT_MS = 8000;
 export const MAX_FETCH_COMFYUI_READ_BYTES = 16 * 1024 * 1024;
+export const FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS = 30000;
+export const MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES = 32 * 1024 * 1024;
 
 const READ_OPERATIONS = new Map([
   ["history", "/history"],
   ["system_stats", "/system_stats"],
   ["logs", "/internal/logs"],
+  ["object_info", "/object_info"],
 ]);
 const LOGS_TRANSPORT_PATH = "/internal/logs/raw";
+
+function readTimeoutMs(operation) {
+  return operation === "object_info"
+    ? FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS
+    : FETCH_COMFYUI_READ_TIMEOUT_MS;
+}
+
+function readMaxBytes(operation) {
+  return operation === "object_info"
+    ? MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES
+    : MAX_FETCH_COMFYUI_READ_BYTES;
+}
 
 // These are bridge transport/routing fields, not read arguments. The
 // dispatcher may stamp them onto every command frame before it reaches us.
@@ -58,7 +73,7 @@ export function validateFetchComfyUIReadArgs(args) {
     throw invalidInput("operation is required");
   }
   if (typeof args.operation !== "string" || !READ_OPERATIONS.has(args.operation)) {
-    throw invalidInput("operation must be one of history, system_stats, logs");
+    throw invalidInput("operation must be one of history, system_stats, logs, object_info");
   }
   return { operation: args.operation, path: READ_OPERATIONS.get(args.operation) };
 }
@@ -231,27 +246,32 @@ async function readResponseText(response, maxBytes, timeoutPromise) {
   return { text, bytes };
 }
 
-/** Fetch one fixed ComfyUI read for the MCP fallback path. */
+/** Fetch one fixed ComfyUI read for the MCP fallback path. The bridge dispatcher
+ * may append its standard `viewing` witness to this object result; the
+ * authenticated MCP relay accepts that context metadata and normalizes the
+ * payload back to this four-field transport contract. */
 export async function fetchComfyUIReadForMcp(
   args,
   {
     api,
     fetchImpl = globalThis.fetch,
-    timeoutMs = FETCH_COMFYUI_READ_TIMEOUT_MS,
-    maxBytes = MAX_FETCH_COMFYUI_READ_BYTES,
+    timeoutMs,
+    maxBytes,
     expectedOrigin,
   } = {},
 ) {
-  if (!(timeoutMs > 0) || !Number.isFinite(timeoutMs)) {
+  const { operation, path } = validateFetchComfyUIReadArgs(args);
+  const effectiveTimeoutMs = timeoutMs ?? readTimeoutMs(operation);
+  const effectiveMaxBytes = maxBytes ?? readMaxBytes(operation);
+  if (!(effectiveTimeoutMs > 0) || !Number.isFinite(effectiveTimeoutMs)) {
     throw readError("invalid_config", "fetch_comfyui_read timeout must be positive");
   }
-  if (!(maxBytes > 0) || !Number.isFinite(maxBytes)) {
+  if (!(effectiveMaxBytes > 0) || !Number.isFinite(effectiveMaxBytes)) {
     throw readError("invalid_config", "fetch_comfyui_read byte limit must be positive");
   }
-  const { operation, path } = validateFetchComfyUIReadArgs(args);
   const origin = expectedOrigin ?? pageOrigin();
   const url = resolveSameOriginUrl(api, path, origin);
-  const timeout = timeoutState(timeoutMs);
+  const timeout = timeoutState(effectiveTimeoutMs);
   const request = {
     method: "GET",
     cache: "no-store",
@@ -291,7 +311,7 @@ export async function fetchComfyUIReadForMcp(
         { status: Number.isFinite(status) ? status : null },
       );
     }
-    const body = await readResponseText(response, maxBytes, timeout.timeoutPromise);
+    const body = await readResponseText(response, effectiveMaxBytes, timeout.timeoutPromise);
     return {
       operation,
       body: body.text,
@@ -306,4 +326,12 @@ export async function fetchComfyUIReadForMcp(
   } finally {
     timeout.dispose();
   }
+}
+
+/** Production command-dispatch seam used by GRAPH_TOOL_EXECUTORS. Keeping this
+ * wrapper beside the helper lets boundary tests exercise the same command route
+ * that receives authenticated bridge frames, rather than calling the transport
+ * helper as an isolated utility. */
+export function dispatchFetchComfyUIReadForMcp(args, options = {}) {
+  return fetchComfyUIReadForMcp(args, options);
 }

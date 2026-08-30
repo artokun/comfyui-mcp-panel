@@ -1,8 +1,11 @@
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS,
+  MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES,
+  dispatchFetchComfyUIReadForMcp,
   fetchComfyUIReadForMcp,
   validateFetchComfyUIReadArgs,
 } from "../../web/js/lib/fetch-comfyui-read.js";
@@ -70,7 +73,7 @@ async function rejection(promise, code) {
   });
 }
 
-test("#2283: the three allowed operations use only their fixed same-origin routes", async () => {
+test("#2283: the allowed operations use only their fixed same-origin routes", async () => {
   const apiURLCalls = [];
   const fileURLCalls = [];
   const apiCalls = [];
@@ -79,6 +82,7 @@ test("#2283: the three allowed operations use only their fixed same-origin route
     history: '{"prompt-1":{"status":{"status_str":"success"}}}',
     system_stats: '{"system":{"os":"windows"},"devices":[]}',
     logs: "ERROR: render failed\n",
+    object_info: '{"KSampler":{"input":{"required":{}}}}',
   };
   for (const operation of Object.keys(bodies)) {
     const result = await fetchComfyUIReadForMcp(
@@ -114,9 +118,9 @@ test("#2283: the three allowed operations use only their fixed same-origin route
     });
   }
 
-  assert.deepEqual(apiURLCalls, ["/history", "/system_stats"]);
+  assert.deepEqual(apiURLCalls, ["/history", "/system_stats", "/object_info"]);
   assert.deepEqual(fileURLCalls, ["/internal/logs/raw"]);
-  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats"]);
+  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats", "/object_info"]);
   assert.deepEqual(rawCalls.map(({ url }) => url), ["https://panel.test/comfy/internal/logs/raw"]);
   for (const { init } of [...apiCalls, ...rawCalls]) {
     assert.equal(init.method, "GET");
@@ -163,7 +167,8 @@ test("#2283: logs raw transport retains origin, redirect, and body-size fences",
 test("#2283: arbitrary paths, URLs, origins, targets, and operation names are refused before fetch", async () => {
   const invalid = [
     {},
-    { operation: "object_info" },
+    { operation: "unknown" },
+    { operation: "object_info", path: "/admin" },
     { operation: "history", path: "/admin" },
     { operation: "history", url: "https://evil.test" },
     { operation: "history", origin: "https://evil.test" },
@@ -233,10 +238,151 @@ test("#2283: redirects and oversized bodies are refused", async () => {
   );
 });
 
+test("#2283: object_info uses its documented large/slow route budget while other reads stay bounded", async () => {
+  assert.ok(MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES > 25_104_088);
+  assert.ok(FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS > 20_840);
+  const body = JSON.stringify({
+    KSampler: {
+      input: { required: {} },
+      output: ["MODEL"],
+      output_is_list: [false],
+      output_name: ["model"],
+      name: "KSampler",
+      display_name: "KSampler",
+      description: "x".repeat(25_104_088),
+      category: "sampling",
+      output_node: false,
+    },
+  });
+  assert.ok(body.length > 25_104_088);
+  const result = await fetchComfyUIReadForMcp(
+    { operation: "object_info" },
+    {
+      expectedOrigin: "https://panel.test",
+      api: {
+        apiURL: (path) => path,
+        fetchApi: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20_841));
+          return response({ body, contentLength: body.length, stream: false });
+        },
+      },
+    },
+  );
+  assert.equal(result.operation, "object_info");
+  assert.equal(result.bytes, body.length);
+
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "history" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => path,
+          fetchApi: async () => response({ body, contentLength: body.length, stream: false }),
+        },
+      },
+    ),
+    "too_large",
+  );
+});
+
+test("#2283: the production dispatcher and helper carry a >20.84s, >25MB object_info reply", async () => {
+  const productionDelayMs = 20_841;
+  const body = JSON.stringify({
+    KSampler: {
+      input: { required: {} },
+      output: ["MODEL"],
+      output_is_list: [false],
+      output_name: ["model"],
+      name: "KSampler",
+      display_name: "KSampler",
+      description: "x".repeat(25_104_088),
+      category: "sampling",
+      output_node: false,
+    },
+  });
+  assert.ok(body.length > 25_104_088);
+  assert.ok(MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES >= body.length);
+  assert.ok(FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS > 20_840);
+
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    let seenRequest;
+    const pending = dispatchFetchComfyUIReadForMcp(
+      { operation: "object_info", rid: "rid-production-shaped" },
+      {
+        api: {
+          apiURL: (path) => path,
+          fetchApi: async (_path, init) => {
+            seenRequest = init;
+            await new Promise((resolve, reject) => {
+              let settled = false;
+              let producerTimer;
+              let onAbort;
+              const finish = (error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(producerTimer);
+                init.signal.removeEventListener("abort", onAbort);
+                if (error) reject(error);
+                else resolve();
+              };
+              onAbort = () => finish(Object.assign(new Error("producer aborted"), { name: "AbortError" }));
+              producerTimer = setTimeout(() => finish(), productionDelayMs);
+              init.signal.addEventListener("abort", onAbort, { once: true });
+              if (init.signal.aborted) onAbort();
+            });
+            return response({ body, contentLength: body.length, stream: false });
+          },
+        },
+      },
+    );
+    mock.timers.tick(productionDelayMs);
+    const result = await pending;
+    assert.equal(result.operation, "object_info");
+    assert.equal(result.bytes, new TextEncoder().encode(body).byteLength);
+    assert.ok(seenRequest.signal instanceof AbortSignal);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("#2283: object_info still refuses an oversize body and a timeout", async () => {
+  const oversize = "x".repeat(MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES + 1);
+  await rejection(
+    dispatchFetchComfyUIReadForMcp(
+      { operation: "object_info" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => path,
+          fetchApi: async () => response({ body: oversize, contentLength: oversize.length, stream: false }),
+        },
+      },
+    ),
+    "too_large",
+  );
+
+  await rejection(
+    dispatchFetchComfyUIReadForMcp(
+      { operation: "object_info" },
+      {
+        timeoutMs: 5,
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => path,
+          fetchApi: () => new Promise((resolve) => setTimeout(() => resolve(response()), 25)),
+        },
+      },
+    ),
+    "timeout",
+  );
+});
+
 test("#2283: the command remains on the authenticated rid executor/reply path", () => {
   const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(source, /fetch_comfyui_read\(args = \{\}\)/);
-  assert.match(source, /return fetchComfyUIReadForMcp\(args, \{ api \}\)/);
+  assert.match(source, /return dispatchFetchComfyUIReadForMcp\(args, \{ api \}\)/);
   assert.match(source, /"ui_render", "ui_update", "ui_dismiss", "fetch_image", "fetch_comfyui_read"/);
   assert.match(source, /const isCommandFrame = msg && typeof msg\.rid === "string" && typeof msg\.cmd === "string"/);
   assert.match(source, /const executor = GRAPH_TOOL_EXECUTORS\[msg\.cmd\]/);
