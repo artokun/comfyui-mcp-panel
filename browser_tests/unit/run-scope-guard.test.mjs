@@ -41,6 +41,9 @@ import {
   cancelPendingScopedQueueItem,
   dispatchScopedRun,
   invokeQueuePromptWithBrowserStack,
+  queueItemScopeIds,
+  unwrapExactScopeTargets,
+  withScopedQueueItemTargets,
 } from "../../web/js/lib/run-scope-guard.js";
 import { resolveRunToNodeTarget } from "../../web/js/lib/subgraph-scope.js";
 
@@ -234,6 +237,92 @@ function makeShadowedQueueFrontend({ dropArgs = false, apiTarget, output = OUR_O
   const app = new NativeApp();
   const nativeAppQueuePrompt = NativeApp.prototype.queuePrompt;
   app.queuePrompt = dropArgs
+    ? async function (number, batch) {
+        return nativeAppQueuePrompt.call(app, number, batch);
+      }
+    : async function (...args) {
+        return nativeAppQueuePrompt.apply(app, args);
+      };
+  return { app, api };
+}
+
+// Frontend 1.49.6 ComfyApp.queuePrompt: push {number, batchCount, queueNodeIds},
+// then the processor reads that array as partialExecutionTargets. An own-property
+// wrapper that calls through with only (number, batch) still reaches this loop —
+// it just pushes queueNodeIds: undefined. Filling the item (not bypassing the
+// wrapper) is how the panel delivers scope natively on that build (#1782).
+function makeFrontend1496({ dropAppArgs = false, dropApiArgs = false, apiTarget, output = OUR_OUTPUT } = {}) {
+  class NativeApi {
+    async queuePrompt(number, data, options) {
+      const targets = options?.partialExecutionTargets;
+      const body = frontendBody({
+        output: data?.output ?? output,
+        number,
+        targets: Array.isArray(targets) && targets.length ? targets : null,
+      });
+      api.posted.push(body);
+      await api.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { prompt_id: "native" };
+    }
+  }
+
+  const api = new NativeApi();
+  api.fetchApi = (...a) => apiTarget.fetchApi(...a);
+  api.posted = [];
+  const nativeApiQueuePrompt = NativeApi.prototype.queuePrompt;
+  api.queuePrompt = dropApiArgs
+    ? async function (number, data) {
+        return nativeApiQueuePrompt.call(api, number, data);
+      }
+    : async function (...args) {
+        return nativeApiQueuePrompt.apply(api, args);
+      };
+
+  class NativeApp {
+    constructor() {
+      this.api = api;
+      this.queueItems = [];
+      this.processingQueue = false;
+      this.graphToPrompt = async () => ({ output, workflow: {} });
+      this.graph = null;
+    }
+
+    async queuePrompt(number, batchCount = 1, optionsOrQueueNodeIds = {}) {
+      const options = Array.isArray(optionsOrQueueNodeIds)
+        ? { queueNodeIds: optionsOrQueueNodeIds }
+        : optionsOrQueueNodeIds && typeof optionsOrQueueNodeIds === "object"
+          ? optionsOrQueueNodeIds
+          : {};
+      this.queueItems.push({
+        number,
+        batchCount,
+        queueNodeIds: options.queueNodeIds,
+        requestId: 1,
+      });
+      if (this.processingQueue) return false;
+      this.processingQueue = true;
+      try {
+        while (this.queueItems.length) {
+          const item = this.queueItems.pop();
+          const p = await this.graphToPrompt();
+          await this.api.queuePrompt(item.number, p, {
+            partialExecutionTargets: item.queueNodeIds,
+          });
+        }
+      } finally {
+        this.processingQueue = false;
+      }
+      return true;
+    }
+  }
+
+  const app = new NativeApp();
+  const nativeAppQueuePrompt = NativeApp.prototype.queuePrompt;
+  app.queuePrompt = dropAppArgs
     ? async function (number, batch) {
         return nativeAppQueuePrompt.call(app, number, batch);
       }
@@ -4159,6 +4248,129 @@ test("#1782 actual queue path: shadowed forwarding preserves scope; dropping wra
       JSON.parse(droppingServer.calls[0].options.body).partial_execution_targets,
       ["14"],
     );
+  } finally {
+    stop();
+  }
+});
+
+test("#1782 queueItemScopeIds / unwrapExactScopeTargets: option objects are the same ids, not a different request", () => {
+  assert.deepEqual(queueItemScopeIds(["76:34"]), ["76:34"]);
+  assert.deepEqual(queueItemScopeIds({ queueNodeIds: ["76:34"] }), ["76:34"]);
+  assert.deepEqual(queueItemScopeIds({ partialExecutionTargets: ["76:34"] }), ["76:34"]);
+  assert.equal(queueItemScopeIds(null), null);
+  assert.equal(queueItemScopeIds("14"), null);
+  assert.equal(queueItemScopeIds({ queueNodeIds: [] }), null);
+  assert.deepEqual(unwrapExactScopeTargets({ queueNodeIds: ["14"] }, ["14"]), ["14"]);
+  assert.deepEqual(unwrapExactScopeTargets({ partialExecutionTargets: [14] }, ["14"]), ["14"]);
+  assert.equal(unwrapExactScopeTargets({ queueNodeIds: ["9"] }, ["14"]), null, "wrong ids stay a mismatch");
+  assert.equal(unwrapExactScopeTargets(["14", "9"], ["14"]), null, "extra ids stay a mismatch");
+  assert.equal(unwrapExactScopeTargets("14", ["14"]), null, "a bare string is not the option shape");
+});
+
+test("#1782 withScopedQueueItemTargets: a dropped 3rd arg is restored on THIS run's item only", async () => {
+  const items = [];
+  const app = { queueItems: items };
+  const execIds = ["14"];
+  const other = { number: MARK_B, requestId: 9, queueNodeIds: undefined };
+  items.push(other);
+  await withScopedQueueItemTargets(app, { queueMark: MARK_A, execIds }, () => {
+    items.push({ number: MARK_A, batchCount: 1, requestId: 1, queueNodeIds: undefined });
+    items.push({ number: MARK_A, requestId: 2, queueNodeIds: { queueNodeIds: ["14"] } });
+    items.push({ number: MARK_A, requestId: 3, queueNodeIds: ["9"] });
+    items.push({ number: MARK_A, queueNodeIds: undefined });
+  });
+  assert.deepEqual(items[0].queueNodeIds, undefined, "a different run's item is never touched");
+  assert.equal(items[1].queueNodeIds, execIds, "the missing array is restored by reference so the ownership tag survives");
+  assert.equal(items[2].queueNodeIds, execIds, "an options object naming the exact roots is flattened to the array 1.49.6 reads");
+  assert.deepEqual(items[3].queueNodeIds, ["9"], "a present array naming different roots is not overwritten");
+  assert.equal(items[4].queueNodeIds, undefined, "an item without ComfyApp's requestId is left for body repair");
+});
+
+test("#1782 frontend 1.49.6: dropping app.queuePrompt still delivers scope natively via queueItems", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const { app, api } = makeFrontend1496({
+      dropAppArgs: true,
+      apiTarget: { fetchApi: server },
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(app, "queuePrompt"), true);
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget: api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(
+      result.scopeAppliedBy,
+      "frontend",
+      "1.49.6's own processor wrote partial_execution_targets after the item was restored — not request_body_repair",
+    );
+    assert.equal(result.repaired, 0);
+    assert.equal(server.calls.length, 1, "the first native attempt is enough");
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1782 frontend 1.49.6: a dropping api.queuePrompt still exact-target repairs rather than false-rejecting", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const { app, api } = makeFrontend1496({
+      dropAppArgs: true,
+      dropApiArgs: true,
+      apiTarget: { fetchApi: server },
+    });
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget: api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.scopeAppliedBy, "request_body_repair");
+    assert.equal(result.repaired, 1);
+    assert.equal(server.calls.length, 1);
+    assert.deepEqual(
+      JSON.parse(server.calls[0].options.body).partial_execution_targets,
+      ["14"],
+      "the fallback still writes EXACTLY the requested roots, never a full-graph post",
+    );
+  } finally {
+    stop();
+  }
+});
+
+test("#1782 exact-target fallback: a store-layer options object in the body is rewritten, not false-rejected", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const guard = createScopedRunGuard({
+      origFetchApi: server,
+      execIds: ["14"],
+      contentHash: OUR_HASH,
+      batch: 1,
+      toNodeId: 14,
+      queueMark: MARK_A,
+      repairScope: true,
+    });
+    const res = await guard(
+      ...promptPost({
+        prompt: OUR_OUTPUT,
+        client_id: "x",
+        number: MARK_A,
+        partial_execution_targets: { queueNodeIds: ["14"], partialExecutionTargets: ["14"] },
+      }),
+    );
+    assert.equal(res.status, 200, "exact ids in the store-layer shape are not a refusal");
+    assert.equal(guard.state.repaired, 1);
+    assert.equal(guard.state.dropped, null);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
   } finally {
     stop();
   }
