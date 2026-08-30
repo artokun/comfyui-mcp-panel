@@ -121,22 +121,23 @@ test("#654: concurrent callers share one in-flight resolution", async () => {
   assert.equal(locks.calls, 1, "two concurrent resolves ran ONE lease attempt");
 });
 
-test("#654: with no lock manager at all, resolve fails closed (and stays retryable)", async () => {
+test("#2104: with no lock manager at all, resolve mints a page-lifetime connection identity", async () => {
   let clock = 1000;
   const identity = createRestartTabIdentity({
     storage: fakeStorage("candidate-a"),
     // `{}` — not undefined: undefined would fall back to the DEFAULT
     // (globalThis.navigator?.locks), which Node ≥22 actually provides. A
     // request-less object models the plain-http LAN frontend where the Web
-    // Locks API is absent (secure-context-only).
+    // Locks API is absent (secure-context-only). That origin still binds
+    // graph tools; omitting identity here is the #2104 refusal.
     locks: {},
     randomUUID: () => "rotated",
     now: () => clock,
     retryBackoffMs: 5000,
   });
-  assert.equal(await identity.resolve(), undefined, "no lock manager → no identity claim");
+  assert.equal(await identity.resolve(), "rotated", "no lock manager → page-lifetime identity");
   clock += 5001;
-  assert.equal(await identity.resolve(), undefined, "a retry still fails closed without locks");
+  assert.equal(await identity.resolve(), "rotated", "the page-lifetime identity is cached");
 });
 
 test("#654: a lock manager whose request REJECTS degrades to the same retryable failure, not a cached rejection", async () => {

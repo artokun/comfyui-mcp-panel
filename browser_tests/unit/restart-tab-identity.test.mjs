@@ -97,11 +97,17 @@ test("#709: actual hello sender waits for a definitive delayed lock verdict; no 
   identity.releaseForTests();
 });
 
-test("#709: absent Web Locks omits identity and the sender cannot fabricate restart readiness", async () => {
+test("#2104: absent Web Locks still publishes a page-lifetime connection identity", async () => {
+  // Web Locks is secure-context-only. A bound live canvas on plain-http LAN
+  // (the #2104 reporter: graph_binding bound, panel_query_graph succeeded)
+  // has no lock manager. Omitting tab_session_id made MCP refuse promoted
+  // subgraph widget writes as "the panel connection identity was unavailable"
+  // before graph_set_widget dispatch. A page-lifetime id is not restart-proof
+  // (it does not survive reload), but it is a usable connection identity.
   const identity = createRestartTabIdentity({
     storage: copiedStorage("possibly-copied"),
     locks: null,
-    randomUUID: () => "unused",
+    randomUUID: () => "page-instance-tab",
   });
   const sent = [];
   await sendBridgeHello({
@@ -110,7 +116,55 @@ test("#709: absent Web Locks omits identity and the sender cannot fabricate rest
     resolveTabIdentity: identity.resolve,
     makePayload: (tabSessionId) => buildHelloPayload({ tabId: "wf:shared.json", tabSessionId }),
   });
-  assert.equal("tab_session_id" in sent[0], false);
+  await sendBridgeHello({
+    socket: { send: (frame) => sent.push(JSON.parse(frame)) },
+    isCurrent: () => true,
+    resolveTabIdentity: identity.resolve,
+    makePayload: (tabSessionId) => buildHelloPayload({ tabId: "wf:shared.json", tabSessionId }),
+  });
+  assert.deepEqual(
+    sent.map((frame) => frame.tab_session_id),
+    ["page-instance-tab", "page-instance-tab"],
+    "a bound canvas without Web Locks must still advertise connection identity",
+  );
+});
+
+test("#2104: a request-less lock object (plain-http LAN) still advertises tab_session_id", async () => {
+  const identity = createRestartTabIdentity({
+    storage: copiedStorage("copied-browser-tab"),
+    // Node ≥22 provides navigator.locks; `{}` models a non-secure origin
+    // where the API is absent rather than contended.
+    locks: {},
+    randomUUID: () => "lan-page-instance",
+  });
+  const sent = [];
+  await sendBridgeHello({
+    socket: { send: (frame) => sent.push(JSON.parse(frame)) },
+    isCurrent: () => true,
+    resolveTabIdentity: identity.resolve,
+    makePayload: (tabSessionId) => buildHelloPayload({ tabId: "wf:shared.json", tabSessionId }),
+  });
+  assert.equal(sent[0].tab_session_id, "lan-page-instance");
+});
+
+test("#2104: a present lock manager that refuses every lease still omits tab_session_id", async () => {
+  const identity = createRestartTabIdentity({
+    storage: copiedStorage("copied-browser-tab"),
+    locks: { request: (_name, _options, callback) => Promise.resolve(callback(null)) },
+    randomUUID: () => "unused-rotation",
+  });
+  const sent = [];
+  await sendBridgeHello({
+    socket: { send: (frame) => sent.push(JSON.parse(frame)) },
+    isCurrent: () => true,
+    resolveTabIdentity: identity.resolve,
+    makePayload: (tabSessionId) => buildHelloPayload({ tabId: "wf:shared.json", tabSessionId }),
+  });
+  assert.equal(
+    "tab_session_id" in sent[0],
+    false,
+    "fail closed only when identity is actually unavailable (exclusivity unproven)",
+  );
 });
 
 test("#709: a rejected Web Locks request also omits identity instead of hanging or trusting storage", async () => {

@@ -12,9 +12,18 @@ function nonBlank(value) {
 /**
  * Resolve an identity suitable for certifying that the browser tab which
  * received a restart is the one which reconnected. A returned ID is backed by
- * an exclusive Web Locks lease held for this page's lifetime. If that cannot be
- * acquired, return undefined so the hello omits the identity and MCP readiness
- * fails closed. There is intentionally no timeout-as-proof fallback.
+ * an exclusive Web Locks lease held for this page's lifetime when that API is
+ * present. If exclusivity cannot be proven because another tab holds the lease,
+ * return undefined so the hello omits the identity and MCP readiness fails
+ * closed. There is intentionally no timeout-as-proof fallback.
+ *
+ * #2104 — Web Locks is secure-context-only. A bound live canvas served over
+ * plain HTTP (LAN ComfyUI) has no lock manager, yet graph reads still succeed
+ * and graph_binding is "bound". Omitting tab_session_id in that case made
+ * panel_set_widget refuse promoted subgraph writes as "the panel connection
+ * identity was unavailable". When the API is absent, mint a page-lifetime
+ * identity instead. Fail closed only when identity is actually unavailable
+ * (locks present, exclusivity unproven).
  *
  * A SUCCESS is cached for the life of the page. A FAILURE is retryable (#654):
  * once `retryBackoffMs` has elapsed, the next resolve() runs a fresh lease
@@ -42,6 +51,15 @@ export function createRestartTabIdentity({
   let lastFailureAt = null;
 
   const fallback = () => (memoryFallback ??= randomUUID());
+  const locksApiPresent = () => {
+    try {
+      return !!(locks && typeof locks.request === "function");
+    } catch {
+      // Unreadable is not "absent". A present-but-unreadable manager must fail
+      // closed rather than mint a connection identity nobody can vouch for.
+      return true;
+    }
+  };
   const read = () => {
     try {
       return nonBlank(storage?.getItem(RESTART_TAB_ID_STORAGE_KEY));
@@ -95,6 +113,18 @@ export function createRestartTabIdentity({
     // browser refresh. Re-attempt at most once per backoff window; inside the
     // window, fail closed with the same undefined the first failure returned.
     if (lastFailureAt != null && now() - lastFailureAt < retryBackoffMs) return undefined;
+    // #2104 — no lock manager is not contention. Graph tools still bind on this
+    // origin (tabRouteIdentity mints a page-instance route), so hello must still
+    // carry a connection identity or MCP refuses promoted subgraph writes.
+    if (!locksApiPresent()) {
+      try {
+        resolved = fallback();
+        return resolved;
+      } catch {
+        lastFailureAt = now();
+        return undefined;
+      }
+    }
     resolving = (async () => {
       let candidate = read() ?? fallback();
       write(candidate);
