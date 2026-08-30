@@ -29,6 +29,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import * as ManagerInstall from "../../web/js/lib/manager-install.js";
+import { isGenericManagerInstallError } from "../../web/js/lib/manager-install-traceback.js";
 const { classifyInstallOutcome, taskFailureReason, parseTaskHistoryItem, queueDrained } =
   ManagerInstall;
 
@@ -120,6 +121,12 @@ function buildVerifyInstalled({ routes, calls = [], budgetMs }) {
     // on purpose: these tests pin the HTTP history path, and an empty log proves
     // the capture cannot short-circuit or alter it.
     managerTaskResults: ManagerInstall.createManagerTaskResultLog(),
+    // #2012 — the verifier reads the log only on a generic "Installation failed"
+    // sentence. These tests pin the history path with a specific registry-miss
+    // reason, so the log read must stay quiet.
+    isGenericManagerInstallError,
+    readInstallTraceback: async () => null,
+    api: { fileURL: (r) => r },
   };
   const factory = new Function(
     ...Object.keys(deps),

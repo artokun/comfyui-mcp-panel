@@ -30,6 +30,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import * as ManagerInstall from "../../web/js/lib/manager-install.js";
+import { isGenericManagerInstallError } from "../../web/js/lib/manager-install-traceback.js";
 const {
   classifyInstallOutcome,
   collectInProgressTasks,
@@ -232,6 +233,12 @@ function buildVerifyInstalled({ routes, calls = [], managerTaskResults }) {
     INSTALL_VERIFY_BUDGET_MS: 4000,
     AbortSignal,
     setTimeout,
+    // #2012 — the verifier reads the log only on a generic "Installation failed"
+    // sentence. These tests pin a specific resolve-target reason, so the log
+    // read must stay quiet.
+    isGenericManagerInstallError,
+    readInstallTraceback: async () => null,
+    api: { fileURL: (r) => r },
   };
   const factory = new Function(
     ...Object.keys(deps),

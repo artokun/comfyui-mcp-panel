@@ -421,7 +421,8 @@ export function queueFailureSignal(status, batchFailed, target) {
  *      signal / stale batchFailed. A genuine renamed-dir install (codex round 3)
  *      lands here, never "failed".
  * @param {{ target:string, dialect?:string, status:unknown, installed:unknown,
- *           listError?:boolean, batchFailed?:unknown, renameProne?:boolean }} input
+ *           listError?:boolean, batchFailed?:unknown, renameProne?:boolean,
+ *           taskFailure?:unknown, traceback?:string }} input
  */
 export function classifyInstallOutcome({
   target,
@@ -432,6 +433,7 @@ export function classifyInstallOutcome({
   batchFailed,
   renameProne = false,
   taskFailure = null,
+  traceback = null,
 }) {
   // #1539 — the Manager's OWN terminal verdict for the task we submitted (keyed
   // by our ui_id) outranks every proxy below, and is checked before the
@@ -448,14 +450,22 @@ export function classifyInstallOutcome({
   // reported `queued: true, pending: true`. The record said "failed" the whole
   // time; nothing read it.
   if (taskFailure) {
+    // #2012 — Manager's do_install often stores only "Installation failed" and
+    // prints the real traceback / res.msg to the server log. When the caller
+    // managed to read that log, the tool result IS the traceback; do not also
+    // send the reader to the log they can no longer see from here.
+    const tb = typeof traceback === "string" && traceback.trim() ? traceback.trim() : "";
     return {
       state: "failed",
       status,
+      taskFailure,
       message:
         `"${target}" install FAILED: the ComfyUI-Manager task terminated with an error` +
         (dialect ? ` (dialect ${dialect})` : "") +
-        `: ${taskFailure}. The install did NOT complete — check the ComfyUI server log ` +
-        `for the full traceback.` +
+        `: ${taskFailure}. The install did NOT complete` +
+        (tb
+          ? `. Manager traceback:\n${tb}`
+          : ` — check the ComfyUI server log for the full traceback.`) +
         // The registry-miss case has a specific, verified way forward (#920), and
         // it is worth far more HERE than on a later poll: this is the reply to the
         // install call itself, so the caller learns it without having to know to
