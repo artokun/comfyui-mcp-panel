@@ -238,6 +238,7 @@ function realRegisterComfyNodeDefs({ app, api, objectInfoCache, objectInfoSnapsh
     "initialBackendReconnectEpoch",
     "comfyBackendSocketDown",
     "TRANSPORT_OUTCOME",
+    "refuseStaleBundleRefresh",
   ];
   const values = {
     app,
@@ -265,6 +266,7 @@ function realRegisterComfyNodeDefs({ app, api, objectInfoCache, objectInfoSnapsh
     initialBackendReconnectEpoch: epoch,
     comfyBackendSocketDown: false,
     TRANSPORT_OUTCOME,
+    refuseStaleBundleRefresh: async () => null,
   };
   const factory = new Function(
     ...names,
