@@ -6,9 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.145] - 2026-08-30
+
 ### Fixed
 - panel_set_widget on a subgraph's promoted widget writes the enclosing container rail even when the call lands on the inner link-driven terminal, instead of reporting applied while the parent value stays stale (#2109)
 - live graph reads recover after a manual canvas edit: a hung panel_graph_outline no longer pins retries, tracker snapshot flush stays mutation-only, and image/canvas widget values are clipped without a full stringify that could miss the 20s RPC window (#2003)
+
 
 ## [0.15.144] - 2026-08-30
 
