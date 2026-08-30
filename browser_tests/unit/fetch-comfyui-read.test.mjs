@@ -287,6 +287,7 @@ test("#2283: object_info uses its documented large/slow route budget while other
 });
 
 test("#2283: the production dispatcher and helper carry a >20.84s, >25MB object_info reply", async () => {
+  const productionDelayMs = 20_841;
   const body = JSON.stringify({
     KSampler: {
       input: { required: {} },
@@ -314,13 +315,29 @@ test("#2283: the production dispatcher and helper carry a >20.84s, >25MB object_
           apiURL: (path) => path,
           fetchApi: async (_path, init) => {
             seenRequest = init;
-            await new Promise((resolve) => setTimeout(resolve, 20_841));
+            await new Promise((resolve, reject) => {
+              let settled = false;
+              let producerTimer;
+              let onAbort;
+              const finish = (error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(producerTimer);
+                init.signal.removeEventListener("abort", onAbort);
+                if (error) reject(error);
+                else resolve();
+              };
+              onAbort = () => finish(Object.assign(new Error("producer aborted"), { name: "AbortError" }));
+              producerTimer = setTimeout(() => finish(), productionDelayMs);
+              init.signal.addEventListener("abort", onAbort, { once: true });
+              if (init.signal.aborted) onAbort();
+            });
             return response({ body, contentLength: body.length, stream: false });
           },
         },
       },
     );
-    mock.timers.tick(20_841);
+    mock.timers.tick(productionDelayMs);
     const result = await pending;
     assert.equal(result.operation, "object_info");
     assert.equal(result.bytes, new TextEncoder().encode(body).byteLength);
