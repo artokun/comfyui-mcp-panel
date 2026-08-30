@@ -15,6 +15,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_search_nodes retries the legacy `/customnode/getmappings` route when the browser never gets an HTTP response from `/v2/customnode/getmappings`, and the structured miss names that transport failure instead of a bare Failed to fetch (#2024)
 - panel_connect by Autogrow name keeps later MiniMax H3 slots on their original wires (#2008)
+- relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
 
 
 ## [0.15.132] - 2026-08-30
@@ -27,7 +28,6 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - the pre-publish registry parity scan now inspects the packaged archive rather than the repo, is wired into the publish job, and refuses to treat a Pending registry status as a pass (#1886)
-- relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
 
 
 ## [0.15.130] - 2026-08-30
