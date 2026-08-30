@@ -332,6 +332,85 @@ function makeFrontend1496({ dropAppArgs = false, dropApiArgs = false, apiTarget,
   return { app, api };
 }
 
+// 1.41.21 topology: native app.queuePrompt pushes {number, batchCount, queueNodeIds}
+// then later calls api.queuePrompt(number, prompt, { partialExecutionTargets }).
+// Two-arg own-property wrappers capture the original function and omit the third
+// argument — the field report on frontend 1.41.21.
+function makeFrontend14121({ dropAppArgs = false, dropApiArgs = false, apiTarget, output = OUR_OUTPUT } = {}) {
+  class NativeApi {
+    async queuePrompt(number, data, options) {
+      const targets = options?.partialExecutionTargets;
+      const body = frontendBody({
+        output: data?.output ?? output,
+        number,
+        targets: Array.isArray(targets) && targets.length ? targets : null,
+      });
+      api.posted.push(body);
+      await api.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { prompt_id: "x" };
+    }
+  }
+
+  const api = new NativeApi();
+  api.fetchApi = apiTarget.fetchApi;
+  api.posted = [];
+  const nativeApiQueuePrompt = NativeApi.prototype.queuePrompt;
+  if (dropApiArgs) {
+    api.queuePrompt = async function (number, prompt) {
+      return nativeApiQueuePrompt.apply(api, [number, prompt]);
+    };
+  } else {
+    api.queuePrompt = async function (...args) {
+      return nativeApiQueuePrompt.apply(api, args);
+    };
+  }
+
+  class NativeApp {
+    constructor() {
+      this.api = api;
+      this.queueItems = [];
+      this.processingQueue = false;
+      this.graphToPrompt = async () => ({ output, workflow: {} });
+    }
+
+    async queuePrompt(number, batchCount = 1, queueNodeIds) {
+      this.queueItems.push({ number, batchCount, queueNodeIds });
+      if (this.processingQueue) return false;
+      this.processingQueue = true;
+      try {
+        while (this.queueItems.length) {
+          const item = this.queueItems.pop();
+          const p = await this.graphToPrompt();
+          const options = item.queueNodeIds?.length
+            ? { partialExecutionTargets: item.queueNodeIds }
+            : undefined;
+          await this.api.queuePrompt(item.number, p, options);
+        }
+      } finally {
+        this.processingQueue = false;
+      }
+      return true;
+    }
+  }
+
+  const app = new NativeApp();
+  const nativeAppQueuePrompt = NativeApp.prototype.queuePrompt;
+  if (dropAppArgs) {
+    app.queuePrompt = async function (number, batch) {
+      return nativeAppQueuePrompt.apply(app, [number, batch]);
+    };
+  } else {
+    app.queuePrompt = async function (...args) {
+      return nativeAppQueuePrompt.apply(app, args);
+    };
+  }
+  return { app, api };
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -4370,6 +4449,60 @@ test("#1782 exact-target fallback: a store-layer options object in the body is r
     assert.equal(res.status, 200, "exact ids in the store-layer shape are not a refusal");
     assert.equal(guard.state.repaired, 1);
     assert.equal(guard.state.dropped, null);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1998 1.41.21 two-arg app wrapper still delivers the target through queuePrompt", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const { app, api } = makeFrontend14121({
+      dropAppArgs: true,
+      apiTarget: { fetchApi: server },
+    });
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget: api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+
+    assert.equal(Object.prototype.hasOwnProperty.call(app, "queuePrompt"), true);
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.scopeAppliedBy, "frontend", "queue item restore reaches api.queuePrompt before body repair");
+    assert.equal(result.repaired, 0);
+    assert.equal(server.calls.length, 1);
+    assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#1998 captured two-arg api wrapper still falls through to request-body repair", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServer();
+    const { app, api } = makeFrontend14121({
+      dropAppArgs: true,
+      dropApiArgs: true,
+      apiTarget: { fetchApi: server },
+    });
+    const result = await dispatchScopedRun({
+      app,
+      apiTarget: api,
+      execIds: ["14"],
+      batch: 1,
+      toNodeId: 14,
+    });
+
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.scopeAppliedBy, "request_body_repair");
+    assert.equal(result.repaired, 1);
+    assert.equal(server.calls.length, 1);
     assert.deepEqual(JSON.parse(server.calls[0].options.body).partial_execution_targets, ["14"]);
   } finally {
     stop();

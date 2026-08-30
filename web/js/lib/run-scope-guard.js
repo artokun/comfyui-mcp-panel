@@ -33,6 +33,7 @@ import { controlAfterGenerateEntries } from "./control-after-generate.js";
 // own header), so there is not one.
 import { withTimeout } from "./bounded-step.js";
 import { scrubSecretShapedText } from "./http-failure.js";
+import { installQueuePromptScopeAdapter } from "./queue-prompt-scope-adapter.js";
 
 // #1854 — the intrinsic captured ONCE at module load. Invoking through a
 // per-call property lookup on the function object would read an overrideable
@@ -2333,6 +2334,17 @@ export async function dispatchScopedRun({
   }
   let dropped = null;
   let restampUsed = false;
+  // #1998 — restore a dropped third argument through live 1.41.21-shaped
+  // queuePrompt wrappers for this run's mark only. Request-body repair stays
+  // the last attempt when a wrapper never calls through.
+  const adapterMarks = { mark };
+  const restoreQueuePromptAdapter = installQueuePromptScopeAdapter({
+    app,
+    api: apiTarget,
+    targets: execIds,
+    queueMarkRef: adapterMarks,
+  });
+  try {
   for (;;) {
     let restampAgain = false;
     dropped = null;
@@ -2614,6 +2626,7 @@ export async function dispatchScopedRun({
           volatileInputs = live.volatileInputs;
           volatileList = volatileInputs ? [...volatileInputs].sort() : [];
           mark = newScopedQueueMark();
+          adapterMarks.mark = mark;
           break;
         }
       }
@@ -2649,5 +2662,8 @@ export async function dispatchScopedRun({
     }
     if (restampAgain) continue;
     return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: dropped };
+  }
+  } finally {
+    restoreQueuePromptAdapter();
   }
 }

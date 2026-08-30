@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 
 const FILES = [
   "configure-app-mode.js",
+  "queue-prompt-scope-adapter.js",
   "run-prompt-snapshot.js",
   "run-scope-guard.js",
   "widget-null-safety.js",
