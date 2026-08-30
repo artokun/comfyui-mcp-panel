@@ -285,6 +285,7 @@ test("#570/#718: hello ALWAYS advertises both workflow-stamp fences so the orche
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_workflow_stamp, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_workflow_stamp_at_write, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_expected_node_type_at_write, true);
+  assert.equal(buildHelloPayload({ tabId: "t" }).enforces_expected_node_identity_at_write, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).publishes_promoted_terminal_witnesses, true);
   assert.equal(buildHelloPayload({ tabId: "t" }).enforces_promoted_parent_rail_at_write, true);
   assert.equal(
@@ -297,6 +298,10 @@ test("#570/#718: hello ALWAYS advertises both workflow-stamp fences so the orche
   );
   assert.equal(
     buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).enforces_expected_node_type_at_write,
+    true,
+  );
+  assert.equal(
+    buildHelloPayload({ tabId: "wf:x.json", title: "x", backend: "codex" }).enforces_expected_node_identity_at_write,
     true,
   );
 });

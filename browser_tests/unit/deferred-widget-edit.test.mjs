@@ -16,6 +16,7 @@ import {
   sameDeferredWidgetValue,
 } from "../../web/js/lib/deferred-widget-edit.js";
 import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
+import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
 
 const panelSource = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const scopedBatchSeedSource = readFileSync(
@@ -201,14 +202,21 @@ function buildProductionDeferredSafety() {
   return { safety, branch };
 }
 
-function runProductionDeferredBranch({ node, queuePayload, expected = "old", value = "new" }) {
+function runProductionDeferredBranch({
+  node,
+  queuePayload,
+  expected = "old",
+  value = "new",
+  expectedNodeIdentity,
+}) {
   const { safety, branch } = buildProductionDeferredSafety();
   let currentQueuePayload = queuePayload;
+  let liveNode = node;
   const timers = [];
   const applyCalls = [];
   const graph = {
     _nodes: [node],
-    getNodeById: (id) => (id === node.id ? node : null),
+    getNodeById: (id) => (id === node.id ? liveNode : null),
   };
   const deferredQueue = createDeferredWidgetEditQueue({
     readQueue: async () => currentQueuePayload,
@@ -249,7 +257,7 @@ function runProductionDeferredBranch({ node, queuePayload, expected = "old", val
     {
       graph_set_widget: async (args) => {
         applyCalls.push(args);
-        node.widgets[0].value = value;
+        liveNode.widgets[0].value = value;
         return { applied: true };
       },
     },
@@ -262,13 +270,20 @@ function runProductionDeferredBranch({ node, queuePayload, expected = "old", val
     setQueue: (next) => {
       currentQueuePayload = next;
     },
-    call: () => executor({
-      node_id: node.id,
-      widget: "text",
-      value,
-      expected_value: expected,
-      defer_until_idle: true,
-    }),
+    replaceNode: (replacement) => {
+      liveNode = replacement;
+    },
+    call: () => {
+      const args = {
+        node_id: node.id,
+        widget: "text",
+        value,
+        expected_value: expected,
+        defer_until_idle: true,
+      };
+      if (expectedNodeIdentity !== undefined) args.expected_node_identity = expectedNodeIdentity;
+      return executor(args);
+    },
   };
 }
 
@@ -288,9 +303,11 @@ test("#1716 production graph_set_widget parks a safe scalar edit while render is
 
 test("#1716 production graph_set_widget replays the parked edit after the queue drains", async () => {
   const node = { id: 7, type: "KSampler", widgets: [{ name: "text", value: "old" }] };
+  const expectedNodeIdentity = nodeInstanceIdentity(node);
   const run = runProductionDeferredBranch({
     node,
     queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+    expectedNodeIdentity,
   });
   const parked = await run.call();
   assert.equal(parked.deferred, true);
@@ -303,8 +320,77 @@ test("#1716 production graph_set_widget replays the parked edit after the queue 
   assert.equal(node.widgets[0].value, "new");
   assert.equal(run.applyCalls.length, 1, "the production executor must be called once at drain");
   assert.equal(run.applyCalls[0].defer_replay, true);
+  assert.equal(run.applyCalls[0].expected_node_identity, expectedNodeIdentity);
+  assert.equal(Object.hasOwn(run.applyCalls[0], "expected_node_identity"), true);
   assert.equal(run.deferredQueue.pending(), 0);
   run.deferredQueue.close();
+});
+
+test("#2478 production deferred replay preserves legacy omission and refuses same-type replacement", async () => {
+  const node = { id: 7, type: "KSampler", widgets: [{ name: "text", value: "old" }] };
+  const run = runProductionDeferredBranch({
+    node,
+    queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+  });
+  await run.call();
+  run.setQueue({ queue_running: [], queue_pending: [] });
+  run.timers.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(Object.hasOwn(run.applyCalls[0], "expected_node_identity"), false);
+  run.deferredQueue.close();
+
+  const guardedNode = { id: 7, type: "KSampler", widgets: [{ name: "text", value: "old" }] };
+  const replacement = { id: 7, type: "KSampler", widgets: [{ name: "text", value: "old" }] };
+  const identity = nodeInstanceIdentity(guardedNode);
+  const guarded = runProductionDeferredBranch({
+    node: guardedNode,
+    queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+    expectedNodeIdentity: identity,
+  });
+  await guarded.call();
+  guarded.replaceNode(replacement);
+  guarded.setQueue({ queue_running: [], queue_pending: [] });
+  guarded.timers.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(guarded.applyCalls.length, 0, "replacement must be refused before the replay executor");
+  assert.equal(replacement.widgets[0].value, "old");
+  guarded.deferredQueue.close();
+});
+
+test("#2478 production deferred path rejects malformed identities but still accepts an omitted identity", async () => {
+  const node = { id: 7, type: "KSampler", widgets: [{ name: "text", value: "old" }] };
+  for (const malformed of ["", 42, "x".repeat(257)]) {
+    const run = runProductionDeferredBranch({
+      node,
+      queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+      expectedNodeIdentity: malformed,
+    });
+    await assert.rejects(run.call(), /expected_node_identity must be a non-empty string/);
+    assert.equal(run.deferredQueue.pending(), 0);
+    run.deferredQueue.close();
+  }
+  const legacy = runProductionDeferredBranch({
+    node,
+    queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+  });
+  await assert.doesNotReject(legacy.call());
+  assert.equal(legacy.deferredQueue.pending(), 1);
+  legacy.deferredQueue.close();
+});
+
+test("#2478 production idle replay forwards the identity witness", async () => {
+  const node = { id: 7, type: "KSampler", widgets: [{ name: "text", value: "old" }] };
+  const expectedNodeIdentity = nodeInstanceIdentity(node);
+  const run = runProductionDeferredBranch({
+    node,
+    queuePayload: { queue_running: [], queue_pending: [] },
+    expectedNodeIdentity,
+  });
+  const result = await run.call();
+  assert.equal(result.applied, true);
+  assert.equal(run.applyCalls.length, 1);
+  assert.equal(run.applyCalls[0].defer_replay, true);
+  assert.equal(run.applyCalls[0].expected_node_identity, expectedNodeIdentity);
 });
 
 test("#1716 production graph_set_widget refuses callback-driven widgets before parking", async () => {

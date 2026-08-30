@@ -416,7 +416,11 @@ export function derivedTimelineRefusal(widgetName, nodeId) {
  * clean current-timeline snapshot, so anything they don't mention is PRESERVED. An explicit
  * empty array (e.g. `motionSegments: []`) still clears that track; only OMISSION preserves.
  */
-function applySerializedLtxTimeline(node, merged, { beforeChange, afterChange, setDirty, preservedTracks, mergedOntoCurrent }) {
+function applySerializedLtxTimeline(
+  node,
+  merged,
+  { beforeChange, afterChange, setDirty, assertTargetStillCurrent, preservedTracks, mergedOntoCurrent },
+) {
   const missing = FALLBACK_REQUIRED_WIDGETS.filter((name) => !findWidget(node, name));
   if (missing.length) {
     throw new LtxTimelineWriteError(
@@ -437,6 +441,7 @@ function applySerializedLtxTimeline(node, merged, { beforeChange, afterChange, s
 
   beforeChange?.();
   try {
+    assertTargetStillCurrent?.();
     findWidget(node, LTX_TIMELINE_MASTER_WIDGET).value = JSON.stringify(merged);
     for (const name of LTX_DERIVED_TIMELINE_WIDGETS) {
       findWidget(node, name).value = derived[name];
@@ -474,7 +479,11 @@ function applySerializedLtxTimeline(node, merged, { beforeChange, afterChange, s
   };
 }
 
-export function applyLtxTimelineWrite(node, value, { getEditor, beforeChange, afterChange, setDirty } = {}) {
+export function applyLtxTimelineWrite(
+  node,
+  value,
+  { getEditor, beforeChange, afterChange, setDirty, assertTargetStillCurrent } = {},
+) {
   const { timeline } = normalizeLtxTimelineValue(value);
   const editor = typeof getEditor === "function" ? getEditor(node) : node?._timelineEditor;
   const overlay = effectiveTimeline(timeline);
@@ -488,6 +497,7 @@ export function applyLtxTimelineWrite(node, value, { getEditor, beforeChange, af
     );
     beforeChange?.();
     try {
+      assertTargetStillCurrent?.();
       editor._applyLoadedTimeline(JSON.stringify(merged), null);
     } finally {
       afterChange?.();
@@ -519,6 +529,7 @@ export function applyLtxTimelineWrite(node, value, { getEditor, beforeChange, af
       beforeChange,
       afterChange,
       setDirty,
+      assertTargetStillCurrent,
       preservedTracks,
       mergedOntoCurrent,
     });

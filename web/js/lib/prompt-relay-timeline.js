@@ -735,7 +735,7 @@ export function promptRelayDerivedRefusal(widgetName, nodeId) {
 export function applyPromptRelayTimelineWrite(
   node,
   value,
-  { getEditor, beforeChange, afterChange, setDirty, now = Date.now } = {},
+  { getEditor, beforeChange, afterChange, setDirty, assertTargetStillCurrent, now = Date.now } = {},
 ) {
   const overlay = normalizePromptRelayTimelineValue(value);
 
@@ -971,6 +971,7 @@ export function applyPromptRelayTimelineWrite(
   let editorSynced = false;
   let uiRefreshError = null;
   try {
+    assertTargetStillCurrent?.();
     widgets[PROMPT_RELAY_MASTER_WIDGET].value = timelineJson;
     widgets.local_prompts.value = derived.local_prompts;
     widgets.segment_lengths.value = derived.segment_lengths;
