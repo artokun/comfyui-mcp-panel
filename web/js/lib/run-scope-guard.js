@@ -896,6 +896,51 @@ function sameSet(a, b) {
 }
 
 /**
+ * IDs a queue item or a wrapped options object is already carrying.
+ *
+ * Frontend 1.49.6 stores `queueNodeIds` as a NodeExecutionId[] on the pending
+ * item. A wrapper that forwards the third argument verbatim can instead leave
+ * the store/API options object in that slot (or in `partial_execution_targets`).
+ * Those are the same IDs in another layer's shape, not a different request.
+ *
+ * @param {unknown} raw
+ * @returns {string[]|null}
+ */
+export function queueItemScopeIds(raw) {
+  if (Array.isArray(raw) && raw.length) return raw.map(String);
+  if (!raw || typeof raw !== "object") return null;
+  if (Array.isArray(raw.queueNodeIds) && raw.queueNodeIds.length) {
+    return raw.queueNodeIds.map(String);
+  }
+  if (Array.isArray(raw.partialExecutionTargets) && raw.partialExecutionTargets.length) {
+    return raw.partialExecutionTargets.map(String);
+  }
+  return null;
+}
+
+/**
+ * When a present-but-unusable `partial_execution_targets` value still names
+ * EXACTLY the requested execution roots, that is not a different request — it
+ * is the store/API option object copied into the body. Returning the expected
+ * ids lets the repair rewrite that shape into the array ComfyUI accepts
+ * instead of false-rejecting an exact-target payload (#1782).
+ *
+ * Wrong, extra, or empty ids return null: those remain a mismatch we do not
+ * overwrite.
+ *
+ * @param {unknown} raw
+ * @param {string[]} expected
+ * @returns {string[]|null}
+ */
+export function unwrapExactScopeTargets(raw, expected) {
+  const want = (expected ?? []).map(String);
+  if (!want.length) return null;
+  const got = queueItemScopeIds(raw);
+  if (!got || !sameSet(got, want)) return null;
+  return want.slice();
+}
+
+/**
  * Verify a POST /prompt request body carries EXACTLY the requested
  * partial-execution scope. Compared as string sets (server exec ids are strings;
  * a colon path like "76:34" for a subgraph-nested output must survive verbatim).
@@ -1629,20 +1674,22 @@ export function createScopedRunGuard({
     // overwrite; an unparseable body cannot be repaired. Both fall through to
     // the refusal below, exactly as before.
     let forwardOptions = options;
+    const exactWrapped = unwrapExactScopeTargets(scopeRead.raw, expected);
     if (
       repairScope &&
       contentOk &&
       !targets &&
-      // ONLY a genuinely ABSENT key (codex gate r7, P0-1). Previously `empty`
-      // and `not_a_list` were repaired too, which broke this module's own rule
-      // that a scope we did not put there is never overwritten. `[]`, `null`,
-      // `"14"`, and especially `{ queueNodeIds: [...] }` are PRESENT values in
-      // a shape we did not expect — the last looks like another layer's scope
-      // convention, not an absence. Absence is ours to fill; a present value we
-      // cannot interpret is someone else's data, and rewriting it would be
-      // executing our intent over a request that said something different.
-      // Those states now fall through to the refusal, which names what it saw.
-      scopeRead.state === "absent"
+      // Absence is ours to fill (codex gate r7, P0-1). `[]`, `null`, `"14"`,
+      // and a `{ queueNodeIds }` object naming SOME OTHER node are PRESENT
+      // values we cannot interpret — rewriting those would execute our intent
+      // over a request that said something different.
+      //
+      // #1782 — the exception is exact-target verified: a store/API options
+      // object that already names THIS run's roots is the same scope in
+      // another layer's shape (measured on 1.48.7 as a verbatim third-argument
+      // copy). That is not a different request, so refusing it was a false
+      // reject of a payload we can rewrite into the array ComfyUI accepts.
+      (scopeRead.state === "absent" || exactWrapped)
     ) {
       const repairedBody = repairScopeInBody(options?.body, expected);
       if (repairedBody != null) {
@@ -1883,6 +1930,116 @@ export function cancelPendingScopedQueueItem(app, { runTag, queueMark } = {}) {
     }
   }
   return { accessible: true, removed };
+}
+
+/**
+ * Restore `queueNodeIds` onto THIS run's pending frontend 1.49.6 queue item
+ * when a wrapper dropped the third argument of `app.queuePrompt`.
+ *
+ * ComfyApp 1.49.6 pushes `{ number, batchCount, queueNodeIds }` synchronously,
+ * then later reads that array for `isPartialExecution` and
+ * `api.queuePrompt(..., { partialExecutionTargets: queueNodeIds })`. An
+ * own-property wrapper that calls through with only `(number, batch)` still
+ * reaches that native loop — it just pushes `queueNodeIds: undefined`. Filling
+ * the missing array on the item lets the frontend write
+ * `partial_execution_targets` itself. The item's `number` must match this
+ * run's mark; a present array/object naming different roots is left untouched.
+ *
+ * Bypassing the wrapper entirely would skip its queue-time behaviour (seed
+ * capture, telemetry). This does not: it still calls through, then puts back
+ * the ids the native loop already knows how to honour.
+ *
+ * @param {object} app
+ * @param {{queueMark: number, execIds: string[]}} scope
+ * @param {() => *} invoke
+ */
+export function withScopedQueueItemTargets(app, { queueMark, execIds } = {}, invoke) {
+  const expected = (execIds ?? []).map(String);
+  const run = typeof invoke === "function" ? invoke : () => {};
+  let items;
+  try {
+    items = app?.queueItems;
+  } catch {
+    return run();
+  }
+  if (!Array.isArray(items) || typeof items.push !== "function" || !expected.length) {
+    return run();
+  }
+
+  const restoreItem = (item) => {
+    try {
+      if (!item || typeof item !== "object") return;
+      if (Number(item.number) !== queueMark) return;
+      // ComfyApp 1.49.6 stamps `requestId` on every queue item. Mock deferred
+      // items used by the fetch-chain tests share `queueItems` without that
+      // field; filling those would rewrite a fixture's stored third argument
+      // and hide a real retry. Absence of requestId means this is not the
+      // native processor's item, so leave it for the body-repair fallback.
+      if (!Object.prototype.hasOwnProperty.call(item, "requestId")) return;
+      const got = queueItemScopeIds(item.queueNodeIds);
+      if (got) {
+        // Already carrying the exact roots, but 1.49.6's `!!queueNodeIds?.length`
+        // and `partialExecutionTargets: queueNodeIds` need an ARRAY. An options
+        // object in that slot is the same scope in the wrong shape — flatten it.
+        if (sameSet(got, expected) && !Array.isArray(item.queueNodeIds)) {
+          item.queueNodeIds = execIds;
+        }
+        return;
+      }
+      item.queueNodeIds = execIds;
+    } catch {
+      // A hostile queue item cannot prevent the original push from running.
+    }
+  };
+
+  const origPush = items.push;
+  const push = function scopedQueueItemPush(...args) {
+    for (const arg of args) restoreItem(arg);
+    return origPush.apply(this, args);
+  };
+  try {
+    items.push = push;
+  } catch {
+    return run();
+  }
+
+  const restorePush = () => {
+    try {
+      if (items.push === push) items.push = origPush;
+    } catch {
+      // A hostile setter cannot prevent the invoke from having run.
+    }
+  };
+  const scanPending = () => {
+    try {
+      for (const item of items) restoreItem(item);
+    } catch {
+      // Reading a hostile queueItems entry must not replace the invoke result.
+    }
+  };
+
+  try {
+    const result = run();
+    if (result && typeof result.then === "function") {
+      return Promise.resolve(result).then(
+        (value) => {
+          scanPending();
+          restorePush();
+          return value;
+        },
+        (error) => {
+          restorePush();
+          throw error;
+        },
+      );
+    }
+    scanPending();
+    restorePush();
+    return result;
+  } catch (error) {
+    restorePush();
+    throw error;
+  }
 }
 
 /**
@@ -2240,7 +2397,9 @@ export async function dispatchScopedRun({
       // dispatched scopeless. An Error throw is decorated with its browser stack;
       // non-Error throws retain their existing identity.
       const queued = await boundedStep(
-        invokeQueuePromptWithBrowserStack(app, mark, batch, scopeArg),
+        withScopedQueueItemTargets(app, { queueMark: mark, execIds }, () =>
+          invokeQueuePromptWithBrowserStack(app, mark, batch, scopeArg),
+        ),
         boundedBy(attemptMs),
       );
       // `"error" in` rather than a truthiness test — a falsy thrown value still throws.
