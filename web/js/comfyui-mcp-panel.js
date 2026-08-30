@@ -805,6 +805,10 @@ import {
   reRegisterExhaustedHint,
 } from "./lib/command-liveness.js";
 import {
+  malformedToolNameException,
+  readMalformedToolName,
+} from "./lib/command-name.js";
+import {
   classifyInteractiveCard,
   refusedInteractiveCardError,
 } from "./lib/interactive-card-fence.js";
@@ -28647,6 +28651,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         let visibleMutationTarget = null;
         try {
           let result;
+          // #1297 — truncated / concatenated / nested-router names are a
+          // validation miss, not an unknown command. Refuse before any
+          // executor lookup so nothing is applied.
+          const malformedName = malformedToolNameException(msg.cmd);
+          if (malformedName) throw malformedName;
           if (msg.cmd === "ask_user") {
             // Not a graph executor — render an interactive question card in the
             // chat (UI scope) and block on the user's pick. The chosen string
@@ -29059,6 +29068,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           const workflowListReadiness = readWorkflowListReadinessRefusal(err);
           const workflowOpenReadiness = readWorkflowOpenReadinessRefusal(err);
           const routeRegistrationReadiness = readRouteRegistrationReadinessRefusal(err);
+          const malformedToolName = readMalformedToolName(err);
           reply = {
             rid: msg.rid,
             ok: false,
@@ -29078,6 +29088,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // reader answers the stronger question — did the gate mint this,
             // pre-executor? — and returns a freshly built object.
             ...(reconnectRefusal ? { refusal: reconnectRefusal } : {}),
+            // #1297 — truncated/nested names are a validation miss, not unknown.
+            ...(malformedToolName ? { code: malformedToolName.code, applied: false } : {}),
             // #1785 — this is a read-only, pre-probe refusal. Keep it separate
             // from the graph-mutation gate's refusal vocabulary so a caller
             // cannot confuse a workflow-list readiness miss with a graph

@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- Truncated or concatenated panel tool names return a malformed-name validation error instead of "unknown tool", and apply no mutation (#1297)
 - panel_set_widget clear of an already-empty combo (VHS_LoadVideo video="") succeeds even when the dropdown has no empty option (#2010)
 - a wildcard-to-wildcard connect refusal is reported as unbound * ports needing a concrete typed producer, not a false type mismatch (#2028)
 
