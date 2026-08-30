@@ -1146,13 +1146,14 @@ export function coerceWidgetValue(
     // installed is caught here instead of failing 40 seconds into a run. The message says
     // which of the two happened, so an agent can tell "your value is wrong" apart from
     // "the panel could not look" and stop treating them as the same failure.
-    const preview = options.slice(0, 40).map((o) => JSON.stringify(o)).join(", ");
     throw new WidgetWriteError(
       `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
         `"${name}". Its option list WAS read successfully and holds ${options.length} ` +
         `option${options.length === 1 ? "" : "s"}, none of them this value — so this is a ` +
-        `rejected VALUE, not an unreadable list. Valid options (${options.length}): ${preview}` +
-        (options.length > 40 ? ", …" : ""),
+        `rejected VALUE, not an unreadable list. The valid option values are intentionally ` +
+        `omitted from this diagnostic because combo values may contain private filenames ` +
+        `or paths. Choose a value from the widget's current dropdown (refreshing its ` +
+        `options first if needed) and retry.`,
       { combo: true },
     );
   }
