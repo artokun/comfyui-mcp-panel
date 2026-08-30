@@ -5,9 +5,11 @@ import { fileURLToPath } from "node:url";
 
 import {
   createChatScrollIntentTracker,
+  isLeavingBottomScrollIntent,
   isUserScrollIntent,
   updateChatStickiness,
 } from "../../web/js/lib/chat-scroll-intent.js";
+import { createChatScrollStabilizer } from "../../web/js/lib/chat-scroll-stabilizer.js";
 import { revealInteractiveCard } from "../../web/js/lib/interactive-card-reveal.js";
 
 const panelSource = readFileSync(
@@ -86,9 +88,17 @@ function buildProductionScrollSurface(options) {
     "atBottom",
     "createChatScrollIntentTracker",
     "updateChatStickiness",
+    "isLeavingBottomScrollIntent",
     `let stickToBottom = true;\n${productionListener}\nreturn {\n  log,\n  newMsgBtn,\n  scrollIntent,\n  disposeChatScrollListeners,\n  get stickToBottom() { return stickToBottom; },\n};`,
   );
-  return build(log, newMsgBtn, atBottom, createChatScrollIntentTracker, updateChatStickiness);
+  return build(
+    log,
+    newMsgBtn,
+    atBottom,
+    createChatScrollIntentTracker,
+    updateChatStickiness,
+    isLeavingBottomScrollIntent,
+  );
 }
 
 function productionRevealScrollNowSource(painterName) {
@@ -235,6 +245,35 @@ test("non-bottom browser scrolls preserve stickiness, while user scrolls unstick
     true,
     "reaching the bottom always re-sticks",
   );
+  assert.equal(
+    updateChatStickiness(true, { atBottom: true, userScrollIntent: true, leavingBottom: true }),
+    false,
+    "an upward gesture inside the slack zone must unstick",
+  );
+  assert.equal(
+    updateChatStickiness(false, { atBottom: true, userScrollIntent: true, leavingBottom: false }),
+    true,
+    "a downward user scroll that lands on the bottom re-sticks",
+  );
+  assert.equal(
+    updateChatStickiness(true, { atBottom: true, userScrollIntent: true, leavingBottom: false }),
+    true,
+    "a non-leaving user gesture at the bottom stays stuck",
+  );
+});
+
+test("wheel-up and page-up are leaving-bottom intent; wheel-down and pointerdown are not", () => {
+  assert.equal(isLeavingBottomScrollIntent({ type: "wheel", deltaY: -40 }), true);
+  assert.equal(isLeavingBottomScrollIntent({ type: "wheel", deltaY: 40 }), false);
+  assert.equal(isLeavingBottomScrollIntent({ type: "wheel", deltaY: -40, ctrlKey: true }), false);
+  assert.equal(isLeavingBottomScrollIntent({ type: "keydown", key: "ArrowUp" }), true);
+  assert.equal(isLeavingBottomScrollIntent({ type: "keydown", key: "PageUp" }), true);
+  assert.equal(isLeavingBottomScrollIntent({ type: "keydown", key: "Home" }), true);
+  assert.equal(isLeavingBottomScrollIntent({ type: "keydown", key: "ArrowDown" }), false);
+  assert.equal(isLeavingBottomScrollIntent({ type: "keydown", key: "End" }), false);
+  assert.equal(isLeavingBottomScrollIntent({ type: "pointerdown" }), false);
+  assert.equal(isLeavingBottomScrollIntent({ type: "touchmove", deltaY: -12 }), true);
+  assert.equal(isLeavingBottomScrollIntent({ type: "touchmove", deltaY: 12 }), false);
 });
 
 test("production DOM wiring expires input that never scrolls before a later browser scroll", async () => {
@@ -354,6 +393,91 @@ test("keydown in form fields (nested editable elements) counts as scroll intent"
     surface.stickToBottom,
     false,
     "a keydown event on a nested form field must count as scroll intent"
+  );
+
+  surface.disposeChatScrollListeners();
+  surface.scrollIntent.dispose();
+});
+
+test("#2000 wheel-up unsticks immediately, even while still inside the bottom slack", () => {
+  const surface = buildProductionScrollSurface();
+  // True bottom: scrollHeight 1000, clientHeight 100 → scrollTop 900.
+  // Slack is 48px, so 870 is still "at bottom" for atBottom().
+  surface.log._scrollTop = 900;
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, true, "resting at the true bottom stays stuck");
+
+  emit(surface.log, "wheel", { deltaY: -30 });
+  assert.equal(
+    surface.stickToBottom,
+    false,
+    "the upward wheel must unstick before the scroll event lands",
+  );
+  assert.equal(surface.scrollIntent.hasPending(), true);
+
+  surface.log._scrollTop = 870;
+  emit(surface.log, "scroll");
+  assert.equal(
+    surface.stickToBottom,
+    false,
+    "a 30px wheel-up inside the 48px slack must not re-stick",
+  );
+
+  surface.disposeChatScrollListeners();
+  surface.scrollIntent.dispose();
+});
+
+test("#2000 pending upward intent blocks the stabilizer from yanking back to the pin", () => {
+  const surface = buildProductionScrollSurface();
+  surface.log._scrollTop = 900;
+  const frames = [];
+  const stabilizer = createChatScrollStabilizer({
+    log: surface.log,
+    shouldStick: () => surface.stickToBottom && !surface.scrollIntent.hasPending(),
+    beforeScroll: () => surface.scrollIntent.noteProgrammaticScroll(),
+    requestFrame: (fn) => frames.push(fn),
+    ResizeObserverCtor: null,
+    MutationObserverCtor: null,
+  });
+
+  emit(surface.log, "wheel", { deltaY: -80 });
+  assert.equal(surface.stickToBottom, false);
+  surface.log._scrollTop = 860;
+  stabilizer.schedule();
+  assert.equal(frames.length, 0, "schedule must be a no-op while the user is leaving the bottom");
+
+  if (frames.length) frames.shift()();
+  assert.equal(surface.log.scrollTop, 860, "the stabilizer must not overwrite the upward wheel");
+
+  stabilizer.dispose();
+  surface.disposeChatScrollListeners();
+  surface.scrollIntent.dispose();
+});
+
+test("#2000 downward scroll to the latest message re-sticks; anchoring without intent does not unstick", () => {
+  const surface = buildProductionScrollSurface();
+  surface.log._scrollTop = 900;
+  emit(surface.log, "scroll");
+
+  emit(surface.log, "wheel", { deltaY: 80 });
+  assert.equal(surface.stickToBottom, true, "a downward wheel at the pin must not unstick");
+
+  emit(surface.log, "wheel", { deltaY: -80 });
+  surface.log._scrollTop = 820;
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, false, "the reader has left the pin");
+
+  emit(surface.log, "wheel", { deltaY: 80 });
+  surface.log._scrollTop = 900;
+  emit(surface.log, "scroll");
+  assert.equal(surface.stickToBottom, true, "returning to the bottom re-sticks");
+
+  surface.log._scrollTop = 850;
+  emit(surface.log, "scroll");
+  assert.equal(
+    surface.stickToBottom,
+    true,
+    "a content-visibility anchoring scroll without user intent must keep autoscroll",
   );
 
   surface.disposeChatScrollListeners();
