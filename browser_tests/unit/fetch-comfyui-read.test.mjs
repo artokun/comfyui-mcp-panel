@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS,
+  MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES,
   fetchComfyUIReadForMcp,
   validateFetchComfyUIReadArgs,
 } from "../../web/js/lib/fetch-comfyui-read.js";
@@ -232,6 +234,83 @@ test("#2283: redirects and oversized bodies are refused", async () => {
       { ...options, maxBytes: 4, fetchImpl: async () => response({ body: "12345" }) },
     ),
     "too_large",
+  );
+});
+
+test("#2283: object_info uses its documented large/slow route budget while other reads stay bounded", async () => {
+  assert.ok(MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES > 25_104_088);
+  assert.ok(FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS > 20_840);
+  const body = JSON.stringify({
+    KSampler: {
+      input: { required: {} },
+      output: ["MODEL"],
+      output_is_list: [false],
+      output_name: ["model"],
+      name: "KSampler",
+      display_name: "KSampler",
+      description: "x".repeat(25_104_088),
+      category: "sampling",
+      output_node: false,
+    },
+  });
+  assert.ok(body.length > 25_104_088);
+  const result = await fetchComfyUIReadForMcp(
+    { operation: "object_info" },
+    {
+      expectedOrigin: "https://panel.test",
+      api: {
+        apiURL: (path) => path,
+        fetchApi: async () => response({ body, contentLength: body.length, stream: false }),
+      },
+    },
+  );
+  assert.equal(result.operation, "object_info");
+  assert.equal(result.bytes, body.length);
+
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "history" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => path,
+          fetchApi: async () => response({ body, contentLength: body.length, stream: false }),
+        },
+      },
+    ),
+    "too_large",
+  );
+});
+
+test("#2283: object_info still refuses an oversize body and a timeout", async () => {
+  const oversize = "x".repeat(MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES + 1);
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "object_info" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => path,
+          fetchApi: async () => response({ body: oversize, contentLength: oversize.length, stream: false }),
+        },
+      },
+    ),
+    "too_large",
+  );
+
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "object_info" },
+      {
+        timeoutMs: 5,
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => path,
+          fetchApi: () => new Promise((resolve) => setTimeout(() => resolve(response()), 25)),
+        },
+      },
+    ),
+    "timeout",
   );
 });
 
