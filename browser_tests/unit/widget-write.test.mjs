@@ -616,7 +616,7 @@ test("#560 SAFETY: dotted addressing on a SUBGRAPH parent is refused (never a ra
   const node = {
     id: 47,
     type: "MySubgraph",
-    subgraph: {},
+    subgraph: { _nodes: [] },
     inputs: [],
     widgets: [{ name: "lora_1", value: { on: true, lora: "a.safetensors", strength: 1 } }],
   };

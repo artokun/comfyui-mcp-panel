@@ -19,6 +19,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { isPromotedContainer } from "../../web/js/lib/graph-read.js";
+
 const PANEL_SRC = readFileSync(
   new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
   "utf8",
@@ -50,6 +52,7 @@ function loadGetSubgraph() {
       "fixedCapNote",
       "summarizeNode",
       "promotedTerminalWitnesses",
+      "isPromotedContainer",
       `return ({${method}}).graph_get_subgraph;`,
     )(
       () => ({ graph: {} }),
@@ -62,6 +65,7 @@ function loadGetSubgraph() {
       () => "truncation note",
       (inner) => ({ id: inner.id, type: inner.type }),
       () => [],
+      isPromotedContainer,
     );
 }
 
@@ -148,6 +152,45 @@ test("#1941 a missing type still throws the canonical line", () => {
       return true;
     },
   );
+});
+
+test("#2006 a root PrimitiveNode throws the definitive non-container line", () => {
+  assertDefinitiveNonContainer({
+    id: 198,
+    type: "PrimitiveNode",
+    isVirtualNode: true,
+    widgets: [{ name: "value", value: "a prompt" }],
+  });
+});
+
+test("#2006 a PrimitiveNode leftover subgraph that looks live is still not a container", () => {
+  // The unfixed predicate treated any live-looking `.subgraph` as a container.
+  // PrimitiveNode is a frontend value source: leftover `_nodes` / getNodeById
+  // must not skip the definitive throw, or MCP refuses the ordinary `value` write.
+  for (const leftover of [
+    { _nodes: [{ id: 1, type: "CLIPTextEncode" }] },
+    { nodes: [{ id: 1, type: "CLIPTextEncode" }] },
+    { getNodeById() { return null; } },
+  ]) {
+    assertDefinitiveNonContainer({
+      id: 198,
+      type: "PrimitiveNode",
+      isVirtualNode: true,
+      subgraph: leftover,
+    });
+  }
+});
+
+test("#2006 a PrimitiveNode whose subgraph getter throws still uses the definitive line", () => {
+  const node = {
+    id: 198,
+    type: "PrimitiveNode",
+    isVirtualNode: true,
+    get subgraph() {
+      throw new Error("subgraph accessor exploded");
+    },
+  };
+  assertDefinitiveNonContainer(node);
 });
 
 test("#1941 a live inner graph is still a container — the throw does not fire", () => {

@@ -2,6 +2,7 @@ import { fireNodeWidgetChanged } from "./node-widget-changed.js";
 import { missingWidgetMessage } from "./missing-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
+import { isPromotedContainer } from "./graph-read.js";
 import {
   boundPropertyFailure,
   boundPropertyState,
@@ -1742,7 +1743,7 @@ export function followPromotionToConcrete(target, resolveSource) {
   let widget = target?.widget ?? null;
   const seen = new Set();
   let depth = 0;
-  while (node && node.subgraph) {
+  while (node && isPromotedContainer(node)) {
     if (seen.has(node)) return { node, widget, cycle: true };
     if (depth >= MAX_PROMOTION_CHAIN_DEPTH) {
       return {
@@ -1797,7 +1798,7 @@ export function collectPromotionIntermediates(target, resolveSource) {
   let widget = target?.widget ?? null;
   const seen = new Set();
   let depth = 0;
-  while (node && node.subgraph) {
+  while (node && isPromotedContainer(node)) {
     if (seen.has(node)) break;
     if (depth >= MAX_PROMOTION_CHAIN_DEPTH) break;
     seen.add(node);
@@ -1837,8 +1838,8 @@ export function resolveWidgetWrite(
   // name contains a dot is never hijacked.
   let subFieldPath = null;
 
-  if (node?.subgraph) {
-    // Reuse a promotion resolution the caller already computed (graph_set_widget
+  if (isPromotedContainer(node)) {
+    // Reuse a promotion resolution the caller already computed (graph_set_widget)
     // resolves it ONCE up front to fresh-authorize the inner target, #458), so the
     // write targets the IDENTICAL inner node it authorized — a relink between the
     // async /object_info fetch and the write can't swap in an unauthorized target.
@@ -1929,7 +1930,7 @@ export function resolveWidgetWrite(
     // all) always wins — the split is never taken when an exact match exists.
     widget = resolveWidgetByName(targetNode, widgetName);
   }
-  if (!widget && node?.subgraph) {
+  if (!widget && isPromotedContainer(node)) {
     // #560 SAFETY: on a SUBGRAPH parent, a dotted name that did not resolve as a
     // promotion alias must NOT fall through to the base-name dotted fallback below —
     // that would write the parent's projected RAIL widget DIRECTLY, bypassing the

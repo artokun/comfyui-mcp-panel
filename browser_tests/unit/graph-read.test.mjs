@@ -42,6 +42,7 @@ import {
   MAX_CHARS_CEILING,
   // #1748
   NOTE_NODE_TYPES,
+  isPromotedContainer,
 } from "../../web/js/lib/graph-read.js";
 
 // ---- #607: link-driven widget detection -----------------------------------
@@ -745,4 +746,67 @@ test("liveLinkTargetInput never throws on malformed nodes (#342)", () => {
   // Holes in the inputs array are skipped, not crashed on.
   assert.equal(liveLinkTargetInput({ inputs: [null, undefined] }, 3), null);
   assert.deepEqual(liveLinkTargetInput({ inputs: [null, { link: 3 }] }, 3), { index: 1, name: undefined });
+});
+
+// ---- #2006: PrimitiveNode is never a promoted container --------------------
+
+test("#2006 a root PrimitiveNode is not a promoted container", () => {
+  assert.equal(
+    isPromotedContainer({ id: 198, type: "PrimitiveNode", isVirtualNode: true, widgets: [{ name: "value" }] }),
+    false,
+  );
+});
+
+test("#2006 leftover live-looking subgraph on PrimitiveNode is still not a container", () => {
+  assert.equal(
+    isPromotedContainer({
+      id: 198,
+      type: "PrimitiveNode",
+      subgraph: { _nodes: [{ id: 1 }], getNodeById() { return null; } },
+    }),
+    false,
+  );
+});
+
+test("#2006 a throwing subgraph getter is not a container", () => {
+  assert.equal(
+    isPromotedContainer({
+      id: 198,
+      type: "PrimitiveNode",
+      get subgraph() {
+        throw new Error("boom");
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isPromotedContainer({
+      id: 74,
+      type: "VHS_VideoCombine",
+      get subgraph() {
+        throw new Error("boom");
+      },
+    }),
+    false,
+  );
+});
+
+test("#2006 a live inner graph is still a container", () => {
+  assert.equal(
+    isPromotedContainer({ id: 4, type: "SubgraphNode", subgraph: { _nodes: [{ id: 12 }] } }),
+    true,
+  );
+  assert.equal(
+    isPromotedContainer({ id: 4, type: "SubgraphNode", subgraph: { nodes: [] } }),
+    true,
+  );
+  assert.equal(
+    isPromotedContainer({ id: 4, type: "SubgraphNode", subgraph: { getNodeById() { return null; } } }),
+    true,
+  );
+});
+
+test("#1941 leftover subgraph that is not a live inner graph is not a container", () => {
+  assert.equal(isPromotedContainer({ id: 74, type: "VHS_VideoCombine", subgraph: {} }), false);
+  assert.equal(isPromotedContainer({ id: 74, type: "VHS_VideoCombine", subgraph: { name: "not-a-graph" } }), false);
 });

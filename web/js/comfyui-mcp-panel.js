@@ -469,6 +469,7 @@ import {
   outlineFloorRefusal,
   outlineValueClipNote,
   clipOutlineTitle,
+  isPromotedContainer,
 } from "./lib/graph-read.js";
 import { slotRenameLines } from "./lib/slot-rename-diff.js";
 import { describeRenameFailure } from "./lib/workflow-rename-error.js";
@@ -10085,7 +10086,7 @@ function promotedTerminalWitnesses(subgraphNode) {
       terminal?.cycle ||
       terminal?.error ||
       terminal?.terminalVirtual ||
-      terminalNode.subgraph ||
+      isPromotedContainer(terminalNode) ||
       terminal?.depth === undefined ||
       !Number.isSafeInteger(terminal.depth) ||
       terminal.depth < 0 ||
@@ -12417,10 +12418,17 @@ function summarizeNode(node) {
   };
   // Subgraphs summarize SHALLOWLY — boundary slots + widgets only, plus an
   // inner node count. Drill in with graph_get_subgraph when needed.
-  if (node.subgraph) {
+  // #2006 — same live-container predicate as graph_get_subgraph / pinpoint
+  // is_subgraph: leftover `.subgraph` on a PrimitiveNode is not a container.
+  if (isPromotedContainer(node)) {
     summary.is_subgraph = true;
-    summary.subgraph_node_count =
-      node.subgraph._nodes?.length ?? node.subgraph.nodes?.length ?? 0;
+    let innerCount = 0;
+    try {
+      innerCount = node.subgraph._nodes?.length ?? node.subgraph.nodes?.length ?? 0;
+    } catch {
+      innerCount = 0;
+    }
+    summary.subgraph_node_count = innerCount;
   }
   return summary;
 }
@@ -14810,7 +14818,7 @@ const GRAPH_TOOL_EXECUTORS = {
           // #2314 — MCP must distinguish a definitive ordinary node from an
           // older Panel whose detail projection cannot classify promotion.
           // Positive-only emission made missing capability look like false.
-          is_subgraph: !!n.subgraph,
+          is_subgraph: isPromotedContainer(n),
         };
         line = JSON.stringify(summary);
         // Final guard: if the fully-capped detail STILL exceeds max_chars (a node with
@@ -14904,11 +14912,11 @@ const GRAPH_TOOL_EXECUTORS = {
               ...(typeof summarized.node_identity === "string"
                 ? { node_identity: summarized.node_identity }
                 : {}),
-              is_subgraph: !!matched[0].subgraph,
+              is_subgraph: isPromotedContainer(matched[0]),
             }
           : {
               ...capSummaryWidgets(summarized, detailWidgetCap, maxChars),
-              is_subgraph: !!matched[0].subgraph,
+              is_subgraph: isPromotedContainer(matched[0]),
             };
       const fitted = fitDetailLine(
         JSON.stringify(summary),
@@ -14934,7 +14942,7 @@ const GRAPH_TOOL_EXECUTORS = {
             ...(typeof summary.node_identity === "string"
               ? { node_identity: summary.node_identity }
               : {}),
-            is_subgraph: !!matched[0].subgraph,
+            is_subgraph: isPromotedContainer(matched[0]),
           },
         ];
       }
@@ -15345,24 +15353,22 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_get_subgraph({ node_id }) {
     const { graph } = getGraphCtx();
     const node = resolveNode(graph, node_id);
-    const sub = node.subgraph;
     // #1941 — MCP's promoted-write probe treats anything other than this exact
     // "is not a subgraph" line as indeterminate and refuses the write. A root
     // node is not a promoted container: only a live inner graph (nodes list or
     // getNodeById) is one. A truthy leftover `subgraph` used to skip the throw
     // and look like an unclassifiable container. Nested parentheses in `type`
     // also made the orchestrator miss its own definitive form, so flatten them.
-    const isContainer =
-      !!sub &&
-      typeof sub === "object" &&
-      (Array.isArray(sub._nodes) || Array.isArray(sub.nodes) || typeof sub.getNodeById === "function");
-    if (!isContainer) {
+    // #2006 — a root PrimitiveNode is never a container, even when leftover
+    // `.subgraph` looks live or its getter throws a non-definitive error.
+    if (!isPromotedContainer(node)) {
       const rawType = typeof node.type === "string" ? node.type : "";
       const type = rawType.replace(/[()]/g, " ").replace(/\s+/g, " ").trim();
       throw new Error(
         type ? `Node ${node.id} (${type}) is not a subgraph` : `Node ${node.id} is not a subgraph`,
       );
     }
+    const sub = node.subgraph;
     const inner = [...(sub._nodes ?? sub.nodes ?? [])];
     const promotedTerminals = promotedTerminalWitnesses(node);
     // #1729 — provenance is a second structured-read path: its raw instance_widgets

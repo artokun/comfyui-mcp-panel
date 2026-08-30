@@ -127,6 +127,6 @@ test("#1925 pinpoint detail publishes a structured is_subgraph row", () => {
   const queryEnd = PANEL_SRC.indexOf("graph_find_nodes({", queryStart);
   const query = PANEL_SRC.slice(queryStart, queryEnd);
   assert.match(query, /pinpointNodes/);
-  assert.match(query, /is_subgraph: !!matched\[0\]\.subgraph/);
+  assert.match(query, /is_subgraph: isPromotedContainer\(matched\[0\]\)/);
   assert.match(query, /\.\.\.\(pinpointNodes \? \{ nodes: pinpointNodes \} : \{\}\)/);
 });
