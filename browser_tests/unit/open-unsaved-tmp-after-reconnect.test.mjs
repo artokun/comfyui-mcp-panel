@@ -1,6 +1,6 @@
 // #2022 — panel_open_workflow of a listed unsaved tmp: tab immediately after
 // reconnect applied the switch but returned a hard error because it could not
-// immediately prove the active workflow. ~7s later list_workflows showed
+// immediately prove the active workflow. ~7s later panel_list_workflows showed
 // active_confirmed:true and last_open.applied:true for the same command.
 //
 // That is a verification race / false-negative, not a failed switch. When the
