@@ -632,6 +632,7 @@ import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
 import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "./lib/settle-open-readable.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
+import { generatedImageMediaItems, generatedImageRemainderText } from "./lib/generated-image.js";
 import {
   applyCurrentDefWidgetValues,
   driftedRequiredInputNames,
@@ -28500,13 +28501,28 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         queueHiddenAgentNote(coerceMessageText(msg.text));
         return;
       }
+      // Codex generatedImage / imageGeneration: paint the bytes, then leftover prose.
+      // Array.isArray: extracted bridge-client tests stub missing helpers as noop.
+      const generatedItems = generatedImageMediaItems(msg);
+      if (Array.isArray(generatedItems) && generatedItems.length && onShowMedia) {
+        try {
+          await onShowMedia(generatedItems);
+        } catch {
+          /* a fenced turn must not surface as a transport error */
+        }
+      }
       if (msg && msg.type === "say" && msg.text != null) {
         // A completed render/output frame can arrive as a structured payload,
         // not a bare string (#238). Route it through the SAME serializer the
         // A2UI/replay paths use so the sidebar shows readable text instead of a
         // dropped frame or an "[object Object]" bubble.
         // `id` reconciles this committed reply with its live streaming preview.
-        onSay(coerceMessageText(msg.text), { id: msg.id, streamed: !!msg.streamed });
+        const sayText = Array.isArray(generatedItems) && generatedItems.length
+          ? generatedImageRemainderText(msg, generatedItems)
+          : coerceMessageText(msg.text);
+        if (sayText || !Array.isArray(generatedItems) || !generatedItems.length) {
+          onSay(sayText, { id: msg.id, streamed: !!msg.streamed });
+        }
       }
       // Live streaming deltas: incremental thinking / reply text before the final
       // `say` commits. phase: "think" | "text" | "end".
