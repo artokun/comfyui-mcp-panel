@@ -845,6 +845,7 @@ import {
   contentProofExclusiveAmongOpen,
 } from "./lib/graph-binding.js";
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
+import { honestRunAck } from "./lib/delivery-ack.js";
 import {
   createRunFetchInterceptor,
   dispatchScopedRun,
@@ -19979,7 +19980,9 @@ const GRAPH_TOOL_EXECUTORS = {
       // dropped outputs, not a refusal of the whole prompt.
       acceptedPromptIds: queuedPromptIds,
     });
-    if (rejection) return rejection;
+    // #1995 — a minted prompt id is a queue receipt. Never rewrite that as a
+    // user-rejected tool result; a lost ack without an id is unknown, not refused.
+    if (rejection) return honestRunAck(rejection);
     // Surface the queued prompt_id(s) so the agent can correlate/track the run —
     // #370 reconciliation and mcp#531 (panel_run must return the prompt_id even
     // when a render is already running) both depend on this being reported.
@@ -20219,7 +20222,7 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       /* a diagnostic must never take down the run it describes */
     }
-    return accept;
+    return honestRunAck(accept);
   },
 
   // WHY IS THAT NODE RED? — the single error surface. LiteGraph only sets a

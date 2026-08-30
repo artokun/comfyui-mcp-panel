@@ -53,6 +53,7 @@ import {
   describeUnrunnable,
 } from "../../web/js/lib/missing-node-preflight.js";
 import { buildQueueAcceptResult, summarizePromptRejection } from "../../web/js/lib/queue-rejection.js";
+import { honestRunAck } from "../../web/js/lib/delivery-ack.js";
 import { installGraphToPromptNullSafety } from "../../web/js/lib/widget-null-safety.js";
 import { installGraphToPromptDynamicReconcile } from "../../web/js/lib/dynamic-widget-reconcile.js";
 import {
@@ -723,6 +724,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     rgthreeFixedSeedNote,
     summarizePromptRejection,
     buildQueueAcceptResult,
+    honestRunAck,
     collectVirtualSourceFeeds,
     virtualSourceNote,
     collectDisabledAncestorOutputs,
