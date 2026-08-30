@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_open_workflow of a listed unsaved tmp: tab after reconnect no longer false-negatives: it rechecks the active routing key before failing, and an applied switch that is still unreadable returns the receipt rather than a hard error (#2022)
+
 ## [0.15.142] - 2026-08-30
 
 ### Fixed

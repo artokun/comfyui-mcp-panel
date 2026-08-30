@@ -358,6 +358,9 @@ function productionOpen(environment) {
     installActivePointerWatch,
     workflowOpenReadinessRefusalError,
     readWorkflowOpenReadinessRefusal,
+    isUnsavedTmpOpenSelector: () => false,
+    appliedTmpOpenShouldFailClosed: () => false,
+    settleOwnedOpenedTmpRoutingKey: async () => ({ status: "unknown" }),
     ...environment,
   };
   const scope = new Proxy(sandbox, {

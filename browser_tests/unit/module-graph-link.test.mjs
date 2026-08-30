@@ -55,6 +55,12 @@ import {
   describeInputLink,
   verifyDisconnect,
 } from "../../web/js/lib/disconnect-verify.js";
+import {
+  appliedTmpOpenShouldFailClosed,
+  isUnsavedTmpOpenSelector,
+  settleOwnedOpenedTmpRoutingKey,
+  settleOwnedOpenedWorkflowActive,
+} from "../../web/js/lib/settle-open-active.js";
 
 // --- Mirror the shared bounded-step edge (#648) --------------------------------------
 // run-completion-frame.js and media-preview.js BOTH import withTimeout from here. If
@@ -124,6 +130,13 @@ test("panel ↔ disconnect-verify.js module edge links (#668)", () => {
   assert.equal(typeof snapshotGraphState, "function");
   assert.equal(typeof describeInputLink, "function");
   assert.equal(typeof verifyDisconnect, "function");
+});
+
+test("panel ↔ settle-open-active.js tmp: reconnect edges link (#2022)", () => {
+  assert.equal(typeof settleOwnedOpenedWorkflowActive, "function");
+  assert.equal(typeof settleOwnedOpenedTmpRoutingKey, "function");
+  assert.equal(typeof isUnsavedTmpOpenSelector, "function");
+  assert.equal(typeof appliedTmpOpenShouldFailClosed, "function");
 });
 
 /**
