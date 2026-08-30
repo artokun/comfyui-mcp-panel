@@ -18,6 +18,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_open_workflow of a listed unsaved tmp: tab after reconnect no longer false-negatives: it rechecks the active routing key before failing, and an applied switch that is still unreadable returns the receipt rather than a hard error (#2022)
 - panel_copy_nodes with explicit node_ids no longer copies a leftover additive canvas selection (#2004)
+- live graph reads recover after a manual canvas edit: a hung panel_graph_outline no longer pins retries, tracker snapshot flush stays mutation-only, and image/canvas widget values are clipped without a full stringify that could miss the 20s RPC window (#2003)
 
 
 ## [0.15.142] - 2026-08-30
