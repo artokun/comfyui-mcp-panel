@@ -199,3 +199,115 @@ export function controlAfterGenerateWarning(node, widgetName, scope = {}) {
     `${controlAfterGenerateRemedy(entry, node, scope)}`
   );
 }
+
+// #2029 — panel_add_node can leave the control combo visible (mode "randomize")
+// without the queue hooks app.queuePrompt actually fires. ComfyUI_frontend
+// widgets.ts hangs beforeQueued/afterQueued on the combo and points the value
+// widget's linkedWidgets at it; without that, ordinary Queue-button runs cache-hit
+// on seed 0 until a tab reload rebuilds the node through the frontend pipeline.
+const ADVANCING_CONTROL_MODES = new Set(["randomize", "increment", "decrement", "increment-wrap"]);
+const SAFE_INTEGER_MAX = 1125899906842624;
+const SAFE_INTEGER_MIN = -1125899906842624;
+const controlHasQueued = new WeakSet();
+
+function targetInputIsConnected(node, target) {
+  const name = target?.name;
+  if (typeof name !== "string") return false;
+  const inputs = Array.isArray(node?.inputs) ? node.inputs : [];
+  for (const input of inputs) {
+    if (!input || input.link == null) continue;
+    if (input.widget?.name === name || input.name === name) return true;
+  }
+  return false;
+}
+
+function nextControlledValue(target, mode) {
+  if (!ADVANCING_CONTROL_MODES.has(mode)) return undefined;
+  const values = target?.options?.values;
+  if (Array.isArray(values) && values.length) {
+    const asString = values.map((v) => String(v));
+    let index = asString.indexOf(String(target.value));
+    const length = values.length;
+    if (mode === "randomize") index = Math.floor(Math.random() * length);
+    else if (mode === "decrement") index -= 1;
+    else index += 1;
+    if (mode === "increment-wrap" && index >= length) index = 0;
+    index = Math.max(0, Math.min(length - 1, index));
+    return values[index];
+  }
+  if (typeof target?.value !== "number" || !Number.isFinite(target.value)) return undefined;
+  const opts = target.options && typeof target.options === "object" ? target.options : {};
+  const step2 = Number(opts.step2) || (Number(opts.step) > 0 ? Number(opts.step) / 10 : 1) || 1;
+  const rawMin = Number(opts.min);
+  const rawMax = Number(opts.max);
+  const min = Number.isFinite(rawMin) ? Math.max(SAFE_INTEGER_MIN, rawMin) : 0;
+  const max = Number.isFinite(rawMax) ? Math.min(SAFE_INTEGER_MAX, rawMax) : min;
+  let next = target.value;
+  if (mode === "decrement") next -= step2;
+  else if (mode === "increment" || mode === "increment-wrap") next += step2;
+  else {
+    const range = (max - min) / step2;
+    next = Math.floor(Math.random() * range) * step2 + min;
+  }
+  return Math.min(Math.max(next, min), max);
+}
+
+function linkControlToTarget(target, control) {
+  if (!target || target === control) return;
+  if (!Array.isArray(target.linkedWidgets)) target.linkedWidgets = [];
+  if (!target.linkedWidgets.includes(control)) target.linkedWidgets.push(control);
+}
+
+function applyControlToTarget(node, target, control) {
+  if (targetInputIsConnected(node, target)) return;
+  const mode = typeof control?.value === "string" ? control.value : String(control?.value ?? "");
+  const next = nextControlledValue(target, mode);
+  if (next === undefined) return;
+  target.value = next;
+  if (typeof target.callback === "function") target.callback(next);
+}
+
+/**
+ * Make an already-materialized control_after_generate combo actually roll its
+ * governed widget on app.queuePrompt, matching the frontend seed-widget pipeline.
+ *
+ * No-op when the combo already carries beforeQueued/afterQueued (a UI-created or
+ * reload-rebuilt node). Never invents a control widget that is not already there.
+ * Returns how many inert combos were armed.
+ */
+export function ensureControlAfterGenerateQueueHooks(node, { getControlMode } = {}) {
+  const entries = controlAfterGenerateEntries(node);
+  if (!entries.length) return 0;
+  const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+  let armed = 0;
+  const runsBefore = () => {
+    try {
+      return getControlMode?.() === "before";
+    } catch {
+      return false;
+    }
+  };
+  for (const entry of entries) {
+    if (!entry || entry.widget === entry.control) continue;
+    const control = widgets.find((w) => w && w.name === entry.control);
+    const target = widgets.find((w) => w && w.name === entry.widget);
+    if (!control || !target || control === target) continue;
+    try {
+      linkControlToTarget(target, control);
+    } catch {
+      /* a non-writable linkedWidgets still gets the queue hooks below */
+    }
+    if (typeof control.beforeQueued === "function" || typeof control.afterQueued === "function") {
+      continue;
+    }
+    control.beforeQueued = () => {
+      if (runsBefore() && controlHasQueued.has(control)) applyControlToTarget(node, target, control);
+      controlHasQueued.add(control);
+    };
+    control.afterQueued = () => {
+      if (!runsBefore()) applyControlToTarget(node, target, control);
+    };
+    armed += 1;
+  }
+  return armed;
+}

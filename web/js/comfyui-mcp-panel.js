@@ -588,6 +588,7 @@ import {
 import {
   controlAfterGenerateModes,
   controlAfterGenerateEntries,
+  ensureControlAfterGenerateQueueHooks,
 } from "./lib/control-after-generate.js";
 import { autoMatchSlots, slotDiagnostic, loopbackRefusalReason } from "./lib/connect-match.js";
 import {
@@ -16262,6 +16263,18 @@ const GRAPH_TOOL_EXECUTORS = {
     } finally {
       graph.afterChange();
     }
+    // #2029 — LG.createNode can leave a control_after_generate combo showing
+    // "randomize" without afterQueued/linkedWidgets, so the ordinary Queue button
+    // never rolls the seed until a tab reload rebuilds the node.
+    ensureControlAfterGenerateQueueHooks(node, {
+      getControlMode: () => {
+        try {
+          return comfyApp?.ui?.settings?.getSettingValue?.("Comfy.WidgetControlMode");
+        } catch {
+          return undefined;
+        }
+      },
+    });
     // #1709 — only a node that reached the live graph earns reuse. The definition is already
     // detached by snapshotBackendDef, and the epoch/context fence prevents it crossing a
     // reconnect or workflow/graph switch.
