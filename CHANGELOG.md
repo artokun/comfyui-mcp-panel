@@ -6,8 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.138] - 2026-08-30
+
 ### Fixed
-- panel_set_widget keeps COMFY_DYNAMICCOMBO_V3 dotted-child writes across queue-time reserialize instead of reverting to spec defaults (#2031)
+- panel_set_widget keeps COMFY_DYNAMICCOMBO_V3 dotted-child writes across queue-time reserialize instead of reverting to spec defaults (#2031, #2096)
+- surface the Manager install traceback in panel_install_node (#2012, #2075)
 
 
 ## [0.15.137] - 2026-08-30
