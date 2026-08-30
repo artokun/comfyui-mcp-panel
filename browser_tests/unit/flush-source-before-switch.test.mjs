@@ -309,10 +309,11 @@ test("#1295: the #1215 TARGET capture gate still skips an untagged switch — th
   assert.ok(flushAt < gateAt, "source flush is BEFORE the switch; target capture is AFTER");
   const gate = SRC.slice(gateAt, SRC.indexOf("await target.changeTracker?.checkState?.()", gateAt));
   assert.match(gate, /!pointerMovedThisOpen/);
-  assert.match(gate, /captureBinding !== "foreign"/);
+  assert.match(gate, /sourceBinding === "bound"/);
+  assert.match(gate, /graphRootMatchesState\(/);
   assert.doesNotMatch(
     gate,
-    /if \(captureBinding !== "foreign"\)/,
-    '"not foreign" alone was the #1215 hole — the source flush must not bring it back',
+    /captureBinding === "bound"\s*\|\|/,
+    'a TARGET tag alone must not reopen the #1215 capture hole',
   );
 });

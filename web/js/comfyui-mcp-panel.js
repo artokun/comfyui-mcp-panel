@@ -811,6 +811,7 @@ import {
   graphRootWorkflowUuidMatches,
   graphRootMatchesState,
   graphRootReproducesStateContent,
+  graphRootStructureExtendsActiveWorkflow,
   applySavedNodePresentation,
   describeRepaintSourceBinding,
   graphCommandBindingBar,
@@ -21955,8 +21956,30 @@ const GRAPH_TOOL_EXECUTORS = {
             activePointerEpochAtOpen !== null &&
             activePointerEpoch === activePointerEpochAtOpen &&
             activeIdentityAtCapture;
+          // A TARGET UUID on the root is not independent proof after a pointer move:
+          // the outgoing SOURCE can retain a stale/shared stamp while the source
+          // classifier correctly answers "foreign". In that shape, capturing would
+          // serialize SOURCE into TARGET. Keep the proven-bound recurrence, and admit
+          // the already-repainted TARGET only when its complete state matches the
+          // target tracker; an unproven or drifted root fails closed.
+          const sourceBinding = pointerMovedThisOpen
+            ? describeLiveCanvasBinding(activeBefore)
+            : "bound";
+          let targetContentProof = false;
+          if (pointerMovedThisOpen && sourceBinding === "foreign") {
+            try {
+              targetContentProof =
+                graphRootMatchesState({
+                  rootGraph: app?.graph,
+                  state: target?.changeTracker?.activeState ?? target?.activeState,
+                }) === true;
+            } catch {
+              targetContentProof = false;
+            }
+          }
           const captureSourceProof =
-            captureBinding === "bound" || (captureBinding !== "foreign" && !pointerMovedThisOpen);
+            captureBinding === "bound" &&
+            (!pointerMovedThisOpen || sourceBinding === "bound" || targetContentProof);
           // #1575 — a state THIS command just read off disk is authoritative, and the
           // canvas mounted behind it is whatever the closed tab left there. Serializing
           // that over the fresh state is the #1215/#968 poisoning through a new entry
@@ -21972,22 +21995,20 @@ const GRAPH_TOOL_EXECUTORS = {
           // information. The helper either uses the pre-watch already-current proof
           // or skips a switch capture and DISCLOSES. Silent skip is the remaining
           // #1215 path (SOURCE widget values surviving onto TARGET).
-          const captureDecision = decideLiveCanvasCapture({
-            watchAvailable: activePointerWatchAvailable,
-            openLoaded: openSettled?.loaded === true,
-            captureSourceProof,
-            pointerProof,
-            pointerMovedThisOpen,
-          });
-          if (captureDecision.disclose) pointerWatchUnavailable = true;
           // #1215 (2026-08-27 recurrence) — DISTINCT from #1911. The Pinia watch
           // proves the POINTER moved; it does not prove the canvas swapped. A stale
           // or shared root UUID still answers "bound" while app.graph is the outgoing
           // tab, and checkState() then serializes that previous canvas into TARGET.
           // Related workflows (same node ids/types, different widgets) are the shape
           // that then publishes TARGET's fence over SOURCE's values.
-          // proven/presentationOnly only: normalizedOnly would treat those related
-          // graphs as a match, which is the silent serve this closes.
+          // The source probe accepts proven/presentationOnly, plus the narrower
+          // additive-node containment case below: an uncaptured SOURCE edit can
+          // otherwise make the exact proof false while the root is still SOURCE.
+          // normalizedOnly would treat related graphs as a match, which is the
+          // silent serve this closes. This probe must run BEFORE
+          // decideLiveCanvasCapture: the production classifier correctly reports
+          // TARGET as foreign while the mounted root is SOURCE, so captureSourceProof
+          // cannot be the only route by which this fact reaches the decision.
           const sourceStateForSwitch = pointerMovedThisOpen
             ? (activeBefore?.changeTracker?.activeState ?? activeBefore?.activeState)
             : null;
@@ -22002,15 +22023,68 @@ const GRAPH_TOOL_EXECUTORS = {
                 rootGraph,
                 state: sourceStateForSwitch,
               });
-              return proof?.proven === true || proof?.presentationOnly === true;
+              if (proof?.proven === true || proof?.presentationOnly === true) return true;
+              // A user edit can make SOURCE's live graph differ from its last
+              // ChangeTracker capture without making it cease to be SOURCE. In
+              // particular, an added node makes the exact proof above false; the
+              // old #1951 gate then allowed checkState() to copy that still-mounted
+              // graph into TARGET. Only take this fallback for the reported
+              // additive-node shape. Without that positive count increase,
+              // structural containment also matches a correctly-mounted TARGET
+              // whose widget values differ, and would regress #1639's proven-bound
+              // capture. A count-short graph is deliberately not a source proof
+              // because it could already have been rebuilt for TARGET.
+              // Containment is content evidence, not ownership evidence. Resolve both
+              // live workflow objects without consulting the mounted root, then require
+              // the production classifier to prove that the root belongs to SOURCE.
+              // The identities must also differ: a duplicate tab with a copied UUID is
+              // not an independent source proof, even if both objects are exposed.
+              const sourceWorkflowUuid = workflowObjectUuid(activeBefore) || workflowStableUuid(activeBefore, {
+                embed: false,
+                commit: false,
+              });
+              const targetWorkflowUuid = workflowObjectUuid(target) || workflowStableUuid(target, {
+                embed: false,
+                commit: false,
+              });
+              if (
+                typeof sourceWorkflowUuid !== "string" ||
+                !sourceWorkflowUuid ||
+                typeof targetWorkflowUuid !== "string" ||
+                !targetWorkflowUuid ||
+                sourceWorkflowUuid === targetWorkflowUuid ||
+                describeLiveCanvasBinding(activeBefore) !== "bound"
+              ) {
+                return false;
+              }
+              const liveNodes = rootGraph?._nodes;
+              const sourceNodeCount = Array.from(sourceStateForSwitch.nodes).length;
+              const liveNodeCount = Array.isArray(liveNodes) ? Array.from(liveNodes).length : 0;
+              if (sourceNodeCount === 0 || liveNodeCount <= sourceNodeCount) {
+                return false;
+              }
+              const sourceStructureContainsLive = graphRootStructureExtendsActiveWorkflow({
+                rootGraph,
+                activeWorkflow: activeBefore,
+              });
+              return sourceStructureContainsLive === true;
             } catch {
               return false;
             }
           };
+          const sourceCanvasStillMounted = liveCanvasStillSource(app?.graph);
+          const captureDecision = decideLiveCanvasCapture({
+            watchAvailable: activePointerWatchAvailable,
+            openLoaded: openSettled?.loaded === true,
+            captureSourceProof,
+            pointerProof,
+            pointerMovedThisOpen,
+            sourceCanvasStillMounted,
+          });
+          if (captureDecision.disclose) pointerWatchUnavailable = true;
           if (
             openSettled?.loaded !== true &&
-            captureDecision.capture &&
-            !liveCanvasStillSource(app?.graph)
+            captureDecision.capture
           ) {
             try {
               // AWAITED (codex). A frontend whose tracker captures asynchronously would

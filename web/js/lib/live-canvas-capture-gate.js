@@ -67,6 +67,7 @@ export function installActivePointerWatch(observer, stores = []) {
  *   captureSourceProof?: boolean,
  *   pointerProof?: boolean,
  *   pointerMovedThisOpen?: boolean,
+ *   sourceCanvasStillMounted?: boolean,
  * }} [input]
  * @returns {{
  *   capture: boolean,
@@ -81,6 +82,7 @@ export function decideLiveCanvasCapture({
   captureSourceProof = false,
   pointerProof = false,
   pointerMovedThisOpen = false,
+  sourceCanvasStillMounted = false,
 } = {}) {
   const discloseMissingWatch = watchAvailable !== true;
   const withNotice = (capture, reason) =>
@@ -96,6 +98,14 @@ export function decideLiveCanvasCapture({
   // A state this command just read off disk holds no node-written values to
   // save, and the canvas behind it is whatever the closed tab left there.
   if (openLoaded === true) return withNotice(false, "loaded-from-disk");
+
+  // A positive SOURCE identity/content proof is stronger than the TARGET
+  // capture proof. The classifier quite correctly answers "foreign" for TARGET
+  // while this root is still SOURCE, so the caller must surface this fact before
+  // the normal capture decision can short-circuit it.
+  if (sourceCanvasStillMounted === true) {
+    return withNotice(false, "source-canvas-still-mounted");
+  }
 
   if (watchAvailable === true) {
     if (pointerProof === true && captureSourceProof === true) {

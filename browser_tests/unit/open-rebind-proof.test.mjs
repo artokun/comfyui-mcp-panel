@@ -1132,7 +1132,7 @@ test("#1215: the pre-switch active workflow is snapshotted BEFORE the pointer mo
   assert.ok(snapAt < switchAt, "…before openWorkflow, which is what changes the answer");
 });
 
-test("#1215: an untagged root admits the capture only in the already-current case", () => {
+test("#1215: a switched capture needs independent source or exact target proof", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const gateAt = src.indexOf("const captureBinding = describeLiveCanvasBinding(target);");
   assert.notEqual(gateAt, -1, "the capture must stay gated on the live-canvas binding");
@@ -1140,19 +1140,33 @@ test("#1215: an untagged root admits the capture only in the already-current cas
   assert.notEqual(captureAt, -1);
   const gate = src.slice(gateAt, captureAt);
   assert.match(gate, /pointerMovedThisOpen = !sameWorkflowObject\(activeBefore, target\)/);
-  // A capture is allowed only when the active pointer did not move. A stale root
-  // carrying the target UUID is not independent canvas proof after a tab switch.
-  assert.match(gate, /!pointerMovedThisOpen/);
-  assert.match(gate, /captureBinding !== "foreign"/);
-  assert.doesNotMatch(
+  // A TARGET UUID alone is not independent canvas proof after a tab switch: the
+  // outgoing SOURCE can carry that stale tag. The positive switched arms must be
+  // explicit and fail closed when neither proof is available.
+  assert.match(gate, /const sourceBinding = pointerMovedThisOpen\s*\?\s*describeLiveCanvasBinding\(activeBefore\)/);
+  assert.match(gate, /captureBinding === "bound"/);
+  assert.match(gate, /sourceBinding === "bound"/);
+  assert.match(gate, /graphRootMatchesState\(/);
+  assert.match(gate, /targetContentProof/);
+  assert.match(
     gate,
-    /if \(captureBinding !== "foreign"\)/,
-    '"not foreign" alone was the #1215 hole — it must not come back',
+    /const sourceCanvasStillMounted = liveCanvasStillSource\(app\?\.graph\)/,
+    "a still-mounted SOURCE canvas must be evaluated before the capture decision",
   );
   assert.match(
     gate,
-    /!liveCanvasStillSource\(app\?\.graph\)/,
-    "a still-mounted SOURCE canvas must not be captured into TARGET even when bound",
+    /graphRootStructureExtendsActiveWorkflow\(\{[\s\S]*activeWorkflow: activeBefore/,
+    "an uncaptured additive SOURCE edit must still identify the mounted graph as SOURCE",
+  );
+  assert.match(
+    gate,
+    /describeLiveCanvasBinding\(activeBefore\) !== "bound"/,
+    "structural SOURCE containment must use the production classifier for SOURCE identity",
+  );
+  assert.match(
+    gate,
+    /sourceCanvasStillMounted,/,
+    "the SOURCE proof must reach the capture decision instead of being short-circuited",
   );
 });
 
