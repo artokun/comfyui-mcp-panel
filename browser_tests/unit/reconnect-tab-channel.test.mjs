@@ -1,6 +1,6 @@
 // #2030 — after panel_restart_comfyui the backend can be healthy
 // (`server_ready:true`) while this tab's workflow command channel is still the
-// pre-restart mapping (`panel_tab_reconnected:false`). `workflow_list` then
+// pre-restart mapping (`tab_reconnected:false`). `workflow_list` then
 // times out (6000 ms), `panel_set_workflow_target({mode:"current"})` cannot
 // read canvas identity, and mutations stay fenced. Unsaved in-memory edits
 // exist, so the repair must re-register THIS tab — never reload or reopen.

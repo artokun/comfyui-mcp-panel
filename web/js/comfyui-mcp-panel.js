@@ -1136,7 +1136,7 @@ let postReconnectBindingProofEpoch = 0;
 let postReconnectWatchToken = 0;
 // #2030 — last reconnect epoch whose workflow command channel has a landed hello.
 // Stale while this is behind backendReconnectEpoch: the orchestrator still waits
-// for a newer generation (`panel_tab_reconnected:false`) even though the backend
+// for a newer generation (`tab_reconnected:false`) even though the backend
 // is up. The watchdog re-hellos THIS tab; it never reloads the in-memory graph.
 let tabChannelReadyEpoch = 0;
 let tabChannelWatchToken = 0;

@@ -1,7 +1,7 @@
 // #2030 — after a ComfyUI backend restart the tab can sit on a live bridge
 // socket whose workflow command channel is still the pre-restart mapping.
 // `panel_restart_comfyui` then reports `server_ready:true` /
-// `panel_tab_reconnected:false`, `workflow_list` times out (6000 ms), and
+// `tab_reconnected:false`, `workflow_list` times out (6000 ms), and
 // `panel_set_workflow_target({mode:"current"})` cannot read canvas identity.
 // Mutations stay fenced. Unsaved in-memory edits exist, so the repair is a
 // reconnect watchdog that re-registers THIS tab's current identity — the same
@@ -39,7 +39,7 @@ function readFlag(value) {
  *
  * True only when the backend is up, the bridge socket is live, and this
  * reconnect epoch has not yet landed a hello. That is
- * `server_ready:true` / `panel_tab_reconnected:false`: ComfyUI is healthy, but
+ * `server_ready:true` / `tab_reconnected:false`: ComfyUI is healthy, but
  * this tab's command channel is still the pre-restart mapping.
  *
  * Re-registering means re-hello of THIS tab's current identity. It must not
