@@ -6,8 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.135] - 2026-08-30
+
 ### Fixed
-- keep the rendered changelog artifact synchronized when a release gains a late-merged entry (#2086)
+- keep the rendered changelog artifact synchronized when a release gains a late-merged entry
+
+- sync rendered changelog for v0.15.134
+
 
 ## [0.15.134] - 2026-08-30
 
