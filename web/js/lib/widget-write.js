@@ -1400,20 +1400,140 @@ function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
   return rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget);
 }
 
+/**
+ * #1997 — the live text control a DOM-backed STRING widget actually reads.
+ *
+ * ComfyUI `addDOMWidget` wires `get value` / `set value` through `options.getValue`
+ * / `options.setValue`. Packs such as TTS-Audio-Suite's StringMultilineTagEditor
+ * implement `getValue` as "read the contenteditable" and make `setValue` a no-op
+ * once `onConfigure` has loaded the workflow — so `widget.value = x` appears to
+ * assign and then reverts. The control itself is `widget.inputEl` (or a textarea /
+ * contenteditable under `widget.element`). Writing that element is what an
+ * on-canvas edit does; `getValue` then returns the new string.
+ *
+ * Detection is structural, not by node type: a live textarea/input/contenteditable,
+ * never a guess at `node.properties`. Widgets whose getValue is a no-op (Pixaroma
+ * `pix_prompt_ui`) have no such control and stay on the #698 diagnosis path.
+ */
+function liveTextEditorElement(widget) {
+  if (!widget || typeof widget !== "object") return null;
+  const seen = [];
+  const push = (el) => {
+    if (el && typeof el === "object" && !seen.includes(el)) seen.push(el);
+  };
+  try {
+    push(widget.inputEl);
+  } catch {
+    /* unreadable inputEl is simply absent */
+  }
+  try {
+    push(widget.element);
+  } catch {
+    /* unreadable element is simply absent */
+  }
+  for (const el of seen) {
+    if (isLiveTextEditor(el)) return el;
+    let inner = null;
+    try {
+      if (typeof el.querySelector === "function") {
+        inner = el.querySelector(
+          "textarea, input[type='text'], input:not([type]), [contenteditable='true'], [contenteditable='']",
+        );
+      }
+    } catch {
+      inner = null;
+    }
+    if (inner && isLiveTextEditor(inner)) return inner;
+  }
+  return null;
+}
+
+function isLiveTextEditor(el) {
+  if (!el || typeof el !== "object") return false;
+  const tag = typeof el.tagName === "string" ? el.tagName.toUpperCase() : "";
+  if (tag === "TEXTAREA") return true;
+  if (tag === "INPUT") {
+    const type = String(el.type || "text").toLowerCase();
+    return type === "text" || type === "search" || type === "url" || type === "email" || type === "password" || type === "";
+  }
+  if (el.isContentEditable === true || el.contentEditable === true || el.contentEditable === "true" || el.contentEditable === "") {
+    return true;
+  }
+  return typeof el.className === "string" && /\bcomfy-multiline-input\b/.test(el.className);
+}
+
+function dispatchDomEvent(el, type) {
+  try {
+    if (typeof el.dispatchEvent !== "function" || typeof Event !== "function") return;
+    el.dispatchEvent(new Event(type, { bubbles: true }));
+  } catch {
+    /* best-effort; verification still decides whether the value stuck */
+  }
+}
+
+function writeLiveTextEditor(el, text) {
+  const tag = typeof el.tagName === "string" ? el.tagName.toUpperCase() : "";
+  const editable =
+    el.isContentEditable === true ||
+    el.contentEditable === true ||
+    el.contentEditable === "true" ||
+    el.contentEditable === "" ||
+    (typeof el.className === "string" && /\bcomfy-multiline-input\b/.test(el.className));
+  if (tag === "TEXTAREA" || tag === "INPUT") {
+    el.value = text;
+  } else if (editable) {
+    el.textContent = text;
+  } else {
+    return false;
+  }
+  // StringMultilineTagEditor's input listener copies getPlainText() into state
+  // and localStorage; without this event the canvas shows the new text and a
+  // reload restores the old one.
+  dispatchDomEvent(el, "input");
+  dispatchDomEvent(el, "change");
+  return true;
+}
+
+function widgetHoldsValue(widget, coerced) {
+  try {
+    return Object.is(widget.value, coerced);
+  } catch {
+    return false;
+  }
+}
+
+/** When a string write did not stick on `.value`, copy it into the live editor. */
+function syncDomBackedTextIfNeeded(widget, coerced) {
+  if (typeof coerced !== "string") return;
+  if (widgetHoldsValue(widget, coerced)) return;
+  const el = liveTextEditorElement(widget);
+  if (!el) return;
+  writeLiveTextEditor(el, coerced);
+}
+
 /** Assign a widget value and drive options.setValue when present (store-backed rails). */
 function assignWidgetValue(widget, coerced) {
   widget.value = coerced;
-  let setValue;
   try {
-    setValue = widget.options?.setValue;
-  } catch {
-    setValue = null;
-  }
-  if (typeof setValue !== "function") return;
-  try {
-    setValue.call(widget, coerced);
+    const setValue = widget.options?.setValue;
+    if (typeof setValue === "function") setValue.call(widget, coerced);
   } catch {
     /* verification below still decides whether the value stuck */
+  }
+  try {
+    syncDomBackedTextIfNeeded(widget, coerced);
+  } catch {
+    /* verification below still decides whether the value stuck */
+  }
+}
+
+/** Restore a captured prior value, including a DOM-backed editor this write updated. */
+function restoreWidgetValue(widget, previous) {
+  widget.value = previous;
+  try {
+    syncDomBackedTextIfNeeded(widget, previous);
+  } catch {
+    /* restore best-effort; read-back below is authoritative */
   }
 }
 
@@ -2860,14 +2980,14 @@ export function applyWidgetWrite(
       // The read-back below still compares it against the captured clone either way.
       if (!instanceScoped || definitionMoved) {
         try {
-          w.value = previous;
+          restoreWidgetValue(w, previous);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
       }
       if (parentWidget) {
         try {
-          parentWidget.value = previousParent;
+          restoreWidgetValue(parentWidget, previousParent);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
@@ -2876,7 +2996,7 @@ export function applyWidgetWrite(
       // the just-written value after a failed write.
       for (let i = 0; i < displayWidgets.length; i++) {
         try {
-          displayWidgets[i].value = previousDisplays[i];
+          restoreWidgetValue(displayWidgets[i], previousDisplays[i]);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
