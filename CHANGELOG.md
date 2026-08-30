@@ -6,8 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.128] - 2026-08-30
+
 ### Fixed
 - panel_set_widget writes DOM-backed multiline editors (StringMultilineTagEditor `text`) through the live input/contenteditable that getValue reads, so a no-op setValue after configure no longer refuses the update (#1997)
+
 
 ## [0.15.127] - 2026-08-30
 
