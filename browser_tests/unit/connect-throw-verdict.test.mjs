@@ -46,6 +46,7 @@ import {
   readStoredLink,
   verifyConnect,
   snapshotInputSlotLinks,
+  snapshotInputSlotNames,
   connectCollateralBullets,
   connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
@@ -60,6 +61,12 @@ import {
   describeSlotRewrites,
   slotRewriteWarning,
 } from "../../web/js/lib/slot-rename-disclosure.js";
+import {
+  isDynamicPrefixSlotName,
+  captureNamedSlotLinks,
+  findSlotIndexByName,
+  reconcileDynamicPrefixSlots,
+} from "../../web/js/lib/dynamic-slot-reconcile.js";
 import { findExistingRailSlot, refuseConnectToRawRail } from "../../web/js/lib/rail-slot.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -157,6 +164,7 @@ function buildExecutors(graph, canvas = {}) {
     "landedAfterThrowWarning",
     "snapshotGraphState",
     "snapshotInputSlotLinks",
+    "snapshotInputSlotNames",
     "verifyConnect",
     "connectCollateralBullets",
     "connectCollateralWarning",
@@ -166,6 +174,10 @@ function buildExecutors(graph, canvas = {}) {
     "captureSlotNames",
     "describeSlotRewrites",
     "slotRewriteWarning",
+    "isDynamicPrefixSlotName",
+    "captureNamedSlotLinks",
+    "findSlotIndexByName",
+    "reconcileDynamicPrefixSlots",
     `const GRAPH_TOOL_EXECUTORS = {
 ${connectSrc}
 ${exposeOutSrc}
@@ -200,6 +212,7 @@ return GRAPH_TOOL_EXECUTORS;`,
     landedAfterThrowWarning,
     snapshotGraphState,
     snapshotInputSlotLinks,
+    snapshotInputSlotNames,
     verifyConnect,
     connectCollateralBullets,
     connectCollateralWarning,
@@ -209,6 +222,10 @@ return GRAPH_TOOL_EXECUTORS;`,
     captureSlotNames,
     describeSlotRewrites,
     slotRewriteWarning,
+    isDynamicPrefixSlotName,
+    captureNamedSlotLinks,
+    findSlotIndexByName,
+    reconcileDynamicPrefixSlots,
   );
 }
 

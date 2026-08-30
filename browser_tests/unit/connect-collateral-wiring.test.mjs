@@ -91,6 +91,20 @@ test("both paths surface the verdict to the caller", () => {
 
 });
 
+test("#2008 graph_connect reconciles dotted Autogrow names after the mutation", () => {
+  const snap = CONNECT_BODY.indexOf("const namedSlotsBefore = captureNamedSlotLinks(target);");
+  assert.ok(snap > 0, "no name→link snapshot on the connect path");
+  const mutate = CONNECT_BODY.indexOf("origin[\"connect\"](outIdx, target, inIdx)");
+  assert.ok(mutate > 0, "the connect mutation site moved — re-anchor this pin");
+  assert.ok(snap < mutate, "the name snapshot must be taken BEFORE the wire is made");
+  const reconcile = CONNECT_BODY.indexOf("const reconciled = reconcileDynamicPrefixSlots({");
+  assert.ok(reconcile > mutate, "reconcile must re-read AFTER onConnectionsChange");
+  assert.ok(
+    /beforeNames: inputNamesBefore/.test(CONNECT_BODY),
+    "verifyConnect must receive the pre-mutation names so an Autogrow index shift is not collateral",
+  );
+});
+
 test("the verdict never REFUSES — the mutation has already happened", () => {
   // #1272's lesson: reporting failure for a connect that landed invites a destructive
   // retry. A `throw` keyed on the collateral verdict would reintroduce exactly that.

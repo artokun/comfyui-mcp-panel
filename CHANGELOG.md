@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_connect by Autogrow name keeps later MiniMax H3 slots on their original wires (#2008)
+
+
 ## [0.15.132] - 2026-08-30
 
 ### Fixed

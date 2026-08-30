@@ -44,6 +44,7 @@ import {
   landedAfterThrowWarning,
   verifyConnect,
   snapshotInputSlotLinks,
+  snapshotInputSlotNames,
   connectCollateralBullets,
   connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
@@ -59,6 +60,12 @@ import {
   describeSlotRewrites,
   slotRewriteWarning,
 } from "../../web/js/lib/slot-rename-disclosure.js";
+import {
+  isDynamicPrefixSlotName,
+  captureNamedSlotLinks,
+  findSlotIndexByName,
+  reconcileDynamicPrefixSlots,
+} from "../../web/js/lib/dynamic-slot-reconcile.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
   applyCurrentDefWidgetValues,
@@ -177,6 +184,7 @@ function buildConnect(graph, titleDeps = {}) {
     landedAfterThrowWarning,
     snapshotGraphState,
     snapshotInputSlotLinks,
+    snapshotInputSlotNames,
     verifyConnect,
     connectCollateralBullets,
     connectCollateralWarning,
@@ -186,6 +194,10 @@ function buildConnect(graph, titleDeps = {}) {
     captureSlotNames,
     describeSlotRewrites,
     slotRewriteWarning,
+    isDynamicPrefixSlotName,
+    captureNamedSlotLinks,
+    findSlotIndexByName,
+    reconcileDynamicPrefixSlots,
     ...titleDeps,
   };
   const names = Object.keys(deps);

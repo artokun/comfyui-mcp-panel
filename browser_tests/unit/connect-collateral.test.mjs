@@ -24,6 +24,7 @@ import { snapshotGraphState } from "../../web/js/lib/disconnect-verify.js";
 import {
   verifyConnect,
   snapshotInputSlotLinks,
+  snapshotInputSlotNames,
   connectCollateralBullets,
   connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
@@ -423,4 +424,47 @@ test("#2380 identity across types still holds where it is NEEDED — the address
     beforeSlots,
   });
   assert.deepEqual(v.collateralReslottedInputs, [], "the addressed slot got what was asked for");
+});
+
+test("#2008 an Autogrow index shift of the SAME named slot is not collateral", () => {
+  const n136 = node(
+    136,
+    [
+      { name: "ref_images.ref_image_4", link: null },
+      { name: "ref_videos.ref_video_0", link: 20 },
+      { name: "prompt", link: 21 },
+    ],
+    [],
+  );
+  const src = node(1, [], [{ name: "IMAGE", links: [] }]);
+  const g = mockGraph([src, n136], {
+    20: { id: 20, origin_id: 99, origin_slot: 0, target_id: 136, target_slot: 1 },
+    21: { id: 21, origin_id: 98, origin_slot: 0, target_id: 136, target_slot: 2 },
+  });
+  const before = snapshotGraphState(g);
+  const beforeSlots = snapshotInputSlotLinks(g);
+  const beforeNames = snapshotInputSlotNames(g);
+
+  n136.inputs.splice(1, 0, { name: "ref_images.ref_image_5", link: null });
+  g.links[22] = { id: 22, origin_id: 1, origin_slot: 0, target_id: 136, target_slot: 0 };
+  n136.inputs[0].link = 22;
+  g.links[20].target_slot = 2;
+  g.links[21].target_slot = 3;
+
+  const naive = verifyConnect(g, before, {
+    intendedLinkIds: [22],
+    beforeSlots,
+    intendedSlots: new Set(["136#0"]),
+  });
+  assert.equal(naive.ok, false, "index-only comparison still sees the shift");
+
+  const v = verifyConnect(g, before, {
+    intendedLinkIds: [22],
+    beforeSlots,
+    intendedSlots: new Set(["136#0"]),
+    beforeNames,
+  });
+  assert.equal(v.ok, true, "the names kept their wires; only the indices moved");
+  assert.deepEqual(v.collateralMovedLinks, []);
+  assert.deepEqual(v.collateralReslottedInputs, []);
 });

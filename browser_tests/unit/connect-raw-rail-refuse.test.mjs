@@ -39,6 +39,7 @@ import {
   landedAfterThrowWarning,
   verifyConnect,
   snapshotInputSlotLinks,
+  snapshotInputSlotNames,
   connectCollateralBullets,
   connectCollateralWarning,
 } from "../../web/js/lib/connect-verify.js";
@@ -54,6 +55,12 @@ import {
   describeSlotRewrites,
   slotRewriteWarning,
 } from "../../web/js/lib/slot-rename-disclosure.js";
+import {
+  isDynamicPrefixSlotName,
+  captureNamedSlotLinks,
+  findSlotIndexByName,
+  reconcileDynamicPrefixSlots,
+} from "../../web/js/lib/dynamic-slot-reconcile.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -247,6 +254,7 @@ function buildConnect(graph, exposeCalls) {
     landedAfterThrowWarning,
     snapshotGraphState,
     snapshotInputSlotLinks,
+    snapshotInputSlotNames,
     verifyConnect,
     connectCollateralBullets,
     connectCollateralWarning,
@@ -256,6 +264,10 @@ function buildConnect(graph, exposeCalls) {
     captureSlotNames,
     describeSlotRewrites,
     slotRewriteWarning,
+    isDynamicPrefixSlotName,
+    captureNamedSlotLinks,
+    findSlotIndexByName,
+    reconcileDynamicPrefixSlots,
     exposeCalls,
   };
   const names = Object.keys(deps);
