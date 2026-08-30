@@ -18658,6 +18658,9 @@ const GRAPH_TOOL_EXECUTORS = {
       // delivery, awaitSetWidgetAck readbacks the live widget instead of hanging
       // until the 90s relay reports outcome-unknown.
       timeoutMs: budget.bounded(),
+      // #2109 — locating the enclosing SubgraphNode when this call addressed the
+      // inner promoted terminal (the subgraph is the current view).
+      rootGraph,
     };
     // The creation and its rollback both live inside this call now, at the synchronous write
     // boundary — see `prepareWriteTarget` above. There is nothing to undo out here.
@@ -28916,7 +28919,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // from the INNER widget, which clears instance STRING overrides.
             // Snapshot the parent rails before the mutation and write them back
             // after (rail only — never the shared inner widget).
+            //
+            // #2109 — graph_set_widget is the exception. A promoted inner write
+            // must be allowed to update the enclosing instance rail (the
+            // serialization source). Restoring the pre-write snapshot would put
+            // the OLD parent value back and report applied while the container
+            // stayed stale. add/rewire still wrap; a widget-value write does not
+            // reconfigure sibling instances.
             if (
+              msg.cmd !== "graph_set_widget" &&
               visibleMutationTarget?.graph &&
               visibleMutationTarget.rootGraph &&
               visibleMutationTarget.graph !== visibleMutationTarget.rootGraph
