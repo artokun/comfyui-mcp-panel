@@ -109,7 +109,7 @@ import {
   PANEL_EXTENSION_NAME,
 } from "./lib/duplicate-panel-guard.js";
 import { tryRegisterWhenReady } from "./lib/resolve-comfy-app.js";
-import { looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
+import { looksLikeApiWorkflow, apiWorkflowPayload, apiLoadShortfall, apiLoadNote } from "./lib/api-workflow-load.js";
 import { sanitizeNodeAuxId, sanitizeNodesAuxId } from "./lib/aux-id-sanitize.js";
 import {
   DEFAULT_RENDER_STALL_SECONDS,
@@ -16495,7 +16495,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // node classes, so widget/link separation is done by the nodes themselves
     // rather than by a converter guessing from /object_info.
     if (!Array.isArray(data.nodes)) {
-      if (looksLikeApiWorkflow(data)) {
+      // panel#2011 — a path like graph.api.json is the bare API map; some exporters
+      // wrap the same map as `{prompt: {…}}`. Import either. A UI `nodes` array
+      // above already excluded this branch.
+      const apiData = apiWorkflowPayload(data);
+      if (apiData) {
         if (typeof app.loadApiJson !== "function") {
           throw new Error(
             "workflow is in API/prompt format and this frontend has no app.loadApiJson to " +
@@ -16503,7 +16507,7 @@ const GRAPH_TOOL_EXECUTORS = {
               "or open the API JSON in the ComfyUI tab by hand.",
           );
         }
-        const apiClone = JSON.parse(JSON.stringify(data));
+        const apiClone = JSON.parse(JSON.stringify(apiData));
         // #1478 (defect 1) — CAPTURE THE TARGET BEFORE THE LOAD. This is the path the
         // reporter was on (`{loaded:true, format:"api", node_count:59}`) and it is the
         // path where the fence provably goes stale, so the identity has to be reported
