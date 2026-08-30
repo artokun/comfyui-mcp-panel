@@ -121,6 +121,18 @@ function widgetValues(widgets) {
  * captured once and cannot report itself twice. Non-objects are skipped rather
  * than throwing, for the same reason `captureNodeTitles` skips them.
  */
+function slotObjects(slots) {
+  try {
+    return Array.isArray(slots) ? [...slots] : [];
+  } catch {
+    return [];
+  }
+}
+
+function isDottedName(name) {
+  return typeof name === "string" && name.includes(".");
+}
+
 export function captureSlotNames(nodes) {
   const snapshot = [];
   for (const node of nodes ?? []) {
@@ -131,6 +143,12 @@ export function captureSlotNames(nodes) {
         node,
         inputs: slotNames(node.inputs),
         outputs: slotNames(node.outputs),
+        // Object identity is how #2008 tells Autogrow INSERTION (the slot
+        // object moved, name intact) from ImpactSwitch RENAME (the same
+        // object is still at that index, name rewritten). Spread is a copy
+        // of the refs, not of the slot records.
+        inputSlots: slotObjects(node.inputs),
+        outputSlots: slotObjects(node.outputs),
         widgets: widgetValues(node.widgets),
       });
     } catch {
@@ -138,6 +156,94 @@ export function captureSlotNames(nodes) {
     }
   }
   return snapshot;
+}
+
+/**
+ * Name changes that are rewrites, not Autogrow insertions.
+ *
+ * Compared three ways, in order:
+ *
+ *   1. Slot OBJECT identity, when any before-object is still in the live
+ *      array. ImpactSwitch mutates `input.name` in place (#1873) — the object
+ *      stays, the name changes, that is a rewrite. Autogrow splices a new
+ *      sibling in (#2008) — the later objects move with their names intact,
+ *      that is not.
+ *   2. Insertion-aware alignment, when no object survived (a rebuild) AND
+ *      the before list had a dotted Autogrow name. New names are skipped;
+ *      surviving names that merely shifted index are not reported.
+ *   3. Index-aligned, the original #1873 comparison, for everything else.
+ *
+ * A brand-new trailing slot is never reported in any of the three.
+ */
+function describeNameChanges(kind, before, after, beforeObjs, afterObjs) {
+  const changes = [];
+  const anySurvived = beforeObjs.some((obj) => obj && afterObjs.includes(obj));
+  if (anySurvived) {
+    for (let i = 0; i < before.length; i++) {
+      const obj = beforeObjs[i];
+      const liveIdx = obj ? afterObjs.indexOf(obj) : -1;
+      if (liveIdx >= 0) {
+        const to = liveIdx < after.length ? after[liveIdx] : null;
+        if (before[i] === to) continue;
+        changes.push({
+          kind,
+          index: i,
+          from: safeDisclosureValue(before[i] ?? null),
+          to: safeDisclosureValue(to),
+        });
+        continue;
+      }
+      changes.push({
+        kind,
+        index: i,
+        from: safeDisclosureValue(before[i] ?? null),
+        to: null,
+      });
+    }
+    return changes;
+  }
+  if (before.some(isDottedName)) {
+    let i = 0;
+    let j = 0;
+    while (i < before.length) {
+      if (j < after.length && before[i] === after[j]) {
+        i++;
+        j++;
+        continue;
+      }
+      if (j < after.length && !before.includes(after[j])) {
+        j++;
+        continue;
+      }
+      if (j < after.length && after.indexOf(before[i], j) !== -1) {
+        j++;
+        continue;
+      }
+      const to = j < after.length ? after[j] : null;
+      if (before[i] !== to) {
+        changes.push({
+          kind,
+          index: i,
+          from: safeDisclosureValue(before[i] ?? null),
+          to: safeDisclosureValue(to),
+        });
+      }
+      i++;
+      if (j < after.length) j++;
+    }
+    return changes;
+  }
+  for (let i = 0; i < before.length; i++) {
+    const to = i < after.length ? after[i] : null;
+    if (before[i] === to) continue;
+    changes.push({
+      kind,
+      index: i,
+      from: safeDisclosureValue(before[i] ?? null),
+      to: safeDisclosureValue(to),
+    });
+  }
+  return changes;
 }
 
 /**
@@ -178,17 +284,10 @@ export function describeSlotRewrites(snapshot) {
       for (const kind of ["input", "output"]) {
         const before = (kind === "input" ? entry.inputs : entry.outputs) ?? [];
         const after = slotNames(kind === "input" ? node.inputs : node.outputs);
-        for (let i = 0; i < before.length; i++) {
-          // `i >= after.length` is a REMOVAL, reported as `to: null`. Indices at or
-          // beyond `before.length` are new slots and are deliberately not read.
-          const to = i < after.length ? after[i] : null;
-          if (before[i] === to) continue;
-          slots.push({
-            kind,
-            index: i,
-            from: safeDisclosureValue(before[i] ?? null),
-            to: safeDisclosureValue(to),
-          });
+        const beforeObjs = (kind === "input" ? entry.inputSlots : entry.outputSlots) ?? [];
+        const afterObjs = slotObjects(kind === "input" ? node.inputs : node.outputs);
+        for (const change of describeNameChanges(kind, before, after, beforeObjs, afterObjs)) {
+          slots.push(change);
         }
       }
       const widgets = [];

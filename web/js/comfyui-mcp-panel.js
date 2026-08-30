@@ -584,6 +584,7 @@ import {
 import { autoMatchSlots, slotDiagnostic, loopbackRefusalReason } from "./lib/connect-match.js";
 import {
   snapshotInputSlotLinks,
+  snapshotInputSlotNames,
   isLinkPersisted,
   removePhantomLink,
   isWidgetBackedInput,
@@ -599,6 +600,12 @@ import {
   connectCollateralBullets,
   connectCollateralWarning,
 } from "./lib/connect-verify.js";
+import {
+  isDynamicPrefixSlotName,
+  captureNamedSlotLinks,
+  findSlotIndexByName,
+  reconcileDynamicPrefixSlots,
+} from "./lib/dynamic-slot-reconcile.js";
 import {
   captureNodeTitles,
   describeTitleRewrites,
@@ -16820,6 +16827,14 @@ const GRAPH_TOOL_EXECUTORS = {
     // time. Captured alongside the titles, for the same reason: the rename
     // happens on the throw path and the success path alike.
     const slotsBefore = captureSlotNames([origin, target]);
+    // #2008 — name→link identity on the TARGET, captured BEFORE Autogrow can
+    // rebuild. Dotted children (`ref_images.ref_image_4`) are addressed by
+    // name; an onConnectionsChange insert that shifts later families must not
+    // steal those names' links or report them as rewrites.
+    const namedSlotsBefore = captureNamedSlotLinks(target);
+    const requestedSlotName =
+      typeof to_input === "string" ? to_input : target.inputs?.[inIdx]?.name ?? null;
+    const inputNamesBefore = snapshotInputSlotNames(graph);
     // #2380 — the whole-graph state, captured BEFORE the wire is made. Every other
     // check on this path is scoped to the two endpoints the command NAMED, so a
     // connect that displaced wiring on a THIRD node returned a clean payload and the
@@ -16852,14 +16867,42 @@ const GRAPH_TOOL_EXECUTORS = {
       graph.afterChange();
     }
     graph.setDirtyCanvas(true, true);
+    // #2008 — re-read the target AFTER onConnectionsChange, then put unrelated
+    // named links back (and the intended dotted slot's new wire) so a later
+    // name-based edit still addresses the same logical slots. Runs on both
+    // verdict paths: the hook that rebuilds fires before we know whether
+    // connect() threw.
+    const landedForReconcile = connectErr
+      ? findLandedInboundLink(graph, origin, outIdx, target, inboundLinkIdsBefore)
+      : null;
+    const reconciled = reconcileDynamicPrefixSlots({
+      graph,
+      node: target,
+      before: namedSlotsBefore,
+      intendedName: requestedSlotName,
+      intendedLinkId: landedForReconcile?.linkId ?? link?.id ?? null,
+      replacedLinkId: prevLinkId
+    });
     // #1855 — read the endpoints' titles back the moment the mutation is over,
     // BEFORE the verdict branches: the hook that renames runs on the throw path
     // and the success path alike, so computing this per-branch would report it on
     // one and drop it on the other.
     const titleRewrites = describeTitleRewrites(titlesBefore);
     // #1873 — read back in the SAME place as the titles, before the verdict
-    // branches, so a re-addressed node is disclosed on both of them.
+    // branches, so a re-addressed node is disclosed on both of them. #2008
+    // has already restored unrelated names, so an Autogrow insert that only
+    // shifted indices is silent here.
     const slotRewrites = describeSlotRewrites(slotsBefore);
+    const liveIntendedIndex = () => {
+      if (Number.isInteger(reconciled?.intendedIndex) && reconciled.intendedIndex >= 0) {
+        return reconciled.intendedIndex;
+      }
+      if (isDynamicPrefixSlotName(requestedSlotName)) {
+        const byName = findSlotIndexByName(target, requestedSlotName);
+        if (byName >= 0) return byName;
+      }
+      return inIdx;
+    };
     if (connectErr) {
       const landed = findLandedInboundLink(graph, origin, outIdx, target, inboundLinkIdsBefore);
       if (!landed) {
@@ -16902,7 +16945,12 @@ const GRAPH_TOOL_EXECUTORS = {
         // Both the requested slot and the one a dynamic pack re-slotted onto. Without
         // naming them the intended-id exemption is global, and the same id landing on an
         // untargeted input would be hidden (gate P1).
-        intendedSlots: new Set([`${target.id}#${inIdx}`, `${target.id}#${landed.inputIndex}`]),
+        intendedSlots: new Set([
+          `${target.id}#${inIdx}`,
+          `${target.id}#${landed.inputIndex}`,
+          `${target.id}#${liveIntendedIndex()}`,
+        ]),
+        beforeNames: inputNamesBefore,
       });
       const landedCollateral = landedVerdict.ok ? [] : connectCollateralBullets(landedVerdict);
       return {
@@ -16977,10 +17025,17 @@ const GRAPH_TOOL_EXECUTORS = {
     // persisted wire (the exact ImpactSwitch bug; the same Reroute→select on a real
     // socket like LatentSwitch does persist). Verify the link actually landed on the
     // live graph; if not, clean up the phantom and FAIL HONESTLY.
-    if (!isLinkPersisted(graph, target, inIdx, link)) {
+    let persistIdx = inIdx;
+    if (!isLinkPersisted(graph, target, persistIdx, link)) {
+      const byName = liveIntendedIndex();
+      if (byName !== persistIdx && isLinkPersisted(graph, target, byName, link)) {
+        persistIdx = byName;
+      }
+    }
+    if (!isLinkPersisted(graph, target, persistIdx, link)) {
       // Clean up ONLY the dangling remnant of THIS attempt — never a link a dynamic
       // node re-slotted to another input (removePhantomLink guards that internally).
-      removePhantomLink(graph, target, inIdx, link);
+      removePhantomLink(graph, target, persistIdx, link);
       graph.setDirtyCanvas(true, true);
       const inputSlot = target.inputs?.[inIdx];
       const widgetHint = isWidgetBackedInput(inputSlot)
@@ -17004,7 +17059,8 @@ const GRAPH_TOOL_EXECUTORS = {
       intendedLinkIds: [link?.id],
       replacedLinkId: prevLinkId,
       beforeSlots: inputLinksBefore,
-      intendedSlots: new Set([`${target.id}#${inIdx}`]),
+      intendedSlots: new Set([`${target.id}#${inIdx}`, `${target.id}#${persistIdx}`, `${target.id}#${liveIntendedIndex()}`]),
+      beforeNames: inputNamesBefore,
     });
     const collateral = verdict.ok ? [] : connectCollateralBullets(verdict);
     return {
@@ -17016,8 +17072,8 @@ const GRAPH_TOOL_EXECUTORS = {
         },
         to: {
           node_id: target.id,
-          input: target.inputs?.[inIdx]?.name ?? inIdx,
-          input_index: inIdx,
+          input: target.inputs?.[persistIdx]?.name ?? persistIdx,
+          input_index: persistIdx,
         },
         type: origin.outputs?.[outIdx]?.type,
         ...(autoMatched.length ? { auto_matched: autoMatched } : {}),

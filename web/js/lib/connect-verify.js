@@ -353,32 +353,73 @@ export function landedAfterThrowWarning(err, extra = "") {
  * has shipped against since #668; changing what that returns would alter a verified
  * path this fix has no business touching.
  */
-export function snapshotInputSlotLinks(graph) {
-  const out = new Map();
+function walkInputSlots(graph, visit) {
   const walk = (g, prefix) => {
     for (const n of g?._nodes ?? []) {
       if (n?.id == null) continue;
       const path = prefix + String(n.id);
-      (n.inputs ?? []).forEach((inp, i) => {
-        // RAW, not String()-normalised (gate P1). litegraph's `_links` is a NUMBER-keyed
-        // Map and its `links` proxy binds Map.prototype.get straight through, so a key of
-        // "7" MISSES a record stored under 7 (#1425). Normalising here made `7` and "7"
-        // compare equal, so a hook that retyped an untargeted slot's id left the wire
-        // unresolvable while the verdict read ok:true. Identity against the intended and
-        // replaced ids is normalised at the comparison instead, where it is needed.
-        if (inp?.link != null) out.set(`${path}#${i}`, inp.link);
-      });
+      (n.inputs ?? []).forEach((inp, i) => visit(path, i, inp));
       if (n?.subgraph && Array.isArray(n.subgraph._nodes)) walk(n.subgraph, `${path}>`);
     }
   };
   walk(graph, "");
+}
+
+export function snapshotInputSlotLinks(graph) {
+  const out = new Map();
+  walkInputSlots(graph, (path, i, inp) => {
+    // RAW, not String()-normalised (gate P1). litegraph's `_links` is a NUMBER-keyed
+    // Map and its `links` proxy binds Map.prototype.get straight through, so a key of
+    // "7" MISSES a record stored under 7 (#1425). Normalising here made `7` and "7"
+    // compare equal, so a hook that retyped an untargeted slot's id left the wire
+    // unresolvable while the verdict read ok:true. Identity against the intended and
+    // replaced ids is normalised at the comparison instead, where it is needed.
+    if (inp?.link != null) out.set(`${path}#${i}`, inp.link);
+  });
   return out;
+}
+
+/**
+ * #2008 — the NAME at each input index, captured alongside the link snapshot.
+ *
+ * Autogrow inserts a sibling and later slots shift index while keeping their
+ * names. Index-keyed link comparison then cries collateral for every shifted
+ * family. Pairing by name is how a `ref_videos.ref_video_0` wire that merely
+ * moved from index 13 to 14 is recognised as the same slot.
+ *
+ * Empty slots are recorded too: an inserted empty Autogrow sibling has no
+ * link, and the name is what identifies it as growth rather than a fill.
+ */
+export function snapshotInputSlotNames(graph) {
+  const out = new Map();
+  walkInputSlots(graph, (path, i, inp) => {
+    try {
+      if (typeof inp?.name === "string") out.set(`${path}#${i}`, inp.name);
+    } catch {
+      /* an unreadable name contributes nothing */
+    }
+  });
+  return out;
+}
+
+function slotKeyPath(slot) {
+  const hash = String(slot).lastIndexOf("#");
+  return hash >= 0 ? String(slot).slice(0, hash) : null;
+}
+
+function namesOnSameNode(names, path, name) {
+  if (!(names instanceof Map) || !path || !name) return [];
+  const keys = [];
+  for (const [slot, slotName] of names) {
+    if (slotName === name && slotKeyPath(slot) === path) keys.push(slot);
+  }
+  return keys;
 }
 
 export function verifyConnect(
   graph,
   before,
-  { intendedLinkIds = [], replacedLinkId, beforeSlots, intendedSlots } = {},
+  { intendedLinkIds = [], replacedLinkId, beforeSlots, intendedSlots, beforeNames } = {},
 ) {
   const after = snapshotGraphState(graph);
   const replacedId = replacedLinkId != null ? String(replacedLinkId) : null;
@@ -390,6 +431,7 @@ export function verifyConnect(
 
   const missingNodes = [...(before?.nodeIds ?? [])].filter((id) => !after.nodeIds.has(id));
   const addedNodes = [...after.nodeIds].filter((id) => !(before?.nodeIds?.has(id) ?? false));
+  const afterNames = beforeNames instanceof Map ? snapshotInputSlotNames(graph) : null;
 
   const collateralRemovedLinks = [];
   for (const [id, view] of before?.links ?? []) {
@@ -440,7 +482,18 @@ export function verifyConnect(
       if (intendedSlots === undefined || intendedSlots.has(landedOn)) continue;
     }
     const now = after.links.get(id);
-    if (now && !sameEndpoints(was, now)) collateralMovedLinks.push({ before: was, after: now });
+    if (now && !sameEndpoints(was, now)) {
+      // #2008 — Autogrow shifts later slots on the SAME node. The link still
+      // names the same input; only target_slot moved. That is not bystander
+      // damage. A move onto a differently-named slot, or onto a different
+      // node, still reports.
+      if (afterNames && String(was.target_id) === String(now.target_id)) {
+        const oldName = beforeNames.get(`${was.target_id}#${was.target_slot}`);
+        const newName = afterNames.get(`${now.target_id}#${now.target_slot}`);
+        if (oldName && oldName === newName) continue;
+      }
+      collateralMovedLinks.push({ before: was, after: now });
+    }
   }
 
   // #2380 — the node-side comparison. Only meaningful when the caller captured slots
@@ -461,21 +514,37 @@ export function verifyConnect(
       // retypes an untargeted slot across a single connect, so this cannot false-positive
       // on a bystander the connect never touched.
       if (nowLink === wasLink) continue;
+      // #2008 — the NAME at this index took its link with it, or the NAME
+      // now sitting here arrived with the link it already had. Index-only
+      // Autogrow shifts must not read as reslots.
+      if (afterNames) {
+        const path = slotKeyPath(slot);
+        const beforeName = beforeNames.get(slot);
+        if (beforeName && wasLink != null) {
+          const liveKeys = namesOnSameNode(afterNames, path, beforeName);
+          if (liveKeys.some((key) => (afterSlots.get(key) ?? null) === wasLink)) continue;
+        }
+        const afterName = afterNames.get(slot);
+        if (afterName && nowLink != null) {
+          const priorKeys = namesOnSameNode(beforeNames, path, afterName);
+          if (priorKeys.some((key) => (beforeSlots.get(key) ?? null) === nowLink)) continue;
+        }
+      }
       // The link this connect made (or the one it displaced) landing on a slot is the
       // expected outcome, not bystander damage.
-            // Location-aware, not id-only (gate P1). Exempting an intended id wherever it
-        // appeared meant a hook could assign that id to an UNTARGETED node's input and
-        // the verdict stayed ok:true — hiding the very rewiring this exists to catch.
-        // The exemption now applies only on the slot the connect actually addressed;
-        // an intended id landing anywhere else is collateral.
-        const isAddressedSlot = intendedSlots === undefined || intendedSlots.has(slot);
-        if (
-          nowLink !== null &&
-          isAddressedSlot &&
-          (intended.has(String(nowLink)) || String(nowLink) === replacedId)
-        ) {
-          continue;
-        }
+      // Location-aware, not id-only (gate P1). Exempting an intended id wherever it
+      // appeared meant a hook could assign that id to an UNTARGETED node's input and
+      // the verdict stayed ok:true — hiding the very rewiring this exists to catch.
+      // The exemption now applies only on the slot the connect actually addressed;
+      // an intended id landing anywhere else is collateral.
+      const isAddressedSlot = intendedSlots === undefined || intendedSlots.has(slot);
+      if (
+        nowLink !== null &&
+        isAddressedSlot &&
+        (intended.has(String(nowLink)) || String(nowLink) === replacedId)
+      ) {
+        continue;
+      }
       if (wasLink !== null && String(wasLink) === replacedId) continue;
       collateralReslottedInputs.push({ slot, before: wasLink, after: nowLink });
     }
