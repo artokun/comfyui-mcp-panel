@@ -1,10 +1,11 @@
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
   FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS,
   MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES,
+  dispatchFetchComfyUIReadForMcp,
   fetchComfyUIReadForMcp,
   validateFetchComfyUIReadArgs,
 } from "../../web/js/lib/fetch-comfyui-read.js";
@@ -261,7 +262,7 @@ test("#2283: object_info uses its documented large/slow route budget while other
       api: {
         apiURL: (path) => path,
         fetchApi: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 8_050));
+          await new Promise((resolve) => setTimeout(resolve, 20_841));
           return response({ body, contentLength: body.length, stream: false });
         },
       },
@@ -285,10 +286,54 @@ test("#2283: object_info uses its documented large/slow route budget while other
   );
 });
 
+test("#2283: the production dispatcher and helper carry a >20.84s, >25MB object_info reply", async () => {
+  const body = JSON.stringify({
+    KSampler: {
+      input: { required: {} },
+      output: ["MODEL"],
+      output_is_list: [false],
+      output_name: ["model"],
+      name: "KSampler",
+      display_name: "KSampler",
+      description: "x".repeat(25_104_088),
+      category: "sampling",
+      output_node: false,
+    },
+  });
+  assert.ok(body.length > 25_104_088);
+  assert.ok(MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES >= body.length);
+  assert.ok(FETCH_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS > 20_840);
+
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    let seenRequest;
+    const pending = dispatchFetchComfyUIReadForMcp(
+      { operation: "object_info", rid: "rid-production-shaped" },
+      {
+        api: {
+          apiURL: (path) => path,
+          fetchApi: async (_path, init) => {
+            seenRequest = init;
+            await new Promise((resolve) => setTimeout(resolve, 20_841));
+            return response({ body, contentLength: body.length, stream: false });
+          },
+        },
+      },
+    );
+    mock.timers.tick(20_841);
+    const result = await pending;
+    assert.equal(result.operation, "object_info");
+    assert.equal(result.bytes, new TextEncoder().encode(body).byteLength);
+    assert.ok(seenRequest.signal instanceof AbortSignal);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 test("#2283: object_info still refuses an oversize body and a timeout", async () => {
   const oversize = "x".repeat(MAX_FETCH_COMFYUI_READ_OBJECT_INFO_BYTES + 1);
   await rejection(
-    fetchComfyUIReadForMcp(
+    dispatchFetchComfyUIReadForMcp(
       { operation: "object_info" },
       {
         expectedOrigin: "https://panel.test",
@@ -302,7 +347,7 @@ test("#2283: object_info still refuses an oversize body and a timeout", async ()
   );
 
   await rejection(
-    fetchComfyUIReadForMcp(
+    dispatchFetchComfyUIReadForMcp(
       { operation: "object_info" },
       {
         timeoutMs: 5,
@@ -320,7 +365,7 @@ test("#2283: object_info still refuses an oversize body and a timeout", async ()
 test("#2283: the command remains on the authenticated rid executor/reply path", () => {
   const source = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   assert.match(source, /fetch_comfyui_read\(args = \{\}\)/);
-  assert.match(source, /return fetchComfyUIReadForMcp\(args, \{ api \}\)/);
+  assert.match(source, /return dispatchFetchComfyUIReadForMcp\(args, \{ api \}\)/);
   assert.match(source, /"ui_render", "ui_update", "ui_dismiss", "fetch_image", "fetch_comfyui_read"/);
   assert.match(source, /const isCommandFrame = msg && typeof msg\.rid === "string" && typeof msg\.cmd === "string"/);
   assert.match(source, /const executor = GRAPH_TOOL_EXECUTORS\[msg\.cmd\]/);

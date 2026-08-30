@@ -339,7 +339,7 @@ import { recordSkillFromGraph, persistRecordedSkill } from "./lib/record-skill.j
 // 1.7MB panel IIFE.
 import { makeCommandBudget } from "./lib/command-budget.js";
 import { fetchImageForMcp } from "./lib/fetch-image.js";
-import { fetchComfyUIReadForMcp } from "./lib/fetch-comfyui-read.js";
+import { dispatchFetchComfyUIReadForMcp } from "./lib/fetch-comfyui-read.js";
 import {
   closeSidePanelHandle,
   dismissLiveA2uiCard,
@@ -13621,7 +13621,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // The operation-to-path mapping and same-origin/credential checks live in the
   // helper; no caller-supplied URL, path, target, or origin reaches fetch().
   fetch_comfyui_read(args = {}) {
-    return fetchComfyUIReadForMcp(args, { api });
+    return dispatchFetchComfyUIReadForMcp(args, { api });
   },
   // #608: force a fresh /object_info re-register + combo refresh so an asset that
   // appeared server-side AFTER page-load — an upload_image action:"stage" input, a freshly

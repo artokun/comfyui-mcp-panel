@@ -327,3 +327,11 @@ export async function fetchComfyUIReadForMcp(
     timeout.dispose();
   }
 }
+
+/** Production command-dispatch seam used by GRAPH_TOOL_EXECUTORS. Keeping this
+ * wrapper beside the helper lets boundary tests exercise the same command route
+ * that receives authenticated bridge frames, rather than calling the transport
+ * helper as an isolated utility. */
+export function dispatchFetchComfyUIReadForMcp(args, options = {}) {
+  return fetchComfyUIReadForMcp(args, options);
+}
