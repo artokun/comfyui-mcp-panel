@@ -1309,32 +1309,15 @@ export function resolveHostPromotedWidgets(subgraphNode, hostInput) {
   // binding. A stale `_widget` can still be a live member of node.widgets while
   // belonging to the link-driven inner projection, so object identity alone is
   // insufficient to decide which identity-linked member is the parent rail.
-  let hostWidgetId = null;
-  try {
-    const id = hostInput.widgetId;
-    if (typeof id === "string" && id.length > 0) hostWidgetId = id;
-  } catch {
-    // Keep the legacy identity path below; an unreadable optional key is not a
-    // reason to replace a directly linked, otherwise valid projection.
-  }
+  const hostWidgetId = readHostWidgetId(hostInput);
   if (!hostWidgetId) return out;
 
-  const readWidgetId = (widget) => {
-    let id = null;
-    try {
-      const candidateId = widget.widgetId;
-      if (typeof candidateId === "string" && candidateId.length > 0) id = candidateId;
-    } catch {
-      // Treat a projection with an unreadable optional key as legacy-unkeyed.
-    }
-    return id;
-  };
-  const described = out.map((widget) => ({ widget, id: readWidgetId(widget) }));
+  const described = out.map((widget) => ({ widget, id: readProjectionWidgetId(widget) }));
   // The projection list can be rebuilt independently of the host input object.
   // Include a newly materialized member by its exact host-owned key so a stale
   // `_widget` cannot win just because it is still one of the input's references.
   const keyedLive = inWidgets
-    .map((widget) => ({ widget, id: readWidgetId(widget) }))
+    .map((widget) => ({ widget, id: readProjectionWidgetId(widget) }))
     .filter((entry) => entry.id === hostWidgetId);
   const keyed = keyedLive;
   if (keyed.length > 1) return [];
@@ -1368,16 +1351,31 @@ function readHostWidgetId(hostInput) {
   }
 }
 
+function readProjectionWidgetId(widget) {
+  try {
+    const id = widget?.widgetId;
+    return typeof id === "string" && id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * ComfyUI's SubgraphNode.widgets getter returns `_widget` first and never builds
- * the host-keyed store projection while that handle still points at the INNER
- * Primitive widget. Dropping that stale handle and re-reading widgets lets the
- * getter materialize the rail queue compilation actually reads (#366).
+ * the host-keyed store projection while that handle still points at an INNER
+ * converted-to-input widget. That handle is the Primitive object itself, or a
+ * CLIPTextEncode.text clone that is a different object with the same name/value.
+ * Dropping the stale handle and re-reading widgets lets the getter materialize
+ * the rail queue compilation actually reads (#366).
  */
 function rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
   if (!subgraphNode || !hostInput || !innerWidget) return [];
-  if (hostInput._widget !== innerWidget) return [];
-  if (!readHostWidgetId(hostInput)) return [];
+  const hostId = readHostWidgetId(hostInput);
+  if (!hostId) return [];
+  const current = hostInput._widget;
+  if (!current) return [];
+  // Already the host-keyed rail — do not drop a live serializing projection.
+  if (current !== innerWidget && readProjectionWidgetId(current) === hostId) return [];
   const saved = hostInput._widget;
   try {
     hostInput._widget = undefined;
@@ -1398,10 +1396,23 @@ function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
   const current = resolveHostPromotedWidgets(subgraphNode, hostInput).filter(
     (widget) => widget && widget !== innerWidget,
   );
-  if (current.length) return current;
+  const hostId = readHostWidgetId(hostInput);
+  const keyed = hostId ? current.filter((widget) => readProjectionWidgetId(widget) === hostId) : [];
+  if (keyed.length) {
+    const displays = current.filter(
+      (widget) => widget !== keyed[0] && readProjectionWidgetId(widget) == null,
+    );
+    return [keyed[0], ...displays];
+  }
+  // No host key: unkeyed identity-linked projections are the rail. A host key
+  // with only an unkeyed clone must rematerialize first — returning the clone
+  // here is the CLIPTextEncode.text recurrence (inner written, parent store stale).
+  if (!hostId && current.length) return current;
   const rematerialized = rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget);
   if (rematerialized.length) return rematerialized;
-  return recoverHostPromotedWidgetsAfterLoad(subgraphNode, hostInput, innerWidget);
+  const recovered = recoverHostPromotedWidgetsAfterLoad(subgraphNode, hostInput, innerWidget);
+  if (recovered.length) return recovered;
+  return current;
 }
 
 /**

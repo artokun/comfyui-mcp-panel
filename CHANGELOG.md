@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_widget on a subgraph host's promoted CLIPTextEncode.text writes the parent rail, not only the inner converted-to-input widget, so queue serialization uses the new value (#366)
+
 ## [0.15.139] - 2026-08-30
 
 ### Fixed

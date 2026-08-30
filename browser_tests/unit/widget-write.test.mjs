@@ -2069,6 +2069,93 @@ test("#366: a promoted COMBO lora_name rail is synced when _widget still points 
   assert.equal(set.promoted_from.parent_widget_synced, true);
 });
 
+/**
+ * #366 CLIPTextEncode recurrence (frontend 1.48.7): promoting `text` converts the
+ * inner widget to an input fed from rail -10. Unlike Primitive, host `_widget` is
+ * a CLONE of that inner widget (different object), so the MiniMax `=== innerWidget`
+ * rematerialize never ran. SubgraphNode.widgets still returns the clone first and
+ * never builds the host-keyed store projection queue compilation reads.
+ */
+function makeConvertedClipTextEncodeFixture({
+  innerId = 11,
+  parentId = 22,
+  oldValue = "old instructional prompt",
+} = {}) {
+  const innerWidget = { name: "text", type: "STRING", value: oldValue };
+  const inner = {
+    id: innerId,
+    type: "CLIPTextEncode",
+    widgets: [innerWidget],
+    inputs: [{ name: "text", widget: { name: "text" }, type: "STRING", link: 1 }],
+  };
+  const links = {
+    1: { id: 1, origin_id: -10, origin_slot: 0, target_id: innerId, target_slot: 0 },
+  };
+  const subgraph = {
+    _nodes: [inner],
+    inputs: [{ name: "text", linkIds: [1] }],
+    inputNode: { id: -10 },
+    links,
+    getNodeById: (id) => (String(id) === String(innerId) ? inner : null),
+    getLink: (id) => links[id] ?? null,
+  };
+  const innerClone = { name: "text", type: "STRING", value: oldValue };
+  const store = { value: oldValue };
+  const hostInput = {
+    name: "text",
+    widgetId: `root:${parentId}:text`,
+    widget: { name: "text" },
+    _widget: innerClone,
+    _subgraphSlot: { name: "text" },
+  };
+  const parent = {
+    id: parentId,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [hostInput],
+    get widgets() {
+      if (!hostInput._widget && hostInput.widgetId) {
+        const rail = {
+          name: "text",
+          widgetId: hostInput.widgetId,
+          type: "STRING",
+          get value() {
+            return store.value;
+          },
+          set value(next) {
+            store.value = next;
+          },
+        };
+        hostInput._widget = rail;
+      }
+      return hostInput._widget ? [hostInput._widget] : [];
+    },
+  };
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === "text" ? { sourceNodeId: String(innerId), sourceWidgetName: "text" } : null;
+  return { parent, inner, innerWidget, innerClone, hostInput, store, resolveSource };
+}
+
+test("#366: a promoted CLIPTextEncode.text write syncs the host-keyed rail, not the inner converted-to-input clone", () => {
+  const { parent, innerWidget, innerClone, hostInput, store, resolveSource } =
+    makeConvertedClipTextEncodeFixture();
+
+  const set = applyWidgetWrite(parent, "text", "new vertical prompt", { resolveSource });
+
+  assert.equal(store.value, "new vertical prompt", "the serializing parent rail store must receive the write");
+  assert.notEqual(hostInput._widget, innerClone, "the converted-to-input clone must not remain the rail handle");
+  assert.notEqual(hostInput._widget, innerWidget);
+  assert.equal(innerWidget.value, "old instructional prompt", "the shared inner CLIPTextEncode is not the serializing rail");
+  assert.equal(innerClone.value, "old instructional prompt", "writing the clone would not update the store");
+  assert.equal(set.value, "new vertical prompt");
+  assert.equal(set.node_id, 22);
+  assert.equal(set.widget, "text");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.equal(set.promoted_from.value_scope, "instance");
+  assert.equal(set.promoted_from.subgraph_node_id, 22);
+  assert.equal(set.promoted_from.inner_node_id, 11);
+});
+
 test("#366: options.setValue on the parent rail is driven so the serializing store updates", () => {
   const store = { value: 5 };
   const inner = { id: 136, type: "PrimitiveFloat", widgets: [{ name: "value", type: "number", value: 5 }] };
