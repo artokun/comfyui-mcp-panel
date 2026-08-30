@@ -6,11 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.137] - 2026-08-30
+
 ### Fixed
-- graph_load imports a wrapped {prompt: .} API/prompt graph the same way as a bare graph.api.json map (#2011)
-- graph_outline follows the live canvas after an active-tab instance change instead of refusing the first read; mutations stay fenced until an explicit rebind (#2007)
-- omit private combo option values from panel_set_widget refusal diagnostics while preserving the invalid-value verdict and option count (#2547)
-- panel_set_widget writes AnimaPromptPlus custom textarea widgets (quality_prompt) through the live editor / store setValue path instead of waiting on a widget callback that never settles (#2020)
+- graph_load imports a wrapped `{prompt: .}` API/prompt graph the same way as a bare `graph.api.json` map (#2011, #2078)
+- graph_outline follows the live canvas after an active-tab instance change instead of refusing the first read; mutations stay fenced until an explicit rebind (#2007, #2070)
+- omit private combo option values from panel_set_widget refusal diagnostics while preserving the invalid-value verdict and option count
+- panel_set_widget writes AnimaPromptPlus custom textarea widgets (quality_prompt) through the live editor / store setValue path instead of waiting on a widget callback that never settles (#2020, #2079)
 
 ## [0.15.136] - 2026-08-30
 
