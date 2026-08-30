@@ -21985,7 +21985,7 @@ const GRAPH_TOOL_EXECUTORS = {
           const targetBindingProof =
             captureBinding === "bound"
               ? true
-              : captureBinding === "unknown" && !pointerMovedThisOpen;
+              : captureBinding === "unknown" && !pointerMovedThisOpen && pointerProof;
           const captureSourceProof =
             targetBindingProof &&
             (!pointerMovedThisOpen || sourceBinding === "bound" || targetContentProof);
