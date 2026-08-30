@@ -1776,6 +1776,56 @@ test("#1911 production workflow_open without $subscribe captures already-current
   assert.equal(panel.guard(), null);
 });
 
+test("#1215 production workflow_open captures an already-current untagged canvas", async () => {
+  const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
+  let captures = 0;
+  let captureDecisionInput;
+  const subscribers = [];
+  target.changeTracker = {
+    activeState: target.activeState,
+    checkState() {
+      captures += 1;
+    },
+  };
+  environment.activeWorkflowRef = () => target;
+  environment.document = workflowPiniaDocument({
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  });
+  environment.decideLiveCanvasCapture = (input) => {
+    captureDecisionInput = input;
+    return decideLiveCanvasCapture(input);
+  };
+  // Use the shipped classifier with an untagged root. The fixture's default
+  // matcher is bound-oriented for the older lifecycle cases; the production
+  // graph-binding matcher correctly answers false for this root, yielding unknown.
+  environment.graphRootWorkflowUuidMatches = graphRootWorkflowUuidMatches;
+  environment.graphRootWorkflowUuidMismatches = graphRootWorkflowUuidMismatches;
+  delete environment.describeLiveCanvasBinding;
+  environment.app.extensionManager.workflow.openWorkflow = async () => {};
+
+  const panel = productionExecutor("workflow_open", environment);
+  const result = await panel.method({ path: target.path, rid: "already-current-untagged" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.equal(captureDecisionInput.pointerMovedThisOpen, false);
+  assert.equal(captureDecisionInput.pointerProof, true, "the active pointer watch proves the target stayed current");
+  assert.equal(
+    captureDecisionInput.captureSourceProof,
+    true,
+    "an untagged but already-current canvas remains eligible for live capture",
+  );
+  assert.equal(captures, 1, "unknown binding must not revert node-written values to activeState");
+  assert.equal(subscribers.length, 0, "the production pointer watch is cleaned up after the open");
+  assert.equal(result.pointer_watch_unavailable, undefined);
+  assert.equal(panel.guard(), null);
+});
+
 test("#1911 production workflow_open without $subscribe skips switch capture, still flushes SOURCE, and discloses", async () => {
   const { target, environment } = productionReadableOpenEnvironment({ readableAfterRetry: true });
   let captures = 0;
