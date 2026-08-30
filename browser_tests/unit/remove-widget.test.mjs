@@ -94,6 +94,37 @@ test("declaredInputNames reads required, optional AND hidden", () => {
   assert.deepEqual([...names].sort(), ["a", "b", "c"]);
 });
 
+test("#1931 nested DynamicCombo children are not top-level declared inputs", () => {
+  const names = declaredInputNames({
+    input: {
+      required: {
+        filename_prefix: ["STRING", { default: "video/ComfyUI" }],
+        format: [
+          "COMFY_DYNAMICCOMBO_V3",
+          { options: [{ key: "auto", inputs: { required: { codec: ["COMFY_DYNAMICCOMBO_V3", { options: [] }] } } }] },
+        ],
+      },
+      optional: { codec: ["COMFY_DYNAMICCOMBO_V3", { options: [] }] },
+    },
+  });
+  assert.equal(names.has("format"), true);
+  assert.equal(names.has("filename_prefix"), true);
+  assert.equal(names.has("codec"), false, "flattened optional codec is a nested child of format");
+});
+
+test("#1931 a required DynamicCombo root stays declared even if another combo nests the same name", () => {
+  const names = declaredInputNames({
+    input: {
+      required: {
+        codec: ["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "auto", inputs: {} }] }],
+        format: [["auto", "mp4"], { default: "auto" }],
+      },
+    },
+  });
+  assert.equal(names.has("codec"), true);
+  assert.equal(names.has("format"), true);
+});
+
 test("declaredInputNames returns NULL for a def it cannot read — not an empty set", () => {
   // The distinction is the whole safety story: an empty Set means "the backend declares
   // nothing, so every widget is dynamic", which would authorize removing ANY widget on a

@@ -54,6 +54,7 @@ import {
 } from "../../web/js/lib/missing-node-preflight.js";
 import { buildQueueAcceptResult, summarizePromptRejection } from "../../web/js/lib/queue-rejection.js";
 import { installGraphToPromptNullSafety } from "../../web/js/lib/widget-null-safety.js";
+import { installGraphToPromptDynamicReconcile } from "../../web/js/lib/dynamic-widget-reconcile.js";
 import {
   installGraphToPromptSnapshotBarrier,
   queuePromptWithGraphToPromptSnapshot,
@@ -703,6 +704,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     describeUnrunnable,
     installGraphToPromptNullSafety,
     installGraphToPromptSnapshotBarrier,
+    installGraphToPromptDynamicReconcile,
     queuePromptWithGraphToPromptSnapshot,
     reserveGraphToPromptSnapshot,
     releaseGraphToPromptSnapshot,

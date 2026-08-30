@@ -1,11 +1,30 @@
 const DYNAMIC_COMBO_V3 = "COMFY_DYNAMICCOMBO_V3";
+const DYNAMIC_WIDGET_MISSING_RE = /Dynamic widget doesn't exist on node/i;
+const GRAPH_TO_PROMPT_RECONCILE = Symbol.for("comfyui-mcp.graphToPromptDynamicReconcile");
+const rawApply = Reflect.apply;
 
 function hasValueSetter(widget) {
   try {
-    return typeof Object.getOwnPropertyDescriptor(widget, "value")?.set === "function";
+    let proto = widget;
+    while (proto && proto !== Object.prototype) {
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (desc) return typeof desc.set === "function";
+      proto = Object.getPrototypeOf(proto);
+    }
+    return false;
   } catch {
     return false;
   }
+}
+
+function graphNodes(graph) {
+  if (Array.isArray(graph?._nodes) && graph._nodes.length) return graph._nodes;
+  if (Array.isArray(graph?.nodes)) return graph.nodes;
+  return [];
+}
+
+function nodeDef(node) {
+  return node?.constructor?.nodeData ?? node?.nodeData ?? null;
 }
 
 function readWidgetId(widget) {
@@ -50,6 +69,7 @@ function walkDynamicComboChildren(spec, visit) {
 
 function nestedChildNamesByRoot(required) {
   const byRoot = new Map();
+  if (!required || typeof required !== "object") return byRoot;
   for (const [name, spec] of Object.entries(required)) {
     if (!isDynamicComboSpec(spec)) continue;
     const children = new Set();
@@ -57,6 +77,26 @@ function nestedChildNamesByRoot(required) {
     if (children.size) byRoot.set(name, children);
   }
   return byRoot;
+}
+
+/**
+ * Bare names that exist only as children of a required DynamicCombo.
+ *
+ * SaveVideo's `codec` is declared under a chosen `format` option, not as its own
+ * top-level input. A flattened optional/hidden copy of that child is not a
+ * backend-declared row for remove_widget (#1931).
+ *
+ * @param {object} def
+ * @returns {Set<string>}
+ */
+export function nestedDynamicComboChildNames(def) {
+  const nested = new Set();
+  const required = def?.input?.required;
+  if (!required || typeof required !== "object") return nested;
+  for (const children of nestedChildNamesByRoot(required).values()) {
+    for (const name of children) nested.add(name);
+  }
+  return nested;
 }
 
 function isInternalRelocationName(name) {
@@ -324,11 +364,11 @@ export function reconcileFreshDynamicWidgets(node, currentDef) {
  * @returns {Array<object>}
  */
 export function reconcileGraphDynamicWidgets(graph) {
-  const nodes = Array.isArray(graph?._nodes) ? graph._nodes : [];
+  const nodes = graphNodes(graph);
   const results = [];
   for (const node of nodes) {
     try {
-      const def = node?.constructor?.nodeData;
+      const def = nodeDef(node);
       if (def) results.push(reconcileFreshDynamicWidgets(node, def));
       if (node?.subgraph) results.push(...reconcileGraphDynamicWidgets(node.subgraph));
     } catch (error) {
@@ -341,4 +381,139 @@ export function reconcileGraphDynamicWidgets(graph) {
     }
   }
   return results;
+}
+
+export function isDynamicWidgetMissingError(error) {
+  let raw = "";
+  try {
+    raw = error instanceof Error ? error.message : String(error ?? "");
+  } catch {
+    return false;
+  }
+  return DYNAMIC_WIDGET_MISSING_RE.test(raw);
+}
+
+/**
+ * Nodes that still carry a schema-verified DynamicCombo orphan (bare `codec`
+ * next to `format.codec` on SaveVideo). Used to name the serializer throw.
+ *
+ * @param {object} graph
+ * @returns {Array<{nodeId: unknown, nodeType: string, orphan: string, nested: string}>}
+ */
+export function describeOrphanDynamicWidgets(graph) {
+  const found = [];
+  for (const node of graphNodes(graph)) {
+    try {
+      const required = nodeDef(node)?.input?.required;
+      const nestedByRoot = nestedChildNamesByRoot(required);
+      if (!nestedByRoot.size) {
+        if (node?.subgraph) found.push(...describeOrphanDynamicWidgets(node.subgraph));
+        continue;
+      }
+      const widgets = Array.isArray(node.widgets) ? node.widgets : [];
+      const names = new Set();
+      for (const widget of widgets) {
+        if (typeof widget?.name === "string") names.add(widget.name);
+      }
+      for (const input of Array.isArray(node.inputs) ? node.inputs : []) {
+        if (typeof input?.name === "string") names.add(input.name);
+      }
+      for (const name of names) {
+        const root = orphanParentRoot(name, nestedByRoot, widgets);
+        if (!root) continue;
+        found.push({
+          nodeId: node.id,
+          nodeType: typeof node.type === "string" ? node.type : "node",
+          orphan: name,
+          nested: `${root}.${name.split(".")[0]}`,
+        });
+      }
+      if (node?.subgraph) found.push(...describeOrphanDynamicWidgets(node.subgraph));
+    } catch {
+      // A hostile node must not hide the rest of the graph.
+    }
+  }
+  return found;
+}
+
+function namedDynamicWidgetError(error, graph) {
+  const candidates = describeOrphanDynamicWidgets(graph);
+  let base = "";
+  try {
+    base = error instanceof Error ? error.message : String(error ?? "");
+  } catch {
+    base = "";
+  }
+  if (!candidates.length) {
+    return error instanceof Error ? error : new Error(base || "Dynamic widget doesn't exist on node");
+  }
+  const listed = candidates
+    .slice(0, 8)
+    .map((entry) => `${entry.nodeType} node ${entry.nodeId} has ${entry.nested} and orphan ${entry.orphan}`)
+    .join("; ");
+  const extra = candidates.length > 8 ? ` (${candidates.length - 8} more)` : "";
+  const message =
+    DYNAMIC_WIDGET_MISSING_RE.test(base) && !/\bnode\s+\d+/i.test(base)
+      ? `Dynamic widget doesn't exist on node: ${listed}${extra}`
+      : `${base} (${listed}${extra})`;
+  const named = new Error(message);
+  if (error instanceof Error) named.cause = error;
+  return named;
+}
+
+/**
+ * Reconcile nested DynamicCombo leftovers immediately before every prompt build,
+ * and retry once if the frontend still throws the unnamed SaveVideo serializer
+ * error. add_node/load already clean what they can; 0.15.124 recurrences still
+ * queued a graph that grew the orphan back (set_widget, restore, restart).
+ *
+ * @param {object} app
+ * @returns {boolean}
+ */
+export function installGraphToPromptDynamicReconcile(app) {
+  if (!app || typeof app.graphToPrompt !== "function") return false;
+  if (app[GRAPH_TO_PROMPT_RECONCILE]) return true;
+  const graphToPromptFn = app.graphToPrompt;
+  const orig = (...args) => rawApply(graphToPromptFn, app, args);
+  app.graphToPrompt = function reconcileThenGraphToPrompt(graph, ...rest) {
+    const target = graph ?? app.rootGraph ?? app.graph ?? null;
+    try {
+      reconcileGraphDynamicWidgets(target);
+    } catch {
+      // Best-effort: a hostile node must not block serialization.
+    }
+    const retry = (error) => {
+      if (!isDynamicWidgetMissingError(error)) throw error;
+      try {
+        reconcileGraphDynamicWidgets(target);
+      } catch {
+        // Retry with whatever state we could clean.
+      }
+      try {
+        const retried = orig(graph, ...rest);
+        if (retried && typeof retried.then === "function") {
+          return Promise.resolve(retried).then(
+            (value) => value,
+            (retryError) => {
+              throw namedDynamicWidgetError(retryError, target);
+            },
+          );
+        }
+        return retried;
+      } catch (retryError) {
+        throw namedDynamicWidgetError(retryError, target);
+      }
+    };
+    try {
+      const result = orig(graph, ...rest);
+      if (result && typeof result.then === "function") {
+        return Promise.resolve(result).then((value) => value, retry);
+      }
+      return result;
+    } catch (error) {
+      return retry(error);
+    }
+  };
+  app[GRAPH_TO_PROMPT_RECONCILE] = true;
+  return true;
 }

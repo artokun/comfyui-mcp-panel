@@ -151,11 +151,18 @@ export function graphToPromptFailureRefusal(error) {
   const cause = detail
     ? ` The frontend serializer reported: "${detail}".`
     : " The frontend did not provide an error detail.";
+  const namesAWidget = /\bnode\s+\d+/i.test(detail) || /orphan /i.test(detail);
+  const unnamedDynamic =
+    /Dynamic widget doesn't exist on node/i.test(detail) && !namesAWidget;
+  const inspect = unnamedDynamic
+    ? `The serializer did not name a node or widget; look for a DynamicCombo node that ` +
+      `carries both a nested child (format.codec) and a bare duplicate (codec).`
+    : `Inspect the named widget or extension before retrying.`;
   return (
     `NOT queued: this workflow could not be serialized into a prompt because ` +
     `graphToPrompt threw.${cause} Nothing was queued and the queue is untouched. ` +
     `This is the ComfyUI frontend or an extension's serializer error, not evidence that ` +
-    `a node type is missing; inspect the named widget or extension before retrying.`
+    `a node type is missing; ${inspect}`
   );
 }
 

@@ -418,7 +418,11 @@ import {
   releaseReconnectScopePin,
 } from "./lib/reconnect-scope-fence.js";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "./lib/set-widget.js";
-import { reconcileFreshDynamicWidgets, reconcileGraphDynamicWidgets } from "./lib/dynamic-widget-reconcile.js";
+import {
+  reconcileFreshDynamicWidgets,
+  reconcileGraphDynamicWidgets,
+  installGraphToPromptDynamicReconcile,
+} from "./lib/dynamic-widget-reconcile.js";
 import {
   createDeferredWidgetEditQueue,
   deferredWidgetQueueCounts,
@@ -19320,6 +19324,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // pre-flight is itself graphToPrompt and must not be the one serialization that
     // can still hit a null widget or establish a reservation before the guard exists.
     installGraphToPromptNullSafety(app);
+    // #1931 — SaveVideo can grow a bare `codec` next to `format.codec` after add/load
+    // (set_widget, restore, restart). Clean it on the serializer itself so preflight
+    // and the deferred queue-loop serialize see the same nested set. Installed before
+    // the snapshot barrier so a cancelled queue item still throws synchronously.
+    installGraphToPromptDynamicReconcile(app);
     installGraphToPromptSnapshotBarrier(app);
     try {
       // Inspect the SERIALIZED prompt, not the canvas. graphToPrompt has already

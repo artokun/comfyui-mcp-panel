@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- SaveVideo DynamicCombo leftovers are cleaned again at queue time: a bare orphan `codec` next to nested `format.codec` is dropped before graphToPrompt, a first-serialize throw retries once, and the refusal names the node when it still fails (#1931)
+
 ## [0.15.126] - 2026-08-30
 
 ### Fixed
