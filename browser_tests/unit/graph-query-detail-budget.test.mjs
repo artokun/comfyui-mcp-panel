@@ -24,6 +24,7 @@ import {
   truncationTail,
 } from "../../web/js/lib/graph-read.js";
 import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
+import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
 
 const PANEL_JS = join(dirname(fileURLToPath(import.meta.url)), "../../web/js/comfyui-mcp-panel.js");
 const source = readFileSync(PANEL_JS, "utf8");
@@ -101,16 +102,22 @@ const graph = {
 
 // summarizeNode is kept deliberately small because its own production dependencies are
 // unrelated to this budget seam. The graph_query method itself is the shipped source.
-const summarizeNode = (node) => ({
-  id: node.id,
-  type: node.type,
-  title: node.title,
-  widgets: Object.fromEntries((node.widgets ?? []).map((w) => [w.name, w.value])),
-  // Production summarizeNode also emits inputs/outputs; those are what push a
-  // fully-capped detail row past max_chars and into fitDetailLine (#2436).
-  ...(Array.isArray(node.inputs) && node.inputs.length ? { inputs: node.inputs } : {}),
-  ...(Array.isArray(node.outputs) && node.outputs.length ? { outputs: node.outputs } : {}),
-});
+const summarizeNode = (node) => {
+  // Use the same panel-owned per-object identity source as the shipped bundle.
+  // The identity is deliberately not copied from a synthetic serialized field.
+  const nodeIdentity = nodeInstanceIdentity(node);
+  return {
+    id: node.id,
+    ...(nodeIdentity ? { node_identity: nodeIdentity } : {}),
+    type: node.type,
+    title: node.title,
+    widgets: Object.fromEntries((node.widgets ?? []).map((w) => [w.name, w.value])),
+    // Production summarizeNode also emits inputs/outputs; those are what push a
+    // fully-capped detail row past max_chars and into fitDetailLine (#2436).
+    ...(Array.isArray(node.inputs) && node.inputs.length ? { inputs: node.inputs } : {}),
+    ...(Array.isArray(node.outputs) && node.outputs.length ? { outputs: node.outputs } : {}),
+  };
+};
 
 const graphQuerySource = methodSource(source, "graph_query({");
 const dependencyNames = [
@@ -268,6 +275,34 @@ test("#2314 detail rows explicitly classify ordinary and promoted nodes", () => 
     assert.equal(row.is_subgraph, true);
     assert.equal(result.nodes?.[0]?.is_subgraph, true, "#1925 pinpoint detail must publish a structured subgraph row");
     assert.equal(result.nodes?.[0]?.id, 83);
+  } finally {
+    graph._nodes.pop();
+  }
+});
+
+test("#2478 one-ID compact probes publish a bounded identity-bearing witness", () => {
+  const node = {
+    id: 84,
+    type: "PrimitiveStringMultiline",
+    title: "Prompt",
+    widgets: [{ name: "text", value: "new" }],
+    inputs: [],
+    outputs: [],
+  };
+  graph._nodes.push(node);
+  try {
+    const result = query({ ids: [84], fields: "compact", max_chars: 500 });
+    const expectedIdentity = nodeInstanceIdentity(node);
+    assert.match(result.text, /#84 PrimitiveStringMultiline/);
+    assert.deepEqual(result.nodes, [
+      {
+        id: 84,
+        type: "PrimitiveStringMultiline",
+        node_identity: expectedIdentity,
+        is_subgraph: false,
+      },
+    ]);
+    assert.ok(JSON.stringify(result.nodes).length <= 500, "identity witness must remain bounded");
   } finally {
     graph._nodes.pop();
   }

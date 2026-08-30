@@ -14862,24 +14862,47 @@ const GRAPH_TOOL_EXECUTORS = {
       truncatedBy = "max_chars";
       text = assemble();
     }
-    // #1925 — a pinpoint detail read is the orchestrator's promoted-scope probe.
-    // That classifier prefers a structured `nodes` row with a boolean
-    // `is_subgraph`; `text` alone is a fallback. Publish the row beside the
-    // survey line so a verified-stable root subgraph instance is classifiable.
+    // #1925/#2478 — a pinpoint read is the orchestrator's promoted-scope and
+    // node-incarnation probe. That classifier prefers a structured `nodes` row
+    // with a boolean `is_subgraph` and, for current panels, the opaque
+    // `node_identity`; `text` alone is a legacy fallback. Publish a minimal
+    // bounded witness for an explicit one-ID compact read too. Broad compact
+    // reads keep their historical text-only shape and never expose a large
+    // structured summary for every node.
     // #1941 — fit the structured row the same way as the survey line. An
     // uncapped VHS/high-fan-in summary used to dwarf `max_chars` while the
     // text stub stayed bounded; a timed-out/truncated probe then fell through
     // to graph_get_subgraph and refused a root node as an unclassifiable
     // promoted container.
     const pinpointNodes = (() => {
-      if (!(pinpoint && proj === "detail" && shown === 1 && matched[0])) return null;
-      const summary = {
-        ...capSummaryWidgets(summarizeNode(matched[0]), detailWidgetCap, maxChars),
-        is_subgraph: !!matched[0].subgraph,
-      };
+      if (!(pinpoint && (proj === "detail" || proj === "compact") && shown === 1 && matched[0])) return null;
+      const summarized = summarizeNode(matched[0]);
+      const summary =
+        proj === "compact"
+          ? {
+              id: summarized.id,
+              type: summarized.type,
+              ...(typeof summarized.node_identity === "string"
+                ? { node_identity: summarized.node_identity }
+                : {}),
+              is_subgraph: !!matched[0].subgraph,
+            }
+          : {
+              ...capSummaryWidgets(summarized, detailWidgetCap, maxChars),
+              is_subgraph: !!matched[0].subgraph,
+            };
       const fitted = fitDetailLine(
         JSON.stringify(summary),
-        { id: summary.id, type: summary.type, title: summary.title, is_subgraph: summary.is_subgraph },
+        proj === "compact"
+          ? {
+              id: summary.id,
+              type: summary.type,
+              ...(typeof summary.node_identity === "string"
+                ? { node_identity: summary.node_identity }
+                : {}),
+              is_subgraph: summary.is_subgraph,
+            }
+          : { id: summary.id, type: summary.type, title: summary.title, is_subgraph: summary.is_subgraph },
         maxChars,
       );
       try {
@@ -14889,6 +14912,9 @@ const GRAPH_TOOL_EXECUTORS = {
           {
             id: summary.id,
             type: summary.type,
+            ...(typeof summary.node_identity === "string"
+              ? { node_identity: summary.node_identity }
+              : {}),
             is_subgraph: !!matched[0].subgraph,
           },
         ];
