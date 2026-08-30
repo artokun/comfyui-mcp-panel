@@ -117,11 +117,12 @@ export const COMBO_REFRESH_NEVER_RAN = Symbol("combo-refresh-never-ran");
  * that itself queues work is visible. No rAF in Node tests → two microtasks,
  * so existing runSetWidget tests do not hang or grow a timer.
  *
- * #1995 — the wait is BOUNDED. After reconnect a backgrounded tab never fires
- * rAF, so an unbounded frame wait held the reply until the relay timed out
- * while the callback had already applied the value. The bound is long enough
- * for a visible frame and short enough that an applied write still gets a
- * receipt. Injectable timers so tests can fire the bound without sleeping.
+ * #1995/#2001 — the wait is BOUNDED. After reconnect, or after an inner-subgraph
+ * widget write, a backgrounded tab / stopped canvas loop never fires rAF, so an
+ * unbounded frame wait held the reply until the relay timed out while the
+ * assignment had already stuck. The bound is long enough for a visible frame
+ * and short enough that an applied write still gets a receipt. Injectable
+ * timers so tests can fire the bound without sleeping.
  */
 export const FRONTEND_WIDGET_FLUSH_MS = 250;
 

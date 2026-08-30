@@ -1867,6 +1867,15 @@ function assignLiveCustomText(widget, coerced) {
 }
 
 /** Assign a widget value and drive options.setValue when present (store-backed rails). */
+function detachThenable(value) {
+  if (value == null || typeof value.then !== "function") return;
+  try {
+    value.then(undefined, () => {});
+  } catch {
+    /* a throwing then() is not a write verdict */
+  }
+}
+
 function assignWidgetValue(widget, coerced) {
   if (typeof coerced === "string" && isLiveCustomTextWidget(widget)) {
     assignLiveCustomText(widget, coerced);
@@ -1875,7 +1884,7 @@ function assignWidgetValue(widget, coerced) {
   widget.value = coerced;
   try {
     const setValue = widget.options?.setValue;
-    if (typeof setValue === "function") setValue.call(widget, coerced);
+    if (typeof setValue === "function") detachThenable(setValue.call(widget, coerced));
   } catch {
     /* verification below still decides whether the value stuck */
   }
@@ -2943,11 +2952,14 @@ export function applyWidgetWrite(
       if (widgetCallback !== null && widgetCallback !== undefined) {
         const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
         threwFromCallback = true;
-        const callbackResult = reflectApply(widgetCallback, valueWidget, callbackArgs);
+        const callbackRet = reflectApply(widgetCallback, valueWidget, callbackArgs);
         threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
-        // A thenable is an unacked frontend callback. Never wait for it: a
-        // customtext Promise that never settles is the #2020 hang.
-        void callbackResult;
+        // #2001/#2020 — a callback that RETURNS a thenable (subgraph navigation,
+        // Vue nextTick, customtext, an openSubgraph receipt) has already been
+        // invoked. Awaiting it would own the command reply for as long as that
+        // work stays pending. Detach: a later rejection must not become an
+        // unhandled-rejection, and the assignment above is the receipt.
+        detachThenable(callbackRet);
       }
     }
     // #1533 — AFTER the callback, still inside this envelope so afterChange

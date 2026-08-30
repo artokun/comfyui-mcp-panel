@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_widget acknowledges an inner-subgraph widget write once readback matches, instead of waiting out the 90s relay on a hanging widget callback or parent-rail restore (#2001)
+
 ## [0.15.143] - 2026-08-30
 
 ### Fixed

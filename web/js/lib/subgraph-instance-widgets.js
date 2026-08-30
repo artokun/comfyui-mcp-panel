@@ -17,6 +17,15 @@
 
 import { promotedValueScope } from "./widget-write.js";
 
+function detachThenable(value) {
+  if (value == null || typeof value.then !== "function") return;
+  try {
+    value.then(undefined, () => {});
+  } catch {
+    /* a throwing then() is not a restore verdict */
+  }
+}
+
 function cloneValue(value) {
   if (value == null || typeof value !== "object") return value;
   try {
@@ -53,13 +62,20 @@ function subgraphIdentity(subgraph) {
  * AND the type UUID (`SubgraphNode.type === subgraph.id`); match either so a
  * clone that did not keep object identity still restores.
  */
+/** Hard cap on graphs visited while collecting instances. A `node.subgraph`
+ *  getter that yields a new object each time would otherwise walk forever, and
+ *  that walk sits on the post-mutation restore path (#2001). */
+const MAX_SUBGRAPH_WALKS = 10000;
+
 export function collectSubgraphInstanceNodes(rootGraph, subgraph) {
   const out = [];
   if (!rootGraph || !subgraph) return out;
   const wantId = subgraphIdentity(subgraph);
   const stack = [rootGraph];
   const seen = new Set();
+  let walks = 0;
   while (stack.length) {
+    if (++walks > MAX_SUBGRAPH_WALKS) break;
     const graph = stack.pop();
     if (!graph || seen.has(graph)) continue;
     seen.add(graph);
@@ -196,7 +212,11 @@ export function restorePromotedInstanceWidgets(rootGraph, snapshot) {
     }
     if (typeof found.rail.callback === "function") {
       try {
-        found.rail.callback(next);
+        // #2001 — the setter is the store. A callback that returns a thenable
+        // (PromotedWidgetView forwarding into openSubgraph / Vue nextTick) must
+        // not own the inner-mutation reply. Detach; a throw still must not undo
+        // the landed restore.
+        detachThenable(found.rail.callback(next));
       } catch {
         /* setter is the store; a callback throw must not undo a landed restore */
       }
@@ -330,6 +350,10 @@ export async function withPreservedPromotedInstanceWidgets(rootGraph, subgraph, 
     } catch {
       /* a hostile thenable must not skip restore */
     }
-    restorePromotedInstanceWidgets(rootGraph, snapshot);
+    try {
+      restorePromotedInstanceWidgets(rootGraph, snapshot);
+    } catch {
+      /* #2001 — a restore throw must not turn a landed inner mutation into a missing reply */
+    }
   }
 }
