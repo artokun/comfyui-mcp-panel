@@ -627,6 +627,7 @@
       "new_messages": "New messages",
       "next": "Next",
       "no_agent_is_listening_on_the_bridge": "No agent is listening on the bridge ({bridge}). This ComfyUI won’t start one — run the agent on YOUR machine, then click Connect:\n    {command}",
+      "no_answer_in_time_adult_content_stays": "No answer in time — adult content stays as it was.",
       "no_chats_match_this_search": "No chats match this search.",
       "no_credential_slots": "No credential slots.",
       "no_errors_recorded_since_the_last_execution": "no errors recorded since the last execution start",

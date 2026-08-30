@@ -140,7 +140,7 @@ test("#952 source guard: a question card registers itself and unregisters when a
     "registered at paint, and ONLY when a command painted it",
   );
   assert.match(paint, /alreadyAnswered: \(\) => done,/, "so an answered card is skipped");
-  assert.match(paint, /promise\.then\(unregister, unregister\)/, "and dropped once it settles, either way");
+  assert.match(paint, /handedToCaller\.then\(unregister, unregister\)/, "and dropped once the caller-facing wait settles, either way");
 });
 
 test("#952 (codex) a SECRET card is retired too, with secret-safe wording", () => {

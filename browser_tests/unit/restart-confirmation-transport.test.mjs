@@ -9,6 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { waitForAdultConsentAnswer } from "../../web/js/lib/adult-consent-wait.js";
 
 const PANEL = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const source = readFileSync(PANEL, "utf8").replace(/\r\n/g, "\n");
@@ -107,6 +108,7 @@ function makeQuestionPainter({ record = () => {}, onReveal = () => {} } = {}) {
     "retireInteractiveCard",
     "tr",
     "INTERACTIVE_ABANDONED",
+    "waitForAdultConsentAnswer",
     `${namedFunctionSource(source, "paintQuestion")}; return paintQuestion;`,
   )(
     document,
@@ -125,6 +127,7 @@ function makeQuestionPainter({ record = () => {}, onReveal = () => {} } = {}) {
     () => {},
     (key, fallback) => fallback,
     Symbol("abandoned"),
+    waitForAdultConsentAnswer,
   );
   return { log, paintQuestion };
 }

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- resolve the 18+ consent card before the 300s tools/call deadline so an idle user gets a structured timeout instead of a transport hang (#390)
+
 ## [0.15.125] - 2026-08-30
 
 ### Fixed
@@ -19,7 +22,6 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 - record node identity fence (#2021)
-
 
 ## [0.15.124] - 2026-08-29
 
