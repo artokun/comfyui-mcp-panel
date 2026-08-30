@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.136] - 2026-08-30
+
 ### Fixed
 - panel_refresh_nodes refuses a stale browser bundle with a Ctrl+Shift+R remedy instead of clearing last-known schema (#2027)
 - panel_refresh_nodes publishes the workflow UUID of the canvas it refreshed, and refuses a retryable route-registration miss if the active route moves, instead of returning refreshed:true with another UUID (#2026)
