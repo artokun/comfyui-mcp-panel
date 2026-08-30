@@ -61,7 +61,7 @@ test("#1787 a route-readiness refusal is fail-closed before the refresh consumer
 
 test("#1787 production wiring keeps the readiness gate ahead of refreshComfyNodeDefs", () => {
   const refreshBody = refreshNodesMatch[0];
-  assert.match(refreshBody, /await awaitActiveRouteRegistration\(\);[\s\S]*refreshComfyNodeDefs/);
+  assert.match(refreshBody, /await awaitActiveRouteRegistration\([^)]*\);[\s\S]*refreshComfyNodeDefs/);
   assert.match(PANEL_SRC, /route_registration_readiness/);
   assert.match(PANEL_SRC, /routeRegistrationReadinessRefusalError/);
 });

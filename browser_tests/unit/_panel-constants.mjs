@@ -104,6 +104,12 @@ export const REFRESH_NODES_EXECUTOR_DEPS = Object.freeze({
   // touching the global node-definition refresh. Harnesses inject their own
   // readiness promise; this default preserves the existing refresh-only cases.
   awaitActiveRouteRegistration: async () => {},
+  // #2026 — the executor snapshots the canvas identity it refreshed. Defaults
+  // keep existing refresh-only harnesses from throwing ReferenceError.
+  liveParseableViewingWitness: () => null,
+  workflowStableUuid: () => null,
+  routeRegistrationReadinessRefusalError: (reason) =>
+    new Error(reason || "route registration not ready"),
 });
 
 /** #1413 — the whole-command deadline `graph_set_widget` takes on its first line. */
