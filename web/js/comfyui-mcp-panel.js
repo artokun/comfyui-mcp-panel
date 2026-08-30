@@ -5304,10 +5304,31 @@ function readRouteRegistrationReadinessRefusal(error) {
 // replacement-socket handoff. Wait for the live route before starting the
 // global, otherwise-safe refresh; if the bridge is down entirely, preserve the
 // local refresh path and let its existing backend readiness handling decide.
+// #2026 — a ready route is not enough: its workflow UUID must still be the
+// command-bound instance. Accepting a stale object identity here lets
+// refresh_nodes answer refreshed:true with another UUID on the same graph.
 const ROUTE_REGISTRATION_WAIT_STEPS_MS = Object.freeze([100, 250, 500, 1000, 2000]);
-async function awaitActiveRouteRegistration() {
+function routeWorkflowUuidDiffers(expectedWorkflowUuid) {
+  if (typeof expectedWorkflowUuid !== "string" || expectedWorkflowUuid.length === 0) return false;
+  let liveUuid;
+  try {
+    liveUuid = workflowStableUuid();
+  } catch {
+    return true;
+  }
+  return liveUuid !== expectedWorkflowUuid;
+}
+
+async function awaitActiveRouteRegistration(expectedWorkflowUuid) {
   const client = liveBridgeClient;
   if (!client || client.isConnected?.() !== true) return;
+  const refuseStaleUuid = () => {
+    if (!routeWorkflowUuidDiffers(expectedWorkflowUuid)) return;
+    throw routeRegistrationReadinessRefusalError(
+      "the active route reports a different workflow instance than the command-bound canvas",
+    );
+  };
+  refuseStaleUuid();
   if (client.isRouteReady?.() === true) return;
   const ready =
     typeof client.waitForRouteReady === "function"
@@ -5316,6 +5337,7 @@ async function awaitActiveRouteRegistration() {
   if (ready !== true || liveBridgeClient !== client || client.isRouteReady?.() !== true) {
     throw routeRegistrationReadinessRefusalError();
   }
+  refuseStaleUuid();
 }
 
 // Per-tab agent session id + which thread this tab is showing. sessionStorage
@@ -13649,7 +13671,23 @@ const GRAPH_TOOL_EXECUTORS = {
     // #1787 — a stale explicit tab_id can still reach this executor during a
     // replacement-socket handoff. Do not let the global refresh run until the
     // bridge has registered the current active route.
-    await awaitActiveRouteRegistration();
+    // #2026 — snapshot the established identity of the canvas this command is
+    // about to refresh. The reply witness is attached after we return and can
+    // re-read a stale workflow-object UUID for the same graph. Publish the
+    // identity we actually refreshed; if the live route moves to another
+    // instance, refuse instead of refreshed:true with another UUID.
+    const liveViewing = liveParseableViewingWitness();
+    let boundUuid = liveViewing?.workflow_uuid;
+    try {
+      const established = workflowStableUuid();
+      if (typeof established === "string" && established.length > 0) boundUuid = established;
+    } catch {
+      // keep the viewing uuid when the established identity cannot be read
+    }
+    const boundIdentity = liveViewing && boundUuid
+      ? { ...liveViewing, workflow_uuid: boundUuid }
+      : liveViewing;
+    await awaitActiveRouteRegistration(boundUuid);
     const verdict = await refreshComfyNodeDefs(undefined, {
       force: true,
       joinInFlight: true,
@@ -13670,6 +13708,22 @@ const GRAPH_TOOL_EXECUTORS = {
       // installs it exists for. See REFRESH_NODES_RUN_BUDGET_MS for the measurement.
       runBudgetMs: REFRESH_NODES_RUN_BUDGET_MS,
     });
+    const liveIdentity = liveParseableViewingWitness();
+    if (
+      boundIdentity?.workflow_uuid &&
+      liveIdentity?.workflow_uuid &&
+      liveIdentity.workflow_uuid !== boundIdentity.workflow_uuid &&
+      !(
+        boundIdentity.graph_identity &&
+        liveIdentity.graph_identity &&
+        boundIdentity.graph_identity === liveIdentity.graph_identity
+      )
+    ) {
+      throw routeRegistrationReadinessRefusalError(
+        "the active route changed to a different workflow instance while node definitions were refreshing",
+      );
+    }
+    const viewing = boundIdentity ? { viewing: boundIdentity } : {};
     // #1404 — a NAMED verdict, before the generic branch below can call it "unknown".
     //
     // NOTHING FAILED and nothing was left half-done: the coalescer does not cancel the run
@@ -13705,6 +13759,7 @@ const GRAPH_TOOL_EXECUTORS = {
           "it settles pays for one refresh instead of two, which is normally enough; if it " +
           "keeps reporting this, the refresh itself is slower than the budget and reloading " +
           "the ComfyUI tab is the fallback that remains.",
+        ...viewing,
       };
     }
     const refreshed = verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true);
@@ -13715,13 +13770,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // consumers rather than assuming the verdict flowed through.
     // `ok` stays true and `refreshed` stays true: the refresh did what it claims. The
     // reload flag is advisory, about the canvas, not a failure of the refresh.
-    const stale = verdict != null && typeof verdict === "object" && verdict.requires_reload
-      ? {
-          requires_reload: true,
-          stale_placeholders: verdict.stale_placeholders,
-          stale_placeholders_note: verdict.stale_placeholders_note,
-        }
-      : {};
+    const stale = {
+      ...viewing,
+      ...(verdict != null && typeof verdict === "object" && verdict.requires_reload
+        ? {
+            requires_reload: true,
+            stale_placeholders: verdict.stale_placeholders,
+            stale_placeholders_note: verdict.stale_placeholders_note,
+          }
+        : {}),
+    };
     // #1172 — forwarded through the SAME hole #981 fell into. The `refreshed: true` branch
     // below returns a fixed object literal, so a field the verdict carries but this whitelist
     // does not name is silently dropped on exactly the successful path where the disclosure

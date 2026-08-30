@@ -120,6 +120,10 @@ function buildRefreshNodes({ refreshComfyNodeDefs, commandBudget = COMMAND_BUDGE
   const deps = {
     refreshComfyNodeDefs,
     awaitActiveRouteRegistration: async () => {},
+    liveParseableViewingWitness: () => null,
+    workflowStableUuid: () => null,
+    routeRegistrationReadinessRefusalError: (reason) =>
+      new Error(reason || "route registration not ready"),
     REFRESH_JOIN_ABANDONED,
     NODE_DEF_REFRESH_REASONS,
     REFRESH_NODES_COMMAND_BUDGET_MS: commandBudget,
