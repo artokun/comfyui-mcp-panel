@@ -110,7 +110,8 @@ test("#890 the parser itself is unchanged — the note is added at the search bo
 
 test("#890 source guard: the search route still asks for the cache the note describes", () => {
   const src = readFileSync(new URL("../../web/js/lib/manager-install.js", import.meta.url), "utf8");
-  assert.match(src, /const route = "customnode\/getmappings\?mode=cache";/, "the route the note reads");
+  assert.match(src, /export const SEARCH_MAPPINGS_ROUTE = "customnode\/getmappings\?mode=cache";/);
+  assert.match(src, /const route = SEARCH_MAPPINGS_ROUTE;/, "the route the note reads");
   assert.match(
     src,
     /parsed\.count === 0 \? \{ \.\.\.parsed, \.\.\.cachedCatalogueNoMatch\(query, parsed\.catalogue_size, route\) \} : parsed/,
