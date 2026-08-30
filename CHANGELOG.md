@@ -6,10 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.130] - 2026-08-30
+
 ### Fixed
 - Codex generatedImage results paint as chat attachments (#1994)
 - panel_run on frontend 1.49.6 delivers to_node_id natively when app.queuePrompt wrappers drop the third argument (#1782)
 - retry one readable workflow-open normalization race while keeping persistent content mismatches fail-closed (#1898)
+
 
 ## [0.15.129] - 2026-08-30
 
