@@ -2664,12 +2664,14 @@ const READ_ONLY_GRAPH_COMMANDS = new Set([
   // corrupts a graph, and that asymmetry is the whole reason reads have a lower
   // bar at all. So this grows one verified command at a time, never by pattern.
   //
-  // `graph_get_object_info` and `graph_prompt_director_audit` are also absent and
-  // also look like reads, but "looks like" is not the standard for weakening a
-  // guard — they stay out until someone establishes it the way this one was
-  // (the orchestrator's own tool description says "Read-only", and its executor
-  // touches no graph state).
+  // #1996 — `graph_get_object_info` reads THIS tab's /object_info and writes no
+  // graph state. Newer MCP requires it for panel_strip_workflow; classifying it
+  // as a mutation refused the schema read on a dirty or unbound tab and failed
+  // strip. It is also canvas-independent (workflow-chat-identity.js): the reply
+  // describes node types, not the active workflow. `graph_prompt_director_audit`
+  // stays out until established the same way.
   "graph_get_errors",
+  "graph_get_object_info",
 ]);
 
 export function graphCommandMayMutateWorkflow(command) {

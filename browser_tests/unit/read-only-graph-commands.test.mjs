@@ -52,6 +52,8 @@ test("every command already treated as a read still is", () => {
     "graph_get_subgraph",
     "graph_list_subgraphs",
     "graph_screenshot",
+    "graph_get_errors",
+    "graph_get_object_info",
   ]) {
     assert.equal(graphCommandMayMutateWorkflow(cmd), false, cmd);
   }
@@ -89,13 +91,23 @@ test("an UNKNOWN command is a mutation — the list fails closed", () => {
   assert.equal(graphCommandMayMutateWorkflow(undefined), true);
 });
 
-test("the two other unlisted reads are deliberately still refused", () => {
-  // Recorded rather than assumed. `graph_get_object_info` and
-  // `graph_prompt_director_audit` also look like reads, but "looks like" is not
-  // the standard for lowering a guard's bar, so they stay out until someone
-  // establishes it. If a later change admits one, this test fails and asks for
-  // the evidence to be written down with it.
-  assert.equal(graphCommandMayMutateWorkflow("graph_get_object_info"), true);
+test("#1996 graph_get_object_info is a READ — strip must not hit the dirty-mutation fence", () => {
+  // Established the same way #1478 was: the executor fetches /object_info and
+  // writes no graph state. Newer MCP requires this command for
+  // panel_strip_workflow; leaving it classified as a mutation refused the
+  // schema read on a dirty tab.
+  assert.equal(graphCommandMayMutateWorkflow("graph_get_object_info"), false);
+  assert.deepEqual(
+    graphCommandBindingBar("graph_get_object_info"),
+    graphCommandBindingBar("graph_serialize"),
+  );
+});
+
+test("the remaining unlisted read is deliberately still refused", () => {
+  // Recorded rather than assumed. `graph_prompt_director_audit` also looks like
+  // a read, but "looks like" is not the standard for lowering a guard's bar, so
+  // it stays out until someone establishes it. If a later change admits it,
+  // this test fails and asks for the evidence to be written down with it.
   assert.equal(graphCommandMayMutateWorkflow("graph_prompt_director_audit"), true);
 });
 

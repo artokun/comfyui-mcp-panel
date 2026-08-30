@@ -430,6 +430,7 @@ import {
   reconcileGraphDynamicWidgets,
   installGraphToPromptDynamicReconcile,
 } from "./lib/dynamic-widget-reconcile.js";
+import { serializeLiveGraph } from "./lib/graph-serialize-capture.js";
 import {
   createDeferredWidgetEditQueue,
   deferredWidgetQueueCounts,
@@ -13949,10 +13950,13 @@ const GRAPH_TOOL_EXECUTORS = {
   // on save). Not two blocks (summary then graph): this command is the capture
   // panel_strip_workflow converts; that tool's own structuredContent.graph is
   // the combined summary+graph form, not a second block from here. Read-only;
-  // subgraph defs ride along in workflow.definitions.
+  // subgraph defs ride along in workflow.definitions. #1996 extra schema fields
+  // stay; capturedWidgetValues rides along for positional-schema skew.
   graph_serialize() {
     const { rootGraph } = getGraphCtx();
-    const workflow = rootGraph.serialize();
+    const workflow = serializeLiveGraph(rootGraph, {
+      reconcile: (graph) => reconcileGraphDynamicWidgets(graph),
+    });
     return { workflow, node_count: workflow?.nodes?.length ?? 0 };
   },
 

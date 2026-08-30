@@ -138,7 +138,7 @@ test('#932 an UNRESOLVABLE active uuid still lets the probe through', () => {
 test('#932 the shared predicate covers BOTH guards, and is strictly wider', () => {
   // Everything canvas-independent stays targetless…
   for (const cmd of ['nodes_search', 'nodes_list', 'nodes_install', 'nodes_queue_status',
-                     'graph_update_node', 'comfy_reboot', 'free_vram']) {
+                     'graph_update_node', 'graph_get_object_info', 'comfy_reboot', 'free_vram']) {
     assert.equal(commandIsCanvasTargetless(cmd), true, `${cmd} targets no canvas`)
   }
   // …plus exactly one more.
@@ -186,6 +186,7 @@ test('#602 fence does NOT apply to canvas-independent Manager/server commands', 
     'nodes_install',
     'nodes_queue_status',
     'graph_update_node', // a Manager PACK update misnamed with a graph_ prefix
+    'graph_get_object_info', // #1996 — node schema, not a canvas
     'comfy_reboot',
     'free_vram',
   ]) {
@@ -738,7 +739,8 @@ test('#607 non-canvas commands are exempt from the workflow-instance fence', () 
     'nodes_install',
     'nodes_queue_status',
     // graph_update_node: a Manager PACK update misnamed with a graph_ prefix (#624).
-    'graph_update_node'
+    'graph_update_node',
+    'graph_get_object_info',
   ]) {
     assert.equal(activeWorkflowFenceApplies({ cmd }), false, `${cmd} must not be fenced`)
   }
