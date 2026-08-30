@@ -49,6 +49,30 @@ test("#1995 a lost run ack without a receipt is unknown, not user-rejected", () 
   assert.match(String(out.retry_guidance), /queue/i);
 });
 
+test("#1995 a rewritten run ack keeps queue-time disclosures", () => {
+  const feeds = [{ node_id: 12, widget: "text", origin_type: "PrimitiveNode" }];
+  const withId = honestRunAck({
+    queued: false,
+    prompt_id: QUEUED_PROMPT_ID,
+    error: USER_REJECTED,
+    virtual_source_feeds: feeds,
+    virtual_source_note: "the stored inner value executes",
+  });
+  assert.equal(withId.queued, true);
+  assert.deepEqual(withId.virtual_source_feeds, feeds);
+  assert.match(withId.virtual_source_note, /stored inner value/);
+
+  const lost = honestRunAck({
+    queued: false,
+    error: USER_REJECTED,
+    virtual_source_feeds: feeds,
+    virtual_source_note: "the stored inner value executes",
+  });
+  assert.equal(lost.queued_unknown, true);
+  assert.deepEqual(lost.virtual_source_feeds, feeds, "a lost ack must not drop the queue-time scan");
+  assert.match(lost.virtual_source_note, /stored inner value/);
+});
+
 test("#1995 a genuine refusal without a prompt id stays a refusal", () => {
   const out = honestRunAck({
     queued: false,

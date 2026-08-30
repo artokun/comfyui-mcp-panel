@@ -62,13 +62,16 @@ export function honestRunAck(result) {
   }
 
   if (!ids.length && rejectedLanguage) {
-    return {
-      queued_unknown: true,
-      error:
-        "The queue acknowledgement was lost or incomplete, so the panel cannot confirm or correlate this run.",
-      retry_guidance:
-        "The run may have been accepted. Check the ComfyUI queue or history before retrying; a blind retry can duplicate the render.",
-    };
+    const out = { ...result };
+    delete out.queued;
+    delete out.error;
+    delete out.error_type;
+    out.queued_unknown = true;
+    out.error =
+      "The queue acknowledgement was lost or incomplete, so the panel cannot confirm or correlate this run.";
+    out.retry_guidance =
+      "The run may have been accepted. Check the ComfyUI queue or history before retrying; a blind retry can duplicate the render.";
+    return out;
   }
 
   return result;
