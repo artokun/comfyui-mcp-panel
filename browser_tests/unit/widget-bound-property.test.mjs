@@ -228,10 +228,10 @@ test("a bound NUMERIC widget the node normalizes still succeeds", () => {
 test("a bound widget whose `value` is an ACCESSOR still verifies", () => {
   // ComfyUI's DOM widgets define `value` as an accessor —
   // `set value(v) { options.setValue?.(v); callback?.(this.value) }` — so `setProperty`'s
-  // copy-back runs that setter a second time. The write must still verify, and the
-  // widget's own callback must not be able to turn the extra invocation into a failure.
-  // Counted, because the count is the thing that changes for a BOUND widget, and it is
-  // the same count `BaseWidget.setValue` produces for an on-canvas edit of one.
+  // copy-back runs that setter. The write must still verify, and the widget's own
+  // callback must not be able to turn that copy-back into a failure.
+  // #2020 skips the DOM `.value` setter and the 5-arg widget.callback for live
+  // customtext (those are the hang). Only setProperty's copy-back remains.
   let store = "old";
   let callbacks = 0;
   const widget = {
@@ -257,7 +257,7 @@ test("a bound widget whose `value` is an ACCESSOR still verifies", () => {
   assert.equal(store, "new");
   assert.equal(node.properties.prompt, "new");
   assert.deepEqual(set.bound_property, { name: "prompt", previous: "old" });
-  assert.equal(callbacks, 3);
+  assert.equal(callbacks, 1, "#2020: live customtext skips setter/callback; only setProperty copy-back fires");
 });
 
 test("#1735: an accessor-backed BooleanWidget copy-back deletion is recovered only after both stores retain", () => {

@@ -1724,7 +1724,7 @@ function dispatchDomEvent(el, type) {
   }
 }
 
-function writeLiveTextEditor(el, text) {
+function writeLiveTextEditor(el, text, { events = true } = {}) {
   const tag = typeof el.tagName === "string" ? el.tagName.toUpperCase() : "";
   const editable =
     el.isContentEditable === true ||
@@ -1741,15 +1741,71 @@ function writeLiveTextEditor(el, text) {
   }
   // StringMultilineTagEditor's input listener copies getPlainText() into state
   // and localStorage; without this event the canvas shows the new text and a
-  // reload restores the old one.
-  dispatchDomEvent(el, "input");
-  dispatchDomEvent(el, "change");
+  // reload restores the old one. Skipped when the widget store already holds
+  // the value: ComfyUI's customtext input handler assigns `widget.value`, and
+  // that setter re-enters a callback that may never settle (#2020).
+  if (events) {
+    dispatchDomEvent(el, "input");
+    dispatchDomEvent(el, "change");
+  }
   return true;
 }
 
 function widgetHoldsValue(widget, coerced) {
   try {
     return Object.is(widget.value, coerced);
+  } catch {
+    return false;
+  }
+}
+
+function readLiveTextEditorValue(el) {
+  try {
+    const tag = typeof el?.tagName === "string" ? el.tagName.toUpperCase() : "";
+    if (tag === "TEXTAREA" || tag === "INPUT") return el.value;
+    if (
+      el?.isContentEditable === true ||
+      el?.contentEditable === true ||
+      el?.contentEditable === "true" ||
+      el?.contentEditable === "" ||
+      (typeof el?.className === "string" && /\bcomfy-multiline-input\b/.test(el.className))
+    ) {
+      return el.textContent;
+    }
+  } catch {
+    /* unreadable editor is simply absent */
+  }
+  return undefined;
+}
+
+/**
+ * #2020 — a STRING widget whose live value is a textarea / contenteditable /
+ * `options.getValue` store, not a plain `.value` field.
+ *
+ * ComfyUI `addDOMWidget` (customtext) implements
+ * `set value(v) { options.setValue?.(v); callback?.(this.value) }`. Vue and
+ * AnimaPromptPlus callbacks on that path can fail to settle, so a programmatic
+ * write must not assign `.value` or await the callback.
+ */
+function isLiveCustomTextWidget(widget) {
+  if (!widget || typeof widget !== "object") return false;
+  if (liveTextEditorElement(widget)) return true;
+  const t = String(widget.type ?? "").toLowerCase();
+  if (t !== "customtext" && t !== "textarea" && t !== "text" && t !== "string") return false;
+  try {
+    const opts = widget.options;
+    return !!(opts && (typeof opts.getValue === "function" || typeof opts.setValue === "function"));
+  } catch {
+    return false;
+  }
+}
+
+function customTextHolds(widget, coerced) {
+  if (widgetHoldsValue(widget, coerced)) return true;
+  const el = liveTextEditorElement(widget);
+  if (!el) return false;
+  try {
+    return Object.is(readLiveTextEditorValue(el), coerced);
   } catch {
     return false;
   }
@@ -1764,8 +1820,47 @@ function syncDomBackedTextIfNeeded(widget, coerced) {
   writeLiveTextEditor(el, coerced);
 }
 
+/**
+ * Drive a live customtext widget without the DOM `.value` setter.
+ *
+ * `options.setValue` updates the widget-value store (what serializes). The
+ * visible textarea is written directly. `input`/`change` fire only when the
+ * store did not take the value, which is the #1997 no-op-setValue case.
+ */
+function assignLiveCustomText(widget, coerced) {
+  let setValueStuck = false;
+  try {
+    const setValue = widget.options?.setValue;
+    if (typeof setValue === "function") {
+      setValue.call(widget, coerced);
+      setValueStuck = widgetHoldsValue(widget, coerced);
+    }
+  } catch {
+    /* verification below still decides whether the value stuck */
+  }
+  const el = liveTextEditorElement(widget);
+  if (el) {
+    try {
+      writeLiveTextEditor(el, coerced, { events: !setValueStuck });
+    } catch {
+      /* verification below still decides whether the value stuck */
+    }
+  }
+  if (!customTextHolds(widget, coerced)) {
+    try {
+      widget.value = coerced;
+    } catch {
+      /* verification below still decides whether the value stuck */
+    }
+  }
+}
+
 /** Assign a widget value and drive options.setValue when present (store-backed rails). */
 function assignWidgetValue(widget, coerced) {
+  if (typeof coerced === "string" && isLiveCustomTextWidget(widget)) {
+    assignLiveCustomText(widget, coerced);
+    return;
+  }
   widget.value = coerced;
   try {
     const setValue = widget.options?.setValue;
@@ -1782,12 +1877,7 @@ function assignWidgetValue(widget, coerced) {
 
 /** Restore a captured prior value, including a DOM-backed editor this write updated. */
 function restoreWidgetValue(widget, previous) {
-  widget.value = previous;
-  try {
-    syncDomBackedTextIfNeeded(widget, previous);
-  } catch {
-    /* restore best-effort; read-back below is authoritative */
-  }
+  assignWidgetValue(widget, previous);
 }
 
 /**
@@ -2562,6 +2652,19 @@ export function applyWidgetWrite(
         typeof actual === "object" &&
         Object.keys(expected).every((k) => JSON.stringify(actual[k]) === JSON.stringify(expected[k]))
       : actual === expected;
+  // #2020 — a live customtext may serialize from the textarea / getValue store
+  // even when a Vue `.value` accessor has not caught up. Read the editor too.
+  const widgetMatchesExpected = (widget) => {
+    let actual;
+    try {
+      actual = widget?.value;
+    } catch {
+      actual = undefined;
+    }
+    if (matchesExpected(actual)) return true;
+    return typeof expected === "string" && isLiveCustomTextWidget(widget) && customTextHolds(widget, expected);
+  };
+  const liveCustomTextWrite = typeof coerced === "string" && isLiveCustomTextWidget(valueWidget);
 
   // Snapshot the PRIOR values AND deep clones of them. Rollback restores the prior
   // OBJECT REFERENCE (`previous`), but a subsequent afterChange hook could mutate
@@ -2818,13 +2921,22 @@ export function applyWidgetWrite(
     // non-callable callback still throws a TypeError exactly as before, and it takes
     // the argument list without spreading — no `Symbol.iterator` to poison either.
     // `reflectApply` is captured at module load for the same reason.
-    if (!fastBypasserAction) {
+    // #2020 — do not invoke (and therefore cannot await) a custom textarea's
+    // widget.callback. ComfyUI DOM widgets already fire it from the `.value`
+    // setter; AnimaPromptPlus / Vue customtext callbacks can fail to settle,
+    // which wedged panel_set_widget until the client timed out. The live
+    // editor + options.setValue path above is what serializes; read-back
+    // still decides whether the write stuck.
+    if (!fastBypasserAction && !liveCustomTextWrite) {
       widgetCallback = valueWidget.callback;
       if (widgetCallback !== null && widgetCallback !== undefined) {
         const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
         threwFromCallback = true;
-        reflectApply(widgetCallback, valueWidget, callbackArgs);
+        const callbackResult = reflectApply(widgetCallback, valueWidget, callbackArgs);
         threwFromCallback = false; // reached only when it RETURNED — a throw leaves it set
+        // A thenable is an unacked frontend callback. Never wait for it: a
+        // customtext Promise that never settles is the #2020 hang.
+        void callbackResult;
       }
     }
     // #1533 — AFTER the callback, still inside this envelope so afterChange
@@ -2902,7 +3014,7 @@ export function applyWidgetWrite(
   // Only an EXACTLY reproducible snap counts. If the config does not explain the
   // observed value, this stays the failure it was — no tolerance, because a
   // tolerance would eventually swallow a real revert that landed nearby.
-  const normalization = matchesExpected(valueWidget.value)
+  const normalization = widgetMatchesExpected(valueWidget)
     ? null
     : explainNumericNormalization(expected, valueWidget.value, valueWidget);
   // comfyui-mcp#1707 — the SHARED DEFINITION must be exactly as it was.
@@ -2917,7 +3029,7 @@ export function applyWidgetWrite(
   // did not perform. Compared structurally against the pre-mutation clone, so a
   // callback mutating a captured object in place is caught too.
   const definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
-  if (!matchesExpected(valueWidget.value) && !normalization) {
+  if (!widgetMatchesExpected(valueWidget) && !normalization) {
     failure =
       `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) did not retain the ` +
       `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(valueWidget.value)}.` +
@@ -2965,7 +3077,7 @@ export function applyWidgetWrite(
       actual: boundPropertyActual,
       unreadable: boundPropertyActual === UNREADABLE_PROPERTY,
     });
-  } else if (parentWidget && parentWidget !== valueWidget && !matchesExpected(parentWidget.value)) {
+  } else if (parentWidget && parentWidget !== valueWidget && !widgetMatchesExpected(parentWidget)) {
     // comfyui-mcp#1707 — `parentWidget !== valueWidget` because on an instance-scoped
     // promoted write the rail IS the widget this write assigned, and the branch above
     // has already verified it — with the #805 normalization allowance this one does not
@@ -2978,11 +3090,11 @@ export function applyWidgetWrite(
       `the requested value: wrote ${JSON.stringify(expected)} but it became ` +
       `${JSON.stringify(parentWidget.value)}. Refusing to report success with a stale rail that ` +
       `would render the OLD value (#366).`;
-  } else if (displayWidgets.some((dw) => !matchesExpected(dw.value))) {
+  } else if (displayWidgets.some((dw) => !widgetMatchesExpected(dw))) {
     // #477: a parent-facing display proxy did not retain the value. Fail closed +
     // roll back rather than report success while the parent node still shows/queries
     // the OLD value (the exact stale-outer-widget symptom).
-    const bad = displayWidgets.find((dw) => !matchesExpected(dw.value));
+    const bad = displayWidgets.find((dw) => !widgetMatchesExpected(dw));
     failure =
       `Promoted display widget "${bad.name}" on subgraph node ${node.id} did not retain the ` +
       `requested value: wrote ${JSON.stringify(expected)} but it became ${JSON.stringify(bad.value)}. ` +
