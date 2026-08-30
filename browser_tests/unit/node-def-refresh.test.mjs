@@ -486,6 +486,7 @@ function buildRegisterComfyNodeDefs({
     // ending from the TAG rather than from its sentence (#1223), so the extracted body
     // throws ReferenceError without it.
     "TRANSPORT_OUTCOME",
+    "refuseStaleBundleRefresh",
     `// #1180 — defined HERE, from the api this scope already has, so each factory site
      // gets its own stub without threading a helper through every call.
      const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
@@ -548,6 +549,7 @@ function buildRegisterComfyNodeDefs({
     7,
     socketDown,
     TRANSPORT_OUTCOME,
+    async () => null,
   );
 }
 

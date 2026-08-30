@@ -323,6 +323,7 @@ import { refreshMissingAssetTrust } from "./lib/missing-asset-refresh.js";
 import {
   NODE_DEF_REFRESH_REASONS,
   describeNodeDefRefresh,
+  describeStaleBundleRefresh,
   describeRefreshGraphLoss,
   restoredLiveNodesNote,
 } from "./lib/node-def-refresh.js";
@@ -1671,6 +1672,41 @@ const OBJECT_INFO_SEED_WAIT_MS = 8000;
 const awaitObjectInfoHistorySeed = (waitMs = OBJECT_INFO_SEED_WAIT_MS) =>
   awaitHistoryBaseline(objectInfoHistory, objectInfoHistorySeed, waitMs);
 
+/**
+ * #2027 — compare the running PANEL_VERSION to the installed pack marker.
+ * A stale tab must not attempt the whole-schema refresh: the on-disk pack may
+ * already have the large-/object_info budget this cached bundle lacks, and a
+ * miss used to retire last-known combo lists the next widget write still needed.
+ * Fail-open on an unreadable probe (same rule as the startup heal).
+ */
+async function refuseStaleBundleRefresh() {
+  try {
+    let installed = null;
+    if (typeof api?.fetchApi === "function") {
+      let timer = null;
+      const probe = (async () => {
+        const res = await api.fetchApi("/comfyui_mcp_panel/version", { cache: "no-store" });
+        if (!res || !res.ok) return null;
+        const body = await res.json().catch(() => null);
+        return typeof body?.version === "string" ? body.version : null;
+      })();
+      try {
+        installed = await Promise.race([
+          probe,
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(null), 2000);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    return describeStaleBundleRefresh({ running: PANEL_VERSION, installed });
+  } catch {
+    return null;
+  }
+}
+
 async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once they have
   // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
@@ -1747,6 +1783,11 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // beginReplacement would bump the generation so the add could not file the per-class
   // proof it just verified.
   if (replacementMayReplaceWholeSnapshot) {
+    // #2027 — a stale browser bundle must not fence or clear last-known schema.
+    // Ask before invalidate/beginReplacement so a large-/object_info miss on an
+    // older tab cannot worsen the next widget edit.
+    const staleBundle = await refuseStaleBundleRefresh();
+    if (staleBundle) return staleBundle;
     // #716 — drop the widget-write burst cache at the START of this run, not after it
     // succeeds (codex). This function runs on exactly the events that change the schema —
     // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is

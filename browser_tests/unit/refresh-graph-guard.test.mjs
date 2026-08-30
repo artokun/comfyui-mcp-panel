@@ -258,6 +258,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     "nodeInventoryLabel",
     "describeRefreshGraphLoss",
     "restoredLiveNodesNote",
+    "refuseStaleBundleRefresh",
     `const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {
        if (typeof api?.getNodeDefs !== "function") return null;
        const settled = await withTimeout(
@@ -306,6 +307,7 @@ function buildRegisterComfyNodeDefs({ appValue, apiValue }) {
     nodeInventoryLabel,
     describeRefreshGraphLoss,
     restoredLiveNodesNote,
+    async () => null,
   );
 }
 

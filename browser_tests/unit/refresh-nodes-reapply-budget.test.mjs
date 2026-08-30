@@ -72,6 +72,7 @@ function buildRun({
     "NODE_DEFS_RETRY_DELAYS_MS", "objectInfoCache", "objectInfoSnapshot", "verifiedNodeDefCache", "backendReconnectEpoch",
     "comfyBackendSocketDown",
     "TRANSPORT_OUTCOME",
+    "refuseStaleBundleRefresh",
   ];
   const vals = {
     app: appValue, api: apiValue,
@@ -95,6 +96,7 @@ function buildRun({
     backendReconnectEpoch: 7,
     comfyBackendSocketDown: false,
     TRANSPORT_OUTCOME,
+    refuseStaleBundleRefresh: async () => null,
   };
   const factory = new Function(...names, `
     const boundedGetNodeDefs = async (ms = NODE_DEFS_FETCH_TIMEOUT_MS) => {

@@ -14,6 +14,7 @@
 //
 // Pure: every input is observed by the caller and passed in.
 
+import { resolveBundleStaleness } from "./bundle-version.js";
 import { nodeInventoryLabel } from "./graph-node-inventory.js";
 // #608 — the ONE renderer for "what each route did", shared with the two other refusals
 // that already print it (`graph_get_object_info` and the set_widget fence). It caps the
@@ -34,19 +35,50 @@ export const NODE_DEF_REFRESH_REASONS = Object.freeze({
   // be restored. A data-loss verdict: it overrides even a real phase failure,
   // because the lost nodes are the fact the caller must act on first.
   GRAPH_NODES_LOST: "graph_nodes_lost",
-  // #1404 — the ONE token in this map that `describeNodeDefRefresh` never produces,
-  // because it does not describe a run at all: the caller's command budget ran out
-  // WAITING for a refresh (someone else's, then its own), and the run it stopped
-  // waiting for is still going. It lives here anyway, and deliberately: `reason` is a
-  // single vocabulary as far as its reader is concerned, and a value that could only be
-  // found by reading the executor is a value nobody will handle. Distinct from every
-  // token above by the fact that matters to a caller — nothing failed, so a retry is
-  // expected to succeed rather than hoped to.
+  // #1404 — a token `describeNodeDefRefresh` never produces, because it does not
+  // describe a run at all: the caller's command budget ran out WAITING for a refresh
+  // (someone else's, then its own), and the run it stopped waiting for is still going.
+  // It lives here anyway, and deliberately: `reason` is a single vocabulary as far as
+  // its reader is concerned, and a value that could only be found by reading the
+  // executor is a value nobody will handle. Distinct from every token above by the
+  // fact that matters to a caller — nothing failed, so a retry is expected to succeed
+  // rather than hoped to.
   REFRESH_STILL_RUNNING: "refresh_still_running",
   // #1695 — a run that crossed a backend reconnect cannot certify the replacement
   // connection's node registry or combo lists.
   REFRESH_SUPERSEDED: "refresh_superseded",
+  // #2027 — also never produced by describeNodeDefRefresh: the refresh was not
+  // attempted because this tab is running a different panel bundle than the pack
+  // on disk. The comparison happens before any phase starts, so a stale tab cannot
+  // retire last-known schema on a large-/object_info miss the installed pack already
+  // fixed.
+  STALE_BUNDLE: "stale_bundle",
 });
+
+/**
+ * #2027 — refuse a node-def refresh when the running browser bundle is STALE.
+ *
+ * Fail-open: only a well-formed mismatch is evidence. A missing/malformed probe
+ * is the same "unknown" resolveBundleStaleness already uses for the startup heal,
+ * and must not invent a stale_bundle verdict that would skip a legitimate refresh.
+ *
+ * @returns {null|{refreshed:false, reason:string, running:string, installed:string, remedy:string}}
+ */
+export function describeStaleBundleRefresh({ running, installed } = {}) {
+  if (resolveBundleStaleness({ running, installed }) !== "stale") return null;
+  const run = String(running).trim();
+  const inst = String(installed).trim();
+  return {
+    refreshed: false,
+    reason: NODE_DEF_REFRESH_REASONS.STALE_BUNDLE,
+    running: run,
+    installed: inst,
+    remedy:
+      `This tab is running panel ${run} while the installed pack is ${inst}. ` +
+      `Hard-refresh this tab (Ctrl+Shift+R) to load panel ${inst} before refreshing node definitions. ` +
+      `Nothing was refreshed, and the last-known schema was left unchanged.`,
+  };
+}
 
 function detailSuffix(thrown) {
   const text = String(thrown?.message ?? thrown ?? "").trim();

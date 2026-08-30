@@ -502,6 +502,7 @@ function realPreloadedRefresh({ app, api, objectInfoCache, objectInfoSnapshot, v
     "initialBackendReconnectEpoch",
     "comfyBackendSocketDown",
     "TRANSPORT_OUTCOME",
+    "refuseStaleBundleRefresh",
   ];
   const values = {
     app,
@@ -529,6 +530,7 @@ function realPreloadedRefresh({ app, api, objectInfoCache, objectInfoSnapshot, v
     initialBackendReconnectEpoch: 0,
     comfyBackendSocketDown: false,
     TRANSPORT_OUTCOME,
+    refuseStaleBundleRefresh: async () => null,
   };
   const factory = new Function(
     ...names,
