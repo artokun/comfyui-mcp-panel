@@ -83,9 +83,8 @@ test("#1297 nested compact-router envelope is malformed, not unknown", () => {
 });
 
 test("#1297 panel-prefixed compact-router envelope is malformed", () => {
-  // The compact-mode router is `panel_` + a router verb. Spell the prefix
-  // and verb as two literals so the vocabulary scan does not see a fake
-  // panel_* tool name (the router is not one).
+  // Prefix is the panel namespace; verb is a compact-router name. The
+  // router itself is not a canvas tool, so it is not written as one token.
   const prefix = "panel_";
   for (const verb of ["call_tool", "list_tools", "describe_tool"]) {
     const name = prefix.concat(verb);
