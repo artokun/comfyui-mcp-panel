@@ -1398,7 +1398,258 @@ function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
     (widget) => widget && widget !== innerWidget,
   );
   if (current.length) return current;
-  return rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget);
+  const rematerialized = rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget);
+  if (rematerialized.length) return rematerialized;
+  return recoverHostPromotedWidgetsAfterLoad(subgraphNode, hostInput, innerWidget);
+}
+
+/**
+ * #2057 — after `loadGraphData`, host rails exist on `node.widgets` (outline
+ * lists them) while `input._widget` may still be unbound. Instance-scoped rails
+ * carry a widgetId; a same-named decoy does not, so it cannot win (#366).
+ */
+function recoverHostPromotedWidgetsAfterLoad(subgraphNode, hostInput, innerWidget) {
+  if (!subgraphNode || !hostInput || hostInput.link != null) return [];
+  const widgets = Array.isArray(subgraphNode.widgets) ? subgraphNode.widgets : [];
+  const wantedName =
+    typeof hostInput.name === "string" && hostInput.name.length > 0
+      ? hostInput.name.toLowerCase()
+      : null;
+  if (!wantedName) return [];
+  const named = [];
+  for (const widget of widgets) {
+    if (!widget || widget === innerWidget) continue;
+    if (typeof widget.name !== "string" || widget.name.toLowerCase() !== wantedName) continue;
+    let widgetId = null;
+    try {
+      widgetId = typeof widget.widgetId === "string" && widget.widgetId.length > 0 ? widget.widgetId : null;
+    } catch {
+      widgetId = null;
+    }
+    if (!widgetId) continue;
+    named.push(widget);
+  }
+  return named.length === 1 ? named : [];
+}
+
+/** LiteGraph subgraph input-rail id. Same constant as subgraph-scope.js; kept
+ * local so this resolver does not take a graph-binding dependency. */
+const SUBGRAPH_INPUT_RAIL_ID = -10;
+
+function subgraphIoSlots(subgraph) {
+  if (Array.isArray(subgraph?.inputs) && subgraph.inputs.length) return subgraph.inputs;
+  if (Array.isArray(subgraph?.inputNode?.slots) && subgraph.inputNode.slots.length) {
+    return subgraph.inputNode.slots;
+  }
+  return [];
+}
+
+function slotLinkIds(slot) {
+  const ids = slot?.linkIds;
+  if (!ids) return [];
+  return Array.isArray(ids) ? ids : [...ids];
+}
+
+function subgraphNodeById(subgraph, id) {
+  if (id == null || !subgraph) return null;
+  if (typeof subgraph.getNodeById === "function") {
+    try {
+      const found = subgraph.getNodeById(id);
+      if (found) return found;
+    } catch {
+      /* fall through to the live node list */
+    }
+  }
+  return (subgraph._nodes ?? subgraph.nodes ?? []).find((node) => String(node?.id) === String(id)) ?? null;
+}
+
+function readSubgraphLink(subgraph, linkId) {
+  if (linkId == null || !subgraph) return null;
+  if (typeof subgraph.getLink === "function") {
+    try {
+      const link = subgraph.getLink(linkId);
+      if (link) return link;
+    } catch {
+      /* try the raw stores below */
+    }
+  }
+  const links = subgraph.links ?? subgraph._links;
+  if (!links) return null;
+  if (typeof links.get === "function") return links.get(linkId) ?? null;
+  if (Array.isArray(links)) {
+    return links.find((entry) => Number(entry?.id ?? entry?.[0]) === Number(linkId)) ?? null;
+  }
+  return links[linkId] ?? null;
+}
+
+function enumerateSubgraphLinks(subgraph) {
+  const links = subgraph?.links ?? subgraph?._links;
+  if (!links) return [];
+  if (typeof links.values === "function") return [...links.values()];
+  if (Array.isArray(links)) return links;
+  return Object.values(links);
+}
+
+function originIsInputRail(originId, subgraph) {
+  if (originId == null) return false;
+  if (Number(originId) === SUBGRAPH_INPUT_RAIL_ID) return true;
+  const inputNode = subgraph?.inputNode;
+  return inputNode != null && String(inputNode.id) === String(originId);
+}
+
+function sourceFromResolvedLink(subgraph, link) {
+  if (!link) return null;
+  const targetId = link.target_id ?? link[3];
+  const targetSlot = link.target_slot ?? link[4];
+  const innerNode = subgraphNodeById(subgraph, targetId);
+  if (!innerNode) return null;
+  const targetInput = Number.isInteger(targetSlot) ? innerNode.inputs?.[targetSlot] : null;
+  let targetWidget = null;
+  if (typeof innerNode.getWidgetFromSlot === "function" && targetInput) {
+    try {
+      targetWidget = innerNode.getWidgetFromSlot(targetInput);
+    } catch {
+      targetWidget = null;
+    }
+  }
+  if (!targetWidget && targetInput) {
+    const widgetName = targetInput.widget?.name ?? targetInput.name;
+    targetWidget = (innerNode.widgets ?? []).find((widget) => widget?.name === widgetName) ?? null;
+  }
+  const sourceWidgetName = targetWidget?.name ?? targetInput?.name;
+  if (typeof sourceWidgetName !== "string" || sourceWidgetName.length === 0) return null;
+  return { sourceNodeId: String(innerNode.id), sourceWidgetName };
+}
+
+function uniqueSlotMatchingAliases(subgraph, aliases) {
+  const wanted = new Set(
+    (aliases ?? []).map((alias) => String(alias).toLowerCase()).filter((alias) => alias.length > 0),
+  );
+  if (!wanted.size) return null;
+  const hits = [];
+  for (const slot of subgraphIoSlots(subgraph)) {
+    const names = [slot?.name, slot?.label]
+      .filter((value) => value != null && String(value).length > 0)
+      .map((value) => String(value).toLowerCase());
+    if (names.some((name) => wanted.has(name))) hits.push(slot);
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+function liveSlotForHostInput(subgraphNode, hostInput, subgraphInput) {
+  const subgraph = subgraphNode?.subgraph;
+  const aliases = promotedInputAliases(hostInput, subgraphInput);
+  const byName = uniqueSlotMatchingAliases(subgraph, aliases);
+  if (byName) return byName;
+  const hostInputs = Array.isArray(subgraphNode?.inputs) ? subgraphNode.inputs : [];
+  const index = hostInputs.indexOf(hostInput);
+  const slots = subgraphIoSlots(subgraph);
+  if (index >= 0 && index < slots.length && hostInputs.length === slots.length) return slots[index];
+  return subgraphInput ?? null;
+}
+
+/**
+ * After load, SubgraphInput.linkIds can still be empty while inner widgets are
+ * already wired from the input rail (-10). Walk those known terminals instead of
+ * treating the promotion as unresolved (#2057).
+ */
+function sourcesFromInputRailSlot(subgraph, slot) {
+  const sources = [];
+  const seen = new Set();
+  const add = (source) => {
+    if (!source) return;
+    const key = `${source.sourceNodeId}\0${source.sourceWidgetName}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    sources.push(source);
+  };
+  for (const linkId of slotLinkIds(slot)) add(sourceFromResolvedLink(subgraph, readSubgraphLink(subgraph, linkId)));
+  const slots = subgraphIoSlots(subgraph);
+  const slotIndex = slots.indexOf(slot);
+  if (slotIndex < 0) return sources;
+  for (const link of enumerateSubgraphLinks(subgraph)) {
+    const originId = link?.origin_id ?? link?.[1];
+    const originSlot = link?.origin_slot ?? link?.[2];
+    if (!originIsInputRail(originId, subgraph) || Number(originSlot) !== slotIndex) continue;
+    add(sourceFromResolvedLink(subgraph, link));
+  }
+  for (const node of subgraph?._nodes ?? subgraph?.nodes ?? []) {
+    if (!node) continue;
+    for (const input of node.inputs ?? []) {
+      if (input?.link == null) continue;
+      const link = readSubgraphLink(subgraph, input.link);
+      if (!link) continue;
+      const originId = link.origin_id ?? link[1];
+      const originSlot = link.origin_slot ?? link[2];
+      if (!originIsInputRail(originId, subgraph) || Number(originSlot) !== slotIndex) continue;
+      add(sourceFromResolvedLink(subgraph, link));
+    }
+  }
+  return sources;
+}
+
+function uniqueRailBackedInnerWidget(subgraph, widgetName) {
+  const wanted = String(widgetName).toLowerCase();
+  if (!wanted) return null;
+  const hits = [];
+  for (const node of subgraph?._nodes ?? subgraph?.nodes ?? []) {
+    if (!node) continue;
+    const widget = (node.widgets ?? []).find((candidate) => candidate?.name?.toLowerCase() === wanted);
+    if (!widget) continue;
+    const input = (node.inputs ?? []).find((slot) => {
+      if (!slot || slot.link == null) return false;
+      const name = slot.name ?? slot.widget?.name;
+      if (typeof name !== "string" || name.toLowerCase() !== wanted) return false;
+      const link = readSubgraphLink(subgraph, slot.link);
+      if (!link) return false;
+      return originIsInputRail(link.origin_id ?? link[1], subgraph);
+    });
+    if (input) hits.push({ sourceNodeId: String(node.id), sourceWidgetName: widget.name });
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+function resolveWidgetOnlyLoadedPromotion(subgraphNode, widgetName) {
+  const subgraph = subgraphNode?.subgraph;
+  const wanted = String(widgetName).toLowerCase();
+  const widgets = Array.isArray(subgraphNode?.widgets) ? subgraphNode.widgets : [];
+  const hostHits = widgets.filter(
+    (widget) => widget && typeof widget.name === "string" && widget.name.toLowerCase() === wanted,
+  );
+  if (hostHits.length !== 1) return { promoted: false };
+  const source = uniqueRailBackedInnerWidget(subgraph, widgetName);
+  if (!source) return { promoted: false };
+  const innerNode = subgraphNodeById(subgraph, source.sourceNodeId);
+  const innerWidget = (innerNode?.widgets ?? []).find((widget) => widget?.name === source.sourceWidgetName);
+  if (!innerNode || !innerWidget) return { promoted: false };
+  const input = { name: hostHits[0].name, _widget: hostHits[0], widget: hostHits[0] };
+  const parentWidgets = liveHostPromotedWidgets(subgraphNode, input, innerWidget);
+  const parentWidget = parentWidgets[0] ?? null;
+  if (!parentWidget) return { promoted: false };
+  return { promoted: true, target: { node: innerNode, widget: innerWidget, input, parentWidget, parentWidgets } };
+}
+
+function resolveLoadedPromotionSource(subgraphNode, hostInput, subgraphInput, widgetName, resolveSource) {
+  const subgraph = subgraphNode?.subgraph;
+  const liveSlot = liveSlotForHostInput(subgraphNode, hostInput, subgraphInput);
+  if (liveSlot && typeof resolveSource === "function") {
+    // #1560 — a throwing resolver is a malformed promotion, not a missing
+    // mapping. Swallowing it let collectPromotionIntermediates keep walking
+    // and return a partial type list. Incomplete (null) results still fall
+    // through to the inner-rail walk (#2057).
+    const resolved = resolveSource(subgraphNode, liveSlot);
+    if (resolved?.sourceNodeId != null && typeof resolved.sourceWidgetName === "string") return resolved;
+  }
+  if (liveSlot) {
+    const sources = sourcesFromInputRailSlot(subgraph, liveSlot);
+    if (sources.length === 1) return sources[0];
+    if (sources.length > 1) {
+      return {
+        error: `promoted widget "${widgetName}" is ambiguous — ${sources.length} inner rail terminals match; refusing to guess.`,
+      };
+    }
+  }
+  return uniqueRailBackedInnerWidget(subgraph, widgetName);
 }
 
 /**
@@ -1646,8 +1897,11 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
     if (aliases.includes(wanted)) matches.push({ input, subgraphInput });
   }
 
-  // No matching host input at all ⇒ a genuine non-promoted own-widget.
-  if (matches.length === 0) return { promoted: false };
+  // No matching host input at all ⇒ usually a genuine non-promoted own-widget.
+  // After load, outline can still list the host rail while configure has not
+  // rebound `_subgraphSlot` onto a host input; a unique inner input-rail
+  // terminal of the same name is that promotion (#2057).
+  if (matches.length === 0) return resolveWidgetOnlyLoadedPromotion(subgraphNode, widgetName);
   if (matches.length > 1) {
     return {
       promoted: true,
@@ -1657,23 +1911,29 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   }
 
   const { input, subgraphInput } = matches[0];
-  // It IS a promoted widget, but its backing subgraph slot is absent — we
-  // cannot reach the inner target, so refuse rather than corrupt the parent.
-  if (!subgraphInput) {
+  const liveSlot = liveSlotForHostInput(subgraphNode, input, subgraphInput);
+  // It IS a promoted widget. Prefer the live subgraph-input / input-rail slot
+  // (which may exist even when `_subgraphSlot` was not rebound after load).
+  // Still fail closed when neither that slot nor a unique inner rail terminal
+  // can name the inner (node, widget) — never write the shifted parent slot.
+  const source = resolveLoadedPromotionSource(subgraphNode, input, liveSlot, widgetName, resolveSource);
+  if (source?.error) {
+    return { promoted: true, target: null, error: source.error };
+  }
+  if (!liveSlot && !source) {
     return {
       promoted: true,
       target: null,
       error: `promoted widget "${widgetName}" has no backing subgraph slot (_subgraphSlot missing) — cannot resolve inner target.`,
     };
   }
-  if (typeof resolveSource !== "function") {
+  if (!source && typeof resolveSource !== "function") {
     return {
       promoted: true,
       target: null,
       error: `no resolver available for promoted widget "${widgetName}".`,
     };
   }
-  const source = resolveSource(subgraphNode, subgraphInput);
   if (!source) {
     return {
       promoted: true,
@@ -1681,10 +1941,7 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
       error: `promoted widget "${widgetName}" has no resolvable inner link (stale/empty linkIds).`,
     };
   }
-  const innerNode =
-    typeof subgraph.getNodeById === "function"
-      ? subgraph.getNodeById(source.sourceNodeId)
-      : (subgraph._nodes ?? []).find((n) => String(n?.id) === String(source.sourceNodeId));
+  const innerNode = subgraphNodeById(subgraph, source.sourceNodeId);
   if (!innerNode) {
     return {
       promoted: true,
