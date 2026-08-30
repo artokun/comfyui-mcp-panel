@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- omit private combo option values from panel_set_widget refusal diagnostics while preserving the invalid-value verdict and option count (#2547)
+
 ## [0.15.136] - 2026-08-30
 
 ### Fixed

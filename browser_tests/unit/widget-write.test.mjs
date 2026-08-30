@@ -672,6 +672,36 @@ test("combo: an invalid value is REJECTED, not coerced to another enum", () => {
   assert.equal(node.widgets[0].value, "pose-1.safetensors", "must not have mutated on reject");
 });
 
+test("#2547: an invalid combo refusal keeps the verdict/count but never discloses option values", () => {
+  const privateOptions = [
+    "private-project/input/portrait-01.png",
+    "private-project/input/portrait-02.png",
+    "private-project/input/client-reference.png",
+  ];
+  const node = {
+    id: 278,
+    type: "LoadImage",
+    widgets: [{ name: "image", options: { values: privateOptions }, value: privateOptions[0] }],
+  };
+
+  let refusal;
+  try {
+    applyWidgetWrite(node, "image", "", HOOKS);
+  } catch (err) {
+    refusal = err;
+  }
+
+  assert.ok(refusal instanceof WidgetWriteError);
+  assert.match(refusal.message, /not a valid option for combo widget "image"/);
+  assert.match(refusal.message, /holds 3 options/);
+  assert.match(refusal.message, /rejected VALUE, not an unreadable list/);
+  assert.match(refusal.message, /intentionally omitted/);
+  for (const privateValue of privateOptions) {
+    assert.equal(refusal.message.includes(privateValue), false, `must not disclose ${privateValue}`);
+  }
+  assert.equal(node.widgets[0].value, privateOptions[0], "must not mutate on reject");
+});
+
 test("combo: a numeric index is NOT reinterpreted as a dropdown position", () => {
   const node = { id: 1, type: "N", widgets: [{ name: "c", options: { values: ["alpha", "beta", "gamma"] }, value: "alpha" }] };
   assert.throws(() => applyWidgetWrite(node, "c", 1, HOOKS), WidgetWriteError);
