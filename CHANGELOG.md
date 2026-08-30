@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.131] - 2026-08-30
+
 ### Fixed
 - the pre-publish registry parity scan now inspects the packaged archive rather than the repo, is wired into the publish job, and refuses to treat a Pending registry status as a pass (#1886)
 
