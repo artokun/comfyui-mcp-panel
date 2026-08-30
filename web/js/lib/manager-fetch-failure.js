@@ -86,11 +86,14 @@ const TRANSPORT_MESSAGES = [
 /**
  * What to say when a Manager call threw before any response arrived.
  *
- * `route` is the path that was attempted (without the `/v2/` prefix the caller adds).
+ * `route` is the path that was attempted (without the prefix). Default prefix is
+ * `/v2/` (managerV2). managerCall passes `{ prefix: "/" }` so a legacy absolute
+ * fetch is not labelled as a v2 route (#2024).
  */
-export function managerFetchFailureMessage(route, err) {
+export function managerFetchFailureMessage(route, err, { prefix = "/v2/" } = {}) {
   const raw = err instanceof Error ? err.message : String(err ?? "");
-  const path = `/v2/${String(route ?? "").replace(/^\/+/, "")}`;
+  const base = String(prefix ?? "/v2/");
+  const path = `${base.endsWith("/") ? base : `${base}/`}${String(route ?? "").replace(/^\/+/, "")}`;
   if (!isTransportFailure(err)) {
     // Not a transport failure — keep whatever it actually was, plus the route it was
     // attempted against. Never relabel an error whose shape is not recognised.
@@ -108,4 +111,23 @@ export function managerFetchFailureMessage(route, err) {
     `MUTATING call (install, update, delete, queue), check the current state first — a ` +
     `blind retry can apply it twice. A read-only call is safe to repeat.`
   );
+}
+
+/**
+ * Is this the panel's Manager transport wrap (#1472), or the browser's own
+ * no-response throw that wrap is built from?
+ *
+ * panel_search_nodes uses this to keep the wrap at the front of `message` so
+ * MCP #2492's host-HTTP fallback can still extractText() it, instead of
+ * replacing it with "Manager is disabled".
+ */
+export function isManagerTransportWrap(err) {
+  if (isTransportFailure(err)) return true;
+  if (err && typeof err === "object" && isTransportFailure(err.cause)) return true;
+  const msg = (err instanceof Error ? err.message : String(err ?? ""))
+    .trim()
+    .replace(/^(?:Error:\s*)+/i, "");
+  const match = /^ComfyUI-Manager request to (\S+) did not complete:\s*([\s\S]+)$/i.exec(msg);
+  if (!match) return false;
+  return isTransportFailure(match[2]);
 }

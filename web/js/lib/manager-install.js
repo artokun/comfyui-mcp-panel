@@ -6,6 +6,11 @@
 // installCustomNode / looksLikeGitUrl / gitCheckoutDir logic
 // (src/services/node-management.ts).
 
+import {
+  isManagerTransportWrap,
+  managerFetchFailureMessage,
+} from "./manager-fetch-failure.js";
+
 /** Does `s` look like a bare "author/repo" GitHub shorthand — no protocol/scp
  *  prefix, no ".git" suffix, exactly one "/", plausible path-segment chars on
  *  both sides? Distinguishes it from a slash-free registry id (e.g.
@@ -572,6 +577,10 @@ export function isManagerUnreachable(err) {
   if (err?.managerSecurityRefusal === true) return false;
   if (isManagerRouteMissing(err)) return true;
   if (err?.managerTransportUnreachable === true) return true;
+  // #2024 — the #1472 wrap does not contain "not reachable", so an untagged
+  // "Failed to fetch" used to skip the legacy getmappings retry. Safe here:
+  // this predicate only gates idempotent GET fallbacks.
+  if (isManagerTransportWrap(err)) return true;
   const msg = String(err?.message ?? err ?? "");
   return /not reachable/i.test(msg) || /HTTP\s*404\b/.test(msg);
 }
@@ -684,6 +693,14 @@ export function matchesAllTerms(hay, terms) {
  * DISCLOSES the clamp as `limit_cap` whenever it bit.
  */
 export const SEARCH_LIMIT_CAP = 40;
+
+/** Route tail `managerGet`/`managerCall` prefix; v2 adds `/v2/`, legacy adds `/`. */
+export const SEARCH_MAPPINGS_ROUTE = "customnode/getmappings?mode=cache";
+
+export const SEARCH_MAPPINGS_ROUTES = [
+  `/v2/${SEARCH_MAPPINGS_ROUTE}`,
+  `/${SEARCH_MAPPINGS_ROUTE}`,
+];
 
 /**
  * Normalize a ComfyUI-Manager `/customnode/getmappings` payload into the
@@ -859,25 +876,51 @@ export async function objectInfoSearchFallback(
  */
 export function managerUnavailableResult(query, err) {
   const timedOut = err?.managerSearchTimedOut === true;
-  return {
+  const reason = String(err?.message ?? err ?? "ComfyUI-Manager not reachable");
+  const transport = !timedOut && isManagerTransportWrap(err);
+  const result = {
     supported: false,
     managerReachable: false,
     count: 0,
     results: [],
     query: query == null ? "" : String(query),
-    reason: String(err?.message ?? err ?? "ComfyUI-Manager not reachable"),
+    reason,
     message: timedOut
       ? "Node-registry search timed out before ComfyUI-Manager replied. No canvas " +
         "workflow was changed. Retry the search; if the Manager remains slow or " +
         "unresponsive, enable/check the built-in Manager and continue with nodes " +
         "already installed via panel_list_nodes or the current graph via " +
         "panel_query_graph."
-      : "Node-registry search is unavailable: the built-in ComfyUI-Manager could not " +
-        "be reached on this ComfyUI (it may be disabled, or a legacy/partial Manager " +
-        "build without the search endpoint). Enable the built-in Manager to search the " +
-        "registry, or continue with the nodes already installed — inspect them with " +
-        "panel_list_nodes and the current graph with panel_query_graph.",
+      : transport
+        ? managerSearchTransportMessage(reason)
+        : "Node-registry search is unavailable: the built-in ComfyUI-Manager could not " +
+          "be reached on this ComfyUI (it may be disabled, or a legacy/partial Manager " +
+          "build without the search endpoint). Enable the built-in Manager to search the " +
+          "registry, or continue with the nodes already installed — inspect them with " +
+          "panel_list_nodes and the current graph with panel_query_graph.",
   };
+  if (transport) {
+    result.transportFailure = true;
+    result.routesAttempted = SEARCH_MAPPINGS_ROUTES.slice();
+  }
+  return result;
+}
+
+/** Keep the #1472 wrap at the FRONT of `message`. MCP #2492 extractText()s that
+ *  field and only host-HTTP-falls-back when it starts with the wrap. */
+function managerSearchTransportMessage(reason) {
+  const wrap = /^ComfyUI-Manager request to \S+ did not complete:/i.test(reason)
+    ? reason
+    : managerFetchFailureMessage(SEARCH_MAPPINGS_ROUTE, reason);
+  return (
+    `${wrap} Both the v2 mappings route (${SEARCH_MAPPINGS_ROUTES[0]}) and the ` +
+    `legacy absolute route (${SEARCH_MAPPINGS_ROUTES[1]}) were attempted from this ` +
+    `browser tab and neither produced an HTTP response. Live canvas reads can still ` +
+    `work — this is a panel-origin transport failure, not proof Manager is disabled ` +
+    `and not proof the pack is missing. The MCP host may still reach those same ` +
+    `mappings over host HTTP. Already-installed nodes remain available via ` +
+    `panel_list_nodes and the current graph via panel_query_graph.`
+  );
 }
 
 /** #1908 — Manager search is a canvas-independent read, but its command still
@@ -1055,7 +1098,9 @@ export function emptyCatalogueResult(query) {
  *   3. if the absolute route is ALSO unreachable, try the installed-node
  *      /object_info search (#426) via the injected `objectInfoGet`; on a miss,
  *      return the structured {supported:false,…} capability result instead of
- *      throwing.
+ *      throwing. A browser-origin transport wrap (#2024, "Failed to fetch" with
+ *      no HTTP response) stays at the front of `message` so it is not a bare
+ *      fetch failure and MCP host-HTTP fallback can still see it.
  * Any non-"unreachable" error still propagates.
  */
 export async function searchNodesVia(
@@ -1063,7 +1108,7 @@ export async function searchNodesVia(
   managerCall,
   { query, limit, objectInfoGet, signal, budgetSignal, timeoutMs } = {},
 ) {
-  const route = "customnode/getmappings?mode=cache";
+  const route = SEARCH_MAPPINGS_ROUTE;
   const requestSignal = managerSearchRequestSignal(signal, budgetSignal);
   const requestOptions = requestSignal ? { signal: requestSignal } : undefined;
   throwIfManagerSearchCallerAborted(signal);

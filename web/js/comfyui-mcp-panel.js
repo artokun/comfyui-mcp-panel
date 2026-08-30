@@ -8195,7 +8195,7 @@ async function managerCall(route, { method = "GET", body, signal } = {}) {
     // the LEGACY transport, i.e. the very rung the ladder falls back TO.
     if (err?.name === "AbortError") throw err;
     throw markManagerUnreachable(
-      new Error(managerFetchFailureMessage(route, err), { cause: err }),
+      new Error(managerFetchFailureMessage(route, err, { prefix: "/" }), { cause: err }),
     );
   }
   if (!res) {
@@ -26140,7 +26140,8 @@ const GRAPH_TOOL_EXECUTORS = {
     // unreachable it falls back to an INSTALLED-node search over the connected
     // ComfyUI's /object_info (#426) so a legacy/disabled Manager still returns
     // usable, already-installed matches; on a miss it returns the structured
-    // {supported:false,…} capability result.
+    // {supported:false,…} capability result. A browser-origin transport wrap
+    // (#2024) is kept as the message so it is not a bare Failed to fetch.
     const budgetSignal = AbortSignal.timeout(NODES_SEARCH_COMMAND_BUDGET_MS);
     return searchNodesVia(managerGet, managerCall, {
       query,

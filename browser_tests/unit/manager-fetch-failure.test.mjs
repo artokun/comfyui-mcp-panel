@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
+  isManagerTransportWrap,
   isTransportFailure,
   managerFetchFailureMessage,
 } from "../../web/js/lib/manager-fetch-failure.js";
@@ -164,6 +165,38 @@ test("#1472 'fetch failed' stays EXACT because a prefix match collides", () => {
   // Where a prefix is ambiguous, exactness wins; where it is not, tolerance wins.
   assert.equal(isTransportFailure(new Error("fetch failed")), true);
   assert.equal(isTransportFailure(new Error("fetch failed for upstream registry")), false);
+});
+
+test("#2024 managerFetchFailureMessage prefix names the absolute path, not /v2/", () => {
+  const msg = managerFetchFailureMessage(
+    "customnode/getmappings?mode=cache",
+    new TypeError("Failed to fetch"),
+    { prefix: "/" },
+  );
+  assert.match(msg, /\/customnode\/getmappings\?mode=cache/);
+  assert.doesNotMatch(msg, /\/v2\/customnode/);
+  assert.match(msg, /did not complete: Failed to fetch/);
+});
+
+test("#2024 isManagerTransportWrap matches the wrap and a bare Failed to fetch", () => {
+  const cause = new TypeError("Failed to fetch");
+  const wrap = new Error(managerFetchFailureMessage("customnode/getmappings?mode=cache", cause), {
+    cause,
+  });
+  assert.equal(isManagerTransportWrap(cause), true);
+  assert.equal(isManagerTransportWrap(wrap), true);
+  assert.equal(isManagerTransportWrap(new Error("Manager customnode/getmappings: HTTP 500")), false);
+  assert.equal(isManagerTransportWrap(new Error("fetch failed for upstream registry")), false);
+});
+
+test("#2024 WIRING: managerCall names the ABSOLUTE route, not /v2/", () => {
+  const src = readFileSync(join(ROOT, "web/js/comfyui-mcp-panel.js"), "utf8");
+  const at = src.indexOf("async function managerCall(");
+  assert.ok(at > 0, "managerCall must exist");
+  const endOfCatch = src.indexOf("if (!res) {", at);
+  assert.ok(endOfCatch > at, "managerCall's catch must be followed by the no-response check");
+  const body = src.slice(at, endOfCatch);
+  assert.match(body, /managerFetchFailureMessage\(route, err, \{ prefix: "\/" \}\)/);
 });
 
 test("#1472 WIRING: the source comment no longer claims a re-send verdict", () => {
