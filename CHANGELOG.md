@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_set_widget no longer refuses a loaded subgraph's promoted combo or number that outline already lists: the host rail resolves to its inner input-rail terminal so the promoted-terminal witness completes (#2057)
 - panel_add_node can add a class from a type-scoped /object_info read when the full dump misses its fixed budget on a large install, without treating a stale whole cache as verified (#2050)
 - relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
 
