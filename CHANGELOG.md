@@ -14,6 +14,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_open_workflow of a listed unsaved tmp: tab after reconnect no longer false-negatives: it rechecks the active routing key before failing, and an applied switch that is still unreadable returns the receipt rather than a hard error (#2022)
 - panel_copy_nodes with explicit node_ids no longer copies a leftover additive canvas selection (#2004)
+- panel_promote_widget refuses canvas-only callback widgets (control_after_generate) and writes only [nodeId, widgetName] string pairs through the legacy promotion store, so saved workflows stay loadable (#2002)
 
 
 ## [0.15.142] - 2026-08-30

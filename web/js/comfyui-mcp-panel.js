@@ -9925,13 +9925,92 @@ function getPiniaStore(id) {
  *  promote/demote/isPromoted) — the state that exposes an inner subgraph widget
  *  on the parent SubgraphNode. Frontend >= 1.48 removed this store: value
  *  widgets promote via linked subgraph inputs, and preview widgets use
- *  `previewExposure` instead. */
+ *  `previewExposure` instead.
+ *
+ *  1.41 `promote`/`demote` take four strings
+ *  `(graphId, subgraphNodeId, interiorNodeId, widgetName)`. Passing a source
+ *  object as the third argument wrote `properties.proxyWidgets[n] = [object, null]`,
+ *  which the load validator rejects (#2002). */
 function getPromotionStore() {
   const store = getPiniaStore("promotion");
   if (!store || typeof store.promote !== "function") {
     throw new Error("widget-promotion unavailable on this ComfyUI frontend (no 'promotion' store)");
   }
   return store;
+}
+
+/** Canvas-only callback widgets (`control_after_generate` and similar): both
+ *  `serialize:false` and `canvasOnly:true`. They have no connectable input slot,
+ *  so the link-only path cannot promote them, and the legacy store used to persist
+ *  an unloadable `proxyWidgets` entry for them (#2002). */
+function isCanvasOnlyCallbackWidget(widget) {
+  if (!widget) return false;
+  const opts = widget.options ?? {};
+  const serializeFalse = widget.serialize === false || opts.serialize === false;
+  const canvasOnly = widget.canvasOnly === true || opts.canvasOnly === true;
+  return serializeFalse && canvasOnly;
+}
+
+/** Frontend load schema for `properties.proxyWidgets`: `[string, string][]`. */
+function isValidProxyWidgetPair(entry) {
+  return (
+    Array.isArray(entry) &&
+    entry.length >= 2 &&
+    typeof entry[0] === "string" &&
+    entry[0].length > 0 &&
+    typeof entry[1] === "string" &&
+    entry[1].length > 0
+  );
+}
+
+/** Drive the 1.41 promotion store with string ids, then rebuild both the store
+ *  and `properties.proxyWidgets` from the union of valid name pairs so serialize
+ *  cannot persist the object/null shape the old 3-arg call wrote (#2002). */
+function applyLegacyPromotionStore(store, action, parent, rootGraph, source) {
+  const rootGraphId = parent.rootGraph?.id ?? rootGraph?.id;
+  const interiorNodeId = String(source.sourceNodeId ?? "");
+  const widgetName = String(source.sourceWidgetName ?? "");
+  if (!interiorNodeId || !widgetName) {
+    throw new Error("legacy promotion requires a string node id and widget name");
+  }
+  store[action](rootGraphId, parent.id, interiorNodeId, widgetName);
+
+  const seen = new Set();
+  const pairs = [];
+  const addPair = (id, name) => {
+    if (typeof id !== "string" || !id || typeof name !== "string" || !name) return;
+    const key = `${id}\0${name}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    pairs.push([id, name]);
+  };
+  const raw = Array.isArray(parent.properties?.proxyWidgets) ? parent.properties.proxyWidgets : [];
+  for (const entry of raw) {
+    if (isValidProxyWidgetPair(entry)) addPair(entry[0], entry[1]);
+  }
+  if (typeof store.getPromotions === "function") {
+    for (const entry of store.getPromotions(rootGraphId, parent.id) ?? []) {
+      addPair(entry?.interiorNodeId, entry?.widgetName);
+    }
+  }
+  const wantedKey = `${interiorNodeId}\0${widgetName}`;
+  let next;
+  if (action === "demote") {
+    next = pairs.filter(([id, name]) => `${id}\0${name}` !== wantedKey);
+  } else {
+    addPair(interiorNodeId, widgetName);
+    next = pairs;
+  }
+
+  const props = parent.properties ?? (parent.properties = {});
+  props.proxyWidgets = next;
+  if (typeof store.setPromotions === "function") {
+    store.setPromotions(
+      rootGraphId,
+      parent.id,
+      next.map(([id, name]) => ({ interiorNodeId: id, widgetName: name })),
+    );
+  }
 }
 
 /** Reach ComfyUI's PREVIEW-widget exposure store (id "previewExposure"; methods
@@ -26440,6 +26519,18 @@ const GRAPH_TOOL_EXECUTORS = {
           // Don't mask why the primary path failed — that message is the useful
           // one. The legacy store is gone on frontend >= 1.48; if it is also
           // missing here, surface BOTH errors rather than only "no promotion store".
+          // Canvas-only callback widgets (control_after_generate) have no slot
+          // and must not fall through: the 3-arg object call used to append
+          // [object, null] to properties.proxyWidgets and the saved workflow
+          // would not load (#2002).
+          if (!demote && isCanvasOnlyCallbackWidget(w)) {
+            throw new Error(
+              `${linkErr?.message ?? linkErr}. Widget "${w.name}" is a canvas-only callback ` +
+                `widget and cannot be promoted — the legacy store would write unloadable ` +
+                `properties.proxyWidgets. Set it on the inner node, or promote a connectable ` +
+                `value widget instead.`,
+            );
+          }
           strategy = "legacy-store";
           let store;
           try {
@@ -26448,8 +26539,7 @@ const GRAPH_TOOL_EXECUTORS = {
             throw new Error(`${linkErr?.message ?? linkErr} (and ${storeErr.message})`);
           }
           for (const p of parents) {
-            const rootGraphId = p.rootGraph?.id ?? rootGraph?.id;
-            store[action](rootGraphId, p.id, source);
+            applyLegacyPromotionStore(store, action, p, rootGraph, source);
           }
         }
       }

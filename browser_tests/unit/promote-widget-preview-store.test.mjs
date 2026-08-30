@@ -114,6 +114,7 @@ function makeHarness({
       : { name: widget.name, type: widget.type ?? "*", label: widget.label, widget: { name: widget.name } },
   linkConnects = true,
   atRoot = false,
+  parentProperties,
 } = {}) {
   const parentInputs = [];
   const subgraph = {
@@ -142,6 +143,7 @@ function makeHarness({
     subgraph,
     inputs: parentInputs,
     rootGraph: { id: "root-uuid" },
+    properties: parentProperties ?? {},
     computeSize() {},
     setDirtyCanvas() {},
     invalidatePromotedViews() {},
@@ -302,7 +304,7 @@ test("#1271 a preview widget without previewExposure still reports the real link
 
 test("#1271 a failed link-only promote still uses the legacy store when it exists", () => {
   const legacy = makeLegacyPromotionStore();
-  const { fn } = makeHarness({
+  const { fn, parent } = makeHarness({
     stores: { promotion: legacy },
     innerWidgets: [{ name: "cfg", type: "number" }],
     slotFor: () => null,
@@ -315,7 +317,12 @@ test("#1271 a failed link-only promote still uses the legacy store when it exist
   assert.equal(legacy.calls[0][0], "promote");
   assert.equal(legacy.calls[0][1], "root-uuid");
   assert.equal(legacy.calls[0][2], 10);
-  assert.deepEqual(legacy.calls[0][3], { sourceNodeId: "3", sourceWidgetName: "cfg" });
+  // 1.41 usePromotionStore.promote(graphId, subgraphNodeId, interiorNodeId, widgetName)
+  // — four strings. The previous 3-arg source object became [object, null] in
+  // properties.proxyWidgets and the saved workflow would not load (#2002).
+  assert.equal(legacy.calls[0][3], "3");
+  assert.equal(legacy.calls[0][4], "cfg");
+  assert.deepEqual(parent.properties.proxyWidgets, [["3", "cfg"]]);
 });
 
 test("#1271 a type-preview widget (no $$ prefix) still uses previewExposure", () => {
@@ -465,4 +472,165 @@ test("#2321 nested subgraph: promote from innermost graph (root → 142 → 133 
   assert.equal(result.promoted, "steps", "promotion should succeed");
   assert.equal(result.from_node, innerNode.id, "source node should be inner");
   assert.deepEqual(result.on_subgraph_nodes, [133], "must find node 133 as the parent");
+});
+
+const CONTROL_AFTER_GENERATE = {
+  name: "control_after_generate",
+  type: "combo",
+  value: "randomize",
+  options: {
+    values: ["fixed", "increment", "decrement", "randomize"],
+    serialize: false,
+    canvasOnly: true,
+  },
+};
+
+function assertLoadableProxyWidgets(proxyWidgets) {
+  assert.ok(Array.isArray(proxyWidgets), "proxyWidgets must be an array");
+  const roundTrip = JSON.parse(JSON.stringify(proxyWidgets));
+  for (const [i, entry] of roundTrip.entries()) {
+    assert.ok(Array.isArray(entry), `proxyWidgets[${i}] must be a pair`);
+    assert.equal(typeof entry[0], "string", `proxyWidgets[${i}][0] must be a string (got ${typeof entry[0]})`);
+    assert.ok(entry[0].length > 0, `proxyWidgets[${i}][0] must be non-empty`);
+    assert.equal(typeof entry[1], "string", `proxyWidgets[${i}][1] must be a string (got ${typeof entry[1]})`);
+    assert.ok(entry[1].length > 0, `proxyWidgets[${i}][1] must be non-empty`);
+  }
+}
+
+/** Mirrors ComfyUI 1.41 usePromotionStore + SubgraphNode.serialize: the store
+ *  holds {interiorNodeId, widgetName}, serialize copies [interiorNodeId, widgetName]
+ *  onto properties.proxyWidgets. Passing a source object as interiorNodeId is
+ *  exactly the [object, null] load failure. */
+function makeFrontendPromotionStore() {
+  const byHost = new Map();
+  const keyOf = (graphId, nodeId) => `${graphId}|${nodeId}`;
+  const store = {
+    calls: [],
+    getPromotions(graphId, nodeId) {
+      return [...(byHost.get(keyOf(graphId, nodeId)) ?? [])];
+    },
+    setPromotions(graphId, nodeId, entries) {
+      byHost.set(keyOf(graphId, nodeId), [...entries]);
+    },
+    promote(graphId, subgraphNodeId, interiorNodeId, widgetName) {
+      store.calls.push(["promote", graphId, subgraphNodeId, interiorNodeId, widgetName]);
+      const entries = store.getPromotions(graphId, subgraphNodeId);
+      entries.push({ interiorNodeId, widgetName });
+      store.setPromotions(graphId, subgraphNodeId, entries);
+    },
+    demote(graphId, subgraphNodeId, interiorNodeId, widgetName) {
+      store.calls.push(["demote", graphId, subgraphNodeId, interiorNodeId, widgetName]);
+      store.setPromotions(
+        graphId,
+        subgraphNodeId,
+        store.getPromotions(graphId, subgraphNodeId).filter(
+          (e) => !(e.interiorNodeId === interiorNodeId && e.widgetName === widgetName),
+        ),
+      );
+    },
+    serialize(parent, graphId) {
+      parent.properties ??= {};
+      parent.properties.proxyWidgets = store.getPromotions(graphId, parent.id).map((e) => [
+        e.interiorNodeId,
+        e.widgetName ?? null,
+      ]);
+    },
+  };
+  return store;
+}
+
+test("#2002 a canvas-only callback widget is refused and never writes proxyWidgets", () => {
+  const legacy = makeLegacyPromotionStore();
+  const { fn, parent } = makeHarness({
+    stores: { promotion: legacy },
+    innerWidgets: [
+      { name: "noise_seed", type: "INT", value: 1 },
+      CONTROL_AFTER_GENERATE,
+    ],
+    slotFor: () => null,
+  });
+
+  assert.throws(
+    () => fn({ node_id: 3, widget: "control_after_generate" }),
+    (err) => {
+      assert.match(err.message, /not backed by a connectable input slot/);
+      assert.match(err.message, /canvas-only callback widget/);
+      assert.match(err.message, /unloadable properties\.proxyWidgets/);
+      return true;
+    },
+  );
+  assert.equal(legacy.calls.length, 0, "must not call the promotion store");
+  assert.deepEqual(parent.properties.proxyWidgets, undefined);
+});
+
+test("#2002 legacy-store serialize writes [string, string] pairs, never [object, null]", () => {
+  const store = makeFrontendPromotionStore();
+  const { fn, parent } = makeHarness({
+    stores: { promotion: store },
+    innerWidgets: [{ name: "cfg", type: "number" }],
+    slotFor: () => null,
+  });
+
+  const result = fn({ node_id: 3, widget: "cfg" });
+  store.serialize(parent, "root-uuid");
+
+  assert.equal(result.strategy, "legacy-store");
+  assertLoadableProxyWidgets(parent.properties.proxyWidgets);
+  assert.deepEqual(parent.properties.proxyWidgets, [["3", "cfg"]]);
+  assert.equal(store.calls[0][3], "3");
+  assert.equal(store.calls[0][4], "cfg");
+  assert.notEqual(typeof store.calls[0][3], "object");
+});
+
+test("#2002 demote strips a pre-existing object/null proxyWidgets entry so the graph can load", () => {
+  const store = makeFrontendPromotionStore();
+  const corrupt = { sourceNodeId: "3", sourceWidgetName: "control_after_generate" };
+  store.setPromotions("root-uuid", 10, [
+    { interiorNodeId: corrupt, widgetName: undefined },
+    { interiorNodeId: "3", widgetName: "steps" },
+  ]);
+  const { fn, parent } = makeHarness({
+    stores: { promotion: store },
+    innerWidgets: [CONTROL_AFTER_GENERATE],
+    slotFor: () => null,
+    parentProperties: {
+      proxyWidgets: [
+        [corrupt, null],
+        ["3", "steps"],
+      ],
+    },
+  });
+
+  const result = fn({ node_id: 3, widget: "control_after_generate", demote: true });
+  store.serialize(parent, "root-uuid");
+
+  assert.equal(result.strategy, "legacy-store");
+  assert.equal(result.demoted, "control_after_generate");
+  assertLoadableProxyWidgets(parent.properties.proxyWidgets);
+  assert.deepEqual(parent.properties.proxyWidgets, [["3", "steps"]]);
+});
+
+test("#2002 a later valid legacy promotion keeps existing string pairs and drops garbage", () => {
+  const store = makeFrontendPromotionStore();
+  store.setPromotions("root-uuid", 10, [
+    { interiorNodeId: { sourceNodeId: "3", sourceWidgetName: "cfg" }, widgetName: undefined },
+    { interiorNodeId: "3", widgetName: "steps" },
+  ]);
+  const { fn, parent } = makeHarness({
+    stores: { promotion: store },
+    innerWidgets: [{ name: "cfg", type: "number" }],
+    slotFor: () => null,
+    parentProperties: {
+      proxyWidgets: [[{ sourceNodeId: "3", sourceWidgetName: "cfg" }, null], ["3", "steps"]],
+    },
+  });
+
+  fn({ node_id: 3, widget: "cfg" });
+  store.serialize(parent, "root-uuid");
+
+  assertLoadableProxyWidgets(parent.properties.proxyWidgets);
+  assert.deepEqual(parent.properties.proxyWidgets, [
+    ["3", "steps"],
+    ["3", "cfg"],
+  ]);
 });
