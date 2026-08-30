@@ -212,11 +212,13 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
     /NODE_DEFS_NO_ANSWER \? null :/,
     "…and a call that never answers must degrade to 'no defs', not park the add",
   );
-  // And the snapshot must be taken on BOTH paths — #700 turns on it.
+  // And the snapshot must be taken on every path that can hand a def to refresh —
+  // #700 turns on it. The third site is #2050's unregistered fallback after a silent
+  // whole dump; a one-class payload reaching registerNodesFromDefs is the same poison.
   assert.equal(
     (body.match(/snapshotBackendDef\(freshDefs, class_type\)/g) ?? []).length,
-    2,
-    "both the fast and full paths must snapshot the backend def before any refresh mutates it",
+    3,
+    "the fast path, the whole-schema path, and the #2050 type-scoped fallback must snapshot the backend def before any refresh mutates it",
   );
 });
 
@@ -635,10 +637,11 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   // same slow backend), so this term shrinks rather than grows. The command budget caps
   // what the add PAYS either way, not what a run inside it may cost.
   const runWait = run;
-  // NOT REGISTERED: no fast path (it is gated on already-registered), then the whole-schema
-  // fetch, then the resolver hands the payload to refreshComfyNodeDefs — which waits for
-  // any in-flight run and then performs its own, so the run wait is paid twice.
-  const unregisteredPath = seed + single + runWait + runWait + registration;
+  // NOT REGISTERED: no first-attempt fast path (it is gated on already-registered), then
+  // the whole-schema fetch, then — if that dump is silent — a bounded type-scoped fallback
+  // (#2050), then the resolver hands the payload to refreshComfyNodeDefs. A whole payload
+  // waits for any in-flight run and then performs its own, so the run wait is paid twice.
+  const unregisteredPath = seed + single + single + runWait + runWait + registration;
   const naiveSum = Math.max(registeredPath, unregisteredPath);
   // The tracked-ceiling ratchet this replaces was scoped "while #1192 is open" and said to
   // swap in the FITS assertion once the fix landed. This is that assertion: the naive sum

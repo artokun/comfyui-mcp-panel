@@ -1741,29 +1741,36 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       ? runOpts.runBudgetMs
       : NODE_DEFS_RUN_BUDGET_MS;
   let runDeadline = monotonicNow() + runBudgetMs;
-  // #716 — drop the widget-write burst cache at the START of this run, not after it
-  // succeeds (codex). This function runs on exactly the events that change the schema —
-  // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
-  // when the schema is most likely to have moved. Invalidating only on success would leave
-  // the pre-change map authorizing writes for the rest of the TTL, where the old code would
-  // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
-  // be wrong in the dangerous direction.
-  objectInfoCache.invalidate();
-  // #2249 — fence the last-observed snapshot while this replacement is unresolved, but do
-  // not destroy it before the new whole map succeeds. If both whole routes fail, the old
-  // membership-only map is still the only usable evidence for an existing scalar widget;
-  // object-info-snapshot.js re-binds it to the post-invalidation generation only after this
-  // run has conclusively failed. Reconnect handlers still clear it outright because a new
-  // backend process is the one event that can change the type set.
-  objectInfoSnapshot.beginReplacement?.();
-  // #1709 — fence verified per-class proofs the same way. A timeout here is not evidence
-  // the type set moved; destroying them at refresh start turned a busy /object_info into a
-  // #458 refusal of a class this session already added on this connection. Generation still
-  // advances, so an in-flight probe cannot reuse or repopulate under the new fence.
-  if (typeof verifiedNodeDefCache?.beginReplacement === "function") {
-    verifiedNodeDefCache.beginReplacement();
-  } else if (typeof verifiedNodeDefCache !== "undefined") {
-    verifiedNodeDefCache.clear();
+  // Whole-schema start-of-run effects. A one-class payload from graph_add_node is not a
+  // type-set replacement (#2050): fencing the last-observed snapshot and then running
+  // refreshComboInNodes() would re-fetch the same dump that just missed its budget, and
+  // beginReplacement would bump the generation so the add could not file the per-class
+  // proof it just verified.
+  if (replacementMayReplaceWholeSnapshot) {
+    // #716 — drop the widget-write burst cache at the START of this run, not after it
+    // succeeds (codex). This function runs on exactly the events that change the schema —
+    // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
+    // when the schema is most likely to have moved. Invalidating only on success would leave
+    // the pre-change map authorizing writes for the rest of the TTL, where the old code would
+    // have fetched and failed closed. Retiring it up front costs one extra fetch and cannot
+    // be wrong in the dangerous direction.
+    objectInfoCache.invalidate();
+    // #2249 — fence the last-observed snapshot while this replacement is unresolved, but do
+    // not destroy it before the new whole map succeeds. If both whole routes fail, the old
+    // membership-only map is still the only usable evidence for an existing scalar widget;
+    // object-info-snapshot.js re-binds it to the post-invalidation generation only after this
+    // run has conclusively failed. Reconnect handlers still clear it outright because a new
+    // backend process is the one event that can change the type set.
+    objectInfoSnapshot.beginReplacement?.();
+    // #1709 — fence verified per-class proofs the same way. A timeout here is not evidence
+    // the type set moved; destroying them at refresh start turned a busy /object_info into a
+    // #458 refusal of a class this session already added on this connection. Generation still
+    // advances, so an in-flight probe cannot reuse or repopulate under the new fence.
+    if (typeof verifiedNodeDefCache?.beginReplacement === "function") {
+      verifiedNodeDefCache.beginReplacement();
+    } else if (typeof verifiedNodeDefCache !== "undefined") {
+      verifiedNodeDefCache.clear();
+    }
   }
   // #1223 — the epoch this run STARTED on, captured before any fetch. The recording below
   // is refused if a reconnect lands while the fetch is in flight, so a pre-restart schema
@@ -1772,8 +1779,9 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   const runStartedAtGeneration = verifiedNodeDefCache.generation();
   // A refresh is not authoritative while any of its frontend mutation work is still
   // outstanding. Consumers such as collectMissingAssets must fail closed during that
-  // window, even if an earlier run had established trust.
-  nodeDefsRefreshConfirmed = false;
+  // window, even if an earlier run had established trust. A one-class registration is
+  // not that replacement, so it must not drop combo trust the last whole run earned.
+  if (replacementMayReplaceWholeSnapshot) nodeDefsRefreshConfirmed = false;
   let thrown = null;
   // #608 — what EACH transport did in the fetch phase, in order, when none of them produced
   // a payload. The verdict appends it, so a refusal names the routes that were actually
@@ -2251,7 +2259,13 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     // models resolve and stale entries clear (#185/#181/#223).
     phase = "combo";
     comboApiPresent = typeof a.refreshComboInNodes === "function";
-    if (comboApiPresent && comboRebuiltLocally && runOpts?.skipDuplicateComboRefresh === true) {
+    if (!replacementMayReplaceWholeSnapshot) {
+      // #2050 — this run registered one class from `/object_info/<Type>`. The frontend
+      // combo refresh re-fetches the whole `/object_info` document, which is the dump
+      // that just could not land. Skip it; the add's own def already carries this class's
+      // combo lists, and sibling combos stay whatever the last whole run left them.
+      phase = "done";
+    } else if (comboApiPresent && comboRebuiltLocally && runOpts?.skipDuplicateComboRefresh === true) {
       // #1736 — reapplyDefsToLiveNodes() has already rebuilt every live combo from
       // this run's authoritative payload. Calling refreshComboInNodes() here would
       // re-fetch the same schema and can remain pending behind concurrent downloads,
@@ -2528,12 +2542,14 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
       !comfyBackendSocketDown &&
       runStartedAtEpoch === backendReconnectEpoch &&
       runStartedAtGeneration === verifiedNodeDefCache.generation();
-    nodeDefsRefreshConfirmed =
-      runIsCurrent &&
-      !comboCompletionPending &&
-      !didThrow &&
-      !!defs &&
-      (comboRan || (!comboFailed && (comboRebuiltLocally || comboAbandonedAfterRebuild)));
+    if (replacementMayReplaceWholeSnapshot) {
+      nodeDefsRefreshConfirmed =
+        runIsCurrent &&
+        !comboCompletionPending &&
+        !didThrow &&
+        !!defs &&
+        (comboRan || (!comboFailed && (comboRebuiltLocally || comboAbandonedAfterRebuild)));
+    }
   }
   // RETURN this run's own verdict so a caller can trust the combo based on the result
   // of ITS refresh, independent of the shared nodeDefsRefreshConfirmed global — which a
@@ -15516,12 +15532,14 @@ const GRAPH_TOOL_EXECUTORS = {
         // "ghost" nodes appeared — the adds landed after the timeout had already
         // been reported as a failure.
         //
-        // GATED ON ALREADY-REGISTERED, and not for speed. The resolver hands
-        // `freshDefs` to refreshComfyNodeDefs() when a type still needs
+        // GATED ON ALREADY-REGISTERED for the first attempt, and not for speed. The
+        // resolver hands `freshDefs` to refreshComfyNodeDefs() when a type still needs
         // registering, and a single-class payload reaching a whole-schema refresh
         // could deregister everything else. When the type is already registered
         // that branch is unreachable, so the hazard is removed by construction
-        // rather than by remembering not to trip it.
+        // rather than by remembering not to trip it. #2050 asks this route again
+        // after the whole dump is silent, and that path marks the payload
+        // single-class so refresh must not treat it as a type-set replacement.
         //
         // The fast path only ever CONFIRMS or establishes explicit absence. Any doubt — a
         // non-200, an older build without the route, an unparseable body, or a timeout —
@@ -15619,6 +15637,48 @@ const GRAPH_TOOL_EXECUTORS = {
             freshDefs = { [class_type]: cachedDef };
             freshDefsAreSingleClass = true;
             currentDef = cachedDef;
+            return freshDefs;
+          }
+        }
+        const wholeUsable =
+          whole != null &&
+          whole !== NODE_DEFS_NO_ANSWER &&
+          typeof whole === "object" &&
+          !Array.isArray(whole);
+        if (
+          !wholeUsable &&
+          !isRegisteredNodeType(LG?.registered_node_types ?? {}, class_type)
+        ) {
+          // #2050 — the whole dump missed its budget (or never ran) on a large install
+          // while ComfyUI is healthy and GET /object_info/<Type> still answers. Ask
+          // about this class before refusing. A stale whole cache is not consulted:
+          // membership comes from this live per-class read, or from #1709's
+          // same-connection verified proof above.
+          const scopedIssued = {
+            generation: verifiedNodeDefCache.generation(),
+            epoch: backendReconnectEpoch,
+          };
+          const one = await withTimeout(
+            fetchSingleNodeInfo(class_type, (route) => api?.fetchApi?.(route)),
+            budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS),
+            () => null,
+          );
+          if (schemaProbeIsCurrent(scopedIssued) && one?.kind === "absent") {
+            freshDefs = recordObjectInfoTypes({});
+            freshDefsAreSingleClass = true;
+            currentDef = undefined;
+            return freshDefs;
+          }
+          if (schemaProbeIsCurrent(scopedIssued) && one?.kind === "present") {
+            // Do not invalidate() here: that advances the schema generation and would
+            // make a still-held whole snapshot unusable for set_widget. This class had
+            // no verified proof (the lookup above missed) and the last whole map is
+            // not evidence about it either.
+            verifiedSchemaWriteGeneration = verifiedNodeDefCache.generation();
+            verifiedSchemaWriteEpoch = scopedIssued.epoch;
+            freshDefs = recordObjectInfoTypes(one.body);
+            freshDefsAreSingleClass = true;
+            currentDef = snapshotBackendDef(freshDefs, class_type);
             return freshDefs;
           }
         }
@@ -15753,9 +15813,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // render-induced probe timeout reproduced the refusal this issue exists to remove.
     //
     // `freshDefsAreSingleClass` is the panel's OWN record of which question it asked, so it
-    // is the honest wholeness claim; the single-class fast path is only taken for an
-    // already-registered type, and it sets that flag. Mutation by a beforeRegisterNodeDef
-    // hook (#700) is irrelevant here because `record` copies out only the type NAMES.
+    // is the honest wholeness claim. The per-class route is taken for an already-registered
+    // type, and also as a last resort when the whole dump cannot land (#2050). Mutation by
+    // a beforeRegisterNodeDef hook (#700) is irrelevant here because `record` copies out
+    // only the type NAMES.
     if (
       freshDefs &&
       !freshDefsAreSingleClass &&

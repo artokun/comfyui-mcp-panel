@@ -45,14 +45,20 @@
  * So: reuse this payload for per-class facts. Anything that ranges over the install needs
  * the whole schema, and the caller must know which one it is holding.
  *
- * The caller additionally gates this on the type ALREADY BEING REGISTERED in
- * LiteGraph, which matters for a reason that is not about speed:
+ * The caller additionally gates the FIRST attempt on the type ALREADY BEING
+ * REGISTERED in LiteGraph, which matters for a reason that is not about speed:
  * `assertAddNodeResolvableRefreshing` passes its `freshDefs` to
  * `refreshComfyNodeDefs()` when a type needs registering, and handing a
  * single-class payload to a whole-schema refresh could deregister everything
  * else. Under that gate the resolver's refresh branch is unreachable, so a
  * partial payload can never get there — the hazard is removed by construction
  * rather than by remembering not to trip it.
+ *
+ * #2050 is the one later exception: after the whole dump misses its budget the
+ * caller asks this route about the unregistered class anyway, and hands the
+ * one-class map to refresh with `preloadedWholeSchema: false` so
+ * `registerComfyNodeDefs` registers that class without fencing the last whole
+ * snapshot or re-fetching `/object_info` via `refreshComboInNodes`.
  */
 
 /** Absence is `{}` with HTTP 200 on this route, not a 404. */
