@@ -2677,6 +2677,37 @@ export function graphCommandMayMutateWorkflow(command) {
 }
 
 /**
+ * #2007 — may a classified graph READ proceed after its stamp names a previous
+ * instance of the live canvas?
+ *
+ * `commandTargetsActiveWorkflow` still returns false here: the fence APPLIES,
+ * and a mutation with the same stamp is still refused. What this answers is
+ * whether the dispatch site may FOLLOW the live canvas instead of throwing.
+ *
+ * A read can only ever inspect `app.canvas.graph`. After a tab reload or an
+ * in-place replace (same workflow name, new instance uuid) the session binding
+ * still names the previous instance, so refusing `graph_outline` withholds the
+ * live graph and demands `panel_set_workflow_target({mode:"current"})` for no
+ * write-safety. The reply already publishes the live `viewing.workflow_uuid`,
+ * so the caller can see which instance was read. Mutations stay fail-closed
+ * until an explicit rebind.
+ *
+ * Fail closed unless ALL of:
+ *   - the command is on the classified read-only list (unknown/write stays a
+ *     mutation);
+ *   - the command carried a non-empty stamp (#718 — unstamped still refuses);
+ *   - the live identity is readable and non-empty (#186);
+ *   - the two differ.
+ */
+export function staleReadMayFollowLiveCanvas({ cmd, commandUuid, activeUuid } = {}) {
+  if (graphCommandMayMutateWorkflow(cmd)) return false;
+  const stamped = typeof commandUuid === "string" ? commandUuid.trim() : "";
+  const live = typeof activeUuid === "string" ? activeUuid.trim() : "";
+  if (!stamped || !live) return false;
+  return stamped !== live;
+}
+
+/**
  * #601 — seal a PROVEN binding onto the live root while the tab is still CLEAN.
  *
  * The dirty-mutation fence (#545 P1) requires a POSITIVE uuid match on the live

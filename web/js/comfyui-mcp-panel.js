@@ -836,6 +836,7 @@ import {
   describeRepaintSourceBinding,
   graphCommandBindingBar,
   graphCommandMayMutateWorkflow,
+  staleReadMayFollowLiveCanvas,
   MUTATION_BINDING_BAR,
   graphBindingRefusalMessage,
   resolveGraphBindingVerdict,
@@ -28416,15 +28417,31 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
               // the case this issue is hunting.
               noteActiveWorkflowMove();
               noteWorkflowInstanceMismatch();
-              throw new Error(
-                workflowInstanceMismatchMessage({
+              // #2007 — a classified READ whose stamp names a previous instance of
+              // this tab. The command can only inspect the live canvas, so refusing
+              // it withholds a graph read and demands a re-target round-trip for no
+              // write-safety. Mutations stay fail-closed until an explicit rebind.
+              if (
+                staleReadMayFollowLiveCanvas({
+                  cmd: msg.cmd,
                   commandUuid: dispatchCommandUuid,
                   activeUuid: dispatchActiveUuid,
-                  // #968 — what last moved the active workflow, if anything did. This is the
-                  // refusal a caller actually sees when a binding has gone stale.
-                  movedNote: activeWorkflowMoves.describeLast(),
-                }),
-              );
+                })
+              ) {
+                if (typeof dispatchActiveUuid === "string" && dispatchActiveUuid) {
+                  msg[WORKFLOW_UUID_FIELD] = dispatchActiveUuid;
+                }
+              } else {
+                throw new Error(
+                  workflowInstanceMismatchMessage({
+                    commandUuid: dispatchCommandUuid,
+                    activeUuid: dispatchActiveUuid,
+                    // #968 — what last moved the active workflow, if anything did. This is the
+                    // refusal a caller actually sees when a binding has gone stale.
+                    movedNote: activeWorkflowMoves.describeLast(),
+                  }),
+                );
+              }
             }
             // #349: UUID fencing proves the command was issued for the active
             // workflow SERVICE object, but graph executors operate on LiteGraph's
