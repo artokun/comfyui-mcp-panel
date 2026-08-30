@@ -70,7 +70,7 @@ async function rejection(promise, code) {
   });
 }
 
-test("#2283: the three allowed operations use only their fixed same-origin routes", async () => {
+test("#2283: the allowed operations use only their fixed same-origin routes", async () => {
   const apiURLCalls = [];
   const fileURLCalls = [];
   const apiCalls = [];
@@ -79,6 +79,7 @@ test("#2283: the three allowed operations use only their fixed same-origin route
     history: '{"prompt-1":{"status":{"status_str":"success"}}}',
     system_stats: '{"system":{"os":"windows"},"devices":[]}',
     logs: "ERROR: render failed\n",
+    object_info: '{"KSampler":{"input":{"required":{}}}}',
   };
   for (const operation of Object.keys(bodies)) {
     const result = await fetchComfyUIReadForMcp(
@@ -114,9 +115,9 @@ test("#2283: the three allowed operations use only their fixed same-origin route
     });
   }
 
-  assert.deepEqual(apiURLCalls, ["/history", "/system_stats"]);
+  assert.deepEqual(apiURLCalls, ["/history", "/system_stats", "/object_info"]);
   assert.deepEqual(fileURLCalls, ["/internal/logs/raw"]);
-  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats"]);
+  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats", "/object_info"]);
   assert.deepEqual(rawCalls.map(({ url }) => url), ["https://panel.test/comfy/internal/logs/raw"]);
   for (const { init } of [...apiCalls, ...rawCalls]) {
     assert.equal(init.method, "GET");
@@ -163,7 +164,8 @@ test("#2283: logs raw transport retains origin, redirect, and body-size fences",
 test("#2283: arbitrary paths, URLs, origins, targets, and operation names are refused before fetch", async () => {
   const invalid = [
     {},
-    { operation: "object_info" },
+    { operation: "unknown" },
+    { operation: "object_info", path: "/admin" },
     { operation: "history", path: "/admin" },
     { operation: "history", url: "https://evil.test" },
     { operation: "history", origin: "https://evil.test" },
