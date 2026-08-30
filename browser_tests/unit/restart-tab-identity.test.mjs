@@ -145,6 +145,53 @@ test("#2104: a request-less lock object (plain-http LAN) still advertises tab_se
     makePayload: (tabSessionId) => buildHelloPayload({ tabId: "wf:shared.json", tabSessionId }),
   });
   assert.equal(sent[0].tab_session_id, "lan-page-instance");
+  assert.notEqual(
+    sent[0].tab_session_id,
+    "copied-browser-tab",
+    "lockless identity must not be the copyable sessionStorage candidate (#640)",
+  );
+});
+
+test("#2104: a throwing mint with no lock manager still omits identity", async () => {
+  const identity = createRestartTabIdentity({
+    storage: copiedStorage("copied-browser-tab"),
+    locks: null,
+    randomUUID: () => {
+      throw new Error("entropy unavailable");
+    },
+  });
+  const sent = [];
+  await sendBridgeHello({
+    socket: { send: (frame) => sent.push(JSON.parse(frame)) },
+    isCurrent: () => true,
+    resolveTabIdentity: identity.resolve,
+    makePayload: (tabSessionId) => buildHelloPayload({ tabId: "wf:shared.json", tabSessionId }),
+  });
+  assert.equal("tab_session_id" in sent[0], false, "fail closed when identity is actually unavailable");
+});
+
+test("#2104: an unreadable lock manager is not 'absent' and still omits identity", async () => {
+  const identity = createRestartTabIdentity({
+    storage: copiedStorage("copied-browser-tab"),
+    locks: {
+      get request() {
+        throw new Error("locks unreadable");
+      },
+    },
+    randomUUID: () => "must-not-mint",
+  });
+  const sent = [];
+  await sendBridgeHello({
+    socket: { send: (frame) => sent.push(JSON.parse(frame)) },
+    isCurrent: () => true,
+    resolveTabIdentity: identity.resolve,
+    makePayload: (tabSessionId) => buildHelloPayload({ tabId: "wf:shared.json", tabSessionId }),
+  });
+  assert.equal(
+    "tab_session_id" in sent[0],
+    false,
+    "a present-but-unreadable manager must fail closed, not mint a page-lifetime identity",
+  );
 });
 
 test("#2104: a present lock manager that refuses every lease still omits tab_session_id", async () => {
