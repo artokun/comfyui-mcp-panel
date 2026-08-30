@@ -114,6 +114,7 @@ function buildWorkflowList({ activeWorkflow, openWorkflows, workflowUuids }) {
     "lateWorkflowSaveReceipts",
     "backendSocketReplyFields",
     "getWorkflowTitle",
+    "ensureWorkflowTabChannel",
     bundle,
   )(
     { extensionManager: { workflow: { openWorkflows } } },
@@ -139,6 +140,7 @@ function buildWorkflowList({ activeWorkflow, openWorkflows, workflowUuids }) {
     () => [],
     () => ({}),
     () => "Unsaved Workflow",
+    async () => {},
   );
 }
 

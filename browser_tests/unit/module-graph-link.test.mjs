@@ -46,6 +46,11 @@ import {
   graphMutationReconnectGate,
 } from "../../web/js/lib/reconnect-recovery.js";
 import {
+  shouldReregisterWorkflowTabChannel,
+  watchReconnectTabChannel,
+  ensureWorkflowTabChannel,
+} from "../../web/js/lib/reconnect-tab-channel.js";
+import {
   snapshotGraphState,
   describeInputLink,
   verifyDisconnect,
@@ -107,6 +112,12 @@ test("panel ↔ node-def-refresh.js / canvas-navigation.js / reconnect-recovery.
   assert.equal(typeof workflowOpenReadinessRefusalError, "function");
   assert.equal(typeof readWorkflowOpenReadinessRefusal, "function");
   assert.equal(typeof graphMutationReconnectGate, "function");
+});
+
+test("panel ↔ reconnect-tab-channel.js module edge links (#2030)", () => {
+  assert.equal(typeof shouldReregisterWorkflowTabChannel, "function");
+  assert.equal(typeof watchReconnectTabChannel, "function");
+  assert.equal(typeof ensureWorkflowTabChannel, "function");
 });
 
 test("panel ↔ disconnect-verify.js module edge links (#668)", () => {
