@@ -27982,12 +27982,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // the reply AND `settleRid` runs: without this the ledger keeps an
             // un-evictable in-flight entry whose replay would await a promise that can
             // never resolve, and answer nothing at all.
-            if (isAbandonedInteractive(result)) {
-              // Withdrawn confirmation: the next in-place save rebinds the
-              // same-origin userdata route rather than inheriting a stale host.
-              noteRestartConfirmTimeout();
-              throw new Error(abandonedInteractiveError(msg.cmd));
-            }
+            if (isAbandonedInteractive(result)) noteRestartConfirmTimeout();
+            if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
           } else if (msg.cmd === "request_secret") {
             // Secure secret entry. The pasted value rides back to the
             // orchestrator (which writes it to config) and is the tool's reply;
