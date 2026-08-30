@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { isPromotedContainer } from "../../web/js/lib/graph-read.js";
 import { graphViewIdentityFor } from "../../web/js/lib/graph-view-identity.js";
 import { subgraphValueProvenance } from "../../web/js/lib/subgraph-value-provenance.js";
 import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
@@ -94,10 +95,12 @@ test("WIRING: production graph_get_subgraph gives MCP a definitive non-promoted 
   const getSubgraph = new Function(
     "getGraphCtx",
     "resolveNode",
+    "isPromotedContainer",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph: {} }),
     (_graph, id) => ({ id, type: "OrdinaryNode" }),
+    isPromotedContainer,
   );
 
   assert.throws(
@@ -142,6 +145,7 @@ test("WIRING: production graph_get_subgraph publishes the terminal nested-promot
     "fixedCapNote",
     "summarizeNode",
     "promotedTerminalWitnesses",
+    "isPromotedContainer",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph }),
@@ -154,6 +158,7 @@ test("WIRING: production graph_get_subgraph publishes the terminal nested-promot
     () => "truncation note",
     (node) => ({ id: node.id, type: node.type }),
     () => [terminal],
+    isPromotedContainer,
   );
 
   const out = getSubgraph({ node_id: 78 });
@@ -180,6 +185,7 @@ test("WIRING: production graph_get_subgraph publishes an explicit empty witness 
     "fixedCapNote",
     "summarizeNode",
     "promotedTerminalWitnesses",
+    "isPromotedContainer",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph: {} }),
@@ -192,6 +198,7 @@ test("WIRING: production graph_get_subgraph publishes an explicit empty witness 
     () => "truncation note",
     (node) => ({ id: node.id, type: node.type }),
     () => [],
+    isPromotedContainer,
   );
 
   assert.deepEqual(getSubgraph({ node_id: 78 }).promoted_terminals, []);
@@ -208,12 +215,14 @@ test("WIRING: production alias witness keeps outer, immediate, and terminal name
     "followPromotionToConcrete",
     "MAX_PROMOTION_CHAIN_DEPTH",
     "promotedInputAliases",
+    "isPromotedContainer",
     `${src.slice(helperStart, helperEnd)}; return promotedTerminalWitnesses;`,
   )(
     resolvePromotedInnerTarget,
     followPromotionToConcrete,
     MAX_PROMOTION_CHAIN_DEPTH,
     promotedInputAliases,
+    isPromotedContainer,
   );
 
   const cases = [
@@ -336,12 +345,14 @@ test("WIRING: production witness refuses an externally-linked parent rail", asyn
     "followPromotionToConcrete",
     "MAX_PROMOTION_CHAIN_DEPTH",
     "promotedInputAliases",
+    "isPromotedContainer",
     `${src.slice(helperStart, helperEnd)}; return promotedTerminalWitnesses;`,
   )(
     resolvePromotedInnerTarget,
     followPromotionToConcrete,
     MAX_PROMOTION_CHAIN_DEPTH,
     promotedInputAliases,
+    isPromotedContainer,
   );
   const rail = { name: "quality_prompt", value: "old" };
   const inner = {
@@ -383,12 +394,14 @@ test("WIRING: production witness re-evaluates parent authority after a promotion
     "followPromotionToConcrete",
     "MAX_PROMOTION_CHAIN_DEPTH",
     "promotedInputAliases",
+    "isPromotedContainer",
     `${src.slice(helperStart, helperEnd)}; return promotedTerminalWitnesses;`,
   )(
     resolvePromotedInnerTarget,
     followPromotionToConcrete,
     MAX_PROMOTION_CHAIN_DEPTH,
     promotedInputAliases,
+    isPromotedContainer,
   );
   const rail = { name: "quality_prompt", value: "old" };
   const input = {
@@ -433,12 +446,14 @@ test("WIRING: production witness refuses to publish [] for an unenumerable proxy
     "followPromotionToConcrete",
     "MAX_PROMOTION_CHAIN_DEPTH",
     "promotedInputAliases",
+    "isPromotedContainer",
     `${src.slice(helperStart, helperEnd)}; return promotedTerminalWitnesses;`,
   )(
     resolvePromotedInnerTarget,
     followPromotionToConcrete,
     MAX_PROMOTION_CHAIN_DEPTH,
     promotedInputAliases,
+    isPromotedContainer,
   );
 
   const entries = makeWitnesses({
@@ -498,6 +513,7 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     "fixedCapNote",
     "summarizeNode",
     "promotedTerminalWitnesses",
+    "isPromotedContainer",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph }),
@@ -510,6 +526,7 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     () => "truncation note",
     (node) => ({ id: node.id, mode: node.mode, inputs: node.inputs, outputs: node.outputs }),
     () => [],
+    isPromotedContainer,
   );
 
   const out = getSubgraph({ node_id: 173 });

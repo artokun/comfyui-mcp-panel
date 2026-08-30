@@ -50,6 +50,38 @@ export const COMPACT_VALUE_CLIP = 60;
 export const NOTE_NODE_TYPES = new Set(["Note", "MarkdownNote"]);
 
 /**
+ * True when `node` is a live promoted-widget container (a SubgraphNode with an
+ * inner graph). MCP's panel_set_widget probe treats a boolean `is_subgraph` and
+ * graph_get_subgraph's "is not a subgraph" line as the ordinary-vs-container
+ * classification. Two leftovers must not look like a container:
+ *
+ *   #1941 — a truthy `.subgraph` that is not a live inner graph (`{}`, a name
+ *           bag) used to skip the definitive throw.
+ *   #2006 — a root PrimitiveNode is a frontend-only value source. It is never
+ *           a subgraph container, even when a leftover `.subgraph` looks live
+ *           or its getter throws. Treating it as one makes graph_get_subgraph
+ *           return a malformed envelope (or a non-definitive throw), and MCP
+ *           then refuses the ordinary `value` write.
+ *
+ * Never throws: an unreadable subgraph accessor is not a container.
+ */
+export function isPromotedContainer(node) {
+  try {
+    if (!node || typeof node !== "object") return false;
+    if (node.type === "PrimitiveNode") return false;
+    const sub = node.subgraph;
+    if (!sub || typeof sub !== "object") return false;
+    return (
+      Array.isArray(sub._nodes) ||
+      Array.isArray(sub.nodes) ||
+      typeof sub.getNodeById === "function"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * #809 (codex gate): "raise `X` up to N" is ITSELF a dead retry when the caller is
  * already at N, and "raise `X`" with no ceiling leaves them guessing how far. Both cost
  * the round trip this issue exists to prevent. One helper so every marker — inline or

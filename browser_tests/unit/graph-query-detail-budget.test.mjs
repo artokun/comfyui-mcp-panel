@@ -21,6 +21,7 @@ import {
   drivenWidgetsFor,
   fitDetailLine,
   isLineProtected,
+  isPromotedContainer,
   truncationTail,
 } from "../../web/js/lib/graph-read.js";
 import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
@@ -146,6 +147,7 @@ const dependencyNames = [
   "clipLine",
   "compactClipNote",
   "redactWidgetValue",
+  "isPromotedContainer",
 ];
 const graphQuery = new Function(
   ...dependencyNames,
@@ -176,6 +178,7 @@ const graphQuery = new Function(
   clipLine,
   compactClipNote,
   redactWidgetValue,
+  isPromotedContainer,
 );
 
 function detailRows(result) {
@@ -303,6 +306,30 @@ test("#2478 one-ID compact probes publish a bounded identity-bearing witness", (
       },
     ]);
     assert.ok(JSON.stringify(result.nodes).length <= 500, "identity witness must remain bounded");
+  } finally {
+    graph._nodes.pop();
+  }
+});
+
+test("#2006 a root PrimitiveNode stays is_subgraph:false even with leftover live subgraph", () => {
+  const node = {
+    id: 198,
+    type: "PrimitiveNode",
+    title: "prompt",
+    isVirtualNode: true,
+    widgets: [{ name: "value", value: "a MiniMax prompt" }],
+    inputs: [],
+    outputs: [],
+    subgraph: { _nodes: [{ id: 1, type: "CLIPTextEncode" }], getNodeById() { return null; } },
+  };
+  graph._nodes.push(node);
+  try {
+    const result = query({ ids: [198], fields: "detail" });
+    const row = detailRows(result)[0];
+    assert.equal(row.is_subgraph, false);
+    assert.equal(result.nodes?.[0]?.is_subgraph, false);
+    assert.equal(result.nodes?.[0]?.type, "PrimitiveNode");
+    assert.equal(result.viewing?.scope, "root");
   } finally {
     graph._nodes.pop();
   }

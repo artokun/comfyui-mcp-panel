@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_set_widget no longer refuses a root PrimitiveNode as an unclassifiable promoted container: leftover `.subgraph` (even a live-looking inner graph or a throwing getter) keeps `is_subgraph:false` and graph_get_subgraph throws the definitive "is not a subgraph" line (#2006)
 - the pre-publish registry parity scan now inspects the packaged archive rather than the repo, is wired into the publish job, and refuses to treat a Pending registry status as a pass (#1886)
 
 

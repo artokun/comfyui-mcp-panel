@@ -45,7 +45,7 @@ import {
 } from "./node-resolve.js";
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
 import { isTypeScopedObjectInfo } from "./scoped-object-info.js";
-import { linkDrivenWidgets, drivenTag } from "./graph-read.js";
+import { isPromotedContainer, linkDrivenWidgets, drivenTag } from "./graph-read.js";
 import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
 import { refreshCustomGeneratedWidgetsAfterWrite } from "./custom-generated-widgets-refresh.js";
 import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
@@ -479,7 +479,7 @@ export async function runSetWidget(
 
   // Resolve the promoted inner target ONCE (PURE — no coercion/mutation). Threaded
   // into applyWidgetWrite so the write never re-resolves to a different node.
-  const promotedResolution = node?.subgraph
+  const promotedResolution = isPromotedContainer(node)
     ? resolvePromotedInnerTarget(node, widgetName, resolveSource)
     : null;
   const isResolvedPromotion = !!(
@@ -595,16 +595,17 @@ export async function runSetWidget(
   let concreteWidgetName;
   // #1126 — is the promotion NESTED (outer → intermediate subgraph → … → concrete), as
   // opposed to a single hop straight to the concrete node? Keyed on exactly what
-  // followPromotionToConcrete's own `while (node && node.subgraph)` loop keys on, so the
-  // two can never disagree about whether the chain continues past the immediate target.
-  // Read only by the #1126 unreadable fallback; see its refusal for why it matters.
+  // followPromotionToConcrete's own `while (node && isPromotedContainer(node))` loop
+  // keys on, so the two can never disagree about whether the chain continues past
+  // the immediate target. Read only by the #1126 unreadable fallback; see its
+  // refusal for why it matters.
   let nestedPromotion = false;
   if (promotedButUnresolvable) {
     authTarget = null;
   } else if (isResolvedPromotion) {
-    nestedPromotion = Boolean(promotedResolution.target?.node?.subgraph);
+    nestedPromotion = isPromotedContainer(promotedResolution.target?.node);
     const concrete = followPromotionToConcrete(promotedResolution.target, resolveSource);
-    if (concrete.node && !concrete.node.subgraph && typeof concrete.node.type === "string") {
+    if (concrete.node && !isPromotedContainer(concrete.node) && typeof concrete.node.type === "string") {
       // Reached a genuine concrete backend node WITH a real type string — authorize it.
       // (assertTypeAgainstFreshBackend below then always runs for a promoted write.)
       authTarget = concrete.node;
@@ -666,7 +667,7 @@ export async function runSetWidget(
     //
     // "Could not determine whether this is a promoted widget on a subgraph" is not
     // "determined it is not" — the same fold this cluster exists to correct.
-    if (node?.subgraph && isVirtualSubgraphContainer(node)) {
+    if (isPromotedContainer(node) && isVirtualSubgraphContainer(node)) {
       const containerVerdict = backendHistoryVerdict(node?.type, wasTypeEverDefined);
       // An UNAVAILABLE map is could-not-determine, NOT "the backend lacks this type" —
       // freshBackendDefinesType returns false for both, so the two must be told apart
