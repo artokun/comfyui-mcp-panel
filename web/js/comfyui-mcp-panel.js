@@ -494,6 +494,7 @@ import {
   subgraphSaveCollisionAction,
   withBlueprintOverwriteConfirm,
 } from "./lib/subgraph-blueprint-overwrite.js";
+import { prepareSubgraphProxyWidgetsForPublish } from "./lib/subgraph-proxy-widgets.js";
 import {
   threadMatchesCurrentWorkflow,
   currentWorkflowIdentityKeys,
@@ -25052,6 +25053,10 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     const finalName =
       typeof name === "string" && name.trim() ? name.trim() : target.title || "Subgraph";
+    // #2005 — the publisher validates properties.proxyWidgets as string
+    // tuples. A legacy-store promote leaves [object, null] entries the
+    // schema rejects. Rewrite them first, or refuse with a repair action.
+    prepareSubgraphProxyWidgetsForPublish(target);
     const prefix = store.typePrefix ?? "SubgraphBlueprint.";
     const fullType = `${prefix}${finalName}`;
     // #636: the collision preflight must not depend on reconstructing the store's own
