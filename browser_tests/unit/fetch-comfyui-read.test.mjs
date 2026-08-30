@@ -260,7 +260,10 @@ test("#2283: object_info uses its documented large/slow route budget while other
       expectedOrigin: "https://panel.test",
       api: {
         apiURL: (path) => path,
-        fetchApi: async () => response({ body, contentLength: body.length, stream: false }),
+        fetchApi: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 8_050));
+          return response({ body, contentLength: body.length, stream: false });
+        },
       },
     },
   );
