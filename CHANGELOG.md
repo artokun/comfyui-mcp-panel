@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_strip_workflow no longer fails when a newer MCP requires the panel's node schema: graph_get_object_info is a canvas-independent read (not a mutation), and graph_serialize keeps extra schema fields while attaching name-keyed widget values so conversion does not depend on positional schema agreement (#1996)
+- scoped panel_run keeps the run-to-node target when a queuePrompt wrapper drops the third argument, instead of relying only on request-body repair (#1998)
 
 ## [0.15.140] - 2026-08-30
 
