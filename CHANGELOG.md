@@ -6,8 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.125] - 2026-08-30
+
 ### Fixed
 - preserve and synchronously fence node-incarnation witnesses across deferred replays and custom LTX/PromptRelay/Ideogram/MiniMax writes (#2021, #2478)
+
+- reject dynamic error-tag proxies
+- publish identity in compact pinpoint rows
+- fence deferred and custom widget writes (#2478)
+- keep additive source edits out of target state (#2017)
+- preserve browser stack for panel_run queue errors (#248) (#2013)
+
+### Changed
+- record node identity fence (#2021)
+
+
 ## [0.15.124] - 2026-08-29
 
 ### Fixed
