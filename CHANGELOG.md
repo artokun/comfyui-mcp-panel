@@ -6,8 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.147] - 2026-08-30
+
 ### Fixed
-- panel_set_widget no longer refuses promoted subgraph widget writes on a bound live canvas when Web Locks cannot mint an exclusive tab identity: hello still publishes a page-lifetime connection identity, and fail-closed omission is kept only when identity is actually unavailable (#2104)
+- panel_set_widget no longer refuses promoted subgraph widget writes on a bound live canvas when Web Locks cannot mint an exclusive tab identity: hello still publishes a page-lifetime connection identity, and fail-closed omission is kept only when identity is actually unavailable (#2104, #2114)
+
 
 ## [0.15.146] - 2026-08-30
 
