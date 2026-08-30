@@ -1,6 +1,7 @@
 const DYNAMIC_COMBO_V3 = "COMFY_DYNAMICCOMBO_V3";
 const DYNAMIC_WIDGET_MISSING_RE = /Dynamic widget doesn't exist on node/i;
 const GRAPH_TO_PROMPT_RECONCILE = Symbol.for("comfyui-mcp.graphToPromptDynamicReconcile");
+const DYNAMIC_COMBO_PRESERVE_CHILDREN = Symbol.for("comfyui-mcp.dynamicComboPreserveChildren");
 const rawApply = Reflect.apply;
 
 function hasValueSetter(widget) {
@@ -175,6 +176,85 @@ function restorePrefixedValues(node, values) {
     } catch {
       // A restore that the native setter rejects is not a reason to fail the reconcile;
       // the rebuilt child already has the definition's default.
+    }
+  }
+}
+
+function valueDescriptor(widget) {
+  try {
+    let proto = widget;
+    while (proto && proto !== Object.prototype) {
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (desc) return desc;
+      proto = Object.getPrototypeOf(proto);
+    }
+  } catch {
+    /* an unreadable widget is not wrappable */
+  }
+  return null;
+}
+
+/**
+ * #2031 — native DynamicCombo value assignment DESTROYS dotted children and
+ * recreates them from spec defaults. graphToPrompt re-assigns the parent combo
+ * even when the selected option did not change (Vue v-model / serialize flush),
+ * so a confirmed `mode.scale` write is rebuilt from `default: 2` after
+ * panel_query_graph already showed 1.5.
+ *
+ * Wrap the setter so a SAME-VALUE assignment restores the live children.
+ * Changing the selected option still rebuilds from the new option's spec.
+ */
+function wrapDynamicComboSetter(node, widget) {
+  if (!widget || widget[DYNAMIC_COMBO_PRESERVE_CHILDREN]) return;
+  const desc = valueDescriptor(widget);
+  if (!desc || typeof desc.set !== "function") return;
+  const origSet = desc.set;
+  const origGet = typeof desc.get === "function" ? desc.get : null;
+  Object.defineProperty(widget, "value", {
+    configurable: true,
+    enumerable: desc.enumerable !== false,
+    get() {
+      return origGet ? origGet.call(this) : undefined;
+    },
+    set(next) {
+      let previous;
+      try {
+        previous = origGet ? origGet.call(this) : undefined;
+      } catch {
+        previous = undefined;
+      }
+      const preserved = capturePrefixedValues(node, widget.name);
+      origSet.call(this, next);
+      if (previous === next) restorePrefixedValues(node, preserved);
+    },
+  });
+  widget[DYNAMIC_COMBO_PRESERVE_CHILDREN] = true;
+}
+
+function wrapGraphDynamicComboSetters(graph) {
+  for (const node of graphNodes(graph)) {
+    try {
+      const required = nodeDef(node)?.input?.required;
+      const dynamicNames = new Set();
+      if (required && typeof required === "object") {
+        for (const [name, spec] of Object.entries(required)) {
+          if (isDynamicComboSpec(spec)) dynamicNames.add(name);
+        }
+      }
+      for (const widget of node.widgets ?? []) {
+        if (typeof widget?.name !== "string") continue;
+        const isRoot = dynamicNames.has(widget.name);
+        const hasChildren = (node.widgets ?? []).some(
+          (candidate) =>
+            candidate !== widget &&
+            typeof candidate?.name === "string" &&
+            candidate.name.startsWith(`${widget.name}.`),
+        );
+        if ((isRoot || hasChildren) && hasValueSetter(widget)) wrapDynamicComboSetter(node, widget);
+      }
+      if (node?.subgraph) wrapGraphDynamicComboSetters(node.subgraph);
+    } catch {
+      /* a hostile node must not block wrapping the rest of the graph */
     }
   }
 }
@@ -478,6 +558,9 @@ export function installGraphToPromptDynamicReconcile(app) {
   app.graphToPrompt = function reconcileThenGraphToPrompt(graph, ...rest) {
     const target = graph ?? app.rootGraph ?? app.graph ?? null;
     try {
+      // #2031 — wrap before native serialize: graphToPrompt re-assigns DynamicCombo
+      // roots, which would otherwise rebuild dotted children from spec defaults.
+      wrapGraphDynamicComboSetters(target);
       reconcileGraphDynamicWidgets(target);
     } catch {
       // Best-effort: a hostile node must not block serialization.
@@ -485,6 +568,7 @@ export function installGraphToPromptDynamicReconcile(app) {
     const retry = (error) => {
       if (!isDynamicWidgetMissingError(error)) throw error;
       try {
+        wrapGraphDynamicComboSetters(target);
         reconcileGraphDynamicWidgets(target);
       } catch {
         // Retry with whatever state we could clean.
