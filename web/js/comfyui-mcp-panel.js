@@ -13770,13 +13770,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // consumers rather than assuming the verdict flowed through.
     // `ok` stays true and `refreshed` stays true: the refresh did what it claims. The
     // reload flag is advisory, about the canvas, not a failure of the refresh.
-    const stale = verdict != null && typeof verdict === "object" && verdict.requires_reload
-      ? {
-          requires_reload: true,
-          stale_placeholders: verdict.stale_placeholders,
-          stale_placeholders_note: verdict.stale_placeholders_note,
-        }
-      : {};
+    const stale = {
+      ...viewing,
+      ...(verdict != null && typeof verdict === "object" && verdict.requires_reload
+        ? {
+            requires_reload: true,
+            stale_placeholders: verdict.stale_placeholders,
+            stale_placeholders_note: verdict.stale_placeholders_note,
+          }
+        : {}),
+    };
     // #1172 — forwarded through the SAME hole #981 fell into. The `refreshed: true` branch
     // below returns a fixed object literal, so a field the verdict carries but this whitelist
     // does not name is silently dropped on exactly the successful path where the disclosure
@@ -13812,7 +13815,7 @@ const GRAPH_TOOL_EXECUTORS = {
             combo_refresh_note: verdict.combo_refresh_note,
           }
         : {};
-    if (refreshed) return { ok: true, refreshed: true, ...stale, ...emptyCombos, ...restored, ...comboUnconfirmed, ...viewing };
+    if (refreshed) return { ok: true, refreshed: true, ...stale, ...emptyCombos, ...restored, ...comboUnconfirmed };
     return {
       ok: true,
       refreshed: false,
@@ -13825,7 +13828,6 @@ const GRAPH_TOOL_EXECUTORS = {
       remedy:
         verdict?.remedy ??
         "The refresh did not complete and the panel could not determine why. Retry; if it persists, reload the ComfyUI tab.",
-      ...viewing,
     };
   },
   // Full-fidelity capture of the live canvas — ONE JSON object
