@@ -21,6 +21,7 @@ import test from "node:test";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   unrunnableNodeIds,
@@ -61,6 +62,21 @@ test("#1654 a frontend serializer throw is preserved as a fail-closed refusal", 
   assert.match(msg, /Dynamic widget doesn't exist on node/);
   assert.match(msg, /Nothing was queued/);
   assert.match(msg, /frontend or an extension's serializer/);
+});
+
+test("#1931 an unnamed DynamicCombo throw does not send the caller to a named widget", () => {
+  const msg = graphToPromptFailureRefusal(new Error("Dynamic widget doesn't exist on node"));
+  assert.doesNotMatch(msg, /inspect the named widget/i);
+  assert.match(msg, /did not name a node or widget/);
+  assert.match(msg, /format\.codec/);
+});
+
+test("#1931 a named DynamicCombo throw keeps the inspect-the-named-widget remedy", () => {
+  const msg = graphToPromptFailureRefusal(
+    new Error("Dynamic widget doesn't exist on node: SaveVideo node 71 has format.codec and orphan codec"),
+  );
+  assert.match(msg, /inspect the named widget/i);
+  assert.match(msg, /SaveVideo node 71/);
 });
 
 test("#1654 serializer refusal rendering is total and bounded for hostile throws", () => {
@@ -129,6 +145,16 @@ test("#1565: a SYNCHRONOUS graphToPrompt still reaches the pre-flight — the bo
   });
   assert.notEqual(msg, "__NO_REFUSAL__", "the pre-flight must still refuse an unrunnable node");
   assert.match(msg, /^NOT queued:/);
+});
+
+test("#1931 graph_run installs the DynamicCombo reconcile wrap before preflight", () => {
+  const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf-8");
+  const rec = src.indexOf("installGraphToPromptDynamicReconcile(app)");
+  const snapshot = src.indexOf("installGraphToPromptSnapshotBarrier(app)");
+  const preflight = src.indexOf("const preflightBuild = await withTimeout(");
+  assert.ok(rec > 0, "graph_run must install the DynamicCombo reconcile wrap");
+  assert.ok(snapshot > rec, "the snapshot barrier must stay outermost so cancel still throws synchronously");
+  assert.ok(preflight > snapshot, "both wraps must be installed before the pre-flight serialize");
 });
 
 test("#1582 the run path guards graphToPrompt BEFORE reading offenders", async () => {

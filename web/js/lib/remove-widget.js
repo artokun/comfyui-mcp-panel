@@ -35,6 +35,7 @@ import { isControlAfterGenerateWidget } from "./control-after-generate.js";
 // than by type string. Reusing it keeps one answer to the question instead of two that
 // can drift — a subgraph node's `type` is a UUID, so a name test would never work anyway.
 import { isVirtualSubgraphContainer } from "./node-resolve.js";
+import { nestedDynamicComboChildNames } from "./dynamic-widget-reconcile.js";
 
 /** Widget names whose VALUE we never echo back, even in a "here is what I removed" reply. */
 const SECRETISH_NAME = /(api[_-]?key|secret|token|password|passwd|credential)/i;
@@ -60,10 +61,21 @@ export function declaredInputNames(def) {
   if (!def || typeof def !== "object") return null;
   const input = def.input;
   if (!input || typeof input !== "object") return null;
+  const required = input.required && typeof input.required === "object" ? input.required : null;
+  const nestedChildren = nestedDynamicComboChildNames(def);
   const names = new Set();
   for (const group of ["required", "optional", "hidden"]) {
     const g = input[group];
-    if (g && typeof g === "object") for (const k of Object.keys(g)) names.add(k);
+    if (!g || typeof g !== "object") continue;
+    for (const k of Object.keys(g)) {
+      // Nested DynamicCombo children are not top-level declared inputs. SaveVideo's
+      // `codec` exists only under a chosen `format` option; a flattened optional/hidden
+      // copy must not block panel_remove_widget of the orphan (#1931).
+      if (nestedChildren.has(k) && !(required && Object.prototype.hasOwnProperty.call(required, k))) {
+        continue;
+      }
+      names.add(k);
+    }
   }
   return names;
 }

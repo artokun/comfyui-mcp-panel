@@ -12,6 +12,10 @@ import assert from "node:assert/strict";
 import {
   reconcileFreshDynamicWidgets,
   reconcileGraphDynamicWidgets,
+  nestedDynamicComboChildNames,
+  describeOrphanDynamicWidgets,
+  isDynamicWidgetMissingError,
+  installGraphToPromptDynamicReconcile,
 } from "../../web/js/lib/dynamic-widget-reconcile.js";
 
 const DYNAMIC = "COMFY_DYNAMICCOMBO_V3";
@@ -380,4 +384,125 @@ test("#2254: stale format.codec is still removed when codec is the required root
   assert.ok(result.relocated.includes("format.codec"));
   assert.equal(node.widgets.some((widget) => widget.name === "format.codec"), false);
   assert.equal(node.widgets.some((widget) => widget.name === "codec"), true);
+});
+
+test("#1931: nested DynamicCombo children are codec/encoding/crf, not top-level format", () => {
+  const names = nestedDynamicComboChildNames(nestedFormatDef());
+  assert.equal(names.has("codec"), true);
+  assert.equal(names.has("encoding"), true);
+  assert.equal(names.has("format"), false);
+  assert.equal(nestedDynamicComboChildNames(legacyCodecDef()).has("codec"), false);
+});
+
+test("#1931: describeOrphanDynamicWidgets names the SaveVideo duplicate set", () => {
+  const { node } = makeNode({
+    def: nestedFormatDef(),
+    extraWidgets: [{ name: "codec", dynamic: true }],
+  });
+  const found = describeOrphanDynamicWidgets({ _nodes: [node] });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].nodeId, 15);
+  assert.equal(found[0].nodeType, "SaveVideo");
+  assert.equal(found[0].orphan, "codec");
+  assert.equal(found[0].nested, "format.codec");
+});
+
+test("#1931: a loaded graph keyed on graph.nodes is still cleaned", () => {
+  const def = nestedFormatDef();
+  const { node, graphToPrompt } = makeNode({
+    def,
+    extraWidgets: [{ name: "codec", dynamic: true }],
+  });
+  assert.throws(graphToPrompt, /Dynamic widget doesn't exist on node/);
+  reconcileGraphDynamicWidgets({ nodes: [node] });
+  assert.equal(node.widgets.some((widget) => widget.name === "codec"), false);
+  assert.doesNotThrow(graphToPrompt);
+});
+
+test("#1931: a prototype value setter still counts as a dynamic root", () => {
+  const def = nestedFormatDef({ hiddenCodec: false });
+  const { node } = makeNode({ def });
+  const format = node.widgets.find((widget) => widget.name === "format");
+  const own = Object.getOwnPropertyDescriptor(format, "value");
+  delete format.value;
+  const proto = Object.create(Object.getPrototypeOf(format));
+  Object.defineProperty(proto, "value", own);
+  Object.setPrototypeOf(format, proto);
+  const result = reconcileFreshDynamicWidgets(node, def);
+  assert.equal(result.failures.length, 0);
+  assert.ok(result.replayed.includes("format"));
+});
+
+test("#1931: the serializer wrap drops the orphan before graphToPrompt", async () => {
+  const def = nestedFormatDef();
+  const { node, graphToPrompt } = makeNode({
+    def,
+    extraWidgets: [{ name: "codec", dynamic: true }],
+  });
+  const app = { graph: { _nodes: [node] }, graphToPrompt };
+  assert.equal(installGraphToPromptDynamicReconcile(app), true);
+  const prompt = await app.graphToPrompt();
+  assert.equal(node.widgets.some((widget) => widget.name === "codec"), false);
+  assert.equal(prompt.output[15].inputs.codec, "auto");
+});
+
+test("#1931: a first-serialize DynamicCombo throw is retried after reconcile", async () => {
+  const def = nestedFormatDef();
+  const { node, graphToPrompt } = makeNode({
+    def,
+    extraWidgets: [{ name: "codec", dynamic: true }],
+  });
+  let calls = 0;
+  const app = {
+    graph: { _nodes: [node] },
+    graphToPrompt() {
+      calls += 1;
+      if (calls === 1) throw new Error("Dynamic widget doesn't exist on node");
+      return graphToPrompt();
+    },
+  };
+  installGraphToPromptDynamicReconcile(app);
+  const prompt = await app.graphToPrompt();
+  assert.equal(calls, 2);
+  assert.equal(node.widgets.some((widget) => widget.name === "codec"), false);
+  assert.equal(prompt.output[15].inputs.codec, "auto");
+});
+
+test("#1931: a persistent serializer throw names the SaveVideo node and orphan", async () => {
+  const def = nestedFormatDef();
+  const { node } = makeNode({
+    def,
+    extraWidgets: [{ name: "codec", dynamic: true }],
+  });
+  const codec = node.widgets.find((widget) => widget.name === "codec");
+  Object.defineProperty(codec, "name", { configurable: true, writable: false, value: "codec" });
+  const app = {
+    graph: { _nodes: [node] },
+    graphToPrompt() {
+      throw new Error("Dynamic widget doesn't exist on node");
+    },
+  };
+  installGraphToPromptDynamicReconcile(app);
+  assert.throws(
+    () => app.graphToPrompt(),
+    (error) => {
+      assert.equal(isDynamicWidgetMissingError(error), true);
+      assert.match(error.message, /SaveVideo node 15/);
+      assert.match(error.message, /format\.codec/);
+      assert.match(error.message, /orphan codec/);
+      return true;
+    },
+  );
+});
+
+test("#1931: the serializer wrap is idempotent", () => {
+  const app = { graphToPrompt: async () => ({ output: {} }) };
+  const first = app.graphToPrompt;
+  assert.equal(installGraphToPromptDynamicReconcile(app), true);
+  const wrapped = app.graphToPrompt;
+  assert.notEqual(wrapped, first);
+  assert.equal(installGraphToPromptDynamicReconcile(app), true);
+  assert.equal(app.graphToPrompt, wrapped);
+  assert.equal(installGraphToPromptDynamicReconcile({}), false);
+  assert.equal(installGraphToPromptDynamicReconcile(null), false);
 });
