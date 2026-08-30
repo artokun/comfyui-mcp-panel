@@ -28,17 +28,20 @@
 //
 // One finding per (rule, file), as the registry reports. Line numbers are not part of
 // the identity: the registry's own anchor drifts as a file grows.
+//
+// SCAN THE PACKAGED ARCHIVE, NEVER THE REPO (#1886). The registry reads node.zip.
+// The working tree still contains every trigger in tests and scripts; the published
+// pack does not. A repo-wide grep would have called the clean 0.15.113 dirty, and
+// a scan that only knew about the rules it already modelled stayed green through
+// ten flagged releases. Default CLI path = git-tracked minus .comfyignore, which
+// is what `comfy node publish` packs. `--archive DIR` scans a packed tree as-is.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const ROOT = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
-const JSON_OUT = process.argv.includes("--json");
-const allowIdx = process.argv.indexOf("--allow");
-const ALLOW = allowIdx >= 0 ? Number(process.argv[allowIdx + 1]) : 0;
-
-const RULES = [
+export const RULES = [
   { id: "$socket3", re: /\.connect\s*\(/ },
   { id: "$socket4", re: /\.bind\s*\(/ },
   // READS COUNT TOO. v0.15.111 flagged __init__.py on this rule anchored at
@@ -51,9 +54,13 @@ const RULES = [
   { id: "$http5", re: /aiohttp\s*\.\s*ClientSession/ },
 ];
 
+function posix(p) {
+  return String(p ?? "").replace(/\\/g, "/");
+}
+
 // Blank comments while PRESERVING offsets so line numbers stay true. String literals
 // are skipped rather than scanned, so a URL's `//` is never read as a comment start.
-function stripComments(text, path) {
+export function stripComments(text, path) {
   const js = /\.(?:js|mjs|cjs|ts|mts|cts)$/i.test(path);
   const py = /\.py$/i.test(path);
   if (!js && !py) return text;
@@ -90,48 +97,183 @@ function stripComments(text, path) {
   return out;
 }
 
-// Published archive = tracked files minus .comfyignore. `--no-index` is REQUIRED:
-// without it git reports a TRACKED file as not-ignored regardless of the pattern,
-// which silently included scripts/, registry/ and browser_tests/ and made this
-// over-report by a factor of eight.
-const tracked = execFileSync("git", ["ls-files", "-z"], { cwd: ROOT, encoding: "utf8" })
-  .split("\0").filter(Boolean);
+/**
+ * Scan a packaged archive. `files` is the pack itself — every entry is a file the
+ * registry would see. Callers that still have a repo must already have dropped
+ * .comfyignore'd paths; this function does not second-guess that.
+ */
+export function scanArchive(files) {
+  const findings = [];
+  for (const entry of files) {
+    const file = posix(entry.file);
+    const text = String(entry.text ?? "");
+    const scanned = stripComments(text, file);
+    for (const rule of RULES) {
+      const m = rule.re.exec(scanned);
+      if (!m) continue;
+      findings.push({
+        file,
+        rule: rule.id,
+        line: scanned.slice(0, m.index).split("\n").length,
+        match: m[0].trim(),
+      });
+    }
+  }
+  const byFile = new Map();
+  for (const f of findings) {
+    if (!byFile.has(f.file)) byFile.set(f.file, []);
+    byFile.get(f.file).push(f);
+  }
+  return { findings, byFile, files: [...byFile.keys()].sort() };
+}
 
-const shipped = tracked.filter((p) => {
+export function flaggedFileCount(result) {
+  return result.byFile.size;
+}
+
+export function exceedsAllowance(result, allow = 0) {
+  return flaggedFileCount(result) > Number(allow);
+}
+
+function git(cwd, ...args) {
+  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+function isComfyignored(root, path) {
   try {
-    execFileSync("git", ["-c", "core.excludesFile=.comfyignore", "check-ignore", "--no-index", "-q", p],
-      { cwd: ROOT, stdio: "ignore" });
+    execFileSync(
+      "git",
+      ["-c", "core.excludesFile=.comfyignore", "check-ignore", "--no-index", "-q", path],
+      { cwd: root, stdio: "ignore" },
+    );
+    return true;
+  } catch {
     return false;
-  } catch { return true; }
-});
-
-const findings = [];
-for (const path of shipped) {
-  let text;
-  try { text = readFileSync(resolve(ROOT, path), "utf8"); } catch { continue; }
-  const scanned = stripComments(text, path);
-  for (const rule of RULES) {
-    const m = rule.re.exec(scanned);
-    if (!m) continue;
-    findings.push({ file: path, rule: rule.id, line: scanned.slice(0, m.index).split("\n").length, match: m[0].trim() });
   }
 }
 
-const byFile = new Map();
-for (const f of findings) {
-  if (!byFile.has(f.file)) byFile.set(f.file, []);
-  byFile.get(f.file).push(f);
+/**
+ * Published archive = tracked files minus .comfyignore. `--no-index` is REQUIRED:
+ * without it git reports a TRACKED file as not-ignored regardless of the pattern,
+ * which silently included scripts/, registry/ and browser_tests/ and made this
+ * over-report by a factor of eight.
+ */
+export function listShippedPaths(root) {
+  const tracked = git(root, "ls-files", "-z").split("\0").filter(Boolean);
+  return tracked.filter((p) => !isComfyignored(root, p));
 }
 
-if (JSON_OUT) {
-  console.log(JSON.stringify({ files: [...byFile.keys()].sort(), findings }, null, 2));
-} else {
-  console.log(`scanned ${shipped.length} shipped file(s)\n`);
-  for (const file of [...byFile.keys()].sort()) {
+export function loadShippedArchive(root) {
+  return listShippedPaths(root).flatMap((file) => {
+    try {
+      return [{ file, text: readFileSync(resolve(root, file), "utf8") }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function walkFiles(dir, prefix = "") {
+  const out = [];
+  for (const name of readdirSync(dir)) {
+    const rel = prefix ? `${prefix}/${name}` : name;
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) out.push(...walkFiles(full, rel));
+    else out.push(rel);
+  }
+  return out;
+}
+
+export function loadArchiveDir(dir) {
+  return walkFiles(dir).flatMap((file) => {
+    try {
+      return [{ file: posix(file), text: readFileSync(join(dir, ...file.split("/")), "utf8") }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+/**
+ * Registry status_reason is a JSON array of findings when Flagged, the prose
+ * "Passed automated checks" when Active, and empty while the version is still
+ * in the scan queue.
+ */
+export function parseStatusReason(statusReason) {
+  if (statusReason == null || statusReason === "") return [];
+  if (Array.isArray(statusReason)) return statusReason;
+  if (typeof statusReason === "object") {
+    return Array.isArray(statusReason.findings) ? statusReason.findings : [statusReason];
+  }
+  const raw = String(statusReason).trim();
+  if (!raw || raw === "Passed automated checks") return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Pending is a queue position, not a pass (#1886). An unscanned version is
+ * neither passing nor failing; reading it as "clean" invents a verdict.
+ *
+ *   fail    — Flagged / Banned, or any parsed findings
+ *   queued  — Pending with no findings yet
+ *   pass    — Active with no findings
+ *   unknown — any other status
+ */
+export function classifyRegistryVersion(record) {
+  const status = String(record?.status ?? "");
+  const findings = parseStatusReason(record?.status_reason);
+  if (findings.length > 0 || /Flagged|Banned/i.test(status)) {
+    return { verdict: "fail", status, findings };
+  }
+  if (/Pending/i.test(status)) {
+    return { verdict: "queued", status, findings };
+  }
+  if (/Active/i.test(status)) {
+    return { verdict: "pass", status, findings };
+  }
+  return { verdict: "unknown", status, findings };
+}
+
+export function isRegistryClean(record) {
+  return classifyRegistryVersion(record).verdict === "pass";
+}
+
+function printReport(result, { json, allow, scanned }) {
+  if (json) {
+    console.log(JSON.stringify({ files: result.files, findings: result.findings }, null, 2));
+    return;
+  }
+  console.log(`scanned ${scanned} shipped file(s)\n`);
+  for (const file of result.files) {
     console.log(`  ${file}`);
-    for (const f of byFile.get(file)) console.log(`      ${f.rule} @${f.line}  ${f.match}`);
+    for (const f of result.byFile.get(file)) console.log(`      ${f.rule} @${f.line}  ${f.match}`);
   }
-  console.log(`\n${byFile.size} file(s) would be flagged python_network_operations` + (ALLOW ? ` (allowance ${ALLOW})` : ""));
+  console.log(
+    `\n${result.byFile.size} file(s) would be flagged python_network_operations` +
+      (allow ? ` (allowance ${allow})` : ""),
+  );
 }
 
-process.exit(byFile.size > ALLOW ? 1 : 0);
+export function main(argv = process.argv.slice(2), { cwd } = {}) {
+  const JSON_OUT = argv.includes("--json");
+  const allowIdx = argv.indexOf("--allow");
+  const ALLOW = allowIdx >= 0 ? Number(argv[allowIdx + 1]) : 0;
+  const archiveIdx = argv.indexOf("--archive");
+  const archiveDir = archiveIdx >= 0 ? argv[archiveIdx + 1] : null;
+
+  const root = cwd
+    || (archiveDir ? resolve(archiveDir) : git(".", "rev-parse", "--show-toplevel").trim());
+  const files = archiveDir ? loadArchiveDir(resolve(archiveDir)) : loadShippedArchive(root);
+  const result = scanArchive(files);
+  printReport(result, { json: JSON_OUT, allow: ALLOW, scanned: files.length });
+  return exceedsAllowance(result, ALLOW) ? 1 : 0;
+}
+
+const invokedDirectly =
+  process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly) process.exit(main());
