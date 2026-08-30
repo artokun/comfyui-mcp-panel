@@ -22056,8 +22056,17 @@ const GRAPH_TOOL_EXECUTORS = {
               targetContentProof = false;
             }
           }
+          // An untagged root is legitimately "unknown" on an already-current tab:
+          // the pointer proof says the canvas was not borrowed from another tab, so
+          // retain the #874 live-canvas capture for node-written values. After a tab
+          // switch, however, unknown remains insufficient; only a positive target
+          // binding plus independent source/target proof may authorize the write.
+          const targetBindingProof =
+            captureBinding === "bound"
+              ? true
+              : captureBinding === "unknown" && !pointerMovedThisOpen && pointerProof;
           const captureSourceProof =
-            captureBinding === "bound" &&
+            targetBindingProof &&
             (!pointerMovedThisOpen || sourceBinding === "bound" || targetContentProof);
           // #1575 — a state THIS command just read off disk is authoritative, and the
           // canvas mounted behind it is whatever the closed tab left there. Serializing
