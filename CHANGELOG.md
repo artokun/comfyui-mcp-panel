@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- after ComfyUI restart, re-hello the existing workflow tab without reloading unsaved in-memory edits, and panel_set_workflow_target({mode:"current"}) forces that re-register when the server is ready but the tab command channel is stale (#2030)
+
+
 ## [0.15.138] - 2026-08-30
 
 ### Fixed

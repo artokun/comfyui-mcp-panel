@@ -393,6 +393,11 @@ import {
   classifyBackendStatusEvent,
   describeGraphMutationReadiness,
 } from "./lib/reconnect-recovery.js";
+import {
+  shouldReregisterWorkflowTabChannel,
+  watchReconnectTabChannel,
+  ensureWorkflowTabChannel,
+} from "./lib/reconnect-tab-channel.js";
 import { describeHttpFailure } from "./lib/http-failure.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
 import { todoItemGlyph } from "./lib/plan-glyph.js";
@@ -1129,6 +1134,12 @@ let activeWorkflowResyncEpoch = 0;
 let postReconnectBindingProofEpoch = 0;
 // Supersede token for the settle watch — a newer reconnect retires the older watch.
 let postReconnectWatchToken = 0;
+// #2030 — last reconnect epoch whose workflow command channel has a landed hello.
+// Stale while this is behind backendReconnectEpoch: the orchestrator still waits
+// for a newer generation (`panel_tab_reconnected:false`) even though the backend
+// is up. The watchdog re-hellos THIS tab; it never reloads the in-memory graph.
+let tabChannelReadyEpoch = 0;
+let tabChannelWatchToken = 0;
 // #646: ComfyUI's own backend socket is DOWN between its "reconnecting" and
 // "reconnected" events (a null "status" payload is the same lost-connection
 // signal). A graph mutation dispatched in that gap can be applied and then wiped
@@ -2919,6 +2930,11 @@ function setupListeners() {
       // The watch runs only the same safe heals a graph command runs lazily;
       // it never repaints the canvas from serialized state (#604).
       kickPostReconnectSettleWatch(backendReconnectEpoch);
+      // #2030: re-register THIS tab's workflow command channel after the backend
+      // cycle. Distinct from the settle watch: that re-proves canvas binding; this
+      // re-hellos the existing tab so workflow_list answers instead of timing out.
+      // Does not open or load the workflow — unsaved in-memory edits stay.
+      kickReconnectTabChannelWatch(backendReconnectEpoch);
       // #1636: drop the remembered subgraph owner and re-pin viewing/mutation scope.
       clearAutoLayoutScope();
       noteReconnectScopeFence();
@@ -9528,6 +9544,51 @@ function postReconnectBindingSettleWindow() {
 // been observed to pass — never a weaker proxy. The watch performs no canvas
 // repaint and no workflow mutation; when the restore never settles it simply
 // stops, and the binding refusals keep their existing remedies.
+function kickReconnectTabChannelWatch(epoch) {
+  const token = ++tabChannelWatchToken;
+  const restartLength = shouldReadvertiseAfterComfyRestart({
+    bridgeConnected: liveBridgeClient?.isConnected?.() === true,
+    outageMs: comfyBackendOutage.outageMs(),
+    helloLandedSinceOutage: landedHelloCount > comfyBackendOutage.helloBaseline(),
+    alreadyReadvertised: false,
+  });
+  const rebootPending = !!ssGet(REBOOT_KEY);
+  if (!restartLength && !rebootPending) {
+    // Benign WS blip: the existing hello still names this tab. Do not mint a
+    // second one — that is the #1138 false-nudge harm.
+    tabChannelReadyEpoch = epoch;
+    return;
+  }
+  if (
+    !shouldReregisterWorkflowTabChannel({
+      serverReady: !comfyBackendIsDown(),
+      bridgeConnected: liveBridgeClient?.isConnected?.() === true,
+      channelReadyForEpoch: tabChannelReadyEpoch === epoch,
+    })
+  ) {
+    // No live socket: the socket-open hello owns recovery.
+    return;
+  }
+  const outageSeq = comfyBackendOutage.seq();
+  void watchReconnectTabChannel({
+    isCurrent: () => token === tabChannelWatchToken && epoch === backendReconnectEpoch,
+    serverReady: () => !comfyBackendIsDown(),
+    channelReady: () => tabChannelReadyEpoch === epoch,
+    reregister: () =>
+      comfyRestartReadvertise.attempt({
+        outageSeq: outageSeq > 0 ? outageSeq : epoch,
+        reconnectEpoch: epoch,
+        isCurrent: () =>
+          epoch === backendReconnectEpoch &&
+          (outageSeq === 0 || outageSeq === comfyBackendOutage.seq()),
+        send: () => liveBridgeClient?.rehello?.(),
+      }),
+  }).catch(() => {
+    // Best-effort: a failed watch leaves the pre-#2030 behavior (channel stays
+    // stale until a manual refresh).
+  });
+}
+
 function kickPostReconnectSettleWatch(epoch) {
   const token = ++postReconnectWatchToken;
   void watchPostReconnectSettle({
@@ -21095,6 +21156,23 @@ const GRAPH_TOOL_EXECUTORS = {
   // Uses ComfyUI's workflow service. "New workflow" opens a NEW TAB and never
   // touches the current graph (graph_clear is ONLY for clearing the open one).
   async workflow_list() {
+    // #2030 — panel_set_workflow_target({mode:"current"}) uses this read to
+    // recover canvas identity after a ComfyUI restart. If the backend is up but
+    // this tab's command channel is still the pre-restart mapping, force a safe
+    // re-hello of THIS tab first. That does not reload or reopen the workflow,
+    // so unsaved in-memory edits stay on the canvas.
+    await ensureWorkflowTabChannel({
+      serverReady: () => !comfyBackendIsDown(),
+      bridgeConnected: () => liveBridgeClient?.isConnected?.() === true,
+      channelReady: () => tabChannelReadyEpoch === backendReconnectEpoch,
+      reregister: () =>
+        comfyRestartReadvertise.attempt({
+          outageSeq: comfyBackendOutage.seq() || backendReconnectEpoch,
+          reconnectEpoch: backendReconnectEpoch,
+          isCurrent: () => true,
+          send: () => liveBridgeClient?.rehello?.(),
+        }),
+    });
     // #1785 — panel_set_workflow_target({mode:"current"}) uses this read to
     // recover the live tab after a ComfyUI restart. A command can reach the
     // panel before the backend reconnect, node-definition refresh, and restored
@@ -40110,7 +40188,10 @@ function buildPanel() {
       // open credentials card to re-poll oauth_status (see cmcpOpenCredentialsFrame).
       cmcpOauthOnBackendsPush?.();
     },
-    onHelloLanded: noteDedicatedWorkflowHello,
+    onHelloLanded: (ctx) => {
+      tabChannelReadyEpoch = backendReconnectEpoch;
+      noteDedicatedWorkflowHello(ctx);
+    },
     onAck(ack) {
       // In-panel OAuth acks (oauth_begin/oauth_status/oauth_signout) are routed
       // to whichever credentials card is currently open — see
