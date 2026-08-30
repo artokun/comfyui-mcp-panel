@@ -282,5 +282,8 @@ export function setWidgetCommandBudgetDeps() {
     COMBO_REFRESH_NEVER_RAN,
     // #1709 — a live whole-schema widget read retires this shared add-node proof.
     verifiedNodeDefCache: createVerifiedNodeDefCache(),
+    // #2116 — late mutation receipts are panel module state. Harnesses supply a no-op.
+    commandFingerprint: () => "",
+    lateMutationReceipts: { remember() {} },
   };
 }

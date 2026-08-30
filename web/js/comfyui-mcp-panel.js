@@ -759,6 +759,7 @@ import {
 } from "./lib/reconnect-staleness.js";
 import { pickRevertSnapshot, describeRevertOutcome, revertDidRestore } from "./lib/graph-revert.js";
 import { commandFingerprint, createCommandDedupeLedger } from "./lib/command-dedupe.js";
+import { createMutationReceiptStore, resolveLateMutationReply } from "./lib/mutation-receipt.js";
 import {
   canvasFileDivergence,
   canvasFileDivergenceNote,
@@ -13789,6 +13790,10 @@ function lateWorkflowSaveReceipts() {
   return Array.from(lateSaveReceipts.values()).map((receipt) => ({ ...receipt }));
 }
 
+function lateMutationReceiptList() {
+  return lateMutationReceipts.list();
+}
+
 /**
  * #1716 — classify the only widget writes that may be replayed after a queue
  * drain. This is intentionally narrower than the normal widget writer:
@@ -18683,6 +18688,16 @@ const GRAPH_TOOL_EXECUTORS = {
       // #2109 — locating the enclosing SubgraphNode when this call addressed the
       // inner promoted terminal (the subgraph is the current view).
       rootGraph,
+      // #2116 — if the write lands after this bound, persist the receipt so
+      // retry_of can resolve the outcome without a duplicate mutation.
+      onLateSuccess: (result) => {
+        const requestId = arguments[0] && typeof arguments[0] === "object" ? arguments[0].rid : undefined;
+        if (typeof requestId !== "string" || !requestId) return;
+        lateMutationReceipts.remember(requestId, result, {
+          cmd: "graph_set_widget",
+          fingerprint: commandFingerprint(arguments[0]),
+        });
+      },
     };
     // The creation and its rollback both live inside this call now, at the synchronous write
     // boundary — see `prepareWriteTarget` above. There is nothing to undo out here.
@@ -21431,6 +21446,7 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       : null;
     const lateSaveReceipts = lateWorkflowSaveReceipts();
+    const lateMutationReceiptsList = lateMutationReceiptList();
     return {
       active: active
         ? {
@@ -21487,6 +21503,10 @@ const GRAPH_TOOL_EXECUTORS = {
       // orchestrator uses absence to recognize an older panel and presence to
       // fail closed when a current panel has no receipt for this save RID.
       late_save_receipts: lateSaveReceipts,
+      // #2116 — exact command-rid receipts for graph_set_widget writes that
+      // applied after the bounded acknowledgement. Always advertised, including
+      // an empty list, so the orchestrator can fail closed on a current panel.
+      late_mutation_receipts: lateMutationReceiptsList,
       ...(activeMaybeStale
         ? { active_possibly_stale: true, stale_hint: activeStaleHint() }
         : {}),
@@ -27757,6 +27777,9 @@ function awaitDuplicateReply(prior, rid, callerTimeoutMs) {
   ]);
 }
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
+// #2116 — rid-correlated receipts for graph_set_widget mutations that applied
+// after the caller timeout. retry_of reads these instead of executing again.
+const lateMutationReceipts = createMutationReceiptStore();
 
 // #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
 // observation after the fact, which is why three reports of `bound` + wrong-graph have not
@@ -28486,6 +28509,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             retryOfHit = true;
           }
         }
+        // #2116 — a graph_set_widget that applied after the caller timeout still
+        // has a rid-correlated receipt. Prefer it over a ledger timeout/unknown
+        // and over joining a hung original: the mutation already landed, so
+        // retry_of must resolve that outcome without a second write.
+        const lateMutation = resolveLateMutationReply(lateMutationReceipts, msg, fingerprint);
+        if (lateMutation) {
+          priorRidReply = lateMutation.reply;
+          retryOfHit = lateMutation.retryOfHit;
+        }
         // #2003 — a hung READ must not pin retries. The ledger joins an in-flight
         // original so a mutation cannot land twice (#517/#694). graph_outline cannot
         // double-apply, and after a manual canvas edit the original may never settle
@@ -29038,6 +29070,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // the same rid on a fresh socket learns the true outcome instead of
         // re-executing the command.
         settleRid(reply);
+        if (msg.cmd === "graph_set_widget" && reply?.ok) {
+          lateMutationReceipts.remember(msg.rid, reply.result, {
+            cmd: msg.cmd,
+            fingerprint,
+          });
+        }
         // A command executor can be ASYNC (ask_user/request_secret block on the user;
         // graph run/save await). If a soft-reload/restart swapped this socket out while
         // we were suspended, this reply belongs to the DEAD session A — it must NOT be

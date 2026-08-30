@@ -217,6 +217,7 @@ export function readLiveWidgetValue(node, widgetName) {
  *   delivered?: boolean,
  *   abandonOnTimeout?: boolean,
  *   onTimeout?: () => void,
+ *   onLateSuccess?: (result: object) => void,
  * }} [opts]
  */
 export async function awaitSetWidgetAck(writePromise, {
@@ -228,6 +229,7 @@ export async function awaitSetWidgetAck(writePromise, {
   delivered = true,
   abandonOnTimeout = false,
   onTimeout,
+  onLateSuccess,
 } = {}) {
   const tracked = Promise.resolve(writePromise);
   tracked.then(() => {}, () => {});
@@ -235,11 +237,25 @@ export async function awaitSetWidgetAck(writePromise, {
     (result) => ({ ok: true, result }),
     (error) => ({ ok: false, error }),
   );
+  const noteLateSuccess = (result) => {
+    if (typeof onLateSuccess !== "function" || !result) return;
+    try {
+      onLateSuccess(result);
+    } catch {
+      /* bookkeeping only; never rewrite the ack */
+    }
+  };
   const raced = await withTimeout(captured, timeoutMs, () => SET_WIDGET_ACK_TIMEOUT, timers);
   if (raced !== SET_WIDGET_ACK_TIMEOUT) {
     if (raced?.ok) return honestWidgetAck(raced.result);
     throw raced.error;
   }
+  // #2116 — the original write is not cancelled. If it applies after this
+  // bound, persist that receipt so retry_of can resolve the outcome without
+  // a second mutation.
+  captured.then((settled) => {
+    if (settled?.ok) noteLateSuccess(honestWidgetAck(settled.result));
+  }, () => {});
   const live = readLiveWidgetValue(node, widget);
   const verified = widgetWriteTimeoutReadback({
     requested,
@@ -252,7 +268,10 @@ export async function awaitSetWidgetAck(writePromise, {
   // Only short-circuit when the live widget already equals the request. A
   // timeout before the write must still surface the inner worded refusal
   // (stale combo, hung /view probe) rather than inventing outcome-unknown.
-  if (verified.applied && verified.verified) return verified;
+  if (verified.applied && verified.verified) {
+    noteLateSuccess(verified);
+    return verified;
+  }
   // #2035 — the production wrapper can safely stop waiting here only if the original
   // body also has a cooperative write fence. Without that fence, returning an unknown
   // reply would let the still-running body reach applyWidgetWrite later and a caller's
@@ -267,7 +286,11 @@ export async function awaitSetWidgetAck(writePromise, {
     throw widgetWriteOutcomeUnknownError();
   }
   const settled = await captured;
-  if (settled?.ok) return honestWidgetAck(settled.result);
+  if (settled?.ok) {
+    const ack = honestWidgetAck(settled.result);
+    noteLateSuccess(ack);
+    return ack;
+  }
   throw settled.error;
 }
 
@@ -390,6 +413,7 @@ export async function runSetWidget(node, widgetName, value, opts = {}) {
         timeoutMs: opts.timeoutMs,
         timers: opts.ackTimers,
         delivered: opts.delivered !== false,
+        onLateSuccess: opts.onLateSuccess,
         abandonOnTimeout,
         ...(abandonOnTimeout
           ? {
