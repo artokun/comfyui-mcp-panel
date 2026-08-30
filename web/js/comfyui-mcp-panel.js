@@ -651,7 +651,12 @@ import {
 import { decideBoundRestart, normalizeBoundOrigin } from "./lib/bound-restart-witness.js";
 import { decideDesktopRestartRestore, resolveDesktopRestore } from "./lib/desktop-restart-restore.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
-import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
+import {
+  appliedTmpOpenShouldFailClosed,
+  isUnsavedTmpOpenSelector,
+  settleOwnedOpenedTmpRoutingKey,
+  settleOwnedOpenedWorkflowActive,
+} from "./lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "./lib/settle-open-readable.js";
 import { coerceMessageText, isDroppedAgentReplay, serializeContext, stripAgentDirectedBlocks } from "./lib/chat-serialize.js";
 import { generatedImageMediaItems, generatedImageRemainderText } from "./lib/generated-image.js";
@@ -5070,6 +5075,16 @@ function workflowTabId(wf = activeWorkflowRef()) {
     if (!priorTempWorkflowId(wf)) setPriorTempWorkflowId(wf, id);
   }
   return id;
+}
+
+// #2022 — READ, never mint. Post-open routing-key settle must not invent a
+// fresh tmp: handle on a restored object; that would look like a different tab
+// and fail a switch that already applied.
+function readExistingWorkflowTabId(wf = activeWorkflowRef()) {
+  if (!wf) return null;
+  const saved = savedWorkflowPath(wf);
+  if (saved) return savedWorkflowHandle(saved);
+  return tempWorkflowInstanceId(wf) || priorTempWorkflowId(wf) || null;
 }
 
 // #640 — the BRIDGE ROUTE for a workflow: the `tab_id` this panel puts on the
@@ -23317,11 +23332,38 @@ const GRAPH_TOOL_EXECUTORS = {
           ownsStep: () => ownsWorkflowReloadGuard(reloadGuardToken),
           endStep: () => endWorkflowReloadStep(reloadGuardToken),
         });
-        if (activeSettle.status !== "settled") {
+        // #2022 — after reconnect, an applied open of a listed tmp: tab can still
+        // look unproven: the restored object is briefly unreadable, or object
+        // identity has not caught up with the switch. Recheck the live routing
+        // key before treating that as a failed switch. A still-unknown result
+        // keeps the receipt (applied:true) rather than throwing a hard error.
+        let tmpRoutingSettle = null;
+        if (
+          activeSettle.status !== "settled" &&
+          isUnsavedTmpOpenSelector(path) &&
+          !openFailed
+        ) {
+          tmpRoutingSettle = await settleOwnedOpenedTmpRoutingKey({
+            requestedKey: path,
+            readActive: activeWorkflowRef,
+            workflowTabId: readExistingWorkflowTabId,
+            beginStep: () => beginWorkflowReloadStep(reloadGuardToken),
+            ownsStep: () => ownsWorkflowReloadGuard(reloadGuardToken),
+            endStep: () => endWorkflowReloadStep(reloadGuardToken),
+          });
+        }
+        const tmpOpenSettled = tmpRoutingSettle?.status === "settled";
+        const tmpOpenAppliedUnproven =
+          isUnsavedTmpOpenSelector(path) &&
+          !openFailed &&
+          activeSettle.status !== "settled" &&
+          !tmpOpenSettled &&
+          !appliedTmpOpenShouldFailClosed({ routingSettle: tmpRoutingSettle });
+        if (activeSettle.status !== "settled" && !tmpOpenSettled && !tmpOpenAppliedUnproven) {
           rebindFailed = new Error(
-            activeSettle.status === "different"
+            activeSettle.status === "different" || tmpRoutingSettle?.status === "different"
               ? "workflow_open did not leave the requested workflow as the stable active canvas"
-              : activeSettle.status === "superseded"
+              : activeSettle.status === "superseded" || tmpRoutingSettle?.status === "superseded"
                 ? "workflow_open lost ownership of its reload window while the active canvas was settling"
                 : "workflow_open could not prove that the requested workflow remained the stable active canvas",
           );
@@ -23332,9 +23374,12 @@ const GRAPH_TOOL_EXECUTORS = {
         // gate for this reconnect epoch. Failed/unknown/superseded opens leave both
         // proofs invalidated below instead of allowing an immediate list or mutation to
         // trust a prior open's proof.
+        // #2022 — an applied tmp: open that is still racing its routing-key proof
+        // DID re-point `active`, so the list's `active_confirmed` window may close.
+        // The mutation gate stays closed until the binding is actually proven.
         if (!rebindFailed && backendReconnectEpoch === openedForEpoch) {
           activeWorkflowResyncEpoch = openedForEpoch;
-          postReconnectBindingProofEpoch = openedForEpoch;
+          if (!tmpOpenAppliedUnproven) postReconnectBindingProofEpoch = openedForEpoch;
         }
       }
       }
@@ -23457,8 +23502,19 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       })(),
     });
+    // #2022 — a tmp: request is not a filename alias. Reporting the native
+    // `path`/`filename` ("Unsaved Workflow", a leftover disk path on an
+    // unpersisted tab) makes the orchestrator corroborate it as a saved
+    // identity and fail the already-applied open when `active_confirmed` is
+    // still catching up. Keep those fields null for unsaved selectors; the
+    // routing key is the identity.
+    const openedForTmp = isUnsavedTmpOpenSelector(path);
     return {
-      opened: { path: target.path, filename: target.filename },
+      opened: {
+        path: openedForTmp ? null : target.path,
+        filename: openedForTmp ? null : target.filename,
+        ...(targetRoutingKeyAtReply ? { routing_key: targetRoutingKeyAtReply } : {}),
+      },
       routing_key: targetRoutingKeyAtReply,
       ...openActiveBinding,
       // #1325 — `panel_set_workflow_target({mode:"current"})` lands here and

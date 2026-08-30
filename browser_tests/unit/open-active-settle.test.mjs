@@ -4,7 +4,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+  appliedTmpOpenShouldFailClosed,
+  isUnsavedTmpOpenSelector,
   settleOpenedWorkflowActive,
+  settleOwnedOpenedTmpRoutingKey,
   settleOwnedOpenedWorkflowActive,
 } from "../../web/js/lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "../../web/js/lib/settle-open-readable.js";
@@ -152,6 +155,10 @@ function productionExecutor(methodName, environment) {
     graphRootWorkflowUuidMatches,
     graphRootWorkflowUuidMismatches,
     describeLiveCanvasBinding: productionDescribeLiveCanvasBinding(environment),
+    isUnsavedTmpOpenSelector,
+    appliedTmpOpenShouldFailClosed,
+    settleOwnedOpenedTmpRoutingKey,
+    readExistingWorkflowTabId: (wf) => (wf?.path ? `wf:${wf.path}` : null),
     ...environment,
   };
   const scope = new Proxy(sandbox, {
