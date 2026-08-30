@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.129] - 2026-08-30
+
+### Fixed
+- queued runs keep their receipt; applied widget writes do not hang on rAF (#2054)
+
+
 ## [0.15.128] - 2026-08-30
 
 ### Fixed
