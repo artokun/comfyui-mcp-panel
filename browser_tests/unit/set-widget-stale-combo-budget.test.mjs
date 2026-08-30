@@ -311,6 +311,9 @@ const EXECUTOR_DEPS = [
   // #1498 — the handler retires the turn's manual-change claim for the widget it just
   // wrote. Panel module state, so the harness supplies a no-op double.
   "dropManualChangeClaim",
+  // #2116 — late mutation receipts are panel module state. Harnesses supply a no-op.
+  "commandFingerprint",
+  "lateMutationReceipts",
 ];
 
 function deferred() {

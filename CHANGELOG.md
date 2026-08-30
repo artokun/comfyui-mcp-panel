@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_widget returns a late mutation receipt when graph_set_widget applies after the caller timeout, and retry_of replays that receipt by request id without a duplicate write (#2116)
+
 ## [0.15.147] - 2026-08-30
 
 ### Fixed
