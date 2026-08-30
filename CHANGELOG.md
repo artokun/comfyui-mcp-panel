@@ -6,11 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.126] - 2026-08-30
+
 ### Fixed
 - after a restart confirmation times out without rebooting, an in-place workflow save rebinds the same-origin userdata route and retries the write once, so a dirty tab is not stranded behind the browsers bare Failed to fetch; if the write still cannot land, the error names the userdata URL and any HTTP status/body (#1757)
 - promoted widget writes no longer treat a stale inner Primitive handle as the parent rail, so MiniMax H3 duration/value_1, turbo_mode, turbo_steps, and lora_name serialize the new value (#366)
 - scoped run-to-node no longer false-refuses after a finished subgraph edit: the graph stamp waits for pending canvas work to settle and restamps once if the revision moved before queue, without falling through to a full-graph run (#572)
 - resolve the 18+ consent card before the 300s tools/call deadline so an idle user gets a structured timeout instead of a transport hang (#390)
+
+- preserve current untagged canvas capture so an already-current untagged root is not treated as the previous tab (#1215, #2038)
+
 
 ## [0.15.125] - 2026-08-30
 
