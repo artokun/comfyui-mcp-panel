@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_widget keeps COMFY_DYNAMICCOMBO_V3 dotted-child writes across queue-time reserialize instead of reverting to spec defaults (#2031)
+
+
 ## [0.15.137] - 2026-08-30
 
 ### Fixed
