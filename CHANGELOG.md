@@ -6,12 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- live graph reads recover after a manual canvas edit: a hung panel_graph_outline no longer pins retries, tracker snapshot flush stays mutation-only, and image/canvas widget values are clipped without a full stringify that could miss the 20s RPC window (#2003)
+
 ## [0.15.144] - 2026-08-30
 
 ### Fixed
 - panel_set_widget acknowledges an inner-subgraph widget write once readback matches, instead of waiting out the 90s relay on a hanging widget callback or parent-rail restore (#2001)
 - panel_promote_widget refuses canvas-only callback widgets (control_after_generate) and writes only [nodeId, widgetName] string pairs through the legacy promotion store, so saved workflows stay loadable (#2002)
-- live graph reads recover after a manual canvas edit: a hung panel_graph_outline no longer pins retries, tracker snapshot flush stays mutation-only, and image/canvas widget values are clipped without a full stringify that could miss the 20s RPC window (#2003)
 
 
 ## [0.15.143] - 2026-08-30
