@@ -37,7 +37,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { dispatchScopedRun, createRunFetchInterceptor } from "../../web/js/lib/run-scope-guard.js";
+import {
+  dispatchScopedRun,
+  createRunFetchInterceptor,
+  invokeQueuePromptWithBrowserStack,
+} from "../../web/js/lib/run-scope-guard.js";
 import { makeCommandBudget } from "../../web/js/lib/command-budget.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import {
@@ -82,6 +86,7 @@ import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame
 import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js";
 import { createRunReceiptOutbox } from "../../web/js/lib/run-receipt-outbox.js";
 import { createRehelloGate, routeIsStale } from "../../web/js/lib/rehello-gate.js";
+import { coerceMessageText } from "../../web/js/lib/chat-serialize.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -689,6 +694,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
       return dispatch ? dispatch(args) : { outcome: "unverified", queueMark: 1, verified: 0, error: "stub" };
     },
     createRunFetchInterceptor,
+    invokeQueuePromptWithBrowserStack,
     graphToPromptUnusable,
     unrunnableNodeIdsInScope,
     unserializableGraphRefusal,
@@ -738,6 +744,109 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
   );
   return { graph_run: factory(...names.map((n) => deps[n])), seen };
 }
+
+test("#248 production path: a scoped and full app.queuePrompt throw retains browser source context", async () => {
+  const stop = keepAlive();
+  try {
+    const browserStack = [
+      "TypeError: Cannot convert undefined or null to object",
+      "    at app.graphToPrompt (http://127.0.0.1:8188/extensions/tts_audio_suite/audio_analyzer_interface.js:102:24)",
+      "    at async ComfyApp.graphToPrompt (http://127.0.0.1:8188/extensions/comfyui-videohelpersuite/js/VHS.core.js:2349:23)",
+    ].join("\n");
+    const makeThrowingApp = () => {
+      const server = makeServer();
+      const apiTarget = { fetchApi: server };
+      const app = makeBusyDroppingFrontend({ apiTarget });
+      app.graph = { _nodes: [] };
+      app.queuePrompt = () => {
+        const error = new TypeError("Cannot convert undefined or null to object");
+        error.stack = browserStack;
+        return Promise.reject(error);
+      };
+      return { app, apiTarget, server };
+    };
+    const assertBrowserContext = (error) => {
+      assert.match(error.message, /^app\.queuePrompt failed:\n/);
+      assert.match(error.message, /Cannot convert undefined or null to object/);
+      assert.match(error.message, /tts_audio_suite\/audio_analyzer_interface\.js:102:24/);
+      assert.match(error.message, /comfyui-videohelpersuite\/js\/VHS\.core\.js:2349:23/);
+      return true;
+    };
+
+    const scoped = makeThrowingApp();
+    const scopedRun = realGraphRun({
+      app: scoped.app,
+      apiTarget: scoped.apiTarget,
+      budgetMs: 2000,
+      serializeMs: 500,
+      dispatch: (args) => dispatchScopedRun({ ...args, verifyTimeoutMs: 100 }),
+    });
+    await assert.rejects(() => scopedRun.graph_run({ to_node_id: 9 }), assertBrowserContext);
+    assert.equal(scoped.server.calls.length, 0, "the queue throw occurred before a POST");
+
+    const full = makeThrowingApp();
+    const fullRun = realGraphRun({
+      app: full.app,
+      apiTarget: full.apiTarget,
+      budgetMs: 2000,
+      serializeMs: 500,
+    });
+    await assert.rejects(() => fullRun.graph_run({}), assertBrowserContext);
+    assert.equal(full.server.calls.length, 0, "the queue throw occurred before a POST");
+  } finally {
+    stop();
+  }
+});
+
+test("#248 production path: a non-Error queue failure reaches the panel-visible reply unchanged", async () => {
+  const stop = keepAlive();
+  try {
+    assert.match(
+      panelSrc,
+      /error: coerceMessageText\(err\?\.message \?\? err\),/,
+      "the live bridge must serialize the executor failure through the panel message coercer",
+    );
+    const thrown = {
+      name: "QueueWrapperFailure",
+      message: "structured queue failure",
+      stack: "QueueWrapperFailure: structured queue failure\n    at extension://queue-wrapper.js:17:9",
+    };
+    const server = makeServer();
+    const apiTarget = { fetchApi: server };
+    const app = makeBusyDroppingFrontend({ apiTarget });
+    app.graph = { _nodes: [] };
+    app.queuePrompt = () => Promise.reject(thrown);
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 2000,
+      serializeMs: 500,
+    });
+
+    await assert.rejects(
+      () => built.graph_run({}),
+      (received) => {
+        assert.equal(received, thrown, "graph_run must preserve the frontend's thrown object");
+        // This is the exact production bridge expression in panel.js: the
+        // panel-visible wire field prefers a structured error's message.
+        const reply = {
+          rid: "non-error-rid",
+          ok: false,
+          error: coerceMessageText(received?.message ?? received),
+        };
+        assert.deepEqual(reply, {
+          rid: "non-error-rid",
+          ok: false,
+          error: "structured queue failure",
+        });
+        return true;
+      },
+    );
+    assert.equal(server.calls.length, 0, "the queue failure occurred before a POST");
+  } finally {
+    stop();
+  }
+});
 
 test("#1565 CALL SITE: graph_run hands the dispatch its own command budget", async () => {
   const stop = keepAlive();

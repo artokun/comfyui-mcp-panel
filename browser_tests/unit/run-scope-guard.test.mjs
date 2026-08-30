@@ -14,6 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -39,6 +40,7 @@ import {
   readScopeFromBody,
   cancelPendingScopedQueueItem,
   dispatchScopedRun,
+  invokeQueuePromptWithBrowserStack,
 } from "../../web/js/lib/run-scope-guard.js";
 import { resolveRunToNodeTarget } from "../../web/js/lib/subgraph-scope.js";
 
@@ -244,6 +246,210 @@ function makeShadowedQueueFrontend({ dropArgs = false, apiTarget, output = OUR_O
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+test("#248 queuePrompt invocation keeps the original browser stack for sync and async throws", async () => {
+  const browserStack = [
+    "TypeError: Cannot convert undefined or null to object",
+    "    at app.queuePrompt (http://127.0.0.1:8188/extensions/tts_audio_suite/audio_analyzer_interface.js:102:24)",
+  ].join("\n");
+  for (const queuePrompt of [
+    () => {
+      const error = new TypeError("Cannot convert undefined or null to object");
+      error.stack = browserStack;
+      throw error;
+    },
+    () => {
+      const error = new TypeError("Cannot convert undefined or null to object");
+      error.stack = browserStack;
+      return Promise.reject(error);
+    },
+  ]) {
+    await assert.rejects(
+      () => invokeQueuePromptWithBrowserStack({ queuePrompt }, 0, 1, undefined),
+      (error) => {
+        assert.match(error.message, /^app\.queuePrompt failed:\n/);
+        assert.match(error.message, /Cannot convert undefined or null to object/);
+        assert.match(error.message, /tts_audio_suite\/audio_analyzer_interface\.js:102:24/);
+        return true;
+      },
+    );
+  }
+});
+
+test("#248 a non-Error with a readable stack keeps its identity and message", async () => {
+  const thrown = {
+    name: "QueueWrapperFailure",
+    message: "structured queue failure",
+    stack: "QueueWrapperFailure: structured queue failure\n    at extension://queue-wrapper.js:17:9",
+  };
+  for (const queuePrompt of [
+    () => {
+      throw thrown;
+    },
+    () => Promise.reject(thrown),
+  ]) {
+    await assert.rejects(
+      () => invokeQueuePromptWithBrowserStack({ queuePrompt }),
+      (received) => {
+        assert.equal(received, thrown);
+        assert.equal(received.message, thrown.message);
+        assert.equal(received.stack, thrown.stack);
+        return true;
+      },
+    );
+  }
+});
+
+test("#248 a non-Error with a spoofed Error toStringTag keeps its identity and message", async () => {
+  for (const thrown of [
+    {
+      [Symbol.toStringTag]: "Error",
+      name: "SpoofedQueueFailure",
+      message: "structured spoofed queue failure",
+      stack: "SpoofedQueueFailure: structured spoofed queue failure\n    at extension://queue-wrapper.js:23:9",
+    },
+    Object.assign(Object.create({ [Symbol.toStringTag]: "Error" }), {
+      name: "InheritedSpoofedQueueFailure",
+      message: "structured inherited spoofed queue failure",
+      stack: "InheritedSpoofedQueueFailure: structured inherited spoofed queue failure\n    at extension://queue-wrapper.js:29:9",
+    }),
+  ]) {
+    for (const queuePrompt of [
+      () => {
+        throw thrown;
+      },
+      () => Promise.reject(thrown),
+    ]) {
+      await assert.rejects(
+        () => invokeQueuePromptWithBrowserStack({ queuePrompt }),
+        (received) => {
+          assert.equal(received, thrown);
+          assert.equal(received.message, thrown.message);
+          assert.equal(received.stack, thrown.stack);
+          return true;
+        },
+      );
+    }
+  }
+});
+
+test("#248 hostile or non-string stacks cannot mask the original queue failure", async () => {
+  for (const stack of [Symbol("hostile stack"), { toString: () => { throw new Error("coercion"); } }]) {
+    const error = new TypeError("Cannot convert undefined or null to object");
+    error.stack = stack;
+    await assert.rejects(
+      () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(error) }),
+      (received) => {
+        assert.equal(received, error);
+        assert.equal(received.message, "Cannot convert undefined or null to object");
+        return true;
+      },
+    );
+  }
+});
+
+test("#248 huge stacks are bounded and credential-shaped text is redacted", async () => {
+  const error = new TypeError("Cannot convert undefined or null to object");
+  error.stack = [
+    error.message,
+    "    at app.graphToPrompt (http://127.0.0.1:8188/extensions/tts_audio_suite/audio_analyzer_interface.js:102:24)",
+    `    at fetch (https://example.test/?opaque=${"a".repeat(64)})`,
+    "    at noisy-frame ".repeat(100_000),
+  ].join("\n");
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(error) }),
+    (wrapped) => {
+      assert.ok(wrapped.message.length <= 4096, `message must be bounded, got ${wrapped.message.length}`);
+      assert.match(wrapped.message, /tts_audio_suite\/audio_analyzer_interface\.js:102:24/);
+      assert.match(wrapped.message, /browser stack truncated/);
+      assert.match(wrapped.message, /«redacted»/);
+      assert.doesNotMatch(wrapped.message, /opaque=aaaa/);
+      return true;
+    },
+  );
+});
+
+test("#248 a Proxy getPrototypeOf trap cannot replace the original thrown value", async () => {
+  let prototypeReads = 0;
+  const hostile = new Proxy({}, {
+    getPrototypeOf() {
+      prototypeReads += 1;
+      throw new Error("getPrototypeOf trap should not run");
+    },
+  });
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(hostile) }),
+    (received) => {
+      assert.equal(received, hostile);
+      return true;
+    },
+  );
+  assert.equal(prototypeReads, 0);
+});
+
+test("#248 a Proxy cannot hang or spoof Error classification through a cyclic prototype", async () => {
+  let prototypeReads = 0;
+  let hostile;
+  hostile = new Proxy({}, {
+    get(target, property, receiver) {
+      if (property === Symbol.toStringTag) return "Error";
+      return Reflect.get(target, property, receiver);
+    },
+    getPrototypeOf() {
+      prototypeReads += 1;
+      return hostile;
+    },
+  });
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(hostile) }),
+    (received) => {
+      assert.equal(received, hostile);
+      return true;
+    },
+  );
+  assert.equal(prototypeReads, 1);
+});
+
+test("#248 a Proxy cannot force an unbounded Error prototype scan", async () => {
+  let prototypeReads = 0;
+  const handler = {
+    get(target, property, receiver) {
+      if (property === Symbol.toStringTag) return "Error";
+      return Reflect.get(target, property, receiver);
+    },
+    getPrototypeOf() {
+      prototypeReads += 1;
+      return new Proxy({}, handler);
+    },
+  };
+  const hostile = new Proxy({}, handler);
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(hostile) }),
+    (received) => {
+      assert.equal(received, hostile);
+      return true;
+    },
+  );
+  assert.equal(prototypeReads, 33);
+});
+
+test("#248 cross-realm Error-shaped values retain their browser stack", async () => {
+  const crossRealmError = runInNewContext(`(() => {
+    const error = new TypeError("Cannot convert undefined or null to object");
+    error.stack = "TypeError: Cannot convert undefined or null to object\\n" +
+      "    at app.graphToPrompt (http://127.0.0.1:8188/extensions/tts_audio_suite/audio_analyzer_interface.js:102:24)";
+    return error;
+  })()`);
+  await assert.rejects(
+    () => invokeQueuePromptWithBrowserStack({ queuePrompt: () => Promise.reject(crossRealmError) }),
+    (wrapped) => {
+      assert.match(wrapped.message, /^app\.queuePrompt failed:\n/);
+      assert.match(wrapped.message, /Cannot convert undefined or null to object/);
+      assert.match(wrapped.message, /tts_audio_suite\/audio_analyzer_interface\.js:102:24/);
+      return true;
+    },
+  );
+});
 
 test("#1782 queuePromptScopeArgs: no scope ⇒ [undefined]; 1.49.6 options carry both queue layers", () => {
   assert.deepEqual(queuePromptScopeArgs(undefined), [undefined]);

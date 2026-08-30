@@ -157,12 +157,12 @@ test("#988 (codex) source guard: the scan runs BEFORE dispatch, not after", () =
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const scan = src.indexOf("repeatingControls = findRepeatingControlWidgets(");
   // #1565 — the unscoped dispatch is BOUNDED by the command budget now, so the literal is
-  // no longer a bare `await`. The anchor follows the call; the ordering property it guards
-  // is unchanged, and the assertion below pins that it is still the bounded call.
-  const dispatch = src.indexOf("app.queuePrompt(0, batch, undefined)");
+  // no longer a bare `await`. #248 routes the queue call through the browser-stack
+  // decorator; anchor the production invocation instead of reaching into that helper.
+  const dispatch = src.indexOf("invokeQueuePromptWithBrowserStack(app, 0, batch, undefined)");
   assert.match(
     src.slice(Math.max(0, dispatch - 200), dispatch + 200),
-    /Promise\.resolve\(\s*queuePromptWithGraphToPromptSnapshot\([\s\S]*?app\.queuePrompt\(0, batch, undefined\)/,
+    /Promise\.resolve\(\s*queuePromptWithGraphToPromptSnapshot\([\s\S]*?invokeQueuePromptWithBrowserStack\(app, 0, batch, undefined\)/,
     "the unscoped dispatch must stay bounded — an unbounded one hangs past the relay window",
   );
   const scopedDispatch = src.indexOf("runScopeResult = await dispatchScopedRun({");
