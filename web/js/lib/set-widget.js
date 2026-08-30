@@ -56,6 +56,8 @@ import {
   serverDeclaresEmptyComboOptions,
   serverDeclaresRemoteComboOptions,
 } from "./input-asset.js";
+import { withTimeout } from "./bounded-step.js";
+import { honestWidgetAck } from "./delivery-ack.js";
 
 /**
  * Fire an undo-history hook that can never escape.
@@ -114,9 +116,17 @@ export const COMBO_REFRESH_NEVER_RAN = Symbol("combo-refresh-never-ran");
  * one animation frame when the host has rAF, then another microtask so a mount
  * that itself queues work is visible. No rAF in Node tests → two microtasks,
  * so existing runSetWidget tests do not hang or grow a timer.
+ *
+ * #1995 — the wait is BOUNDED. After reconnect a backgrounded tab never fires
+ * rAF, so an unbounded frame wait held the reply until the relay timed out
+ * while the callback had already applied the value. The bound is long enough
+ * for a visible frame and short enough that an applied write still gets a
+ * receipt. Injectable timers so tests can fire the bound without sleeping.
  */
-export function awaitFrontendWidgetFlush() {
-  return new Promise((resolve) => {
+export const FRONTEND_WIDGET_FLUSH_MS = 250;
+
+export function awaitFrontendWidgetFlush(timers) {
+  const flush = new Promise((resolve) => {
     queueMicrotask(() => {
       if (typeof requestAnimationFrame === "function") {
         requestAnimationFrame(() => queueMicrotask(resolve));
@@ -125,6 +135,7 @@ export function awaitFrontendWidgetFlush() {
       }
     });
   });
+  return withTimeout(flush, FRONTEND_WIDGET_FLUSH_MS, () => undefined, timers);
 }
 
 function widgetValuesMatch(expected, actual) {
@@ -1033,7 +1044,7 @@ export async function runSetWidget(
 
   async function succeedWrite(extra = {}, extraResult = {}) {
     const set = await retainVerifiedWrite(write(extra), () => write(extra));
-    return withWarning({ set, ...extraResult });
+    return withWarning(honestWidgetAck({ set, ...extraResult }));
   }
 
   // #558: the value widget being written may be governed by a non-`fixed`
@@ -1570,7 +1581,7 @@ export async function runSetWidget(
           }
           throw unreadableErr;
         }
-        return withWarning({
+        return withWarning(honestWidgetAck({
           set,
           ...(typeof refreshCombos === "function" ? { refreshed: true } : {}),
           // A stateful callback that finally answered `[]` landed on #507's acceptance instead,
@@ -1610,7 +1621,7 @@ export async function runSetWidget(
                   `itself — may show it as out-of-range.`,
               }
             : {}),
-        });
+        }));
       }
       // The shape test said the server does NOT declare this input's list empty — but when the
       // only schema available is #1223's snapshot, that "no" is not the server publishing a
