@@ -388,7 +388,9 @@ export function selectorTargetsNonActiveWorkflow({ resolved, active } = {}) {
  *  touches no graph. graph_get_virtual_types (comfyui-mcp#1400) reads the GLOBAL
  *  LiteGraph class registry, never a canvas, and its reply describes no workflow —
  *  and it is pulled by the orchestrator at hello, where no workflow stamp exists
- *  to agree with. */
+ *  to agree with. graph_get_object_info (#1996) reads THIS tab's /object_info
+ *  (the node schema), never a canvas; panel_strip_workflow needs it even when
+ *  the canvas binding is unproven, because the schema is per-ComfyUI. */
 const CANVAS_INDEPENDENT_COMMANDS = new Set([
   'nodes_search',
   'nodes_list',
@@ -396,6 +398,7 @@ const CANVAS_INDEPENDENT_COMMANDS = new Set([
   'nodes_queue_status',
   'graph_update_node',
   'graph_get_virtual_types',
+  'graph_get_object_info',
   'fetch_image',
   'fetch_comfyui_read',
   'comfy_reboot',
