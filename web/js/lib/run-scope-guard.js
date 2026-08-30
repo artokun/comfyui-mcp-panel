@@ -1547,7 +1547,7 @@ export function createScopedRunGuard({
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
-  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, failed: null, repairedFromKeys: null, prunedRetry: null };
+  const state = { observed: 0, repaired: 0, rejected: 0, refused: 0, overrun: 0, overrunError: null, inFlight: 0, indeterminate: 0, closed: false, retired: false, dropped: null, droppedReason: null, droppedBody: null, failed: null, repairedFromKeys: null, prunedRetry: null };
   const waiters = new Set();
   const notify = () => {
     for (const fire of [...waiters]) fire();
@@ -1779,6 +1779,13 @@ export function createScopedRunGuard({
               bodyKeys: scopeRead.bodyKeys,
             };
       state.droppedReason = verdict.reason;
+      if (!contentOk) {
+        try {
+          state.droppedBody = typeof options?.body === "string" ? options.body : null;
+        } catch {
+          state.droppedBody = null;
+        }
+      }
       try {
         state.dropped = scopeDroppedError({ toNodeId, verdict });
       } catch {
@@ -1899,6 +1906,68 @@ export function cancelPendingScopedQueueItem(app, { runTag, queueMark } = {}) {
  *    (no fetchApi to observe through, or no prompt signature) — refused
  *    BEFORE dispatch, nothing queued.
  */
+
+/**
+ * The cheap canvas-revision signal the scoped-run stamp waits on (#572).
+ * `changeCount` / `_restoringState` / `isLoadingGraph` are ChangeTracker's
+ * own "do not snapshot yet" windows; `extra` is LiteGraph's last-change
+ * counter when the frontend exposes one. Unreadable fields count as idle.
+ */
+export function graphStampRevision(app) {
+  const graph = app?.rootGraph ?? app?.graph ?? null;
+  let tracker = null;
+  try {
+    tracker =
+      app?.extensionManager?.workflow?.activeWorkflow?.changeTracker ??
+      graph?.changeTracker ??
+      null;
+  } catch {
+    tracker = null;
+  }
+  let changeCount = 0;
+  let restoring = false;
+  let loading = false;
+  let extra = 0;
+  try {
+    const n = Number(tracker?.changeCount);
+    if (Number.isFinite(n) && n > 0) changeCount = n;
+  } catch {
+    /* unreadable tracker → treat as idle */
+  }
+  try {
+    restoring = !!tracker?._restoringState;
+  } catch {
+    restoring = false;
+  }
+  try {
+    loading = !!tracker?.constructor?.isLoadingGraph;
+  } catch {
+    loading = false;
+  }
+  try {
+    const n = Number(graph?.last_change_time ?? graph?._version);
+    if (Number.isFinite(n)) extra = n;
+  } catch {
+    extra = 0;
+  }
+  return { changeCount, restoring, loading, extra };
+}
+
+export function graphStampBusy(rev) {
+  return !!rev && (rev.changeCount > 0 || rev.restoring || rev.loading);
+}
+
+export function sameGraphStampRevision(a, b) {
+  return (
+    !!a &&
+    !!b &&
+    a.changeCount === b.changeCount &&
+    a.restoring === b.restoring &&
+    a.loading === b.loading &&
+    a.extra === b.extra
+  );
+}
+
 export async function dispatchScopedRun({
   app,
   apiTarget,
@@ -1912,7 +1981,7 @@ export async function dispatchScopedRun({
   onPromptId = null,
   onAcceptedNodeErrors = null,
 } = {}) {
-  const mark = queueMark ?? newScopedQueueMark();
+  let mark = queueMark ?? newScopedQueueMark();
   // #1565 — ONE DEADLINE FOR THE WHOLE DISPATCH, so the per-attempt bounds COMPOSE.
   //
   // Every wait in this function used to start its own fresh clock: four argument
@@ -2015,41 +2084,75 @@ export async function dispatchScopedRun({
   // No hash ⇒ no attribution ⇒ fail closed BEFORE dispatch. The canonical
   // form is RETAINED (contentCanon) so a graph_changed refusal can say WHAT
   // differed instead of asserting a cause (#659).
-  let contentHash = null;
-  let contentCanon = null;
-  let volatileInputs = null;
-  // #1571 — KEEP what was thrown. The refusal below is the only thing the caller sees,
-  // and without this the serializer's own message (which names the offending node) was
-  // discarded at exactly the moment it was needed.
-  let fingerprintCause = null;
-  try {
-    if (typeof app.graphToPrompt === "function") {
-      // This panel's live root is app.graph (r8) — app.rootGraph only as a
-      // fallback for frontends that expose it instead.
-      volatileInputs = collectVolatileInputs(app?.graph ?? app?.rootGraph ?? null);
-      // #1565 — BOUNDED. Serializing the whole workflow is the first thing the run path
-      // does that the read path never does, and an extension's serializeValue that never
-      // settles held the command open with no bound at all. A serializer that will not
-      // answer leaves no fingerprint, which is already the fail-closed state below:
-      // `unverifiable`, nothing queued, and the cause named.
-      const built = await boundedStep(app.graphToPrompt(), boundedBy(verifyTimeoutMs));
-      if (built === TIMED_OUT) {
-        throw new Error(
-          `app.graphToPrompt did not answer within this run's command budget — the ` +
-            `frontend could not serialize the workflow, so nothing was queued`,
-        );
+  //
+  // #572 recurrence — subgraph-exit / node-activate edits can still be
+  // flushing when this stamp runs (ChangeTracker.changeCount > 0, or the
+  // first graphToPrompt itself rematerialises a nested link). Snapshot after
+  // that window closes, and restamp once if the revision moved during the
+  // first fingerprint. A genuine mid-window user edit still mismatches and
+  // is refused (#556).
+  const fingerprintOnce = async () => {
+    let contentHash = null;
+    let contentCanon = null;
+    let volatileInputs = null;
+    let fingerprintCause = null;
+    try {
+      if (typeof app.graphToPrompt === "function") {
+        // Prefer the workflow root when the canvas is still inside a subgraph
+        // view: prompt keys are root-relative colon paths.
+        volatileInputs = collectVolatileInputs(app?.rootGraph ?? app?.graph ?? null);
+        // #1565 — BOUNDED. Serializing the whole workflow is the first thing the run path
+        // does that the read path never does, and an extension's serializeValue that never
+        // settles held the command open with no bound at all. A serializer that will not
+        // answer leaves no fingerprint, which is already the fail-closed state below:
+        // `unverifiable`, nothing queued, and the cause named.
+        const built = await boundedStep(app.graphToPrompt(), boundedBy(verifyTimeoutMs));
+        if (built === TIMED_OUT) {
+          throw new Error(
+            `app.graphToPrompt did not answer within this run's command budget — the ` +
+              `frontend could not serialize the workflow, so nothing was queued`,
+          );
+        }
+        // `"error" in` rather than a truthiness test: a falsy thrown value (`throw undefined`)
+        // used to propagate out of here, and a bound must not swallow it.
+        if ("error" in built) throw built.error;
+        contentCanon = canonicalizePrompt(built.value?.output, volatileInputs);
+        contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
       }
-      // `"error" in` rather than a truthiness test: a falsy thrown value (`throw undefined`)
-      // used to propagate out of here, and a bound must not swallow it.
-      if ("error" in built) throw built.error;
-      contentCanon = canonicalizePrompt(built.value?.output, volatileInputs);
-      contentHash = contentCanon ? fnv1aHex(JSON.stringify(contentCanon)) : null;
+    } catch (err) {
+      contentHash = null;
+      contentCanon = null;
+      fingerprintCause = err;
     }
-  } catch (err) {
-    contentHash = null;
-    contentCanon = null;
-    fingerprintCause = err;
+    return { contentHash, contentCanon, volatileInputs, fingerprintCause };
+  };
+  const yieldStampTurn = async () => {
+    if (hasBudget && typeof budget.exhausted === "function" && budget.exhausted()) return TIMED_OUT;
+    return boundedStep(new Promise((resolve) => setTimeout(resolve, 0)), boundedBy(1));
+  };
+
+  let rev = graphStampRevision(app);
+  await yieldStampTurn();
+  let revSettled = graphStampRevision(app);
+  if (graphStampBusy(revSettled) || !sameGraphStampRevision(rev, revSettled)) {
+    await yieldStampTurn();
+    revSettled = graphStampRevision(app);
   }
+
+  let fp = await fingerprintOnce();
+  const revAfterStamp = graphStampRevision(app);
+  if (
+    fp.contentHash &&
+    (!sameGraphStampRevision(revSettled, revAfterStamp) || graphStampBusy(revSettled))
+  ) {
+    const again = await fingerprintOnce();
+    if (again.contentHash) fp = again;
+  }
+
+  let contentHash = fp.contentHash;
+  let contentCanon = fp.contentCanon;
+  let volatileInputs = fp.volatileInputs;
+  const fingerprintCause = fp.fingerprintCause;
   if (!contentHash) {
     return {
       outcome: "unverifiable",
@@ -2063,7 +2166,7 @@ export async function dispatchScopedRun({
   // post-hash outcome so the caller can report the coverage gap truthfully
   // instead of implying full-graph drift proof (see collectVolatileInputs'
   // ACCEPTED RESIDUAL note).
-  const volatileList = volatileInputs ? [...volatileInputs].sort() : [];
+  let volatileList = volatileInputs ? [...volatileInputs].sort() : [];
   // Ownership tag for the timeout cancellation (see QUEUE_ITEM_TAG).
   const runTag = Symbol("cmcp-scoped-run");
   try {
@@ -2072,8 +2175,12 @@ export async function dispatchScopedRun({
     // non-extensible array — cancellation will report 0 and the sentinel covers it.
   }
   let dropped = null;
-  const attempts = queuePromptScopeAttempts(execIds);
-  for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
+  let restampUsed = false;
+  for (;;) {
+    let restampAgain = false;
+    dropped = null;
+    const attempts = queuePromptScopeAttempts(execIds);
+    for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
     const { arg: scopeArg, repair } = attempts[attemptIndex];
     const isLastAttempt = attemptIndex === attempts.length - 1;
     dropped = null;
@@ -2323,7 +2430,34 @@ export async function dispatchScopedRun({
     // r7 CONTENT DRIFT with ZERO verified posts is NOT an argument-shape
     // problem — retrying the other shape would produce the same drifted post.
     // Terminal refusal naming that the graph changed under the deferred item.
+    //
+    // #572 — one exception, and only this one: the refused body already equals
+    // a fresh serialization of the now-idle canvas. The first stamp was stale
+    // (subgraph-exit / node-activate still flushing); nothing was queued. Adopt
+    // the settled snapshot on a NEW mark so the closed first-attempt sentinel
+    // still blocks the old identity, and dispatch once. A live graph that does
+    // not match the refused body is a real concurrent edit and still refuses.
     if (guard.state.observed === 0 && guard.state.droppedReason === "graph_changed") {
+      if (!restampUsed) {
+        const live = await fingerprintOnce();
+        const bodyHash = live.contentHash
+          ? promptContentHashFromBody(guard.state.droppedBody, live.volatileInputs)
+          : null;
+        if (
+          live.contentHash &&
+          bodyHash === live.contentHash &&
+          !graphStampBusy(graphStampRevision(app))
+        ) {
+          restampUsed = true;
+          restampAgain = true;
+          contentHash = live.contentHash;
+          contentCanon = live.contentCanon;
+          volatileInputs = live.volatileInputs;
+          volatileList = volatileInputs ? [...volatileInputs].sort() : [];
+          mark = newScopedQueueMark();
+          break;
+        }
+      }
       return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: guard.state.dropped };
     }
     // A corrupted post with ZERO verified posts means this argument SHAPE was
@@ -2353,6 +2487,8 @@ export async function dispatchScopedRun({
         graphChanged: guard.state.droppedReason === "graph_changed",
       }),
     };
+    }
+    if (restampAgain) continue;
+    return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: dropped };
   }
-  return { outcome: "refused", queueMark: mark, verified: 0, volatileInputs: volatileList, error: dropped };
 }
