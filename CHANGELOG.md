@@ -27,6 +27,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - the pre-publish registry parity scan now inspects the packaged archive rather than the repo, is wired into the publish job, and refuses to treat a Pending registry status as a pass (#1886)
+- relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
 
 
 ## [0.15.130] - 2026-08-30
@@ -46,9 +47,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [0.15.128] - 2026-08-30
 
 ### Fixed
-- after reconnect, a queued run is never reported as user-rejected
+- after reconnect, a queued run is never reported as user-rejected (#1995)
 - panel_set_widget writes DOM-backed multiline editors (StringMultilineTagEditor `text`) through the live input/contenteditable that getValue reads, so a no-op setValue after configure no longer refuses the update (#1997)
-- relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
 
 
 ## [0.15.127] - 2026-08-30
