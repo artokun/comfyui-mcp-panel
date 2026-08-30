@@ -29,6 +29,8 @@ import {
   // #809
   clipCompactValue,
   compactClipNote,
+  isHeavyLiveWidgetValue,
+  HEAVY_WIDGET_PLACEHOLDER,
   OUTLINE_DETAIL_LEVELS,
   OUTLINE_MAX_CHARS_DEFAULT,
   OUTLINE_MAX_CHARS_FLOOR,
@@ -659,6 +661,29 @@ test("#1634 the clip note names the cap actually in force", () => {
     assert.equal(named, String(cap), `the note must name the cap in force (${cap})`);
   }
   assert.equal(compactClipNote(0, WIDGET_VALUE_CAP), "", "still silent when nothing clipped");
+});
+
+test("#2003 clipCompactValue does not stringify pixel buffers or canvas-like values", () => {
+  const pixels = new Uint8ClampedArray(1024 * 1024 * 4);
+  assert.equal(isHeavyLiveWidgetValue(pixels), true);
+  const started = Date.now();
+  const clipped = clipCompactValue({ width: 1024, height: 1024, data: pixels });
+  const elapsed = Date.now() - started;
+  assert.equal(clipped.clipped, true);
+  assert.equal(clipped.text, HEAVY_WIDGET_PLACEHOLDER);
+  assert.ok(elapsed < 50, `pixel bags must clip without a full stringify (${elapsed}ms)`);
+
+  const huge = new Array(8_000).fill(7);
+  const arrStarted = Date.now();
+  const arr = clipCompactValue(huge);
+  const arrElapsed = Date.now() - arrStarted;
+  assert.equal(arr.clipped, true);
+  assert.equal(arr.text, HEAVY_WIDGET_PLACEHOLDER);
+  assert.ok(arrElapsed < 50, `long arrays must not be JSON.stringified (${arrElapsed}ms)`);
+
+  assert.equal(isHeavyLiveWidgetValue("a short prompt"), false);
+  assert.equal(isHeavyLiveWidgetValue({ seed: 42 }), false);
+  assert.equal(capWidgetValue({ data: pixels }), HEAVY_WIDGET_PLACEHOLDER);
 });
 
 test("#1634 clipCompactValue honours a raised cap for a pinpoint read", () => {

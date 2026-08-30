@@ -173,10 +173,17 @@ test("#1723 flush swallows a capture failure like the deferred path does", () =>
 test("#1723 wires the flush BEFORE the graph-binding fence in the dispatch path", () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const source = readFileSync(join(here, "../../web/js/comfyui-mcp-panel.js"), "utf8").replace(/\r\n/g, "\n");
-  const flush = source.indexOf("flushPendingChangeTrackerSnapshot(");
+  const gate = source.indexOf("if (msg.cmd.startsWith(\"graph_\") && !commandIsCanvasIndependent(msg.cmd))");
   const fence = source.indexOf("assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd))");
+  assert.ok(gate >= 0, "the graph dispatch gate must exist");
+  assert.ok(fence > gate, "the binding fence still runs for graph commands");
+  const region = source.slice(gate, fence);
+  const flush = region.indexOf("flushPendingChangeTrackerSnapshot(");
   assert.ok(flush >= 0, "the dispatch path flushes a pending tracker snapshot");
-  assert.ok(fence > flush, "the flush lands before the binding fence reads the tracker");
+  // #2003 — the flush is mutation-only. Reads that serialize here miss the 20s
+  // graph_outline window after a PreviewImage/canvas edit.
+  const mutate = region.lastIndexOf("if (graphCommandMayMutateWorkflow(msg.cmd))", flush);
+  assert.ok(mutate >= 0 && mutate < flush, "the flush must sit inside the mutation branch, before the fence");
 });
 
 // ---------------------------------------------------------------------------

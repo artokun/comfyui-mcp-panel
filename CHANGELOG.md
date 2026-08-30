@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- live graph reads recover after a manual canvas edit: a hung panel_graph_outline no longer pins retries, tracker snapshot flush stays mutation-only, and image/canvas widget values are clipped without a full stringify that could miss the 20s RPC window (#2003)
+
 ## [0.15.144] - 2026-08-30
 
 ### Fixed

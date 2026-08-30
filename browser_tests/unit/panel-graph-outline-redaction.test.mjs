@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 
 import { displayLabel } from "../../web/js/lib/slot-labels.js";
 import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
+import { clipCompactValue, HEAVY_WIDGET_PLACEHOLDER } from "../../web/js/lib/graph-read.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -29,8 +30,10 @@ function productionFormatter(body) {
   return new Function(
     "redactWidgetValue",
     "NOTE_NODE_TYPES",
+    "clipCompactValue",
+    "COMPACT_VALUE_CLIP",
     `let outlineClipped = 0; let outlineClippedNoteIds = []; ${source}; return fmtVal;`,
-  )(redactWidgetValue, new Set(["Note", "MarkdownNote"]));
+  )(redactWidgetValue, new Set(["Note", "MarkdownNote"]), clipCompactValue, 60);
 }
 
 function productionRenderNodeLines(body, fmtVal, node) {
@@ -102,6 +105,24 @@ test("#1729 graph_outline redacts a bypassed API-key widget in its live node ren
   assert.match(lines[0], new RegExp(`api_key="?${escapeRegex(REDACTED_WIDGET_VALUE)}"?`));
   assert.match(lines[0], /prompt=visible prompt/, "ordinary visible widget values remain intact");
   assert.ok(!lines.join("\n").includes(secret), "the credential is absent from the outline text");
+});
+
+test("#2003 graph_outline clips ImageData-like widget values without a full stringify", () => {
+  const body = handlerBody(readFileSync(PANEL_JS, "utf8"), "graph_outline({");
+  assert.match(body, /clipCompactValue\(safeValue, COMPACT_VALUE_CLIP\)/, "the outline formatter must use the bounded clip");
+  const pixels = new Uint8ClampedArray(256 * 256 * 4);
+  const node = {
+    id: 2003,
+    type: "PreviewImage",
+    widgets: [{ name: "image", value: { width: 256, height: 256, data: pixels } }],
+    inputs: [],
+    outputs: [],
+  };
+  const started = Date.now();
+  const lines = productionRenderNodeLines(body, productionFormatter(body), node);
+  const elapsed = Date.now() - started;
+  assert.match(lines.join("\n"), new RegExp(`image="${HEAVY_WIDGET_PLACEHOLDER.replace(/[[\]]/g, "\\$&")}"`));
+  assert.ok(elapsed < 50, `PreviewImage pixel bags must not stall the outline (${elapsed}ms)`);
 });
 
 function escapeRegex(value) {

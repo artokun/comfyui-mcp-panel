@@ -905,6 +905,7 @@ import {
 } from "./lib/session-rebind.js";
 import { createRestartTabIdentity, sendBridgeHello } from "./lib/restart-tab-identity.js";
 import { createRehelloGate, routeIsStale } from "./lib/rehello-gate.js";
+import { shouldJoinInFlightGraphReply, ledgerReplyIsInFlight } from "./lib/graph-rpc-liveness.js";
 /** #1095 — control frames that must arrive AFTER the hello that establishes their route,
  *  and whose senders ignore the return value. Those two properties together are what makes
  *  a frame queueable: a queued frame's outcome is not yet known, so it may only be queued
@@ -14511,17 +14512,18 @@ const GRAPH_TOOL_EXECUTORS = {
      */
     const fmtVal = (v, node, widgetName) => {
       const safeValue = redactWidgetValue(widgetName, v);
-      const s = String(typeof safeValue === "string" ? safeValue : JSON.stringify(safeValue) ?? "").replace(/\s+/g, " ");
-      let clipped = s;
-      if (s.length > 60) {
+      // #2003 — clipCompactValue refuses to JSON.stringify ImageData / typed arrays /
+      // canvas elements, which is how a PreviewImage widget edit stalled this read.
+      const clippedValue = clipCompactValue(safeValue, COMPACT_VALUE_CLIP);
+      if (clippedValue.clipped) {
         outlineClipped++;
         // #1748: a clipped NOTE value is lost instructions, not a re-queryable detail —
         // remember the node so the footer can name it (the row's own 60-char clip reads
         // as the whole note otherwise).
         if (NOTE_NODE_TYPES.has(node?.type) && !outlineClippedNoteIds.includes(node.id))
           outlineClippedNoteIds.push(node.id);
-        clipped = s.slice(0, 57) + "…";
       }
+      const clipped = clippedValue.text;
       if (!/[[\]]/.test(clipped)) return clipped;
       // Escape backslashes first, then quotes, so the escape introduced for a quote is
       // not doubled — and the closing quote cannot be swallowed by a trailing backslash.
@@ -28455,6 +28457,21 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             retryOfHit = true;
           }
         }
+        // #2003 — a hung READ must not pin retries. The ledger joins an in-flight
+        // original so a mutation cannot land twice (#517/#694). graph_outline cannot
+        // double-apply, and after a manual canvas edit the original may never settle
+        // inside the 20s window; joining it is how every retry_of stays silent.
+        // Settled replies still join. Mutations still join.
+        if (
+          priorRidReply !== undefined &&
+          !shouldJoinInFlightGraphReply({
+            cmd: msg.cmd,
+            priorInFlight: ledgerReplyIsInFlight(priorRidReply),
+          })
+        ) {
+          priorRidReply = undefined;
+          retryOfHit = false;
+        }
         if (priorRidReply !== undefined) {
           // #1095 — THIS PATH WAITS, AND THEN REPLIES, so it holds the route exactly like an
           // executing command does and must be marked exactly like one.
@@ -28807,15 +28824,18 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                 });
                 if (reconnectGate) throw reconnectRefusalError(reconnectGate);
               }
-              // comfyui-mcp#1723 — a successful command defers its tracker snapshot
-              // past the reply (#581); a back-to-back command from the same burst
+              const { graph, rootGraph, canvas } = getGraphCtx();
+              // comfyui-mcp#1723 — a successful MUTATION defers its tracker snapshot
+              // past the reply (#581); a back-to-back write from the same burst
               // reaches the fence on the stale pre-command fingerprint and refuses
               // the RIGHT canvas. Flush the capture already committed to (same
               // tracker only — a different active tracker means the tab moved).
-              flushPendingChangeTrackerSnapshot(
-                app?.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null,
-              );
-              const { graph, rootGraph, canvas } = getGraphCtx();
+              // #2003 — reads must not flush; captureCanvasState can miss the 20s window.
+              if (graphCommandMayMutateWorkflow(msg.cmd)) {
+                flushPendingChangeTrackerSnapshot(
+                  app?.extensionManager?.workflow?.activeWorkflow?.changeTracker ?? null,
+                );
+              }
               assertGraphBoundToActiveWorkflow(graph, rootGraph, graphCommandBindingBar(msg.cmd));
               if (graphCommandMayMutateWorkflow(msg.cmd)) {
                 visibleMutationTarget = { graph, canvas, rootGraph };
