@@ -784,6 +784,10 @@ import {
 } from "./lib/workflow-save.js";
 import { describeSaveBackendSocket } from "./lib/save-transport-failure.js";
 import {
+  noteRestartConfirmTimeout,
+  rebindSameOriginSaveRoute,
+} from "./lib/save-route-retry.js";
+import {
   WORKFLOW_SAVE_COMMAND_BUDGET_MS,
   runBoundedWorkflowSave,
   workflowSaveTimeoutObservation,
@@ -7613,6 +7617,14 @@ async function programmaticSave(name) {
       describeSaveBackendSocket({
         flaggedDown: comfyBackendSocketDown,
         socketReadyState: comfyBackendSocketReadyState(),
+      }),
+    // #1757 — after a restart confirmation expires without rebooting, point the
+    // userdata write back at this page's origin before retrying the same-origin
+    // save. Evaluated at failure time so it describes the host that is live now.
+    rebindSaveRoute: () =>
+      rebindSameOriginSaveRoute({
+        api,
+        origin: globalThis.location?.origin,
       }),
   });
   if (details.mode === "in-place" && typeof clearWorkflowGraphProvenanceUnknown === "function") {
@@ -27970,7 +27982,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // the reply AND `settleRid` runs: without this the ledger keeps an
             // un-evictable in-flight entry whose replay would await a promise that can
             // never resolve, and answer nothing at all.
-            if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
+            if (isAbandonedInteractive(result)) {
+              // Withdrawn confirmation: the next in-place save rebinds the
+              // same-origin userdata route rather than inheriting a stale host.
+              noteRestartConfirmTimeout();
+              throw new Error(abandonedInteractiveError(msg.cmd));
+            }
           } else if (msg.cmd === "request_secret") {
             // Secure secret entry. The pasted value rides back to the
             // orchestrator (which writes it to config) and is the tool's reply;
