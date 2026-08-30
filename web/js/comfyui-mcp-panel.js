@@ -91,7 +91,11 @@ import {
 // it is how this repo keeps producing near-duplicate bugs, per that file's own header.
 import { withTimeout } from "./lib/bounded-step.js";
 import { createChatScrollStabilizer } from "./lib/chat-scroll-stabilizer.js";
-import { createChatScrollIntentTracker, updateChatStickiness } from "./lib/chat-scroll-intent.js";
+import {
+  createChatScrollIntentTracker,
+  isLeavingBottomScrollIntent,
+  updateChatStickiness,
+} from "./lib/chat-scroll-intent.js";
 import { createRunReceiptOutbox } from "./lib/run-receipt-outbox.js";
 import {
   mergeRunCompletionMetadata,
@@ -33116,6 +33120,7 @@ function buildPanel() {
   const onNewMessagesClick = () => {
     stickToBottom = true;
     newMsgBtn.hidden = true;
+    scrollIntent.clearUserIntent();
     scrollIntent.noteProgrammaticScroll({ behavior: "smooth" });
     log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
     chatScrollStabilizer.schedule();
@@ -33126,9 +33131,16 @@ function buildPanel() {
   // real height; scroll anchoring then emits a browser scroll event with no user intent.
   // Such an event must not latch stickToBottom off while the transcript settles.
   const scrollIntent = createChatScrollIntentTracker();
+  let lastChatScrollTop = log.scrollTop;
   const chatScrollIntentListenerOptions = { passive: true };
   const onChatScrollIntent = (event) => {
     scrollIntent.note(event);
+    // Unstick on the gesture itself. Waiting for the matching scroll event lets
+    // the stabilizer's already-queued rAF overwrite the first wheel ticks while
+    // stickToBottom is still true, so a long streaming turn never leaves the pin.
+    if (isLeavingBottomScrollIntent(event) || scrollIntent.hasLeavingBottom()) {
+      stickToBottom = false;
+    }
   };
   const onChatScrollEnd = (event) => {
     if (event.target !== event.currentTarget) return;
@@ -33137,9 +33149,13 @@ function buildPanel() {
   const onChatLogScroll = (event) => {
     if (event.target !== event.currentTarget) return;
     const isAtBottom = atBottom();
+    const scrolledUp = log.scrollTop < lastChatScrollTop;
+    lastChatScrollTop = log.scrollTop;
+    const { userScrollIntent, leavingBottom } = scrollIntent.consumeIntent();
     stickToBottom = updateChatStickiness(stickToBottom, {
       atBottom: isAtBottom,
-      userScrollIntent: scrollIntent.consume(),
+      userScrollIntent,
+      leavingBottom: leavingBottom || (userScrollIntent && scrolledUp),
     });
     if (isAtBottom) newMsgBtn.hidden = true;
   };
@@ -33157,7 +33173,7 @@ function buildPanel() {
   log.addEventListener("scroll", onChatLogScroll);
   const chatScrollStabilizer = createChatScrollStabilizer({
     log,
-    shouldStick: () => stickToBottom,
+    shouldStick: () => stickToBottom && !scrollIntent.hasPending(),
     beforeScroll: () => scrollIntent.noteProgrammaticScroll(),
   });
   body.appendChild(newMsgBtn);
@@ -36891,6 +36907,7 @@ function buildPanel() {
       forceStick: () => {
         stickToBottom = true;
         newMsgBtn.hidden = true;
+        scrollIntent.clearUserIntent();
       },
       scrollNow: () => {
         scrollIntent.noteProgrammaticScroll();
@@ -37204,6 +37221,7 @@ function buildPanel() {
       forceStick: () => {
         stickToBottom = true;
         newMsgBtn.hidden = true;
+        scrollIntent.clearUserIntent();
       },
       scrollNow: () => {
         scrollIntent.noteProgrammaticScroll();
@@ -37250,6 +37268,7 @@ function buildPanel() {
   function appendUser(text, opts = {}) {
     stickToBottom = true; // your own message → always jump to the latest
     newMsgBtn.hidden = true;
+    scrollIntent.clearUserIntent();
     // Capture the rewind anchor NOW (the latest turn's UUID) so a later rewind to
     // this message forks the conversation right before it — stored directly (not as
     // an index, which a bounded-ring shift() would invalidate).

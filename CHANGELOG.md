@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- chat autoscroll no longer yanks the transcript back to the bottom while the user is scrolling up: an upward gesture unsticks immediately, including inside the 48px slack, and the stabilizer waits until they return to the bottom or jump to latest (#2000)
+
+
 ## [0.15.141] - 2026-08-30
 
 ### Fixed
