@@ -1,4 +1,5 @@
-// The "Video previews in chat" setting (panel#1280).
+// The "Inline video playback in chat" setting (panel#1280). Not the hide-cards
+// switch — that is "Generated media in chat" (panel#2034).
 //
 // THE REQUEST. Every generated video lands in the chat transcript as a live,
 // autoplaying <video> (the lazy holder in the panel keeps the decode to

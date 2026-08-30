@@ -602,6 +602,9 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
     "appendImageCacheBust",
     "NO_PROMPT_KEY",
     "collectNodeOutputMedia",
+    "chatMediaEnabled",
+    "getSetting",
+    "SETTING_CHAT_MEDIA",
     `return (runCompletion) => [
       (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()}),
       (${panelSrc.slice(
@@ -627,6 +630,9 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
     (url) => url,
     NO_PROMPT_KEY,
     collectNodeOutputMedia,
+    (v) => v !== false,
+    () => undefined,
+    "comfyui-mcp.chatMedia",
   );
 
   const registrationStart = panelSrc.indexOf(

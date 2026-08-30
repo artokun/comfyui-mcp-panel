@@ -1,4 +1,4 @@
-// #1280 — "Video previews in chat" (default ON): off paints a metadata-only
+// #1280 — "Inline video playback in chat" (default ON): off paints a metadata-only
 // placeholder and leaves the full decode to the lightbox.
 //
 // Two things are pinned here:
