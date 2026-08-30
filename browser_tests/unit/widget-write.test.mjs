@@ -60,6 +60,43 @@ test("#347: clearing to '' does NOT weaken combo/numeric strictness (#240)", () 
   assert.throws(() => coerceWidgetValue(num, ""), /not a number/);
 });
 
+// #2010: VHS_LoadVideo's `video` combo lists filenames and no empty option, yet the
+// live widget is already "". An idempotent clear of that already-empty value must
+// succeed as a no-op; a populated combo still refuses "" when it is not an option.
+const VHS_VIDEO_FILES = ["clip_a.mp4", "clip_b.webm", "clip_c.mp4", "clip_d.mov"];
+
+test("#2010: clearing an already-empty VHS_LoadVideo combo succeeds even without an empty option", () => {
+  const widget = {
+    name: "video",
+    type: "combo",
+    options: { values: [...VHS_VIDEO_FILES] },
+    value: "",
+  };
+  const node = { id: 165, type: "VHS_LoadVideo", widgets: [widget] };
+
+  assert.equal(coerceWidgetValue(widget, ""), "");
+  const set = applyWidgetWrite(node, "video", "", HOOKS);
+  assert.equal(set.value, "");
+  assert.equal(widget.value, "");
+});
+
+test("#2010: clearing a populated combo still refuses when \"\" is not an option", () => {
+  const widget = {
+    name: "video",
+    type: "combo",
+    options: { values: [...VHS_VIDEO_FILES] },
+    value: VHS_VIDEO_FILES[0],
+  };
+  const node = { id: 174, type: "VHS_LoadVideo", widgets: [widget] };
+
+  assert.throws(() => coerceWidgetValue(widget, ""), WidgetWriteError);
+  assert.throws(
+    () => applyWidgetWrite(node, "video", "", HOOKS),
+    (err) => err instanceof WidgetWriteError && /not a valid option/.test(err.message),
+  );
+  assert.equal(widget.value, VHS_VIDEO_FILES[0], "must not mutate on refuse");
+});
+
 test("#524: exact case wins when two widgets differ only by case", () => {
   const backgroundToggle = { name: "Background", type: "BOOLEAN", value: false };
   const backgroundMode = { name: "background", type: "COMBO", options: { values: ["Alpha", "Color"] }, value: "Alpha" };

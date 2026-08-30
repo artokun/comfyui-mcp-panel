@@ -1128,6 +1128,16 @@ export function coerceWidgetValue(
     }
     // STRICT typed membership first: an exact-typed option is always writable.
     if (options.includes(value)) return value;
+    // #2010: an already-empty combo is already the requested clear. VHS_LoadVideo's
+    // video dropdown lists filenames and no "", yet the live widget is video="".
+    // That no-op must succeed; a populated combo still refuses "" below.
+    if (value === "") {
+      try {
+        if (widget.value === "") return value;
+      } catch {
+        /* unreadable current value stays an off-list refusal */
+      }
+    }
     // #667: NUMERIC-LABELLED options (VHS ProRes profile ["lt",…,"4444",…], ffv1
     // level ["0","1","3"]). The tool's `value` param is string|number|boolean, so a
     // numeric-looking label can arrive as the NUMBER 4444 after upstream JSON

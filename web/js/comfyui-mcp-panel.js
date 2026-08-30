@@ -17784,7 +17784,16 @@ const GRAPH_TOOL_EXECUTORS = {
       arguments[0] && typeof arguments[0] === "object" ? arguments[0].expected_scope : undefined;
     const expected_node_identity =
       arguments[0] && typeof arguments[0] === "object" ? arguments[0].expected_node_identity : undefined;
-    const { defer_until_idle, expected_value, defer_replay } = arguments[0] ?? {};
+    const { defer_until_idle, expected_value, defer_replay, clear } = arguments[0] ?? {};
+    if (clear !== undefined && clear !== true && clear !== false) {
+      throw new Error("graph_set_widget clear must be a boolean");
+    }
+    if (clear === true) {
+      if (value !== undefined && value !== null && value !== "") {
+        throw new Error("graph_set_widget cannot combine clear:true with a non-empty value");
+      }
+      value = "";
+    }
     if (
       expected_node_identity !== undefined &&
       (typeof expected_node_identity !== "string" ||
@@ -17868,6 +17877,7 @@ const GRAPH_TOOL_EXECUTORS = {
           ...(expected_node_identity !== undefined ? { expected_node_identity } : {}),
           expected_value,
           defer_replay: true,
+          ...(clear !== undefined ? { clear } : {}),
         });
       }
       const deferredGraph = graph;
@@ -17911,6 +17921,7 @@ const GRAPH_TOOL_EXECUTORS = {
             ...(expected_node_identity !== undefined ? { expected_node_identity } : {}),
             expected_value,
             defer_replay: true,
+            ...(clear !== undefined ? { clear } : {}),
           }),
       });
     }
@@ -18215,6 +18226,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // past the end of a very long argument.
     const setWidgetOpts = {
       registry: LG?.registered_node_types ?? {},
+      ...(clear !== undefined ? { clear } : {}),
       // Fresh-backend type authorization (#458 set_widget gap): the go/no-go for the
       // resolved target node's TYPE is decided against the CURRENT /object_info — NOT
       // the stale LiteGraph registry, which keeps a positive for an uninstalled pack
