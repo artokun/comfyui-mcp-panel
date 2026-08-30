@@ -94,9 +94,12 @@ test("#805 WIRING: normalization suppresses the failure AND is disclosed on the 
   // widget, the promoted inner widget, or — on an instance-scoped promoted write — the
   // wrapper's own rail. The read-back and the normalization explanation must be taken
   // from the SAME widget, or a normalizing rail is reported as a failed write.
-  assert.match(src, /const normalization = matchesExpected\(valueWidget\.value\)/)
+  // #2020 — read-back goes through `widgetMatchesExpected` so a live customtext can
+  // match on the textarea / getValue store. For numeric widgets that helper is still
+  // `matchesExpected(widget.value)`, so the #805 grid check is unchanged.
+  assert.match(src, /const normalization = widgetMatchesExpected\(valueWidget\)/)
   assert.match(src, /explainNumericNormalization\(expected, valueWidget\.value, valueWidget\)/)
-  assert.match(src, /if \(!matchesExpected\(valueWidget\.value\) && !normalization\) \{/)
+  assert.match(src, /if \(!widgetMatchesExpected\(valueWidget\) && !normalization\) \{/)
   // …and the caller must be TOLD, or a silently-changed value is its own defect.
   assert.match(src, /normalized: true/)
   assert.match(src, /requested_value: expected/)
