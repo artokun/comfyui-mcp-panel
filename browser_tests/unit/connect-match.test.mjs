@@ -13,7 +13,8 @@
  *          input when no free wildcard slot exists yet; an explicit to_input
  *          still replaces deliberately.
  * Plus the invariant that genuinely incompatible types stay refused (#204),
- * and the same-node loopback refusal diagnostic (#1266).
+ * the same-node loopback refusal diagnostic (#1266), and the unresolved
+ * wildcard-to-wildcard refusal diagnostic (#2028).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -26,6 +27,7 @@ import {
   isWildcardSlotType,
   slotDiagnostic,
   loopbackRefusalReason,
+  unresolvedWildcardPairReason,
 } from "../../web/js/lib/connect-match.js";
 
 // VHS_LoadVideo-shaped origin: IMAGE output at index 0, plus non-IMAGE outputs.
@@ -451,4 +453,58 @@ test("#1266: a genuinely incompatible same-node pair is not CALLED compatible �
   const reason = loopbackRefusalReason(node, 0, 3);
   assert.match(reason, /refuses before any type check runs/);
   assert.doesNotMatch(reason, /ARE type-compatible/);
+});
+
+// ---- #2028: unresolved wildcard-to-wildcard is not a type mismatch ---------
+//
+// Reported: connecting PrimitiveNode output 0 (type *) to ComfySwitchNode
+// input "on_false" (type *) was refused with "No input on node 790 accepts
+// type *" — while the diagnostic's own slot listing showed [0] "on_false"
+// (*). LiteGraph's connect() needs a concrete type to bind; neither port
+// supplies one, so connect() returns null. The computed slotDiagnostic tail
+// was reading that as a type incompatibility. Keep the refusal; name the
+// unbound pair and tell the caller to land a concrete typed producer first.
+
+function primitiveNode791() {
+  return {
+    id: 791,
+    type: "PrimitiveNode",
+    outputs: [{ name: "connect to widget input", type: "*" }],
+  };
+}
+function comfySwitchNode790() {
+  return {
+    id: 790,
+    type: "ComfySwitchNode",
+    inputs: [
+      { name: "on_false", type: "*", link: null },
+      { name: "on_true", type: "*", link: null },
+      { name: "switch", type: "BOOLEAN", widget: true, link: null },
+    ],
+  };
+}
+
+test("#2028: the unresolved-wildcard reason names the pair and tells the caller to bind a concrete type first", () => {
+  const reason = unresolvedWildcardPairReason(primitiveNode791(), comfySwitchNode790(), 0, 0);
+  assert.match(reason, /unresolved wildcard-to-wildcard/);
+  assert.match(reason, /output "connect to widget input" \(\*\)/);
+  assert.match(reason, /input "on_false" \(\*\)/);
+  assert.match(reason, /concrete typed producer/);
+  assert.match(reason, /INTConstant/);
+});
+
+test("#2028: with the reason override the diagnostic KEEPS the slot listing but drops the false type tail", () => {
+  const origin = primitiveNode791();
+  const target = comfySwitchNode790();
+  const msg = slotDiagnostic(origin, target, {
+    from_output: 0,
+    to_input: "on_false",
+    reason: unresolvedWildcardPairReason(origin, target, 0, 0),
+  });
+  // The full slot listing is preserved — it was the reporter's evidence.
+  assert.match(msg, /\[0\] "on_false" \(\*\)/);
+  // The false "no input accepts type *" claim is gone.
+  assert.doesNotMatch(msg, /No input on node 790 accepts type/);
+  assert.match(msg, /unresolved wildcard-to-wildcard/);
+  assert.match(msg, /INTConstant/);
 });

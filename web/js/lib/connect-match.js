@@ -15,6 +15,11 @@
 //   #1266 — a LiteGraph refusal on a SAME-NODE (loopback) connect is not a
 //          type mismatch: loopbackRefusalReason replaces the computed
 //          "no input accepts type X" tail that falsely blamed the slots' types.
+//   #2028 — a LiteGraph refusal on two UNRESOLVED wildcards (`*` → `*`) is
+//          not a type mismatch either: the listing already showed `*` inputs.
+//          unresolvedWildcardPairReason replaces the computed
+//          "no input accepts type *" tail and tells the caller to land a
+//          concrete typed producer first.
 
 export const SLOT_RANK_EXACT = 2;
 export const SLOT_RANK_WILD = 1;
@@ -209,6 +214,29 @@ export function loopbackRefusalReason(node, outIdx, inIdx) {
   return (
     `LiteGraph refuses a connection from a node to ITSELF (${pair}): ${verdict}. ` +
     `Route through a Reroute node to wire the node's own output back to its input.`
+  );
+}
+
+/** #2028 — the honest failure tail when LiteGraph refused a connection whose
+ *  SELECTED output AND input are both still unresolved wildcards (`*`).
+ *  connect() needs a concrete type to bind; a PrimitiveNode output (`*`) into
+ *  a ComfySwitchNode on_false (`*`) supplies none, so the link is null. The
+ *  computed slotDiagnostic tail ("no input accepts type *") is a FALSE type
+ *  mismatch here: the listing already showed `*` inputs. Names the resolved
+ *  slot pair, states that neither port is bound, and points at connecting a
+ *  concrete typed producer first (INTConstant is the workaround the reporter
+ *  verified). Only a reason string; the caller passes it as slotDiagnostic's
+ *  `reason` override so the full slot listing is kept. */
+export function unresolvedWildcardPairReason(origin, target, outIdx, inIdx) {
+  const out = origin.outputs?.[outIdx];
+  const inp = target.inputs?.[inIdx];
+  const pair =
+    `output "${out?.name ?? outIdx}" (${renderSlotType(out?.type)}) → ` +
+    `input "${inp?.name ?? inIdx}" (${renderSlotType(inp?.type)})`;
+  return (
+    `LiteGraph refuses an unresolved wildcard-to-wildcard pair (${pair}): ` +
+    `neither port supplies a concrete type to bind. ` +
+    `Connect a concrete typed producer first (for example INTConstant), then retry this connection.`
   );
 }
 

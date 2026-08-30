@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- a wildcard-to-wildcard connect refusal is reported as unbound * ports needing a concrete typed producer, not a false type mismatch (#2028)
+
+
 ## [0.15.148] - 2026-08-30
 
 ### Fixed

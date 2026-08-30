@@ -121,6 +121,8 @@ const resolveRail = () => null;
 const isEmptyRailSlotRef = (ref) => ref == null || ref === "";
 const slotDiagnostic = () => "slot diagnostic";
 const loopbackRefusalReason = () => "loopback";
+const unresolvedWildcardPairReason = () => "wildcard pair";
+const isWildcardSlotType = () => false;
 const findSubgraphHostNode = () => null;
 const uniqueSubgraphOutputName = (_g, base) => base;
 const uniqueSubgraphInputName = (_g, base) => base;
@@ -154,6 +156,8 @@ function buildConnect(graph, overrides = {}) {
     autoMatchSlots,
     slotDiagnostic,
     loopbackRefusalReason,
+    unresolvedWildcardPairReason,
+    isWildcardSlotType,
     uniqueSubgraphOutputName,
     uniqueSubgraphInputName,
     isLinkPersisted,
