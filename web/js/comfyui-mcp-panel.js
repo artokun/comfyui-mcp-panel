@@ -24723,6 +24723,12 @@ const GRAPH_TOOL_EXECUTORS = {
         throw new Error(`node_ids not found in the current graph: ${missing.join(", ")}`);
       }
       const ns = resolved.map((r) => r.node);
+      // #2004: some frontends' selectItems is additive, so leftover nodes/groups
+      // would otherwise stay selected and be serialized with the explicit ids.
+      canvas.selectedItems?.clear?.();
+      if (canvas.selected_nodes && typeof canvas.selected_nodes === "object") {
+        for (const id of Object.keys(canvas.selected_nodes)) delete canvas.selected_nodes[id];
+      }
       if (typeof canvas.selectItems === "function") canvas.selectItems(ns);
       else if (typeof canvas.selectNodes === "function") canvas.selectNodes(ns);
     }
