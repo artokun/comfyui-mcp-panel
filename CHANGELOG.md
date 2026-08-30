@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- scoped run-to-node no longer false-refuses after a finished subgraph edit: the graph stamp waits for pending canvas work to settle and restamps once if the revision moved before queue, without falling through to a full-graph run (#572)
 - resolve the 18+ consent card before the 300s tools/call deadline so an idle user gets a structured timeout instead of a transport hang (#390)
 
 ## [0.15.125] - 2026-08-30
