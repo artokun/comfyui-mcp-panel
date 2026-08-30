@@ -594,6 +594,62 @@ test("#366 recurrence: production promoted write selects the host rail after a s
   assert.equal(set.promoted_from.value_scope, "instance");
 });
 
+test("#366 recurrence: stale inner _widget is rematerialized into the host-keyed rail through runSetWidget", async () => {
+  const reg = loadedRegistry();
+  const innerWidget = { name: "value", type: "INT", value: 5 };
+  const inner = {
+    id: 136,
+    type: "KSampler",
+    widgets: [innerWidget],
+    constructor: { nodeData: { input: { required: {} } } },
+  };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "136" ? inner : null) };
+  const store = { value: 5 };
+  const hostInput = {
+    name: "value_1",
+    label: "duration",
+    widgetId: "root:105:value_1",
+    widget: { name: "value_1" },
+    _widget: innerWidget,
+    _subgraphSlot: { name: "value_1", label: "duration" },
+  };
+  const parent = {
+    id: 105,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [hostInput],
+    get widgets() {
+      if (!hostInput._widget && hostInput.widgetId) {
+        const rail = {
+          name: "value_1",
+          label: "duration",
+          widgetId: hostInput.widgetId,
+          type: "INT",
+          get value() {
+            return store.value;
+          },
+          set value(next) {
+            store.value = next;
+          },
+        };
+        hostInput._widget = rail;
+      }
+      return hostInput._widget ? [hostInput._widget] : [];
+    },
+  };
+  const resolveSource = (_node, input) =>
+    input?.name === "value_1" ? { sourceNodeId: "136", sourceWidgetName: "value" } : null;
+
+  const { set } = await setViaHandler(reg, parent, "duration", 12, resolveSource);
+
+  assert.equal(store.value, 12, "the host-keyed rail store must receive the write");
+  assert.notEqual(hostInput._widget, innerWidget);
+  assert.equal(innerWidget.value, 5, "the inner Primitive-shaped widget is not the serializing rail");
+  assert.equal(set.node_id, 105);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.equal(set.promoted_from.value_scope, "instance");
+});
+
 test("set_widget e2e: unreachable ⇒ REFUSE even for a would-be-core type, no mutation", async () => {
   const reg = unreachableRegistry();
   const node = { id: 1, type: "CheckpointLoaderSimple", widgets: [{ name: "ckpt_name", type: "text", value: "" }] };
