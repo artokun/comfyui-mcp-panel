@@ -220,6 +220,11 @@ test("#1827 the dispatcher snapshots before a subgraph mutation and restores aft
     /visibleMutationTarget\.graph !== visibleMutationTarget\.rootGraph/,
     "preserve only while INSIDE a subgraph — the reported enter/mutate/exit path",
   );
+  assert.match(
+    SRC,
+    /msg\.cmd !== "graph_set_widget"/,
+    "#2109 — a promoted widget write must not have its new rail value restored to the snapshot",
+  );
 });
 
 /**

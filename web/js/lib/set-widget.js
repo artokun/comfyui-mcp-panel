@@ -30,6 +30,7 @@ import {
   applyWidgetWrite,
   WidgetWriteError,
   resolvePromotedInnerTarget,
+  resolveEnclosingPromotedWrite,
   followPromotionToConcrete,
   collectPromotionIntermediates,
 } from "./widget-write.js";
@@ -417,6 +418,9 @@ async function runSetWidgetBody(
     // cause it never established.
     describeObjectInfoFailure,
     resolveSource,
+    // #2109 — live root used to locate the enclosing SubgraphNode when the
+    // caller addressed an inner promoted terminal (MCP's enter-then-write path).
+    rootGraph,
     canvas,
     beforeChange,
     afterChange,
@@ -650,9 +654,39 @@ async function runSetWidgetBody(
 
   // Resolve the promoted inner target ONCE (PURE — no coercion/mutation). Threaded
   // into applyWidgetWrite so the write never re-resolves to a different node.
-  const promotedResolution = isPromotedContainer(node)
+  let promotedResolution = isPromotedContainer(node)
     ? resolvePromotedInnerTarget(node, widgetName, resolveSource)
     : null;
+  // #2109 — MCP's promoted-write protocol addresses the INNER terminal after
+  // entering the subgraph (node 289 `length`, not wrapper 322 `frame_counts`).
+  // That path never ran #366, so the enclosing rail stayed stale, the inner
+  // widget is link-driven from rail -10, and the reply reported applied with a
+  // link-driven warning. Retarget through the enclosing subgraph node's
+  // promoted widget so the serializing parent rail is written. If the promotion
+  // is observed but the rail cannot be identified, refuse rather than write
+  // inner-only.
+  if (!(promotedResolution && promotedResolution.promoted && promotedResolution.target)) {
+    const enclosing = resolveEnclosingPromotedWrite(node, widgetName, {
+      rootGraph,
+      resolveSource,
+    });
+    if (enclosing?.resolution?.promoted && enclosing.resolution.target) {
+      if (!enclosing.resolution.target.parentWidget) {
+        throw new Error(
+          `panel_set_widget refused "${widgetName}" on node ${node?.id} (${node?.type}): ` +
+            `promoted widget "${enclosing.widgetName}" on subgraph node ${enclosing.owner?.id} ` +
+            `resolves to this inner widget, but its AUTHORITATIVE parent rail widget could not ` +
+            `be identified (the value that serializes at queue time). Refusing to write the ` +
+            `inner widget alone, which would silently render the OLD value (#2109). Edit this ` +
+            `widget from the enclosing subgraph node, or disconnect the inner input to make ` +
+            `the inner value authoritative.`,
+        );
+      }
+      node = enclosing.owner;
+      widgetName = enclosing.widgetName;
+      promotedResolution = enclosing.resolution;
+    }
+  }
   const isResolvedPromotion = !!(
     promotedResolution &&
     promotedResolution.promoted &&

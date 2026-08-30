@@ -2150,6 +2150,101 @@ export function promotedInputAliases(input, subgraphInput = input?._subgraphSlot
     .map((value) => String(value));
 }
 
+/** Hard cap on graphs visited while locating the enclosing SubgraphNode. A
+ *  `node.subgraph` getter that yields a new object each time would otherwise
+ *  walk forever on the inner-write retarget path (#2109). */
+const MAX_ENCLOSING_SUBGRAPH_WALKS = 10000;
+
+/**
+ * The SubgraphNode whose inner graph is `innerNode.graph`. MCP's promoted-write
+ * protocol addresses the INNER terminal after entering the subgraph; locating
+ * the wrapper is what lets the write retarget onto the serializing parent rail.
+ */
+export function findEnclosingSubgraphNode(innerNode, rootGraph) {
+  const subgraph = innerNode?.graph;
+  if (!subgraph || typeof subgraph !== "object") return null;
+  const directCandidates = [
+    subgraph.parentNode,
+    subgraph.ownerNode,
+    subgraph._subgraphNode,
+    subgraph.subgraphNode,
+  ];
+  for (const candidate of directCandidates) {
+    if (candidate && candidate !== innerNode && candidate.subgraph === subgraph) return candidate;
+  }
+  const roots = [rootGraph, subgraph.rootGraph, subgraph.root];
+  const stack = [];
+  for (const root of roots) {
+    if (root && typeof root === "object") stack.push(root);
+  }
+  const seen = new Set();
+  let walks = 0;
+  while (stack.length) {
+    if (++walks > MAX_ENCLOSING_SUBGRAPH_WALKS) break;
+    const graph = stack.pop();
+    if (!graph || seen.has(graph)) continue;
+    seen.add(graph);
+    for (const node of graph._nodes ?? []) {
+      if (!node || node === innerNode) continue;
+      if (node.subgraph === subgraph) return node;
+      if (node.subgraph) stack.push(node.subgraph);
+    }
+  }
+  return null;
+}
+
+/**
+ * #2109 — when the caller addressed an INNER widget that is the terminal of a
+ * promotion, resolve the enclosing subgraph node's promoted alias so the write
+ * can run the parent-rail path (#366) instead of mutating the link-driven inner
+ * widget alone.
+ *
+ * Returns `{ owner, widgetName, resolution }` when a unique enclosing promotion
+ * maps onto this inner `(node, widget)`, otherwise null. Pure: no mutation.
+ */
+export function resolveEnclosingPromotedWrite(innerNode, widgetName, { rootGraph, resolveSource } = {}) {
+  if (!innerNode || widgetName == null || widgetName === "") return null;
+  if (isPromotedContainer(innerNode)) return null;
+  const owner = findEnclosingSubgraphNode(innerNode, rootGraph);
+  if (!owner || owner === innerNode || !isPromotedContainer(owner)) return null;
+  const wantedNode = String(innerNode.id);
+  const wantedWidget = String(widgetName);
+  const tried = new Set();
+  const consider = (alias) => {
+    if (typeof alias !== "string" || alias.length === 0 || tried.has(alias)) return null;
+    tried.add(alias);
+    let resolution;
+    try {
+      resolution = resolvePromotedInnerTarget(owner, alias, resolveSource);
+    } catch {
+      return null;
+    }
+    if (!resolution?.promoted || !resolution.target) return null;
+    if (String(resolution.target.node?.id) !== wantedNode) return null;
+    if (resolution.target.widget?.name !== wantedWidget) return null;
+    return { owner, widgetName: alias, resolution };
+  };
+  for (const input of owner.inputs ?? []) {
+    for (const alias of promotedInputAliases(input, input?._subgraphSlot)) {
+      const hit = consider(alias);
+      if (hit) return hit;
+    }
+  }
+  let widgets;
+  try {
+    widgets = owner.widgets;
+  } catch {
+    widgets = null;
+  }
+  if (Array.isArray(widgets)) {
+    for (const widget of widgets) {
+      const hit = consider(widget?.name) || consider(widget?.label);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
 /**
  * Collect EVERY INTERMEDIATE virtual SubgraphNode traversed from `target` (the
  * immediate promoted inner) down to — but EXCLUDING — the ultimate concrete node. A
