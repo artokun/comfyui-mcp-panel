@@ -69,6 +69,7 @@ test("#1931 an unnamed DynamicCombo throw does not send the caller to a named wi
   assert.doesNotMatch(msg, /inspect the named widget/i);
   assert.match(msg, /did not name a node or widget/);
   assert.match(msg, /format\.codec/);
+  assert.match(msg, /PrimitiveNode STRING widget/);
 });
 
 test("#1931 a named DynamicCombo throw keeps the inspect-the-named-widget remedy", () => {
@@ -77,6 +78,15 @@ test("#1931 a named DynamicCombo throw keeps the inspect-the-named-widget remedy
   );
   assert.match(msg, /inspect the named widget/i);
   assert.match(msg, /SaveVideo node 71/);
+});
+
+test("#2009 a named PrimitiveNode throw keeps the inspect-the-named-widget remedy", () => {
+  const msg = graphToPromptFailureRefusal(
+    new Error("Dynamic widget doesn't exist on node: PrimitiveNode node 12 has typed STRING value widget"),
+  );
+  assert.match(msg, /inspect the named widget/i);
+  assert.match(msg, /PrimitiveNode node 12/);
+  assert.match(msg, /STRING value widget/);
 });
 
 test("#1654 serializer refusal rendering is total and bounded for hostile throws", () => {

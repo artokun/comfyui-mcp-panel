@@ -1,3 +1,9 @@
+import {
+  describeTypedPrimitiveWidgets,
+  registerLivePrimitiveWidgets,
+  resyncLivePrimitiveWidgets,
+} from "./primitive-dynamic-widgets.js";
+
 const DYNAMIC_COMBO_V3 = "COMFY_DYNAMICCOMBO_V3";
 const DYNAMIC_WIDGET_MISSING_RE = /Dynamic widget doesn't exist on node/i;
 const GRAPH_TO_PROMPT_RECONCILE = Symbol.for("comfyui-mcp.graphToPromptDynamicReconcile");
@@ -517,21 +523,28 @@ export function describeOrphanDynamicWidgets(graph) {
 }
 
 function namedDynamicWidgetError(error, graph) {
-  const candidates = describeOrphanDynamicWidgets(graph);
+  const orphans = describeOrphanDynamicWidgets(graph);
+  const primitives = describeTypedPrimitiveWidgets(graph);
+  const listedParts = [
+    ...orphans.map(
+      (entry) => `${entry.nodeType} node ${entry.nodeId} has ${entry.nested} and orphan ${entry.orphan}`,
+    ),
+    ...primitives.map(
+      (entry) =>
+        `${entry.nodeType} node ${entry.nodeId} has typed ${entry.outputType} ${entry.widgetName} widget`,
+    ),
+  ];
   let base = "";
   try {
     base = error instanceof Error ? error.message : String(error ?? "");
   } catch {
     base = "";
   }
-  if (!candidates.length) {
+  if (!listedParts.length) {
     return error instanceof Error ? error : new Error(base || "Dynamic widget doesn't exist on node");
   }
-  const listed = candidates
-    .slice(0, 8)
-    .map((entry) => `${entry.nodeType} node ${entry.nodeId} has ${entry.nested} and orphan ${entry.orphan}`)
-    .join("; ");
-  const extra = candidates.length > 8 ? ` (${candidates.length - 8} more)` : "";
+  const listed = listedParts.slice(0, 8).join("; ");
+  const extra = listedParts.length > 8 ? ` (${listedParts.length - 8} more)` : "";
   const message =
     DYNAMIC_WIDGET_MISSING_RE.test(base) && !/\bnode\s+\d+/i.test(base)
       ? `Dynamic widget doesn't exist on node: ${listed}${extra}`
@@ -541,11 +554,44 @@ function namedDynamicWidgetError(error, graph) {
   return named;
 }
 
+function prepareLiveDynamicWidgets(graph) {
+  try {
+    registerLivePrimitiveWidgets(graph);
+  } catch {
+    // Best-effort: a hostile PrimitiveNode must not block serialization.
+  }
+  try {
+    // #2031 — wrap before native serialize: graphToPrompt re-assigns DynamicCombo
+    // roots, which would otherwise rebuild dotted children from spec defaults.
+    wrapGraphDynamicComboSetters(graph);
+    reconcileGraphDynamicWidgets(graph);
+  } catch {
+    // Best-effort: a hostile node must not block serialization.
+  }
+}
+
+function retryLiveDynamicWidgets(graph) {
+  try {
+    resyncLivePrimitiveWidgets(graph);
+  } catch {
+    // Retry with whatever widgets are still live.
+  }
+  try {
+    wrapGraphDynamicComboSetters(graph);
+    reconcileGraphDynamicWidgets(graph);
+  } catch {
+    // Retry with whatever state we could clean.
+  }
+}
+
 /**
- * Reconcile nested DynamicCombo leftovers immediately before every prompt build,
- * and retry once if the frontend still throws the unnamed SaveVideo serializer
- * error. add_node/load already clean what they can; 0.15.124 recurrences still
- * queued a graph that grew the orphan back (set_widget, restore, restart).
+ * Reconcile nested DynamicCombo leftovers and register live PrimitiveNode
+ * widgets immediately before every prompt build, and retry once if the frontend
+ * still throws the unnamed serializer error. add_node/load already clean what
+ * they can; 0.15.124 recurrences still queued a graph that grew the orphan back
+ * (set_widget, restore, restart). #2009 recurrences mint a PrimitiveNode
+ * STRING widget after graph.add(), which reads and writes but is absent from
+ * the serializer's widget-store schema.
  *
  * @param {object} app
  * @returns {boolean}
@@ -557,22 +603,10 @@ export function installGraphToPromptDynamicReconcile(app) {
   const orig = (...args) => rawApply(graphToPromptFn, app, args);
   app.graphToPrompt = function reconcileThenGraphToPrompt(graph, ...rest) {
     const target = graph ?? app.rootGraph ?? app.graph ?? null;
-    try {
-      // #2031 — wrap before native serialize: graphToPrompt re-assigns DynamicCombo
-      // roots, which would otherwise rebuild dotted children from spec defaults.
-      wrapGraphDynamicComboSetters(target);
-      reconcileGraphDynamicWidgets(target);
-    } catch {
-      // Best-effort: a hostile node must not block serialization.
-    }
+    prepareLiveDynamicWidgets(target);
     const retry = (error) => {
       if (!isDynamicWidgetMissingError(error)) throw error;
-      try {
-        wrapGraphDynamicComboSetters(target);
-        reconcileGraphDynamicWidgets(target);
-      } catch {
-        // Retry with whatever state we could clean.
-      }
+      retryLiveDynamicWidgets(target);
       try {
         const retried = orig(graph, ...rest);
         if (retried && typeof retried.then === "function") {

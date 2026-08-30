@@ -156,7 +156,8 @@ export function graphToPromptFailureRefusal(error) {
     /Dynamic widget doesn't exist on node/i.test(detail) && !namesAWidget;
   const inspect = unnamedDynamic
     ? `The serializer did not name a node or widget; look for a DynamicCombo node that ` +
-      `carries both a nested child (format.codec) and a bare duplicate (codec).`
+      `carries both a nested child (format.codec) and a bare duplicate (codec), or a ` +
+      `freshly typed PrimitiveNode STRING widget.`
     : `Inspect the named widget or extension before retrying.`;
   return (
     `NOT queued: this workflow could not be serialized into a prompt because ` +
