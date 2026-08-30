@@ -140,6 +140,42 @@ export function awaitFrontendWidgetFlush(timers) {
 
 const SET_WIDGET_ACK_TIMEOUT = Symbol("set-widget-ack-timeout");
 
+function widgetWriteOutcomeUnknownError() {
+  return new Error(
+    `panel_set_widget outcome is UNKNOWN after delivery: the requested widget value was ` +
+      `not observed in a live readback before the acknowledgement wait ended. The original ` +
+      `write was NOT retried. Call panel_query_graph to check the current value before ` +
+      `issuing this mutation again (#2035).`,
+  );
+}
+
+// #2035 — native dynamic-combo roots and custom widgets expose their live mutation through
+// a value setter, while an ordinary LiteGraph widget owns a plain data property. This is a
+// structural capability check, not a node-name allowlist: only a widget whose setter can
+// rebuild/customize the live canvas gets the early-unknown contract below.
+function hasValueSetter(widget) {
+  try {
+    let proto = widget;
+    while (proto && proto !== Object.prototype) {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+      if (descriptor) return typeof descriptor.set === "function";
+      proto = Object.getPrototypeOf(proto);
+    }
+  } catch {
+    /* an unreadable widget stays on the existing receipt/refusal path */
+  }
+  return false;
+}
+
+function shouldAbandonSetWidgetOnTimeout(node, widgetName) {
+  try {
+    const widget = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    return widget?.type === "custom" || hasValueSetter(widget);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * #2025 — never-throwing live read of one named widget. Used by the timeout
  * readback so a missing node or a hostile getter cannot replace the ack.
@@ -177,6 +213,8 @@ export function readLiveWidgetValue(node, widgetName) {
  *   timeoutMs?: number,
  *   timers?: { setTimer?: Function, clearTimer?: Function },
  *   delivered?: boolean,
+ *   abandonOnTimeout?: boolean,
+ *   onTimeout?: () => void,
  * }} [opts]
  */
 export async function awaitSetWidgetAck(writePromise, {
@@ -186,6 +224,8 @@ export async function awaitSetWidgetAck(writePromise, {
   timeoutMs,
   timers,
   delivered = true,
+  abandonOnTimeout = false,
+  onTimeout,
 } = {}) {
   const tracked = Promise.resolve(writePromise);
   tracked.then(() => {}, () => {});
@@ -211,6 +251,19 @@ export async function awaitSetWidgetAck(writePromise, {
   // timeout before the write must still surface the inner worded refusal
   // (stale combo, hung /view probe) rather than inventing outcome-unknown.
   if (verified.applied && verified.verified) return verified;
+  // #2035 — the production wrapper can safely stop waiting here only if the original
+  // body also has a cooperative write fence. Without that fence, returning an unknown
+  // reply would let the still-running body reach applyWidgetWrite later and a caller's
+  // state read/retry could race a delayed mutation. The direct helper keeps its older
+  // refusal-preserving default for callers that do not provide that fence.
+  if (abandonOnTimeout && delivered) {
+    try {
+      onTimeout?.();
+    } catch {
+      /* abandonment is a safety latch; a diagnostic hook must not reopen the wait */
+    }
+    throw widgetWriteOutcomeUnknownError();
+  }
   const settled = await captured;
   if (settled?.ok) return honestWidgetAck(settled.result);
   throw settled.error;
@@ -316,11 +369,18 @@ export function scopedAuthorizationTypes(node, promotedResolution, isResolvedPro
 }
 
 const ACK_WRAPPED = Symbol("set-widget-ack-wrapped");
+const ACK_STATE = Symbol("set-widget-ack-state");
 
 export async function runSetWidget(node, widgetName, value, opts = {}) {
   if (!opts[ACK_WRAPPED]) {
+    const ackState = { abandoned: false };
+    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName);
     return awaitSetWidgetAck(
-      runSetWidgetBody(node, widgetName, value, { ...opts, [ACK_WRAPPED]: true }),
+      runSetWidgetBody(node, widgetName, value, {
+        ...opts,
+        [ACK_WRAPPED]: true,
+        [ACK_STATE]: ackState,
+      }),
       {
         node,
         widget: widgetName,
@@ -328,6 +388,14 @@ export async function runSetWidget(node, widgetName, value, opts = {}) {
         timeoutMs: opts.timeoutMs,
         timers: opts.ackTimers,
         delivered: opts.delivered !== false,
+        abandonOnTimeout,
+        ...(abandonOnTimeout
+          ? {
+              onTimeout: () => {
+                ackState.abandoned = true;
+              },
+            }
+          : {}),
       },
     );
   }
@@ -441,8 +509,13 @@ async function runSetWidgetBody(
     // treating a verified write as retained. Production uses awaitFrontendWidgetFlush;
     // unit tests inject a flush that reproduces the later empty overwrite.
     awaitFrontendWidgetFlush: awaitFrontendWidgetFlushInjected,
+    [ACK_STATE]: ackState,
   } = {},
 ) {
+  const assertNotAbandoned = () => {
+    if (ackState?.abandoned) throw widgetWriteOutcomeUnknownError();
+  };
+
   // Never re-derived, and never cached: the oracle may not have run yet when this closure is
   // built, and a caller that answers differently per call is answering about a different
   // fetch. A non-function is the unwired default ("live", see above); a THROWING one, or one
@@ -872,6 +945,7 @@ async function runSetWidgetBody(
   // (2) Repair positional UNKNOWN/UNKNOWN_n widget names against the live def so
   //     the caller's real widget name resolves (#199) — resolved direct node only.
   if (reconcile) {
+    assertNotAbandoned();
     assertTargetStillCurrentNow();
     reconcileUnknownWidgetNames(node);
   }
@@ -910,6 +984,7 @@ async function runSetWidgetBody(
     // synchronous. A workflow switch while the fresh-object-info fetch was in
     // flight therefore refuses before touching either canvas; retry and upload
     // recovery use this same boundary too.
+    assertNotAbandoned();
     assertTargetStillCurrentNow();
     // #757 — CREATE A MISSING TARGET HERE, INSIDE THE SAME SYNCHRONOUS STRETCH.
     //
@@ -1125,10 +1200,13 @@ async function runSetWidgetBody(
    */
   async function retainVerifiedWrite(set, rewrite) {
     await flushFrontendWidgets();
+    assertNotAbandoned();
     assertTargetStillCurrentNow();
     if (widgetStillHolds(set)) return set;
+    assertNotAbandoned();
     const retried = rewrite();
     await flushFrontendWidgets();
+    assertNotAbandoned();
     assertTargetStillCurrentNow();
     if (widgetStillHolds(retried)) return retried;
     const live = readLiveWritten(retried);
