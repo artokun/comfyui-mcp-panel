@@ -769,6 +769,7 @@ import {
   refusedInteractiveCardError,
 } from "./lib/interactive-card-fence.js";
 import { revealInteractiveCard } from "./lib/interactive-card-reveal.js";
+import { waitForAdultConsentAnswer } from "./lib/adult-consent-wait.js";
 import {
   saveActiveWorkflow,
   shouldGroundBeforeTurn,
@@ -36464,8 +36465,33 @@ function buildPanel() {
         }),
       abandon,
     });
-    promise.then(unregister, unregister);
-    return promise;
+    // #390 — the 18+ consent card is the one question whose idle wait used to
+    // outlive the enclosing tools/call. Bound HERE, on the promise the
+    // executor awaits, so an unanswered gate resolves with a structured
+    // timeout instead of holding the rid until the transport kills it.
+    // Non-consent questions (restart confirm, generic asks) pass through.
+    const handedToCaller = waitForAdultConsentAnswer(msg, promise, {
+      onTimeout: () => {
+        if (done || abandoned) return;
+        done = true;
+        try {
+          const note = document.createElement("div");
+          note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.8615);opacity:0.7;margin-top:0.4rem;";
+          note.textContent = tr(
+            "panel.no_answer_in_time_adult_content_stays",
+            "No answer in time — adult content stays as it was.",
+          );
+          card.appendChild(note);
+          for (const el of [...btnRow.children, other, submit]) {
+            try { el.disabled = true; } catch { /* presentation-only */ }
+          }
+        } catch (error) {
+          console.warn("[comfyui-mcp-panel] couldn't present consent-card timeout:", error?.message ?? error);
+        }
+      },
+    });
+    handedToCaller.then(unregister, unregister);
+    return handedToCaller;
   }
 
   /**
