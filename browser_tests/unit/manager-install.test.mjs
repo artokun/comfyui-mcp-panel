@@ -32,6 +32,8 @@ const {
   parseObjectInfoSearch,
   objectInfoSearchFallback,
   SEARCH_LIMIT_CAP,
+  MANAGER_SEARCH_TIMEOUT,
+  MANAGER_SEARCH_UNREACHABLE,
 } = ManagerInstall;
 
 test("looksLikeGitUrl recognizes every git protocol, plus author/repo shorthand (#301)", () => {
@@ -1670,9 +1672,9 @@ test("#1908 the production nodes_search handler answers a stalled Manager inside
     budgetMs: 25,
     managerGet,
     managerCall,
-    fetchObjectInfo: async () => {
-      throw new Error("object_info fallback must not run after the search budget aborts");
-    },
+    // #2099 — a Manager budget abort still tries /object_info. An empty map is
+    // a miss, so the result stays the retryable timeout rather than hanging.
+    fetchObjectInfo: async () => ({}),
   });
 
   const started = Date.now();
@@ -1680,10 +1682,12 @@ test("#1908 the production nodes_search handler answers a stalled Manager inside
   const elapsed = Date.now() - started;
 
   assert.ok(elapsed < 1000, `stalled search must settle promptly, took ${elapsed} ms`);
-  assert.equal(managerCallUsed, false, "an exhausted search budget must not start another route");
+  assert.equal(managerCallUsed, false, "an exhausted search budget must not start another Manager route");
   assert.equal(result.supported, false);
   assert.equal(result.managerReachable, false);
   assert.equal(result.query, "MiniMaxH3UnifiedToVideo");
+  assert.equal(result.retryable, true);
+  assert.equal(result.reason_code, MANAGER_SEARCH_TIMEOUT);
   assert.match(result.reason, /timed out/i);
   assert.match(result.message, /No canvas workflow was changed/i);
   assert.match(result.message, /Retry/i);
@@ -1894,6 +1898,8 @@ test("managerUnavailableResult is a safe, actionable structured payload", () => 
   assert.equal(r.supported, false);
   assert.equal(r.query, "");
   assert.equal(r.reason, UNREACHABLE.message);
+  assert.equal(r.retryable, true);
+  assert.equal(r.reason_code, MANAGER_SEARCH_UNREACHABLE);
 });
 
 // ---- #426: /object_info installed-node fallback when Manager is unreachable ---

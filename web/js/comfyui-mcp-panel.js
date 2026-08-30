@@ -26395,11 +26395,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // (no-/v2) legacy route on an unreachable/404 signal (a legacy-UI pip build
     // or real 3.x Manager can serve /customnode/getmappings while the /v2 route
     // 404s — or detectManagerDialect's /v2 probe fails). When BOTH are
-    // unreachable it falls back to an INSTALLED-node search over the connected
-    // ComfyUI's /object_info (#426) so a legacy/disabled Manager still returns
-    // usable, already-installed matches; on a miss it returns the structured
-    // {supported:false,…} capability result. A browser-origin transport wrap
-    // (#2024) is kept as the message so it is not a bare Failed to fetch.
+    // unreachable OR the command budget expires (#2099) it falls back to an
+    // INSTALLED-node search over the connected ComfyUI's /object_info (#426) so
+    // a stalled/legacy/disabled Manager still returns usable already-installed
+    // matches (DaSiWa_SeedControl); a timeout miss is a retryable named reason
+    // rather than an empty hang, and local hits are never dressed as Manager
+    // catalogue rows. A browser-origin transport wrap (#2024) is kept as the
+    // message so it is not a bare Failed to fetch.
     const budgetSignal = AbortSignal.timeout(NODES_SEARCH_COMMAND_BUDGET_MS);
     return searchNodesVia(managerGet, managerCall, {
       query,

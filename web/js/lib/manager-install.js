@@ -704,6 +704,19 @@ export function matchesAllTerms(hay, terms) {
  */
 export const SEARCH_LIMIT_CAP = 40;
 
+/**
+ * #2099 — after the Manager command budget expires, /object_info still gets a
+ * short dedicated window so a stalled registry does not skip an installed-node
+ * hit (DaSiWa_SeedControl). Sized to fit inside the bridge's remaining slack
+ * after NODES_SEARCH_COMMAND_BUDGET_MS (15s of a 20s read window).
+ */
+export const OBJECT_INFO_SEARCH_FALLBACK_MS = 2500;
+
+/** Named reasons for a Manager-search miss that is safe to retry. */
+export const MANAGER_SEARCH_TIMEOUT = "manager_search_timeout";
+export const MANAGER_SEARCH_UNREACHABLE = "manager_unreachable";
+export const MANAGER_SEARCH_TRANSPORT = "manager_search_transport";
+
 /** Route tail `managerGet`/`managerCall` prefix; v2 adds `/v2/`, legacy adds `/`. */
 export const SEARCH_MAPPINGS_ROUTE = "customnode/getmappings?mode=cache";
 
@@ -821,12 +834,16 @@ export function parseObjectInfoSearch(objectInfo, query, limit) {
 }
 
 /**
- * #426 — when BOTH Manager registry routes are unreachable, try the installed-node
- * `/object_info` search before giving up. On a hit, return a supported result the
- * agent can act on (installed-only); otherwise fall through to the structured
- * "Manager unavailable" capability result. `objectInfoGet` is dependency-injected
- * (the panel wires the live /object_info fetch) so this stays unit-testable, and
- * NEVER throws — any /object_info failure degrades to managerUnavailableResult.
+ * #426/#2099 — when Manager registry search is unreachable OR times out, try the
+ * installed-node `/object_info` search before giving up. On a hit, return a
+ * supported result the agent can act on (installed-only, never a fabricated
+ * Manager catalogue row); otherwise fall through to the structured miss.
+ * `objectInfoGet` is dependency-injected so this stays unit-testable, and NEVER
+ * throws — any /object_info failure degrades to managerUnavailableResult.
+ *
+ * A Manager command-budget abort is NOT caller cancellation: /object_info is a
+ * local ComfyUI read and must not inherit that abort, or an installed class
+ * like DaSiWa_SeedControl is skipped after a 15s empty hang.
  */
 export async function objectInfoSearchFallback(
   objectInfoGet,
@@ -840,22 +857,32 @@ export async function objectInfoSearchFallback(
 ) {
   const effectiveCallerSignal = callerSignal ?? (budgetSignal ? undefined : requestSignal);
   throwIfManagerSearchCallerAborted(effectiveCallerSignal);
-  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
-  if (isAbortLikeError(err)) throw err;
-  if (typeof objectInfoGet !== "function") return managerUnavailableResult(query, err);
+  const timedOut = budgetSignal?.aborted === true || err?.managerSearchTimedOut === true;
+  // #2099 — Manager timeout is the case we still want /object_info for. Caller
+  // abort remains an AbortError. A non-timeout AbortError from Manager itself
+  // (no budget tag) is still cancellation.
+  if (!timedOut && isAbortLikeError(err)) throw err;
+  if (typeof objectInfoGet !== "function") {
+    return timedOut ? managerSearchTimedOutResult(query, timeoutMs) : managerUnavailableResult(query, err);
+  }
+  const fallbackOptions = objectInfoFallbackRequestOptions(
+    effectiveCallerSignal,
+    timedOut,
+    requestSignal,
+  );
   let info;
   try {
-    info = await objectInfoGet(requestSignal ? { signal: requestSignal } : undefined);
+    info = await objectInfoGet(fallbackOptions);
   } catch (fallbackErr) {
     throwIfManagerSearchCallerAborted(effectiveCallerSignal);
-    if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
-    if (isAbortLikeError(fallbackErr)) throw fallbackErr;
-    return managerUnavailableResult(query, err);
+    if (!timedOut && isAbortLikeError(fallbackErr)) throw fallbackErr;
+    return timedOut ? managerSearchTimedOutResult(query, timeoutMs) : managerUnavailableResult(query, err);
   }
   throwIfManagerSearchCallerAborted(effectiveCallerSignal);
-  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
   const parsed = parseObjectInfoSearch(info, query, limit);
-  if (!parsed.count) return managerUnavailableResult(query, err);
+  if (!parsed.count) {
+    return timedOut ? managerSearchTimedOutResult(query, timeoutMs) : managerUnavailableResult(query, err);
+  }
   const result = {
     supported: true,
     managerReachable: false,
@@ -864,16 +891,32 @@ export async function objectInfoSearchFallback(
     count: parsed.count,
     results: parsed.results,
     query: query == null ? "" : String(query),
-    message:
-      "ComfyUI-Manager's registry search is unavailable (the built-in Manager is " +
-      "disabled, or a legacy/partial build without the search endpoint), so these are " +
-      "INSTALLED nodes matching your query from the connected ComfyUI's /object_info — " +
-      "already available to use directly (add with panel_add_node). Searching/installing " +
-      "NEW packs from the registry needs the built-in Manager (v4+) enabled.",
+    message: timedOut
+      ? "ComfyUI-Manager's registry search timed out, so these are INSTALLED nodes " +
+        "matching your query from the connected ComfyUI's /object_info — already " +
+        "available to use directly (add with panel_add_node). This is not a Manager " +
+        "catalogue result. Retry the registry search if you need installable packs."
+      : "ComfyUI-Manager's registry search is unavailable (the built-in Manager is " +
+        "disabled, or a legacy/partial build without the search endpoint), so these are " +
+        "INSTALLED nodes matching your query from the connected ComfyUI's /object_info — " +
+        "already available to use directly (add with panel_add_node). Searching/installing " +
+        "NEW packs from the registry needs the built-in Manager (v4+) enabled.",
   };
+  if (timedOut) result.managerTimedOut = true;
   // #1287 — the clamp disclosure must survive the fallback re-wrap too.
   if (parsed.limit_cap) result.limit_cap = parsed.limit_cap;
   return result;
+}
+
+/** After a Manager budget abort, /object_info must not see that aborted signal. */
+function objectInfoFallbackRequestOptions(callerSignal, timedOut, requestSignal) {
+  if (!timedOut) return requestSignal ? { signal: requestSignal } : undefined;
+  const fallbackBudget =
+    typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(OBJECT_INFO_SEARCH_FALLBACK_MS)
+      : undefined;
+  const signal = managerSearchRequestSignal(callerSignal, fallbackBudget);
+  return signal ? { signal } : undefined;
 }
 
 /**
@@ -888,6 +931,11 @@ export function managerUnavailableResult(query, err) {
   const timedOut = err?.managerSearchTimedOut === true;
   const reason = String(err?.message ?? err ?? "ComfyUI-Manager not reachable");
   const transport = !timedOut && isManagerTransportWrap(err);
+  const reason_code = timedOut
+    ? MANAGER_SEARCH_TIMEOUT
+    : transport
+      ? MANAGER_SEARCH_TRANSPORT
+      : MANAGER_SEARCH_UNREACHABLE;
   const result = {
     supported: false,
     managerReachable: false,
@@ -895,6 +943,8 @@ export function managerUnavailableResult(query, err) {
     results: [],
     query: query == null ? "" : String(query),
     reason,
+    reason_code,
+    retryable: true,
     message: timedOut
       ? "Node-registry search timed out before ComfyUI-Manager replied. No canvas " +
         "workflow was changed. Retry the search; if the Manager remains slow or " +
@@ -938,12 +988,37 @@ function managerSearchTransportMessage(reason) {
  * budget is converted into a bounded, actionable result. Caller cancellation
  * remains an AbortError so callers can stop the operation without it looking like
  * a successful, structured Manager timeout. */
-function managerSearchTimedOutResult(query, timeoutMs) {
+function managerSearchTimeoutError(timeoutMs) {
   const err = new Error(
     `ComfyUI-Manager node search timed out after ${timeoutMs ?? 15000} ms; no reply arrived.`,
   );
   err.managerSearchTimedOut = true;
-  return managerUnavailableResult(query, err);
+  return err;
+}
+
+function managerSearchTimedOutResult(query, timeoutMs) {
+  return managerUnavailableResult(query, managerSearchTimeoutError(timeoutMs));
+}
+
+function managerSearchTimeoutFallback(
+  objectInfoGet,
+  query,
+  limit,
+  timeoutMs,
+  requestSignal,
+  budgetSignal,
+  callerSignal,
+) {
+  return objectInfoSearchFallback(
+    objectInfoGet,
+    query,
+    limit,
+    managerSearchTimeoutError(timeoutMs),
+    requestSignal,
+    timeoutMs,
+    budgetSignal,
+    callerSignal,
+  );
 }
 
 function isAbortLikeError(err) {
@@ -1105,10 +1180,12 @@ export function emptyCatalogueResult(query) {
  *   2. on an unreachable/404 signal, retry the ABSOLUTE legacy route (a legacy-
  *      UI pip build or real 3.x Manager can serve /customnode/getmappings while
  *      the /v2 route 404s, or detectManagerDialect's /v2 probe fails);
- *   3. if the absolute route is ALSO unreachable, try the installed-node
- *      /object_info search (#426) via the injected `objectInfoGet`; on a miss,
- *      return the structured {supported:false,…} capability result instead of
- *      throwing. A browser-origin transport wrap (#2024, "Failed to fetch" with
+ *   3. if the absolute route is ALSO unreachable, OR the command budget expires
+ *      before either route replies (#2099), try the installed-node /object_info
+ *      search (#426) via the injected `objectInfoGet`. A timeout miss is a
+ *      retryable named reason, not an empty hang; a local hit (DaSiWa_SeedControl)
+ *      is returned as installed-only and is never dressed as a Manager catalogue
+ *      row. A browser-origin transport wrap (#2024, "Failed to fetch" with
  *      no HTTP response) stays at the front of `message` so it is not a bare
  *      fetch failure and MCP host-HTTP fallback can still see it.
  * Any non-"unreachable" error still propagates.
@@ -1127,14 +1204,34 @@ export async function searchNodesVia(
     data = await managerGet(route, requestOptions);
   } catch (err) {
     throwIfManagerSearchCallerAborted(signal);
-    if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+    if (budgetSignal?.aborted) {
+      return managerSearchTimeoutFallback(
+        objectInfoGet,
+        query,
+        limit,
+        timeoutMs,
+        requestSignal,
+        budgetSignal,
+        signal,
+      );
+    }
     if (isAbortLikeError(err)) throw err;
     if (!isManagerUnreachable(err)) throw err;
     try {
       data = await managerCall(route, requestOptions);
     } catch (err2) {
       throwIfManagerSearchCallerAborted(signal);
-      if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
+      if (budgetSignal?.aborted) {
+        return managerSearchTimeoutFallback(
+          objectInfoGet,
+          query,
+          limit,
+          timeoutMs,
+          requestSignal,
+          budgetSignal,
+          signal,
+        );
+      }
       if (isAbortLikeError(err2)) throw err2;
       if (isManagerUnreachable(err2))
         return objectInfoSearchFallback(
@@ -1151,7 +1248,6 @@ export async function searchNodesVia(
     }
   }
   throwIfManagerSearchCallerAborted(signal);
-  if (budgetSignal?.aborted) return managerSearchTimedOutResult(query, timeoutMs);
   const parsed = parseNodeMappings(data, query, limit);
   // #808 — an EMPTY catalogue is not a no-match, and only this branch can tell the
   // caller so. Checked on `catalogue_size` (packs the payload carried) rather than
