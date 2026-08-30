@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_widget no longer reports outcome-unknown after the value has landed: the handler ack is flushed once graph_set_widget resolves, and a timeout after delivery returns applied and verified from an idempotent readback (#2025)
+
+
 ## [0.15.135] - 2026-08-30
 
 ### Fixed

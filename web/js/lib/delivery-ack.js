@@ -12,6 +12,10 @@
  * callback returned. Neither may be rewritten as "rejected" or as a timeout
  * that names no receipt.
  *
+ * #2025 — when the outer wait ends after delivery and there is no `set`
+ * receipt, an idempotent live-widget readback that equals the request is
+ * itself the receipt ("applied and verified"), never outcome-unknown.
+ *
  * Dependency-free. Unit-testable with plain values.
  */
 
@@ -110,4 +114,56 @@ export function honestWidgetAck(result, { timeout = false } = {}) {
   }
 
   return result;
+}
+
+/** Named in the #2025 timeout-readback receipt when the live widget equals the request. */
+export const APPLIED_AND_VERIFIED_NOTE = "applied and verified";
+
+function widgetValuesEqual(expected, actual) {
+  if (
+    (expected !== null && typeof expected === "object") ||
+    (actual !== null && typeof actual === "object")
+  ) {
+    try {
+      return JSON.stringify(expected) === JSON.stringify(actual);
+    } catch {
+      return false;
+    }
+  }
+  return Object.is(expected, actual);
+}
+
+/**
+ * #2025 — defence-in-depth when the outer wait ends after the command was
+ * delivered. Idempotent readback of the targeted widget: if the live value
+ * equals the request, the mutation already landed and must not be reported
+ * as outcome-unknown.
+ *
+ * @param {{
+ *   requested?: any,
+ *   actual?: any,
+ *   found?: boolean,
+ *   node_id?: any,
+ *   widget?: any,
+ *   delivered?: boolean,
+ * }} [input]
+ */
+export function widgetWriteTimeoutReadback({
+  requested,
+  actual,
+  found = false,
+  node_id,
+  widget,
+  delivered = true,
+} = {}) {
+  if (!delivered) return honestWidgetAck({}, { timeout: true });
+  if (found && widgetValuesEqual(requested, actual)) {
+    return {
+      applied: true,
+      verified: true,
+      set: { node_id, widget, value: actual },
+      ack_note: APPLIED_AND_VERIFIED_NOTE,
+    };
+  }
+  return honestWidgetAck({}, { timeout: true });
 }

@@ -18360,6 +18360,10 @@ const GRAPH_TOOL_EXECUTORS = {
           return false;
         }
       },
+      // #2025 — the remaining command budget bounds the write+ack. On timeout after
+      // delivery, awaitSetWidgetAck readbacks the live widget instead of hanging
+      // until the 90s relay reports outcome-unknown.
+      timeoutMs: budget.bounded(),
     };
     // The creation and its rollback both live inside this call now, at the synchronous write
     // boundary — see `prepareWriteTarget` above. There is nothing to undo out here.

@@ -57,7 +57,7 @@ import {
   serverDeclaresRemoteComboOptions,
 } from "./input-asset.js";
 import { withTimeout } from "./bounded-step.js";
-import { honestWidgetAck } from "./delivery-ack.js";
+import { honestWidgetAck, widgetWriteTimeoutReadback } from "./delivery-ack.js";
 
 /**
  * Fire an undo-history hook that can never escape.
@@ -136,6 +136,84 @@ export function awaitFrontendWidgetFlush(timers) {
     });
   });
   return withTimeout(flush, FRONTEND_WIDGET_FLUSH_MS, () => undefined, timers);
+}
+
+const SET_WIDGET_ACK_TIMEOUT = Symbol("set-widget-ack-timeout");
+
+/**
+ * #2025 — never-throwing live read of one named widget. Used by the timeout
+ * readback so a missing node or a hostile getter cannot replace the ack.
+ */
+export function readLiveWidgetValue(node, widgetName) {
+  try {
+    const live = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    if (!live) return { found: false, value: undefined };
+    return { found: true, value: live.value };
+  } catch {
+    return { found: false, value: undefined };
+  }
+}
+
+/**
+ * #2025 — flush and correlate a graph_set_widget result once the write
+ * resolves, and fall back to an idempotent live-widget readback when the
+ * outer wait ends after delivery.
+ *
+ * `writePromise` is the SAME runSetWidget call the handler awaits. A refusal
+ * still throws. A resolved receipt is passed through honestWidgetAck so an
+ * applied write is never a hard timeout with no receipt. A timeout after
+ * delivery reads the targeted widget and returns "applied and verified"
+ * when it equals the requested value.
+ *
+ * The original write is not cancelled: withTimeout never cancels, and a
+ * rejection handler is attached immediately so an abandoned late throw
+ * cannot become an unhandled rejection.
+ *
+ * @param {Promise<any>|any} writePromise
+ * @param {{
+ *   node?: any,
+ *   widget?: any,
+ *   requested?: any,
+ *   timeoutMs?: number,
+ *   timers?: { setTimer?: Function, clearTimer?: Function },
+ *   delivered?: boolean,
+ * }} [opts]
+ */
+export async function awaitSetWidgetAck(writePromise, {
+  node,
+  widget,
+  requested,
+  timeoutMs,
+  timers,
+  delivered = true,
+} = {}) {
+  const tracked = Promise.resolve(writePromise);
+  tracked.then(() => {}, () => {});
+  const captured = tracked.then(
+    (result) => ({ ok: true, result }),
+    (error) => ({ ok: false, error }),
+  );
+  const raced = await withTimeout(captured, timeoutMs, () => SET_WIDGET_ACK_TIMEOUT, timers);
+  if (raced !== SET_WIDGET_ACK_TIMEOUT) {
+    if (raced?.ok) return honestWidgetAck(raced.result);
+    throw raced.error;
+  }
+  const live = readLiveWidgetValue(node, widget);
+  const verified = widgetWriteTimeoutReadback({
+    requested,
+    actual: live.value,
+    found: live.found,
+    node_id: node?.id,
+    widget,
+    delivered,
+  });
+  // Only short-circuit when the live widget already equals the request. A
+  // timeout before the write must still surface the inner worded refusal
+  // (stale combo, hung /view probe) rather than inventing outcome-unknown.
+  if (verified.applied && verified.verified) return verified;
+  const settled = await captured;
+  if (settled?.ok) return honestWidgetAck(settled.result);
+  throw settled.error;
 }
 
 function widgetValuesMatch(expected, actual) {
@@ -237,7 +315,26 @@ export function scopedAuthorizationTypes(node, promotedResolution, isResolvedPro
   return types;
 }
 
-export async function runSetWidget(
+const ACK_WRAPPED = Symbol("set-widget-ack-wrapped");
+
+export async function runSetWidget(node, widgetName, value, opts = {}) {
+  if (!opts[ACK_WRAPPED]) {
+    return awaitSetWidgetAck(
+      runSetWidgetBody(node, widgetName, value, { ...opts, [ACK_WRAPPED]: true }),
+      {
+        node,
+        widget: widgetName,
+        requested: value,
+        timeoutMs: opts.timeoutMs,
+        timers: opts.ackTimers,
+        delivered: opts.delivered !== false,
+      },
+    );
+  }
+  return runSetWidgetBody(node, widgetName, value, opts);
+}
+
+async function runSetWidgetBody(
   node,
   widgetName,
   value,
