@@ -58,7 +58,7 @@ Every provider shares one orchestrator on one loopback port (default
 | **Pick a provider** | A backend picker with **Claude** / **ChatGPT** chips — choose the agent, not a port. Switching providers starts a fresh chat (sessions aren't shared across providers) and posts a system note. |
 | **Provider onboarding** | Connect-time readiness detection per provider (CLI on PATH + a login on disk; macOS Keychain handled). An onboarding card shows only when neither provider is signed in; the panel auto-switches to a ready provider when your saved pick isn't usable (your saved preference is untouched), and a not-ready row becomes a "set up" action. |
 | **Live-canvas building** | The agent adds, wires, moves, retitles, colors, collapses, groups, and lays out nodes on the graph you're viewing — all through a fixed `panel_*` allowlist (no arbitrary JS), every edit undoable with **Ctrl+Z**. |
-| **One-shot workflow / pack load** | `panel_load_workflow` drops a whole graph onto the canvas in one call — load a bundled installer pack's local-GPU workflow by name without shuttling the JSON through the chat. |
+| **One-shot workflow / pack load** | `panel_load_workflow` drops a whole graph onto the canvas in one call — load a bundled installer pack's local-GPU workflow by name without shuttling the JSON through the chat. UI/litegraph and API/prompt (`graph.api.json`) both load. |
 | **Local-GPU vs paid-API awareness** | Bundled packs are local/free; for ad-hoc graphs the agent checks the runtime (`list_packs` `action:"check_runtime"`) and **asks before spending paid API credits**. |
 | **Installer packs + skills** | The agent discovers bundled model-family skills and one-command installer packs, then applies the manifest and loads the ready workflow instead of hand-building a graph. |
 | **Rewind & rollback** | Roll back **code** (graph), **conversation** (fork the session), or **both** from any past message, plus `/revert` and double-Esc quick rewind. |
@@ -212,7 +212,7 @@ which receives `panel_*` by a different route.
 
 | Tool | Effect |
 |---|---|
-| `panel_load_workflow` | Replace the live graph with a full workflow in one call — prefer `pack:<name>` to load a bundled installer pack's local-GPU workflow without shuttling the JSON through chat. The replaced graph becomes an undo point (double-Esc / revert). |
+| `panel_load_workflow` | Replace the live graph with a full workflow in one call — prefer `pack:<name>` to load a bundled installer pack's local-GPU workflow without shuttling the JSON through chat. Accepts UI/litegraph JSON and API/prompt format (`graph.api.json`). The replaced graph becomes an undo point (double-Esc / revert). |
 
 **Knowledge & cost awareness** — the agent (Claude *or* ChatGPT) discovers bundled expertise and checks runtime cost before spending credits
 

@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 
 import {
   looksLikeApiWorkflow,
+  apiWorkflowPayload,
   apiClassCounts,
   apiLoadShortfall,
   apiLoadNote,
@@ -54,6 +55,17 @@ function describe_shape() {
     assert.equal(looksLikeApiWorkflow({ 1: { foo: 1 }, 2: { bar: 2 } }), false);
     // A single non-numeric key disqualifies it (that is a UI-ish object).
     assert.equal(looksLikeApiWorkflow({ 1: { class_type: "X" }, extra: {} }), false);
+  });
+
+  test("#2011 graph.api.json (bare API map) and a wrapped {prompt} both unwrap to the map", () => {
+    // The reporter's path ended in graph.api.json — ComfyUI's Save (API Format)
+    // is the numeric-key map. Some pipelines wrap that map as `{prompt: {…}}`.
+    assert.equal(apiWorkflowPayload(API), API);
+    assert.equal(apiWorkflowPayload({ prompt: API }), API);
+    assert.equal(apiWorkflowPayload({ nodes: [], links: [] }), null);
+    assert.equal(apiWorkflowPayload({ prompt: { nodes: [] } }), null);
+    assert.equal(apiWorkflowPayload({ prompt: { 1: { foo: 1 } } }), null);
+    assert.equal(apiWorkflowPayload(null), null);
   });
 }
 
@@ -155,9 +167,9 @@ test("#775 WIRING: graph_load delegates to loadApiJson instead of refusing", () 
   const src = readFileSync(PANEL_JS, "utf8");
   assert.match(
     src,
-    /import \{ looksLikeApiWorkflow, apiLoadShortfall, apiLoadNote \} from "\.\/lib\/api-workflow-load\.js"/,
+    /import \{ looksLikeApiWorkflow, apiWorkflowPayload, apiLoadShortfall, apiLoadNote \} from "\.\/lib\/api-workflow-load\.js"/,
   );
-  const i = src.indexOf("if (looksLikeApiWorkflow(data))");
+  const i = src.indexOf("const apiData = apiWorkflowPayload(data);");
   assert.ok(i > 0, "graph_load must branch on the API shape");
   // Bounded by the branch's own end, not by a character count. This read a fixed 2200-char
   // window, so adding a comment inside the branch silently pushed the LAST assertion out of
@@ -166,6 +178,7 @@ test("#775 WIRING: graph_load delegates to loadApiJson instead of refusing", () 
   const end = src.indexOf('"graph is not a UI workflow', i);
   assert.ok(end > i, "the non-API refusal that follows the branch must still be recognisable");
   const branch = src.slice(i, end);
+  assert.match(branch, /JSON\.parse\(JSON\.stringify\(apiData\)\)/, "the imported payload is the unwrapped API map");
   assert.match(branch, /app\.loadApiJson\(apiClone, "graph_load\.json"\)/, "it imports rather than refusing");
   // The label avoids naming the internal bridge command on purpose: the
   // vocabulary gate reads any such name in a string as advice a model could try

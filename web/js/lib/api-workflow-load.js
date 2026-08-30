@@ -66,6 +66,25 @@ export function looksLikeApiWorkflow(data) {
   });
 }
 
+/**
+ * The API/prompt map to import, or null when `data` is not that shape.
+ *
+ * ComfyUI's "Save (API Format)" and files named `graph.api.json` are the bare
+ * numeric-key map. Some exporters wrap the same map as `{prompt: {…}}`. A UI
+ * workflow (top-level `nodes`) returns null so the UI load path stays in charge.
+ *
+ * @param {unknown} data
+ * @returns {Record<string, unknown> | null}
+ */
+export function apiWorkflowPayload(data) {
+  if (looksLikeApiWorkflow(data)) return /** @type {Record<string, unknown>} */ (data);
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    const prompt = /** @type {any} */ (data).prompt;
+    if (looksLikeApiWorkflow(prompt)) return prompt;
+  }
+  return null;
+}
+
 /** How many of each class_type the API workflow asked for. */
 export function apiClassCounts(apiData) {
   const want = new Map();
