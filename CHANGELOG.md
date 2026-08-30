@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- retry one readable workflow-open normalization race while keeping persistent content mismatches fail-closed (#1898)
+
 ## [0.15.129] - 2026-08-30
 
 ### Fixed
