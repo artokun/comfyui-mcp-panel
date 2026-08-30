@@ -162,8 +162,11 @@ const OPERATIONS = {
  * @param {"in-place"|"save-as"} ctx.operation  which write was attempted
  * @param {string}  ctx.path     the workflow's store path ("workflows/Foo.json")
  * @param {"down"|"open"|undefined} ctx.backendSocket  see describeSaveBackendSocket
+ * @param {string}  [ctx.url]    absolute request URL when one was observed
+ * @param {number}  [ctx.status] HTTP status when a response DID arrive
+ * @param {string}  [ctx.body]   bounded response body when a response DID arrive
  */
-export function saveTransportFailureMessage(err, { operation, path, backendSocket } = {}) {
+export function saveTransportFailureMessage(err, { operation, path, backendSocket, url, status, body } = {}) {
   if (!isTransportFailure(err)) return null;
   const raw = (err instanceof Error ? err.message : String(err ?? "")).trim();
   const op = OPERATIONS[operation] || { verb: "the save of", state: "" };
@@ -172,16 +175,44 @@ export function saveTransportFailureMessage(err, { operation, path, backendSocke
   const where = route
     ? `ComfyUI's same-origin userdata route (${route})`
     : `ComfyUI's same-origin userdata route`;
+  const observed = observedSaveResponse(err, { url, status, body });
+  const responseClause = observed.hasStatus
+    ? `failed ${op.verb} ${target} against ${where}.${observed.text}`
+    : `${op.verb} ${target} received NO HTTP response from ${where}, so there is no status code and no response body to report — they do not exist (#1757).${observed.text}`;
   return (
-    `${raw || "the request failed"} — ${op.verb} ${target} received NO HTTP response from ` +
-    `${where}, so there is no status code and no response body to ` +
-    `report — they do not exist (#1757).${socketNote(backendSocket)} This does NOT establish ` +
+    `${raw || "the request failed"} — ${responseClause}${socketNote(backendSocket)} This does NOT establish ` +
     `that nothing was written: a reply lost after the request was delivered looks exactly like ` +
     `this from the browser, so read the file back before retrying rather than assuming either ` +
     `outcome.${op.state} Finally: graph reads, layout edits and panel_list_workflows keep ` +
     `succeeding right through this, because they run against the in-memory graph and issue no ` +
     `HTTP at all — their success is not evidence that ComfyUI is up.`
   );
+}
+
+/** Extra URL/status/body the throw carried. `hasStatus` means a response line existed. */
+function observedSaveResponse(err, { url, status, body }) {
+  let failUrl = typeof url === "string" && url ? url : "";
+  if (!failUrl && err && typeof err === "object" && typeof err.url === "string" && err.url) {
+    failUrl = err.url;
+  }
+  let failStatus;
+  if (typeof status === "number" && Number.isFinite(status)) failStatus = status;
+  else if (err && typeof err === "object" && typeof err.status === "number" && Number.isFinite(err.status)) {
+    failStatus = err.status;
+  }
+  let failBody = typeof body === "string" ? body.trim() : "";
+  if (!failBody && err && typeof err === "object" && typeof err.body === "string") {
+    failBody = err.body.trim();
+  }
+  if (failBody.length > 200) failBody = `${failBody.slice(0, 200)}…`;
+  const parts = [];
+  if (failUrl) parts.push(`Request URL: ${failUrl}`);
+  if (typeof failStatus === "number") parts.push(`HTTP status: ${failStatus}`);
+  if (failBody) parts.push(`body: ${failBody}`);
+  return {
+    hasStatus: typeof failStatus === "number",
+    text: parts.length === 0 ? "" : ` ${parts.join("; ")}.`,
+  };
 }
 
 /**

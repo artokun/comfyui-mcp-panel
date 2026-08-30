@@ -10,6 +10,11 @@ import {
   isSaveTransportFailure,
   readBackendSocket,
 } from "./save-transport-failure.js";
+import {
+  classifySaveWriteLanded,
+  resolveSameOriginUserDataUrl,
+  writeWithSameOriginRetry,
+} from "./save-route-retry.js";
 
 // Programmatic workflow saving — shared by the panel and unit tests.
 //
@@ -674,6 +679,13 @@ export async function saveActiveWorkflow(
     // moment. Omitted by a caller that cannot observe it ⇒ the message says nothing
     // about the socket, which is the honest answer.
     describeBackendSocket,
+    // #1757 recurrence — re-point the userdata write at the page origin after a
+    // timed-out restart confirmation (or any transport miss). Injected as a
+    // function so tests drive the shipped write without a live `api` object.
+    rebindSaveRoute,
+    // Optional override for the post-transport read-back. Omitted ⇒ built from
+    // existsOnDisk / readDiskBytes against the bytes this write was about to send.
+    probeSaveLanded,
     // Optional production hook used for persisted Save-As copies. It must return true
     // only after the destination-stamped copy is proven live on the shared canvas.
     repaintCanvas,
@@ -1388,7 +1400,15 @@ export async function saveActiveWorkflow(
   }
   if (inPlace === "authorize") markPersistedForOverwrite(wf); // sync (post-assert) ⇒ no leak window
   recordOutcome(details, "in-place", { sourcePath: currentPath, targetPath: finalTargetPath });
-  const savedRecord = await saveInPlace(svc, wf, { readSaveFailureCause, path: finalTargetPath, describeBackendSocket });
+  const savedRecord = await saveInPlace(svc, wf, {
+    readSaveFailureCause,
+    path: finalTargetPath,
+    describeBackendSocket,
+    rebindSaveRoute,
+    probeSaveLanded,
+    existsOnDisk,
+    readDiskBytes,
+  });
   // r10 — thread the save API's own produced record (when it returns one) through
   // details, so the identity carry can prove succession from the replacement
   // EVENT. An empty/non-object return simply carries no thread (fail safe).
@@ -2303,14 +2323,53 @@ export function explainUserDataStoreFailure(message) {
   );
 }
 
-async function saveInPlace(svc, wf, { readSaveFailureCause, path, describeBackendSocket } = {}) {
+async function saveInPlace(svc, wf, {
+  readSaveFailureCause,
+  path,
+  describeBackendSocket,
+  rebindSaveRoute,
+  probeSaveLanded,
+  existsOnDisk,
+  readDiskBytes,
+} = {}) {
   // Return the save API's own result: when it yields the workflow record it
   // PRODUCED (a re-registered successor object), that is the one unambiguous
   // replacement-event thread the identity carry can use (r10) — path occupancy
   // proves nothing (a close→reopen occupies the same path with a new identity).
+  const hasStoreWrite = typeof svc?.saveWorkflow === "function";
+  const hasRecordWrite = typeof wf?.save === "function";
+  if (!hasStoreWrite && !hasRecordWrite) {
+    throw new Error("workflow save API unavailable on this frontend");
+  }
+  const write = () => (hasStoreWrite ? svc.saveWorkflow(wf) : wf.save());
+  let expectedText;
   try {
-    if (typeof svc.saveWorkflow === "function") return await svc.saveWorkflow(wf);
-    if (typeof wf.save === "function") return await wf.save();
+    if (typeof wf?.content === "string" && wf.content) expectedText = wf.content;
+    else if (wf?.activeState != null) expectedText = JSON.stringify(wf.activeState);
+  } catch {
+    expectedText = undefined;
+  }
+  const probe =
+    typeof probeSaveLanded === "function"
+      ? probeSaveLanded
+      : () =>
+          classifySaveWriteLanded({
+            path,
+            expectedText,
+            existsOnDisk,
+            readDiskBytes,
+          });
+  const url = resolveSameOriginUserDataUrl(path);
+  try {
+    // In-place overwrite of the same graph bytes is idempotent, so one retry
+    // after a lost response cannot apply a distinct mutation twice.
+    return await writeWithSameOriginRetry(write, {
+      rebind: rebindSaveRoute,
+      probe,
+      recoveredValue: wf,
+      allowUnknownRetry: true,
+      url,
+    });
   } catch (err) {
     // #1757 — FIRST, because it is the shape that carries no status at all. A
     // transport failure never produced an HTTP response, so `explainUserDataStoreFailure`
@@ -2320,6 +2379,9 @@ async function saveInPlace(svc, wf, { readSaveFailureCause, path, describeBacken
     const decorated = decorateSaveTransportFailure(err, {
       operation: "in-place",
       path,
+      url,
+      status: err && typeof err === "object" && typeof err.status === "number" ? err.status : undefined,
+      body: err && typeof err === "object" && typeof err.body === "string" ? err.body : undefined,
       // Read HERE, not at entry: the socket state that matters is the one at the moment
       // the write failed, and the write is what we just awaited.
       backendSocket: readBackendSocket(describeBackendSocket),
@@ -2341,7 +2403,6 @@ async function saveInPlace(svc, wf, { readSaveFailureCause, path, describeBacken
     }
     throw err;
   }
-  throw new Error("workflow save API unavailable on this frontend");
 }
 
 /** True when `err` is a name-collision (HTTP 409) from the userdata write — the

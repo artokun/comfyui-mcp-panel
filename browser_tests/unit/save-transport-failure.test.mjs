@@ -37,6 +37,13 @@ import {
   saveTransportFailureMessage,
   userDataRoute,
 } from "../../web/js/lib/save-transport-failure.js";
+import {
+  clearRestartConfirmTimeout,
+  noteRestartConfirmTimeout,
+  rebindSameOriginSaveRoute,
+  restartConfirmTimeoutPending,
+} from "../../web/js/lib/save-route-retry.js";
+import { linkDrivenWidgets } from "../../web/js/lib/graph-read.js";
 
 /** Exactly what Chrome throws when a fetch never completes. */
 const failedToFetch = () => new TypeError("Failed to fetch");
@@ -441,4 +448,136 @@ test("#1757 programmaticSave hands saveActiveWorkflow a LIVE socket observer", (
     /describeSaveBackendSocket\(\{[\s\S]*flaggedDown: comfyBackendSocketDown[\s\S]*socketReadyState: comfyBackendSocketReadyState\(\)/,
     "reading the same two observations the graph-mutation gate reads",
   );
+  assert.match(
+    call,
+    /rebindSaveRoute: \(\) =>/,
+    "the same-origin userdata rebind is installed on the production save",
+  );
+  assert.match(call, /rebindSameOriginSaveRoute\(\{[\s\S]*api,[\s\S]*origin:/);
+});
+
+function liveGraphNode() {
+  return {
+    graph: { links: { 7: { origin_id: 85, origin_slot: 0 } } },
+    widgets: [{ name: "steps", value: 30 }],
+    inputs: [{ name: "steps", type: "INT", link: 7 }],
+  };
+}
+
+test("#1757 recurrence: restart-confirm timeout → graph read still works → save succeeds after rebind", async () => {
+  clearRestartConfirmTimeout();
+  noteRestartConfirmTimeout();
+
+  const driven = linkDrivenWidgets(liveGraphNode());
+  assert.deepEqual(
+    driven,
+    { steps: { node_id: 85, output_slot: 0 } },
+    "in-memory graph reads keep working; they issue no HTTP",
+  );
+
+  const api = { api_host: "stale.example:9999" };
+  const active = persistedTab();
+  let writes = 0;
+  const svc = makeStore({
+    active,
+    disk: [active.path],
+    onSaveWorkflow: () => {
+      writes += 1;
+      if (api.api_host !== "127.0.0.1:8188") throw failedToFetch();
+    },
+  });
+
+  const saved = await saveActiveWorkflow(svc, undefined, {
+    existsOnDisk: async () => true,
+    rebindSaveRoute: () => rebindSameOriginSaveRoute({ api, origin: "http://127.0.0.1:8188" }),
+  });
+
+  assert.ok(saved, "the in-place save must persist after the same-origin rebind");
+  assert.equal(writes, 1, "rebind runs before the first write when the confirmation timed out");
+  assert.equal(api.api_host, "127.0.0.1:8188");
+  assert.equal(restartConfirmTimeoutPending(), false, "the save consumes the timeout flag");
+});
+
+test("#1757 recurrence: a missed in-place write is retried once and then succeeds", async () => {
+  clearRestartConfirmTimeout();
+  noteRestartConfirmTimeout();
+  assert.deepEqual(linkDrivenWidgets(liveGraphNode()).steps, { node_id: 85, output_slot: 0 });
+
+  const active = persistedTab();
+  let writes = 0;
+  let rebinds = 0;
+  const svc = makeStore({
+    active,
+    disk: [active.path],
+    onSaveWorkflow: () => {
+      writes += 1;
+      if (writes === 1) throw failedToFetch();
+    },
+  });
+
+  const saved = await saveActiveWorkflow(svc, undefined, {
+    existsOnDisk: async () => true,
+    probeSaveLanded: async () => "missed",
+    rebindSaveRoute: () => {
+      rebinds += 1;
+    },
+  });
+
+  assert.ok(saved);
+  assert.equal(writes, 2, "exactly one retry of the shipped store write");
+  assert.ok(rebinds >= 1, "the same-origin route is rebound before the retry");
+});
+
+test("#1757 recurrence: a still-failing save returns the userdata URL, not bare 'Failed to fetch'", async () => {
+  clearRestartConfirmTimeout();
+  noteRestartConfirmTimeout();
+  assert.ok(linkDrivenWidgets(liveGraphNode()).steps);
+
+  const active = persistedTab();
+  const svc = makeStore({
+    active,
+    disk: [active.path],
+    onSaveWorkflow: () => {
+      const err = failedToFetch();
+      err.status = 503;
+      err.body = "origin warming up";
+      throw err;
+    },
+  });
+
+  const err = await saveAndCatch(svc, undefined, {
+    existsOnDisk: async () => true,
+    probeSaveLanded: async () => "missed",
+    rebindSaveRoute: () => {},
+  });
+
+  assert.ok(err, "the save must still fail when the retry cannot persist");
+  assert.equal(err.message === "Failed to fetch", false, "the bare browser string is the defect");
+  assert.notEqual(err.message, "Failed to fetch");
+  assert.match(err.message, /Request URL:/);
+  assert.match(err.message, /\/userdata\/workflows%2FLTX%20EROS%20Extend\.json/);
+  assert.match(err.message, /HTTP status: 503/);
+  assert.match(err.message, /origin warming up/);
+});
+
+test("#1757 recurrence: a lost response whose write DID land is reported as success, not retried", async () => {
+  clearRestartConfirmTimeout();
+  const active = persistedTab();
+  let writes = 0;
+  const svc = makeStore({
+    active,
+    disk: [active.path],
+    onSaveWorkflow: () => {
+      writes += 1;
+      throw failedToFetch();
+    },
+  });
+
+  const saved = await saveActiveWorkflow(svc, undefined, {
+    existsOnDisk: async () => true,
+    probeSaveLanded: async () => "landed",
+  });
+
+  assert.ok(saved, "read-back proof that the bytes landed is success");
+  assert.equal(writes, 1, "must not retry a mutation the probe already found on disk");
 });
