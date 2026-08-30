@@ -300,6 +300,7 @@ import {
 } from "./lib/unpack-link-verify.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { isGenericManagerUpdateError, readUpdateTraceback } from "./lib/manager-update-traceback.js";
+import { isGenericManagerInstallError, readInstallTraceback } from "./lib/manager-install-traceback.js";
 import { describeScreenshotFraming } from "./lib/screenshot-framing.js";
 import { readActiveSidebarTab, shouldDetachPanelRoot, findSidebarTabButton } from "./lib/active-sidebar-tab.js";
 import { buildPanelFailureShell } from "./lib/panel-failure-shell.js";
@@ -8819,8 +8820,18 @@ async function verifyInstalled(target, dialect, { batchFailed, renameProne, budg
       listError = true;
     }
   }
+  // #2012 — Manager's do_install records only "Installation failed" (plus an
+  // optional node spec) and prints the real traceback / res.msg to the server
+  // log. When the stored reason is that generic sentence, fetch the log and
+  // attach the traceback so the tool result is the evidence, not a pointer to
+  // it. A specific Manager exception already in the task record does not pay
+  // for a log read.
+  let traceback;
+  if (taskFailure && isGenericManagerInstallError(taskFailure)) {
+    traceback = await readInstallTraceback(target, api);
+  }
   return classifyInstallOutcome({
-    target, dialect, status, installed, listError, batchFailed, renameProne, taskFailure,
+    target, dialect, status, installed, listError, batchFailed, renameProne, taskFailure, traceback,
   });
 }
 
