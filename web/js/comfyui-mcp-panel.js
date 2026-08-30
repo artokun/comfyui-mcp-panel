@@ -1776,6 +1776,7 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
     Number.isFinite(runOpts?.runBudgetMs) && runOpts.runBudgetMs > 0
       ? runOpts.runBudgetMs
       : NODE_DEFS_RUN_BUDGET_MS;
+  let runDeadline = monotonicNow() + runBudgetMs;
   // Whole-schema start-of-run effects. A one-class payload from graph_add_node is not a
   // type-set replacement (#2050): fencing the last-observed snapshot and then running
   // refreshComboInNodes() would re-fetch the same dump that just missed its budget, and
@@ -1783,14 +1784,10 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // proof it just verified.
   if (replacementMayReplaceWholeSnapshot) {
     // #2027 — a stale browser bundle must not fence or clear last-known schema.
-    // Ask before the run deadline is armed so a slow version probe cannot steal
-    // fetch budget, and before invalidate/beginReplacement so a large-/object_info
-    // miss on an older tab cannot worsen the next widget edit.
+    // Ask before invalidate/beginReplacement so a large-/object_info miss on an
+    // older tab cannot worsen the next widget edit.
     const staleBundle = await refuseStaleBundleRefresh();
     if (staleBundle) return staleBundle;
-  }
-  let runDeadline = monotonicNow() + runBudgetMs;
-  if (replacementMayReplaceWholeSnapshot) {
     // #716 — drop the widget-write burst cache at the START of this run, not after it
     // succeeds (codex). This function runs on exactly the events that change the schema —
     // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
