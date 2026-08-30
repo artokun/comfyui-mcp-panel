@@ -11,6 +11,7 @@ All notable changes to this project are documented here. This project adheres to
 - scoped panel_run keeps the run-to-node target when a queuePrompt wrapper drops the third argument, instead of relying only on request-body repair (#1998)
 - panel_restart_comfyui uses ComfyUI Desktop's restartCore/restartApp to restore the backend after stop, and refuses a Manager reboot when no Desktop relaunch path is available, so a Desktop instance is not left stopped (#1999)
 - panel_run serializes a freshly typed PrimitiveNode STRING widget from the live graph instead of rejecting it as a missing dynamic widget (#2009)
+- KSampler nodes added with panel_add_node keep control_after_generate='randomize' armed, so the ordinary Queue button rolls the seed instead of cache-hitting on 0 until a tab reload (#2029)
 
 ## [0.15.140] - 2026-08-30
 

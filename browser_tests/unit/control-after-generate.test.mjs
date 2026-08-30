@@ -9,6 +9,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   CONTROL_AFTER_GENERATE_MODES,
@@ -17,7 +19,10 @@ import {
   controlAfterGenerateModes,
   controlEntryForWidget,
   controlAfterGenerateWarning,
+  ensureControlAfterGenerateQueueHooks,
 } from "../../web/js/lib/control-after-generate.js";
+
+const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 
 // A KSampler-shaped node: seed value widget followed by its control combo, exactly
 // as the ComfyUI frontend builds it (control widget serialize:false/canvasOnly).
@@ -286,4 +291,101 @@ test("a node with no control widget yields no entries", () => {
   const node = { id: 5, type: "CLIPTextEncode", widgets: [{ name: "text", value: "hi" }] };
   assert.deepEqual(controlAfterGenerateModes(node), {});
   assert.deepEqual(controlAfterGenerateEntries(node), []);
+});
+
+// #2029 — panel_add_node materializes the control combo (visible, mode randomize)
+// without afterQueued / linkedWidgets, so the ordinary Queue button never rolls
+// the seed. These tests pin the unfixed node (seed stays 0) and the repair.
+
+function inertSeedNode(mode = "randomize", seedValue = 0) {
+  const seed = { name: "seed", type: "INT", value: seedValue, options: { min: 0, max: 100, step2: 1 } };
+  const control = {
+    name: "control_after_generate",
+    type: "combo",
+    value: mode,
+    options: { values: [...CONTROL_AFTER_GENERATE_MODES], serialize: false, canvasOnly: true },
+  };
+  return { id: 3, type: "KSampler", widgets: [seed, control], seed, control };
+}
+
+test("#2029 unfixed: an inert control_after_generate combo does not roll the seed", () => {
+  const node = inertSeedNode("randomize", 0);
+  assert.equal(typeof node.control.afterQueued, "undefined");
+  assert.equal(node.seed.linkedWidgets, undefined);
+  node.control.afterQueued?.();
+  assert.equal(node.seed.value, 0, "panel-add default seed must stay 0 when the combo is inert");
+});
+
+test("#2029 ensureControlAfterGenerateQueueHooks arms randomize so a queue rolls the seed", () => {
+  const node = inertSeedNode("randomize", 0);
+  assert.equal(ensureControlAfterGenerateQueueHooks(node), 1);
+  assert.equal(typeof node.control.afterQueued, "function");
+  assert.equal(node.seed.linkedWidgets[0], node.control);
+
+  const orig = Math.random;
+  Math.random = () => 0.5;
+  try {
+    node.control.afterQueued();
+  } finally {
+    Math.random = orig;
+  }
+  assert.equal(node.seed.value, 50);
+});
+
+test("#2029 increment/decrement actually step the governed seed", () => {
+  const inc = inertSeedNode("increment", 10);
+  ensureControlAfterGenerateQueueHooks(inc);
+  inc.control.afterQueued();
+  assert.equal(inc.seed.value, 11);
+
+  const dec = inertSeedNode("decrement", 10);
+  ensureControlAfterGenerateQueueHooks(dec);
+  dec.control.afterQueued();
+  assert.equal(dec.seed.value, 9);
+});
+
+test("#2029 a live frontend hook is left alone; linkedWidgets is still filled", () => {
+  const node = inertSeedNode("randomize", 0);
+  let calls = 0;
+  const existing = () => {
+    calls += 1;
+  };
+  node.control.afterQueued = existing;
+  assert.equal(ensureControlAfterGenerateQueueHooks(node), 0);
+  assert.equal(node.control.afterQueued, existing);
+  assert.equal(node.seed.linkedWidgets[0], node.control);
+  node.control.afterQueued();
+  assert.equal(calls, 1);
+  assert.equal(node.seed.value, 0, "our repair must not wrap and double-apply a live hook");
+});
+
+test("#2029 WidgetControlMode 'before' rolls on the second beforeQueued, not afterQueued", () => {
+  const node = inertSeedNode("increment", 0);
+  ensureControlAfterGenerateQueueHooks(node, { getControlMode: () => "before" });
+  node.control.afterQueued();
+  assert.equal(node.seed.value, 0);
+  node.control.beforeQueued();
+  assert.equal(node.seed.value, 0, "first beforeQueued is the frontend skip");
+  node.control.beforeQueued();
+  assert.equal(node.seed.value, 1);
+});
+
+test("#2029 a linked (converted-to-input) seed is not rolled", () => {
+  const node = inertSeedNode("randomize", 7);
+  node.inputs = [{ name: "seed", link: 99, widget: { name: "seed" } }];
+  ensureControlAfterGenerateQueueHooks(node);
+  node.control.afterQueued();
+  assert.equal(node.seed.value, 7);
+});
+
+test("#2029 graph_add_node arms control_after_generate after the node is on the graph", () => {
+  const panel = readFileSync(PANEL_JS, "utf8");
+  const addAt = panel.indexOf("async graph_add_node(");
+  const removeAt = panel.indexOf("graph_remove_node(", addAt);
+  assert.ok(addAt > 0 && removeAt > addAt, "graph_add_node must exist");
+  const body = panel.slice(addAt, removeAt);
+  const graphAddAt = body.indexOf("graph.add(node)");
+  const ensureAt = body.indexOf("ensureControlAfterGenerateQueueHooks(node");
+  assert.ok(graphAddAt > 0, "the node must be added to the graph");
+  assert.ok(ensureAt > graphAddAt, "queue-hook repair must run AFTER graph.add(node)");
 });

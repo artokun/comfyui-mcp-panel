@@ -26,6 +26,7 @@ import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-c
 import { fetchSingleNodeInfo } from "../../web/js/lib/single-node-def.js";
 import { reconcileFreshDynamicWidgets } from "../../web/js/lib/dynamic-widget-reconcile.js";
 import { safeRemoveNode } from "../../web/js/lib/safe-remove-node.js";
+import { ensureControlAfterGenerateQueueHooks } from "../../web/js/lib/control-after-generate.js";
 
 export const PANEL_SRC = readFileSync(
   fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
@@ -247,6 +248,8 @@ export function addNodeCommandBudgetDeps() {
       `HARNESS STUB refusal for "${classType}" — the shipped wording lives in the panel.`,
     reconcileFreshDynamicWidgets,
     safeRemoveNode,
+    // #2029 — graph_add_node arms inert control_after_generate combos after graph.add.
+    ensureControlAfterGenerateQueueHooks,
   };
 }
 
