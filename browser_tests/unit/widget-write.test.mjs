@@ -1915,6 +1915,170 @@ test("#366: a promoted STRING widget also syncs the parent rail (prompt text)", 
   assert.equal(set.promoted_from.parent_widget_synced, true);
 });
 
+/**
+ * MiniMax H3 / frontend 1.49+ shape: the host input is named `value_1` with
+ * display label `duration`, widgetId names this wrapper, and `_widget` still
+ * points at the INNER Primitive widget. SubgraphNode.widgets is a getter that
+ * returns `_widget` until that stale handle is dropped, then projects the
+ * store-backed rail queue compilation reads.
+ */
+function makeStaleInnerRailFixture({
+  innerId = 136,
+  innerType = "PrimitiveFloat",
+  innerWidgetType = "number",
+  innerValue = 5,
+  outerName = "value_1",
+  outerLabel = "duration",
+  parentId = 105,
+  comboValues = null,
+} = {}) {
+  const innerWidget = {
+    name: "value",
+    type: innerWidgetType,
+    value: innerValue,
+    ...(comboValues ? { options: { values: comboValues } } : {}),
+  };
+  const inner = { id: innerId, type: innerType, widgets: [innerWidget] };
+  const subgraph = {
+    _nodes: [inner],
+    getNodeById: (id) => (String(id) === String(innerId) ? inner : null),
+  };
+  const store = { value: innerValue };
+  const hostInput = {
+    name: outerName,
+    label: outerLabel,
+    widgetId: `root:${parentId}:${outerName}`,
+    widget: { name: outerName },
+    _widget: innerWidget,
+    _subgraphSlot: { name: outerName, label: outerLabel },
+  };
+  const parent = {
+    id: parentId,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [hostInput],
+    get widgets() {
+      if (!hostInput._widget && hostInput.widgetId) {
+        const rail = {
+          name: outerName,
+          label: outerLabel,
+          widgetId: hostInput.widgetId,
+          type: innerWidgetType,
+          get value() {
+            return store.value;
+          },
+          set value(next) {
+            store.value = next;
+          },
+          options: {
+            ...(comboValues ? { values: comboValues } : {}),
+            setValue(next) {
+              store.value = next;
+            },
+          },
+        };
+        hostInput._widget = rail;
+      }
+      return hostInput._widget ? [hostInput._widget] : [];
+    },
+  };
+  const resolveSource = (_node, subgraphInput) =>
+    subgraphInput?.name === outerName ? { sourceNodeId: String(innerId), sourceWidgetName: "value" } : null;
+  return { parent, inner, innerWidget, hostInput, store, resolveSource };
+}
+
+test("#366: writing the duration LABEL syncs the host-keyed rail, not the stale inner Primitive handle", () => {
+  const { parent, inner, innerWidget, hostInput, store, resolveSource } = makeStaleInnerRailFixture();
+
+  const set = applyWidgetWrite(parent, "duration", 12, { resolveSource });
+
+  assert.equal(store.value, 12, "the store-backed parent rail must hold the new duration");
+  assert.equal(hostInput._widget.value, 12);
+  assert.notEqual(hostInput._widget, innerWidget, "the inner Primitive must not remain the rail handle");
+  assert.equal(inner.widgets[0].value, 5, "the shared inner Primitive is not the serializing rail");
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+  assert.equal(set.promoted_from.value_scope, "instance");
+  assert.equal(set.promoted_from.subgraph_node_id, 105);
+  assert.equal(set.node_id, 105);
+});
+
+test("#366: writing value_1 (the programmatic name) also syncs that host-keyed duration rail", () => {
+  const { parent, store, resolveSource } = makeStaleInnerRailFixture();
+  const set = applyWidgetWrite(parent, "value_1", 8, { resolveSource });
+  assert.equal(store.value, 8);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#366: a promoted BOOLEAN turbo_mode rail is synced when _widget still points at the inner toggle", () => {
+  const { parent, store, resolveSource } = makeStaleInnerRailFixture({
+    innerId: 140,
+    innerType: "PrimitiveBoolean",
+    innerWidgetType: "toggle",
+    innerValue: false,
+    outerName: "value",
+    outerLabel: "turbo_mode",
+  });
+  const set = applyWidgetWrite(parent, "turbo_mode", true, { resolveSource });
+  assert.equal(store.value, true);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#366: a promoted COMBO lora_name rail is synced when _widget still points at the inner combo", () => {
+  const options = ["minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "other.safetensors"];
+  const { parent, store, resolveSource } = makeStaleInnerRailFixture({
+    innerId: 141,
+    innerType: "LoraLoader",
+    innerWidgetType: "combo",
+    innerValue: options[0],
+    outerName: "lora_name",
+    outerLabel: "lora_name",
+    comboValues: options,
+  });
+  const set = applyWidgetWrite(parent, "lora_name", options[1], { resolveSource });
+  assert.equal(store.value, options[1]);
+  assert.equal(set.promoted_from.parent_widget_synced, true);
+});
+
+test("#366: options.setValue on the parent rail is driven so the serializing store updates", () => {
+  const store = { value: 5 };
+  const inner = { id: 136, type: "PrimitiveFloat", widgets: [{ name: "value", type: "number", value: 5 }] };
+  const subgraph = { _nodes: [inner], getNodeById: (id) => (String(id) === "136" ? inner : null) };
+  const railWidget = {
+    name: "value_1",
+    label: "duration",
+    widgetId: "root:105:value_1",
+    type: "number",
+    value: 5,
+    options: {
+      setValue(next) {
+        store.value = next;
+      },
+    },
+  };
+  const parent = {
+    id: 105,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [
+      {
+        name: "value_1",
+        label: "duration",
+        widgetId: "root:105:value_1",
+        _widget: railWidget,
+        widget: { name: "value_1" },
+        _subgraphSlot: { name: "value_1", label: "duration" },
+      },
+    ],
+    widgets: [railWidget],
+  };
+  const resolveSource = (_n, si) =>
+    si?.name === "value_1" ? { sourceNodeId: "136", sourceWidgetName: "value" } : null;
+
+  applyWidgetWrite(parent, "duration", 12, { resolveSource });
+  assert.equal(railWidget.value, 12);
+  assert.equal(store.value, 12, "the serializing store must update, not only the view property");
+});
+
 test("#366×#179: a promoted COMPOSITE write merges onto the RAIL's current object — the rail's unspecified fields are NOT clobbered by the stale inner", () => {
   // Inner (non-authoritative) and rail (authoritative) hold DIVERGENT composite
   // values. A partial write {strength:0.6} must preserve the RAIL's `lora`

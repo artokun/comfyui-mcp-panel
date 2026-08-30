@@ -1357,6 +1357,66 @@ export function resolveHostPromotedWidgets(subgraphNode, hostInput) {
   return described.map((entry) => entry.widget);
 }
 
+function readHostWidgetId(hostInput) {
+  try {
+    const id = hostInput?.widgetId;
+    return typeof id === "string" && id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ComfyUI's SubgraphNode.widgets getter returns `_widget` first and never builds
+ * the host-keyed store projection while that handle still points at the INNER
+ * Primitive widget. Dropping that stale handle and re-reading widgets lets the
+ * getter materialize the rail queue compilation actually reads (#366).
+ */
+function rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
+  if (!subgraphNode || !hostInput || !innerWidget) return [];
+  if (hostInput._widget !== innerWidget) return [];
+  if (!readHostWidgetId(hostInput)) return [];
+  const saved = hostInput._widget;
+  try {
+    hostInput._widget = undefined;
+    void subgraphNode.widgets;
+  } catch {
+    hostInput._widget = saved;
+    return [];
+  }
+  const next = resolveHostPromotedWidgets(subgraphNode, hostInput).filter(
+    (widget) => widget && widget !== innerWidget,
+  );
+  if (next.length) return next;
+  hostInput._widget = saved;
+  return [];
+}
+
+function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
+  const current = resolveHostPromotedWidgets(subgraphNode, hostInput).filter(
+    (widget) => widget && widget !== innerWidget,
+  );
+  if (current.length) return current;
+  return rematerializeHostPromotedWidgets(subgraphNode, hostInput, innerWidget);
+}
+
+/** Assign a widget value and drive options.setValue when present (store-backed rails). */
+function assignWidgetValue(widget, coerced) {
+  widget.value = coerced;
+  let setValue;
+  try {
+    setValue = widget.options?.setValue;
+  } catch {
+    setValue = null;
+  }
+  if (typeof setValue !== "function") return;
+  try {
+    setValue.call(widget, coerced);
+  } catch {
+    /* verification below still decides whether the value stuck */
+  }
+}
+
 /**
  * The single AUTHORITATIVE parent rail widget for `hostInput` — the projection whose
  * value serializes at queue time (#366). This is the FIRST identity-authenticated
@@ -1525,7 +1585,9 @@ export function resolvePromotedInnerTarget(subgraphNode, widgetName, resolveSour
   // (e.g. the widget is further promoted OUTWARD to an enclosing subgraph and is
   // exposed here as an input with no settable widget); the caller FAILS CLOSED on
   // null rather than write inner-only and render silently stale.
-  const parentWidgets = resolveHostPromotedWidgets(subgraphNode, input);
+  // The inner Primitive widget is never a parent rail, even when a stale `_widget`
+  // handle still points at it and the computed widgets getter therefore lists it.
+  const parentWidgets = liveHostPromotedWidgets(subgraphNode, input, innerWidget);
   const parentWidget = parentWidgets[0] ?? null;
   return { promoted: true, target: { node: innerNode, widget: innerWidget, input, parentWidget, parentWidgets } };
 }
@@ -1872,6 +1934,28 @@ export function applyWidgetWrite(
       // a stateful dynamic source can answer differently on a second call.
       out: coerceOutcome,
     });
+
+  // The rail object captured before /object_info may be a stale inner Primitive
+  // handle. Re-read the live host projections at write time so the store-backed
+  // rail (what serializes) is the one assigned.
+  if (promotedFrom && promotedHostInput) {
+    const liveRails = liveHostPromotedWidgets(node, promotedHostInput, w);
+    if (liveRails.length) {
+      promotedParentWidget = liveRails[0];
+      promotedParentWidgets = liveRails;
+    } else if (promotedParentWidget === w) {
+      throw new WidgetWriteError(
+        `promoted widget "${widgetName}" on subgraph node ${node.id} resolves to an inner ` +
+          `widget, but its AUTHORITATIVE parent rail widget could not be identified (the value ` +
+          `that serializes at queue time). This happens when the widget is further promoted to ` +
+          `an enclosing subgraph (fed by an outer link / exposed as an input, not a settable ` +
+          `widget), the promotion metadata is malformed, or its name is duplicated. Refusing to ` +
+          `write the inner widget alone, which would silently render the OLD value (#366). Edit ` +
+          `this widget from the outermost subgraph node, or disconnect the inner input to make ` +
+          `the inner value authoritative.`,
+      );
+    }
+  }
 
   // #366: for a promoted subgraph widget the AUTHORITATIVE value lives on the
   // parent's OWN rail widget (resolved by the promotion RELATIONSHIP in
@@ -2280,14 +2364,14 @@ export function applyWidgetWrite(
       if (fastBypasserAction) {
         Reflect.apply(fastBypasserAction.toggle, valueWidget, [fastBypasserAction.requested]);
       } else {
-        w.value = coerced;
+        assignWidgetValue(w, coerced);
       }
     }
-    if (parentWidget) parentWidget.value = coerced;
+    if (parentWidget) assignWidgetValue(parentWidget, coerced);
     // #477: sync the parent-facing DISPLAY proxies too. They are VIEWS of the same
     // promoted value (no semantic callback of their own — the inner target's fires
     // once below), so we assign their value directly, same as the rail.
-    for (const dw of displayWidgets) dw.value = coerced;
+    for (const dw of displayWidgets) assignWidgetValue(dw, coerced);
     // #1268 / comfyui-mcp#1658 — drive the BOUND PROPERTY, in litegraph's own position:
     // `BaseWidget.setValue` assigns the widget, then calls `node.setProperty(...)`, then
     // fires the callback. Placed here so a programmatic write leaves the node in the SAME
