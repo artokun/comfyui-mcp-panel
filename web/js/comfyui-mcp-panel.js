@@ -644,6 +644,7 @@ import {
   POINTER_WATCH_UNAVAILABLE_NOTICE,
 } from "./lib/live-canvas-capture-gate.js";
 import { decideBoundRestart, normalizeBoundOrigin } from "./lib/bound-restart-witness.js";
+import { decideDesktopRestartRestore, resolveDesktopRestore } from "./lib/desktop-restart-restore.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
 import { settleOwnedOpenedWorkflowActive } from "./lib/settle-open-active.js";
 import { settleOpenedWorkflowReadable } from "./lib/settle-open-readable.js";
@@ -27051,6 +27052,54 @@ const GRAPH_TOOL_EXECUTORS = {
         // Queue probe failed (ComfyUI unreachable / no /queue) — fall through and
         // reboot; don't block a needed restart on a flaky probe.
       }
+    }
+    // #1999 — Desktop Manager reboot can stop the Python backend without
+    // Desktop bringing it back. A proven Electron restore (restartCore
+    // stops AND starts; restartApp / relaunchApp relaunch the app) is
+    // the recoverable path. Without one, refuse while the server is still
+    // up — a Manager POST here is a stop that nothing in this tab undoes.
+    const desktopBridge =
+      (typeof window !== "undefined" &&
+        (window.electronAPI ?? window.comfyAPI?.electron ?? window.api ?? window.__comfyDesktop2)) ||
+      null;
+    const desktopRestore = resolveDesktopRestore(desktopBridge);
+    const desktopDecision = decideDesktopRestartRestore({
+      desktopShell: isEmbeddedDesktopShell({
+        electronBridge: desktopBridge,
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
+      }),
+      restore: desktopRestore,
+    });
+    if (desktopDecision.kind === "refuse") {
+      return {
+        rebooting: false,
+        refused: true,
+        ...rebootTargetFields(),
+        error: desktopDecision.note,
+      };
+    }
+    if (desktopDecision.kind === "desktop_restore" && desktopRestore) {
+      try {
+        await desktopRestore.restore();
+      } catch (err) {
+        if (!comfyBackendIsDown()) {
+          return {
+            rebooting: false,
+            refused: true,
+            ...rebootTargetFields(),
+            error:
+              `ComfyUI Desktop ${desktopRestore.name} failed before the backend went down` +
+              (err && err.message ? `: ${err.message}` : "") +
+              ". ComfyUI was NOT restarted.",
+          };
+        }
+      }
+      return {
+        rebooting: true,
+        via: desktopRestore.name,
+        ...rebootTargetFields(),
+        note: desktopDecision.note,
+      };
     }
     // Fire the reboot. IMPORTANT: a "successful" reboot usually looks like a
     // FAILED fetch. The bundled Desktop Manager handler calls exit(0) the instant

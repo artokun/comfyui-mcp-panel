@@ -58,12 +58,13 @@ test("it is a plain function, not a method on the executors table", () => {
 
 // ── every branch, including the ones that failed ───────────────────────────
 
-test("all seven reply branches name the target", () => {
+test("all reply branches name the target", () => {
   // The failures matter most: "which server refused?" is the whole question when
   // the panel and the headless tool disagree about what they are pointing at.
   // #1913 adds the bound-identity refusal as a seventh named branch.
+  // #1999 adds the Desktop restore / refuse / restore-failed-upright branches.
   const spread = (reboot.match(/\.\.\.rebootTargetFields\(\)/g) || []).length;
-  assert.equal(spread, 7, `expected 7 branches to carry the target, found ${spread}`);
+  assert.equal(spread, 10, `expected 10 branches to carry the target, found ${spread}`);
 });
 
 test("the successful reboot says which server is going down", () => {
