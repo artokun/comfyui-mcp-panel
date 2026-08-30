@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- keep the rendered changelog artifact synchronized when a release gains a late-merged entry (#2086)
+
 ## [0.15.134] - 2026-08-30
 
 ### Fixed
