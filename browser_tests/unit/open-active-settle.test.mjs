@@ -164,7 +164,11 @@ function productionExecutor(methodName, environment) {
   return factory(scope);
 }
 
-function productionReadableOpenEnvironment({ readableAfterRetry, readableButMismatched = false }) {
+function productionReadableOpenEnvironment({
+  readableAfterRetry,
+  readableButMismatched = false,
+  mismatchOnlyFirstLoad = false,
+}) {
   const previous = { path: "workflows/previous.json" };
   const target = {
     path: "workflows/target.json",
@@ -191,11 +195,12 @@ function productionReadableOpenEnvironment({ readableAfterRetry, readableButMism
     loadGraphData: async (state) => {
       loads += 1;
       root.extra = state.extra;
+      const mismatched = readableButMismatched && (!mismatchOnlyFirstLoad || loads === 1);
       root._nodes = [
         {
           id: 1,
           type: "KSampler",
-          widgets_values: [readableButMismatched ? "stale-value" : "target-value"],
+          widgets_values: [mismatched ? "stale-value" : "target-value"],
         },
       ];
     },
@@ -412,6 +417,59 @@ test("#1898 settles a readable outline after one normalization retry", async () 
   assert.equal(settleCalls, 4, "identity is settled before retry and after the final probe");
 });
 
+test("#1898 retries when a readable outline still lacks the final content proof", async () => {
+  const target = { path: "workflows/target.json" };
+  let outlineCalls = 0;
+  let settleCalls = 0;
+  let retries = 0;
+
+  const result = await settleOpenedWorkflowReadable({
+    settleActive: async () => {
+      settleCalls += 1;
+      return { status: "settled", active: target };
+    },
+    readGraphOutline: async () => {
+      outlineCalls += 1;
+      return { node_count: 8, outline: "8 nodes", detail_level: "full" };
+    },
+    shouldRetryNormalization: () => true,
+    retryNormalization: async () => {
+      retries += 1;
+      return true;
+    },
+  });
+
+  assert.equal(result.status, "settled-readable");
+  assert.equal(result.retried, true);
+  assert.equal(retries, 1, "a readable but unproven graph gets one bounded retry");
+  assert.equal(outlineCalls, 2, "the graph is re-probed after the retry");
+  assert.equal(settleCalls, 4, "identity is settled before and after the retry, then at return");
+});
+
+test("#1898 a readable outline does not retry when the caller declines", async () => {
+  const target = { path: "workflows/target.json" };
+  let retries = 0;
+  let outlineCalls = 0;
+
+  const result = await settleOpenedWorkflowReadable({
+    settleActive: async () => ({ status: "settled", active: target }),
+    readGraphOutline: async () => {
+      outlineCalls += 1;
+      return { node_count: 8, outline: "8 nodes", detail_level: "full" };
+    },
+    shouldRetryNormalization: () => false,
+    retryNormalization: async () => {
+      retries += 1;
+      return true;
+    },
+  });
+
+  assert.equal(result.status, "settled-readable");
+  assert.equal(result.retried, false);
+  assert.equal(retries, 0, "leftover-source or already-proven content must not reload");
+  assert.equal(outlineCalls, 1, "a declined retry keeps the first readable probe");
+});
+
 test("#1898 keeps an unreadable or unproven graph outcome unknown", async () => {
   const target = { path: "workflows/target.json" };
   let retries = 0;
@@ -612,6 +670,25 @@ test("#1898 production workflow_open accepts a settled readable outline after no
   assert.equal(panel.guard(), null, "the readable outcome releases the production reload guard");
 });
 
+test("#1898 production workflow_open retries a readable graph whose content is still normalizing", async () => {
+  const { target, counters, environment } = productionReadableOpenEnvironment({
+    readableAfterRetry: false,
+    readableButMismatched: true,
+    mismatchOnlyFirstLoad: true,
+  });
+  const panel = productionExecutor("workflow_open", environment);
+
+  const result = await panel.method({ path: target.path, rid: "readable-content-race" });
+
+  assert.equal(result.opened.path, target.path);
+  assert.deepEqual(
+    counters(),
+    { loads: 2, outlines: 2, contentProofs: 2 },
+    "a readable first outline still gets one bounded content-normalization retry",
+  );
+  assert.equal(panel.guard(), null, "the recovered outcome releases the production reload guard");
+});
+
 test("#1898 production workflow_open keeps a readable but mismatched graph unknown", async () => {
   const { target, counters, environment } = productionReadableOpenEnvironment({
     readableAfterRetry: false,
@@ -622,8 +699,8 @@ test("#1898 production workflow_open keeps a readable but mismatched graph unkno
   await assert.rejects(panel.method({ path: target.path, rid: "mismatched-readable-race" }), /content could not be verified/);
   assert.deepEqual(
     counters(),
-    { loads: 1, outlines: 1, contentProofs: 2 },
-    "readability cannot replace the final normalized node/value content proof",
+    { loads: 2, outlines: 2, contentProofs: 2 },
+    "a persistent mismatch remains unknown after the one bounded normalization retry",
   );
   assert.equal(panel.guard(), null, "the unknown outcome releases the production reload guard");
 });

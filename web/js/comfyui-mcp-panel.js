@@ -22529,9 +22529,10 @@ const GRAPH_TOOL_EXECUTORS = {
                 // #1898 — a graph can still be normalizing after the store has
                 // switched identity and `loadGraphData` has resolved. If the
                 // requested identity is already proven, let a real graph_outline
-                // probe settle that race; an unreadable probe gets exactly one
+                // probe settle that race; an unreadable probe, or a readable
+                // probe whose content is still unproven, gets exactly one
                 // normalization retry. The probe remains fail-closed: identity,
-                // readability and the final active settlement must all be proven.
+                // readability and the final content proof must all be proven.
                 if (
                   verdict.status === OPEN_REBIND_STATUS.CONTENT_UNVERIFIED &&
                   // #1283/#1089/#1215 — the readable-outline recovery is only
@@ -22561,6 +22562,12 @@ const GRAPH_TOOL_EXECUTORS = {
                         endStep: () => endWorkflowReloadStep(reloadGuardToken),
                       }),
                     readGraphOutline: () => GRAPH_TOOL_EXECUTORS.graph_outline({}),
+                    // A readable outline proves only that the graph is available. If the
+                    // first full content proof is still unproven, give the same bounded
+                    // normalization retry one opportunity even when the outline was
+                    // already readable. The final content proof below remains the gate,
+                    // so a persistent or structurally different graph still refuses.
+                    shouldRetryNormalization: () => !leftoverPreviousCanvas && !contentMatches,
                     retryNormalization: async () => {
                       if (!beginWorkflowReloadStep(reloadGuardToken)) return false;
                       try {
