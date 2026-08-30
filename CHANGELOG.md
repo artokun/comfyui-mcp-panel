@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- Generated images/videos no longer have to auto-post into the chat: a new Generated media in chat setting (on by default) can keep the transcript text-only without hiding agent-visible outputs, and Video previews in chat is labeled as inline playback so it is no longer mistaken for that switch (#2034)
+
 ## [0.15.145] - 2026-08-30
 
 ### Fixed

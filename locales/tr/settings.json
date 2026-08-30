@@ -47,9 +47,13 @@
     "name": "RunPod / Yerel'i göster",
     "tooltip": "Araç çubuğunda RunPod / Yerel sunucu düğmesini gösterir — bulut GPU podu oluştur/başlat/durdur/bağlan ya da yerele geri dön. Varsayılan olarak kapalı; bu seçenek bağlı bir mobil uygulamaya da iletilir."
   },
+  "comfyui-mcp_chatMedia": {
+    "name": "Sohbette oluşturulan medya",
+    "tooltip": "Oluşturulan görselleri, videoları ve sesi sohbet kartları olarak gösterir. Kapatırsanız döküm yalnızca metin kalır; ajan çıktıları (storyboard ve tamamlanma kareleri dahil) almaya devam eder. Değişiklikten sonra oluşturulan medya için geçerlidir. Sohbetteki kartlar kalır; gizlenenler kaydedilmez ve yenilemeden sonra geri gelmez."
+  },
   "comfyui-mcp_videoPreviews": {
-    "name": "Sohbette video önizlemeleri",
-    "tooltip": "Oluşturulan videoları sohbet içinde oynat. RAM'den tasarruf etmek için kapat: video, ilk karesi ve dosya adını gösteren bir yer tutucu olarak görünür; tıklamak videonun tamamını ışık kutusunda açar. Değişiklikten sonra oluşturulan videolar için geçerlidir; sohbette zaten bulunan kartlar oynatıcılarını korur."
+    "name": "Sohbette satır içi video oynatma",
+    "tooltip": "Oluşturulan videoları sohbet içinde oynat. RAM'den tasarruf etmek için kapat: video, ilk karesi ve dosya adını gösteren bir yer tutucu olarak görünür; tıklamak videonun tamamını ışık kutusunda açar. Videoları sohbetten gizlemez — bunun için Sohbette oluşturulan medya ayarını kullanın. Değişiklikten sonra oluşturulan videolar için geçerlidir; sohbette zaten bulunan kartlar oynatıcılarını korur."
   },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Beta uygulamayı edinin",

@@ -47,9 +47,13 @@
     "name": "Afficher RunPod / Local",
     "tooltip": "Affiche le bouton d'hôte RunPod / Local dans la barre d'outils — déployer, démarrer, arrêter ou connecter un pod GPU cloud, ou revenir en local. Désactivé par défaut ; l'indicateur est aussi transmis à une appli mobile connectée."
   },
+  "comfyui-mcp_chatMedia": {
+    "name": "Médias générés dans le chat",
+    "tooltip": "Affiche les images, vidéos et audios générés sous forme de cartes dans le chat. Désactivez pour garder le fil en texte seul ; l'agent reçoit toujours les sorties (y compris storyboards et cadres de fin). S'applique aux médias générés après le changement. Les cartes déjà présentes restent ; les cartes masquées ne sont pas enregistrées et ne réapparaissent pas après un rechargement."
+  },
   "comfyui-mcp_videoPreviews": {
-    "name": "Aperçus vidéo dans le chat",
-    "tooltip": "Lire les vidéos générées directement dans le chat. Désactivez pour économiser la RAM : la vidéo apparaît alors comme un espace réservé avec sa première image et son nom de fichier, et un clic ouvre la vidéo complète dans la visionneuse. S'applique aux vidéos générées après le changement ; les cartes déjà présentes dans le chat conservent leur lecteur."
+    "name": "Lecture vidéo dans le chat",
+    "tooltip": "Lire les vidéos générées directement dans le chat. Désactivez pour économiser la RAM : la vidéo apparaît alors comme un espace réservé avec sa première image et son nom de fichier, et un clic ouvre la vidéo complète dans la visionneuse. Cela ne masque pas les vidéos du chat — utilisez Médias générés dans le chat pour cela. S'applique aux vidéos générées après le changement ; les cartes déjà présentes dans le chat conservent leur lecteur."
   },
   "comfyui-mcp_mobileAppLinks": {
     "name": "Obtenir l'appli bêta",

@@ -58,6 +58,9 @@ function productionOnExecuted() {
     "appendImageCacheBust",
     "NO_PROMPT_KEY",
     "collectNodeOutputMedia",
+    "chatMediaEnabled",
+    "getSetting",
+    "SETTING_CHAT_MEDIA",
     `return (${panelSrc.slice(start, end).trim()});`,
   )(
     (m) =>
@@ -75,6 +78,9 @@ function productionOnExecuted() {
     appendImageCacheBust,
     NO_PROMPT_KEY,
     collectNodeOutputMedia,
+    (v) => v !== false,
+    () => undefined,
+    "comfyui-mcp.chatMedia",
   );
   return { onExecuted, painted, buffered };
 }

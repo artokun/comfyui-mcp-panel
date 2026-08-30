@@ -147,6 +147,9 @@ test("#1718 production boundary: late poster results stay with their render atte
     "appendStoryboardCacheBust",
     "NO_PROMPT_KEY",
     "collectNodeOutputMedia",
+    "chatMediaEnabled",
+    "getSetting",
+    "SETTING_CHAT_MEDIA",
     `return (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()});`,
   )(
     (m) => `/view?filename=${m.filename}&type=${m.type || "output"}`,
@@ -162,6 +165,9 @@ test("#1718 production boundary: late poster results stay with their render atte
     appendStoryboardCacheBust,
     NO_PROMPT_KEY,
     collectNodeOutputMedia,
+    (v) => v !== false,
+    () => undefined,
+    "comfyui-mcp.chatMedia",
   );
 
   const painted = [];

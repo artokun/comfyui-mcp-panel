@@ -841,6 +841,7 @@ import {
   storyboardSampleTimes,
 } from "./lib/media-duration.js";
 import { videoPreviewsEnabled } from "./lib/video-previews.js";
+import { chatMediaEnabled } from "./lib/chat-media-inflow.js";
 import { readyAckCanPromoteBackend } from "./lib/pi-readiness.js";
 import { createRunReconcileSweep } from "./lib/run-reconcile-sweep.js";
 import {
@@ -5963,7 +5964,13 @@ const SETTING_FLAG_RUNPOD = "comfyui-mcp.featureFlag.runpod";
 // screen. On by default; off paints a metadata-only placeholder (first frame +
 // filename) and leaves the full decode to the lightbox. Read at PAINT time, so
 // it needs no live-apply hook — cards already in the log are untouched.
+// This is NOT the hide-cards switch; that is SETTING_CHAT_MEDIA (#2034).
 const SETTING_VIDEO_PREVIEWS = "comfyui-mcp.videoPreviews";
+// #2034 — auto-paint generated image/video/audio cards into the chat log. On
+// by default; off keeps the transcript text-only. Agent-visible inlineImages /
+// videos / storyboard / completion frames are untouched. Read per executed
+// completion so a toggle applies to the next output without a reload.
+const SETTING_CHAT_MEDIA = "comfyui-mcp.chatMedia";
 // RETIRED setting ids (mcp#884): "comfyui-mcp.sessionFollowsPanel" (legacy
 // boolean) and "comfyui-mcp.chatScope" (panel/workflow/ask combo). The
 // conversation is always panel-owned now; stored values under these ids are
@@ -6978,14 +6985,28 @@ function panelSettingsList() {
       },
     },
     {
-      id: SETTING_VIDEO_PREVIEWS,
-      name: "Video previews in chat",
-      get category() { return cat(tr("panel.general", "General"), "Video previews in chat"); },
+      id: SETTING_CHAT_MEDIA,
+      name: "Generated media in chat",
+      get category() { return cat(tr("panel.general", "General"), "Generated media in chat"); },
       sortOrder: 150,
       tooltip:
+        "Show generated images, videos, and audio as cards in the chat transcript. Turn off to keep the " +
+        "transcript text-only; the agent still receives the outputs (including storyboards and completion frames). " +
+        "Applies to media generated after the change. Cards already in the chat stay; suppressed cards are not " +
+        "saved and will not reappear after a reload.",
+      type: "boolean",
+      defaultValue: true,
+    },
+    {
+      id: SETTING_VIDEO_PREVIEWS,
+      name: "Inline video playback in chat",
+      get category() { return cat(tr("panel.general", "General"), "Inline video playback in chat"); },
+      sortOrder: 151,
+      tooltip:
         "Play generated videos inline in the chat. Turn off to save RAM: a video then appears as a placeholder with " +
-        "its first frame and filename, and clicking it opens the full video in the lightbox. Applies to videos " +
-        "generated after the change; cards already in the chat keep their player.",
+        "its first frame and filename, and clicking it opens the full video in the lightbox. This does not hide " +
+        "videos from the chat — use Generated media in chat for that. Applies to videos generated after the change; " +
+        "cards already in the chat keep their player.",
       type: "boolean",
       defaultValue: true,
     },
@@ -36539,7 +36560,7 @@ function buildPanel() {
     if (!holder.style.aspectRatio) holder.style.aspectRatio = "16 / 9";
   }
 
-  // #1280 — the placeholder a video card gets when "Video previews in chat" is
+  // #1280 — the placeholder a video card gets when inline video playback is
   // off. The element loads METADATA ONLY: no autoplay, no loop, no controls, so
   // the browser fetches the headers and the first frame and stops — the decode
   // this setting exists to avoid is never paid until the user asks for it.
@@ -41903,6 +41924,10 @@ function buildPanel() {
       const k = d.prompt_id == null ? NO_PROMPT_KEY : String(d.prompt_id);
       return k === NO_PROMPT_KEY ? null : k;
     })();
+    // #2034 — read per completion, not at mount. An unreadable store must not
+    // hide cards (`!== false`); skipping paint skips recordMedia so a suppressed
+    // card is not replayed. Agent-visible buffers below still fill.
+    const chatMediaOn = chatMediaEnabled(getSetting(SETTING_CHAT_MEDIA));
     for (const m of media) {
       if (!m || !m.filename) continue;
       const url = imageViewUrl(m);
@@ -41912,7 +41937,7 @@ function buildPanel() {
         // source decode, and late poster callback all address this render only.
         const storyboardIdentity = createStoryboardIdentity();
         const videoUrl = appendStoryboardCacheBust(url, storyboardIdentity);
-        paintVideo(videoUrl, m.filename);
+        if (chatMediaOn) paintVideo(videoUrl, m.filename);
         // Carry the node id so the deferred storyboard event can name its node,
         // plus the exact URL/identity used by the already-painted card.
         videos.push({ m, nodeId, videoUrl, storyboardIdentity });
@@ -41921,7 +41946,7 @@ function buildPanel() {
         // inlineImages: that list is delivered to the agent as inline image
         // blocks, so audio there would be both a broken picture and a claim of
         // something the agent cannot perceive (#710).
-        paintAudio(url, m.filename);
+        if (chatMediaOn) paintAudio(url, m.filename);
       } else {
         // #1834 — THE CARD's URL is the one that has to be unique, not just the
         // metadata probe's. `/view?filename=…` is stable across runs, and a
@@ -41941,7 +41966,7 @@ function buildPanel() {
         // probe could agree with — a key minted here would just make the note
         // describe a different file from the one on screen. Closing it needs a
         // per-run identity threaded through the tracker's buffer and flush.
-        paintImage(appendImageCacheBust(url, runCacheKey), m.filename);
+        if (chatMediaOn) paintImage(appendImageCacheBust(url, runCacheKey), m.filename);
         inlineImages.push(m);
       }
     }
