@@ -539,11 +539,23 @@ async function runSetWidgetBody(
     // unit tests inject a flush that reproduces the later empty overwrite.
     awaitFrontendWidgetFlush: awaitFrontendWidgetFlushInjected,
     [ACK_STATE]: ackState,
+    clear,
   } = {},
 ) {
   const assertNotAbandoned = () => {
     if (ackState?.abandoned) throw widgetWriteOutcomeUnknownError();
   };
+  if (clear !== undefined && clear !== true && clear !== false) {
+    throw new Error("panel_set_widget clear must be a boolean");
+  }
+  if (clear === true) {
+    if (value !== undefined && value !== null && value !== "") {
+      throw new Error(
+        `panel_set_widget cannot combine clear:true with a non-empty value on widget "${widgetName}"`,
+      );
+    }
+    value = "";
+  }
 
   // Never re-derived, and never cached: the oracle may not have run yet when this closure is
   // built, and a caller that answers differently per call is answering about a different

@@ -161,3 +161,38 @@ test("a valid value on the FIRST try does not call refresh at all", async () => 
   assert.equal(res.refreshed, undefined);
   assert.equal(refreshCalls, 0);
 });
+
+test("#2010: already-empty combo + clear:true is a no-op success without refreshing", async () => {
+  const files = ["clip_a.mp4", "clip_b.webm", "clip_c.mp4", "clip_d.mov"];
+  const widget = { name: "video", type: "combo", options: { values: files }, value: "" };
+  const node = { id: 165, type: "VHS_LoadVideo", widgets: [widget] };
+  let refreshCalls = 0;
+  const res = await runSetWidget(node, "video", undefined, {
+    registry: { VHS_LoadVideo: {} },
+    getFreshObjectInfo: async () => ({ VHS_LoadVideo: {} }),
+    clear: true,
+    refreshCombos: async () => {
+      refreshCalls += 1;
+    },
+  });
+  assert.equal(res.set.value, "");
+  assert.equal(widget.value, "");
+  assert.equal(res.refreshed, undefined);
+  assert.equal(refreshCalls, 0, "already-empty clear must not enter stale-combo recovery");
+});
+
+test("#2010: clear:true on a populated combo still refuses when \"\" is not an option", async () => {
+  const files = ["clip_a.mp4", "clip_b.webm", "clip_c.mp4", "clip_d.mov"];
+  const widget = { name: "video", type: "combo", options: { values: files }, value: files[0] };
+  const node = { id: 174, type: "VHS_LoadVideo", widgets: [widget] };
+  await assert.rejects(
+    () =>
+      runSetWidget(node, "video", undefined, {
+        registry: { VHS_LoadVideo: {} },
+        getFreshObjectInfo: async () => ({ VHS_LoadVideo: {} }),
+        clear: true,
+      }),
+    (err) => err instanceof Error && /not a valid option/.test(err.message),
+  );
+  assert.equal(widget.value, files[0], "must not mutate on refuse");
+});
