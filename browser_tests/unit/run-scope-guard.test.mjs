@@ -333,6 +333,36 @@ test("#248 a non-Error with a spoofed Error toStringTag keeps its identity and m
   }
 });
 
+test("#248 a finite dynamic toStringTag Proxy keeps non-Error identity and message", async () => {
+  const thrown = new Proxy(
+    {},
+    {
+      get(target, property, receiver) {
+        if (property === Symbol.toStringTag) return "Error";
+        if (property === "message") return "structured dynamic proxy queue failure";
+        if (property === "stack") return "structured dynamic proxy stack";
+        return Reflect.get(target, property, receiver);
+      },
+    },
+  );
+  for (const queuePrompt of [
+    () => {
+      throw thrown;
+    },
+    () => Promise.reject(thrown),
+  ]) {
+    await assert.rejects(
+      () => invokeQueuePromptWithBrowserStack({ queuePrompt }),
+      (received) => {
+        assert.equal(received, thrown);
+        assert.equal(received.message, "structured dynamic proxy queue failure");
+        assert.equal(received.stack, "structured dynamic proxy stack");
+        return true;
+      },
+    );
+  }
+});
+
 test("#248 hostile or non-string stacks cannot mask the original queue failure", async () => {
   for (const stack of [Symbol("hostile stack"), { toString: () => { throw new Error("coercion"); } }]) {
     const error = new TypeError("Cannot convert undefined or null to object");

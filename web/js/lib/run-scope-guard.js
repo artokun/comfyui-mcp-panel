@@ -49,6 +49,7 @@ const objectToString = Object.prototype.toString;
 const hasOwn = Object.prototype.hasOwnProperty;
 const getPrototypeOf = Object.getPrototypeOf;
 const toStringTag = Symbol.toStringTag;
+const stackProperty = "stack";
 const BROWSER_ERROR_PROTO_MAX = 32;
 
 // `instanceof Error` rejects an Error created by the browser realm when this
@@ -78,7 +79,16 @@ function isBrowserError(value) {
       if (hasOwn.call(prototype, toStringTag)) return false;
       prototype = getPrototypeOf(prototype);
     }
-    return prototype === null;
+    if (prototype !== null) return false;
+
+    // JavaScript has no standard Proxy detector, and a Proxy can synthesize
+    // Symbol.toStringTag dynamically without exposing that tag through its
+    // own/prototype descriptors. Native browser Error instances do expose an
+    // own stack slot, including the cross-realm Errors this classifier exists
+    // to support. Requiring that independent witness keeps a finite tag-only
+    // Proxy fail-closed instead of replacing the thrown value and losing its
+    // identity/message surface.
+    return hasOwn.call(value, stackProperty);
   } catch {
     return false;
   }
