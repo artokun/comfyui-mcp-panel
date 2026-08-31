@@ -207,11 +207,15 @@ export function collectNodeOutputMedia(out) {
   const types = [];
   let count = 0;
   for (const [key, bag] of Object.entries(out)) {
-    // `3d` and `result` are skipped for the same reason `audio` is: they are
-    // harvested above onto their own channel, so counting them here would report
-    // one output twice. Belt-and-braces — neither matches MEDIA_KEY_SUFFIX today.
-    if (STANDARD_MEDIA_KEY_SET.has(key) || key === AUDIO_MEDIA_KEY) continue;
-    if (key === MODEL_3D_MEDIA_KEY || key === MODEL_3D_RESULT_KEY) continue;
+    // Every key harvested above onto its own channel, so a single output cannot be
+    // reported once as content and again as withheld. Only the standard three can
+    // actually reach this test today — `audio`, `3d` and `result` do not match
+    // MEDIA_KEY_SUFFIX — so those three are a guard against a future widening of
+    // that regex, not live filtering.
+    if (STANDARD_MEDIA_KEY_SET.has(key)) continue;
+    if (key === AUDIO_MEDIA_KEY || key === MODEL_3D_MEDIA_KEY || key === MODEL_3D_RESULT_KEY) {
+      continue;
+    }
     if (!Array.isArray(bag) || !MEDIA_KEY_SUFFIX.test(key)) continue;
     let keyCount = 0;
     for (const m of bag) {
