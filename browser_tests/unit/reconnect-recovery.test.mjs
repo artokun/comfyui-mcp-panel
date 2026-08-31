@@ -708,20 +708,36 @@ test("#618 regression: the binding verdict still receives the #433 settle window
 test("#646 wiring: the async write boundary re-checks the gate (a dispatch can span a backend drop)", () => {
   const start = SRC.indexOf("function revalidateGraphMutationContext(");
   assert.notEqual(start, -1);
-  const body = SRC.slice(start, start + 1400);
+  // The WHOLE function, not a fixed byte window. A `start + N` slice silently
+  // stops asserting the moment a comment pushes a needle past N: `indexOf`
+  // returns -1, and -1 compares LESS THAN every real offset, so an ordering
+  // assertion written this way flips from "proven" to "vacuously true" (or, as
+  // in #2125, fails for a reason that has nothing to do with the ordering).
+  // Slice to the function's own end and require each needle to actually exist.
+  const end = SRC.indexOf("\n}", SRC.indexOf("  return current;", start));
+  assert.ok(end > start, "revalidateGraphMutationContext must still end by returning the context");
+  const body = SRC.slice(start, end);
   assert.match(
     body,
     /graphMutationReconnectGate\(\{[\s\S]*?backendDown: comfyBackendIsDown\(\),[\s\S]*?bindingSettleWindow: postReconnectBindingSettleWindow\(\)/,
     "the pre-write revalidation consults the same live signals",
   );
+  const at = (needle) => {
+    const i = body.indexOf(needle);
+    assert.notEqual(i, -1, `${needle} must be present in revalidateGraphMutationContext`);
+    return i;
+  };
   assert.ok(
-    body.indexOf("graphMutationReconnectGate({") < body.indexOf("getGraphCtx()"),
+    at("graphMutationReconnectGate({") < at("getGraphCtx()"),
     "the gate fires BEFORE getGraphCtx — the probe can change the canvas (the rebind heal), which would falsify 'nothing changed' (codex r7)",
   );
   assert.ok(
-    body.indexOf("graphMutationReconnectGate({") < body.indexOf("assertGraphBoundToActiveWorkflow("),
+    at("graphMutationReconnectGate({") < at("assertGraphBoundToActiveWorkflow("),
     "the gate fires BEFORE the write-boundary binding assert",
   );
+  // #2125 — the workflow probe is part of the "nothing changed" evidence, so it
+  // must be read AFTER the canvas-changing getGraphCtx, exactly as the capture does.
+  assert.ok(at("getGraphCtx()") < at("probeActiveWorkflow()"), "the workflow probe follows getGraphCtx");
 });
 
 test("#1325 wiring: a null status only arms the flag when the live socket is not OPEN", () => {

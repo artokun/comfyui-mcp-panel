@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_add_node no longer refuses with "the active workflow or graph view changed" on a frontend that exposes no active workflow: absent-at-both-ends is unchanged, not a tab switch, so the mutation runs on the same canvas the reads already succeeded on (#2125)
+
 ## [0.15.149] - 2026-08-30
 
 ### Fixed
