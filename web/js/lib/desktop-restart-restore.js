@@ -46,6 +46,61 @@ export function resolveDesktopRestore(bridge) {
 }
 
 /**
+ * The first proven restore across EVERY candidate bridge, preferring by function
+ * (`restartCore` before a whole-app relaunch) rather than by which global happened
+ * to be defined first.
+ *
+ * #2134 — the caller picked its bridge with `a ?? b ?? c` and probed only that one.
+ * `??` stops at the first non-nullish global, so a bridge that exists but carries no
+ * restore function masked a later one that did, and the guard reported "no Desktop
+ * relaunch path is available" without having looked at the rest.
+ *
+ * @param {unknown[]} bridges
+ * @returns {{ name: string, restore: () => unknown } | null}
+ */
+export function resolveDesktopRestoreFrom(bridges) {
+  const list = Array.isArray(bridges) ? bridges : [bridges];
+  for (const name of DESKTOP_RESTORE_FNS) {
+    for (const bridge of list) {
+      const resolved = resolveDesktopRestore(bridge);
+      if (resolved && resolved.name === name) return resolved;
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether a ComfyUI Desktop app supervises THIS backend — the only question that
+ * makes a Manager stop unrecoverable.
+ *
+ * #2134 — this guard reused `isEmbeddedDesktopShell`, which is
+ * `Boolean(bridge) || /Electron\//.test(userAgent)`. That helper answers a question
+ * about the BROWSER ("is this an Electron webview, which ships no speech service?")
+ * and its UA arm is right for that. This is a question about the SERVER, and a UA
+ * token cannot answer it: any Electron-embedded browser pointed at an ordinary
+ * ComfyUI carries `Electron/` while nothing supervises the backend. There the guard
+ * refused a Manager reboot that would have worked, and told the user "this is a
+ * ComfyUI Desktop instance" — which was not true, and left them with no way to load
+ * the nodes they had just installed.
+ *
+ * The injected bridge is the only positive evidence, and it is what ComfyUI's own
+ * frontend uses (`src/utils/envUtil.ts` is `window.electronAPI`, and the shipped
+ * 1.49.6 bundle never sniffs the UA for `Electron/` anywhere). A page with no bridge
+ * is indistinguishable from an ordinary browser tab, which is the case Manager
+ * reboot has always handled correctly.
+ *
+ * This cannot regress #1999: every page that previously had a bridge still takes the
+ * restore-or-refuse path unchanged. Only the bridge-less UA-only case changes.
+ *
+ * @param {unknown[]} bridges
+ * @returns {boolean}
+ */
+export function isDesktopSupervisedShell(bridges) {
+  const list = Array.isArray(bridges) ? bridges : [bridges];
+  return list.some((bridge) => Boolean(bridge));
+}
+
+/**
  * @param {{
  *   desktopShell?: boolean,
  *   restore?: { name?: unknown, restore?: unknown } | null,

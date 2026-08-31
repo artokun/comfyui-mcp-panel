@@ -658,7 +658,11 @@ import {
   POINTER_WATCH_UNAVAILABLE_NOTICE,
 } from "./lib/live-canvas-capture-gate.js";
 import { decideBoundRestart, normalizeBoundOrigin } from "./lib/bound-restart-witness.js";
-import { decideDesktopRestartRestore, resolveDesktopRestore } from "./lib/desktop-restart-restore.js";
+import {
+  decideDesktopRestartRestore,
+  isDesktopSupervisedShell,
+  resolveDesktopRestoreFrom,
+} from "./lib/desktop-restart-restore.js";
 import { settleOpenedWorkflowTarget } from "./lib/settle-open-target.js";
 import {
   appliedTmpOpenShouldFailClosed,
@@ -27398,16 +27402,18 @@ const GRAPH_TOOL_EXECUTORS = {
     // stops AND starts; restartApp / relaunchApp relaunch the app) is
     // the recoverable path. Without one, refuse while the server is still
     // up — a Manager POST here is a stop that nothing in this tab undoes.
-    const desktopBridge =
-      (typeof window !== "undefined" &&
-        (window.electronAPI ?? window.comfyAPI?.electron ?? window.api ?? window.__comfyDesktop2)) ||
-      null;
-    const desktopRestore = resolveDesktopRestore(desktopBridge);
+    // #2134 — every candidate bridge is probed, and Desktop is proven by a bridge
+    // rather than by an `Electron/` User-Agent. `??` used to stop at the first
+    // non-nullish global, and the UA arm called any Electron-embedded browser a
+    // Desktop instance, so an ordinary ComfyUI viewed through one was refused a
+    // reboot that would have worked. See isDesktopSupervisedShell.
+    const desktopBridges =
+      typeof window !== "undefined"
+        ? [window.electronAPI, window.comfyAPI?.electron, window.api, window.__comfyDesktop2]
+        : [];
+    const desktopRestore = resolveDesktopRestoreFrom(desktopBridges);
     const desktopDecision = decideDesktopRestartRestore({
-      desktopShell: isEmbeddedDesktopShell({
-        electronBridge: desktopBridge,
-        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
-      }),
+      desktopShell: isDesktopSupervisedShell(desktopBridges),
       restore: desktopRestore,
     });
     if (desktopDecision.kind === "refuse") {
