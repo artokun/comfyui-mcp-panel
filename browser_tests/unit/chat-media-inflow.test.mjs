@@ -11,6 +11,13 @@
 //     these tests instantiate the production handler and assert what the
 //     painters actually receive. Skipping paint skips recordMedia (the painters
 //     record as they paint). Agent-visible inlineImages/videos still buffer.
+//
+// #2126 UPDATED the audio half of both gate tests. They used to assert the
+// tracker was not called AT ALL for audio, as a proxy for "audio never joins the
+// agent's inline-image delivery". The tracker IS called now — audio rides its own
+// channel so the completion frame can name it — so the proxy is replaced by the
+// invariant it stood for: `output.images` stays EMPTY. Loosened nothing; the
+// #710 rule is asserted directly instead of through a call count.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -197,7 +204,13 @@ test("#2034: explicit false skips image/video/audio cards but still buffers agen
     },
   });
   assert.equal(audio.painted.audio.length, 0, "the audio card must not land in the transcript");
-  assert.equal(audio.buffered.length, 0, "audio still does not join the agent's inline-image delivery");
+  assert.equal(audio.buffered.length, 1, "the agent is still told the run produced audio (#2126)");
+  assert.deepEqual(
+    audio.buffered[0].output.images,
+    [],
+    "audio still does not join the agent's inline-image delivery",
+  );
+  assert.equal(audio.buffered[0].output.audio[0].filename, "line.wav");
 });
 
 test("#2034: default ON still paints every kind", () => {
@@ -218,7 +231,12 @@ test("#2034: default ON still paints every kind", () => {
     detail: { prompt_id: "aud", output: { images: [{ filename: "line.wav", type: "output" }] } },
   });
   assert.equal(audio.painted.audio.length, 1);
-  assert.equal(audio.buffered.length, 0);
+  assert.equal(audio.buffered.length, 1, "#2126 — the agent is told the run produced audio");
+  assert.deepEqual(
+    audio.buffered[0].output.images,
+    [],
+    "audio still does not join the agent's inline-image delivery",
+  );
 });
 
 test("#2034: replay of already-recorded cards is not gated — only new executed paints are", () => {
