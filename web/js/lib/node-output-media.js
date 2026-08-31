@@ -144,7 +144,14 @@ function model3dRefFromResultEntry(entry) {
   if (dot <= 0) return null;
   if (!MODEL_3D_EXTENSIONS.has(filename.slice(dot + 1).toLowerCase())) return null;
   if (!SAVED_3D_FILENAME.test(filename)) return null;
-  return { filename, subfolder: segments.join("/"), type: "output" };
+  // `typeInferred` marks this ref as one whose ROOT was reasoned about rather than read.
+  // The note uses it to decide what fetch advice it is entitled to give: a `3d`-key
+  // descriptor states its own `type`, so get_image arguments built from it are facts;
+  // these are a conclusion, and a `Preview3D` passthrough of an input-rooted path is the
+  // shape the conclusion is wrong for. Spelling out arguments that embed the guess could
+  // silently fetch a DIFFERENT, same-named file under output/, so those refs are pointed
+  // at the run's history entry — which carries the reference verbatim — instead.
+  return { filename, subfolder: segments.join("/"), type: "output", typeInferred: true };
 }
 
 /**
@@ -483,16 +490,24 @@ export function formatModel3dMediaNote({
       ? `get_history for prompt ${promptId}`
       : "get_history";
   const restClause = rest > 0 ? ` The rest are listed in ${promptClause}.` : "";
-  // The ref's `type` is inferred, not observed — see model3dRefFromResultEntry. Rather
-  // than present the arguments as certain, name the root they assume and give the one
-  // retry that covers the shape they are wrong for. A 404 the agent can recover from is
-  // a different thing from a completion that quietly points at nothing.
-  const fetchClause =
-    ` To get ${count === 1 ? "the file itself" : "the first of them"}, call get_image with ` +
-    `${getImageRefClause(shown[0])} — a 3D model is SAVED TO DISK rather than returned to you ` +
-    `inline, so what you get is a path a local tool can open. Those arguments assume ComfyUI's ` +
-    `output directory; if the fetch misses, this node previewed a file it did not itself write, ` +
-    `so retry with type "input".`;
+  // The advice each ref is ENTITLED to give, decided by the evidence it carries.
+  //
+  // A `3d`-key descriptor (SaveGLB) states its own `type`, so get_image arguments built
+  // from it are facts. A `result`-derived ref's root was concluded, not read, and the
+  // shape that conclusion is wrong for — a `Preview3D` passthrough of an input-rooted
+  // path — would not merely 404: a same-named file under output/ would be fetched
+  // INSTEAD, silently handing over the wrong mesh. So those are pointed at the run's
+  // history entry, which carries ComfyUI's own reference verbatim, and no guessed
+  // argument list is put in the agent's hands at all.
+  const inferred = files.some((m) => m && m.typeInferred);
+  const fetchClause = inferred
+    ? ` A 3D model is SAVED TO DISK rather than returned to you inline, so what you can get is a ` +
+      `path a local tool can open. Read the exact file reference from ${promptClause} and fetch ` +
+      `it with get_image — do not assume the directory from the name above, because a node that ` +
+      `only PREVIEWED a model reports it the same way one that saved it does.`
+    : ` To get ${count === 1 ? "the file itself" : "the first of them"}, call get_image with ` +
+      `${getImageRefClause(shown[0])} — a 3D model is SAVED TO DISK rather than returned to you ` +
+      `inline, so what you get is a path a local tool can open.`;
   const tail = attached
     ? ""
     : ` This IS the completion you were told to wait for — nothing further is coming, so do not ` +

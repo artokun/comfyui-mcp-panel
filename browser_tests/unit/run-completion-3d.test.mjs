@@ -99,6 +99,9 @@ test("#2128 collectNodeOutputMedia reads Save3DAdvanced's bare result path", () 
     filename: "PROP_crate_00001.glb",
     subfolder: "3D",
     type: "output",
+    // The root was concluded from the naming, not read off the bag — so the ref says so,
+    // and the note downgrades its fetch advice accordingly.
+    typeInferred: true,
   });
   assert.deepEqual(got.deliverable, [], "a mesh must never join the inline-image harvest");
   assert.deepEqual(got.audio, [], "nor the audio channel");
@@ -417,9 +420,12 @@ test("#2128 THE REPORTED FRAME — previews plus a .glb no longer claims nothing
     frame.images.every((m) => !String(m.filename).endsWith(".glb")),
     "the mesh must never ride the frame as an inline image block (#710)",
   );
-  // And it points at the file with arguments that actually address it.
-  assert.match(frame.note, /get_image with filename "PROP_crate_00001\.glb"/);
-  assert.match(frame.note, /subfolder "3D"/);
+  // And it points at a reference that actually addresses the file. For a `result`-derived
+  // ref that is the run's history entry, NOT a spelled-out argument list: the root was
+  // concluded from the naming, and a same-named file under output/ would otherwise be
+  // fetched instead of the one this run produced.
+  assert.match(frame.note, /Read the exact file reference from get_history for prompt/);
+  assert.doesNotMatch(frame.note, /get_image with filename/);
 });
 
 test("#2128 a 3D-only run is not reported as producing nothing", async () => {
@@ -562,18 +568,34 @@ test("#2128 the 3D note names a bounded number of files and points at get_histor
   assert.equal(formatModel3dMediaNote({ models3d: [] }), null);
 });
 
-test("#2128 the fetch advice names the root it assumes, and the retry", () => {
-  // Codex merge-gate P1, round 3. A `result` ref's `type` is INFERRED (every node that
-  // produces the save-counter naming writes to output/), not read off the bag — and a
-  // `Preview3D` passthrough of an input-rooted path is the shape that inference is
-  // wrong for. Presenting the get_image arguments as certain would make the completion
-  // point at nothing; naming the assumed root plus the one retry keeps it recoverable.
-  const note = formatModel3dMediaNote({
-    models3d: [{ filename: "PROP_crate_00001.glb", subfolder: "3D", type: "output" }],
+test("#2128 fetch advice matches the evidence the ref carries", () => {
+  // Codex merge-gate P1, rounds 3 and 4 — the same inference, restated. A `result` ref's
+  // root is CONCLUDED from ComfyUI's save naming; a `3d`-key descriptor STATES its type.
+  // The shape the conclusion is wrong for — a `Preview3D` passthrough of an input-rooted
+  // path — would not merely 404: a same-named file under output/ gets fetched instead,
+  // silently handing over the wrong mesh. So each ref only gets the advice it has earned.
+  const inferredNote = formatModel3dMediaNote({
+    models3d: [
+      { filename: "PROP_crate_00001.glb", subfolder: "3D", type: "output", typeInferred: true },
+    ],
     promptId: "p1",
   });
-  assert.match(note, /assume ComfyUI's output directory/);
-  assert.match(note, /retry with type "input"/);
+  assert.match(inferredNote, /Read the exact file reference from get_history for prompt p1/);
+  assert.match(inferredNote, /do not assume the directory from the name above/);
+  assert.doesNotMatch(
+    inferredNote,
+    /get_image with filename/,
+    "a guessed root must never be handed over as a literal argument list",
+  );
+
+  // A SaveGLB descriptor said what it is, so the arguments are facts and are spelled out.
+  const observedNote = formatModel3dMediaNote({
+    models3d: [{ filename: "ComfyUI_00001_.glb", subfolder: "3d", type: "output" }],
+    promptId: "p2",
+  });
+  assert.match(observedNote, /get_image with filename "ComfyUI_00001_\.glb"/);
+  assert.match(observedNote, /subfolder "3d"/);
+  assert.doesNotMatch(observedNote, /do not assume the directory/);
 });
 
 // ---------------------------------------------------------------------------
