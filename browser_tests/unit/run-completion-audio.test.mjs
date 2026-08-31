@@ -438,3 +438,115 @@ test("#2126 the frame that reaches the transport names the audio", async () => {
   assert.doesNotMatch(sent[0].note, /no output node produced one/);
   assert.deepEqual(sent[0].images, []);
 });
+
+// ---------------------------------------------------------------------------
+// 7. Two states the codex merge gate found on the first round of this change.
+//
+// Both are the SAME defect the issue reports, re-entered through a lifecycle path
+// the first fix did not cover. Both were reproduced by execution before being
+// fixed; the first was confirmed by the gate independently.
+// ---------------------------------------------------------------------------
+
+function makeTimerTracker(onFlush = () => {}) {
+  const timers = new Set();
+  const clock = { t: 1_000_000 };
+  const tracker = createRunCompletionTracker({
+    onFlush,
+    now: () => clock.t,
+    setTimer: (fn, ms) => {
+      const t = { fn, ms };
+      timers.add(t);
+      return t;
+    },
+    clearTimer: (t) => timers.delete(t),
+  });
+  tracker._fireTimers = (ms) => {
+    for (const t of [...timers]) {
+      if (t.ms !== ms) continue;
+      timers.delete(t);
+      t.fn();
+    }
+  };
+  return tracker;
+}
+
+test("#2126 queue-idle before execution_success must not destroy the audio refs", () => {
+  // The run's `execution_start` and `executing(node)` frames were dropped, so the
+  // prompt is not `active` and onExecutingNull sweeps it. flush() of an
+  // images/videos-empty batch emits nothing and DELETES the buffer, which is where
+  // onExecutionSuccess reads the audio from — so the agent got `noMedia` and the
+  // "no output node produced one" report for a run that wrote a .flac.
+  const h = makeTracker();
+  const P = "prompt-queue-idle";
+  h.tracker.onQueued(P);
+  h.tracker.onExecuted(P, { audio: SAVE_AUDIO_OUTPUT.audio });
+  h.tracker.onExecutingNull();
+  h.tracker.onExecutionSuccess(P);
+
+  assert.equal(h.flushes.length, 1);
+  assert.equal(h.flushes[0].audio?.length, 1, "the refs must survive a queue-idle sweep");
+  assert.equal(h.flushes[0].audio[0].filename, "ComfyUI_00007_.flac");
+});
+
+test("#2126 queue-idle still flushes a buffer that HAS something to attach", () => {
+  // The guard must not disarm the sweep it narrows: a still/video batch stranded by
+  // a missed end signal is exactly what onExecutingNull exists to deliver.
+  const h = makeTracker();
+  const P = "prompt-stranded-still";
+  h.tracker.onQueued(P);
+  h.tracker.onExecuted(P, { images: [{ filename: "stranded.png", type: "output" }] });
+  h.tracker.onExecutingNull();
+  assert.equal(h.flushes.length, 1, "an image batch is still salvaged at queue idle");
+  assert.equal(h.flushes[0].images[0].filename, "stranded.png");
+});
+
+test("#2126 a held completion's persistence round-trip keeps the audio", async () => {
+  // A panel_run whose /prompt response is delayed past the dispatch hold has its
+  // batch RETAINED for replay. Persisting that record without `audio` restores the
+  // image and silently loses the file the same run produced.
+  const first = makeTimerTracker(() => {});
+  const dispatchToken = first.beginPanelRun();
+  const P = "P-held-audio";
+  first.onExecutionStart(P);
+  first.onExecuted(P, {
+    images: [{ filename: "held.png", type: "output" }],
+    audio: SAVE_AUDIO_OUTPUT.audio,
+  });
+  first.onExecutionSuccess(P);
+  first._fireTimers(30000);
+
+  const state = first.terminalCompletionMetadata();
+  assert.equal(state.length, 1);
+  assert.equal(state[0].payload.audio?.length, 1, "the snapshot must carry the audio");
+  first.dispose();
+
+  const replayed = [];
+  const fresh = makeTimerTracker((payload) => replayed.push(payload));
+  assert.equal(fresh.restoreTerminalCompletion(state[0]), true);
+  fresh.onQueued(P, { routeId: "r", sessionId: "s", dispatchToken });
+  assert.equal(replayed.length, 1, "the delayed prompt binds and replays after restart");
+  assert.equal(replayed[0].images[0].filename, "held.png");
+  assert.equal(replayed[0].audio?.length, 1, "and the replay still names the audio");
+});
+
+test("#2126 a persisted record from a build without audio restores unchanged", () => {
+  // No `audio` key must stay no `audio` key — not an empty array the composer then
+  // has to reason about.
+  const fresh = makeTimerTracker();
+  assert.equal(
+    fresh.restoreTerminalCompletion({
+      promptId: "P-legacy",
+      payload: {
+        promptId: "P-legacy",
+        images: [{ filename: "legacy.png", type: "output" }],
+        videos: [],
+        durationMs: 0,
+        finishedAt: 1_000_000,
+      },
+      unkeyedFlushed: true,
+    }),
+    true,
+  );
+  const restored = fresh.terminalCompletionMetadata()[0].payload;
+  assert.equal("audio" in restored, false, "no audio key is invented on restore");
+});

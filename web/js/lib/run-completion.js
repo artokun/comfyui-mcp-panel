@@ -621,6 +621,12 @@ export function createRunCompletionTracker({
         promptId,
         images: Array.isArray(payload?.images) ? [...payload.images] : [],
         videos: Array.isArray(payload?.videos) ? [...payload.videos] : [],
+        // #2126 (codex gate P1) — a held completion is replayed to the agent after a
+        // reload, so dropping the audio here restores the images and silently loses
+        // the file the run also produced. The frame would then name outputs it did
+        // attach and none of the one it could not, which is the same half-truth the
+        // rest of this change removes.
+        ...(payload?.audio?.length ? { audio: [...payload.audio] } : {}),
         durationMs: Number.isFinite(payload?.durationMs) ? payload.durationMs : null,
         finishedAt: Number.isFinite(payload?.finishedAt) ? payload.finishedAt : null,
         ...(typeof payload?.duplicateOf === "string" ? { duplicateOf: payload.duplicateOf } : {}),
@@ -1313,7 +1319,23 @@ export function createRunCompletionTracker({
      */
     onExecutingNull() {
       for (const k of [...buffers.keys()]) {
-        if (!active.has(k)) flush(k);
+        // #2126 (codex gate P1) — only a buffer with something to ATTACH has
+        // anything to salvage here. flush() of an images/videos-empty batch cannot
+        // emit; all it does is DELETE the buffer, taking the audio/withheld refs
+        // that onExecutionSuccess reads off it for the completion frame. Queue-idle
+        // routinely arrives before execution_success for a run whose start and
+        // `executing(node)` frames were dropped, and destroying the refs there
+        // re-creates the reported defect exactly: a run that produced a file,
+        // reported to the agent as producing none. Reproduced by execution before
+        // this guard existed — onQueued/onExecuted(audio)/onExecutingNull/
+        // onExecutionSuccess flushed `{audio: null, noMedia: true}`.
+        //
+        // Retention is bounded: onExecuted put the key in `pending`, so reconcile
+        // or the give-up eviction deletes the buffer if no terminal signal ever
+        // comes, the next run's sequential flush in onExecutionStart clears it (and
+        // there the refs ARE recoverable — that run reconciles from /history), and
+        // execution_success itself deletes it via flush()'s empty-batch path.
+        if (!active.has(k) && hasBufferedMedia(k)) flush(k);
       }
     },
 
@@ -1574,6 +1596,12 @@ export function createRunCompletionTracker({
         promptId: k,
         images: Array.isArray(payload.images) ? [...payload.images] : [],
         videos: Array.isArray(payload.videos) ? [...payload.videos] : [],
+        // #2126 — restored only when it is genuinely an array of refs; a persisted
+        // record from an older build simply has no `audio` key, and must not become
+        // an `audio: []` the composer then reasons about.
+        ...(Array.isArray(payload.audio) && payload.audio.length
+          ? { audio: [...payload.audio] }
+          : {}),
         durationMs: Number.isFinite(payload.durationMs) ? payload.durationMs : null,
         finishedAt: Number.isFinite(payload.finishedAt) ? payload.finishedAt : null,
         ...(typeof payload.duplicateOf === "string" ? { duplicateOf: payload.duplicateOf } : {}),
