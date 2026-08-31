@@ -42022,8 +42022,13 @@ function buildPanel() {
     // video isn't shown as a broken <img>. CompareFrames (and similar) write
     // `a_images` / `b_images` instead — those are counted as withheld, never
     // attached, so a 768-temp dump cannot flood the completion frame (#1934).
-    const { deliverable: media, audio: audioBag, withheld } = collectNodeOutputMedia(out);
-    if (!media.length && !audioBag.length && !withheld) return;
+    const {
+      deliverable: media,
+      audio: audioBag,
+      models3d: model3dBag,
+      withheld,
+    } = collectNodeOutputMedia(out);
+    if (!media.length && !audioBag.length && !model3dBag.length && !withheld) return;
     const nodeId = d.node ?? d.display_node ?? null;
     // Viewable images (incl. animated gifs) go inline to the agent as-is. Video
     // refs are EXCLUDED here — the agent can't decode them — and instead get a
@@ -42117,11 +42122,20 @@ function buildPanel() {
     // deferred+grouped. Routing videos through the SAME lifecycle (rather than a
     // per-node timer) is what gives a video its real start→finish duration and
     // guarantees exactly one completion per prompt (#269/#468).
-    if (inlineImages.length || videos.length || audios.length || withheld) {
+    // #2128 — ComfyUI's 3D outputs. SaveGLB reports `{3d:[{filename,subfolder,type}]}`;
+    // Save3DAdvanced / SaveGaussianSplat / SavePointCloud / Preview3D* report a bare
+    // path string inside `{result:[...]}`. collectNodeOutputMedia has already
+    // normalised both to `/view` descriptors. Nothing is painted: a mesh has no chat
+    // widget here, and it must never reach paintImage — that is #710 on a fourth
+    // surface. The agent is told about it by NAME on the completion frame, which is
+    // the half that was missing.
+    const models3d = model3dBag.filter((m) => m && m.filename);
+    if (inlineImages.length || videos.length || audios.length || models3d.length || withheld) {
       runCompletion.onExecuted(d.prompt_id, {
         images: inlineImages,
         videos,
         audio: audios,
+        models3d,
         withheld,
       });
     }
