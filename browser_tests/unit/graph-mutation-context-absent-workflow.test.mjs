@@ -36,8 +36,18 @@ const APP = {};
 const ROOT_GRAPH = { _nodes: [] };
 const CANVAS = {};
 
+// `workflowReadable: true` = the probe RAN and found no active workflow. A context
+// that omits it (or sets it false) is an UNREADABLE probe and must stay refused.
 function ctx(overrides = {}) {
-  return { app: APP, graph: ROOT_GRAPH, rootGraph: ROOT_GRAPH, canvas: CANVAS, workflow: null, ...overrides };
+  return {
+    app: APP,
+    graph: ROOT_GRAPH,
+    rootGraph: ROOT_GRAPH,
+    canvas: CANVAS,
+    workflow: null,
+    workflowReadable: true,
+    ...overrides,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +92,41 @@ test("#2125: absence APPEARING or DISAPPEARING is still a change", () => {
       sameWorkflowObject,
     ),
     true,
+  );
+});
+
+test("#2125 gate r1: an UNREADABLE probe is not proven absence — it stays refused", () => {
+  // `activeWorkflowRef()` answers null both when there is no active workflow and
+  // when the lookup THREW. Only the first is evidence the tab did not move; the
+  // second is "I did not find out", and two of them must not witness each other.
+  const unreadable = ctx({ workflowReadable: false });
+  const proven = ctx();
+  assert.equal(
+    sameGraphMutationContext(unreadable, unreadable, sameWorkflowObject),
+    false,
+    "two failed reads must not pass as absent-then-absent — the workflow may have changed under them",
+  );
+  assert.equal(sameGraphMutationContext(proven, unreadable, sameWorkflowObject), false);
+  assert.equal(sameGraphMutationContext(unreadable, proven, sameWorkflowObject), false);
+  // Fail-closed for any caller that does not carry the flag at all: the relaxation
+  // is opt-in by evidence, never by default.
+  const silent = { ...proven };
+  delete silent.workflowReadable;
+  assert.equal(
+    sameGraphMutationContext(silent, silent, sameWorkflowObject),
+    false,
+    "a context that never stated readability gets the pre-fix behaviour",
+  );
+  // …and readability is irrelevant once a workflow is actually present.
+  const wf = { changeTracker: {} };
+  assert.equal(
+    sameGraphMutationContext(
+      { ...ctx({ workflow: wf }), workflowReadable: false },
+      { ...ctx({ workflow: wf }), workflowReadable: false },
+      sameWorkflowObject,
+    ),
+    true,
+    "a probe that returned an object plainly ran, whatever the flag says",
   );
 });
 
@@ -149,7 +194,7 @@ function buildMutationContextPair(deps) {
   return make(...names.map((n) => deps[n]));
 }
 
-function harness({ workflow = null, bindingVerdict = null } = {}) {
+function harness({ workflow = null, readable = true, bindingVerdict = null } = {}) {
   const rootGraph = { _nodes: [] };
   const app = {};
   const canvas = {};
@@ -162,6 +207,7 @@ function harness({ workflow = null, bindingVerdict = null } = {}) {
       sameGraphMutationContext,
       sameWorkflowObject,
       getGraphCtx: () => ({ app, graph: rootGraph, rootGraph, canvas, LG: {} }),
+      probeActiveWorkflow: () => ({ workflow, readable }),
       activeWorkflowRef: () => workflow,
       // The #646 reconnect gate is not what this test is about; it must stay
       // wired (reconnect-recovery.test.mjs pins that) but answer "no refusal".
@@ -190,6 +236,55 @@ test("#2125 call site: graph_add_node's revalidation admits a canvas whose workf
   assert.equal(h.calls.asserted, 1, "and the binding bar still ran — the gate was admitted, not skipped");
 });
 
+test("#2125 call site r1: a probe that THREW at both ends is still refused", () => {
+  // The gate's P1. If the panel reported this as an ordinary absence, a workflow
+  // that moved during the preflight while the lookup happened to be throwing
+  // would be written to unverified.
+  const h = harness({ workflow: null, readable: false });
+  const captured = h.captureGraphMutationContext();
+  assert.equal(captured.workflow, null);
+  assert.equal(captured.workflowReadable, false, "the capture must record that the probe did not run");
+  assert.throws(
+    () => h.revalidateGraphMutationContext(captured),
+    /active workflow or graph view changed/,
+    "unreadable is 'I did not find out', never 'nothing changed'",
+  );
+  assert.equal(h.calls.asserted, 0, "and nothing reached the binding assert or the graph");
+});
+
+test("#2125 call site r1: the panel's own probe reports readable:false when the lookup throws", () => {
+  // Not a stub: the REAL probeActiveWorkflow source, driven with a getter that
+  // throws — the shape that makes activeWorkflowRef() return a bare null today.
+  const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
+  const start = src.indexOf("function probeActiveWorkflow()");
+  assert.notEqual(start, -1, "probeActiveWorkflow must exist");
+  const endNeedle = "\n}";
+  const body = src.slice(start, src.indexOf(endNeedle, start) + endNeedle.length);
+  const probe = new Function("window", "app", `${body}\nreturn probeActiveWorkflow;`);
+
+  const exploding = {};
+  Object.defineProperty(exploding, "activeWorkflow", {
+    get() { throw new Error("extensionManager surface is unavailable"); },
+  });
+  assert.deepEqual(
+    probe({}, { extensionManager: { workflow: exploding } })(),
+    { workflow: null, readable: false },
+    "a throwing lookup must be reported as unreadable, not as an absent workflow",
+  );
+
+  // And the two states it must still distinguish.
+  assert.deepEqual(
+    probe({}, { extensionManager: { workflow: { activeWorkflow: null } } })(),
+    { workflow: null, readable: true },
+    "a lookup that ran and found nothing is PROVEN absence",
+  );
+  const wf = { changeTracker: {} };
+  assert.deepEqual(
+    probe({}, { extensionManager: { workflow: { activeWorkflow: wf } } })(),
+    { workflow: wf, readable: true },
+  );
+});
+
 test("#2125 call site: a genuine tab switch during the preflight is still refused", () => {
   // The guard's reason for existing, exercised through the same real source: the
   // capture sees workflow A, the revalidate sees workflow B.
@@ -203,6 +298,7 @@ test("#2125 call site: a genuine tab switch during the preflight is still refuse
     sameGraphMutationContext,
     sameWorkflowObject,
     getGraphCtx: () => ({ app, graph: rootGraph, rootGraph, canvas, LG: {} }),
+    probeActiveWorkflow: () => ({ workflow, readable: true }),
     activeWorkflowRef: () => workflow,
     graphMutationReconnectGate: () => null,
     comfyBackendIsDown: () => false,

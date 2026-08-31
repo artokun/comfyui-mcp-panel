@@ -32,12 +32,26 @@
  * Absence appearing or disappearing is still a change: a workflow that arrives
  * mid-preflight, or one that vanishes, both stay refused. Only absent→absent is
  * admitted, and it is admitted because it is not evidence of anything.
+ *
+ * ABSENT IS NOT THE SAME AS UNREADABLE (gate r1 P1), and the whole safety of the
+ * paragraph above rests on the distinction. `activeWorkflowRef()` also answers
+ * `null` when its lookup THREW, and two throws would otherwise witness
+ * "absent, then absent" across a preflight the workflow genuinely moved during —
+ * admitting a write onto a canvas nothing verified. So the caller reports whether
+ * the probe RAN (`workflowReadable`), and a null is only unchanged when BOTH ends
+ * proved there was nothing to see. Unreadable, or unstated, fails closed exactly
+ * as before this fix: a context that does not carry the flag is refused on a null
+ * workflow, so no other caller can opt into the relaxation by accident.
  */
+function absenceProven(context) {
+  return context.workflow == null && context.workflowReadable === true;
+}
+
 function sameWorkflowSlot(before, after, sameWorkflow) {
-  const beforeAbsent = before == null;
-  const afterAbsent = after == null;
-  if (beforeAbsent || afterAbsent) return beforeAbsent && afterAbsent;
-  return sameWorkflow(before, after);
+  if (before.workflow == null || after.workflow == null) {
+    return absenceProven(before) && absenceProven(after);
+  }
+  return sameWorkflow(before.workflow, after.workflow);
 }
 
 export function sameGraphMutationContext(before, after, sameWorkflow = (a, b) => a === b) {
@@ -46,5 +60,5 @@ export function sameGraphMutationContext(before, after, sameWorkflow = (a, b) =>
     before.graph === after.graph &&
     before.rootGraph === after.rootGraph &&
     before.canvas === after.canvas &&
-    sameWorkflowSlot(before.workflow, after.workflow, sameWorkflow);
+    sameWorkflowSlot(before, after, sameWorkflow);
 }

@@ -4017,16 +4017,28 @@ function captureWasSuppressed(tracker) {
   }
 }
 
-function activeWorkflowRef() {
+// #2125 — the ONE read of the active workflow, tagged with whether it actually
+// RAN. `activeWorkflowRef()` collapses "the frontend exposes no active workflow"
+// and "the lookup threw" into the same `null`, which is fine for every caller
+// that only wants the object, and NOT fine for a caller asking whether anything
+// changed: two throws would otherwise witness "absent, then absent" for a tab
+// that moved underneath them. `readable:false` means "I did not find out".
+function probeActiveWorkflow() {
   try {
-    return (
-      window.comfyAPI?.app?.app?.extensionManager?.workflow?.activeWorkflow ||
-      (typeof app !== "undefined" && app?.extensionManager?.workflow?.activeWorkflow) ||
-      null
-    );
+    return {
+      workflow:
+        window.comfyAPI?.app?.app?.extensionManager?.workflow?.activeWorkflow ||
+        (typeof app !== "undefined" && app?.extensionManager?.workflow?.activeWorkflow) ||
+        null,
+      readable: true,
+    };
   } catch {
-    return null;
+    return { workflow: null, readable: false };
   }
+}
+
+function activeWorkflowRef() {
+  return probeActiveWorkflow().workflow;
 }
 
 function savedWorkflowPath(wf = activeWorkflowRef()) {
@@ -13659,7 +13671,13 @@ async function awaitRequiredCustomWidgetRegistration(
 
 function captureGraphMutationContext() {
   const context = getGraphCtx();
-  return { ...context, workflow: activeWorkflowRef() };
+  // #2125 — carry the READABILITY of the workflow probe alongside its result. The
+  // comparison below admits an absent workflow, and it may only do so when both
+  // ends PROVED the absence; a probe that threw returns the same `null` and
+  // proves nothing. One probe call per capture, so the flag cannot disagree with
+  // the value it describes.
+  const probe = probeActiveWorkflow();
+  return { ...context, workflow: probe.workflow, workflowReadable: probe.readable };
 }
 
 function revalidateGraphMutationContext(captured) {
@@ -13676,7 +13694,11 @@ function revalidateGraphMutationContext(captured) {
     bindingSettleWindow: postReconnectBindingSettleWindow(),
   });
   if (reconnectGate) throw reconnectRefusalError(reconnectGate);
-  const current = { ...getGraphCtx(), workflow: activeWorkflowRef() };
+  // getGraphCtx FIRST, then the workflow probe — the same order as the capture, so
+  // the two contexts are built from the same sequence of reads (#2125).
+  const currentGraphCtx = getGraphCtx();
+  const currentProbe = probeActiveWorkflow(); // #2125 — see captureGraphMutationContext
+  const current = { ...currentGraphCtx, workflow: currentProbe.workflow, workflowReadable: currentProbe.readable };
   if (!sameGraphMutationContext(captured, current, sameWorkflowObject)) {
     throw new Error(
       "The active workflow or graph view changed while this node was preparing; nothing was added. Retry on the intended tab.",
