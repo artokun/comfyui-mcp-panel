@@ -25,7 +25,11 @@
 import { duplicateCompletionNote } from "./completion-dedupe.js";
 import { withTimeout } from "./bounded-step.js";
 import { completionCompositionDiagnostic } from "./completion-delivery-diagnostics.js";
-import { formatAudioMediaNote, formatWithheldMediaNote } from "./node-output-media.js";
+import {
+  formatAudioMediaNote,
+  formatModel3dMediaNote,
+  formatWithheldMediaNote,
+} from "./node-output-media.js";
 import {
   appendImageCacheBust,
   appendStoryboardCacheBust,
@@ -52,7 +56,8 @@ export const STILLS_METADATA_TIMEOUT_MS = 1000;
  * batch was empty (no frame emitted).
  *
  * @param {{promptId:(string|null), images?:any[], videos?:any[], audio?:any[],
- *   durationMs:(number|null), finishedAt?:(number|null), reconciled?:boolean,
+ *   models3d?:any[], durationMs:(number|null), finishedAt?:(number|null),
+ *   reconciled?:boolean,
  *   withheld?:({ count:number, keys:string[], types:string[] }|null)}} payload
  *   `finishedAt` is epoch ms of the run's REAL finish; `reconciled` marks a
  *   completion recovered from /history rather than observed live (#1199).
@@ -65,6 +70,7 @@ export async function composeRunCompletionFrame(
     images = [],
     videos = [],
     audio = [],
+    models3d = [],
     durationMs,
     noMedia = false,
     duplicateOf = null,
@@ -177,6 +183,24 @@ export async function composeRunCompletionFrame(
   const leadingSectionCount = noteSections.length;
   let metadata = [];
 
+  // #2126 / #2128 — the run's NON-IMAGE saved outputs, resolved BEFORE the stills
+  // segment starts because the stills note depends on them. Both are pure filters
+  // over the payload, so hoisting them costs nothing and awaits nothing.
+  const audioRefs = (Array.isArray(audio) ? audio : []).filter((m) => m && m.filename);
+  const model3dRefs = (Array.isArray(models3d) ? models3d : []).filter((m) => m && m.filename);
+  // #2128 — what `buildStillsSegment` is missing when it decides whether a saved
+  // output node ran. It only ever sees IMAGES, so a run whose real output is a
+  // `.glb` (or a `.flac`) with `PreviewImage` taps upstream looked identical to a
+  // preview-only run: it told the agent "no saved output node ran … Add a SaveImage
+  // node" while a 16 MB mesh sat in `output/3D/`. All three claims were false, and
+  // the advice cannot work — a SaveImage node cannot persist a `FILE_3D_GLB`.
+  //
+  // Passed as KINDS rather than a bare boolean so the note can name what actually
+  // ran instead of gesturing at "something else".
+  const nonImageOutputKinds = [];
+  if (model3dRefs.length) nonImageOutputKinds.push({ kind: "3D model", count: model3dRefs.length });
+  if (audioRefs.length) nonImageOutputKinds.push({ kind: "audio", count: audioRefs.length });
+
   // ── Stills + video segments in PARALLEL ────────────────────────────────
   // #1610 — these used to be sequential: stills metadata (HEAD + Image decode,
   // each bounded at 8 s inside the helpers) ran to completion BEFORE the
@@ -199,6 +223,7 @@ export async function composeRunCompletionFrame(
         finishedClock,
         finishedAt,
         promptId,
+        nonImageOutputKinds,
         stillsMetadataTimeoutMs,
         setTimer,
         clearTimer,
@@ -272,7 +297,6 @@ export async function composeRunCompletionFrame(
   // falling through to "produced no image or video output ... no output node
   // produced one" — which is not merely unhelpful, it is false when a SaveAudio
   // node wrote a file. That false report IS the reported defect.
-  const audioRefs = (Array.isArray(audio) ? audio : []).filter((m) => m && m.filename);
   if (audioRefs.length) {
     const audioNote = formatAudioMediaNote({
       audio: audioRefs,
@@ -281,6 +305,21 @@ export async function composeRunCompletionFrame(
       attached: outImages.length > 0 || !!withheldSummary,
     });
     if (audioNote) noteSections.push(audioNote);
+  }
+
+  // #2128 — the run's 3D MODEL outputs, on the same terms as audio: named, never
+  // attached. `Save3DAdvanced` writes a real `.glb` and is `is_output_node`, so a
+  // run that ends in one has produced its final result; the completion frame said
+  // the opposite. Being CONTENT, this section also keeps a 3D-only run out of the
+  // media-less "no output node produced one" branch below.
+  if (model3dRefs.length) {
+    const model3dNote = formatModel3dMediaNote({
+      models3d: model3dRefs,
+      promptId,
+      durationSuffix: took,
+      attached: outImages.length > 0 || !!withheldSummary || audioRefs.length > 0,
+    });
+    if (model3dNote) noteSections.push(model3dNote);
   }
 
   // #356 Bug 2 — a run that finished with no image and no video still has to be
@@ -318,29 +357,50 @@ export async function composeRunCompletionFrame(
     return frame;
   }
 
+  // Machine-readable summary for a run that attached NOTHING. Per-still metadata is
+  // built from `finals`, so with no images there is none to report and this is the
+  // only structured account of what the run produced. 3D is checked first (#2128):
+  // when a run emits both, the mesh is the saved deliverable and the audio rides
+  // along, and the prose note names both regardless of which one this key picks.
+  const unattachedMetadata = () => {
+    if (outImages.length) return null;
+    if (model3dRefs.length) {
+      return [{
+        outputs: "model_3d",
+        reason: "not_viewable",
+        count: model3dRefs.length,
+        files: model3dRefs.map((m) => String(m.filename)),
+        ...recoveryMetadata(),
+      }];
+    }
+    if (audioRefs.length && !withheldSummary) {
+      return [{
+        outputs: "audio",
+        reason: "not_audible",
+        count: audioRefs.length,
+        files: audioRefs.map((m) => String(m.filename)),
+        ...recoveryMetadata(),
+      }];
+    }
+    if (withheldSummary) {
+      return [{
+        outputs: "withheld",
+        reason: "media_budget",
+        count: withheldSummary.count,
+        keys: withheldSummary.keys,
+        types: withheldSummary.types,
+        ...recoveryMetadata(),
+      }];
+    }
+    return null;
+  };
+
   const frame = {
     type: "agent_event",
     kind: "executed",
     images: outImages,
     note: noteSections.join("\n\n"),
-    metadata: audioRefs.length && !outImages.length && !withheldSummary
-      ? [{
-          outputs: "audio",
-          reason: "not_audible",
-          count: audioRefs.length,
-          files: audioRefs.map((m) => String(m.filename)),
-          ...recoveryMetadata(),
-        }]
-      : withheldSummary && !outImages.length
-        ? [{
-            outputs: "withheld",
-            reason: "media_budget",
-            count: withheldSummary.count,
-            keys: withheldSummary.keys,
-            types: withheldSummary.types,
-            ...recoveryMetadata(),
-          }]
-        : metadata,
+    metadata: unattachedMetadata() ?? metadata,
     completion_diagnostics: completionDiagnostics(),
     // Machine-readable attribution: which prompt this completion belongs to, so
     // a delayed prior-run flush can never be mistaken for the current run (#224).
@@ -437,8 +497,29 @@ function recoveredCompletionNote(realFinishedAt, ageMs) {
 }
 
 /**
+ * "1 3D model output" · "2 audio outputs" · "1 3D model output and 2 audio outputs".
+ *
+ * Returns null for an empty/unusable list, which is what keeps the ORIGINAL
+ * preview-only sentence reachable: a run that genuinely saved nothing must still
+ * be told to add a SaveImage node (#2128 narrows that advice, it does not remove it).
+ */
+function summariseNonImageOutputs(kinds) {
+  const parts = (Array.isArray(kinds) ? kinds : [])
+    .filter((k) => k && k.count > 0 && k.kind)
+    .map((k) => `${k.count} ${k.kind} output${k.count === 1 ? "" : "s"}`);
+  if (!parts.length) return null;
+  if (parts.length === 1) return parts[0];
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+
+/**
  * Still-image portion: classify final-vs-preview, compose the note, and gather
  * per-final metadata. Returns { images, note, metadata } — never sends a frame.
+ *
+ * `deps.nonImageOutputKinds` is what this function cannot see for itself (#2128):
+ * `[{kind, count}]` for the run's saved NON-image outputs. Without it the no-finals
+ * branch inferred "no saved output node ran" from the image set alone, which is a
+ * claim about the whole RUN made from a strict subset of its outputs.
  */
 async function buildStillsSegment(bufImages, deps) {
   const {
@@ -452,6 +533,7 @@ async function buildStillsSegment(bufImages, deps) {
     finishedClock,
     finishedAt,
     promptId,
+    nonImageOutputKinds = [],
     stillsMetadataTimeoutMs = STILLS_METADATA_TIMEOUT_MS,
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = (t) => clearTimeout(t),
@@ -491,9 +573,19 @@ async function buildStillsSegment(bufImages, deps) {
       previewCount === 1
         ? `this image is a preview (temporary, not a final file)`
         : `these ${previewCount} images are previews (temporary, not a final file)`;
-    note =
-      `Run finished, but no saved output node ran — ${previewClause}. ` +
-      `Add a SaveImage node to persist the result, or treat the preview as the result if that's intended.`;
+    // #2128 — a saved output node DID run; it just did not save an IMAGE. The old
+    // sentence made three false claims at once (no output node ran, no final file
+    // exists, add a SaveImage node) for a workflow ending in `Save3DAdvanced` with
+    // `PreviewImage` taps upstream, and the remedy it named cannot work: SaveImage
+    // takes an IMAGE, and the payload is a `FILE_3D_GLB`. Say what ran instead, and
+    // let the note for that output name the file.
+    const saved = summariseNonImageOutputs(nonImageOutputKinds);
+    note = saved
+      ? `Run finished — ${previewClause}. But the run DID save a final result: ` +
+        `${saved} (named below in this completion). Do NOT add a SaveImage node — the ` +
+        `saved output is not an image, so SaveImage cannot persist it.`
+      : `Run finished, but no saved output node ran — ${previewClause}. ` +
+        `Add a SaveImage node to persist the result, or treat the preview as the result if that's intended.`;
   }
 
   // ── Rich per-output metadata (parallel, bounded, never drops the note) ──

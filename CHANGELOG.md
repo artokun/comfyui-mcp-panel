@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_add_node no longer refuses with "the active workflow or graph view changed" on a frontend that exposes no active workflow: absent-at-both-ends is unchanged, not a tab switch, so the mutation runs on the same canvas the reads already succeeded on (#2125)
 - A SaveAudio render is reported instead of dropped: ComfyUI's `audio` output bag is collected, so an audio player is painted in chat and the run's completion frame names the files rather than telling the agent the run "produced no image or video output" and that no output node produced a file. Audio is named, never attached — the agent still cannot hear it (#2126)
+- A run whose result is a 3D model no longer reports the opposite: ComfyUI's two 3D output shapes are collected (`SaveGLB`'s `3d` descriptors, and the bare path string `Save3DAdvanced` / `SaveGaussianSplat` / `SavePointCloud` / `Preview3D` put in `result`), so a workflow ending in `Save3DAdvanced` names the `.glb` it wrote instead of saying "no saved output node ran ... Add a SaveImage node". The completion note no longer infers that claim from the image set alone, so a preview-tapped audio run stops making it too; a genuinely preview-only run still gets the original advice. 3D is named, never attached (#2128)
 
 ## [0.15.149] - 2026-08-30
 

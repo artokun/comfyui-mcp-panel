@@ -1,4 +1,9 @@
-import { collectNodeOutputMedia, mergeAudioMedia, mergeWithheldMedia } from "./node-output-media.js";
+import {
+  collectNodeOutputMedia,
+  mergeAudioMedia,
+  mergeModel3dMedia,
+  mergeWithheldMedia,
+} from "./node-output-media.js";
 
 // Parse a ComfyUI `/history/<prompt_id>` entry into a terminal completion batch.
 //
@@ -23,6 +28,9 @@ import { collectNodeOutputMedia, mergeAudioMedia, mergeWithheldMedia } from "./n
  *   counted on `withheld` and never copied into `images`/`videos` (#1934).
  *   ComfyUI's own `audio` bag comes back on `audio` — never on `images`, or a
  *   recovered SaveAudio run would reach the agent as an inline image (#2126/#710).
+ *   3D outputs (SaveGLB's `3d` descriptors, and the bare path string a
+ *   Save3DAdvanced puts in `result`) come back on `models3d`, for the same reason
+ *   and on the same terms (#2128).
  * @param {object}   [opts]
  * @param {(m:object)=>boolean} [opts.isVideo]  Classifies an output ref as video
  *   (else still image), matching the live path's classification.
@@ -30,6 +38,7 @@ import { collectNodeOutputMedia, mergeAudioMedia, mergeWithheldMedia } from "./n
  *   timestamp implausibly far in the future. Injectable for tests.
  * @returns {null | { terminal:boolean, status:("success"|"error"|"interrupted"|"unknown"),
  *   images:object[], videos:{m:object,nodeId:string}[], audio:object[],
+ *   models3d:object[],
  *   withheld:({ count:number, keys:string[], types:string[] }|null),
  *   startedAt:(number|null), finishedAt:(number|null) }}
  *   `null` when there's no usable entry. `startedAt`/`finishedAt` are epoch ms
@@ -66,6 +75,7 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
   const images = [];
   const videos = [];
   let audio = [];
+  let models3d = [];
   let withheld = null;
   const outputs = entry.outputs && typeof entry.outputs === "object" ? entry.outputs : {};
   for (const [nodeId, out] of Object.entries(outputs)) {
@@ -73,6 +83,9 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
     const collected = collectNodeOutputMedia(out);
     withheld = mergeWithheldMedia(withheld, collected.withheld);
     if (collected.audio.length) audio = mergeAudioMedia(audio, collected.audio);
+    // #2128 — merged across nodes, and merged at all because one prompt can carry a
+    // SaveGLB and a Save3DAdvanced whose `result` names the very same file.
+    if (collected.models3d.length) models3d = mergeModel3dMedia(models3d, collected.models3d);
     for (const m of collected.deliverable) {
       if (typeof isVideo === "function" && isVideo(m)) videos.push({ m, nodeId: String(nodeId) });
       else images.push(m);
@@ -92,6 +105,7 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
     images,
     videos,
     audio,
+    models3d,
     withheld,
     startedAt,
     finishedAt,

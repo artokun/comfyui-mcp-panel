@@ -41,6 +41,93 @@ const AUDIO_MEDIA_KEY = "audio";
 const AUDIO_NOTE_NAME_LIMIT = 6;
 
 /**
+ * #2128 — ComfyUI's 3D outputs, which arrive in TWO unrelated shapes.
+ *
+ * 1. `SaveGLB` (`comfy_extras/nodes_save_3d.py`) returns
+ *    `ui={"3d": [{filename, subfolder, type:"output"}]}` — ordinary `/view`
+ *    descriptors, just under a key nothing read.
+ *
+ * 2. `Save3DAdvanced`, `SaveGaussianSplat` and `SavePointCloud` all delegate to
+ *    `execute_save_3d_advanced`, which serialises through
+ *    `UI.PreviewUI3DAdvanced.as_dict()` (`comfy_api/latest/_ui.py`) and returns
+ *    `{"result": [model_file, camera_info, model_3d_info]}` — where `model_file`
+ *    is a bare PATH STRING (`"3D/PROP_crate_00001.glb"`), not a descriptor.
+ *    `Preview3D` / `Preview3DAdvanced` use the sibling `PreviewUI3D.as_dict()`,
+ *    the same `{"result": [...]}` shape.
+ *
+ * Neither key matches the three literal media keys nor the widened
+ * `/(?:images|gifs|videos)$/` scan, so a 16 MB `.glb` was invisible to the whole
+ * completion path — the #2128 defect, and the #2126 defect with a different file
+ * extension.
+ *
+ * `result` is a GENERIC key, so admission is deliberately narrow: a STRING entry
+ * whose extension is a 3D model format. The camera dict and the model-info list
+ * that sit beside `model_file` are not strings; `PreviewUI3D`'s third element IS
+ * a string (`"temp/bg_<hex>.png"`) and is excluded by the same extension test.
+ *
+ * Held back from `deliverable` for the #710 reason audio is: a mesh handed to the
+ * agent as an inline image block is a broken picture plus a claim of a perception
+ * nobody had.
+ */
+const MODEL_3D_MEDIA_KEY = "3d";
+const MODEL_3D_RESULT_KEY = "result";
+
+/**
+ * Extensions admitted from a bare `result` path string.
+ *
+ * Exactly the formats the three Save-3D nodes accept on their `model_3d` socket
+ * (`IO.File3DGLB/GLTF/FBX/OBJ/STL/USDZ`, `File3DPLY/SPLAT/SPZ/KSPLAT`), which is
+ * what `_save_file3d_to_output` then names the file with (`model_3d.format`).
+ *
+ * NOT the same list as `input-asset.js`'s `file_upload` set, and the difference is
+ * intentional rather than an oversight: that set gates what the panel may put INTO
+ * a `Load3D` combo, so it tracks ComfyUI's own input LISTING and deliberately omits
+ * `usdz`. This set reads what ComfyUI reported it just WROTE, and `Save3DAdvanced`
+ * declares `IO.File3DUSDZ` on its input, so a `.usdz` output is producible and must
+ * be reported.
+ *
+ * A `File3DAny` carrying some format outside this list is under-reported, which
+ * degrades to today's behaviour. That direction is chosen on purpose: a missed 3D
+ * output is the status quo, whereas a false positive would invent an output node.
+ */
+const MODEL_3D_EXTENSIONS = new Set([
+  "glb", "gltf", "obj", "fbx", "stl", "usdz", "ply", "splat", "spz", "ksplat",
+]);
+
+// How many filenames one 3D note spells out before it summarises the rest.
+const MODEL_3D_NOTE_NAME_LIMIT = 6;
+
+/**
+ * Turn a bare `result` path string into a `/view` descriptor, or null.
+ *
+ * Splits on BOTH separators. `get_save_image_path` derives the subfolder with
+ * `os.path.dirname(os.path.normpath(prefix))`, and on Windows `normpath` rewrites
+ * `/` to `\` — so a nested prefix like `3D/props/PROP` yields `"3D\\props"`, which
+ * the node then joins to the filename with a forward slash. One emitted string can
+ * therefore carry both.
+ *
+ * `type` is reported as `"output"` because every core node that emits this shape
+ * writes to `folder_paths.get_output_directory()`: the three Save-3D nodes
+ * unconditionally, and `Preview3D` whenever it materialises a `File3D`. The one
+ * shape where that is wrong is `Preview3D` handed a literal path string, which it
+ * passes through unchanged — there the file may sit under `input/`. That costs a
+ * `get_image` call that 404s and can be retried, against the alternative of staying
+ * silent and telling the agent to re-run a 15-minute job.
+ */
+function model3dRefFromResultEntry(entry) {
+  if (typeof entry !== "string") return null;
+  const path = entry.trim();
+  if (!path) return null;
+  const segments = path.split(/[\\/]+/).filter(Boolean);
+  const filename = segments.pop();
+  if (!filename) return null;
+  const dot = filename.lastIndexOf(".");
+  if (dot <= 0) return null;
+  if (!MODEL_3D_EXTENSIONS.has(filename.slice(dot + 1).toLowerCase())) return null;
+  return { filename, subfolder: segments.join("/"), type: "output" };
+}
+
+/**
  * A ComfyUI /view descriptor: `{ filename, type, subfolder }`.
  *
  * Required for WIDENED keys so an arbitrary array on a node's UI result cannot
@@ -61,18 +148,20 @@ export function isMediaDescriptor(entry) {
  * `deliverable` is the existing three-key harvest (filename present is enough,
  * matching the live path). `audio` is ComfyUI's `audio` bag, harvested with the
  * SAME laxness and kept separate (#2126) — played in chat, named on the
- * completion frame, never attached to it. `withheld` is the count/keys/types of
+ * completion frame, never attached to it. `models3d` is the same arrangement for
+ * ComfyUI's two 3D output shapes (#2128). `withheld` is the count/keys/types of
  * every other matching bag — never a copy of the refs, so a 768-image dump
  * cannot leak onto the completion frame by accident.
  *
  * @param {object|null|undefined} out
- * @returns {{ deliverable: object[], audio: object[], withheld: ({ count: number, keys: string[], types: string[] }|null) }}
+ * @returns {{ deliverable: object[], audio: object[], models3d: object[], withheld: ({ count: number, keys: string[], types: string[] }|null) }}
  */
 export function collectNodeOutputMedia(out) {
   const deliverable = [];
   const audio = [];
+  const models3d = [];
   if (out == null || typeof out !== "object" || Array.isArray(out)) {
-    return { deliverable, audio, withheld: null };
+    return { deliverable, audio, models3d, withheld: null };
   }
 
   for (const key of STANDARD_MEDIA_KEYS) {
@@ -94,11 +183,35 @@ export function collectNodeOutputMedia(out) {
     }
   }
 
+  // #2128 — SaveGLB's descriptors. Same laxness as `deliverable` and `audio`: a
+  // filename is enough, so a build that omits `type` is still reported.
+  if (Array.isArray(out[MODEL_3D_MEDIA_KEY])) {
+    for (const m of out[MODEL_3D_MEDIA_KEY]) {
+      if (!m || !m.filename) continue;
+      models3d.push(m);
+    }
+  }
+
+  // #2128 — Save3DAdvanced / SaveGaussianSplat / SavePointCloud / Preview3D*,
+  // whose `model_file` is a bare path STRING sharing an array with a camera dict
+  // and a model-info list. Only 3D-extension strings are admitted, so the
+  // siblings — and PreviewUI3D's `"temp/bg_<hex>.png"` — are passed over.
+  if (Array.isArray(out[MODEL_3D_RESULT_KEY])) {
+    for (const entry of out[MODEL_3D_RESULT_KEY]) {
+      const ref = model3dRefFromResultEntry(entry);
+      if (ref) models3d.push(ref);
+    }
+  }
+
   const keys = [];
   const types = [];
   let count = 0;
   for (const [key, bag] of Object.entries(out)) {
+    // `3d` and `result` are skipped for the same reason `audio` is: they are
+    // harvested above onto their own channel, so counting them here would report
+    // one output twice. Belt-and-braces — neither matches MEDIA_KEY_SUFFIX today.
     if (STANDARD_MEDIA_KEY_SET.has(key) || key === AUDIO_MEDIA_KEY) continue;
+    if (key === MODEL_3D_MEDIA_KEY || key === MODEL_3D_RESULT_KEY) continue;
     if (!Array.isArray(bag) || !MEDIA_KEY_SUFFIX.test(key)) continue;
     let keyCount = 0;
     for (const m of bag) {
@@ -112,7 +225,7 @@ export function collectNodeOutputMedia(out) {
     }
   }
 
-  return { deliverable, audio, withheld: count ? { count, keys, types } : null };
+  return { deliverable, audio, models3d, withheld: count ? { count, keys, types } : null };
 }
 
 /**
@@ -124,6 +237,25 @@ export function collectNodeOutputMedia(out) {
  * @returns {object[]}
  */
 export function mergeAudioMedia(a, b) {
+  return mergeMediaRefs(a, b);
+}
+
+/**
+ * #2128 — the 3D twin of `mergeAudioMedia`, and it matters more here: a single
+ * Save3DAdvanced emits its `result` bag on `executed` AND again in `/history`, and
+ * a `SaveGLB` + `Save3DAdvanced` pair on one prompt merges across two nodes.
+ *
+ * @param {object[]|null|undefined} a
+ * @param {object[]|null|undefined} b
+ * @returns {object[]}
+ */
+export function mergeModel3dMedia(a, b) {
+  return mergeMediaRefs(a, b);
+}
+
+// De-duplicate on the `/view` identity — the tuple that decides which file the
+// server hands back. Shared so the audio and 3D channels cannot drift apart.
+function mergeMediaRefs(a, b) {
   const seen = new Set();
   const out = [];
   for (const list of [a, b]) {
@@ -253,7 +385,7 @@ export function formatAudioMediaNote({
   // saved to disk, so what get_image hands back is a path, not a perception.
   const fetchClause =
     ` To get ${count === 1 ? "the file itself" : "the first of them"}, call get_image with ` +
-    `${audioRefClause(shown[0])} — audio is SAVED TO DISK rather than returned to you inline, ` +
+    `${getImageRefClause(shown[0])} — audio is SAVED TO DISK rather than returned to you inline, ` +
     `so what you get is a path a local tool can open (you still cannot hear it).`;
   const tail = attached
     ? ""
@@ -270,7 +402,7 @@ export function formatAudioMediaNote({
 
 // A get_image argument list for one audio descriptor, matching the wording the
 // panel_show_media disclosure uses so both surfaces ask for the file the same way.
-function audioRefClause(ref) {
+function getImageRefClause(ref) {
   const parts = [
     `filename "${String(ref?.filename ?? "")}"`,
     `type "${String(ref?.type || "output")}"`,
@@ -278,4 +410,64 @@ function audioRefClause(ref) {
   const subfolder = ref?.subfolder == null ? "" : String(ref.subfolder);
   if (subfolder) parts.push(`subfolder "${subfolder}"`);
   return parts.join(", ");
+}
+
+/**
+ * Agent-facing note for a run's 3D MODEL outputs (#2128). Name them; attach none.
+ *
+ * Says three things the reported message got wrong, and nothing more. A saved
+ * output node DID run; a real file WAS written; and a `SaveImage` node could not
+ * have persisted it, because the payload is a mesh, not an image.
+ *
+ * Like the audio note it claims nothing about the chat — a `/history` reconcile
+ * paints no card at all — and it states plainly that the agent has not seen the
+ * geometry, because a 3D file reaches it as neither pixels nor text. That last
+ * sentence is the #710 guard: named, but not perceived.
+ *
+ * @param {object} opts
+ * @param {object[]} opts.models3d  `/view` descriptors from the `3d` / `result` bags.
+ * @param {string|null} [opts.promptId]
+ * @param {string} [opts.durationSuffix]  e.g. ` in 3.0s` (leading space included)
+ * @param {boolean} [opts.attached]  true when stills/videos already ride the frame
+ * @returns {string|null}  null when there is no 3D output to report.
+ */
+export function formatModel3dMediaNote({
+  models3d,
+  promptId = null,
+  durationSuffix = "",
+  attached = false,
+} = {}) {
+  const files = (Array.isArray(models3d) ? models3d : []).filter((m) => m && m.filename);
+  const count = files.length;
+  if (!count) return null;
+  const outputWord = count === 1 ? "output" : "outputs";
+  const shown = files.slice(0, MODEL_3D_NOTE_NAME_LIMIT);
+  const named = shown.map((m) => `\`${String(m.filename)}\``).join(", ");
+  const rest = count - shown.length;
+  const more = rest > 0 ? `, and ${rest} more` : "";
+  const lead = attached
+    ? `Also produced ${count} 3D model ${outputWord}: ${named}${more}.`
+    : `The run you queued finished successfully${durationSuffix} and produced ${count} 3D ` +
+      `model ${outputWord}: ${named}${more}.`;
+  const promptClause =
+    promptId != null && String(promptId) !== ""
+      ? `get_history for prompt ${promptId}`
+      : "get_history";
+  const restClause = rest > 0 ? ` The rest are listed in ${promptClause}.` : "";
+  const fetchClause =
+    ` To get ${count === 1 ? "the file itself" : "the first of them"}, call get_image with ` +
+    `${getImageRefClause(shown[0])} — a 3D model is SAVED TO DISK rather than returned to you ` +
+    `inline, so what you get is a path a local tool can open.`;
+  const tail = attached
+    ? ""
+    : ` This IS the completion you were told to wait for — nothing further is coming, so do not ` +
+      `keep waiting for media.`;
+  return (
+    `\u{1F9CA} ${lead} This is the run's saved result. The model is NOT attached to this frame ` +
+    `and you have not seen it, so do not describe its shape, topology, materials or quality. ` +
+    `Adding a SaveImage node would NOT persist it — the payload is a mesh, not an image.` +
+    fetchClause +
+    restClause +
+    tail
+  );
 }
