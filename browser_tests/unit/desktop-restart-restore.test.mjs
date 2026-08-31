@@ -185,25 +185,46 @@ test("#1999: the panel imports and calls the shipped helper", () => {
  */
 
 test("#2134: an Electron browser with no bridge is not Desktop — Manager reboot stays the path", () => {
-  assert.equal(isDesktopSupervisedShell([undefined, undefined, undefined, undefined]), false);
+  assert.equal(isDesktopSupervisedShell({ electronBridge: null, restore: null }), false);
   const decision = decideDesktopRestartRestore({
-    desktopShell: isDesktopSupervisedShell([undefined, undefined, undefined, undefined]),
+    desktopShell: isDesktopSupervisedShell({ electronBridge: null, restore: null }),
     restore: resolveDesktopRestoreFrom([undefined, undefined, undefined, undefined]),
   });
   assert.equal(decision.kind, "manager_reboot");
   assert.equal(decision.note, "");
 });
 
-test("#2134: an injected bridge still proves Desktop, wherever in the list it sits", () => {
-  assert.equal(isDesktopSupervisedShell([{}]), true);
-  assert.equal(isDesktopSupervisedShell([undefined, undefined, undefined, {}]), true);
-  assert.equal(isDesktopSupervisedShell([]), false);
+test("#2134: a truthy alternate global with no relaunch function is NOT Desktop proof", () => {
+  // The alternates (window.api, window.__comfyDesktop2, comfyAPI.electron) are
+  // unverified guesses. Stock ComfyUI defines no `window.api` at all — it exposes
+  // `window.comfyAPI.api.api` — but a custom node may. Accepting a bare truthy
+  // value there would put a new weak signal exactly where the User-Agent was.
+  for (const alternate of [{}, { someUnrelatedMethod() {} }, "truthy", 1]) {
+    const bridges = [undefined, undefined, alternate, undefined];
+    assert.equal(
+      isDesktopSupervisedShell({
+        electronBridge: undefined,
+        restore: resolveDesktopRestoreFrom(bridges),
+      }),
+      false,
+      String(alternate),
+    );
+  }
 });
 
-test("#2134: #1999 is preserved — a real Desktop bridge with no restore still refuses", () => {
+test("#2134: an alternate global that DOES expose a relaunch function is Desktop", () => {
+  const bridges = [undefined, { restartCore() {} }, undefined, undefined];
+  const restore = resolveDesktopRestoreFrom(bridges);
+  assert.equal(isDesktopSupervisedShell({ electronBridge: undefined, restore }), true);
+});
+
+test("#2134: #1999 is preserved — electronAPI alone is Desktop, even with no restore", () => {
   const bridges = [{ openExternalUrl() {} }, undefined, undefined, undefined];
   const decision = decideDesktopRestartRestore({
-    desktopShell: isDesktopSupervisedShell(bridges),
+    desktopShell: isDesktopSupervisedShell({
+      electronBridge: bridges[0],
+      restore: resolveDesktopRestoreFrom(bridges),
+    }),
     restore: resolveDesktopRestoreFrom(bridges),
   });
   assert.equal(decision.kind, "refuse");
@@ -228,7 +249,7 @@ test("#2134: a bridge with no restore does not mask a later bridge that has one"
   assert.deepEqual(calls, ["restartApp"]);
   assert.equal(
     decideDesktopRestartRestore({
-      desktopShell: isDesktopSupervisedShell(bridges),
+      desktopShell: isDesktopSupervisedShell({ electronBridge: bridges[0], restore: resolved }),
       restore: resolved,
     }).kind,
     "desktop_restore",
@@ -285,6 +306,15 @@ function runRebootDesktopDecision(win) {
 test("#2134: the shipped call site does not refuse an Electron browser with no bridge", () => {
   // Pre-fix this returned `refuse` with the exact string the reporter quoted.
   const decision = runRebootDesktopDecision({});
+  assert.equal(decision.kind, "manager_reboot");
+});
+
+test("#2134: the shipped call site does not treat a bare window.api as Desktop", () => {
+  // Raised on review of this fix: `window.api` is not ComfyUI's API object (that is
+  // `window.comfyAPI.api.api`), but a custom node may define it. With no relaunch
+  // function on it there is no Desktop evidence and nothing to restore with, so the
+  // reboot must proceed rather than refuse.
+  const decision = runRebootDesktopDecision({ api: { someUnrelatedMethod() {} } });
   assert.equal(decision.kind, "manager_reboot");
 });
 

@@ -27413,7 +27413,13 @@ const GRAPH_TOOL_EXECUTORS = {
         : [];
     const desktopRestore = resolveDesktopRestoreFrom(desktopBridges);
     const desktopDecision = decideDesktopRestartRestore({
-      desktopShell: isDesktopSupervisedShell(desktopBridges),
+      // Desktop is `window.electronAPI` (what ComfyUI's own envUtil reads) or a
+      // candidate that really exposes a relaunch function — never just a truthy
+      // global, which would put a new weak signal where the User-Agent was.
+      desktopShell: isDesktopSupervisedShell({
+        electronBridge: typeof window !== "undefined" ? window.electronAPI : null,
+        restore: desktopRestore,
+      }),
       restore: desktopRestore,
     });
     if (desktopDecision.kind === "refuse") {

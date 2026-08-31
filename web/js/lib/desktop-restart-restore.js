@@ -83,21 +83,38 @@ export function resolveDesktopRestoreFrom(bridges) {
  * ComfyUI Desktop instance" — which was not true, and left them with no way to load
  * the nodes they had just installed.
  *
- * The injected bridge is the only positive evidence, and it is what ComfyUI's own
- * frontend uses (`src/utils/envUtil.ts` is `window.electronAPI`, and the shipped
- * 1.49.6 bundle never sniffs the UA for `Electron/` anywhere). A page with no bridge
- * is indistinguishable from an ordinary browser tab, which is the case Manager
- * reboot has always handled correctly.
+ * Evidence is therefore one of two things, and NOT "some global happened to be
+ * truthy":
  *
- * This cannot regress #1999: every page that previously had a bridge still takes the
- * restore-or-refuse path unchanged. Only the bridge-less UA-only case changes.
+ *   * `window.electronAPI` — the canonical Electron bridge, and the only one
+ *     ComfyUI's own frontend consults (`src/utils/envUtil.ts` is exactly
+ *     `function electronAPI(){return window.electronAPI}`; the shipped 1.49.6
+ *     bundle sniffs the UA for `Electron/` nowhere, in 868 files). Its mere
+ *     presence is Desktop, even with no restore function on it — that is #1999.
+ *   * a candidate that actually exposes a Desktop restore function. Something
+ *     offering `restartCore` is a Desktop supervisor whatever global it arrived on.
  *
- * @param {unknown[]} bridges
+ * The alternates (`window.comfyAPI.electron`, `window.api`, `window.__comfyDesktop2`)
+ * are unverified guesses inherited with this guard, so a bare truthy value on one of
+ * them proves nothing. `window.api` in particular is NOT ComfyUI's API object — stock
+ * ComfyUI exposes that as `window.comfyAPI.api.api` and defines no `window.api` at
+ * all — but any custom node may define it, and treating that as "a Desktop app
+ * supervises this backend" would re-create the very over-refusal being fixed here,
+ * just with a different weak signal standing in for the User-Agent.
+ *
+ * A page with neither is indistinguishable from an ordinary browser tab, which is the
+ * case Manager reboot has always handled correctly — and it has nothing to restore
+ * with regardless.
+ *
+ * #1999 is preserved: a real Desktop shell still refuses before the stop, because
+ * `electronAPI` alone is enough to make it Desktop.
+ *
+ * @param {{ electronBridge?: unknown, restore?: { restore?: unknown } | null }} [input]
  * @returns {boolean}
  */
-export function isDesktopSupervisedShell(bridges) {
-  const list = Array.isArray(bridges) ? bridges : [bridges];
-  return list.some((bridge) => Boolean(bridge));
+export function isDesktopSupervisedShell({ electronBridge = null, restore = null } = {}) {
+  if (electronBridge) return true;
+  return typeof restore?.restore === "function";
 }
 
 /**
