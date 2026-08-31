@@ -268,14 +268,57 @@ test("#1707: an instance key does NOT license the claim — a rail that still wr
   );
 
   // The REQUESTED value survives nowhere: not on the rail, not in the store queue
-  // compilation reads, and not on the definition every sibling reads. (A rail that
-  // forwards to the definition cannot have both restored independently — the two are
-  // one store — so the refusal is reported as a partial state rather than a clean
-  // rollback, which is what it is.)
+  // compilation reads, and not on the definition every sibling reads. (#2132 corrects
+  // an earlier note here which said the rail and the definition "cannot both be
+  // restored independently — the two are one store". They are NOT one store: this rail
+  // READS its own store entry and only WRITES THROUGH to the inner widget, so restoring
+  // the rail first and the shared inner widget last restores both. The divergent case
+  // that made the difference visible is pinned in the #2132 test below.)
   assert.notEqual(target.rail.value, 1024);
   assert.notEqual(sg.queuedValue(target), 1024);
   assert.notEqual(sg.definition(), 1024);
   assert.notEqual(sibling.rail.value, 1024);
+  assert.equal(sg.definition(), 1920, "the shared definition is back on exactly the value it held");
+  assert.equal(target.rail.value, 1920, "and so is the rail");
+});
+
+test("#2132: the rollback of a forwarding rail restores the SHARED definition, not the rail's value", () => {
+  // The reported shape (panel 0.15.149, frontend 1.51.9). The rail's per-instance store
+  // and the shared inner widget have DIVERGED before the write — the promoted control
+  // was set on this instance, and the inner widget was later edited inside the subgraph
+  // definition. That divergence is the whole defect: with the two in sync, restoring the
+  // inner and then letting the rail's restore forward back onto it lands the same value,
+  // so the bug is invisible; diverged, the rail's captured value is forwarded onto the
+  // SHARED inner widget after its own rollback and overwrites it.
+  const sg = makeReusableSubgraph({ definitionValue: 512, railWritesDefinition: true });
+  const sibling = sg.instance(279);
+  const target = sg.instance(293);
+  target.rail.value = 1920; // forwards to the inner widget, as this rail does
+  sg.inner.widgets[0].value = 512; // …and the definition is then edited back, on its own
+  assert.equal(sg.definition(), 512, "precondition: rail 1920, shared definition 512");
+  assert.equal(target.rail.value, 1920);
+
+  let err = null;
+  try {
+    applyWidgetWrite(target.node, "width", 1024, { resolveSource });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof WidgetWriteError, "a forwarding rail is still refused");
+  assert.match(err.message, /ALSO changed the shared subgraph definition/);
+
+  // THE PIN. Before #2132 the shared definition was left holding 1920 — the rail's value,
+  // forwarded onto it by the rail's own rollback after the inner rollback had already put
+  // 512 back. Every sibling instance and every instance created later reads this widget.
+  assert.equal(sg.definition(), 512, "the shared definition is restored to its own captured value");
+  assert.equal(target.rail.value, 1920, "and the rail is restored to its own, independently");
+  assert.equal(sg.queuedValue(target), 1920, "including what queue compilation reads");
+  assert.equal(sibling.rail.value, 512, "the sibling nobody addressed is untouched");
+  // A clean rollback, so it must not be reported as a partial state: the reported message
+  // said "Rollback of inner "prompt" did not take effect … the graph may be in a partial
+  // state", which sent the user to undo a graph that is now whole.
+  assert.doesNotMatch(err.message, /did not take effect/);
+  assert.doesNotMatch(err.message, /partial state/);
 });
 
 test("#1707: a failed instance-scoped write does not touch the definition on the ROLLBACK either", () => {

@@ -3470,20 +3470,6 @@ export function applyWidgetWrite(
           /* restore best-effort; read-back below is authoritative */
         }
       }
-      // comfyui-mcp#1707 — restore the inner definition widget only when this write
-      // could have moved it: it was written (the definition-scoped path), or it moved
-      // anyway (the instance-scoped path's own failure branch above). An instance-scoped
-      // write that left it alone must not assign it here either — the assignment is a
-      // no-op for a plain widget but a side effect for a DOM one, and rolling back a
-      // write this path never made is exactly the shared-definition touch it avoided.
-      // The read-back below still compares it against the captured clone either way.
-      if (!instanceScoped || definitionMoved) {
-        try {
-          restoreWidgetValue(w, previous);
-        } catch {
-          /* restore best-effort; read-back below is authoritative */
-        }
-      }
       if (parentWidget) {
         try {
           restoreWidgetValue(parentWidget, previousParent);
@@ -3496,6 +3482,36 @@ export function applyWidgetWrite(
       for (let i = 0; i < displayWidgets.length; i++) {
         try {
           restoreWidgetValue(displayWidgets[i], previousDisplays[i]);
+        } catch {
+          /* restore best-effort; read-back below is authoritative */
+        }
+      }
+      // comfyui-mcp#1707 — restore the inner definition widget only when this write
+      // could have moved it: it was written (the definition-scoped path), or it moved
+      // anyway (the instance-scoped path's own failure branch above). An instance-scoped
+      // write that left it alone must not assign it here either — the assignment is a
+      // no-op for a plain widget but a side effect for a DOM one, and rolling back a
+      // write this path never made is exactly the shared-definition touch it avoided.
+      // The read-back below still compares it against the captured clone either way.
+      //
+      // #2132 — LAST, after the rail and every display proxy. The only way this branch
+      // is reached on the instance-scoped path is `definitionMoved`: a rail that writes
+      // THROUGH to the inner widget. Restoring the inner first therefore rolled it back
+      // and then the rail's own restore forwarded the rail's captured value straight
+      // back onto it — leaving the SHARED definition holding a value that was neither
+      // the requested one nor the one it started with, for every sibling instance and
+      // every instance created later. It only showed when the two had diverged before
+      // the write (`previousParent !== previous`), which is why it survived as the
+      // "Rollback of inner … did not take effect" partial state in #2132 rather than as
+      // an obvious failure. Ordering the shared value last makes the forwarding write
+      // an intermediate state the inner restore then overwrites, so both stores land on
+      // their own captured values. If a shape forwards in BOTH directions the two
+      // genuinely cannot both be restored, and the read-back below still reports that
+      // as the partial state it is — with the SHARED definition, not the single rail,
+      // as the one that is made whole.
+      if (!instanceScoped || definitionMoved) {
+        try {
+          restoreWidgetValue(w, previous);
         } catch {
           /* restore best-effort; read-back below is authoritative */
         }
