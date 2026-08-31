@@ -648,6 +648,8 @@ import {
   deferChangeTrackerSnapshot,
   flushPendingChangeTrackerSnapshot,
   trackerCaptureSuppressed,
+  trackerExposesCaptureComparator,
+  trackerSnapshotBehindCanvas,
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
 import {
@@ -4477,9 +4479,20 @@ const _savePathGuardRefusalsLogged = new Set();
  *
  * TWO CONJUNCTS, both required, and the caller supplies neither by inference:
  *
- *   1. `trackerCaptureSuppressed` — upstream POSITIVELY reports it skipped the
- *      capture. Without this a save could be refused for ordinary tracker lag, which
- *      `prepareForSave` would have resolved a microsecond later.
+ *   1. UPSTREAM POSITIVELY REPORTS THAT NO CAPTURE HAPPENED — by either of two
+ *      readings, because neither covers the other:
+ *        · `trackerCaptureSuppressed` — it names a suppression window it is inside
+ *          right now. True only while that window is still OPEN.
+ *        · `trackerSnapshotBehindCanvas` (panel#2133) — `ChangeTracker.graphEqual`,
+ *          the comparator `captureCanvasState` itself uses to decide whether to
+ *          replace `activeState`, still says the snapshot differs from the live root.
+ *          Every path that reaches this wrapper has already asked for its refresh, so
+ *          a difference that survives that request means the capture was swallowed —
+ *          whichever of upstream's five early returns swallowed it, including the two
+ *          (`!app.graph`, `!isActiveTracker(this)`) the first reading cannot see.
+ *      Without conjunct 1 a save could be refused for ordinary tracker lag, which
+ *      `prepareForSave` would have resolved a microsecond later; both readings above
+ *      are taken AFTER that microsecond has passed.
  *   2. a comparison of the live root against the state about to be written ACTUALLY
  *      HAPPENED (`describeGraphStateDifference(...).comparable === true`) and the
  *      tolerant proof (`graphRootReproducesStateContent`) did not vouch for it — neither
@@ -4528,7 +4541,15 @@ function saveWouldPersistStaleSnapshot(wf, state) {
     const active = activeWorkflowRef();
     if (!active || !sameWorkflowObject(active, wf)) return false;
     const tracker = wf.changeTracker ?? null;
-    if (!tracker || !trackerCaptureSuppressed(tracker)) return false;
+    if (!tracker) return false;
+    // The CHEAP half of conjunct 1, asked before anything is serialized. Serializing
+    // the live root is the expensive step (#581: a large nested subgraph is slow enough
+    // to blow the orchestrator's reply budget), this guard runs on ComfyUI's whole save
+    // funnel, and until #2133 the flag read short-circuited it. When no flag is set AND
+    // upstream exposes no comparator, nothing can be established from either reading —
+    // so stop here, at exactly the pre-#2133 cost.
+    const suppressed = trackerCaptureSuppressed(tracker);
+    if (!suppressed && !trackerExposesCaptureComparator(tracker)) return false;
     const appRef = window.comfyAPI?.app?.app ?? (typeof app !== "undefined" ? app : null);
     const rootGraph = appRef?.rootGraph ?? appRef?.graph ?? null;
     if (typeof rootGraph?.serialize !== "function") return false;
@@ -4557,6 +4578,29 @@ function saveWouldPersistStaleSnapshot(wf, state) {
     }
     if (liveState == null) return false;
     const frozen = { serialize: () => liveState };
+    // CONJUNCT 1, off the same frozen snapshot. Either upstream names a suppression
+    // window it is inside RIGHT NOW, or upstream's own comparator says the snapshot
+    // still differs from the canvas AFTER a capture was requested — which a capture
+    // that actually ran would have fixed, because that comparison IS the test
+    // `captureCanvasState` uses to decide whether to replace `activeState`.
+    //
+    // panel#2133 — the second disjunct exists because the first is only true while the
+    // window is still OPEN. A capture swallowed a moment earlier (the deferred
+    // post-command snapshot exhausting its bounded retry chain, or `prepareForSave()`
+    // returning without capturing because `isActiveTracker` said no — a condition the
+    // three-field model cannot see at all) leaves the snapshot stranded behind the
+    // canvas with every suppression flag back to false by the time the write funnels
+    // through here. That is the reported shape: three nodes and a group added on the
+    // canvas, `panel_save_workflow` answering `saved:true`, and the file coming back
+    // after a restart with the pre-edit graph. Every path that reaches this wrapper —
+    // `workflowService.saveWorkflow`, `saveWorkflowAs`, autosave, Ctrl+S, and the
+    // panel's own in-place route — has already asked for its refresh by now, so a
+    // difference that SURVIVES that request is not the "lag `prepareForSave` resolves a
+    // microsecond later" the first disjunct is scoped around; the microsecond has
+    // passed.
+    if (!suppressed && !trackerSnapshotBehindCanvas(tracker, frozen, state)) {
+      return false;
+    }
     if (describeGraphStateDifference({ rootGraph: frozen, state })?.comparable !== true) {
       return false;
     }

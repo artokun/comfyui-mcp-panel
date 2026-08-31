@@ -8,6 +8,8 @@ import {
   deferChangeTrackerSnapshot,
   flushPendingChangeTrackerSnapshot,
   trackerCaptureSuppressed,
+  trackerExposesCaptureComparator,
+  trackerSnapshotBehindCanvas,
 } from "../../web/js/lib/change-tracker-snapshot.js";
 
 test("#581 defers the captured tracker snapshot and preserves its receiver", () => {
@@ -491,4 +493,128 @@ test("#1563 a flush upstream swallows keeps the record PENDING for the next comm
   assert.equal(flushPendingChangeTrackerSnapshot(tracker), true);
   assert.equal(tracker.activeState.generation, 1);
   assert.equal(flushPendingChangeTrackerSnapshot(tracker), false, "a LANDED flush consumes the record");
+});
+
+// ---------------------------------------------------------------------------
+// panel#2133 — `trackerSnapshotBehindCanvas`: the same question, asked in upstream's
+// own vocabulary so it covers every early return at once.
+//
+// `trackerCaptureSuppressed` above reads three of the FIVE conditions the shipped
+// frontend's `captureCanvasState` early-returns on (1.49.6 also checks `!app.graph`
+// and `!isActiveTracker(this)`, and `prepareForSave()` is ITSELF only
+// `isActiveTracker(this) && this.captureCanvasState()`). Enumerating them by name is a
+// race against a frontend this panel does not own, so this asks the question the
+// capture itself answers: `ChangeTracker.graphEqual` decides whether `activeState` gets
+// replaced, so if it still reports a difference after a refresh was requested, no
+// capture ran.
+// ---------------------------------------------------------------------------
+
+/** A tracker shaped like ComfyUI's: the comparator is a STATIC on the constructor. */
+function trackerWith(graphEqual, activeState = { nodes: [{ id: 1 }] }) {
+  class ChangeTracker {}
+  ChangeTracker.isLoadingGraph = false;
+  ChangeTracker.graphEqual = graphEqual;
+  const tracker = new ChangeTracker();
+  tracker.activeState = activeState;
+  tracker.changeCount = 0;
+  tracker._restoringState = false;
+  return tracker;
+}
+
+test("#2133 a comparator that says the snapshot differs is positive evidence", () => {
+  const seen = [];
+  const tracker = trackerWith(function (a, b) {
+    // Upstream calls it as a static; the receiver must be the constructor, not undefined.
+    assert.equal(this, tracker.constructor, "graphEqual must be called on its own class");
+    seen.push([a, b]);
+    return false;
+  });
+  const live = { nodes: [{ id: 1 }, { id: 2 }] };
+  assert.equal(trackerSnapshotBehindCanvas(tracker, { serialize: () => live }), true);
+  assert.deepEqual(seen, [[tracker.activeState, live]], "compared the snapshot against the canvas");
+});
+
+test("#2133 a comparator that says EQUAL is not evidence of a swallowed capture", () => {
+  const tracker = trackerWith(() => true);
+  assert.equal(trackerSnapshotBehindCanvas(tracker, { serialize: () => ({ nodes: [] }) }), false);
+});
+
+test("#2133 the caller's own state wins over a re-read of the tracker field", () => {
+  // The wrapper passes the EXACT state the write serializes. A record with no
+  // changeTracker falls back to `wf.activeState`, so the two can differ — and the
+  // question must be asked about the bytes that will land on disk.
+  const tracker = trackerWith((a) => a === "the-one-being-written");
+  assert.equal(
+    trackerSnapshotBehindCanvas(tracker, { serialize: () => ({ nodes: [] }) }, "the-one-being-written"),
+    false,
+  );
+  assert.equal(
+    trackerSnapshotBehindCanvas(tracker, { serialize: () => ({ nodes: [] }) }, "something-else"),
+    true,
+  );
+});
+
+test("#2133 POSITIVE EVIDENCE ONLY: everything unreadable answers false", () => {
+  const live = { serialize: () => ({ nodes: [] }) };
+  // No comparator at all (an older or renamed frontend).
+  assert.equal(trackerSnapshotBehindCanvas({ activeState: { nodes: [] } }, live), false);
+  assert.equal(trackerSnapshotBehindCanvas(null, live), false);
+  // A comparator that cannot decide. STRICTLY false is the only refusal.
+  assert.equal(trackerSnapshotBehindCanvas(trackerWith(() => undefined), live), false);
+  assert.equal(trackerSnapshotBehindCanvas(trackerWith(() => 0), live), false);
+  assert.equal(trackerSnapshotBehindCanvas(trackerWith(() => null), live), false);
+  // A comparator that throws — a custom node that replaced ChangeTracker.
+  assert.equal(
+    trackerSnapshotBehindCanvas(
+      trackerWith(() => {
+        throw new Error("boom");
+      }),
+      live,
+    ),
+    false,
+  );
+  // No root, an unserializable root, a root that answers null.
+  assert.equal(trackerSnapshotBehindCanvas(trackerWith(() => false), null), false);
+  assert.equal(trackerSnapshotBehindCanvas(trackerWith(() => false), {}), false);
+  assert.equal(
+    trackerSnapshotBehindCanvas(trackerWith(() => false), { serialize: () => null }),
+    false,
+  );
+  assert.equal(
+    trackerSnapshotBehindCanvas(trackerWith(() => false), {
+      serialize() {
+        throw new Error("a custom node exploded in a serialization hook");
+      },
+    }),
+    false,
+  );
+  // No snapshot to compare.
+  assert.equal(trackerSnapshotBehindCanvas(trackerWith(() => false, null), live), false);
+  const throwing = trackerWith(() => false);
+  Object.defineProperty(throwing, "activeState", {
+    get() {
+      throw new Error("a throwing accessor must not blow past the guard");
+    },
+  });
+  assert.equal(trackerSnapshotBehindCanvas(throwing, live), false);
+});
+
+test("#2133 trackerExposesCaptureComparator is the cheap half of the same question", () => {
+  // Split out so the save funnel can skip serializing the live root when neither
+  // reading of conjunct 1 could establish anything. It must answer for the SAME
+  // carrier `trackerSnapshotBehindCanvas` reads (the constructor static), or the
+  // early-out would skip a question that was in fact answerable.
+  assert.equal(trackerExposesCaptureComparator(trackerWith(() => false)), true);
+  assert.equal(trackerExposesCaptureComparator({ activeState: {} }), false);
+  assert.equal(trackerExposesCaptureComparator(null), false);
+  class NotAFunction {}
+  NotAFunction.graphEqual = "nope";
+  assert.equal(trackerExposesCaptureComparator(new NotAFunction()), false);
+  const throwing = {};
+  Object.defineProperty(throwing, "constructor", {
+    get() {
+      throw new Error("a throwing accessor must not blow past the guard");
+    },
+  });
+  assert.equal(trackerExposesCaptureComparator(throwing), false);
 });
