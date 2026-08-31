@@ -648,6 +648,7 @@ import {
   deferChangeTrackerSnapshot,
   flushPendingChangeTrackerSnapshot,
   trackerCaptureSuppressed,
+  trackerExposesCaptureComparator,
   trackerSnapshotBehindCanvas,
 } from "./lib/change-tracker-snapshot.js";
 import { flushSourceCanvasBeforeSwitch } from "./lib/flush-source-before-switch.js";
@@ -4541,6 +4542,14 @@ function saveWouldPersistStaleSnapshot(wf, state) {
     if (!active || !sameWorkflowObject(active, wf)) return false;
     const tracker = wf.changeTracker ?? null;
     if (!tracker) return false;
+    // The CHEAP half of conjunct 1, asked before anything is serialized. Serializing
+    // the live root is the expensive step (#581: a large nested subgraph is slow enough
+    // to blow the orchestrator's reply budget), this guard runs on ComfyUI's whole save
+    // funnel, and until #2133 the flag read short-circuited it. When no flag is set AND
+    // upstream exposes no comparator, nothing can be established from either reading —
+    // so stop here, at exactly the pre-#2133 cost.
+    const suppressed = trackerCaptureSuppressed(tracker);
+    if (!suppressed && !trackerExposesCaptureComparator(tracker)) return false;
     const appRef = window.comfyAPI?.app?.app ?? (typeof app !== "undefined" ? app : null);
     const rootGraph = appRef?.rootGraph ?? appRef?.graph ?? null;
     if (typeof rootGraph?.serialize !== "function") return false;
@@ -4589,10 +4598,7 @@ function saveWouldPersistStaleSnapshot(wf, state) {
     // difference that SURVIVES that request is not the "lag `prepareForSave` resolves a
     // microsecond later" the first disjunct is scoped around; the microsecond has
     // passed.
-    if (
-      !trackerCaptureSuppressed(tracker) &&
-      !trackerSnapshotBehindCanvas(tracker, frozen, state)
-    ) {
+    if (!suppressed && !trackerSnapshotBehindCanvas(tracker, frozen, state)) {
       return false;
     }
     if (describeGraphStateDifference({ rootGraph: frozen, state })?.comparable !== true) {

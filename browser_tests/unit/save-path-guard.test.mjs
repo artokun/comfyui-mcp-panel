@@ -41,6 +41,7 @@ import {
 import { sameWorkflowObject } from "../../web/js/lib/workflow-chat-identity.js";
 import {
   trackerCaptureSuppressed,
+  trackerExposesCaptureComparator,
   trackerSnapshotBehindCanvas,
 } from "../../web/js/lib/change-tracker-snapshot.js";
 import {
@@ -189,6 +190,7 @@ function buildInstaller() {
     "workflowSaveRefusalError",
     "activeWorkflowRef",
     "trackerCaptureSuppressed",
+    "trackerExposesCaptureComparator",
     "trackerSnapshotBehindCanvas",
     "describeGraphStateDifference",
     "graphRootReproducesStateContent",
@@ -208,6 +210,7 @@ function buildInstaller() {
         workflowSaveRefusalError,
         () => activeWorkflow,
         trackerCaptureSuppressed,
+        trackerExposesCaptureComparator,
         trackerSnapshotBehindCanvas,
         describeGraphStateDifference,
         graphRootReproducesStateContent,
@@ -892,11 +895,24 @@ test("#2133 WIRING: conjunct 1 is a DISJUNCTION at the call site, not a rewritte
   const body = source.slice(at, end);
   assert.match(
     body,
-    /!trackerCaptureSuppressed\(tracker\) &&\s*!trackerSnapshotBehindCanvas\(tracker, frozen, state\)/,
+    /!suppressed && !trackerSnapshotBehindCanvas\(tracker, frozen, state\)/,
     "either reading of 'no capture happened' must satisfy conjunct 1",
   );
+  assert.match(
+    body,
+    /const suppressed = trackerCaptureSuppressed\(tracker\);/,
+    "the flag reading is still one of the two",
+  );
+  // The cheap pre-check must not become the whole gate: a tracker that EXPOSES the
+  // comparator has to go on and ASK it, and a suppressed tracker must reach conjunct 2
+  // even when no comparator exists at all (the #1563 path, unchanged).
+  assert.match(
+    body,
+    /if \(!suppressed && !trackerExposesCaptureComparator\(tracker\)\) return false;/,
+    "the serialize-free early-out is gated on BOTH readings being unavailable",
+  );
   const frozenAt = body.indexOf("const frozen = { serialize: () => liveState };");
-  const conjunct1At = body.indexOf("!trackerSnapshotBehindCanvas(tracker, frozen, state)");
+  const conjunct1At = body.indexOf("!suppressed && !trackerSnapshotBehindCanvas(tracker, frozen, state)");
   const conjunct2At = body.indexOf("describeGraphStateDifference({ rootGraph: frozen, state })");
   assert.ok(frozenAt > 0, "the frozen snapshot must still exist");
   assert.ok(conjunct1At > frozenAt, "conjunct 1 must read the frozen snapshot");

@@ -142,7 +142,21 @@ export function trackerCaptureSuppressed(tracker) {
  * `graphEqual` is a STATIC with no `this` use, so it is called with the constructor as
  * receiver; a frontend that makes it an instance method still resolves through the
  * prototype chain and behaves the same.
+ *
+ * `trackerExposesCaptureComparator` is the CHEAP half of the same question, split out
+ * so a caller can skip the work this one needs. Answering it requires serializing the
+ * live root, and this guard sits on ComfyUI's whole save funnel — a caller with no
+ * other reason to serialize should ask this first and stop when it answers `false`,
+ * which is also exactly the pre-#2133 cost on a frontend that has no comparator.
  */
+export function trackerExposesCaptureComparator(tracker) {
+  try {
+    return typeof tracker?.constructor?.graphEqual === "function";
+  } catch {
+    return false;
+  }
+}
+
 export function trackerSnapshotBehindCanvas(tracker, rootGraph, snapshot) {
   try {
     const ctor = tracker?.constructor;

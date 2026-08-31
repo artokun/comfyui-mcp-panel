@@ -8,6 +8,7 @@ import {
   deferChangeTrackerSnapshot,
   flushPendingChangeTrackerSnapshot,
   trackerCaptureSuppressed,
+  trackerExposesCaptureComparator,
   trackerSnapshotBehindCanvas,
 } from "../../web/js/lib/change-tracker-snapshot.js";
 
@@ -596,4 +597,24 @@ test("#2133 POSITIVE EVIDENCE ONLY: everything unreadable answers false", () => 
     },
   });
   assert.equal(trackerSnapshotBehindCanvas(throwing, live), false);
+});
+
+test("#2133 trackerExposesCaptureComparator is the cheap half of the same question", () => {
+  // Split out so the save funnel can skip serializing the live root when neither
+  // reading of conjunct 1 could establish anything. It must answer for the SAME
+  // carrier `trackerSnapshotBehindCanvas` reads (the constructor static), or the
+  // early-out would skip a question that was in fact answerable.
+  assert.equal(trackerExposesCaptureComparator(trackerWith(() => false)), true);
+  assert.equal(trackerExposesCaptureComparator({ activeState: {} }), false);
+  assert.equal(trackerExposesCaptureComparator(null), false);
+  class NotAFunction {}
+  NotAFunction.graphEqual = "nope";
+  assert.equal(trackerExposesCaptureComparator(new NotAFunction()), false);
+  const throwing = {};
+  Object.defineProperty(throwing, "constructor", {
+    get() {
+      throw new Error("a throwing accessor must not blow past the guard");
+    },
+  });
+  assert.equal(trackerExposesCaptureComparator(throwing), false);
 });
