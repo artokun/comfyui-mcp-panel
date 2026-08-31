@@ -36943,14 +36943,15 @@ function buildPanel() {
    *  Audio is also kept out of the agent's inline delivery: an audio file handed
    *  over as an inline IMAGE is a perception nobody had.
    *
-   *  DELIBERATELY NOT DONE HERE: collecting ComfyUI's own `audio` output key.
-   *  onExecuted reads images/gifs/videos only, so a SaveAudio render paints
-   *  nothing in chat today and reports nothing to the agent — that is silence,
-   *  not a false claim, so it is a missing feature on this surface rather than
-   *  the #710 honesty defect. Adding it changes what appears in chat after every
-   *  audio render and touches the completion-delivery lifecycle (#269/#468), so
-   *  it belongs in its own change. Until then this branch covers a descriptor
-   *  that arrives misfiled under one of the three collected keys. */
+   *  #2126 — ComfyUI's own `audio` output key IS collected now; that change is
+   *  this one. The note that stood here called the omission "silence, not a false
+   *  claim". It was not silence. A run whose only output node was SaveAudio
+   *  buffered nothing, so execution_success took the media-less branch and told
+   *  the agent the run "produced no image or video output ... if this workflow was
+   *  meant to save a file, no output node produced one" — with the file on disk.
+   *  This branch still earns its keep for a descriptor misfiled under one of the
+   *  three image keys; one from the `audio` BAG is audio by provenance and is
+   *  never asked. */
   function isAudioOutput(m) {
     const fmt = String(m?.format || "").toLowerCase();
     if (fmt.startsWith("audio/")) return true;
@@ -42021,14 +42022,17 @@ function buildPanel() {
     // video isn't shown as a broken <img>. CompareFrames (and similar) write
     // `a_images` / `b_images` instead — those are counted as withheld, never
     // attached, so a 768-temp dump cannot flood the completion frame (#1934).
-    const { deliverable: media, withheld } = collectNodeOutputMedia(out);
-    if (!media.length && !withheld) return;
+    const { deliverable: media, audio: audioBag, withheld } = collectNodeOutputMedia(out);
+    if (!media.length && !audioBag.length && !withheld) return;
     const nodeId = d.node ?? d.display_node ?? null;
     // Viewable images (incl. animated gifs) go inline to the agent as-is. Video
     // refs are EXCLUDED here — the agent can't decode them — and instead get a
     // storyboard delivered asynchronously below.
     const inlineImages = [];
     const videos = [];
+    // #2126 — this run's audio refs. Played in chat, and reported to the agent by
+    // NAME on the completion frame; never added to inlineImages (see below).
+    const audios = [];
     // #1834 — the still cards' cache key: the id the completion frame's probes
     // will bust with, derived the way the tracker derives it. It runs BOTH of
     // the tracker's steps, because either one alone puts the card on a
@@ -42067,8 +42071,10 @@ function buildPanel() {
         // Played, never painted as an image — and deliberately NOT added to
         // inlineImages: that list is delivered to the agent as inline image
         // blocks, so audio there would be both a broken picture and a claim of
-        // something the agent cannot perceive (#710).
+        // something the agent cannot perceive (#710). It IS reported by NAME on
+        // the completion frame (#2126), which is the honest half.
         if (chatMediaOn) paintAudio(url, m.filename);
+        audios.push(m);
       } else {
         // #1834 — THE CARD's URL is the one that has to be unique, not just the
         // metadata probe's. `/view?filename=…` is stable across runs, and a
@@ -42092,6 +42098,18 @@ function buildPanel() {
         inlineImages.push(m);
       }
     }
+    // ComfyUI's own `audio` bag (#2126). SaveAudio / SaveAudioMP3 / SaveAudioOpus /
+    // SaveAudioAdvanced / PreviewAudio all serialise through SavedAudios.as_dict()
+    // — `{ audio: [ {filename, subfolder, type} ] }` — so this one key covers every
+    // core audio output node. Kind is settled by PROVENANCE, not by isAudioOutput:
+    // the bag already said what these are, and a file whose extension that regex
+    // does not list would otherwise fall through to paintImage — #710 on a third
+    // surface. No cache-bust: audio has no poster/probe pair to keep on one URL.
+    for (const m of audioBag) {
+      if (!m || !m.filename) continue;
+      if (chatMediaOn) paintAudio(imageViewUrl(m), m.filename);
+      audios.push(m);
+    }
     // Buffer this run's outputs (images AND videos) instead of delivering per
     // node — the tracker flushes them together as ONE completion when the prompt
     // AUTHORITATIVELY finishes (execution_success / queue idle). Everything is
@@ -42099,14 +42117,19 @@ function buildPanel() {
     // deferred+grouped. Routing videos through the SAME lifecycle (rather than a
     // per-node timer) is what gives a video its real start→finish duration and
     // guarantees exactly one completion per prompt (#269/#468).
-    if (inlineImages.length || videos.length || withheld) {
-      runCompletion.onExecuted(d.prompt_id, { images: inlineImages, videos, withheld });
+    if (inlineImages.length || videos.length || audios.length || withheld) {
+      runCompletion.onExecuted(d.prompt_id, {
+        images: inlineImages,
+        videos,
+        audio: audios,
+        withheld,
+      });
     }
     // #1286 — ComfyUI keys preview images by node id and will plant
     // $$canvas-image-preview on whatever node now holds that id (a freshly
     // added ConditioningConcat after a live-canvas edit). Keep the preview
     // on the emitting image/output node.
-    if (media.length) {
+    if (media.length || audioBag.length) {
       stripMisattachedExecutionPreviews({
         graph: app?.graph,
         nodeOutputs: app?.nodeOutputs,

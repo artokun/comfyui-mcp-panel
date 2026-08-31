@@ -1,4 +1,4 @@
-import { collectNodeOutputMedia, mergeWithheldMedia } from "./node-output-media.js";
+import { collectNodeOutputMedia, mergeAudioMedia, mergeWithheldMedia } from "./node-output-media.js";
 
 // Parse a ComfyUI `/history/<prompt_id>` entry into a terminal completion batch.
 //
@@ -21,13 +21,15 @@ import { collectNodeOutputMedia, mergeWithheldMedia } from "./node-output-media.
  *   status:{status_str?, completed?} }`. Pass `null` when absent. Extra keys
  *   ending in images/gifs/videos (CompareFrames `a_images`/`b_images`) are
  *   counted on `withheld` and never copied into `images`/`videos` (#1934).
+ *   ComfyUI's own `audio` bag comes back on `audio` — never on `images`, or a
+ *   recovered SaveAudio run would reach the agent as an inline image (#2126/#710).
  * @param {object}   [opts]
  * @param {(m:object)=>boolean} [opts.isVideo]  Classifies an output ref as video
  *   (else still image), matching the live path's classification.
  * @param {() => number} [opts.now]  Clock (epoch ms) used ONLY to reject a
  *   timestamp implausibly far in the future. Injectable for tests.
  * @returns {null | { terminal:boolean, status:("success"|"error"|"interrupted"|"unknown"),
- *   images:object[], videos:{m:object,nodeId:string}[],
+ *   images:object[], videos:{m:object,nodeId:string}[], audio:object[],
  *   withheld:({ count:number, keys:string[], types:string[] }|null),
  *   startedAt:(number|null), finishedAt:(number|null) }}
  *   `null` when there's no usable entry. `startedAt`/`finishedAt` are epoch ms
@@ -63,12 +65,14 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
 
   const images = [];
   const videos = [];
+  let audio = [];
   let withheld = null;
   const outputs = entry.outputs && typeof entry.outputs === "object" ? entry.outputs : {};
   for (const [nodeId, out] of Object.entries(outputs)) {
     if (!out || typeof out !== "object") continue;
     const collected = collectNodeOutputMedia(out);
     withheld = mergeWithheldMedia(withheld, collected.withheld);
+    if (collected.audio.length) audio = mergeAudioMedia(audio, collected.audio);
     for (const m of collected.deliverable) {
       if (typeof isVideo === "function" && isVideo(m)) videos.push({ m, nodeId: String(nodeId) });
       else images.push(m);
@@ -87,6 +91,7 @@ export function parseHistoryEntry(entry, { isVideo, now = () => Date.now() } = {
     status: isError ? "error" : isInterrupted ? "interrupted" : isSuccess ? "success" : "unknown",
     images,
     videos,
+    audio,
     withheld,
     startedAt,
     finishedAt,

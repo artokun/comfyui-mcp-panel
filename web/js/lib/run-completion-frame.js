@@ -25,7 +25,7 @@
 import { duplicateCompletionNote } from "./completion-dedupe.js";
 import { withTimeout } from "./bounded-step.js";
 import { completionCompositionDiagnostic } from "./completion-delivery-diagnostics.js";
-import { formatWithheldMediaNote } from "./node-output-media.js";
+import { formatAudioMediaNote, formatWithheldMediaNote } from "./node-output-media.js";
 import {
   appendImageCacheBust,
   appendStoryboardCacheBust,
@@ -51,8 +51,8 @@ export const STILLS_METADATA_TIMEOUT_MS = 1000;
  * prompt. Resolves to the frame that was sent (for tests), or null when the
  * batch was empty (no frame emitted).
  *
- * @param {{promptId:(string|null), images?:any[], videos?:any[], durationMs:(number|null),
- *   finishedAt?:(number|null), reconciled?:boolean,
+ * @param {{promptId:(string|null), images?:any[], videos?:any[], audio?:any[],
+ *   durationMs:(number|null), finishedAt?:(number|null), reconciled?:boolean,
  *   withheld?:({ count:number, keys:string[], types:string[] }|null)}} payload
  *   `finishedAt` is epoch ms of the run's REAL finish; `reconciled` marks a
  *   completion recovered from /history rather than observed live (#1199).
@@ -64,6 +64,7 @@ export async function composeRunCompletionFrame(
     promptId,
     images = [],
     videos = [],
+    audio = [],
     durationMs,
     noMedia = false,
     duplicateOf = null,
@@ -264,6 +265,24 @@ export async function composeRunCompletionFrame(
     );
   }
 
+  // #2126 — the run's AUDIO outputs. Named, never attached: the frame's `images`
+  // are inline image blocks and an audio file delivered as one is a broken picture
+  // plus a perception nobody had (#710). Pushed here for the same structural
+  // reason the withheld note is: it is CONTENT, so it stops an audio-only run
+  // falling through to "produced no image or video output ... no output node
+  // produced one" — which is not merely unhelpful, it is false when a SaveAudio
+  // node wrote a file. That false report IS the reported defect.
+  const audioRefs = (Array.isArray(audio) ? audio : []).filter((m) => m && m.filename);
+  if (audioRefs.length) {
+    const audioNote = formatAudioMediaNote({
+      audio: audioRefs,
+      promptId,
+      durationSuffix: took,
+      attached: outImages.length > 0 || !!withheldSummary,
+    });
+    if (audioNote) noteSections.push(audioNote);
+  }
+
   // #356 Bug 2 — a run that finished with no image and no video still has to be
   // REPORTED when the agent was told to wait for it. panel_run's reply says "you
   // will be notified automatically — do NOT poll — end your turn now and wait", so
@@ -304,16 +323,24 @@ export async function composeRunCompletionFrame(
     kind: "executed",
     images: outImages,
     note: noteSections.join("\n\n"),
-    metadata: withheldSummary && !outImages.length
+    metadata: audioRefs.length && !outImages.length && !withheldSummary
       ? [{
-          outputs: "withheld",
-          reason: "media_budget",
-          count: withheldSummary.count,
-          keys: withheldSummary.keys,
-          types: withheldSummary.types,
+          outputs: "audio",
+          reason: "not_audible",
+          count: audioRefs.length,
+          files: audioRefs.map((m) => String(m.filename)),
           ...recoveryMetadata(),
         }]
-      : metadata,
+      : withheldSummary && !outImages.length
+        ? [{
+            outputs: "withheld",
+            reason: "media_budget",
+            count: withheldSummary.count,
+            keys: withheldSummary.keys,
+            types: withheldSummary.types,
+            ...recoveryMetadata(),
+          }]
+        : metadata,
     completion_diagnostics: completionDiagnostics(),
     // Machine-readable attribution: which prompt this completion belongs to, so
     // a delayed prior-run flush can never be mistaken for the current run (#224).
