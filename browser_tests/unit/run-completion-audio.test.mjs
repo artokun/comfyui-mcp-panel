@@ -46,6 +46,7 @@ import {
 import { parseHistoryEntry } from "../../web/js/lib/history-reconcile.js";
 import { createRunCompletionTracker, NO_PROMPT_KEY } from "../../web/js/lib/run-completion.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
+import { createRunCompletionFlushHandler } from "../../web/js/lib/run-completion-delivery.js";
 import { chatMediaEnabled } from "../../web/js/lib/chat-media-inflow.js";
 import {
   appendImageCacheBust,
@@ -382,4 +383,58 @@ test("#2126 a reconciled panel-queued audio run carries its refs to the flush", 
   assert.equal(h.flushes.length, 1, "the /history safety net must recover an audio run");
   assert.equal(h.flushes[0].audio?.length, 1);
   assert.deepEqual(h.flushes[0].images, []);
+});
+
+// ---------------------------------------------------------------------------
+// 6. End to end through the SHIPPED wiring — tracker + delivery handler.
+//
+// Sections 3 and 4 test the two halves separately, and each would still pass if
+// the handler between them dropped `audio` on the floor: a one-line pass-through
+// is invisible to a helper-level test. This drives the same composition the panel
+// installs at comfyui-mcp-panel.js's `onFlush: createRunCompletionFlushHandler({…})`
+// and asserts on the frame that actually reaches the transport.
+// ---------------------------------------------------------------------------
+
+async function settle(turns = 6) {
+  for (let i = 0; i < turns; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+test("#2126 the frame that reaches the transport names the audio", async () => {
+  const sent = [];
+  let tracker;
+  const onFlush = createRunCompletionFlushHandler({
+    sendFrame: (frame) => (sent.push(frame), true),
+    markDelivered: (promptId, completionKey) => tracker.markDelivered(promptId, completionKey),
+    markUndelivered: (promptId, completionKey) => tracker.markUndelivered(promptId, completionKey),
+    pruneRebootMarker: () => {},
+    coerceMessageText: (v) => (v == null ? "" : String(v)),
+    formatDuration: (ms) => (ms == null ? null : `${Math.round(ms / 1000)}s`),
+    formatClock: () => "12:00:00",
+    imageViewUrl: (m) => `view://${m?.filename ?? "x"}`,
+    fetchImageBytes: async () => 2048,
+    fetchImageDimensions: async () => ({ w: 512, h: 512 }),
+    humanizeBytes: (n) => (n == null ? null : `${n} B`),
+    buildVideoStoryboard: async () => null,
+    uploadBlobToInput: async (_blob, name, opts) => ({ filename: name, type: opts?.type || "input" }),
+    storyboardFrameCount: () => 20,
+    paintImage: () => {},
+    applyVideoPoster: () => {},
+    videoStoryboardEnabled: false,
+    agentReceivesImages: () => true,
+    isAgentMuted: () => false,
+    warn: () => {},
+  });
+  tracker = createRunCompletionTracker({ onFlush, setTimer: () => 0, clearTimer: () => {} });
+
+  const P = "prompt-wired";
+  tracker.onQueued(P);
+  tracker.onExecutionStart(P);
+  tracker.onExecuted(P, { audio: SAVE_AUDIO_OUTPUT.audio });
+  tracker.onExecutionSuccess(P);
+  await settle();
+
+  assert.equal(sent.length, 1, "one completion frame reaches the transport");
+  assert.match(sent[0].note, /ComfyUI_00007_\.flac/, "the audio must survive the delivery handler");
+  assert.doesNotMatch(sent[0].note, /no output node produced one/);
+  assert.deepEqual(sent[0].images, []);
 });
