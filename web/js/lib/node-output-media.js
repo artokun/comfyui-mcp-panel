@@ -439,9 +439,14 @@ function getImageRefClause(ref) {
 /**
  * Agent-facing note for a run's 3D MODEL outputs (#2128). Name them; attach none.
  *
- * Says three things the reported message got wrong, and nothing more. A saved
- * output node DID run; a real file WAS written; and a `SaveImage` node could not
- * have persisted it, because the payload is a mesh, not an image.
+ * Retires the three claims the reported message made, and asserts nothing beyond
+ * them: an output node DID run, it produced a file that is named here, and a
+ * `SaveImage` node could not have persisted it because the payload is a mesh.
+ *
+ * It does NOT say the file was saved BY THIS RUN. `Preview3D` handed a literal path
+ * passes it through without writing anything, and the outputs bag cannot tell that
+ * apart from a `Save3DAdvanced` write — so a provenance claim would be a new false
+ * statement of exactly the class this note exists to remove.
  *
  * Like the audio note it claims nothing about the chat — a `/history` reconcile
  * paints no card at all — and it states plainly that the agent has not seen the
@@ -487,7 +492,7 @@ export function formatModel3dMediaNote({
     : ` This IS the completion you were told to wait for — nothing further is coming, so do not ` +
       `keep waiting for media.`;
   return (
-    `\u{1F9CA} ${lead} This is the run's saved result. The model is NOT attached to this frame ` +
+    `\u{1F9CA} ${lead} The model is NOT attached to this frame ` +
     `and you have not seen it, so do not describe its shape, topology, materials or quality. ` +
     `Adding a SaveImage node would NOT persist it — the payload is a mesh, not an image.` +
     fetchClause +

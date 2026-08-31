@@ -36,9 +36,14 @@
 // not why a mesh is held back).
 //
 // And buildStillsSegment stops inferring a claim about the whole RUN from a strict
-// subset of its outputs. It is now told which non-image outputs were saved, which
+// subset of its outputs. It is now told which non-image outputs the run produced, which
 // fixes the #2126 sibling too: audio + preview taps produced the same false sentence
 // after that fix landed, because #2126 only covered the media-less path.
+//
+// What it deliberately does NOT say is that THIS RUN saved the file. `Preview3D` handed
+// a literal path passes it through without writing anything, and the bag cannot tell
+// that apart from a `Save3DAdvanced` write — so the note names the output and refuses
+// the SaveImage advice, and asserts no provenance beyond that.
 //
 // Delete any single wire below and one of these fails: the collection (1), the panel
 // call site (2), the tracker's buffer/flush (3), the composer's two notes (4), the
@@ -403,7 +408,7 @@ test("#2128 THE REPORTED FRAME — previews plus a .glb no longer claims nothing
   );
   // What it says instead: the previews ARE previews, but a final result was saved.
   assert.match(frame.note, /previews \(temporary, not a final file\)/);
-  assert.match(frame.note, /DID save a final result: 1 3D model output/);
+  assert.match(frame.note, /also produced 1 3D model output/);
   assert.match(frame.note, /PROP_crate_00001\.glb/);
   assert.match(frame.note, /Do NOT add a SaveImage node/);
   // Named, never attached — and the 7 taps still go for vision.
@@ -440,6 +445,32 @@ test("#2128 a 3D-only run is not reported as producing nothing", async () => {
   assert.equal(frame.metadata[0].outputs, "model_3d");
   assert.equal(frame.metadata[0].reason, "not_viewable");
   assert.deepEqual(frame.metadata[0].files, ["ComfyUI_00001_.glb"]);
+});
+
+test("#2128 the note never claims THIS RUN saved the file", async () => {
+  // Codex merge-gate P1, round 2. `Preview3D` handed a literal path string passes it
+  // through and writes nothing, and the outputs bag cannot tell that apart from a
+  // Save3DAdvanced write. So the completion may say the run PRODUCED a 3D output and
+  // name it — both true of every shape — but must not assert provenance it cannot
+  // have, or the fix reintroduces its own defect class one node over.
+  const sent = [];
+  const frame = await composeRunCompletionFrame(
+    {
+      promptId: "p-provenance",
+      images: PREVIEW_TAPS,
+      videos: [],
+      models3d: collectNodeOutputMedia(SAVE_3D_ADVANCED).models3d,
+      durationMs: 1000,
+    },
+    frameDeps(sent),
+  );
+  assert.doesNotMatch(frame.note, /DID save/i);
+  assert.doesNotMatch(frame.note, /run's saved result/i);
+  assert.doesNotMatch(frame.note, /saved a final/i);
+  // What it still does say — the part that retires the reported claims.
+  assert.match(frame.note, /also produced 1 3D model output/);
+  assert.match(frame.note, /PROP_crate_00001\.glb/);
+  assert.match(frame.note, /Do NOT add a SaveImage node/);
 });
 
 test("#2128 a genuinely preview-only run keeps the original advice", async () => {
@@ -498,7 +529,7 @@ test("#2128 the SIBLING defect — audio plus preview taps stopped claiming noth
     frameDeps(sent),
   );
   assert.doesNotMatch(frame.note, /no saved output node ran/);
-  assert.match(frame.note, /DID save a final result: 1 audio output/);
+  assert.match(frame.note, /also produced 1 audio output/);
 });
 
 test("#2128 a run saving BOTH a mesh and audio names both kinds", async () => {

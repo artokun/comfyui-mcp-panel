@@ -579,11 +579,16 @@ async function buildStillsSegment(bufImages, deps) {
     // `PreviewImage` taps upstream, and the remedy it named cannot work: SaveImage
     // takes an IMAGE, and the payload is a `FILE_3D_GLB`. Say what ran instead, and
     // let the note for that output name the file.
+    // Deliberately says PRODUCED, not "saved". The outputs bag cannot distinguish a
+    // `Save3DAdvanced` from a `Preview3D` handed a literal path it passes through
+    // without writing anything, so a provenance claim here would be a new false
+    // statement of the same class. "Produced" is true of every shape, and it is
+    // already enough to retire all three claims the issue reported.
     const saved = summariseNonImageOutputs(nonImageOutputKinds);
     note = saved
-      ? `Run finished — ${previewClause}. But the run DID save a final result: ` +
-        `${saved} (named below in this completion). Do NOT add a SaveImage node — the ` +
-        `saved output is not an image, so SaveImage cannot persist it.`
+      ? `Run finished — ${previewClause}. The run also produced ${saved} (named below in ` +
+        `this completion), so these previews are not its only output. Do NOT add a ` +
+        `SaveImage node — that output is not an image, so SaveImage cannot persist it.`
       : `Run finished, but no saved output node ran — ${previewClause}. ` +
         `Add a SaveImage node to persist the result, or treat the preview as the result if that's intended.`;
   }
