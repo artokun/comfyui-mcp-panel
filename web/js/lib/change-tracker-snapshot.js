@@ -68,7 +68,12 @@ function warnMissingOwnershipOnce() {
 /**
  * Did upstream POSITIVELY tell us this capture was a no-op? (panel#1563)
  *
- * Reads the three fields `captureCanvasState`'s own early return reads. It is
+ * Reads three of the five conditions `captureCanvasState`'s own early return reads.
+ * The two it does NOT read — `!app.graph` and `!isActiveTracker(this)` — need objects
+ * this dependency-light module is not given, and enumerating them by name is a race
+ * against a frontend this panel does not own; `trackerSnapshotBehindCanvas` below
+ * answers the same question from upstream's own comparator instead, for every
+ * suppression condition at once (panel#2133). It is
  * deliberately POSITIVE-evidence-only — an unrecognised tracker answers `false`,
  * not `true` — because the one caller that acts on it here RETRIES, and retrying
  * forever on a frontend whose fields were renamed would be a busy loop that no
@@ -94,6 +99,85 @@ export function trackerCaptureSuppressed(tracker) {
     if (Number(tracker?.changeCount) > 0) return true; // inside a change transaction
     if (tracker?.constructor?.isLoadingGraph) return true; // a graph is loading
     return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Did UPSTREAM'S OWN comparator say this snapshot is behind the canvas? (panel#2133)
+ *
+ * `trackerCaptureSuppressed` above models three of `captureCanvasState`'s early
+ * returns. MEASURED against the shipped bundle (comfyui-frontend 1.49.6,
+ * `settingStore-CwkLtSKP.js`) there are FIVE:
+ *
+ *     captureCanvasState(){
+ *       let e=this._restoringState,t=this.changeCount>0;
+ *       if(!$.graph||t||e||ChangeTracker.isLoadingGraph)return;
+ *       if(!isActiveTracker(this)){reportInactiveTrackerCall(...);return}
+ *       ...
+ *     }
+ *
+ * — so `!app.graph` and `!isActiveTracker(this)` are swallowed captures the panel's
+ * three-field model reports as "not suppressed". `prepareForSave()` is itself only
+ * `isActiveTracker(this) && this.captureCanvasState()`, so the second of those makes
+ * the refresh a complete no-op with no signal at all. Chasing each new condition by
+ * name is the wrong shape of fix: it is a race against a frontend this panel does not
+ * own, and the LOSS it guards (a save reporting success over a file that is missing
+ * the canvas's work) is the same whatever swallowed the call.
+ *
+ * So ask the question upstream itself answers. `captureCanvasState` replaces
+ * `activeState` exactly when `ChangeTracker.graphEqual(activeState, rootGraph.serialize())`
+ * is false. If that static — reached off the tracker's own constructor, the same way
+ * `isLoadingGraph` is — still answers `false` AFTER a capture has been requested, then
+ * a capture that actually ran would have replaced the snapshot, and the one that was
+ * requested did not. That is positive evidence of a swallowed capture, expressed in
+ * upstream's own vocabulary, and it needs no knowledge of WHY.
+ *
+ * POSITIVE EVIDENCE ONLY, like its sibling: an unreachable `graphEqual`, an
+ * unserializable root, an absent snapshot, or a throw from either answers `false`.
+ * A guard that cannot read its evidence must never invent a refusal (#1563 r2) —
+ * and this one gates ComfyUI's whole save funnel, autosave and Ctrl+S included.
+ *
+ * `graphEqual` is a STATIC with no `this` use, so it is called with the constructor as
+ * receiver; a frontend that makes it an instance method still resolves through the
+ * prototype chain and behaves the same.
+ */
+export function trackerSnapshotBehindCanvas(tracker, rootGraph, snapshot) {
+  try {
+    const ctor = tracker?.constructor;
+    const graphEqual = ctor?.graphEqual;
+    if (typeof graphEqual !== "function") return false;
+    if (typeof rootGraph?.serialize !== "function") return false;
+    // The caller passes the EXACT state the write will serialize, so this question and
+    // the write can never be looking at different objects; `undefined` (no opinion)
+    // falls back to the tracker's own field, which is what upstream compares.
+    let state = snapshot;
+    if (state === undefined) {
+      try {
+        state = tracker.activeState;
+      } catch {
+        return false;
+      }
+    }
+    if (state == null) return false;
+    let live;
+    try {
+      live = rootGraph.serialize();
+    } catch {
+      return false;
+    }
+    if (live == null) return false;
+    let equal;
+    try {
+      equal = graphEqual.call(ctor, state, live);
+    } catch {
+      return false;
+    }
+    // STRICTLY false. A comparator that answers `undefined` (renamed, stubbed, or
+    // unable to decide) has established nothing, and reading that as "behind" would
+    // refuse every save on a frontend whose shape this panel does not recognise.
+    return equal === false;
   } catch {
     return false;
   }
