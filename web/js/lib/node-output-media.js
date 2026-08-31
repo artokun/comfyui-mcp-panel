@@ -98,22 +98,41 @@ const MODEL_3D_EXTENSIONS = new Set([
 const MODEL_3D_NOTE_NAME_LIMIT = 6;
 
 /**
- * Turn a bare `result` path string into a `/view` descriptor, or null.
+ * A SAVED 3D output's filename, as `get_save_image_path` names it.
+ *
+ * `_save_file3d_to_output` builds `f"{filename}_{counter:05}.{ext}"`, so a genuinely
+ * saved file ALWAYS ends in an underscore, at least five digits, and the extension.
+ * That is the whole discriminator, and it has to exist because the `result` bag is
+ * shared by nodes that save and nodes that only preview:
+ *
+ *   Save3DAdvanced / SaveGaussianSplat / SavePointCloud
+ *     → `PROP_crate_00001.glb`, in output/           ← a real saved result
+ *   Preview3DAdvanced      → `preview3d_advanced_<32 hex>.glb`, in TEMP/
+ *   PreviewGaussianSplat   → `preview_splat_<32 hex>.ply`,      in TEMP/
+ *   PreviewPointCloud      → `preview_pointcloud_<32 hex>.ply`, in TEMP/
+ *   Preview3D              → `preview3d_<32 hex>.glb` in output/, or, when handed a
+ *                            literal path string, that string passed through unchanged
+ *
+ * Reporting any of those five as the run's saved result would be the very defect this
+ * change exists to remove, one node over: `Preview3DAdvanced` is documented as
+ * previewing "without saving it to the ComfyUI output directory", its file is swept
+ * with temp/, and a `/view?type=output` for it 404s. A 32-hex uuid cannot end in
+ * `_<5+ digits>.<ext>` (the hex is one unbroken run with no underscore), and a
+ * user-supplied passthrough path does not carry a save counter either, so all five are
+ * excluded by the same test — and a saved output can never be missed by it, because
+ * ComfyUI has no other way to name one.
+ *
+ * `type` is then `"output"` unconditionally, which is now sound rather than a
+ * near-certainty: every node that produces this naming writes to
+ * `folder_paths.get_output_directory()`.
  *
  * Splits on BOTH separators. `get_save_image_path` derives the subfolder with
- * `os.path.dirname(os.path.normpath(prefix))`, and on Windows `normpath` rewrites
- * `/` to `\` — so a nested prefix like `3D/props/PROP` yields `"3D\\props"`, which
- * the node then joins to the filename with a forward slash. One emitted string can
- * therefore carry both.
- *
- * `type` is reported as `"output"` because every core node that emits this shape
- * writes to `folder_paths.get_output_directory()`: the three Save-3D nodes
- * unconditionally, and `Preview3D` whenever it materialises a `File3D`. The one
- * shape where that is wrong is `Preview3D` handed a literal path string, which it
- * passes through unchanged — there the file may sit under `input/`. That costs a
- * `get_image` call that 404s and can be retried, against the alternative of staying
- * silent and telling the agent to re-run a 15-minute job.
+ * `os.path.dirname(os.path.normpath(prefix))`, and on Windows `normpath` rewrites `/`
+ * to `\` — so a nested prefix like `3D/props/PROP` yields `"3D\\props"`, which the node
+ * then joins to the filename with a forward slash. One emitted string can carry both.
  */
+const SAVED_3D_FILENAME = /_\d{5,}\.[A-Za-z0-9]+$/;
+
 function model3dRefFromResultEntry(entry) {
   if (typeof entry !== "string") return null;
   const path = entry.trim();
@@ -124,6 +143,7 @@ function model3dRefFromResultEntry(entry) {
   const dot = filename.lastIndexOf(".");
   if (dot <= 0) return null;
   if (!MODEL_3D_EXTENSIONS.has(filename.slice(dot + 1).toLowerCase())) return null;
+  if (!SAVED_3D_FILENAME.test(filename)) return null;
   return { filename, subfolder: segments.join("/"), type: "output" };
 }
 

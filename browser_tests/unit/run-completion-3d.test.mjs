@@ -121,18 +121,55 @@ test("#2128 the result siblings are not mistaken for files", () => {
   assert.deepEqual(collectNodeOutputMedia({ result: "nope" }).models3d, []);
   assert.deepEqual(collectNodeOutputMedia({ result: ["notes.txt", "readme"] }).models3d, []);
   assert.deepEqual(collectNodeOutputMedia(null).models3d, []);
+  // The extension allowlist carries its own weight, independently of the save-counter
+  // test: a file that IS saved output-shaped but is not a mesh must not be announced
+  // as a 3D model. Without the allowlist this PNG would be.
+  assert.deepEqual(
+    collectNodeOutputMedia({ result: ["3D/render_00001.png"] }).models3d,
+    [],
+    "a save-counter name with a non-3D extension is not a mesh",
+  );
+  assert.deepEqual(collectNodeOutputMedia({ result: ["out/clip_00001.mp4"] }).models3d, []);
 });
 
 test("#2128 every core 3D save format is admitted", () => {
   // The formats the three Save-3D nodes declare on their `model_3d` socket, which is
-  // what `_save_file3d_to_output` names the file with (`model_3d.format`).
+  // what `_save_file3d_to_output` names the file with (`model_3d.format`). Names are
+  // production-shaped — `f"{filename}_{counter:05}.{ext}"`.
   for (const ext of ["glb", "gltf", "obj", "fbx", "stl", "usdz", "ply", "splat", "spz", "ksplat"]) {
-    const got = collectNodeOutputMedia({ result: [`3d/mesh.${ext}`] });
+    const got = collectNodeOutputMedia({ result: [`3d/mesh_00001.${ext}`] });
     assert.equal(got.models3d.length, 1, `.${ext} must be reported`);
   }
-  // Case-insensitively, since the extension comes from a user-set filename_prefix
-  // via the node's declared format.
-  assert.equal(collectNodeOutputMedia({ result: ["3d/MESH.GLB"] }).models3d.length, 1);
+  assert.equal(collectNodeOutputMedia({ result: ["3d/MESH_00001.GLB"] }).models3d.length, 1);
+  // A counter past 99999 widens rather than wraps.
+  assert.equal(collectNodeOutputMedia({ result: ["3d/mesh_123456.glb"] }).models3d.length, 1);
+});
+
+test("#2128 a TEMP 3D preview is never reported as the run's saved result", () => {
+  // The `result` bag is shared by nodes that SAVE and nodes that only PREVIEW.
+  // Preview3DAdvanced, PreviewGaussianSplat and PreviewPointCloud all write to
+  // folder_paths.get_temp_directory() and emit the identical {"result":[...]} shape.
+  // Reporting one as a saved final would be this very defect one node over — the file
+  // is swept with temp/ and a /view?type=output for it 404s.
+  //
+  // The discriminator is the save counter: `_save_file3d_to_output` names every saved
+  // file `_{counter:05}.{ext}`, which a 32-hex uuid cannot produce.
+  for (const name of [
+    "preview3d_advanced_9f3ab27c4d1e4f8ab0c5d6e7f8a9b0c1.glb", // Preview3DAdvanced → temp/
+    "preview_splat_9f3ab27c4d1e4f8ab0c5d6e7f8a9b0c1.ply", // PreviewGaussianSplat → temp/
+    "preview_pointcloud_9f3ab27c4d1e4f8ab0c5d6e7f8a9b0c1.ply", // PreviewPointCloud → temp/
+    "preview3d_9f3ab27c4d1e4f8ab0c5d6e7f8a9b0c1.glb", // Preview3D → output/, still a preview
+  ]) {
+    assert.deepEqual(
+      collectNodeOutputMedia({ result: [name] }).models3d,
+      [],
+      `${name} is a preview, not a saved output`,
+    );
+  }
+  // Preview3D handed a LITERAL path passes it through unchanged and saves nothing;
+  // it carries no save counter either, so the same test excludes it.
+  assert.deepEqual(collectNodeOutputMedia({ result: ["3d/my_model.glb"] }).models3d, []);
+  assert.deepEqual(collectNodeOutputMedia({ result: ["C:/assets/crate.glb"] }).models3d, []);
 });
 
 test("#2128 a Windows subfolder separator is split correctly", () => {
@@ -514,14 +551,24 @@ test("#2128 parseHistoryEntry returns 3D on its own channel, never as an image",
 });
 
 test("#2128 one prompt naming the same file from two nodes reports it once", () => {
-  const parsed = parseHistoryEntry({
-    status: { status_str: "success", messages: [] },
-    outputs: {
-      1: { "3d": [{ filename: "m.glb", subfolder: "3d", type: "output" }] },
-      2: { result: ["3d/m.glb"] },
-    },
+  // Both bags normalise to the identical /view identity, so the merge must collapse
+  // them. Guarded against going vacuous: each bag ALONE yields one ref, and a
+  // genuinely different file yields two — so a `1` here is the merge, not an
+  // admission rule quietly rejecting one side.
+  const glbKey = { "3d": [{ filename: "PROP_crate_00001.glb", subfolder: "3D", type: "output" }] };
+  const resultKey = { result: ["3D/PROP_crate_00001.glb"] };
+  assert.equal(collectNodeOutputMedia(glbKey).models3d.length, 1, "the 3d bag alone admits one");
+  assert.equal(collectNodeOutputMedia(resultKey).models3d.length, 1, "the result bag alone admits one");
+
+  const status = { status_str: "success", messages: [] };
+  const same = parseHistoryEntry({ status, outputs: { 1: glbKey, 2: resultKey } });
+  assert.equal(same.models3d.length, 1, "merged on the /view identity");
+
+  const different = parseHistoryEntry({
+    status,
+    outputs: { 1: glbKey, 2: { result: ["3D/PROP_crate_00002.glb"] } },
   });
-  assert.equal(parsed.models3d.length, 1, "merged on the /view identity");
+  assert.equal(different.models3d.length, 2, "two distinct files stay two");
 });
 
 test("#2128 a reconciled panel-queued 3D run carries its refs to the flush", async () => {
