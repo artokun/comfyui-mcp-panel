@@ -198,7 +198,7 @@ function harness({ workflow = null, readable = true, bindingVerdict = null } = {
   const rootGraph = { _nodes: [] };
   const app = {};
   const canvas = {};
-  const calls = { asserted: 0 };
+  const calls = { asserted: 0, assertOpts: null, freshReads: 0 };
   return {
     rootGraph,
     calls,
@@ -208,15 +208,21 @@ function harness({ workflow = null, readable = true, bindingVerdict = null } = {
       sameWorkflowObject,
       getGraphCtx: () => ({ app, graph: rootGraph, rootGraph, canvas, LG: {} }),
       probeActiveWorkflow: () => ({ workflow, readable }),
-      activeWorkflowRef: () => workflow,
+      // Any read taken OUTSIDE the two probes is a fresh sample of the same
+      // surface — the gate r2 P1. Counted so a test can assert there are none.
+      activeWorkflowRef: () => {
+        calls.freshReads += 1;
+        return workflow;
+      },
       // The #646 reconnect gate is not what this test is about; it must stay
       // wired (reconnect-recovery.test.mjs pins that) but answer "no refusal".
       graphMutationReconnectGate: () => null,
       comfyBackendIsDown: () => false,
       postReconnectBindingSettleWindow: () => false,
       reconnectRefusalError: (gate) => new Error(`reconnect-refusal:${gate}`),
-      assertGraphBoundToActiveWorkflow: () => {
+      assertGraphBoundToActiveWorkflow: (_graph, _rootGraph, opts) => {
         calls.asserted += 1;
+        calls.assertOpts = opts;
         if (bindingVerdict) throw new Error(bindingVerdict);
       },
       MUTATION_BINDING_BAR: { requireDirtyMutationBinding: true },
@@ -234,6 +240,47 @@ test("#2125 call site: graph_add_node's revalidation admits a canvas whose workf
 
   assert.equal(current.rootGraph, h.rootGraph, "the node is committed to the canvas that was captured");
   assert.equal(h.calls.asserted, 1, "and the binding bar still ran — the gate was admitted, not skipped");
+});
+
+test("#2125 gate r2: the binding assert decides on the probe, not a third fresh read", () => {
+  // The gate's r2 P1. Admitting a PROVEN absence at the comparison is only safe if
+  // the binding bar decides about that same observation. Left to take its own
+  // `activeWorkflowRef()` sample, a throw there returns null, and every predicate in
+  // resolveGraphBindingVerdict reads null as "no workflow service — legacy
+  // availability" — so the write would be permitted on an UNREADABLE surface, which
+  // is precisely the conflation this whole fix removes one line above.
+  const h = harness({ workflow: null, readable: true });
+  const captured = h.captureGraphMutationContext();
+  h.revalidateGraphMutationContext(captured);
+
+  assert.equal(h.calls.asserted, 1, "the binding bar still runs");
+  assert.ok(h.calls.assertOpts, "…and it is given options");
+  assert.deepEqual(
+    h.calls.assertOpts.workflowProbe,
+    { workflow: null, readable: true },
+    "the binding bar is handed the observation the comparison just validated",
+  );
+  assert.equal(
+    h.calls.freshReads,
+    0,
+    "nothing on this path takes a fresh activeWorkflowRef() sample — one observation, one decision",
+  );
+});
+
+test("#2125 gate r2: the binding assert PREFERS the supplied probe over its own read", () => {
+  // The consuming half, pinned on the real source. The assert is far too entangled
+  // to execute here, so this asserts the exact expression that decides it — a revert
+  // to a bare `activeWorkflowRef()` fails.
+  const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
+  const start = src.indexOf("function assertGraphBoundToActiveWorkflow(");
+  assert.notEqual(start, -1, "assertGraphBoundToActiveWorkflow must exist");
+  const body = src.slice(start, src.indexOf("\n}\n", start));
+  assert.match(
+    body,
+    /const activeWorkflow = workflowProbe \? workflowProbe\.workflow : activeWorkflowRef\(\);/,
+    "a caller-supplied observation wins; only a caller that made none re-reads",
+  );
+  assert.match(body, /workflowProbe = null,/, "and the option defaults off, so every other caller is unchanged");
 });
 
 test("#2125 call site r1: a probe that THREW at both ends is still refused", () => {

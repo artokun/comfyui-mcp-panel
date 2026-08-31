@@ -9686,11 +9686,27 @@ function assertGraphBoundToActiveWorkflow(
     // `graphCommandBindingBar`. Gating the stale-tag bypass on the absence of the
     // mutation flag would be default-permit (codex).
     staleTagReadBypass = false,
+    // #2125 (gate r2 P1) — the caller's OWN observation of the active workflow, when
+    // it already made one as part of proving nothing changed. See below.
+    workflowProbe = null,
   } = {},
 ) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
   const inSubgraph = !!rootGraph && graph !== rootGraph;
-  const activeWorkflow = activeWorkflowRef();
+  // #2125 (gate r2 P1) — DECIDE ON THE CALLER'S OBSERVATION, not a fresh one.
+  //
+  // `revalidateGraphMutationContext` admits an absent workflow only when its probe
+  // PROVED the absence (it ran and found nothing), never when the probe threw. A
+  // bare re-read here would be a third, independent sample of the same surface, and
+  // `activeWorkflowRef()` reports a throw as `null` — which every predicate below
+  // reads as "no workflow service — legacy availability". So the gate could admit on
+  // a proven absence and this layer could then permit the write on an UNREADABLE one,
+  // re-introducing one line down exactly the conflation the gate exists to prevent.
+  //
+  // One observation, one decision. Callers that did not probe (every read path, and
+  // the direct mutation paths that have no preflight to straddle) pass nothing and
+  // get the original read, unchanged.
+  const activeWorkflow = workflowProbe ? workflowProbe.workflow : activeWorkflowRef();
   // Every caller, including direct CivitAI graph_load and local snapshot restore,
   // must establish the active object identity before relying on a dirty-tab
   // relaxation. workflowStableUuid is root-blind when this object has no cache:
@@ -13706,6 +13722,11 @@ function revalidateGraphMutationContext(captured) {
   }
   assertGraphBoundToActiveWorkflow(current.graph, current.rootGraph, {
     ...MUTATION_BINDING_BAR,
+    // #2125 (gate r2 P1) — the binding decision must be about the workflow this
+    // function just PROVED unchanged, not about a third sample of the same surface
+    // taken microseconds later. Without this the comparison above and the binding
+    // bar below can disagree about whether the workflow was readable at all.
+    workflowProbe: currentProbe,
   });
   return current;
 }
