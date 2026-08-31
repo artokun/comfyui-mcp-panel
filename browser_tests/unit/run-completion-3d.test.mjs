@@ -562,6 +562,20 @@ test("#2128 the 3D note names a bounded number of files and points at get_histor
   assert.equal(formatModel3dMediaNote({ models3d: [] }), null);
 });
 
+test("#2128 the fetch advice names the root it assumes, and the retry", () => {
+  // Codex merge-gate P1, round 3. A `result` ref's `type` is INFERRED (every node that
+  // produces the save-counter naming writes to output/), not read off the bag — and a
+  // `Preview3D` passthrough of an input-rooted path is the shape that inference is
+  // wrong for. Presenting the get_image arguments as certain would make the completion
+  // point at nothing; naming the assumed root plus the one retry keeps it recoverable.
+  const note = formatModel3dMediaNote({
+    models3d: [{ filename: "PROP_crate_00001.glb", subfolder: "3D", type: "output" }],
+    promptId: "p1",
+  });
+  assert.match(note, /assume ComfyUI's output directory/);
+  assert.match(note, /retry with type "input"/);
+});
+
 // ---------------------------------------------------------------------------
 // 5. Recovery — a completion rebuilt from /history is honest too.
 // ---------------------------------------------------------------------------

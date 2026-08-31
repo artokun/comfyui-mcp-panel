@@ -483,10 +483,16 @@ export function formatModel3dMediaNote({
       ? `get_history for prompt ${promptId}`
       : "get_history";
   const restClause = rest > 0 ? ` The rest are listed in ${promptClause}.` : "";
+  // The ref's `type` is inferred, not observed — see model3dRefFromResultEntry. Rather
+  // than present the arguments as certain, name the root they assume and give the one
+  // retry that covers the shape they are wrong for. A 404 the agent can recover from is
+  // a different thing from a completion that quietly points at nothing.
   const fetchClause =
     ` To get ${count === 1 ? "the file itself" : "the first of them"}, call get_image with ` +
     `${getImageRefClause(shown[0])} — a 3D model is SAVED TO DISK rather than returned to you ` +
-    `inline, so what you get is a path a local tool can open.`;
+    `inline, so what you get is a path a local tool can open. Those arguments assume ComfyUI's ` +
+    `output directory; if the fetch misses, this node previewed a file it did not itself write, ` +
+    `so retry with type "input".`;
   const tail = attached
     ? ""
     : ` This IS the completion you were told to wait for — nothing further is coming, so do not ` +
