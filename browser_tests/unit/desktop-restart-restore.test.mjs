@@ -249,6 +249,66 @@ test("#2134: garbage candidates never invent a relaunch path", () => {
   assert.equal(resolveDesktopRestoreFrom(null), null);
 });
 
+/**
+ * The tests above drive the helpers, and a helper can be right while the call site
+ * feeds it the wrong input — which is exactly what #2134 was. This one EXECUTES the
+ * shipped call-site expression against synthetic `window` shapes, so a regression is
+ * caught by behaviour rather than by a source match.
+ */
+function runRebootDesktopDecision(win) {
+  const reboot = rebootExecutorSource();
+  const start = reboot.indexOf("    const desktopBridges =");
+  assert.ok(start > 0, "the reboot executor must build its Desktop bridge candidates");
+  const decideAt = reboot.indexOf("decideDesktopRestartRestore({", start);
+  assert.ok(decideAt > start, "the candidates must feed decideDesktopRestartRestore");
+  const end = reboot.indexOf("    });", decideAt) + "    });".length;
+  const snippet = reboot.slice(start, end);
+  // A vacuous slice would make every assertion below trivially true.
+  assert.ok(snippet.includes("isDesktopSupervisedShell("), "snippet must contain the decision inputs");
+  const run = new Function(
+    "window",
+    "navigator",
+    "decideDesktopRestartRestore",
+    "isDesktopSupervisedShell",
+    "resolveDesktopRestoreFrom",
+    `${snippet}\n return desktopDecision;`,
+  );
+  return run(
+    win,
+    { userAgent: "Mozilla/5.0 ... Electron/32.0.1 Safari/537.36" },
+    decideDesktopRestartRestore,
+    isDesktopSupervisedShell,
+    resolveDesktopRestoreFrom,
+  );
+}
+
+test("#2134: the shipped call site does not refuse an Electron browser with no bridge", () => {
+  // Pre-fix this returned `refuse` with the exact string the reporter quoted.
+  const decision = runRebootDesktopDecision({});
+  assert.equal(decision.kind, "manager_reboot");
+});
+
+test("#2134: the shipped call site still refuses a real Desktop with no relaunch path", () => {
+  const decision = runRebootDesktopDecision({ electronAPI: { openExternalUrl() {} } });
+  assert.equal(decision.kind, "refuse");
+  assert.match(decision.note, /no Desktop relaunch path/);
+});
+
+test("#2134: the shipped call site restores through a real Desktop bridge", () => {
+  const decision = runRebootDesktopDecision({ electronAPI: { restartApp() {} } });
+  assert.equal(decision.kind, "desktop_restore");
+  assert.equal(decision.via, "restartApp");
+});
+
+test("#2134: the shipped call site finds a restore the `??` chain used to mask", () => {
+  const decision = runRebootDesktopDecision({
+    electronAPI: { openExternalUrl() {} },
+    comfyAPI: { electron: { restartCore() {} } },
+  });
+  assert.equal(decision.kind, "desktop_restore");
+  assert.equal(decision.via, "restartCore");
+});
+
 test("#2134: comfy_reboot must not decide Desktop from the User-Agent", () => {
   const reboot = rebootExecutorSource();
   assert.ok(reboot.length > 400, "the reboot executor source must actually be extracted");
