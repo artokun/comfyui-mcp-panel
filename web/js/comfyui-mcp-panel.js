@@ -42129,7 +42129,12 @@ function buildPanel() {
     // $$canvas-image-preview on whatever node now holds that id (a freshly
     // added ConditioningConcat after a live-canvas edit). Keep the preview
     // on the emitting image/output node.
-    if (media.length || audioBag.length) {
+    // Still gated on IMAGE media, deliberately (#2126). This sweep re-homes image
+    // outputs onto `preferNodeId` and records it in the #1374 ownership ledger, so
+    // handing it an audio emitter would attribute image-preview state to a node
+    // that cannot host one. An audio-only `executed` used to return before this
+    // line; keeping it out preserves that exactly.
+    if (media.length) {
       stripMisattachedExecutionPreviews({
         graph: app?.graph,
         nodeOutputs: app?.nodeOutputs,
