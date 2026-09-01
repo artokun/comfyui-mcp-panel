@@ -295,6 +295,31 @@ test("#2143: a display label carried by exactly one row is an address, and pins 
   });
 });
 
+test("#2143: a label address survives the node GROWING a same-named row mid-command", () => {
+  // A label addresses a ROW. That its name also happens to identify it is true when the
+  // address is resolved and need not be true when the write runs — `await getFreshObjectInfo()`
+  // sits between them, and a node that grows a row in that window turns the unique name into a
+  // duplicated one. Unpinned, the write resolved by first-match and landed on the NEWCOMER
+  // while the row the label named went untouched.
+  const target = { name: "foo", type: "string", value: "mine", label: "Target" };
+  const node = { id: 1, type: "T", widgets: [target] };
+
+  const address = resolveWidgetAddress(node, "Target");
+  assert.equal(address.name, "foo");
+  assert.equal(address.occurrence.widget, target, "the label pins the row it named");
+
+  // …and the row arrives ahead of it.
+  const newcomer = { name: "foo", type: "string", value: "theirs" };
+  node.widgets = [newcomer, target];
+
+  assert.throws(
+    () => applyWidgetWrite(node, address.name, "written", { occurrence: address.occurrence }),
+    (err) => err instanceof WidgetWriteError && /REORDERED/.test(err.message),
+  );
+  assert.equal(newcomer.value, "theirs", "the newcomer was not written");
+  assert.equal(target.value, "mine", "and neither was the addressed row — the caller re-reads");
+});
+
 test("#2143: an AMBIGUOUS label is refused, never resolved to the first match", () => {
   const node = {
     id: 59,
@@ -320,9 +345,11 @@ test("#2143: a name that already resolves is returned untouched, with no occurre
   // The two shapes every ordinary write takes: a plain name, and a #560 dotted sub-field.
   assert.deepEqual(addr(node, "seed"), plain("seed"));
   assert.deepEqual(addr(node, "seed.on"), plain("seed.on"));
-  // A label on a UNIQUELY-named widget resolves to the ordinary name path: no ordinal is
-  // pinned, so nothing about that write changes.
-  assert.deepEqual(addr(node, "Sampler seed"), plain("seed"));
+  // A label on a UNIQUELY-named widget resolves to that widget's NAME — but it is still
+  // PINNED, because "the name identifies it too" is true of this instant, not of the write:
+  // the node can grow a same-named row across the /object_info await, and a bare name would
+  // then resolve by first-match onto the newcomer. See the dedicated test below.
+  assert.deepEqual(addr(node, "Sampler seed"), { name: "seed", index: 0, label: "Sampler seed" });
   // Nothing matches at all — the caller's own missing-widget refusal stays in charge.
   assert.equal(resolveWidgetAddress(node, "nope"), null);
   assert.equal(resolveWidgetAddress(node, "nope[0]"), null);

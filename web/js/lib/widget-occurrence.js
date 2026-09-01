@@ -370,8 +370,17 @@ export function resolveWidgetAddress(node, requested) {
   const occurrences = occurrencesOf(node, name);
   const at = occurrences.find((entry) => entry.widget === labelled[0]);
   if (!at) return null;
-  // A label that names a UNIQUE widget still resolves through the ordinary name path —
-  // pinning an occurrence there would put an index on a write that never needed one, and
-  // needlessly cross the deferral gate below.
-  return occurrences.length > 1 ? pin(name, at) : plain(name);
+  // ALWAYS pinned, including when the name is currently unique. A label addresses a ROW, and
+  // "the name happens to identify it too" is a fact about this instant, not about the write:
+  // the write happens after an `await getFreshObjectInfo()`, and a node that grows a row in
+  // that window turns the unique name into a duplicated one. Returning a bare name here let
+  // the write resolve by first-match and land on the NEWCOMER while the row the label named
+  // went untouched — the silent-wrong-row this module exists to prevent, reached through the
+  // address added to prevent it.
+  //
+  // The cost is that a label-addressed write cannot be deferred (the gate in
+  // graph_set_widget refuses any pinned address, because a deferred replay re-resolves by
+  // name). That is a limit on capability this change introduces, not a regression: before it,
+  // a label was not an address at all.
+  return pin(name, at);
 }
