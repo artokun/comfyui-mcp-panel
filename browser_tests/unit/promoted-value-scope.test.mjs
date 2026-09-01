@@ -707,6 +707,77 @@ test("comfyui-mcp#2689: the repair is structural — an OBJECT-valued promoted w
   assert.equal(set.promoted_from.shared_definition_write_through, true);
 });
 
+test("comfyui-mcp#2689: a repair is judged on the STORE, not on a textarea the restore did not repaint", () => {
+  // The sharp form of the same rule. Here the rail's own store DID take the value, so the
+  // repair runs — and restoring the shared inner widget writes back through to that store,
+  // which is what the queue compiler reads. The textarea still shows the new prompt, because
+  // nothing repainted it. Judged on the editor, the repair looks clean and the write would be
+  // reported as an instance-scoped success while the value that executes is the OLD one.
+  const store = new Map();
+  const widgetId = `${ROOT_GRAPH_ID}:5646:text`;
+  const innerWidget = { name: "text", type: "customtext", options: { multiline: true } };
+  let innerBacking = "OLD PROMPT";
+  const inner = { id: 5606, type: "CLIPTextEncode", widgets: [innerWidget] };
+  const subgraph = { id: "sg", _nodes: [inner], getNodeById: (id) => (String(id) === "5606" ? inner : null) };
+  store.set(widgetId, { value: "OLD PROMPT" });
+  // The definition writes BACK through to the store — the other direction of the same
+  // write-through. Only the store side is bidirectional; the editor is not repainted.
+  Object.defineProperty(innerWidget, "value", {
+    get: () => innerBacking,
+    set: (next) => {
+      innerBacking = next;
+      store.get(widgetId).value = next;
+    },
+    configurable: true,
+  });
+  const editor = { tagName: "TEXTAREA", value: "OLD PROMPT" };
+  const rail = {
+    name: "text",
+    type: "customtext",
+    inputEl: editor,
+    get value() {
+      return store.get(widgetId).value;
+    },
+    set value(next) {
+      store.get(widgetId).value = next;
+    },
+    options: {
+      getValue: () => store.get(widgetId).value,
+      setValue: (next) => {
+        store.get(widgetId).value = next;
+        innerBacking = next; // the write-through this issue is about
+      },
+    },
+  };
+  const input = { name: "text", widgetId, _widget: rail, widget: { name: "text" }, _subgraphSlot: { name: "text" } };
+  const host = {
+    id: 5646,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [input],
+    get widgets() {
+      return [rail];
+    },
+  };
+  const resolve = (_n, si) => (si?.name === "text" ? { sourceNodeId: "5606", sourceWidgetName: "text" } : null);
+
+  let err = null;
+  try {
+    applyWidgetWrite(host, "text", "a NEW prompt", { resolveSource: resolve });
+  } catch (e) {
+    err = e;
+  }
+  // The trap is not visible in the end state — the rollback repaints the editor too. It is
+  // visible in the DECISION: judged on the editor this write is a clean instance-scoped
+  // success, and mutating the acceptance clause back to `widgetMatchesExpected` makes this
+  // test report exactly that.
+  assert.ok(err instanceof WidgetWriteError, "the repair must not be accepted on the editor's word");
+  assert.match(err.message, /ALSO changed the shared subgraph definition/);
+  assert.equal(store.get(widgetId).value, "OLD PROMPT", "the store queue compilation reads is not left claiming a write");
+  assert.equal(editor.value, "OLD PROMPT", "and the rollback repainted the editor too, so nothing renders a value that did not land");
+  assert.equal(innerWidget.value, "OLD PROMPT", "and the shared definition is whole");
+});
+
 test("#1707: a failed instance-scoped write does not touch the definition on the ROLLBACK either", () => {
   const sg = makeReusableSubgraph({ definitionValue: 512 });
   const target = sg.instance(293);
