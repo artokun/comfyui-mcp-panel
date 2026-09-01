@@ -151,13 +151,20 @@ export function graphToPromptFailureRefusal(error) {
   const cause = detail
     ? ` The frontend serializer reported: "${detail}".`
     : " The frontend did not provide an error detail.";
-  const namesAWidget = /\bnode\s+\d+/i.test(detail) || /orphan /i.test(detail);
+  // #2140 — the panel's own last-resort naming lists CANDIDATE nodes when it could not
+  // identify the culprit. Those ids match /node \d+/, so without this the refusal would
+  // contradict itself: "no node could be identified" followed by "inspect the named
+  // widget". An explicit disclaimer outranks the pattern that happens to match it.
+  const disclaimsIdentity = /no node could be identified/i.test(detail);
+  const namesAWidget =
+    !disclaimsIdentity && (/\bnode\s+\d+/i.test(detail) || /orphan /i.test(detail));
   const unnamedDynamic =
     /Dynamic widget doesn't exist on node/i.test(detail) && !namesAWidget;
   const inspect = unnamedDynamic
     ? `The serializer did not name a node or widget; look for a DynamicCombo node that ` +
-      `carries both a nested child (format.codec) and a bare duplicate (codec), or a ` +
-      `freshly typed PrimitiveNode STRING widget.`
+      `carries both a nested child (format.codec) and a bare duplicate (codec), a ` +
+      `DynamicCombo whose selected option declares a child row the node is not carrying, ` +
+      `or a freshly typed PrimitiveNode STRING widget.`
     : `Inspect the named widget or extension before retrying.`;
   return (
     `NOT queued: this workflow could not be serialized into a prompt because ` +
