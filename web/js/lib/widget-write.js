@@ -3,7 +3,7 @@ import { missingWidgetMessage } from "./missing-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
 import { isPromotedContainer } from "./graph-read.js";
-import { widgetOccurrenceOf } from "./widget-occurrence.js";
+import { widgetOccurrenceOf, occurrenceLabelOf } from "./widget-occurrence.js";
 import {
   boundPropertyFailure,
   boundPropertyState,
@@ -416,15 +416,18 @@ export function isCompositeObjectWidget(widget) {
  *
  * `occurrenceIndex` (#2143) is set ONLY when the caller EXPLICITLY addressed one of
  * several widgets sharing `widgetName` — "NAME[1]", or a display label that names
- * exactly one row. When it is set, three things change and nothing else does:
+ * exactly one row. It is a POSITION IN `node.widgets`, the same number
+ * `duplicate_widgets` publishes, not an ordinal counted over same-named rows. When it is
+ * set, three things change and nothing else does:
  *
- *   * the i-th exact-name match is returned instead of the first;
- *   * an index that no longer has a widget behind it returns null rather than the
- *     first — the caller's dotted/base retry gets its turn and, failing that, the
- *     ordinary missing-widget refusal fires. Silently writing occurrence 0 for an
- *     address that asked for occurrence 1 is the defect, not an acceptable fallback;
- *   * the case-insensitive fallback is SKIPPED, because an occurrence ordinal counted
- *     over exact-name matches means nothing against a differently-cased name.
+ *   * the widget AT that position is returned, and only if it still carries the
+ *     requested name;
+ *   * a position that no longer holds that name returns null rather than the first
+ *     match — the caller's dotted/base retry gets its turn and, failing that, the
+ *     refusal below fires. Silently writing row 0 for an address that named row 1 is
+ *     the defect, not an acceptable fallback;
+ *   * the case-insensitive fallback is SKIPPED, because a position pinned against an
+ *     exact name means nothing against a differently-cased one.
  *
  * With no `occurrenceIndex` — every call that existed before #2143 — this function is
  * byte-identical to what it was.
@@ -433,8 +436,8 @@ function resolveWidgetByName(node, widgetName, occurrenceIndex = null) {
   const wanted = String(widgetName);
   const widgets = node?.widgets ?? [];
   if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0) {
-    const sameName = widgets.filter((cand) => cand?.name === wanted);
-    return sameName[occurrenceIndex] ?? null;
+    const at = widgets[occurrenceIndex];
+    return at?.name === wanted ? at : null;
   }
   const exact = widgets.find((cand) => cand?.name === wanted);
   if (exact) return exact;
@@ -2323,6 +2326,9 @@ export function resolveWidgetWrite(
   // caller said so explicitly ("NAME[1]" or a unique display label; see widget-occurrence.js).
   // Null on every other write, which is every write that existed before #2143.
   occurrenceIndex = null,
+  // …and the display label that row carried when the address was resolved, so a row that
+  // MOVED between resolution and the write is refused rather than written over.
+  occurrenceLabel = null,
 ) {
   let targetNode = node;
   let widget = null;
@@ -2500,10 +2506,10 @@ export function resolveWidgetWrite(
       const rows = (targetNode?.widgets ?? []).filter((cand) => cand?.name === base).length;
       if (rows) {
         throw new WidgetWriteError(
-          `Node ${targetNode?.id} (${targetNode?.type}) now carries ${rows} widget` +
-            `${rows === 1 ? "" : "s"} named "${base}", so occurrence ${occurrenceIndex} no longer ` +
-            `exists — the node's rows changed after the address was resolved. Nothing was written; ` +
-            `re-read panel_query_graph's duplicate_widgets and address the row again.`,
+          `Node ${targetNode?.id} (${targetNode?.type}) still carries ${rows} widget` +
+            `${rows === 1 ? "" : "s"} named "${base}", but index ${occurrenceIndex} is no longer ` +
+            `one of them — the node's rows changed after the address was resolved. Nothing was ` +
+            `written; re-read panel_query_graph's duplicate_widgets and address the row again.`,
         );
       }
     }
@@ -2512,6 +2518,32 @@ export function resolveWidgetWrite(
     // point at panel_set_property instead of a click dead-end, and list each
     // available widget name once (Fast Groups repeats RGTHREE_TOGGLE_AND_NAV).
     throw new WidgetWriteError(missingWidgetMessage(targetNode, widgetName));
+  }
+
+  // #2143 — AN INDEX IS ONLY AS GOOD AS THE LIST IT INDEXES.
+  //
+  // The address was resolved at the command boundary; the write happens after
+  // `await getFreshObjectInfo()`. An rgthree Fast Groups node rebuilds its toggle rows
+  // whenever the groups it matches change, and a rebuild can REORDER them — so position 1
+  // can be a different group by the time we get here, with the same name and a perfectly
+  // valid-looking widget sitting in it. The ordinal alone cannot tell those apart.
+  //
+  // So the row's DISPLAY LABEL — the group title, which is the only thing that
+  // distinguishes one `RGTHREE_TOGGLE_AND_NAV` from another — is pinned at resolution and
+  // re-checked here, before coercion and before any mutation. A row that moved is refused,
+  // not written over. Rows that carry no label at all are indistinguishable to the caller
+  // too, so there is nothing this check could establish for them and it does not run.
+  if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0 && occurrenceLabel != null) {
+    const liveLabel = occurrenceLabelOf(widget);
+    if (liveLabel !== occurrenceLabel) {
+      throw new WidgetWriteError(
+        `The widget at index ${occurrenceIndex} on node ${targetNode?.id} (${targetNode?.type}) ` +
+          `is now labelled ${liveLabel == null ? "(no label)" : `"${liveLabel}"`}, not ` +
+          `"${occurrenceLabel}" — the node's rows moved after the address was resolved, so this ` +
+          `index no longer names the row you addressed. Nothing was written; re-read ` +
+          `panel_query_graph's duplicate_widgets and address the row again (#2143).`,
+      );
+    }
   }
 
   // Gate on the RESOLVED target BEFORE coercion (#458). coerceWidgetValue reads —
@@ -2566,6 +2598,9 @@ export function applyWidgetWrite(
     // matches change, so a captured object can be detached from the node by write time
     // while the ordinal still names the row the caller meant.
     occurrenceIndex = null,
+    // …and the label that row carried when the address was resolved, which is what makes a
+    // REORDER between the two detectable. See the pin in resolveWidgetWrite.
+    occurrenceLabel = null,
   } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
@@ -2589,7 +2624,7 @@ export function applyWidgetWrite(
       // membership. Read below; NEVER re-derived by reading the option list again, since
       // a stateful dynamic source can answer differently on a second call.
       out: coerceOutcome,
-    }, occurrenceIndex);
+    }, occurrenceIndex, occurrenceLabel);
 
   // #2143 — WHICH same-named row this write resolved to, captured BEFORE any mutation and
   // by widget IDENTITY, so a callback that rebuilds the node cannot make the reply describe

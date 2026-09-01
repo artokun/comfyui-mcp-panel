@@ -22,7 +22,9 @@ import { readFileSync } from "node:fs";
 
 import { applyWidgetWrite, WidgetWriteError } from "../../web/js/lib/widget-write.js";
 import { readLiveWidgetValue } from "../../web/js/lib/set-widget.js";
+import { widgetWriteTimeoutReadback } from "../../web/js/lib/delivery-ack.js";
 import { missingWidgetMessage } from "../../web/js/lib/missing-widget.js";
+import { duplicateWidgetRows } from "../../web/js/lib/widget-rows.js";
 import {
   parseOccurrenceSelector,
   resolveWidgetAddress,
@@ -143,16 +145,83 @@ test("#2143: an EXACT widget name always wins, brackets and all", () => {
   const node = { id: 1, type: "T", widgets: [{ name: "foo[1]" }, { name: "foo" }, { name: "foo" }] };
   // The literal name resolves to itself with no occurrence pinned — the bracket is never
   // interpreted when a widget actually carries that spelling.
-  assert.deepEqual(resolveWidgetAddress(node, "foo[1]"), { name: "foo[1]", occurrenceIndex: null });
+  assert.deepEqual(resolveWidgetAddress(node, "foo[1]"), {
+    name: "foo[1]",
+    occurrenceIndex: null,
+    occurrenceLabel: null,
+  });
 });
 
 test("#2143: a duplicated name addresses a specific occurrence, and composes with sub-fields", () => {
   const node = { id: 59, type: BYPASSER, widgets: [{ name: ROW }, { name: ROW }] };
-  assert.deepEqual(resolveWidgetAddress(node, `${ROW}[1]`), { name: ROW, occurrenceIndex: 1 });
-  assert.deepEqual(resolveWidgetAddress(node, `${ROW}[0]`), { name: ROW, occurrenceIndex: 0 });
+  assert.deepEqual(resolveWidgetAddress(node, `${ROW}[1]`), {
+    name: ROW,
+    occurrenceIndex: 1,
+    occurrenceLabel: null,
+  });
+  assert.deepEqual(resolveWidgetAddress(node, `${ROW}[0]`), {
+    name: ROW,
+    occurrenceIndex: 0,
+    occurrenceLabel: null,
+  });
   assert.deepEqual(resolveWidgetAddress(node, `${ROW}[1].toggled`), {
     name: `${ROW}.toggled`,
     occurrenceIndex: 1,
+    occurrenceLabel: null,
+  });
+
+  // A bracket address pins the LABEL of the row it landed on, exactly as the label route
+  // does. Without it a `[1]` address carries only a position, and a rebuild that reorders
+  // the rows across the handler's own await would write whichever group moved into slot 1.
+  const labelled = {
+    id: 59,
+    type: BYPASSER,
+    widgets: [
+      { name: ROW, label: "Enable VRAM optimizations 1" },
+      { name: ROW, label: "Enable VRAM optimizations 2" },
+    ],
+  };
+  assert.deepEqual(resolveWidgetAddress(labelled, `${ROW}[1]`), {
+    name: ROW,
+    occurrenceIndex: 1,
+    occurrenceLabel: "Enable VRAM optimizations 2",
+  });
+});
+
+test("#2143: the selector index is the SAME number duplicate_widgets publishes", () => {
+  // The two halves of the surface must agree, and they only agree by construction when the
+  // selector counts positions in `node.widgets` — NOT occurrences of the name. A compact
+  // per-name ordinal happens to match on the reporter's node (its toggle rows start at
+  // widget 0) and silently disagrees on any node with a leading widget: duplicate_widgets
+  // would advertise indexes 1 and 2 while "ROW[2]" was refused and row 2 reported as 1.
+  const node = {
+    id: 59,
+    type: BYPASSER,
+    widgets: [
+      { name: "matchColors", value: "" },
+      { name: ROW, label: "Enable VRAM optimizations 1", value: { toggled: true } },
+      { name: ROW, label: "Enable VRAM optimizations 2", value: { toggled: true } },
+    ],
+  };
+  const published = duplicateWidgetRows(node)[ROW].map((row) => row.index);
+  assert.deepEqual(published, [1, 2], "duplicate_widgets indexes positions in node.widgets");
+
+  for (const index of published) {
+    assert.equal(
+      resolveWidgetAddress(node, `${ROW}[${index}]`).occurrenceIndex,
+      index,
+      `duplicate_widgets index ${index} must be a valid address`,
+    );
+  }
+  // And the address that a per-name ordinal would have produced is refused, rather than
+  // quietly landing on the last row.
+  assert.throws(() => resolveWidgetAddress(node, `${ROW}[0]`), WidgetAddressError);
+
+  // The reply round-trips: the index it reports is an address you can send straight back.
+  assert.deepEqual(widgetOccurrenceOf(node, node.widgets[2]), {
+    index: 2,
+    of: 2,
+    label: "Enable VRAM optimizations 2",
   });
 });
 
@@ -169,13 +238,13 @@ test("#2143: an out-of-range occurrence is refused, naming the addresses that ex
     () => resolveWidgetAddress(node, `${ROW}[2]`),
     (err) =>
       err instanceof WidgetAddressError &&
-      /occurrence 2 does not exist/.test(err.message) &&
+      /carries no widget named "RGTHREE_TOGGLE_AND_NAV" at index 2/.test(err.message) &&
       err.message.includes(`"${ROW}[0]" (Enable VRAM optimizations 1)`) &&
       err.message.includes(`"${ROW}[1]" (Enable VRAM optimizations 2)`),
   );
 });
 
-test("#2143: a display label carried by exactly one row is an address", () => {
+test("#2143: a display label carried by exactly one row is an address, and pins that label", () => {
   const node = {
     id: 59,
     type: BYPASSER,
@@ -187,6 +256,7 @@ test("#2143: a display label carried by exactly one row is an address", () => {
   assert.deepEqual(resolveWidgetAddress(node, "Enable VRAM optimizations 2"), {
     name: ROW,
     occurrenceIndex: 1,
+    occurrenceLabel: "Enable VRAM optimizations 2",
   });
 });
 
@@ -211,12 +281,13 @@ test("#2143: a name that already resolves is returned untouched, with no occurre
     type: "KSampler",
     widgets: [{ name: "seed", label: "Sampler seed" }, { name: "steps" }],
   };
+  const plain = (name) => ({ name, occurrenceIndex: null, occurrenceLabel: null });
   // The two shapes every ordinary write takes: a plain name, and a #560 dotted sub-field.
-  assert.deepEqual(resolveWidgetAddress(node, "seed"), { name: "seed", occurrenceIndex: null });
-  assert.deepEqual(resolveWidgetAddress(node, "seed.on"), { name: "seed.on", occurrenceIndex: null });
+  assert.deepEqual(resolveWidgetAddress(node, "seed"), plain("seed"));
+  assert.deepEqual(resolveWidgetAddress(node, "seed.on"), plain("seed.on"));
   // A label on a UNIQUELY-named widget resolves to the ordinary name path: no ordinal is
   // pinned, so nothing about that write changes.
-  assert.deepEqual(resolveWidgetAddress(node, "Sampler seed"), { name: "seed", occurrenceIndex: null });
+  assert.deepEqual(resolveWidgetAddress(node, "Sampler seed"), plain("seed"));
   // Nothing matches at all — the caller's own missing-widget refusal stays in charge.
   assert.equal(resolveWidgetAddress(node, "nope"), null);
   assert.equal(resolveWidgetAddress(node, "nope[0]"), null);
@@ -317,11 +388,41 @@ test("#2143: an ordinal with no row behind it at write time refuses instead of w
     () => applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrenceIndex: 1 }),
     (err) =>
       err instanceof WidgetWriteError &&
-      /occurrence 1 no longer exists/.test(err.message) &&
+      /index 1 is no longer one of them/.test(err.message) &&
       /Nothing was written/.test(err.message),
   );
   assert.deepEqual(fixture.modes(), [[0, 0], [0, 0]], "no mode moved");
   assert.deepEqual(fixture.rows[0].value, { toggled: true });
+});
+
+test("#2143: a row that MOVED between resolution and the write is refused, not written over", () => {
+  const fixture = twoGroupBypasser();
+  // The address was resolved against [group one, group two]; by write time a rebuild has
+  // swapped them. Index 1 is still a perfectly valid RGTHREE_TOGGLE_AND_NAV — it is just a
+  // different group, which the ordinal alone cannot tell. The pinned label can.
+  fixture.bypasser.widgets = [fixture.rows[1], fixture.rows[0]];
+
+  assert.throws(
+    () =>
+      applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
+        occurrenceIndex: 1,
+        occurrenceLabel: "Enable VRAM optimizations 2",
+      }),
+    (err) =>
+      err instanceof WidgetWriteError &&
+      /is now labelled "Enable VRAM optimizations 1"/.test(err.message) &&
+      /Nothing was written/.test(err.message),
+  );
+  assert.deepEqual(fixture.modes(), [[0, 0], [0, 0]], "neither group moved");
+});
+
+test("#2143: a pinned label that still matches writes normally", () => {
+  const fixture = twoGroupBypasser();
+  applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
+    occurrenceIndex: 1,
+    occurrenceLabel: "Enable VRAM optimizations 2",
+  });
+  assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]]);
 });
 
 test("#2143: an occurrence address on a PROMOTED subgraph widget is refused, not silently dropped", () => {
@@ -388,6 +489,45 @@ test("#2143: the timeout readback reads the row that was written, not the first 
   assert.equal(readLiveWidgetValue(bypasser, ROW, 5).found, false);
 });
 
+test("#2143: the timeout receipt carries the same row attribution the write's own reply would", () => {
+  const { bypasser, rows } = twoGroupBypasser();
+  rows[1].value = { toggled: false };
+  const live = readLiveWidgetValue(bypasser, ROW, 1);
+
+  const receipt = widgetWriteTimeoutReadback({
+    requested: { toggled: false },
+    actual: live.value,
+    found: live.found,
+    node_id: bypasser.id,
+    widget: ROW,
+    widget_occurrence: widgetOccurrenceOf(bypasser, live.widget),
+  });
+
+  assert.equal(receipt.applied, true);
+  assert.equal(receipt.verified, true);
+  // This receipt STANDS IN for the write's reply. Without the attribution it names only
+  // RGTHREE_TOGGLE_AND_NAV — restoring, on the one path that reports on a write it did not
+  // perform, exactly the ambiguity the address was chosen to remove.
+  assert.deepEqual(receipt.set.widget_occurrence, {
+    index: 1,
+    of: 2,
+    label: "Enable VRAM optimizations 2",
+  });
+
+  // A unique-name write is byte-identical to before: no attribution field at all.
+  const plain = { id: 3, type: "KSampler", widgets: [{ name: "steps", value: 30 }] };
+  const plainLive = readLiveWidgetValue(plain, "steps");
+  const plainReceipt = widgetWriteTimeoutReadback({
+    requested: 30,
+    actual: plainLive.value,
+    found: plainLive.found,
+    node_id: 3,
+    widget: "steps",
+    widget_occurrence: widgetOccurrenceOf(plain, plainLive.widget),
+  });
+  assert.equal("widget_occurrence" in plainReceipt.set, false);
+});
+
 // ---------------------------------------------------------------------------
 // The CALL SITE — the plumbing above is inert unless the shipped handler uses it
 // ---------------------------------------------------------------------------
@@ -421,8 +561,10 @@ test("#2143: the shipped graph_set_widget resolves the address BEFORE every name
     assert.ok(at > 0, `guard not found in the shipped handler: ${guard}`);
     assert.ok(at > resolveAt, `${guard} runs BEFORE the address is resolved`);
   }
-  // …and the resolved ordinal is handed to the write, not merely computed.
+  // …and the resolved ordinal AND its pinned label are handed to the write, not merely
+  // computed. The label is what makes a reorder across the handler's own await detectable.
   assert.match(body, /occurrenceIndex: widgetOccurrenceIndex/);
+  assert.match(body, /occurrenceLabel: widgetOccurrenceLabel/);
 });
 
 test("#2143: runSetWidget forwards the ordinal to the write and to its own ack readback", () => {
@@ -432,7 +574,10 @@ test("#2143: runSetWidget forwards the ordinal to the write and to its own ack r
   ).replace(/\r\n/g, "\n");
   // applyWidgetWrite is the only thing that can select the row…
   assert.match(setWidgetSource, /applyWidgetWrite\(node, widgetName, value, \{[\s\S]*?\n\s*occurrenceIndex,/);
+  assert.match(setWidgetSource, /applyWidgetWrite\(node, widgetName, value, \{[\s\S]*?\n\s*occurrenceLabel,/);
   // …and the #2025 timeout readback must consult the same row, or a write that timed out on
   // row 1 can be acked from row 0's value.
   assert.match(setWidgetSource, /readLiveWidgetValue\(node, widget, occurrenceIndex\)/);
+  // …and report which row it read.
+  assert.match(setWidgetSource, /widget_occurrence: live\.widget \? widgetOccurrenceOf\(node, live\.widget\) : null/);
 });

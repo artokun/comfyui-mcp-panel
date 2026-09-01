@@ -93,11 +93,25 @@ function occurrencesOf(node, name) {
   return out;
 }
 
+/** The display label an occurrence carries at a given moment, or null. Exported so the
+ *  write can PIN it: the ordinal alone survives a reorder of the rows it counts. */
+export function occurrenceLabelOf(widget) {
+  return widgetLabel(widget);
+}
+
 /**
  * The occurrence report for a widget that has already been resolved: WHICH of the
  * same-named rows this is, and how many there are. Null when the name is unique on the
  * node (the overwhelmingly common shape), so a caller emits nothing rather than a
  * meaningless `{index: 0, of: 1}` on every ordinary write.
+ *
+ * `index` is the widget's position in `node.widgets` — the SAME number
+ * `duplicate_widgets` publishes, and the same number `"NAME[i]"` takes, so the reply
+ * round-trips straight back into an address. It is deliberately NOT a compact ordinal
+ * counted over same-named rows only: those two numbers agree exactly when the duplicated
+ * name starts at widget 0 and disagree silently otherwise, which would have made this
+ * field and `duplicate_widgets` contradict each other on any node with a leading widget.
+ * `of` is how many widgets share the name.
  *
  * Located by IDENTITY, never by name — the point is to report which of several identical
  * names was chosen, so a name lookup here would answer its own question wrong.
@@ -107,10 +121,10 @@ export function widgetOccurrenceOf(node, widget) {
   if (name == null) return null;
   const same = occurrencesOf(node, name);
   if (same.length < 2) return null;
-  const at = same.findIndex((entry) => entry.widget === widget);
-  if (at < 0) return null;
+  const hit = same.find((entry) => entry.widget === widget);
+  if (!hit) return null;
   const label = widgetLabel(widget);
-  return { index: at, of: same.length, ...(label != null ? { label } : {}) };
+  return { index: hit.index, of: same.length, ...(label != null ? { label } : {}) };
 }
 
 /** `"NAME[3]"` -> `{ base: "NAME", index: 3 }`; anything else -> null. The index is a plain
@@ -130,9 +144,9 @@ export function parseOccurrenceSelector(segment) {
 /** The addresses that WOULD work, for a refusal that has to name them. Bounded so a node
  *  with many rows cannot turn one refusal into a wall of text. */
 function describeOccurrences(name, occurrences, limit = 8) {
-  const shown = occurrences.slice(0, limit).map(({ widget }, i) => {
+  const shown = occurrences.slice(0, limit).map(({ index, widget }) => {
     const label = widgetLabel(widget);
-    return `"${name}[${i}]"${label != null ? ` (${label})` : ""}`;
+    return `"${name}[${index}]"${label != null ? ` (${label})` : ""}`;
   });
   const rest = occurrences.length - shown.length;
   return shown.join(", ") + (rest > 0 ? `, and ${rest} more` : "");
@@ -172,15 +186,22 @@ export function duplicateAddressHint(node) {
  * case-insensitive fallback, #560 dotted sub-field, and finally the missing-widget
  * refusal) runs completely unchanged.
  *
- * Returns `{ name, occurrenceIndex }` otherwise:
+ * Returns `{ name, occurrenceIndex, occurrenceLabel }` otherwise:
  *   * `name` is what every downstream name-keyed lookup, classifier and refusal should use
  *     — the widget's REAL name, never the selector or the label. This matters for more than
  *     tidiness: `classifyRgthreeFastGroupsWrite` and friends key on the widget NAME, so
  *     resolving a label here and passing the label onward would let a label address slip
  *     past a name-keyed safety refusal.
- *   * `occurrenceIndex` is the ordinal among widgets carrying `name`, and is set ONLY when
- *     the caller addressed one EXPLICITLY. A plain name resolves with `occurrenceIndex:
- *     null`, so its write path is byte-identical to before this change.
+ *   * `occurrenceIndex` is the widget's position in `node.widgets` — the SAME number
+ *     `duplicate_widgets` publishes — and is set ONLY when the caller addressed one
+ *     EXPLICITLY. A plain name resolves with `occurrenceIndex: null`, so its write path is
+ *     byte-identical to before this change.
+ *   * `occurrenceLabel` is the display label that row carried AT RESOLUTION TIME (null when
+ *     it carries none). An index is a position, and a position is only as good as the list
+ *     it indexes: the write happens after an `await getFreshObjectInfo()`, and a Fast Groups
+ *     node rebuilds and REORDERS its rows when the groups it matches change. Pinning the
+ *     label lets the write refuse a row that moved instead of toggling whichever group
+ *     happens to sit at that index now.
  *
  * Throws WidgetAddressError for an address that parsed but cannot be honoured.
  */
@@ -188,32 +209,40 @@ export function resolveWidgetAddress(node, requested) {
   if (typeof requested !== "string" || requested === "") return null;
   const widgets = widgetsOf(node);
   if (!widgets.length) return null;
+  const plain = (name) => ({ name, occurrenceIndex: null, occurrenceLabel: null });
 
   // 1. EXACT NAME on the whole string — brackets, dots and all. Never rewritten, and no
   //    occurrence is pinned: this is the address that already worked.
-  if (occurrencesOf(node, requested).length) return { name: requested, occurrenceIndex: null };
+  if (occurrencesOf(node, requested).length) return plain(requested);
 
   const dot = requested.indexOf(".");
   const head = dot > 0 ? requested.slice(0, dot) : requested;
   const tail = dot > 0 ? requested.slice(dot) : "";
 
   // 2. EXACT NAME on the #560 dotted BASE — likewise already worked, likewise untouched.
-  if (dot > 0 && occurrencesOf(node, head).length) return { name: requested, occurrenceIndex: null };
+  if (dot > 0 && occurrencesOf(node, head).length) return plain(requested);
 
-  // 3. OCCURRENCE SELECTOR on the head segment: "NAME[1]" / "NAME[1].field".
+  // 3. OCCURRENCE SELECTOR on the head segment: "NAME[1]" / "NAME[1].field". The number is
+  //    the position in `node.widgets`, so it is exactly the `index` duplicate_widgets
+  //    publishes — a caller can paste one straight back without re-deriving anything.
   const selector = parseOccurrenceSelector(head);
   if (selector) {
     const occurrences = occurrencesOf(node, selector.base);
     if (occurrences.length) {
-      if (selector.index >= occurrences.length) {
+      const at = occurrences.find((entry) => entry.index === selector.index);
+      if (!at) {
         throw new WidgetAddressError(
-          `Node ${node?.id} (${node?.type}) carries ${occurrences.length} widget` +
-            `${occurrences.length === 1 ? "" : "s"} named "${selector.base}", so occurrence ` +
-            `${selector.index} does not exist (valid: ${describeOccurrences(selector.base, occurrences)}). ` +
-            `Re-read panel_query_graph's duplicate_widgets for the current rows — nothing was written.`,
+          `Node ${node?.id} (${node?.type}) carries no widget named "${selector.base}" at index ` +
+            `${selector.index}. The index is the widget's position in the node, the same one ` +
+            `panel_query_graph's duplicate_widgets reports — valid here: ` +
+            `${describeOccurrences(selector.base, occurrences)}. Nothing was written.`,
         );
       }
-      return { name: `${selector.base}${tail}`, occurrenceIndex: selector.index };
+      return {
+        name: `${selector.base}${tail}`,
+        occurrenceIndex: at.index,
+        occurrenceLabel: widgetLabel(at.widget),
+      };
     }
   }
 
@@ -239,10 +268,12 @@ export function resolveWidgetAddress(node, requested) {
   const name = widgetName(labelled[0]);
   if (name == null) return null;
   const occurrences = occurrencesOf(node, name);
-  const at = occurrences.findIndex((entry) => entry.widget === labelled[0]);
-  if (at < 0) return null;
+  const at = occurrences.find((entry) => entry.widget === labelled[0]);
+  if (!at) return null;
   // A label that names a UNIQUE widget still resolves through the ordinary name path —
   // pinning an occurrence there would put an index on a write that never needed one, and
   // needlessly cross the deferral gate below.
-  return { name, occurrenceIndex: occurrences.length > 1 ? at : null };
+  return occurrences.length > 1
+    ? { name, occurrenceIndex: at.index, occurrenceLabel: requested }
+    : plain(name);
 }

@@ -59,6 +59,7 @@ import {
 } from "./input-asset.js";
 import { withTimeout } from "./bounded-step.js";
 import { honestWidgetAck, widgetWriteTimeoutReadback } from "./delivery-ack.js";
+import { widgetOccurrenceOf } from "./widget-occurrence.js";
 
 /**
  * Fire an undo-history hook that can never escape.
@@ -207,7 +208,9 @@ export function readLiveWidgetValue(node, widgetName, occurrenceIndex = null) {
   try {
     const live = liveWidgetAt(node, widgetName, occurrenceIndex);
     if (!live) return { found: false, value: undefined };
-    return { found: true, value: live.value };
+    // `widget` is returned so the caller can attribute the read to the row it came from by
+    // IDENTITY (#2143) rather than re-deriving it from the ordinal it asked for.
+    return { found: true, value: live.value, widget: live };
   } catch {
     return { found: false, value: undefined };
   }
@@ -285,6 +288,10 @@ export async function awaitSetWidgetAck(writePromise, {
     found: live.found,
     node_id: node?.id,
     widget,
+    // #2143 — this receipt stands in for the write's own reply, so it must carry the same
+    // row attribution. Derived from the widget that was actually READ (by identity), not
+    // from the requested ordinal, so it describes the row this readback saw.
+    widget_occurrence: live.widget ? widgetOccurrenceOf(node, live.widget) : null,
     delivered,
   });
   // Only short-circuit when the live widget already equals the request. A
@@ -571,6 +578,9 @@ async function runSetWidgetBody(
     // the only thing that says which row. Null for every address that is not explicitly
     // occurrence-scoped, which is every call that existed before #2143.
     occurrenceIndex = null,
+    // …and the label that row carried when the address was resolved, so a REORDER between
+    // resolution and the write is refused rather than written over (#2143).
+    occurrenceLabel = null,
   } = {},
 ) {
   const assertNotAbandoned = () => {
@@ -1153,6 +1163,7 @@ async function runSetWidgetBody(
         assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
         promotedResolution,
         occurrenceIndex,
+        occurrenceLabel,
         ...extra,
       });
       // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
