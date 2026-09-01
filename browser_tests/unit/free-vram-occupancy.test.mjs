@@ -20,6 +20,7 @@ import {
   FREE_VRAM_SETTLE_POLL_MS,
   comparableUsedMb,
   freeVramSuccessResult,
+  pinnedTorchPoolDevices,
   readVramOccupancy,
   settleVramOccupancyAfterFree,
   vramOccupancyFromStats,
@@ -118,6 +119,23 @@ function asyncFreeingComfy({ usedBefore = 9426, usedAfter = 1500, dropAfterReads
   return { fetchApi, calls, statsReads: () => postFreeReads };
 }
 
+/** /system_stats with the per-device torch allocator counters. `[usedMb, index,
+ *  torchTotalMb, torchFreeMb]`; pass null for either torch value to omit it. */
+const torchStats = (entries, totalMb = 12282) => ({
+  devices: entries.map(([usedMb, index, torchTotalMb, torchFreeMb]) => ({
+    name: `cuda:${index} NVIDIA GeForce RTX 4070 Ti`,
+    type: "cuda",
+    index,
+    vram_total: totalMb * MB,
+    vram_free: (totalMb - usedMb) * MB,
+    ...(torchTotalMb === null || torchTotalMb === undefined
+      ? {}
+      : { torch_vram_total: torchTotalMb * MB }),
+    ...(torchFreeMb === null || torchFreeMb === undefined
+      ? {}
+      : { torch_vram_free: torchFreeMb * MB }),
+  })),
+});
 /** The NAIVE total the pre-review code compared on — kept only to demonstrate that the
  *  hazard is real, never used by production. */
 const usedTotal = (rows) => rows.reduce((sum, d) => sum + d.vram_used_mb, 0);
@@ -469,6 +487,12 @@ test("#2144 the panel row stops saying 'freed VRAM' for a pending unload", () =>
   const row = panelSrc.slice(rowStart, panelSrc.indexOf('case "workflow_save":', rowStart));
   assert.match(row, /r\.freed === false/);
   assert.match(row, /panel\.free_vram_pending/);
+  assert.match(row, /r\.branch === "torch_pool_pinned"/);
+  assert.match(row, /panel\.free_vram_pinned/);
+  assert.ok(
+    row.indexOf("torch_pool_pinned") < row.indexOf("r.freed === false"),
+    "a pin must be recognised BEFORE the pending row calls it merely not-yet",
+  );
   assert.ok(
     row.indexOf("r.freed === false") < row.indexOf("panel.unloaded_models_freed_vram"),
     "the pending branch must be reached BEFORE the unconditional 'freed VRAM' row",
@@ -585,4 +609,85 @@ test("#2144 the settle does not end early when a device drops out mid-wait", asy
   });
   assert.equal(settled.observed, false, "a vanished device is not an observed free");
   assert.equal(settled.waitedMs, 1000, "it waits out the whole budget rather than stopping");
+});
+
+// ---------------------------------------------------------------------------
+// #2144 review round 2 — freed:false makes comfyui-mcp's annotateFreeVramAck return
+// early, so the pinned-device diagnosis it used to add has to be made here.
+// ---------------------------------------------------------------------------
+
+test("#2144 a still-pinned torch pool is diagnosed, not reported as pending", () => {
+  // 9426 MB held, and THIS ComfyUI's allocator has 24 MB free in an 8192 MB pool —
+  // the reporter shape #1866/#1887 named: memory /free cannot reach.
+  const before = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24]]));
+  const after = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24]]));
+  const result = freeVramSuccessResult({ before, after, waitedMs: 5000, polls: 19 });
+  assert.equal(result.freed, false);
+  assert.equal(result.branch, "torch_pool_pinned");
+  assert.notEqual(result.outcome, "pending", "waiting is the WRONG advice for a pin");
+  assert.equal(result.pinned_devices.length, 1);
+  assert.match(result.pinned_devices[0].name, /cuda:0/);
+  // the diagnosis the orchestrator would have supplied, and no longer does
+  assert.match(result.note, /panel_restart_comfyui/);
+  assert.match(result.note, /Ray|parallel CLIP|custom-node/i);
+  assert.doesNotMatch(result.note, /re-read VRAM with get_system_stats once the queue is idle/);
+});
+
+test("#2144 an EMPTY torch pool that did not drop is pending, not a pin", () => {
+  // The card is occupied but this ComfyUI holds almost nothing — another process, or an
+  // unload still queued behind a render. A restart here would be the wrong move.
+  const before = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 8000]]));
+  const after = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 8000]]));
+  const result = freeVramSuccessResult({ before, after, waitedMs: 5000, polls: 19 });
+  assert.equal(result.freed, false);
+  assert.equal(result.branch, "unload_not_observed");
+  assert.equal(result.outcome, "pending");
+  assert.equal(result.pinned_devices, undefined);
+  assert.match(result.note, /PENDING/);
+});
+
+test("#2144 an UNKNOWN torch pool claims nothing — still pending, never pinned", () => {
+  // Older ComfyUI payloads carry no torch_vram_* at all.
+  const before = vramOccupancyFromStats(torchStats([[9426, 0, null, null]]));
+  const after = vramOccupancyFromStats(torchStats([[9426, 0, null, null]]));
+  assert.equal(after[0].torch_vram_total_mb, null);
+  assert.deepEqual(pinnedTorchPoolDevices(after), []);
+  assert.equal(freeVramSuccessResult({ before, after }).branch, "unload_not_observed");
+});
+
+test("#2144 a small leftover pool is not a pin — the 1 GiB floor", () => {
+  // 32 MiB of leftovers next to a card another instance is occupying is not /free failing.
+  const rows = vramOccupancyFromStats(torchStats([[9426, 0, 32, 0]]));
+  assert.deepEqual(pinnedTorchPoolDevices(rows), []);
+});
+
+test("#2144 the pin threshold is pool FULLNESS — 20% free is pinned, 21% is not", () => {
+  assert.equal(pinnedTorchPoolDevices(vramOccupancyFromStats(torchStats([[9426, 0, 5000, 1000]]))).length, 1);
+  assert.equal(pinnedTorchPoolDevices(vramOccupancyFromStats(torchStats([[9426, 0, 5000, 1050]]))).length, 0);
+});
+
+test("#2144 a pin on ONE card of several is named on its own", () => {
+  const before = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24], [500, 1, 8192, 8000]]));
+  const after = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24], [500, 1, 8192, 8000]]));
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.branch, "torch_pool_pinned");
+  assert.equal(result.pinned_devices.length, 1);
+  assert.match(result.pinned_devices[0].name, /cuda:0/);
+});
+
+test("#2144 a pinned pool does NOT override an occupancy drop the panel actually saw", () => {
+  // The orchestrator's own #1866 check still runs on freed:true, so the panel must not
+  // start issuing a second, competing verdict on that branch.
+  const before = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24]]));
+  const after = vramOccupancyFromStats(torchStats([[1500, 0, 8192, 24]]));
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.freed, true);
+  assert.equal(result.branch, "verified_system_stats");
+  assert.equal(result.pinned_devices, undefined);
+});
+
+test("#2144 the torch counters reach the reply so the reading can be audited", () => {
+  const rows = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24]]));
+  assert.equal(rows[0].torch_vram_total_mb, 8192);
+  assert.equal(rows[0].torch_vram_free_mb, 24);
 });

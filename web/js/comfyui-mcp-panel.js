@@ -32209,6 +32209,16 @@ function describeCommand(cmd, msg, reply) {
       // #2144 — the executor no longer claims freed:true on occupancy it re-read and watched
       // NOT move, so this row must not keep saying "freed VRAM" for that reply either. A
       // pending unload is the flag being queued behind whatever the worker thread is doing.
+      // A pinned torch pool is not a slow unload: it will not resolve on its own, so it
+      // must not read as "not yet" in the chat row either.
+      if (r.branch === "torch_pool_pinned")
+        return {
+          icon: "pi-exclamation-triangle",
+          text: tr(
+            "panel.free_vram_pinned",
+            "Unloaded models — but VRAM is still held by this ComfyUI",
+          ),
+        };
       if (r.freed === false)
         return {
           icon: "pi-info-circle",

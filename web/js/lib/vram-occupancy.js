@@ -28,7 +28,10 @@
  *
  * Four honest branches, all after a POST /free 2xx:
  *   - `verified_system_stats`  — occupancy was re-read and DROPPED.        freed:true
- *   - `unload_not_observed`    — re-read for the whole budget, no drop.    freed:false,
+ *   - `torch_pool_pinned`      — no drop, AND this ComfyUI's torch pool is still full, so
+ *                                the memory is one /free cannot reach.     freed:false,
+ *                                outcome:"torch_pool_pinned" — restart THIS instance.
+ *   - `unload_not_observed`    — no drop, torch pool not pinned.           freed:false,
  *                                outcome:"pending" — the flag is set, ComfyUI has not
  *                                applied it yet.
  *   - `after_only_occupancy`   — no comparable baseline: the BEFORE read missed, or no
@@ -45,6 +48,13 @@
  * total (`comparableUsedMb`). A device that drops out of `/system_stats` between the two
  * reads shrinks a total exactly like a successful unload does, so a sum-based verdict would
  * report a free that never happened — the same lie in the opposite direction.
+ *
+ * AND because `freed:false` makes comfyui-mcp's `annotateFreeVramAck` return early (it
+ * only re-reads occupancy when the panel claimed `freed:true`), the pinned-device diagnosis
+ * that used to come from there has to be made HERE for these branches — otherwise a
+ * genuinely pinned instance would be told to wait for an unload that is never coming. That
+ * is `deviceTorchPoolPinned`, on the same counters and the same thresholds, read from the
+ * server this tab actually fronts.
  */
 
 const BYTES_PER_MB = 1024 * 1024;
@@ -138,12 +148,18 @@ export function vramOccupancyFromStats(stats) {
     } catch {
       name = "";
     }
+    // This ComfyUI's own torch allocator, when the payload carries it. `vram_*` is the whole
+    // device — every process — so only these can attribute occupancy to THIS instance.
+    const torchTotal = counterOf(d?.torch_vram_total);
+    const torchFree = counterOf(d?.torch_vram_free);
     out.push({
       name,
       device_key: deviceKeyOf(d),
       vram_total_mb: roundMb(total),
       vram_free_mb: roundMb(free),
       vram_used_mb: roundMb(total - free),
+      torch_vram_total_mb: torchTotal === null ? null : roundMb(torchTotal),
+      torch_vram_free_mb: torchFree === null ? null : roundMb(torchFree),
     });
   }
   return out;
@@ -151,6 +167,44 @@ export function vramOccupancyFromStats(stats) {
 
 function usedMb(rows) {
   return rows.reduce((sum, d) => sum + d.vram_used_mb, 0);
+}
+
+/** A torch pool of at least this size is worth judging; below it, leftovers are noise. */
+const PINNED_TORCH_POOL_MIN_MB = 1024; // 1 GiB, matching comfyui-mcp
+/** …and it is still PINNED when at most this share of the pool is free after /free. */
+const PINNED_TORCH_POOL_FREE_RATIO = 0.2;
+
+/**
+ * True when THIS ComfyUI's torch pool on `row` is still held after /free.
+ *
+ * Thresholds and reasoning mirror `deviceStillPinned` in comfyui-mcp's panel-tools.ts
+ * (#1866/#1887) deliberately, because this branch is where that check no longer runs: the
+ * orchestrator's `annotateFreeVramAck` returns early unless the panel said `freed:true`, and
+ * #2144 stops the panel saying that over occupancy it watched not move. Rather than leave
+ * a genuinely pinned instance with "pending, wait and re-read" — advice that is wrong for a
+ * pin /free cannot clear — the panel makes the call itself, on the server its own tab
+ * fronts. (It does NOT duplicate the check on the verified branch; the orchestrator still
+ * runs there, and two verdicts on one reading is how they come to disagree.)
+ *
+ * Device-global counters are deliberately NOT consulted: `vram_free` is the whole card, so
+ * it cannot tell this ComfyUI from a second instance, a trainer or the browser. An unknown
+ * torch pool is not pinned — an unknown answer claims nothing in either direction.
+ */
+function deviceTorchPoolPinned(row) {
+  const total = row?.torch_vram_total_mb;
+  const free = row?.torch_vram_free_mb;
+  if (typeof total !== "number" || typeof free !== "number") return false;
+  if (!Number.isFinite(total) || !Number.isFinite(free)) return false;
+  if (total < PINNED_TORCH_POOL_MIN_MB) return false;
+  if (free < 0) return true;
+  return free / total <= PINNED_TORCH_POOL_FREE_RATIO;
+}
+
+/** Devices whose torch pool is still pinned. Exported for tests and for any caller that
+ *  wants the same reading the reply is built from. */
+export function pinnedTorchPoolDevices(rows) {
+  const list = occupancyRows(rows);
+  return list ? list.filter(deviceTorchPoolPinned) : [];
 }
 
 function occupancyRows(value) {
@@ -314,6 +368,25 @@ function settleFields(waitedMs, polls) {
   return fields;
 }
 
+function pinnedPoolNote(pinned, beforeMb, afterMb, waitedMs) {
+  const named = pinned
+    .map((d) => `${d.name || d.device_key || "device"} (torch pool ${d.torch_vram_free_mb}/${d.torch_vram_total_mb} MB free)`)
+    .join(", ");
+  const watched = Number.isFinite(waitedMs) ? `${Math.max(0, Math.round(waitedMs))} ms` : "the settle budget";
+  return (
+    `POST /free was accepted (unload_models and free_memory), but occupancy did not drop over ` +
+    `${watched} (before_mb ${beforeMb} → after_mb ${afterMb}) and THIS ComfyUI's own torch ` +
+    `allocator is still holding its pool on: ${named}. That is not a slow unload waiting to ` +
+    `land — /free unloads models and empties the cache, so a pool this full afterwards is ` +
+    `memory /free cannot reach: Ray workers, sequence-parallel or parallel CLIP loaders, or ` +
+    `custom-node allocations outside the model cache. Re-issuing /free will not clear it ` +
+    `(it is idempotent and already applied). The next step is panel_restart_comfyui, which ` +
+    `restarts THIS instance and does release those allocations. Note this reading is the ` +
+    `torch pool, not the card: occupancy held by a DIFFERENT process on the same GPU would ` +
+    `not appear here and a restart would not free it either.`
+  );
+}
+
 function notObservedNote(beforeMb, afterMb, waitedMs, polls) {
   const watched = Number.isFinite(waitedMs) ? `${Math.max(0, Math.round(waitedMs))} ms` : "the settle budget";
   const samples = Number.isFinite(polls) ? `${Math.max(1, Math.round(polls))} samples` : "repeated samples";
@@ -359,7 +432,24 @@ export function freeVramSuccessResult({ before = null, after = null, waitedMs, p
       devices_after: afterOcc,
     };
     if (afterMb < beforeMb) {
+      // The orchestrator's own pinned-device check (#1866) still runs on freed:true, so the
+      // panel does not second-guess it here.
       return { freed: true, ...base, branch: "verified_system_stats", occupancy };
+    }
+    // Occupancy answered and did not move. Two very different reasons, and they take
+    // OPPOSITE next steps, so the reply must not merge them: a pool /free cannot clear needs
+    // a restart, while an unload queued behind a render just needs waiting out.
+    const pinned = pinnedTorchPoolDevices(afterOcc);
+    if (pinned.length > 0) {
+      return {
+        freed: false,
+        ...base,
+        outcome: "torch_pool_pinned",
+        branch: "torch_pool_pinned",
+        pinned_devices: pinned,
+        occupancy,
+        note: pinnedPoolNote(pinned, beforeMb, afterMb, waitedMs),
+      };
     }
     return {
       freed: false,
