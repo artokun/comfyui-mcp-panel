@@ -29,6 +29,7 @@ import {
   parseOccurrenceSelector,
   resolveWidgetAddress,
   widgetOccurrenceOf,
+  widgetAtOccurrence,
   duplicateAddressHint,
   WidgetAddressError,
 } from "../../web/js/lib/widget-occurrence.js";
@@ -841,28 +842,33 @@ test("#2143: retention does not verify against a row the rebuild DETACHED", asyn
   // Identity is only an answer while the object is still on the node. A rebuild that
   // detaches it leaves a live-looking object whose `.value` is a reading of a widget the
   // canvas no longer draws — so the check must fall through, not vouch for the write.
+  //
+  // The rows are LABELLED here, so the retry can identify which one it means; the
+  // indistinguishable case is the next test. That separation is the point: this one is
+  // about the membership check, not about what happens when nothing can discriminate.
   const node = {
     id: 59,
     type: "DupRows",
     constructor: nodeCtor(),
     graph: { links: {} },
-    widgets: [{ name: "row", type: "string", value: "old-0" }, null],
+    widgets: [{ name: "row", type: "string", value: "old-0", label: "first" }, null],
   };
   const detached = {
     name: "row",
     type: "string",
     value: "old-1",
+    label: "second",
     callback() {
       // The rebuild replaces the row entirely, and the replacement did NOT take the value —
       // the #1922 shape retention exists for.
-      node.widgets = [node.widgets[0], { name: "row", type: "string", value: "old-1" }];
+      node.widgets = [node.widgets[0], { name: "row", type: "string", value: "old-1", label: "second" }];
     },
   };
   node.widgets[1] = detached;
 
   await runSetWidget(node, "row", "new", {
     ...wiredDeps("DupRows"),
-    occurrence: { index: 1, widget: detached },
+    occurrence: { index: 1, of: 2, label: "second", widget: detached },
   });
 
   // If the detached object could vouch, retention would pass on its `.value` and the
@@ -871,6 +877,55 @@ test("#2143: retention does not verify against a row the rebuild DETACHED", asyn
   // the mismatch and re-writes, so the live row holds the value.
   assert.equal(node.widgets[1].value, "new", "the row the node actually carries was written");
   assert.notEqual(node.widgets[1], detached, "and it is the replacement, not the detached object");
+});
+
+test("#2143: a rebuild into INDISTINGUISHABLE rows refuses rather than writing one blind", async () => {
+  // The addressed row object is gone and the count is unchanged, so name and count say
+  // nothing about which row is which. Two shapes make the LABEL say nothing either: no
+  // label at all, and a label SHARED by both same-named rows. In both, writing one of them
+  // is a coin flip, and a coin flip that mutes the wrong group is the defect this issue is
+  // about. Refuse; the caller re-reads duplicate_widgets and addresses it again.
+  for (const label of [undefined, "shared"]) {
+    const node = {
+      id: 59,
+      type: "DupRows",
+      constructor: nodeCtor(),
+      graph: { links: {} },
+      widgets: [{ name: "row", type: "string", value: "old-0", label }, null],
+    };
+    const detached = {
+      name: "row",
+      type: "string",
+      value: "old-1",
+      label,
+      callback() {
+        node.widgets = [node.widgets[0], { name: "row", type: "string", value: "old-1", label }];
+      },
+    };
+    node.widgets[1] = detached;
+
+    await assert.rejects(
+      runSetWidget(node, "row", "new", {
+        ...wiredDeps("DupRows"),
+        occurrence: { index: 1, of: 2, label: label ?? null, widget: detached },
+      }),
+      /no longer names the row this call addressed/,
+      `label ${JSON.stringify(label)}`,
+    );
+    assert.equal(node.widgets[1].value, "old-1", "the replacement row was not written blind");
+  }
+
+  // A label that names exactly ONE of the rebuilt rows still resolves — the refusal is
+  // about being unable to discriminate, not about rebuilds as such.
+  assert.equal(
+    widgetAtOccurrence(
+      { widgets: [{ name: "row", label: "a" }, { name: "row", label: "b" }] },
+      "row",
+      1,
+      { index: 1, of: 2, label: "b", widget: { name: "row", label: "b" } },
+    )?.label,
+    "b",
+  );
 });
 
 test("#2143: retention survives a callback that RELABELS the row it just wrote", async () => {

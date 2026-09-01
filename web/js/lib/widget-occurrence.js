@@ -121,16 +121,17 @@ export function occurrenceLabelOf(widget) {
  *      that was addressed, whatever the labels say. This is the shape a Fast Groups node
  *      actually produces when it rebuilds: a group was added or removed, so every index
  *      after it means a different group now.
- *   3. LABEL. A rebuild that kept the same number of rows: a matching label says it put the
- *      same row back here, a different one says it did not.
+ *   3. LABEL, and it must actually DISCRIMINATE. A rebuild that kept the same number of
+ *      rows: a matching label says it put the same row back here, a different one says it
+ *      did not — but a label shared by more than one same-named row says nothing at all,
+ *      and neither does no label. Once the addressed OBJECT is gone, an inconclusive label
+ *      is a REFUSAL, not a pass: the rows cannot be told apart, so writing one of them is a
+ *      coin flip, and a coin flip that mutes the wrong group is this whole issue. The
+ *      caller re-reads `duplicate_widgets` and addresses it again — cheap, and honest.
  *
- * WHAT IS LEFT, stated rather than defended: a rebuild that replaces the row objects,
- * keeps the same number of rows, REORDERS them, and where the rows carry no labels at all
- * (or identical ones) is accepted. At that point nothing on the node distinguishes those
- * rows — not the name, not the count, not the label, and the value is what the write is
- * about to change — so no check placed here could tell them apart. The reported node is not
- * that shape: an rgthree Fast Groups row is labelled with its group's title, which is
- * exactly what step 3 reads.
+ * A pin carrying only an `index` gets steps 1 and 3 vacuously and lands on name + position:
+ * the old behaviour, kept so a bare `{index}` stays usable in fixtures and direct helper
+ * calls. Nothing the panel sends is that shape — it always pins the row it resolved.
  */
 export function widgetAtOccurrence(node, name, index, pin = null) {
   if (!Number.isInteger(index) || index < 0) return null;
@@ -138,12 +139,25 @@ export function widgetAtOccurrence(node, name, index, pin = null) {
   const at = widgets[index];
   if (!at || widgetName(at) !== name) return null;
   const pinned = pin && typeof pin === "object" ? pin : null;
+  const rebuilt = !!pinned?.widget && !widgets.includes(pinned.widget);
   if (pinned?.widget) {
     if (at === pinned.widget) return at;
-    if (widgets.includes(pinned.widget)) return null;
+    // The addressed row is still on the node, just not here: the rows were REORDERED and
+    // this index is stale.
+    if (!rebuilt) return null;
   }
-  if (Number.isInteger(pinned?.of) && occurrencesOf(node, name).length !== pinned.of) return null;
+  const sameName = occurrencesOf(node, name);
+  if (Number.isInteger(pinned?.of) && sameName.length !== pinned.of) return null;
   if (pinned?.label != null && widgetLabel(at) !== pinned.label) return null;
+  // The addressed row OBJECT is gone, so identity established nothing and the label is all
+  // that is left. Require it to name exactly ONE of the rows sharing this name; otherwise
+  // refuse rather than write whichever row happens to have landed here.
+  if (rebuilt && sameName.length > 1) {
+    const labelNamesOneRow =
+      pinned.label != null &&
+      sameName.filter((entry) => widgetLabel(entry.widget) === pinned.label).length === 1;
+    if (!labelNamesOneRow) return null;
+  }
   return at;
 }
 
