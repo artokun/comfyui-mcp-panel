@@ -24,6 +24,9 @@ import { createCivitaiContent } from "./cmcp-civitai-ui.js";
 import { createAppsContent } from "./cmcp-apps-ui.js";
 import { createTrainingContent } from "./cmcp-training-ui.js";
 import { createLocalContent } from "./cmcp-runpod-ui.js";
+// Vendored from the ComfyUI_BenjiDirector submodule by its sync script. It is build
+// output, which is why it lives under vendor/ — the panel scope gate skips that path.
+import { createDirectorContent } from "./vendor/benjidirector/pane.js";
 import { tr } from "./lib/i18n.js";
 
 // key → content factory + tab presentation. Order = tab-bar order.
@@ -38,6 +41,7 @@ const TABS = [
   { key: "apps", get label() { return tr("sidepanel_ui.apps", "Apps"); }, icon: "pi-th-large", factory: createAppsContent },
   { key: "training", get label() { return tr("sidepanel_ui.training", "Training"); }, icon: "pi-bolt", factory: createTrainingContent },
   { key: "local", get label() { return tr("sidepanel_ui.runpod", "RunPod"); }, icon: "pi-server", factory: createLocalContent },
+  { key: "director", get label() { return tr("sidepanel_ui.director", "Director"); }, icon: "pi-video", factory: createDirectorContent },
 ];
 // Legacy per-surface alias classes applied to the modal while that tab is active.
 const ALIAS = { civitai: "cmcp-civitai-modal", training: "cmcp-tr-modal", apps: "cmcp-apps-modal" };

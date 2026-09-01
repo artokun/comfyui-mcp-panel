@@ -35338,7 +35338,7 @@ function buildPanel() {
   // themed toggled state (cleared on close). The buttons are const-declared below,
   // but this only runs at tab-change time, by which point they're initialized.
   function setActiveToolbarTab(key) {
-    const map = { civitai: civitaiBtn, apps: appsBtn, training: trainingBtn, local: runpodBtn };
+    const map = { civitai: civitaiBtn, apps: appsBtn, training: trainingBtn, local: runpodBtn, director: directorBtn };
     for (const [k, btn] of Object.entries(map)) {
       if (btn) btn.classList.toggle("cmcp-toolbtn-active", k === key);
     }
@@ -35379,6 +35379,7 @@ function buildPanel() {
   const openApps = () => openSidePanelTab("apps");
   const openTraining = (opts = {}) => openSidePanelTab("training", { dock: opts.dock !== false });
   const openRunpod = () => openSidePanelTab("local");
+  const openDirector = (opts = {}) => openSidePanelTab("director", { dock: opts.dock !== false });
   const civitaiBtn = toolbarBtn("pi-circle", "CivitAI");
   civitaiBtn.querySelector(".pi").remove();
   civitaiBtn.title = tr("panel.civitai_explorer_browse_and_pull_models_loras", "CivitAI explorer — browse and pull models, LoRAs, and workflows without leaving the panel.");
@@ -35558,7 +35559,13 @@ function buildPanel() {
 
   const toolbarSpacer = document.createElement("span");
   toolbarSpacer.className = "cmcp-spacer";
-  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, appsBtn, trainingBtn, runpodBtn);
+  const directorBtn = toolbarBtn("pi-video", tr("sidepanel_ui.director", "Director"));
+  directorBtn.title = tr(
+    "panel.director_agent_driven_scene_graph",
+    "Director — an agent-driven scene graph for long-form video, backed by Calliope.",
+  );
+  directorBtn.addEventListener("click", () => toggleSidePanelTab("director", () => openDirector({ dock: true })));
+  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, appsBtn, trainingBtn, runpodBtn, directorBtn);
 
   // Feature-flag the newer toolbar surfaces (Apps / Training / RunPod). Hidden by
   // default; opt in via Settings › Features. Inline display (not the `hidden`

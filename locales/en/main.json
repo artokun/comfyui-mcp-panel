@@ -474,6 +474,7 @@
       "detect_follow_comfyui": "Detect (follow ComfyUI)",
       "diagnostics_copied_paste_them_in_discord": "✅ Diagnostics copied — paste them in Discord",
       "dictate_browser_speech_recognition": "Dictate (browser speech recognition)",
+      "director_agent_driven_scene_graph": "Director — an agent-driven scene graph for long-form video, backed by Calliope.",
       "disconnect": "Disconnect",
       "disconnected_click_connect_to_start_again": "Disconnected. Click Connect to start again.",
       "disconnected_slot": "Disconnected {slot}",
@@ -1003,6 +1004,7 @@
       "apps": "Apps",
       "civitai": "CivitAI",
       "close": "Close",
+      "director": "Director",
       "runpod": "RunPod",
       "search": "Search…",
       "training": "Training"
