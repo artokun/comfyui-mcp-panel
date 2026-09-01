@@ -124,6 +124,28 @@ test("#2151: enabling an already-enabled row does not silently bypass the effect
   assert.equal(result.value, true);
 });
 
+test("#2151: the write is a setter for every input shape a caller can send", () => {
+  // A tool call carries JSON, so the boolean can arrive as "false" / "0" / 0. Each of these has
+  // to land on the SAME mode regardless of where the linked node started, which is the property
+  // the toggling callback could not have: it read the mode instead of the value.
+  for (const value of ["false", "0", 0, false]) {
+    for (const startMode of [0, 4]) {
+      const fixture = makeModeChanger({ linkedModes: [startMode] });
+      applyWidgetWrite(fixture.node, "Enable LC Film Stock (B&W)", value, {});
+      assert.equal(fixture.linked[0].mode, 4, `${JSON.stringify(value)} from mode ${startMode}`);
+      assert.equal(fixture.widgets[0].value, false);
+    }
+  }
+  for (const value of ["true", "1", 1, true]) {
+    for (const startMode of [0, 4]) {
+      const fixture = makeModeChanger({ linkedModes: [startMode] });
+      applyWidgetWrite(fixture.node, "Enable LC Film Stock (B&W)", value, {});
+      assert.equal(fixture.linked[0].mode, 0, `${JSON.stringify(value)} from mode ${startMode}`);
+      assert.equal(fixture.widgets[0].value, true);
+    }
+  }
+});
+
 test("#2151: the write drives doModeChange(value), never the toggling callback", () => {
   const fixture = makeModeChanger({ linkedModes: [0] });
   applyWidgetWrite(fixture.node, "Enable LC Film Stock (B&W)", false, {});
