@@ -61,7 +61,7 @@ export function createDirectorContent(ctx, shell, opts = {}) {
       // hash. Without it the browser caches this module indefinitely: the panel is served raw
       // with no bundler, so nothing else busts it, and a user who updated the pack would keep
       // running the old editor with no way to tell.
-      const mod = await import("./director-app.js?v=0ddc97b93bdf");
+      const mod = await import("./director-app.js?v=d733e5066c4f");
       // The pane can be torn down while the dynamic import is in flight; mounting into a
       // detached node would leak a React root that nothing will ever unmount.
       if (mountEl !== bodyEl || !bodyEl.isConnected) return;
