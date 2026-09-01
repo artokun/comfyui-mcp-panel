@@ -37,7 +37,16 @@ const ROOT_GRAPH_ID = "c4a254bb-935e-4013-b380-5e36954de4b0";
  * factory for instances of it — the reporter's shape: several wrappers, one
  * definition, a promoted `width`.
  */
-function makeReusableSubgraph({ definitionValue = 512, railWritesDefinition = false, innerHasCallback = true } = {}) {
+function makeReusableSubgraph({
+  definitionValue = 512,
+  railWritesDefinition = false,
+  innerHasCallback = true,
+  // comfyui-mcp#2689 — a frontend that hands out a per-instance `widgetId` while its
+  // rail READS the shared inner widget as well as writing it. The two directions make
+  // the rail and the definition ONE store, so the repair below provably cannot
+  // separate them and the write must stay refused.
+  railIsInnerView = false,
+} = {}) {
   const events = { innerCallback: [], railCallback: [], railSets: [] };
   const inner = {
     id: 10,
@@ -83,7 +92,24 @@ function makeReusableSubgraph({ definitionValue = 512, railWritesDefinition = fa
       // (definition) widget's value at promotion time.
       store.set(widgetId, { name: "width", type: "INT", value: inner.widgets[0].value, options: {} });
     }
-    const rail = widgetId
+    const rail = widgetId && railIsInnerView
+      ? {
+          name: "width",
+          type: "INT",
+          options: {},
+          get value() {
+            return inner.widgets[0].value;
+          },
+          set value(next) {
+            events.railSets.push(next);
+            inner.widgets[0].value = next;
+          },
+          callback(next) {
+            events.railCallback.push(next);
+            inner.widgets[0].value = next;
+          },
+        }
+      : widgetId
       ? {
           get name() {
             return store.get(widgetId)?.name ?? "width";
@@ -252,44 +278,103 @@ test("#1707: the instance-scoped write fires the RAIL's callback, not the shared
   );
 });
 
-test("#1707: an instance key does NOT license the claim — a rail that still writes the definition fails closed", () => {
-  // The discriminator reads the frontend's own store key. If that key is present but
-  // the rail turns out to forward to the inner widget anyway, the write DID reach every
-  // sibling, and reporting `value_scope: "instance"` would be false. Refuse instead.
+test("comfyui-mcp#2689: a rail that writes THROUGH to the definition is REPAIRED, not refused", () => {
+  // WAS a refusal (#1707). The rail writes the wrapper's own store entry — the value
+  // queue compilation reads — and then ALSO assigns the shared inner widget, which
+  // nothing asked it to do and which an on-canvas edit of the promoted control never
+  // does. Refusing the whole write made every promoted STRING on the reported frontends
+  // permanently unwritable. Undoing the second assignment leaves the first one exactly
+  // where it was addressed, and THAT is verified here rather than assumed.
   const sg = makeReusableSubgraph({ definitionValue: 512, railWritesDefinition: true });
   const target = sg.instance(293);
   const sibling = sg.instance(279);
   sibling.rail.value = 1536;
   target.rail.value = 1920;
 
-  assert.throws(
-    () => applyWidgetWrite(target.node, "width", 1024, { resolveSource }),
-    (err) => err instanceof WidgetWriteError && /ALSO changed the shared subgraph definition/.test(err.message),
-  );
+  const set = applyWidgetWrite(target.node, "width", 1024, { resolveSource });
 
-  // The REQUESTED value survives nowhere: not on the rail, not in the store queue
-  // compilation reads, and not on the definition every sibling reads. (#2132 corrects
-  // an earlier note here which said the rail and the definition "cannot both be
-  // restored independently — the two are one store". They are NOT one store: this rail
-  // READS its own store entry and only WRITES THROUGH to the inner widget, so restoring
-  // the rail first and the shared inner widget last restores both. The divergent case
-  // that made the difference visible is pinned in the #2132 test below.)
-  assert.notEqual(target.rail.value, 1024);
-  assert.notEqual(sg.queuedValue(target), 1024);
-  assert.notEqual(sg.definition(), 1024);
-  assert.notEqual(sibling.rail.value, 1024);
-  assert.equal(sg.definition(), 1920, "the shared definition is back on exactly the value it held");
-  assert.equal(target.rail.value, 1920, "and so is the rail");
+  // The addressed wrapper took the value, including what queue compilation reads.
+  assert.equal(target.rail.value, 1024);
+  assert.equal(sg.queuedValue(target), 1024);
+  // …and the shared definition is back on its own value, so the claim below is true.
+  assert.equal(sg.definition(), 1920, "the shared definition is restored to its captured value");
+  assert.equal(sibling.rail.value, 1536, "the sibling nobody addressed is untouched");
+  assert.equal(sg.queuedValue(sibling), 1536);
+  // An instance created afterwards is seeded from the definition — the wrapper "nobody
+  // touched" in the original report. It must not inherit this instance's value.
+  assert.equal(sg.instance(300).rail.value, 1920, "a later instance inherits the definition, not this write");
+
+  assert.equal(set.promoted_from.value_scope, "instance");
+  assert.equal(set.value, 1024);
+  assert.equal(set.node_id, 293);
+  // The definition WAS touched and put back. That is disclosed as data, not inferred.
+  assert.equal(set.promoted_from.shared_definition_write_through, true);
+  assert.match(set.promoted_from.shared_definition_write_through_note, /It was undone/);
+  assert.match(set.promoted_from.shared_definition_write_through_note, /node 10/);
 });
 
-test("#2132: the rollback of a forwarding rail restores the SHARED definition, not the rail's value", () => {
-  // The reported shape (panel 0.15.149, frontend 1.51.9). The rail's per-instance store
-  // and the shared inner widget have DIVERGED before the write — the promoted control
-  // was set on this instance, and the inner widget was later edited inside the subgraph
-  // definition. That divergence is the whole defect: with the two in sync, restoring the
-  // inner and then letting the rail's restore forward back onto it lands the same value,
-  // so the bug is invisible; diverged, the rail's captured value is forwarded onto the
-  // SHARED inner widget after its own rollback and overwrites it.
+test("comfyui-mcp#2689: a rail that does NOT write through says nothing about a write-through", () => {
+  // The disclosure marks a real event. An unconditional flag would train a caller to
+  // ignore the one case where the shared definition was actually assigned.
+  const sg = makeReusableSubgraph({ definitionValue: 512 });
+  const target = sg.instance(293);
+
+  const set = applyWidgetWrite(target.node, "width", 1024, { resolveSource });
+
+  assert.equal(set.promoted_from.value_scope, "instance");
+  assert.equal(
+    "shared_definition_write_through" in set.promoted_from,
+    false,
+    "a rail that never touched the definition must reply exactly as it always did",
+  );
+  assert.equal(sg.definition(), 512);
+});
+
+test("comfyui-mcp#2689: a rail that is genuinely ONE store with the definition is still refused", () => {
+  // The fence is not removed, it is made conditional on an OBSERVATION. This frontend
+  // hands out a per-instance key — so `promotedValueScope` says "instance" — while its
+  // rail both reads and writes the shared inner widget. Restoring the inner widget
+  // therefore drags the rail back with it, the repair cannot verify, and reporting
+  // `value_scope: "instance"` would be exactly the false claim #1707 exists to stop.
+  const sg = makeReusableSubgraph({ definitionValue: 512, railIsInnerView: true });
+  const target = sg.instance(293);
+  const sibling = sg.instance(279);
+  assert.equal(promotedValueScope(target.node, target.input), "instance", "precondition: it claims an instance key");
+
+  let err = null;
+  try {
+    applyWidgetWrite(target.node, "width", 1024, { resolveSource });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof WidgetWriteError, "a rail that cannot be separated from the definition is refused");
+  assert.match(err.message, /ALSO changed the shared subgraph definition/);
+  // …and it says WHICH shape this is, so the caller is not told to retry something that
+  // will fail identically forever.
+  assert.match(err.message, /are one store here/);
+  assert.match(err.message, /comfyui-mcp#2689/);
+
+  // The requested value survives nowhere, and the SHARED definition is whole.
+  assert.equal(sg.definition(), 512, "the shared definition is back on exactly the value it held");
+  assert.equal(target.rail.value, 512);
+  assert.equal(sibling.rail.value, 512, "the sibling nobody addressed is untouched");
+  // A clean rollback must not be reported as a partial state.
+  assert.doesNotMatch(err.message, /did not take effect/);
+  assert.doesNotMatch(err.message, /partial state/);
+});
+
+test("#2132 × comfyui-mcp#2689: a REPAIRED write that then fails still restores the SHARED definition last", () => {
+  // The #2132 shape (panel 0.15.149, frontend 1.51.9): a write-through rail whose own
+  // store and the shared inner widget have DIVERGED before the write. That divergence is
+  // what makes the rollback ORDER observable — restore the inner first and the rail's own
+  // restore forwards its captured value straight back onto the SHARED definition, leaving
+  // every sibling instance and every later instance on a value nobody asked for.
+  //
+  // Under #2689 the collateral definition write is repaired, so this write no longer
+  // fails on `definitionMoved`. It is failed here by a promotion DRIFT raised after the
+  // repair has already run — which is the case that pins BOTH properties at once: the
+  // rollback must still restore the inner widget even though the definition-moved verdict
+  // was cleared, and it must do it AFTER the rail.
   const sg = makeReusableSubgraph({ definitionValue: 512, railWritesDefinition: true });
   const sibling = sg.instance(279);
   const target = sg.instance(293);
@@ -298,27 +383,106 @@ test("#2132: the rollback of a forwarding rail restores the SHARED definition, n
   assert.equal(sg.definition(), 512, "precondition: rail 1920, shared definition 512");
   assert.equal(target.rail.value, 1920);
 
+  // A rail callback that re-points the host input's serialization binding: the write is
+  // applied and repaired, and only the post-write recheck rejects it.
+  const railCallback = target.rail.callback.bind(target.rail);
+  target.rail.callback = (next) => {
+    railCallback(next);
+    target.input.widgetId = ROOT_GRAPH_ID + ":999:width";
+  };
+
   let err = null;
   try {
     applyWidgetWrite(target.node, "width", 1024, { resolveSource });
   } catch (e) {
     err = e;
   }
-  assert.ok(err instanceof WidgetWriteError, "a forwarding rail is still refused");
-  assert.match(err.message, /ALSO changed the shared subgraph definition/);
+  assert.ok(err instanceof WidgetWriteError, "a drifted promotion is still refused");
+  assert.match(err.message, /CHANGED during the write/);
 
-  // THE PIN. Before #2132 the shared definition was left holding 1920 — the rail's value,
-  // forwarded onto it by the rail's own rollback after the inner rollback had already put
-  // 512 back. Every sibling instance and every instance created later reads this widget.
+  // THE PIN. Restore the inner widget after the rail, or the shared definition is left
+  // holding 1920 — the rail's value, forwarded onto it by the rail's own rollback.
   assert.equal(sg.definition(), 512, "the shared definition is restored to its own captured value");
   assert.equal(target.rail.value, 1920, "and the rail is restored to its own, independently");
   assert.equal(sg.queuedValue(target), 1920, "including what queue compilation reads");
   assert.equal(sibling.rail.value, 512, "the sibling nobody addressed is untouched");
-  // A clean rollback, so it must not be reported as a partial state: the reported message
-  // said "Rollback of inner "prompt" did not take effect … the graph may be in a partial
-  // state", which sent the user to undo a graph that is now whole.
   assert.doesNotMatch(err.message, /did not take effect/);
   assert.doesNotMatch(err.message, /partial state/);
+});
+
+test("comfyui-mcp#2689: the REPORTED shape — a promoted multiline prompt on a CLIPTextEncode", () => {
+  // The reproduction from the report, node ids and all: parent SubgraphNode 5646 with
+  // inner CLIPTextEncode 5606, the promotion RENAMED (`text_1` outside, `text` inside),
+  // and the rail a live custom-text widget whose `options.setValue` writes this wrapper's
+  // store entry — and, on this frontend, the shared inner widget as well.
+  //
+  // Modelled as a DOM-backed rail rather than a plain accessor because that is what the
+  // frontend registers for a promoted STRING, and it is why the COMBO reports (#2688)
+  // took a different path while every promoted prompt hit this one.
+  const store = new Map();
+  const widgetId = `${ROOT_GRAPH_ID}:5646:${encodeURIComponent("text_1")}`;
+  const inner = {
+    id: 5606,
+    type: "CLIPTextEncode",
+    widgets: [{ name: "text", type: "customtext", value: "OLD PROMPT", options: { multiline: true } }],
+  };
+  const subgraph = {
+    id: "sg-prompt",
+    _nodes: [inner],
+    getNodeById: (id) => (String(id) === "5606" ? inner : null),
+  };
+  store.set(widgetId, { name: "text_1", type: "customtext", value: inner.widgets[0].value, options: {} });
+  const rail = {
+    name: "text_1",
+    type: "customtext",
+    get value() {
+      return store.get(widgetId)?.value;
+    },
+    set value(next) {
+      const state = store.get(widgetId);
+      if (state) state.value = next;
+    },
+    options: {
+      getValue: () => store.get(widgetId)?.value,
+      setValue: (next) => {
+        const state = store.get(widgetId);
+        if (state) state.value = next;
+        // The write-through this issue is about.
+        inner.widgets[0].value = next;
+      },
+    },
+  };
+  const input = {
+    name: "text_1",
+    widgetId,
+    _widget: rail,
+    widget: { name: "text_1" },
+    _subgraphSlot: { name: "text_1" },
+  };
+  const host = {
+    id: 5646,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [input],
+    get widgets() {
+      return [rail];
+    },
+  };
+  const resolvePrompt = (_node, subgraphInput) =>
+    subgraphInput?.name === "text_1" ? { sourceNodeId: "5606", sourceWidgetName: "text" } : null;
+
+  // This is the call that failed on panel 0.15.149 with "Rolled back rather than report
+  // an instance-scoped write that was not one".
+  const set = applyWidgetWrite(host, "text_1", "a NEW prompt", { resolveSource: resolvePrompt });
+
+  assert.equal(rail.value, "a NEW prompt", "the promoted control holds the new prompt");
+  assert.equal(store.get(widgetId).value, "a NEW prompt", "and so does what queue compilation reads");
+  assert.equal(inner.widgets[0].value, "OLD PROMPT", "the shared definition's inner widget is untouched");
+  assert.equal(set.promoted_from.value_scope, "instance");
+  assert.equal(set.promoted_from.inner_node_id, 5606);
+  assert.equal(set.node_id, 5646);
+  assert.equal(set.value, "a NEW prompt");
+  assert.equal(set.promoted_from.shared_definition_write_through, true);
 });
 
 test("#1707: a failed instance-scoped write does not touch the definition on the ROLLBACK either", () => {
