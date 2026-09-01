@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { applyWidgetWrite, WidgetWriteError } from "../../web/js/lib/widget-write.js";
-import { readLiveWidgetValue } from "../../web/js/lib/set-widget.js";
+import { readLiveWidgetValue, runSetWidget } from "../../web/js/lib/set-widget.js";
 import { widgetWriteTimeoutReadback } from "../../web/js/lib/delivery-ack.js";
 import { missingWidgetMessage } from "../../web/js/lib/missing-widget.js";
 import { duplicateWidgetRows } from "../../web/js/lib/widget-rows.js";
@@ -617,6 +617,110 @@ test("#2143: the timeout receipt carries the same row attribution the write's ow
     widget_occurrence: widgetOccurrenceOf(plain, plainLive.widget),
   });
   assert.equal("widget_occurrence" in plainReceipt.set, false);
+});
+
+// ---------------------------------------------------------------------------
+// The whole async body — where a post-write re-read can still name the wrong row
+// ---------------------------------------------------------------------------
+
+/** A node type the fresh-/object_info authorization accepts, so runSetWidget reaches its
+ *  own write and post-write retention rather than refusing at the oracle. */
+function nodeCtor() {
+  const c = function NodeCtor() {};
+  c.nodeData = { input: { required: {} } };
+  return c;
+}
+
+function wiredDeps(type) {
+  const ctor = nodeCtor();
+  const registry = { [type]: ctor };
+  return {
+    registry,
+    getRegistry: () => registry,
+    getFreshObjectInfo: async () => ({ [type]: {} }),
+    beforeChange() {},
+    afterChange() {},
+    setDirty() {},
+  };
+}
+
+test("#2143: the post-write retention check re-reads the row that was written", async () => {
+  // The failure this pins is a FALSE REFUSAL over an APPLIED write. `retainVerifiedWrite`
+  // re-reads the widget after the frontend flush; reading the first same-named row instead
+  // of the addressed one sees the old value, retries the write, sees it again, and refuses —
+  // telling the caller nothing was applied about a mutation that landed twice.
+  const node = {
+    id: 59,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [
+      { name: "row", type: "string", value: "old-0" },
+      { name: "row", type: "string", value: "old-1" },
+    ],
+  };
+
+  const res = await runSetWidget(node, "row", "new", { ...wiredDeps("DupRows"), occurrenceIndex: 1 });
+
+  assert.equal(res.set.value, "new");
+  assert.equal(node.widgets[1].value, "new", "the addressed row was written");
+  assert.equal(node.widgets[0].value, "old-0", "the first row was not");
+  assert.deepEqual(res.set.widget_occurrence, { index: 1, of: 2 });
+});
+
+test("#2143: retention survives a callback that RELABELS the row it just wrote", async () => {
+  // The write's callback re-derives the row labels — which is what a Fast Groups row action
+  // does, since it changes the very groups the labels come from. Retention runs after that
+  // callback, so a label pin there would reject the row it had just written, and the retry
+  // it triggers is a SECOND MUTATION — on a Fast Groups row, a second toggle of the group.
+  // Name + position is the level that holds.
+  let callbacks = 0;
+  const node = {
+    id: 59,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [
+      { name: "row", type: "string", value: "old-0", label: "before 0" },
+      {
+        name: "row",
+        type: "string",
+        value: "old-1",
+        label: "before 1",
+        callback() {
+          callbacks += 1;
+          node.widgets[0].label = `pass ${callbacks} row 0`;
+          node.widgets[1].label = `pass ${callbacks} row 1`;
+        },
+      },
+    ],
+  };
+
+  const res = await runSetWidget(node, "row", "new", { ...wiredDeps("DupRows"), occurrenceIndex: 1 });
+
+  assert.equal(res.set.value, "new");
+  assert.equal(node.widgets[1].value, "new");
+  assert.equal(node.widgets[1].label, "pass 1 row 1", "the callback did relabel the row");
+  assert.equal(callbacks, 1, "a relabel must not trigger a second write of the same row");
+});
+
+test("#2143: an end-to-end write to a bare duplicated name is unchanged, and discloses the row", async () => {
+  const node = {
+    id: 59,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [
+      { name: "row", type: "string", value: "old-0" },
+      { name: "row", type: "string", value: "old-1" },
+    ],
+  };
+
+  const res = await runSetWidget(node, "row", "new", wiredDeps("DupRows"));
+
+  assert.equal(node.widgets[0].value, "new");
+  assert.equal(node.widgets[1].value, "old-1");
+  assert.deepEqual(res.set.widget_occurrence, { index: 0, of: 2 });
 });
 
 // ---------------------------------------------------------------------------

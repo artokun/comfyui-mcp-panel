@@ -1308,8 +1308,26 @@ async function runSetWidgetBody(
     const hosts = [node, resolvedTargetNode, authTarget].filter(Boolean);
     const prefer = hosts.filter((host) => host.id === set?.node_id);
     const rest = hosts.filter((host) => host.id !== set?.node_id);
+    // #2143 — WHICH row, when the name is carried by more than one. `find` by name answers
+    // about the FIRST, so a verified write to row 1 was checked against row 0's value: the
+    // retention check would see a mismatch it could not fix, retry the write, see it again,
+    // and REFUSE — reporting "nothing was applied" about a mutation that had landed twice.
+    // The occurrence comes off the write's own reply, so it names the row the write actually
+    // reached (including the bare-name case, where row 0 was chosen implicitly) rather than
+    // the ordinal the request asked for. Absent for every unique name, where `find` is exact.
+    //
+    // NAME AND POSITION ONLY — the pinned LABEL is deliberately not applied here, unlike at
+    // the write and at the ack readback. This runs AFTER the widget's own callback, and a
+    // Fast Groups row action re-derives its rows' labels from the groups it just changed; a
+    // label pin would then reject the very row it had written and turn a landed write into a
+    // retry and a refusal — the same false report this whole check exists to avoid. The
+    // retry is not left unguarded by that: `rewrite()` goes back through applyWidgetWrite,
+    // whose own label pin refuses a row that MOVED rather than writing the wrong one.
+    const occurrence = set?.widget_occurrence;
     for (const host of [...prefer, ...rest]) {
-      const live = host.widgets?.find((candidate) => candidate?.name === set?.widget);
+      const live = occurrence
+        ? widgetAtOccurrence(host, set?.widget, occurrence.index)
+        : host.widgets?.find((candidate) => candidate?.name === set?.widget);
       if (live) return { found: true, value: live.value };
     }
     return { found: false, value: undefined };
