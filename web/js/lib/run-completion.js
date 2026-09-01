@@ -488,6 +488,23 @@ export function createRunCompletionTracker({
   // depends on a peer capability it cannot observe must be bounded, or a peer
   // that never answers turns it into an infinite loop.
   //
+  // #2150 — AND AN OLD ORCHESTRATOR IS NOT THE ONLY WAY TO GET NO RECEIPT. That
+  // is the reading the paragraph above invites, and a reporter took it: they saw
+  // this budget spent in full on comfyui-mcp 0.52.146, read "before v0.52.122",
+  // concluded the ack path must be present-but-blocked, and filed a panel bug for
+  // an orchestrator one. On a CURRENT orchestrator the ack is gated on
+  // `acceptsCompletionReceipt()`, which needs a live ticket for the prompt id
+  // that is not `reused`, passes `ownsRun()`, and carries THIS completion key.
+  // A completion can be journaled, delivered to the agent, and still fail every
+  // one of those — the ticket was evicted (mcp caps at 64), the tab id or
+  // conversation churned across a reconnect, or a remount re-minted the key.
+  // The same check drives the agent-facing "its origin is UNDETERMINED" banner,
+  // so that banner and a spent budget are one condition, not two symptoms.
+  // Tracked upstream as comfyui-mcp#2700, which is where the fix belongs: the
+  // panel cannot tell a declined receipt from a frame lost in transit, because
+  // both look like silence, and recovering the lost one is what this replay is
+  // FOR. So the bound stays, and it stays at three.
+  //
   // So: the replay stays, and what is counted is the only thing that can
   // actually reach the agent — a completion frame the TRANSPORT ACCEPTED for
   // this run which no receipt has retired. Past the budget the panel stops
