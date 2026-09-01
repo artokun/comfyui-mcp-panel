@@ -1377,17 +1377,47 @@ async function runSetWidgetBody(
    * write once more (the init has now run, which is why the reporter's second
    * call stuck); if it still does not hold, refuse.
    */
+  /**
+   * #2143 — RE-RESOLVE THE REPORTED ADDRESS AFTER THE FLUSH.
+   *
+   * `widget_occurrence.index` is the number a caller sends straight back as "NAME[i]".
+   * applyWidgetWrite resolves it as the last thing it does, but the flush below happens
+   * after that and the node can reorder or rebuild its rows in that window — so the number
+   * that reaches the caller has to be answered again, from the written row, at the moment
+   * the reply is formed. Same rule applyWidgetWrite uses: a live position when the row
+   * still has one, otherwise the pre-write capture flagged `stale` so the caller knows
+   * which row was written without being handed a number to reuse.
+   *
+   * Applied on retainVerifiedWrite's OWN returns rather than at each ack site. There are
+   * two of those — the ordinary success and the stale/unreadable-combo recovery — and the
+   * recovery one was missed when this lived at the call site, which is the whole argument
+   * for putting it where the flush is instead of where the reply is.
+   */
+  const withLiveOccurrence = (set) => {
+    const written = writtenWidgets.get(set);
+    if (!written?.valueWidget || !set || typeof set !== "object") return set;
+    const live = widgetOccurrenceOf(written.valueNode, written.valueWidget, set.widget);
+    const next =
+      live ?? (written.preWriteOccurrence ? { ...written.preWriteOccurrence, stale: true } : null);
+    if (next === null) {
+      if (!("widget_occurrence" in set)) return set;
+      const { widget_occurrence: _dropped, ...rest } = set;
+      return rest;
+    }
+    return { ...set, widget_occurrence: next };
+  };
+
   async function retainVerifiedWrite(set, rewrite) {
     await flushFrontendWidgets();
     assertNotAbandoned();
     assertTargetStillCurrentNow();
-    if (widgetStillHolds(set)) return set;
+    if (widgetStillHolds(set)) return withLiveOccurrence(set);
     assertNotAbandoned();
     const retried = rewrite();
     await flushFrontendWidgets();
     assertNotAbandoned();
     assertTargetStillCurrentNow();
-    if (widgetStillHolds(retried)) return retried;
+    if (widgetStillHolds(retried)) return withLiveOccurrence(retried);
     const live = readLiveWritten(retried);
     throw new WidgetWriteError(
       `Widget "${retried?.widget}" on node ${retried?.node_id} (${node?.type}) did not retain the ` +
@@ -1408,23 +1438,9 @@ async function runSetWidgetBody(
    * position when the row still has one, otherwise the pre-write capture flagged `stale`
    * so the caller knows which row was written without being handed a number to reuse.
    */
-  const withLiveOccurrence = (set) => {
-    const written = writtenWidgets.get(set);
-    if (!written?.valueWidget || !set || typeof set !== "object") return set;
-    const live = widgetOccurrenceOf(written.valueNode, written.valueWidget, set.widget);
-    const next =
-      live ?? (written.preWriteOccurrence ? { ...written.preWriteOccurrence, stale: true } : null);
-    if (next === null) {
-      if (!("widget_occurrence" in set)) return set;
-      const { widget_occurrence: _dropped, ...rest } = set;
-      return rest;
-    }
-    return { ...set, widget_occurrence: next };
-  };
-
   async function succeedWrite(extra = {}, extraResult = {}) {
     const set = await retainVerifiedWrite(write(extra), () => write(extra));
-    return withWarning(honestWidgetAck({ set: withLiveOccurrence(set), ...extraResult }));
+    return withWarning(honestWidgetAck({ set, ...extraResult }));
   }
 
   // #558: the value widget being written may be governed by a non-`fixed`

@@ -1409,6 +1409,33 @@ test("#2143: runSetWidget forwards the ordinal to the write and to its own ack r
   assert.match(setWidgetSource, /occurrence: opts\.occurrence \?\? null,/);
 });
 
+test("#2143: EVERY retention return is address-remapped, not just the ordinary ack site", () => {
+  const setWidgetSource = readFileSync(
+    new URL("../../web/js/lib/set-widget.js", import.meta.url),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+
+  // `retainVerifiedWrite` is awaited from TWO places — the ordinary success and the
+  // stale/unreadable-combo recovery — and each hands its `set` to its own `honestWidgetAck`.
+  // While the post-flush address remap lived at the call site, the recovery one did not get
+  // it and returned a pre-flush index with no `stale` flag. This is a structural fact, so it
+  // is asserted structurally: the remap is on retention's own returns, so a caller cannot
+  // fail to apply it — including a third one nobody has written yet.
+  const callSites = [...setWidgetSource.matchAll(/await retainVerifiedWrite\(/g)];
+  assert.ok(callSites.length >= 2, `expected both retention call sites, found ${callSites.length}`);
+
+  const start = setWidgetSource.indexOf("async function retainVerifiedWrite(");
+  const end = setWidgetSource.indexOf("\n  }", setWidgetSource.indexOf("did not retain the", start));
+  assert.ok(start >= 0 && end > start, "could not locate retainVerifiedWrite");
+  const body = setWidgetSource.slice(start, end);
+
+  const returns = [...body.matchAll(/return (?!new )(.+?);/g)].map((m) => m[1]);
+  assert.ok(returns.length >= 2, `expected retention's success returns, found ${returns.length}`);
+  for (const expr of returns) {
+    assert.match(expr, /^withLiveOccurrence\(/, `a retention return bypasses the remap: ${expr}`);
+  }
+});
+
 test("#2143: the write resolves the row through the SHARED definition, not its own copy", () => {
   const widgetWriteSource = readFileSync(
     new URL("../../web/js/lib/widget-write.js", import.meta.url),
