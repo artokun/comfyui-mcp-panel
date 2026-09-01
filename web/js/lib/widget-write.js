@@ -3849,10 +3849,6 @@ export function applyWidgetWrite(
   // A row the callback REMOVED has no current address, so the pre-write capture is reported
   // with `stale: true` rather than silently dropped: the caller still learns which row was
   // written, and is told not to reuse the number.
-  const liveOccurrence = promotedFrom ? null : widgetOccurrenceOf(valueNode, valueWidget);
-  const widgetOccurrence =
-    liveOccurrence ?? (preWriteOccurrence ? { ...preWriteOccurrence, stale: true } : null);
-
   const verifiedValue = valueWidget.value;
   const verifiedName = valueWidget.name;
   const previousForHook = instanceScoped ? previousParent : previous;
@@ -3864,6 +3860,27 @@ export function applyWidgetWrite(
     afterChange,
     setDirty,
   });
+
+  // #2143 — RESOLVED AFTER THE LAST THING THAT CAN MOVE A ROW.
+  //
+  // `widget_occurrence.index` is an ADDRESS: the number a caller sends straight back as
+  // "NAME[i]", which is why it matches what `duplicate_widgets` publishes. Two hooks can
+  // reorder or rebuild `node.widgets` after the value lands — the widget's own callback,
+  // and then the node's `onWidgetChanged` (#1519) fired just above — so it is read here,
+  // after both, and by IDENTITY against the widget that was written. Reading it any
+  // earlier names a row this write never touched, and re-using that number writes that
+  // other row: the silent-wrong-row this issue exists to remove, reintroduced by the
+  // field added to prevent it.
+  //
+  // Unlike `verifiedName`/`verifiedValue`, a fresh read is CORRECT here and a stale capture
+  // is not: #1519 keeps those pre-hook because a post-hook read would report a value nothing
+  // verified, whereas this is anchored to the written widget, so it can only ever name that
+  // row — wherever the row has moved to. A row a hook REMOVED has no current address, so the
+  // pre-write capture is reported with `stale: true` rather than silently dropped: the caller
+  // still learns which row was written, and is told not to reuse the number.
+  const liveOccurrence = promotedFrom ? null : widgetOccurrenceOf(valueNode, valueWidget);
+  const widgetOccurrence =
+    liveOccurrence ?? (preWriteOccurrence ? { ...preWriteOccurrence, stale: true } : null);
 
   // On success, a promoted write has ALWAYS synced the authoritative parent rail
   // widget (verified AFTER afterChange, or it would have rolled back + thrown).

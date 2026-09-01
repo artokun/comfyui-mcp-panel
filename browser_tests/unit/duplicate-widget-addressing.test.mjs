@@ -468,6 +468,29 @@ test("#2143: the REPORTED index is a live address, not the position the row had 
   );
 });
 
+test("#2143: the reported index survives the node's onWidgetChanged hook too", () => {
+  // TWO hooks can move a row after the value lands: the widget's own callback (the test
+  // above) and then the node's `onWidgetChanged` (#1519). The address has to be read after
+  // BOTH — a fix that only cleared the first leaves the identical defect one hook later,
+  // which is exactly how this one was found.
+  const node = { id: 59, type: "T", widgets: [] };
+  const a = { name: "row", type: "string", value: "a", label: "A" };
+  const b = { name: "row", type: "string", value: "b", label: "B" };
+  node.widgets = [a, b];
+  node.onWidgetChanged = () => {
+    node.widgets = [b, a];
+  };
+
+  const res = applyWidgetWrite(node, "row", "new", {
+    occurrence: { index: 1, label: "B", widget: b },
+  });
+
+  assert.equal(b.value, "new");
+  assert.equal(node.widgets.indexOf(b), 0, "the hook moved the written row to index 0");
+  assert.deepEqual(res.widget_occurrence, { index: 0, of: 2, label: "B" });
+  assert.equal(resolveWidgetAddress(node, `row[${res.widget_occurrence.index}]`).occurrence.widget, b);
+});
+
 test("#2143: a row the callback REMOVED is reported stale rather than as a usable address", () => {
   const node = { id: 59, type: "T", widgets: [] };
   const a = { name: "row", type: "string", value: "a", label: "A" };
