@@ -741,6 +741,18 @@ function ideogramQueueTimeDerivedInput(node) {
  * real mid-window mode flip is still drift — the same judgment the orchestrator's
  * #2120 classifier makes when it refuses `seed_control_state` on its own.
  *
+ * KNOWN RESIDUAL, stated rather than hidden (codex r2, P1). The pack decides with a
+ * CLOSURE (`controlState`), and we can only read the widget it persists that closure
+ * into. The two agree on every path the pack itself drives — it writes the widget on
+ * every state change and re-reads it on graph load — but a write that bypasses the
+ * pack (a direct `seed_control_state` set that never re-runs its install) can desync
+ * them until the next load. Both directions are bounded and neither is silent-wrong
+ * output: widget=fixed / closure=random restores exactly the refusal this fixes (safe,
+ * visible, re-reportable); widget=random / closure=fixed costs drift coverage on these
+ * two inputs of this one node class and nothing else. The closure is not reachable from
+ * here, so the widget is the only observable signal; narrowing further is not possible
+ * without the pack exposing its state.
+ *
  * Defensive like its neighbours: an unreadable node yields no names, which fails
  * TOWARD detecting drift.
  */
@@ -756,6 +768,17 @@ function dasiwaQueueTimeSeedInputs(node) {
     const stateWidget = widgets.find((w) => w?.name === DASIWA_SEED_STATE_INPUT);
     // `if (!seedWidget() || !stateWidget()) return;` — the pack installs no roll.
     if (!seedWidget || !stateWidget) return [];
+    // codex r2, P1 — the ROLL ITSELF, not a proxy for it. `dasiwaSeedControlInstall`
+    // sets `__dasiwaSeedInstalled = true` BEFORE it checks for the two widgets and
+    // returns, and that flag then makes every later install a no-op. So a node that
+    // was installed while a widget was still missing never gets `__dasiwaSeedPrepareSeed`
+    // — even if both widgets appear afterwards. Inferring the roll from the widgets
+    // alone would exclude two inputs on a node the pack will never touch, which
+    // silently retires drift coverage on it. Requiring the function is the same
+    // shape as the Ideogram signal requiring a live `serializeValue`, and it fails
+    // in the SAFE direction: if the pack ever renames this internal we stop
+    // excluding, the original refusal comes back, and it gets reported.
+    if (typeof node?.__dasiwaSeedPrepareSeed !== "function") return [];
     // `node.inputs?.find(i => i.name === "seed")?.link != null` — external seed.
     const seedInput = (Array.isArray(node?.inputs) ? node.inputs : []).find(
       (i) => i?.name === "seed",

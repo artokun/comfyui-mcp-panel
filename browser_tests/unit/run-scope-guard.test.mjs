@@ -4952,10 +4952,14 @@ function dasiwaNode(id, opts = {}) {
   // for an EXPLICIT `comfyClass: undefined`, so the fail-closed assertion below
   // would have passed while testing a fully-classed node.
   const comfyClass = "comfyClass" in opts ? opts.comfyClass : "DaSiWa_SeedControl";
+  // The pack defines __dasiwaSeedPrepareSeed only at the END of a successful
+  // install; `rollInstalled: false` is the node whose install bailed early.
+  const rollInstalled = opts.rollInstalled !== false;
   return {
     id,
     type,
     comfyClass,
+    ...(rollInstalled ? { __dasiwaSeedPrepareSeed: () => {} } : {}),
     inputs: [{ name: "seed", link: seedLink }],
     widgets: widgets ?? [
       { name: "seed_value", value: 42 },
@@ -5014,6 +5018,11 @@ test("comfyui-mcp#2712 collectVolatileInputs: narrow by construction", () => {
     [
       "a foreign node carrying the same widget names is NOT this pack",
       dasiwaNode(2739, { comfyClass: "Other_SeedThing", type: "Other_SeedThing" }),
+      [],
+    ],
+    [
+      "codex r2 P1: both widgets present but the pack never installed its roll (__dasiwaSeedInstalled was set before the widget check, so a later install is a no-op)",
+      dasiwaNode(2739, { rollInstalled: false }),
       [],
     ],
   ];
