@@ -774,6 +774,67 @@ test("#2158 production workflow_open MEASURES a transport failure instead of ass
   assert.equal(journal.at(-1)?.resolved?.path, target.path);
 });
 
+test("#2158 production workflow_open still REJECTS when its own diagnosis throws", async () => {
+  // The hazard the extraction harness surfaced. Diagnosis runs inside a catch block, and
+  // a throw raised there lands in this executor's OUTER handler — which reads it as a
+  // disk-read warning, leaves `openFailed` null, and lets the open continue down its
+  // SUCCESS path. A workflow switch that threw would be reported as one that worked.
+  const previous = { path: "workflows/previous.json" };
+  const target = { path: "workflows/target.json", filename: "target.json", isModified: false };
+  const nativeError = new Error("NetworkError when attempting to fetch resource.");
+  const journal = [];
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app: {
+      canvas: {},
+      extensionManager: {
+        workflow: {
+          openWorkflows: [target],
+          workflows: [],
+          getWorkflowByPath: () => target,
+          openWorkflow: async () => {
+            throw nativeError;
+          },
+        },
+      },
+    },
+    activeWorkflowRef: () => previous,
+    sameWorkflowObject,
+    // The diagnosis itself is broken. Whatever else happens, the FAILURE must survive.
+    openSwitchFailureMessage: () => {
+      throw new TypeError("openSwitchFailureMessage is not a function");
+    },
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    workflowStableUuid: () => "c2512bcc-6a89-4b9f-a58c-ff48a2eb7e95",
+    noteOpenAttempt: (entry) => {
+      journal.push(entry);
+      return { seq: journal.length };
+    },
+    coerceMessageText: (value) => String(value),
+    getWorkflowTitle: () => "Previous",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => ({ token: 1 }),
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+  });
+
+  const failure = await panel.method({ path: target.path, rid: "diagnosis-throws" }).then(
+    (ok) => assert.fail(`a failed switch must never resolve as success: ${JSON.stringify(ok)}`),
+    (err) => err,
+  );
+  // The raw failure is kept rather than lost — degraded, but never silently successful.
+  assert.equal(failure, nativeError);
+  assert.match(journal.at(-1)?.error ?? "", /NetworkError/);
+  assert.equal(panel.guard(), null, "and the reload guard is still released");
+});
+
 test("#2158 production workflow_open refuses the clean negative when the pointer DID move", async () => {
   // The hazard the hardcoded `false` was hiding. `openWorkflow` assigns
   // `activeWorkflow.value` and only THEN writes `comfyApp.canvas.bg_tint`, so a throw
