@@ -44,7 +44,6 @@ function addr(node, requested) {
   return {
     name: a.name,
     index: a.occurrence?.index ?? null,
-    of: a.occurrence?.of ?? null,
     label: a.occurrence?.label ?? null,
   };
 }
@@ -166,17 +165,16 @@ test("#2143: an EXACT widget name always wins, brackets and all", () => {
   const node = { id: 1, type: "T", widgets: [{ name: "foo[1]" }, { name: "foo" }, { name: "foo" }] };
   // The literal name resolves to itself with no occurrence pinned — the bracket is never
   // interpreted when a widget actually carries that spelling.
-  assert.deepEqual(addr(node, "foo[1]"), { name: "foo[1]", index: null, of: null, label: null });
+  assert.deepEqual(addr(node, "foo[1]"), { name: "foo[1]", index: null, label: null });
 });
 
 test("#2143: a duplicated name addresses a specific occurrence, and composes with sub-fields", () => {
   const node = { id: 59, type: BYPASSER, widgets: [{ name: ROW }, { name: ROW }] };
-  assert.deepEqual(addr(node, `${ROW}[1]`), { name: ROW, index: 1, of: 2, label: null });
-  assert.deepEqual(addr(node, `${ROW}[0]`), { name: ROW, index: 0, of: 2, label: null });
+  assert.deepEqual(addr(node, `${ROW}[1]`), { name: ROW, index: 1, label: null });
+  assert.deepEqual(addr(node, `${ROW}[0]`), { name: ROW, index: 0, label: null });
   assert.deepEqual(addr(node, `${ROW}[1].toggled`), {
     name: `${ROW}.toggled`,
     index: 1,
-    of: 2,
     label: null,
   });
   // The row OBJECT is pinned too — the only thing that can tell two identically-labelled
@@ -197,7 +195,6 @@ test("#2143: a duplicated name addresses a specific occurrence, and composes wit
   assert.deepEqual(addr(labelled, `${ROW}[1]`), {
     name: ROW,
     index: 1,
-    of: 2,
     label: "Enable VRAM optimizations 2",
   });
 });
@@ -217,13 +214,13 @@ test("#2143: a duplicated widget whose NAME contains dots is addressable", () =>
     ],
   };
   assert.deepEqual(duplicateWidgetRows(node)["foo.bar"].map((r) => r.index), [0, 1]);
-  assert.deepEqual(addr(node, "foo.bar[1]"), { name: "foo.bar", index: 1, of: 2, label: "second" });
+  assert.deepEqual(addr(node, "foo.bar[1]"), { name: "foo.bar", index: 1, label: "second" });
 
   // …and a real widget named `foo` still wins the DOTTED split, because the selector only
   // ever fires when no widget carries the requested string. Here `foo.on[0]` is not a
   // widget name and `foo.on` is not either, so it is a sub-field write on `foo`.
   const composite = { id: 8, type: "T", widgets: [{ name: "foo", value: { on: true } }] };
-  assert.deepEqual(addr(composite, "foo.on"), { name: "foo.on", index: null, of: null, label: null });
+  assert.deepEqual(addr(composite, "foo.on"), { name: "foo.on", index: null, label: null });
 });
 
 test("#2143: the selector index is the SAME number duplicate_widgets publishes", () => {
@@ -294,7 +291,6 @@ test("#2143: a display label carried by exactly one row is an address, and pins 
   assert.deepEqual(addr(node, "Enable VRAM optimizations 2"), {
     name: ROW,
     index: 1,
-    of: 2,
     label: "Enable VRAM optimizations 2",
   });
 });
@@ -320,7 +316,7 @@ test("#2143: a name that already resolves is returned untouched, with no occurre
     type: "KSampler",
     widgets: [{ name: "seed", label: "Sampler seed" }, { name: "steps" }],
   };
-  const plain = (name) => ({ name, index: null, of: null, label: null });
+  const plain = (name) => ({ name, index: null, label: null });
   // The two shapes every ordinary write takes: a plain name, and a #560 dotted sub-field.
   assert.deepEqual(addr(node, "seed"), plain("seed"));
   assert.deepEqual(addr(node, "seed.on"), plain("seed.on"));
@@ -459,7 +455,7 @@ test("#2143: the REPORTED index is a live address, not the position the row had 
   node.widgets = [a, b];
 
   const res = applyWidgetWrite(node, "row", "new", {
-    occurrence: { index: 1, of: 2, label: "B", widget: b },
+    occurrence: { index: 1, label: "B", widget: b },
   });
 
   assert.equal(b.value, "new", "row B is the one that was written");
@@ -487,7 +483,7 @@ test("#2143: a row the callback REMOVED is reported stale rather than as a usabl
   node.widgets = [a, b];
 
   const res = applyWidgetWrite(node, "row", "new", {
-    occurrence: { index: 1, of: 2, label: "B", widget: b },
+    occurrence: { index: 1, label: "B", widget: b },
   });
 
   // The row has no current address, so the pre-write capture is reported — flagged, so the
@@ -569,16 +565,15 @@ test("#2143: identity ACCEPTS the unmoved row, so an ordinary pinned write still
   assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]]);
 });
 
-test("#2143: a rebuild that CHANGED THE NUMBER of rows is refused, labels or no labels", () => {
-  // The shape a Fast Groups node actually produces when it rebuilds: a group was added or
-  // removed while the write was in flight, so every index after it can mean a different
-  // group. Caught by the pinned COUNT — and, unlike the label, it still catches it when the
-  // row that ended up at that index happens to carry the label that was pinned, and when
-  // the rows carry no labels at all.
+test("#2143: a rebuild that GREW the row set is refused when the label cannot single one out", () => {
+  // A Fast Groups node that gains a group mid-command: the row set is not the set that was
+  // addressed, so an index into it can mean a different group. What settles it is whether
+  // the pinned LABEL still names exactly one row — here it does not, because the extra row
+  // shares it (or there are no labels at all).
   //
   // A plain node, not the Bypasser fixture: a Fast Groups row with no live `group` refuses
   // in the #2146 mode journal before this check is ever consulted, which would make the
-  // test pass for a reason that has nothing to do with the count.
+  // test pass for a reason that has nothing to do with the address.
   for (const label of ["two", undefined]) {
     const node = {
       id: 7,
@@ -594,7 +589,7 @@ test("#2143: a rebuild that CHANGED THE NUMBER of rows is refused, labels or no 
     assert.throws(
       () =>
         applyWidgetWrite(node, "row", "written", {
-          occurrence: { index: 1, of: 2, label: label ?? null, widget: ghost },
+          occurrence: { index: 1, label: label ?? null, widget: ghost },
         }),
       WidgetWriteError,
       `label ${JSON.stringify(label)}`,
@@ -607,6 +602,29 @@ test("#2143: a rebuild that CHANGED THE NUMBER of rows is refused, labels or no 
   }
 });
 
+test("#2143: a grown row set still RESOLVES when the label singles the row out", () => {
+  // The other half, and the reason the number of rows is not a check of its own. A rebuild
+  // added a row, but the pinned label still names exactly one — so the row at that index IS
+  // the row that was addressed, whatever the count did. Refusing here would be a refusal
+  // over an address that is not actually ambiguous.
+  const node = {
+    id: 7,
+    type: "T",
+    widgets: [
+      { name: "row", type: "string", value: "a", label: "A" },
+      { name: "row", type: "string", value: "b", label: "B" },
+      { name: "row", type: "string", value: "c", label: "C" },
+    ],
+  };
+
+  const res = applyWidgetWrite(node, "row", "written", {
+    occurrence: { index: 1, label: "B", widget: { name: "row", label: "B" } },
+  });
+
+  assert.equal(res.value, "written");
+  assert.deepEqual(node.widgets.map((w) => w.value), ["a", "written", "c"]);
+});
+
 test("#2143: a REBUILD that replaces the row objects falls back to the label, not a refusal", () => {
   // Identity is inconclusive here — the addressed object is gone entirely, which is what an
   // rgthree Fast Groups rebuild does. Refusing on that would block the ordinary case; the
@@ -615,7 +633,7 @@ test("#2143: a REBUILD that replaces the row objects falls back to the label, no
   const ghost = { name: ROW, label: "Enable VRAM optimizations 2" };
 
   applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
-    occurrence: { index: 1, of: 2, label: "Enable VRAM optimizations 2", widget: ghost },
+    occurrence: { index: 1, label: "Enable VRAM optimizations 2", widget: ghost },
   });
   assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]], "the rebuilt row was written");
 });
@@ -895,14 +913,14 @@ test("#2143: retention follows the row it wrote when a callback REORDERS the nod
   assert.equal(node.widgets[1].value, "old-0", "and the row now AT index 1 was not touched");
 });
 
-test("#2143: retention does not verify against a row the rebuild DETACHED", async () => {
-  // Identity is only an answer while the object is still on the node. A rebuild that
-  // detaches it leaves a live-looking object whose `.value` is a reading of a widget the
-  // canvas no longer draws — so the check must fall through, not vouch for the write.
+test("#2143: retention re-writes when a rebuild replaced the row and dropped the value", async () => {
+  // The #1922 shape, on a DUPLICATED name: the write lands, the callback replaces the row
+  // with a fresh object that did not take the value, and the row the canvas now draws
+  // still holds the old one. Retention must see that and write again rather than report a
+  // success whose value is nowhere on the node.
   //
   // The rows are LABELLED here, so the retry can identify which one it means; the
-  // indistinguishable case is the next test. That separation is the point: this one is
-  // about the membership check, not about what happens when nothing can discriminate.
+  // indistinguishable case is the next test. That separation is the point.
   const node = {
     id: 59,
     type: "DupRows",
@@ -925,13 +943,12 @@ test("#2143: retention does not verify against a row the rebuild DETACHED", asyn
 
   await runSetWidget(node, "row", "new", {
     ...wiredDeps("DupRows"),
-    occurrence: { index: 1, of: 2, label: "second", widget: detached },
+    occurrence: { index: 1, label: "second", widget: detached },
   });
 
-  // If the detached object could vouch, retention would pass on its `.value` and the
-  // replacement — the row the canvas actually draws — would keep "old-1", which is exactly
-  // the silent-stale success #1922 exists to prevent. Falling through to name+position sees
-  // the mismatch and re-writes, so the live row holds the value.
+  // A check that answered from the replaced object would pass on ITS `.value` and leave the
+  // row the canvas draws holding "old-1" — the silent-stale success #1922 exists to
+  // prevent. Reading the live row instead sees the mismatch and re-writes.
   assert.equal(node.widgets[1].value, "new", "the row the node actually carries was written");
   assert.notEqual(node.widgets[1], detached, "and it is the replacement, not the detached object");
 });
@@ -964,7 +981,7 @@ test("#2143: a rebuild into INDISTINGUISHABLE rows refuses rather than writing o
     await assert.rejects(
       runSetWidget(node, "row", "new", {
         ...wiredDeps("DupRows"),
-        occurrence: { index: 1, of: 2, label: label ?? null, widget: detached },
+        occurrence: { index: 1, label: label ?? null, widget: detached },
       }),
       /no longer names the row this call addressed/,
       `label ${JSON.stringify(label)}`,
@@ -979,10 +996,77 @@ test("#2143: a rebuild into INDISTINGUISHABLE rows refuses rather than writing o
       { widgets: [{ name: "row", label: "a" }, { name: "row", label: "b" }] },
       "row",
       1,
-      { index: 1, of: 2, label: "b", widget: { name: "row", label: "b" } },
+      { index: 1, label: "b", widget: { name: "row", label: "b" } },
     )?.label,
     "b",
   );
+});
+
+test("#2143: a name that only BECOMES duplicated during the write is still read correctly", async () => {
+  // The widget name is unique when the write starts, and the callback PREPENDS a second row
+  // of the same name holding the old value. A retention read by bare name would return that
+  // prepended row, see a mismatch, and mutate a second time.
+  //
+  // It does not, because `widget_occurrence` is resolved AFTER the write: the name is
+  // duplicated by then, so the reply carries the written row's live position and retention
+  // reads exactly that row. This is the case that shows the late resolution is not merely
+  // about reporting — it is what makes the post-write read correct.
+  let callbacks = 0;
+  const node = { id: 1, type: "DupRows", constructor: nodeCtor(), graph: { links: {} }, widgets: [] };
+  const only = {
+    name: "row",
+    type: "string",
+    value: "old",
+    callback() {
+      callbacks += 1;
+      node.widgets = [{ name: "row", type: "string", value: "old" }, only];
+    },
+  };
+  node.widgets = [only];
+
+  const res = await runSetWidget(node, "row", "new", wiredDeps("DupRows"));
+
+  assert.equal(res.set.value, "new");
+  assert.equal(only.value, "new", "the widget that was written holds the value");
+  assert.equal(callbacks, 1, "and it was written once — no retry against the prepended row");
+  assert.equal(node.widgets[0].value, "old", "the prepended row is untouched");
+});
+
+test("#2143: retention accepts an ordinary rebuild that CARRIES THE VALUE forward", async () => {
+  // Why retention keys on name+position once the written object is gone, rather than
+  // demanding identity as the write does. A rebuild that replaces the row objects and
+  // copies their values across is the ORDINARY thing a rebuild does — and from here it is
+  // indistinguishable from "my row was replaced by one that already held the value".
+  // Requiring identity would refuse both, reporting failure for a command whose asked-for
+  // effect is on the canvas at the address the caller gave.
+  const node = {
+    id: 1,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [],
+  };
+  node.widgets = [
+    { name: "row", type: "string", value: "a" },
+    {
+      name: "row",
+      type: "string",
+      value: "b",
+      callback() {
+        node.widgets = node.widgets.map((w) => ({ name: "row", type: "string", value: w.value }));
+      },
+    },
+  ];
+  const addressed = node.widgets[1];
+
+  const res = await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: addressed },
+  });
+
+  assert.equal(res.set.value, "new");
+  assert.equal(node.widgets[1].value, "new", "the value is in effect on the row the node draws");
+  assert.notEqual(node.widgets[1], addressed, "on a REPLACEMENT object, not the one written");
 });
 
 test("#2143: retention survives a callback that RELABELS the row it just wrote", async () => {

@@ -93,8 +93,9 @@ function occurrencesOf(node, name) {
   return out;
 }
 
-/** The display label an occurrence carries at a given moment, or null. Exported so the
- *  write can PIN it: the ordinal alone survives a reorder of the rows it counts. */
+/** The display label a row carries right now, or null. Exported so a REFUSAL can name what
+ *  is at an index instead of what was expected there — the same reading `widgetAtOccurrence`
+ *  compares against, so the message and the decision cannot disagree. */
 export function occurrenceLabelOf(widget) {
   return widgetLabel(widget);
 }
@@ -116,12 +117,7 @@ export function occurrenceLabelOf(widget) {
  *      the rows carry no labels, or identical ones, where nothing else can tell them apart.
  *      If that object is still on the node but somewhere ELSE, the rows were REORDERED and
  *      the index is stale: null, so the write refuses rather than mutating a stranger.
- *   2. HOW MANY rows carry the name. Once identity is inconclusive — the addressed object
- *      is gone, i.e. a REBUILD — a changed count is proof the set of rows is not the set
- *      that was addressed, whatever the labels say. This is the shape a Fast Groups node
- *      actually produces when it rebuilds: a group was added or removed, so every index
- *      after it means a different group now.
- *   3. LABEL, and it must actually DISCRIMINATE. A rebuild that kept the same number of
+ *   2. LABEL, and it must actually DISCRIMINATE. A rebuild that kept the same number of
  *      rows: a matching label says it put the same row back here, a different one says it
  *      did not — but a label shared by more than one same-named row says nothing at all,
  *      and neither does no label. Once the addressed OBJECT is gone, an inconclusive label
@@ -129,9 +125,15 @@ export function occurrenceLabelOf(widget) {
  *      coin flip, and a coin flip that mutes the wrong group is this whole issue. The
  *      caller re-reads `duplicate_widgets` and addresses it again — cheap, and honest.
  *
- * A pin carrying only an `index` gets steps 1 and 3 vacuously and lands on name + position:
- * the old behaviour, kept so a bare `{index}` stays usable in fixtures and direct helper
- * calls. Nothing the panel sends is that shape — it always pins the row it resolved.
+ * A pin carrying only an `index` skips both (there is no object and no label to weigh) and
+ * lands on name + position: the old behaviour, kept so a bare `{index}` stays usable in
+ * fixtures and direct helper calls. Nothing the panel sends is that shape — it always pins
+ * the row it resolved.
+ *
+ * The number of same-named rows is deliberately NOT a third test. It looks like independent
+ * evidence and is not: when the label discriminates, the row it names IS the addressed row
+ * however many siblings appeared beside it, so refusing on the count is a false refusal;
+ * and when the label does not, step 2 has already refused.
  */
 export function widgetAtOccurrence(node, name, index, pin = null) {
   if (!Number.isInteger(index) || index < 0) return null;
@@ -147,7 +149,6 @@ export function widgetAtOccurrence(node, name, index, pin = null) {
     if (!rebuilt) return null;
   }
   const sameName = occurrencesOf(node, name);
-  if (Number.isInteger(pinned?.of) && sameName.length !== pinned.of) return null;
   if (pinned?.label != null && widgetLabel(at) !== pinned.label) return null;
   // The addressed row OBJECT is gone, so identity established nothing and the label is all
   // that is left. Require it to name exactly ONE of the rows sharing this name; otherwise
@@ -249,7 +250,7 @@ function pinnedOccurrence(node, selector) {
   const occurrences = occurrencesOf(node, selector.base);
   if (!occurrences.length) return null;
   const at = occurrences.find((entry) => entry.index === selector.index);
-  if (at) return { at, of: occurrences.length };
+  if (at) return at;
   throw new WidgetAddressError(
     `Node ${node?.id} (${node?.type}) carries no widget named "${selector.base}" at index ` +
       `${selector.index}. The index is the widget's position in the node, the same one ` +
@@ -296,9 +297,9 @@ export function resolveWidgetAddress(node, requested) {
   const widgets = widgetsOf(node);
   if (!widgets.length) return null;
   const plain = (name) => ({ name, occurrence: null });
-  const pin = (name, at, of) => ({
+  const pin = (name, at) => ({
     name,
-    occurrence: { index: at.index, of, label: widgetLabel(at.widget), widget: at.widget },
+    occurrence: { index: at.index, label: widgetLabel(at.widget), widget: at.widget },
   });
 
   // 1. EXACT NAME on the whole string — brackets, dots and all. Never rewritten, and no
@@ -314,8 +315,8 @@ export function resolveWidgetAddress(node, requested) {
   //    called `foo.bar` outranks splitting the string at `foo`.
   const wholeSelector = parseOccurrenceSelector(requested);
   if (wholeSelector) {
-    const hit = pinnedOccurrence(node, wholeSelector);
-    if (hit) return pin(wholeSelector.base, hit.at, hit.of);
+    const at = pinnedOccurrence(node, wholeSelector);
+    if (at) return pin(wholeSelector.base, at);
   }
 
   const dot = requested.indexOf(".");
@@ -328,8 +329,8 @@ export function resolveWidgetAddress(node, requested) {
   // 4. OCCURRENCE SELECTOR on the head segment: "NAME[1].field".
   const selector = dot > 0 ? parseOccurrenceSelector(head) : null;
   if (selector) {
-    const hit = pinnedOccurrence(node, selector);
-    if (hit) return pin(`${selector.base}${tail}`, hit.at, hit.of);
+    const at = pinnedOccurrence(node, selector);
+    if (at) return pin(`${selector.base}${tail}`, at);
   }
 
   // 4. DISPLAY LABEL — last, and only for the WHOLE string, so it can never pre-empt a
@@ -359,5 +360,5 @@ export function resolveWidgetAddress(node, requested) {
   // A label that names a UNIQUE widget still resolves through the ordinary name path —
   // pinning an occurrence there would put an index on a write that never needed one, and
   // needlessly cross the deferral gate below.
-  return occurrences.length > 1 ? pin(name, at, occurrences.length) : plain(name);
+  return occurrences.length > 1 ? pin(name, at) : plain(name);
 }
