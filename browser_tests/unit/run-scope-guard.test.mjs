@@ -5006,14 +5006,14 @@ test("comfyui-mcp#2712 collectVolatileInputs: narrow by construction", () => {
   const cases = [
     ["an externally linked seed passes through unrolled", dasiwaNode(2739, { seedLink: 55 }), []],
     [
-      "a missing seed_control_state widget means the pack installed no roll",
+      "no seed_control_state widget means the mode is unreadable, so nothing is excluded",
       dasiwaNode(2739, { widgets: [{ name: "seed_value", value: 42 }] }),
       [],
     ],
     [
-      "a missing seed_value widget means the pack installed no roll",
+      "codex r3 P1: a seed_value widget removed AFTER a successful install still excludes - the pack re-checks widgets only at install time and keeps rolling",
       dasiwaNode(2739, { widgets: [{ name: "seed_control_state", value: dasiwaState("random") }] }),
-      [],
+      ["2739 seed_control_state", "2739 seed_value"],
     ],
     [
       "a foreign node carrying the same widget names is NOT this pack",
@@ -5041,6 +5041,29 @@ test("comfyui-mcp#2712 collectVolatileInputs: narrow by construction", () => {
     [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { comfyClass: "Other_SeedThing" })] })],
     [],
     "a mismatched comfyClass is not this pack, whatever `type` says",
+  );
+});
+
+test("comfyui-mcp#2712 codex r3 P2: a non-enumerable `mode` is dropped by the pack's spread, so the node still rolls", () => {
+  // The pack builds state with `{ mode: "random", ..., ...parsed }`. A spread copies
+  // only enumerable OWN properties, so these two shapes stay RANDOM there — reading
+  // `parsed.mode` directly would call them fixed and reinstate the refusal.
+  const nonEnumerable = Object.defineProperty({}, "mode", { value: "fixed", enumerable: false });
+  const inherited = Object.create({ mode: "fixed" });
+  for (const [label, value] of [
+    ["non-enumerable own mode", nonEnumerable],
+    ["inherited mode", inherited],
+  ]) {
+    assert.deepEqual(
+      [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { state: value })] })].sort(),
+      ["2739 seed_control_state", "2739 seed_value"],
+      label + " is dropped by the pack's spread, so the node is random and rolls",
+    );
+  }
+  // A plain enumerable own `mode` object IS honoured, exactly as the spread would.
+  assert.deepEqual(
+    [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { state: { mode: "fixed" } })] })],
+    [],
   );
 });
 

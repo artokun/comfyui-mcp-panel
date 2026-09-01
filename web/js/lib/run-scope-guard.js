@@ -713,8 +713,9 @@ function ideogramQueueTimeDerivedInput(node) {
  *    different is NOT rolled by the pack. Falling back to `type` would drop both
  *    seed inputs from the hash for a node that never mutates, silently retiring
  *    drift coverage on it — the one direction this signal must never fail;
- *  - BOTH backing widgets present — `dasiwaSeedControlInstall` returns early
- *    without ever defining the roll when either is missing;
+ *  - the pack's own roll function present on this node (see below), which is what
+ *    proves `dasiwaSeedControlInstall` ran to completion with both backing widgets;
+ *  - the state widget present, because its value IS the mode we read;
  *  - a LINKED `seed` input rolls nothing (`dasiwaSeedControlHasExternalSeed`),
  *    so an externally-driven node keeps full drift coverage;
  *  - `mode === "fixed"` rolls nothing, exactly like the `value === "fixed"` gate
@@ -764,10 +765,19 @@ function dasiwaQueueTimeSeedInputs(node) {
   try {
     if (!DASIWA_QUEUE_ROLLING_SEED_TYPES.has(node?.comfyClass)) return [];
     const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
-    const seedWidget = widgets.find((w) => w?.name === DASIWA_SEED_VALUE_INPUT);
     const stateWidget = widgets.find((w) => w?.name === DASIWA_SEED_STATE_INPUT);
-    // `if (!seedWidget() || !stateWidget()) return;` — the pack installs no roll.
-    if (!seedWidget || !stateWidget) return [];
+    // The STATE widget only, and only because its value is the mode we must read
+    // (codex r3, P1). The pack checks BOTH widgets when it INSTALLS; re-checking
+    // them here would be a second, stricter gate the pack does not apply at roll
+    // time, so a seed_value widget removed after a successful install would stop
+    // our exclusion while the pack kept rolling — reinstating the refusal. The
+    // install check is already covered, exactly once, by the roll function below.
+    // Belt-and-braces with the catch below, which would turn the resulting
+    // TypeError into the same empty result — so a mutation deleting this line
+    // survives the suite. Kept explicit anyway: reaching the fail-safe by way of
+    // a thrown property access would make the outcome depend on the breadth of
+    // that catch, and the next person to narrow it would silently change this.
+    if (!stateWidget) return [];
     // codex r2, P1 — the ROLL ITSELF, not a proxy for it. `dasiwaSeedControlInstall`
     // sets `__dasiwaSeedInstalled = true` BEFORE it checks for the two widgets and
     // returns, and that flag then makes every later install a no-op. So a node that
@@ -804,7 +814,13 @@ function dasiwaSeedControlModeIsFixed(raw) {
   } else if (raw && typeof raw === "object") {
     parsed = raw;
   }
-  return parsed && typeof parsed === "object" ? parsed.mode === "fixed" : false;
+  // SPREAD, not a direct read (codex r3, P2). The pack computes its state with
+  // `{ mode: "random", ... , ...parsed }`, and a spread copies only ENUMERABLE OWN
+  // properties — so a non-enumerable or inherited `mode` is dropped there and the
+  // node stays random. Reading `parsed.mode` would see that key, call the node
+  // fixed, and reinstate the refusal on a node that does roll.
+  const spread = parsed && typeof parsed === "object" ? { ...parsed } : {};
+  return spread.mode === "fixed";
 }
 
 export function collectVolatileInputs(rootGraph) {
