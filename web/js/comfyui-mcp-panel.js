@@ -19896,9 +19896,14 @@ const GRAPH_TOOL_EXECUTORS = {
           return captureRunDispatchIdentity({ routeReady: false, targetId });
         }
       }
-      // Direct/unit callers without a mounted bridge retain the legacy local-run path.
-      // A mounted panel always installs runDispatchIdentityRef in buildPanel.
-      return captureRunDispatchIdentity({ routeId: dispatchReceiptRoute, targetId });
+      // No mounted identity reader means there is no proven workflow/route snapshot.
+      // A mounted panel always installs runDispatchIdentityRef in buildPanel; direct
+      // callers must fail closed rather than queue without that proof.
+      return captureRunDispatchIdentity({
+        routeId: dispatchReceiptRoute,
+        routeReady: false,
+        targetId,
+      });
     };
     // Mark the dispatch before queuePrompt can produce a fast execution_success.
     // The tracker holds that completion until the delayed /prompt response gives
@@ -41082,17 +41087,48 @@ function buildPanel() {
     runReceiptOutbox.enqueue(rid, promptId, routeId, completionKey);
   const panelRunDispatchIdentity = (targetId = null) => {
     let routeId = null;
+    let routeReady = false;
+    let routeIdentityProven = false;
     let workflowUuid = null;
+    let workflowIdentityProven = false;
+    let workflowIdentityAmbiguous = false;
     try {
       routeId = panelRunReceiptRouteRef();
+      routeIdentityProven = typeof routeId === "string" && routeId.trim().length > 0;
     } catch {}
     try {
-      workflowUuid = workflowStableUuid();
+      routeReady = client.isRouteReady?.() === true;
+    } catch {}
+    try {
+      // This is deliberately a pure read of an identity established by the
+      // graph-binding fence. Calling workflowStableUuid() here could mint a
+      // plausible value after the active workflow probe became unreadable.
+      const probe = probeActiveWorkflow();
+      const workflow = probe.workflow;
+      const candidate =
+        probe.readable && workflow && typeof workflow === "object"
+          ? workflowObjectUuid(workflow)
+          : null;
+      const owner = candidate ? workflowUuidOwner(candidate) : null;
+      workflowIdentityAmbiguous =
+        !!owner && !!workflow && !sameWorkflowObject(owner, workflow);
+      if (
+        !workflowIdentityAmbiguous &&
+        !!owner &&
+        !!workflow &&
+        isCanonicalWorkflowInstanceUuid(candidate)
+      ) {
+        workflowUuid = candidate;
+        workflowIdentityProven = true;
+      }
     } catch {}
     return {
       routeId,
-      routeReady: client.isRouteReady?.() === true,
+      routeReady,
+      routeIdentityProven,
       workflowUuid,
+      workflowIdentityProven,
+      workflowIdentityAmbiguous,
       reconnectEpoch: backendReconnectEpoch,
       targetId,
     };

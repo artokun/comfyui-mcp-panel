@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   captureRunDispatchIdentity,
@@ -7,11 +9,18 @@ import {
   downgradeUnstableRunResult,
 } from "../../web/js/lib/run-dispatch-identity.js";
 
+const PANEL_SRC = readFileSync(
+  fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url)),
+  "utf8",
+).replace(/\r\n/g, "\n");
+
 const identity = (overrides = {}) =>
   captureRunDispatchIdentity({
     routeId: "route-a",
     routeReady: true,
-    workflowUuid: "workflow-a",
+    routeIdentityProven: true,
+    workflowUuid: "11111111-1111-4111-8111-111111111111",
+    workflowIdentityProven: true,
     reconnectEpoch: 4,
     targetId: "10:7",
     ...overrides,
@@ -34,7 +43,7 @@ test("run dispatch identity reports reconnect, route, workflow, target, and read
     identity({
       routeId: "route-b",
       routeReady: false,
-      workflowUuid: "workflow-b",
+      workflowUuid: "22222222-2222-4222-8222-222222222222",
       reconnectEpoch: 5,
       targetId: "11:8",
     }),
@@ -55,10 +64,56 @@ test("an unreadable identity is not a wildcard", () => {
   assert.deepEqual(result.changed, ["bridge route"]);
 });
 
-test("route readiness is required for a live identity", () => {
-  const result = compareRunDispatchIdentity(identity(), captureRunDispatchIdentity({ routeReady: false }));
+test("equal absent route identities are never stable", () => {
+  const result = compareRunDispatchIdentity(
+    identity({ routeId: null, routeIdentityProven: true }),
+    identity({ routeId: null, routeIdentityProven: true }),
+  );
   assert.equal(result.stable, false);
-  assert.deepEqual(result.changed, ["reconnect", "bridge route", "workflow", "run target", "route readiness"]);
+  assert.deepEqual(result.changed, ["bridge route unavailable"]);
+});
+
+test("route readiness is required for a live identity", () => {
+  const result = compareRunDispatchIdentity(identity(), identity({ routeReady: false }));
+  assert.equal(result.stable, false);
+  assert.deepEqual(result.changed, ["route readiness"]);
+});
+
+test("equal absent or invalid workflow identities are never stable", () => {
+  for (const workflowUuid of [null, "not-a-uuid"]) {
+    const result = compareRunDispatchIdentity(
+      identity({ workflowUuid, workflowIdentityProven: true }),
+      identity({ workflowUuid, workflowIdentityProven: true }),
+    );
+    assert.equal(result.stable, false, workflowUuid ?? "null workflow identity");
+    assert.deepEqual(result.changed, ["workflow identity unavailable"]);
+  }
+});
+
+test("an explicitly ambiguous workflow owner is never stable", () => {
+  const result = compareRunDispatchIdentity(
+    identity(),
+    identity({ workflowIdentityAmbiguous: true }),
+  );
+  assert.equal(result.stable, false);
+  assert.deepEqual(result.changed, ["workflow identity ambiguous"]);
+});
+
+test("the production identity provider publishes proof, not a swallowed null UUID", () => {
+  const start = PANEL_SRC.indexOf("const panelRunDispatchIdentity =");
+  const end = PANEL_SRC.indexOf("  const panelRunReceiptTransport", start);
+  assert.ok(start >= 0 && end > start, "the production identity provider is still present");
+  const provider = PANEL_SRC.slice(start, end);
+  assert.match(provider, /let routeReady = false;/);
+  assert.match(provider, /let routeIdentityProven = false;/);
+  assert.match(provider, /routeIdentityProven = typeof routeId === "string"/);
+  assert.match(provider, /const probe = probeActiveWorkflow\(\);/);
+  assert.match(provider, /const candidate =/);
+  assert.match(provider, /workflowObjectUuid\(workflow\)/);
+  assert.match(provider, /workflowIdentityProven = true;/);
+  assert.match(provider, /workflowIdentityAmbiguous/);
+  assert.match(provider, /isCanonicalWorkflowInstanceUuid\(candidate\)/);
+  assert.doesNotMatch(provider, /workflowUuid = workflowStableUuid\(\);/);
 });
 
 test("an unstable scoped receipt keeps queued_prompt_ids while removing queued:true", () => {

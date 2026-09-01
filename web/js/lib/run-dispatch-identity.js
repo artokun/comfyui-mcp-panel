@@ -4,6 +4,8 @@
  * A prompt_id proves that ComfyUI accepted a request at one instant. It does
  * not prove that the same backend, workflow target, or bridge route remained
  * in place while the panel was waiting for the frontend queue wrapper.
+ * Missing or unproven identities are not stable merely because both reads are
+ * null; callers must provide explicit proof for every dispatch identity.
  * Keep this comparison dependency-free so the executor can fail closed and
  * the production-path tests can drive the exact boundary.
  */
@@ -18,17 +20,34 @@ function epoch(value) {
   return Number.isFinite(value) ? value : null;
 }
 
+function canonicalWorkflowUuid(value) {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+  );
+}
+
 export function captureRunDispatchIdentity({
   routeId = null,
   routeReady = true,
+  routeIdentityProven = false,
   workflowUuid = null,
+  workflowIdentityProven = false,
+  workflowIdentityAmbiguous = false,
   reconnectEpoch = null,
   targetId = null,
 } = {}) {
+  const normalizedWorkflowUuid = text(workflowUuid);
+  const normalizedRouteId = text(routeId);
+  const ambiguous = workflowIdentityAmbiguous === true;
   return {
-    routeId: text(routeId),
+    routeId: normalizedRouteId,
     routeReady: routeReady === true,
-    workflowUuid: text(workflowUuid),
+    routeIdentityProven: routeIdentityProven === true && !!normalizedRouteId,
+    workflowUuid: normalizedWorkflowUuid,
+    workflowIdentityProven:
+      workflowIdentityProven === true && !ambiguous && canonicalWorkflowUuid(normalizedWorkflowUuid),
+    workflowIdentityAmbiguous: ambiguous,
     reconnectEpoch: epoch(reconnectEpoch),
     targetId: text(targetId),
   };
@@ -44,7 +63,13 @@ export function compareRunDispatchIdentity(before, after) {
   const changed = [];
   if (left.reconnectEpoch !== right.reconnectEpoch) changed.push("reconnect");
   if (left.routeId !== right.routeId) changed.push("bridge route");
+  else if (!left.routeIdentityProven || !right.routeIdentityProven) changed.push("bridge route unavailable");
   if (left.workflowUuid !== right.workflowUuid) changed.push("workflow");
+  if (left.workflowIdentityAmbiguous || right.workflowIdentityAmbiguous) {
+    changed.push("workflow identity ambiguous");
+  } else if (!left.workflowIdentityProven || !right.workflowIdentityProven) {
+    changed.push("workflow identity unavailable");
+  }
   if (left.targetId !== right.targetId) changed.push("run target");
   if (!left.routeReady || !right.routeReady) changed.push("route readiness");
   return { stable: changed.length === 0, changed, before: left, after: right };
