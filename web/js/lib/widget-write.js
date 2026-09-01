@@ -3036,6 +3036,134 @@ export function applyWidgetWrite(
   // CAPTURED (not rethrown here) so that VERIFICATION runs AFTER afterChange has
   // fired its hooks: an afterChange hook can itself re-stale a widget or change the
   // promotion topology, and that must be caught too (not just callback-time drift).
+  // comfyui-mcp#2689 — REPAIR the collateral definition write instead of refusing the
+  // whole write.
+  //
+  // A rail that WRITES THROUGH to the inner widget is not the same failure as a rail whose
+  // value and the definition's are one store. The store the queue compiler reads is this
+  // wrapper's own entry (`store[input.widgetId]`), and the rail's setter landed the value
+  // there; what it ALSO did was assign the shared inner widget, which nothing asked it to
+  // do. Undoing exactly that second assignment leaves the write where it was addressed and
+  // the definition where it was — so `value_scope: "instance"` becomes a statement the code
+  // has OBSERVED rather than one it refused to make.
+  //
+  // That was the whole cost of the old refusal: on the reported frontends every promoted
+  // STRING rail writes through, so a promoted prompt could not be set AT ALL — not from the
+  // wrapper, and not by entering the subgraph (that path resolves to the same rail).
+  //
+  // FAIL CLOSED, still. The repair is accepted only when BOTH halves are verified after it:
+  // the shared definition is structurally back on its captured value, AND the rail (and
+  // every #477 display proxy) still holds the requested one. A shape that forwards in BOTH
+  // directions fails the second check — restoring the inner drags the rail back with it —
+  // and keeps the old refusal and the old rollback, unchanged.
+  //
+  // Stays TRUE for the rest of this call once a repair has landed, because the rollback
+  // still has to restore the inner widget if some LATER check fails: the rail's own restore
+  // forwards onto it a second time (#2132), and skipping the inner restore would leave the
+  // SHARED definition holding the rail's captured value.
+  let definitionRepaired = false;
+  // WHICH check blocked the repair — "rail" | "inner" | "display", or null when it was
+  // never attempted. The refusal names it. A single "the repair was attempted" flag let one
+  // message speak for three different situations: a separable rail whose #477 display proxy
+  // simply follows the definition is NOT a rail that is one store with it, and telling that
+  // caller to unpack the subgraph sends them to rebuild a graph over a projection that would
+  // have re-rendered.
+  let definitionRepairBlockedBy = null;
+  // STRICTLY retained, deliberately — not `widgetMatchesExpected`.
+  //
+  // That helper also accepts a live custom-text widget whose DOM EDITOR holds the value while
+  // its own `.value` does not (#2020), which is right for judging a write that has already
+  // landed. It is the wrong evidence for THIS decision: the repair spends that judgement
+  // erasing the only other copy of the value. A promoted rail's `.value` reads the
+  // per-widgetId store — the entry queue compilation reads — so a rail showing the value only
+  // in its textarea has not been shown to have landed it anywhere durable, and restoring the
+  // definition could leave the write nowhere at all. Such a rail keeps the old refusal instead
+  // of being repaired on weaker evidence, and — because the repair is never ATTEMPTED there —
+  // that refusal does not claim the two stores are inseparable when all that happened is the
+  // rail's own store did not take the value.
+  const strictlyRetained = (widget) => {
+    try {
+      return matchesExpected(widget?.value);
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * comfyui-mcp#2689 — undo the rail's collateral assignment to the SHARED definition.
+   *
+   * Runs INSIDE the write's own undo envelope (from its `finally`, before `safeAfter()`),
+   * for the reason #1533's number restore is there: `panel_set_widget` advertises "Undoable
+   * with Ctrl+Z", these hooks ARE litegraph's `graph.beforeChange`/`afterChange`, and the
+   * repair mutates the shared subgraph definition. Recorded as a SEPARATE transaction it
+   * would be strictly worse than not recording it at all — one Ctrl+Z would undo only the
+   * repair and reinstate the definition move while the instance rail kept the new value,
+   * i.e. hand the user a one-keystroke path to the very leak this exists to prevent. Inside,
+   * the write and its repair are one step: undo goes to the pre-write state, redo to the
+   * repaired one.
+   *
+   * Everything it reads and writes is captured before the envelope opens, and it is total —
+   * a throw here must never become the write's `threw`, which is attribution this module is
+   * careful about elsewhere.
+   *
+   * The accept decision is therefore taken BEFORE `afterChange` fires. That is a real
+   * narrowing and it is the right one: the alternative is a second transaction. A hook that
+   * re-moves the definition afterwards is still caught, by the LIVE `definitionMoved`
+   * re-classification after the envelope closes, which is what actually decides the verdict.
+   */
+  const repairSharedDefinitionWriteThrough = () => {
+    try {
+      if (!instanceScoped) return;
+      if (structurallyEqual(w.value, previousClone)) return;
+      if (!strictlyRetained(valueWidget)) return;
+      // What the WRITE left on the inner widget, so a repair that does not verify can be put
+      // back. Without this the failure path reports the REPAIR instead of the write: on a
+      // rail that is one store with the definition, restoring the inner widget drags the rail
+      // down with it, and the verdict flips from "ALSO changed the shared subgraph definition"
+      // (true, and actionable) to "did not retain the requested value" (false — the rail
+      // retained it; this code took it away). A repair that cannot be verified must leave
+      // EXACTLY the state the write left, so every verdict describes the write.
+      //
+      // Kept as BOTH the reference and a structural CLONE. The reference is what a restore
+      // must reinstate (this module restores prior REFERENCES everywhere, so a rollback hands
+      // back the object the node already had); the clone is what says whether that
+      // reinstatement actually reproduced the post-write value, because a widget whose setter
+      // mutates its current value object IN PLACE turns the captured reference into whatever
+      // was last assigned — including the pre-write value we just restored FROM.
+      const innerAfterWrite = w.value;
+      const innerAfterWriteClone = deepClone(innerAfterWrite);
+      try {
+        restoreWidgetValue(w, previous);
+      } catch {
+        /* the read-back below is authoritative */
+      }
+      const innerRestored = structurallyEqual(w.value, previousClone);
+      const railKeptValue = strictlyRetained(valueWidget);
+      const displaysKeptValue = displayWidgets.every((dw) => strictlyRetained(dw));
+      if (innerRestored && railKeptValue && displaysKeptValue) {
+        definitionRepaired = true;
+        return;
+      }
+      // Ordered by how fundamental the obstacle is: a rail dragged back with the definition
+      // is the two being one store; an inner widget that will not take its own value back is
+      // the definition being unrestorable; a stale display proxy is neither — the value
+      // stores separated fine and a parent-facing VIEW did not.
+      definitionRepairBlockedBy = !railKeptValue ? "rail" : !innerRestored ? "inner" : "display";
+      try {
+        restoreWidgetValue(w, innerAfterWrite);
+      } catch {
+        /* the LIVE re-classification after the envelope decides, not what was attempted */
+      }
+      if (!structurallyEqual(w.value, innerAfterWriteClone)) {
+        try {
+          restoreWidgetValue(w, innerAfterWriteClone);
+        } catch {
+          /* still decided from the LIVE value */
+        }
+      }
+    } catch {
+      /* never let the repair become the write's throw; the verdict is taken from live state */
+    }
+  };
   let threw = null;
   // #976 (codex NO-SHIP round 2): a captured throw cannot be detected by testing
   // `threw` for truthiness — `throw undefined`, `throw null`, `throw 0`, `throw ""`
@@ -3190,6 +3318,11 @@ export function applyWidgetWrite(
     didThrow = true;
     threw = err;
   } finally {
+    // comfyui-mcp#2689 — inside this envelope, so the write and the undo of its collateral
+    // definition assignment are ONE undoable step. In the `finally` rather than at the end
+    // of the `try`, because the write-through happens during the value assignments: a
+    // callback that throws afterwards must not leave the shared definition moved.
+    repairSharedDefinitionWriteThrough();
     safeAfter();
   }
 
@@ -3234,141 +3367,11 @@ export function applyWidgetWrite(
       return UNREADABLE_PROPERTY;
     }
   };
-  // comfyui-mcp#2689 — REPAIR the collateral definition write instead of refusing the
-  // whole write.
-  //
-  // A rail that WRITES THROUGH to the inner widget is not the same failure as a rail
-  // whose value and the definition's are one store. The store the queue compiler reads
-  // is this wrapper's own entry (`store[input.widgetId]`), and the rail's setter landed
-  // the value there; what it ALSO did was assign the shared inner widget, which nothing
-  // asked it to do. Undoing exactly that second assignment leaves the write where it was
-  // addressed and the definition where it was — so `value_scope: "instance"` becomes a
-  // statement the code has OBSERVED rather than one it refused to make.
-  //
-  // That was the whole cost of the old refusal: on the reported frontends every promoted
-  // STRING rail writes through, so a promoted prompt could not be set AT ALL — not from
-  // the wrapper, and not by entering the subgraph (that path resolves to the same rail).
-  //
-  // FAIL CLOSED, still. The repair is only accepted when BOTH halves are verified after
-  // it: the shared definition is structurally back on its captured value, AND the rail
-  // (and every #477 display proxy) still holds the requested one. A shape that forwards
-  // in BOTH directions fails the second check — restoring the inner drags the rail back
-  // with it — and keeps today's refusal and today's rollback, unchanged.
-  //
-  // Gated on the rail having RETAINED the value: when it did not, "did not retain" is the
-  // accurate verdict and the branch below owns it. Assigning the inner widget here is not
-  // a new touch of the definition — the write-through already moved it, and this is the
-  // same restore the rollback below performs, taken before the verdict rather than after.
+  // comfyui-mcp#2689 — classified from the LIVE definition value, AFTER afterChange, so an
+  // `afterChange` hook that re-assigns the shared inner widget is caught here even though
+  // the repair itself ran inside the envelope. `definitionRepaired` records that the repair
+  // landed at the time it ran; this line decides whether the definition is still whole now.
   let definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
-  // Stays TRUE for the rest of this call once a repair has run, because the rollback
-  // still has to restore the inner widget if some LATER check fails: the rail's own
-  // restore forwards onto it a second time (#2132), and skipping the inner restore
-  // would leave the SHARED definition holding the rail's captured value.
-  let definitionRepaired = false;
-  // Whether the repair actually RAN. The refusal below is also reachable without it (a
-  // numeric rail that normalized its value is not `widgetMatchesExpected`, so the repair
-  // is skipped and the definition-moved verdict stands), and a message that described an
-  // attempt that never happened would be a claim about a check nothing performed.
-  // WHICH check blocked the repair — "rail" | "inner" | "display", or null when it was
-  // never attempted. The refusal below names it. A single "the repair was attempted" flag
-  // let one message speak for three different situations: a separable rail whose #477
-  // display proxy simply follows the definition is NOT a rail that is one store with it,
-  // and telling that caller to unpack the subgraph sends them to rebuild a graph over a
-  // projection that would have re-rendered.
-  let definitionRepairBlockedBy = null;
-  // STRICTLY retained, deliberately — not `widgetMatchesExpected`.
-  //
-  // That helper also accepts a live custom-text widget whose DOM EDITOR holds the value
-  // while its own `.value` does not (#2020), which is right for judging a write that has
-  // already landed. It is the wrong evidence for THIS decision: the repair spends that
-  // judgement erasing the only other copy of the value. A promoted rail's `.value` reads
-  // the per-widgetId store — the entry queue compilation reads — so a rail showing the
-  // value only in its textarea has not been shown to have landed it anywhere durable, and
-  // restoring the definition could leave the write nowhere at all. Such a rail keeps the
-  // old refusal instead of being repaired on weaker evidence, and — because the repair is
-  // never ATTEMPTED there — that refusal does not claim the two stores are inseparable
-  // when all that happened is the rail's own store did not take the value.
-  const strictlyRetained = (widget) => {
-    try {
-      return matchesExpected(widget?.value);
-    } catch {
-      return false;
-    }
-  };
-  if (definitionMoved && strictlyRetained(valueWidget)) {
-    // What the WRITE left on the inner widget, so a repair that does not verify can be
-    // put back. Without this the failure path reports the REPAIR instead of the write: on
-    // a rail that is one store with the definition, restoring the inner widget drags the
-    // rail down with it, and the verdict flips from "ALSO changed the shared subgraph
-    // definition" (true, and actionable) to "did not retain the requested value" (false —
-    // the rail retained it; this code took it away). A repair that cannot be verified must
-    // leave EXACTLY the state the write left, so every verdict below describes the write.
-    //
-    // Kept as BOTH the reference and a structural CLONE. The reference is what a restore
-    // must reinstate (this module restores prior REFERENCES everywhere, so a rollback
-    // hands back the object the node already had); the clone is what says whether that
-    // reinstatement actually reproduced the post-write value, because a widget whose
-    // setter mutates its current value object IN PLACE turns the captured reference into
-    // whatever was last assigned — including the pre-write value we just restored FROM.
-    const innerAfterWrite = w.value;
-    const innerAfterWriteClone = deepClone(innerAfterWrite);
-    // In its OWN undo envelope, like the rollback below — and for the same reason.
-    // These hooks ARE litegraph's `graph.beforeChange`/`afterChange` (see the panel's call
-    // site), and `panel_set_widget` advertises "Undoable with Ctrl+Z". A mutation of the
-    // SHARED definition taken outside a bracket is invisible to that history: the snapshot
-    // taken when the write's envelope closed still holds the write-through this repair
-    // removes, so a redo would put the leak back into every sibling instance. Bracketed,
-    // the repair is a step of its own and the history and the live graph agree.
-    safeBefore();
-    try {
-      restoreWidgetValue(w, previous);
-    } catch {
-      /* the read-back below is authoritative */
-    } finally {
-      safeAfter();
-    }
-    // Read AFTER that envelope closed, never inside it: an afterChange hook can itself
-    // re-stale a widget or re-run a setter, and the accept decision has to see what the
-    // hooks LEFT — the same discipline the write's own verification follows.
-    const innerRestored = structurallyEqual(w.value, previousClone);
-    const railKeptValue = strictlyRetained(valueWidget);
-    const displaysKeptValue = displayWidgets.every((dw) => strictlyRetained(dw));
-    if (innerRestored && railKeptValue && displaysKeptValue) {
-      definitionMoved = false;
-      definitionRepaired = true;
-    } else {
-      // Ordered by how fundamental the obstacle is: a rail dragged back with the
-      // definition is the two being one store; an inner widget that will not take its own
-      // value back is the definition being unrestorable; a stale display proxy is neither
-      // — the value stores separated fine and a parent-facing VIEW did not.
-      definitionRepairBlockedBy = !railKeptValue ? "rail" : !innerRestored ? "inner" : "display";
-      // The undo is bracketed too — it is a second mutation of the shared definition, and
-      // leaving it out of the history would strand the repair's step there with nothing
-      // that reverses it. Each restore keeps its own catch inside the one envelope, so a
-      // throwing setter on the first cannot skip the clone fallback.
-      safeBefore();
-      try {
-        try {
-          restoreWidgetValue(w, innerAfterWrite);
-        } catch {
-          /* re-classified from the LIVE value below, not from what was attempted */
-        }
-        if (!structurallyEqual(w.value, innerAfterWriteClone)) {
-          try {
-            restoreWidgetValue(w, innerAfterWriteClone);
-          } catch {
-            /* still re-classified from the LIVE value below */
-          }
-        }
-      } finally {
-        safeAfter();
-      }
-      // Taken from what is actually there now, never from what the undo tried to do: an
-      // inner widget that refused to take the write-through value back is not a moved
-      // definition, and the branches below judge the rail on its own terms.
-      definitionMoved = !structurallyEqual(w.value, previousClone);
-    }
-  }
   // Read ONCE, after the envelope closed. Two reads of a stateful accessor can disagree,
   // and the verdict and the message it prints must be the same observation. Taken after
   // the #2689 repair so the one reading describes the state this call actually leaves.

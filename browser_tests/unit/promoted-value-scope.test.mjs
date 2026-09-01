@@ -874,31 +874,49 @@ test("comfyui-mcp#2689: an inner widget that locks after the repair's restore ca
   assert.equal(displayProxy.value, 512);
 });
 
-test("comfyui-mcp#2689: the repair mutates the shared definition inside an UNDO bracket", () => {
+test("comfyui-mcp#2689: the write and its repair are ONE undoable step, and the step commits the REPAIRED definition", () => {
   // `beforeChange`/`afterChange` are litegraph's `graph.beforeChange`/`afterChange`, and
-  // panel_set_widget advertises "Undoable with Ctrl+Z". The repair changes the SHARED
-  // subgraph definition, so it has to be a step the history can see: unbracketed, the
-  // snapshot taken when the write's own envelope closed still holds the write-through the
-  // repair removed, and a redo would put that leak back into every sibling instance.
+  // panel_set_widget advertises "Undoable with Ctrl+Z". The repair mutates the SHARED
+  // subgraph definition, so where it sits relative to that bracket is load-bearing in both
+  // directions:
+  //
+  //   * OUTSIDE the bracket entirely, the state `afterChange` commits still holds the
+  //     write-through — so a REDO reinstates the leak.
+  //   * in a bracket OF ITS OWN, one Ctrl+Z undoes only the repair and puts the definition
+  //     move back while the instance rail keeps the new value — a one-keystroke path to the
+  //     exact leak this exists to prevent, which is strictly worse than not recording it.
+  //
+  // So it runs inside the WRITE's envelope: one step, whose committed state has the
+  // definition already restored. That is what this asserts — not just the bracket count,
+  // but the definition value the hooks actually SEE.
   const sg = makeReusableSubgraph({ definitionValue: 512, railWritesDefinition: true });
   const target = sg.instance(293);
   const events = [];
 
   const set = applyWidgetWrite(target.node, "width", 1024, {
     resolveSource,
-    beforeChange: () => events.push("before"),
-    afterChange: () => events.push("after"),
+    beforeChange: () => events.push(["before", sg.definition()]),
+    afterChange: () => events.push(["after", sg.definition()]),
   });
 
   assert.equal(set.promoted_from.shared_definition_write_through, true, "precondition: the repair ran");
-  // The write's own envelope, then the repair's: every mutation of the definition is
-  // inside one, and every bracket is balanced.
-  assert.deepEqual(events, ["before", "after", "before", "after"]);
+  assert.deepEqual(
+    events,
+    [
+      ["before", 512],
+      ["after", 512],
+    ],
+    "ONE balanced step, and the state it commits does not contain the write-through",
+  );
+  assert.equal(target.rail.value, 1024, "…while the instance's own value is the requested one");
   assert.equal(sg.definition(), 512);
 });
 
-test("comfyui-mcp#2689: a repair that is undone brackets the undo too", () => {
-  // Otherwise the repair's step is stranded in the history with nothing reversing it.
+test("comfyui-mcp#2689: a repair that is UNDONE is inside the same step, so the refusal still brackets cleanly", () => {
+  // Blocked repair: the undo of it must be in the same envelope as the repair, or the
+  // committed state disagrees with the live graph again. Two balanced steps in total — the
+  // write (with its repair and that repair's undo), then the rollback — and neither of the
+  // states they commit holds a definition value the caller did not ask for.
   const sg = makeReusableSubgraph({ definitionValue: 512, railIsInnerView: true });
   const target = sg.instance(293);
   const events = [];
@@ -906,13 +924,14 @@ test("comfyui-mcp#2689: a repair that is undone brackets the undo too", () => {
   assert.throws(() =>
     applyWidgetWrite(target.node, "width", 1024, {
       resolveSource,
-      beforeChange: () => events.push("before"),
-      afterChange: () => events.push("after"),
+      beforeChange: () => events.push(["before", sg.definition()]),
+      afterChange: () => events.push(["after", sg.definition()]),
     }),
   );
 
-  // write envelope, repair envelope, undo envelope, rollback envelope — four, balanced.
-  assert.deepEqual(events, ["before", "after", "before", "after", "before", "after", "before", "after"]);
+  assert.equal(events.length, 4, "the write envelope and the rollback envelope — two balanced steps");
+  assert.deepEqual(events.map((e) => e[0]), ["before", "after", "before", "after"]);
+  assert.equal(events[3][1], 512, "and the final committed state has the shared definition whole");
   assert.equal(sg.definition(), 512);
 });
 
