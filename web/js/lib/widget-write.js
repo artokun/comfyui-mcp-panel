@@ -3878,7 +3878,9 @@ export function applyWidgetWrite(
   // row — wherever the row has moved to. A row a hook REMOVED has no current address, so the
   // pre-write capture is reported with `stale: true` rather than silently dropped: the caller
   // still learns which row was written, and is told not to reuse the number.
-  const liveOccurrence = promotedFrom ? null : widgetOccurrenceOf(valueNode, valueWidget);
+  const liveOccurrence = promotedFrom
+    ? null
+    : widgetOccurrenceOf(valueNode, valueWidget, verifiedName);
   const widgetOccurrence =
     liveOccurrence ?? (preWriteOccurrence ? { ...preWriteOccurrence, stale: true } : null);
 

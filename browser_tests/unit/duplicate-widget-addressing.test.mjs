@@ -491,6 +491,65 @@ test("#2143: the reported index survives the node's onWidgetChanged hook too", (
   assert.equal(resolveWidgetAddress(node, `row[${res.widget_occurrence.index}]`).occurrence.widget, b);
 });
 
+test("#2143: a hook that RENAMES the written row cannot make the reply self-contradictory", () => {
+  // The reply carries a `widget` NAME and an occurrence, and they must describe the same
+  // thing. `onWidgetChanged` can rename the widget after the write while the reported name
+  // stays the pre-hook one (#1519) — counting rows under the NEW name would publish
+  // `{index, of}` about a name the reply never mentions, so replaying `row[index]` would
+  // address something else entirely.
+  const renamedIntoADuplicate = { id: 59, type: "T", widgets: [] };
+  const other = { name: "other", type: "string", value: "a" };
+  const written = { name: "row", type: "string", value: "b" };
+  renamedIntoADuplicate.widgets = [other, written];
+  renamedIntoADuplicate.onWidgetChanged = () => {
+    written.name = "other";
+  };
+
+  const res = applyWidgetWrite(renamedIntoADuplicate, "row", "new", { occurrence: null });
+
+  assert.equal(res.widget, "row", "the reported name is the pre-hook one, per #1519");
+  assert.equal(
+    "widget_occurrence" in res,
+    false,
+    "and no occurrence is published under a name the row no longer carries",
+  );
+
+  // When the name WAS duplicated before the write, the pre-write capture still says which
+  // row was written — flagged, so the number is not reused.
+  const node = { id: 59, type: "T", widgets: [] };
+  const a = { name: "row", type: "string", value: "a", label: "A" };
+  const b = { name: "row", type: "string", value: "b", label: "B" };
+  node.widgets = [a, b];
+  node.onWidgetChanged = () => {
+    b.name = "renamed";
+  };
+
+  const res2 = applyWidgetWrite(node, "row", "new", {
+    occurrence: { index: 1, label: "B", widget: b },
+  });
+  assert.deepEqual(res2.widget_occurrence, { index: 1, of: 2, label: "B", stale: true });
+});
+
+test("#2143: a rebuild down to ONE row of that name resolves — there is nothing to be wrong about", () => {
+  // The scope of the indistinguishable-rebuild refusal, deliberately: it fires only when
+  // MORE THAN ONE row still carries the name. With exactly one candidate there is no wrong
+  // choice available — a bare `row` write would reach the same widget — so refusing would
+  // refuse an address that is not ambiguous.
+  const node = {
+    id: 7,
+    type: "T",
+    widgets: [{ name: "x" }, { name: "x" }, { name: "row", type: "string", value: "c" }],
+  };
+
+  const res = applyWidgetWrite(node, "row", "written", {
+    occurrence: { index: 2, label: null, widget: { name: "row" } },
+  });
+
+  assert.equal(res.value, "written");
+  assert.equal(node.widgets[2].value, "written");
+  assert.equal("widget_occurrence" in res, false, "one row of that name — nothing to disclose");
+});
+
 test("#2143: a row the callback REMOVED is reported stale rather than as a usable address", () => {
   const node = { id: 59, type: "T", widgets: [] };
   const a = { name: "row", type: "string", value: "a", label: "A" };

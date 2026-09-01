@@ -153,6 +153,10 @@ export function widgetAtOccurrence(node, name, index, pin = null) {
   // The addressed row OBJECT is gone, so identity established nothing and the label is all
   // that is left. Require it to name exactly ONE of the rows sharing this name; otherwise
   // refuse rather than write whichever row happens to have landed here.
+  //
+  // `> 1` is the scope on purpose: with exactly one row left carrying the name there is no
+  // wrong choice available — a bare-name write would reach that same widget — so refusing
+  // would refuse an address that is not actually ambiguous.
   if (rebuilt && sameName.length > 1) {
     const labelNamesOneRow =
       pinned.label != null &&
@@ -179,9 +183,16 @@ export function widgetAtOccurrence(node, name, index, pin = null) {
  * Located by IDENTITY, never by name — the point is to report which of several identical
  * names was chosen, so a name lookup here would answer its own question wrong.
  */
-export function widgetOccurrenceOf(node, widget) {
+export function widgetOccurrenceOf(node, widget, expectedName = null) {
   const name = widgetName(widget);
   if (name == null) return null;
+  // #2143 — the reply that carries this also carries a `widget` NAME, and the two must
+  // describe the same thing. A node's `onWidgetChanged` hook can RENAME the widget after the
+  // write, while the reported name stays the pre-hook one (#1519); counting rows under the
+  // new name would then publish `{index, of}` about a name the reply never mentions, and
+  // replaying `oldName[index]` would address something else entirely. Caller passes the name
+  // it is going to report; a widget that no longer carries it has no address under it.
+  if (expectedName != null && name !== expectedName) return null;
   const same = occurrencesOf(node, name);
   if (same.length < 2) return null;
   const hit = same.find((entry) => entry.widget === widget);
@@ -333,7 +344,7 @@ export function resolveWidgetAddress(node, requested) {
     if (at) return pin(`${selector.base}${tail}`, at);
   }
 
-  // 4. DISPLAY LABEL — last, and only for the WHOLE string, so it can never pre-empt a
+  // 5. DISPLAY LABEL — last, and only for the WHOLE string, so it can never pre-empt a
   //    name-based route. Skipped when a name matches case-insensitively, which keeps the
   //    #524 fallback the thing that decides that case, exactly as it does today.
   const lowered = requested.toLowerCase();
