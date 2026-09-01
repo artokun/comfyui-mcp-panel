@@ -105,17 +105,20 @@ function counterOf(value) {
  * gets `null`, which excludes it from every comparison: an unmatchable device must not be
  * able to move a verdict.
  */
-function deviceKeyOf(d) {
-  let type = "";
-  let index = null;
+function deviceTypeOf(d) {
   try {
-    type = typeof d?.type === "string" ? d.type : "";
-    index = Number(d?.index);
+    return typeof d?.type === "string" ? d.type : "";
   } catch {
-    type = "";
-    index = null;
+    return "";
   }
-  if (type && Number.isFinite(index)) return `${type}:${index}`;
+}
+
+function deviceKeyOf(d) {
+  const type = deviceTypeOf(d);
+  // `counterOf`, not `Number`: a cpu/mps row carries `index: null`, and `Number(null)` is a
+  // perfectly finite 0 — which would mint a `cpu:0` key for a device that has no ordinal.
+  const index = counterOf(d?.index);
+  if (type && index !== null) return `${type}:${index}`;
   let name = "";
   try {
     name = typeof d?.name === "string" ? d.name : "";
@@ -154,6 +157,7 @@ export function vramOccupancyFromStats(stats) {
     const torchFree = counterOf(d?.torch_vram_free);
     out.push({
       name,
+      device_type: deviceTypeOf(d) || null,
       device_key: deviceKeyOf(d),
       vram_total_mb: roundMb(total),
       vram_free_mb: roundMb(free),
@@ -175,6 +179,31 @@ const PINNED_TORCH_POOL_MIN_MB = 1024; // 1 GiB, matching comfyui-mcp
 const PINNED_TORCH_POOL_FREE_RATIO = 0.2;
 
 /**
+ * Device types whose `torch_vram_total` / `torch_vram_free` are ACTUALLY a torch allocator
+ * pool, and so can be read as "this ComfyUI is still holding memory".
+ *
+ * On `cpu` and `mps` they are not. ComfyUI's `get_total_memory` / `get_free_memory` take an
+ * early branch for those:
+ *
+ *     if dev.type == 'cpu' or dev.type == 'mps':
+ *         mem_total_torch = psutil.virtual_memory().total
+ *         mem_free_torch  = psutil.virtual_memory().available
+ *
+ * — whole-machine RAM, every process on the box. A laptop at 15 % available RAM is an
+ * ordinary Tuesday, and judging it by the pool rule would report `torch_pool_pinned` and
+ * tell the user to restart ComfyUI over someone else's memory. Everything else
+ * (`cuda`/`xpu`/`npu`/`mlu`) reports `reserved` and `reserved - active`, which is the pool.
+ *
+ * A WHITELIST, not a blacklist, and deliberately: the two verdicts are not symmetric. A
+ * missed pin degrades to "pending — wait and re-read", which is merely slow; a false pin
+ * prescribes a restart. So an unrecognised device type is not judged, and a payload too old
+ * to carry `type` at all is not judged either. (DirectML is excluded for free: ComfyUI
+ * hardcodes both of its counters to 1 GiB, so the ratio is 1.0 and could never read as
+ * pinned anyway.)
+ */
+const TORCH_POOL_DEVICE_TYPES = new Set(["cuda", "xpu", "npu", "mlu"]);
+
+/**
  * True when THIS ComfyUI's torch pool on `row` is still held after /free.
  *
  * Thresholds and reasoning mirror `deviceStillPinned` in comfyui-mcp's panel-tools.ts
@@ -188,9 +217,11 @@ const PINNED_TORCH_POOL_FREE_RATIO = 0.2;
  *
  * Device-global counters are deliberately NOT consulted: `vram_free` is the whole card, so
  * it cannot tell this ComfyUI from a second instance, a trainer or the browser. An unknown
- * torch pool is not pinned — an unknown answer claims nothing in either direction.
+ * torch pool is not pinned — an unknown answer claims nothing in either direction. Neither
+ * is a device whose type does not actually report a pool; see `TORCH_POOL_DEVICE_TYPES`.
  */
 function deviceTorchPoolPinned(row) {
+  if (!TORCH_POOL_DEVICE_TYPES.has(row?.device_type)) return false;
   const total = row?.torch_vram_total_mb;
   const free = row?.torch_vram_free_mb;
   if (typeof total !== "number" || typeof free !== "number") return false;

@@ -121,10 +121,10 @@ function asyncFreeingComfy({ usedBefore = 9426, usedAfter = 1500, dropAfterReads
 
 /** /system_stats with the per-device torch allocator counters. `[usedMb, index,
  *  torchTotalMb, torchFreeMb]`; pass null for either torch value to omit it. */
-const torchStats = (entries, totalMb = 12282) => ({
+const torchStats = (entries, totalMb = 12282, type = "cuda") => ({
   devices: entries.map(([usedMb, index, torchTotalMb, torchFreeMb]) => ({
-    name: `cuda:${index} NVIDIA GeForce RTX 4070 Ti`,
-    type: "cuda",
+    name: `${type}:${index} NVIDIA GeForce RTX 4070 Ti`,
+    type,
     index,
     vram_total: totalMb * MB,
     vram_free: (totalMb - usedMb) * MB,
@@ -690,4 +690,64 @@ test("#2144 the torch counters reach the reply so the reading can be audited", (
   const rows = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24]]));
   assert.equal(rows[0].torch_vram_total_mb, 8192);
   assert.equal(rows[0].torch_vram_free_mb, 24);
+});
+
+// ---------------------------------------------------------------------------
+// #2144 review round 3 — on cpu/mps, torch_vram_* is psutil SYSTEM memory, not a pool.
+// ---------------------------------------------------------------------------
+
+test("#2144 a CPU-only ComfyUI under memory pressure is not a pinned torch pool", () => {
+  // ComfyUI: `if dev.type == 'cpu' or dev.type == 'mps': mem_free_torch =
+  // psutil.virtual_memory().available`. 1 GB available of 16 GB RAM is an ordinary busy
+  // machine, not this instance holding VRAM — and it must never prescribe a restart.
+  const rows = vramOccupancyFromStats(torchStats([[15000, null, 16384, 1024]], 16384, "cpu"));
+  assert.equal(rows[0].device_type, "cpu");
+  assert.deepEqual(pinnedTorchPoolDevices(rows), []);
+  const result = freeVramSuccessResult({ before: rows, after: rows });
+  assert.equal(result.branch, "unload_not_observed");
+  assert.notEqual(result.branch, "torch_pool_pinned");
+  // The pending note NAMES panel_restart_comfyui to rule it out, so the assertion is on
+  // the prescription, not the mention.
+  assert.match(result.note, /NOT the "device still pinned"/);
+  assert.doesNotMatch(result.note, /The next step is panel_restart_comfyui/);
+});
+
+test("#2144 an MPS device is the same early branch and is judged the same way", () => {
+  const rows = vramOccupancyFromStats(torchStats([[15000, null, 16384, 100]], 16384, "mps"));
+  assert.deepEqual(pinnedTorchPoolDevices(rows), []);
+});
+
+test("#2144 an unrecognised device type is not judged — the whitelist is conservative", () => {
+  const rows = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24]], 12282, "privateuseone"));
+  assert.deepEqual(pinnedTorchPoolDevices(rows), []);
+});
+
+test("#2144 the pool-backed accelerator types ARE judged", () => {
+  for (const type of ["cuda", "xpu", "npu", "mlu"]) {
+    const rows = vramOccupancyFromStats(torchStats([[9426, 0, 8192, 24]], 12282, type));
+    assert.equal(pinnedTorchPoolDevices(rows).length, 1, `${type} should be judged`);
+  }
+});
+
+test("#2144 a payload with no type at all is not judged", () => {
+  // The single-GPU `stats()` helper carries neither type nor index.
+  const rows = vramOccupancyFromStats({
+    devices: [
+      {
+        name: "cuda:0 NVIDIA GeForce RTX 5080",
+        vram_total: 12282 * MB,
+        vram_free: 2856 * MB,
+        torch_vram_total: 8192 * MB,
+        torch_vram_free: 24 * MB,
+      },
+    ],
+  });
+  assert.equal(rows[0].device_type, null);
+  assert.deepEqual(pinnedTorchPoolDevices(rows), []);
+});
+
+test("#2144 a null device index does not mint a phantom ordinal key", () => {
+  const rows = vramOccupancyFromStats(torchStats([[15000, null, 16384, 1024]], 16384, "cpu"));
+  assert.notEqual(rows[0].device_key, "cpu:0", "index:null is not device 0");
+  assert.match(rows[0].device_key, /^name:/);
 });
