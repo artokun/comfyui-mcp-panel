@@ -75,6 +75,13 @@ function messageOf(err) {
   return (err instanceof Error ? err.message : String(err ?? "")).trim();
 }
 
+/** The raw text as a sentence, without doubling a full stop it already carries. Firefox's
+ *  string ends in one and Chrome's does not, so a bare `${raw}.` reads as "…resource.."
+ *  for the exact browser this issue was reported from. */
+function asSentence(raw) {
+  return /[.!?]$/.test(raw) ? raw : `${raw}.`;
+}
+
 /** A tri-state observation: `true`, `false`, or `null` when it could not be observed. */
 function triState(v) {
   return v === true ? true : v === false ? false : null;
@@ -147,7 +154,7 @@ export function openSwitchFailureMessage({
   if (verdict.transport) {
     parts.push(
       `panel_open_workflow could not switch to ${want}: the frontend's read of the workflow ` +
-        `file did not complete. ${raw}. This is a TRANSPORT failure on the workflow-content ` +
+        `file did not complete. ${asSentence(raw)} This is a TRANSPORT failure on the workflow-content ` +
         `route (GET ${WORKFLOW_CONTENT_ROUTE}) — no usable response reached the browser, so ` +
         `there is no HTTP status or response body to report (#2158). Likely causes are ComfyUI ` +
         `having stopped or restarted, the tab having lost its connection, or a proxy in front ` +
@@ -158,7 +165,7 @@ export function openSwitchFailureMessage({
     // what it actually said, and add only the route it was attempted against.
     parts.push(
       `panel_open_workflow could not switch to ${want}: the native workflow switch failed ` +
-        `while reading the workflow file (GET ${WORKFLOW_CONTENT_ROUTE}). ${raw}.`,
+        `while reading the workflow file (GET ${WORKFLOW_CONTENT_ROUTE}). ${asSentence(raw)}`,
     );
   }
 

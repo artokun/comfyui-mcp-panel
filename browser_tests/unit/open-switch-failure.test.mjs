@@ -254,3 +254,18 @@ test("#2158 WIRED: the classifier is SHARED with #1472, not a second copy of the
   assert.match(lib, /import \{ isTransportFailure \} from "\.\/manager-fetch-failure\.js";/);
   assert.doesNotMatch(lib, /networkerror when attempting to fetch resource/i, "no second copy of the table");
 });
+
+test("#2158 the raw message is not double-punctuated", () => {
+  // Firefox's string already ends in a full stop and Chrome's does not, so a bare
+  // `${raw}.` produced "…fetch resource.." for the exact browser this was reported from.
+  const ff = openSwitchFailureMessage({ path: "a.json", err: FIREFOX, activeIsSource: true });
+  assert.doesNotMatch(ff, /\.\./, "no doubled full stop");
+  assert.match(ff, /fetch resource\. This is a TRANSPORT failure/);
+  // Chrome's has no trailing stop and must still get one.
+  const cr = openSwitchFailureMessage({ path: "a.json", err: CHROME, activeIsSource: true });
+  assert.match(cr, /Failed to fetch\. This is a TRANSPORT failure/);
+  // Same on the non-transport branch, where the server's own text is kept.
+  const ans = openSwitchFailureMessage({ path: "a.json", err: ANSWERED, activeIsSource: true });
+  assert.match(ans, /404 Not Found\. MEASURED/);
+  assert.doesNotMatch(ans, /\.\./);
+});
