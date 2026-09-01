@@ -116,14 +116,21 @@ export function occurrenceLabelOf(widget) {
  *      the rows carry no labels, or identical ones, where nothing else can tell them apart.
  *      If that object is still on the node but somewhere ELSE, the rows were REORDERED and
  *      the index is stale: null, so the write refuses rather than mutating a stranger.
- *   2. LABEL, only once identity is inconclusive — i.e. the addressed object is gone,
- *      which is a REBUILD, which is exactly what an rgthree Fast Groups node does whenever
- *      the groups it matches change. A matching label says the rebuild put the same row
- *      back here; a different one says it did not.
- *   3. Neither available (no pin object, no label): position and name alone, which is what
- *      a direct helper call with a bare index gets. Documented rather than defended: with
- *      no identity and no label there is nothing on the node that could distinguish the
- *      rows, and none of this is reachable from the panel, which always pins both.
+ *   2. HOW MANY rows carry the name. Once identity is inconclusive — the addressed object
+ *      is gone, i.e. a REBUILD — a changed count is proof the set of rows is not the set
+ *      that was addressed, whatever the labels say. This is the shape a Fast Groups node
+ *      actually produces when it rebuilds: a group was added or removed, so every index
+ *      after it means a different group now.
+ *   3. LABEL. A rebuild that kept the same number of rows: a matching label says it put the
+ *      same row back here, a different one says it did not.
+ *
+ * WHAT IS LEFT, stated rather than defended: a rebuild that replaces the row objects,
+ * keeps the same number of rows, REORDERS them, and where the rows carry no labels at all
+ * (or identical ones) is accepted. At that point nothing on the node distinguishes those
+ * rows — not the name, not the count, not the label, and the value is what the write is
+ * about to change — so no check placed here could tell them apart. The reported node is not
+ * that shape: an rgthree Fast Groups row is labelled with its group's title, which is
+ * exactly what step 3 reads.
  */
 export function widgetAtOccurrence(node, name, index, pin = null) {
   if (!Number.isInteger(index) || index < 0) return null;
@@ -135,6 +142,7 @@ export function widgetAtOccurrence(node, name, index, pin = null) {
     if (at === pinned.widget) return at;
     if (widgets.includes(pinned.widget)) return null;
   }
+  if (Number.isInteger(pinned?.of) && occurrencesOf(node, name).length !== pinned.of) return null;
   if (pinned?.label != null && widgetLabel(at) !== pinned.label) return null;
   return at;
 }
@@ -227,7 +235,7 @@ function pinnedOccurrence(node, selector) {
   const occurrences = occurrencesOf(node, selector.base);
   if (!occurrences.length) return null;
   const at = occurrences.find((entry) => entry.index === selector.index);
-  if (at) return at;
+  if (at) return { at, of: occurrences.length };
   throw new WidgetAddressError(
     `Node ${node?.id} (${node?.type}) carries no widget named "${selector.base}" at index ` +
       `${selector.index}. The index is the widget's position in the node, the same one ` +
@@ -274,9 +282,9 @@ export function resolveWidgetAddress(node, requested) {
   const widgets = widgetsOf(node);
   if (!widgets.length) return null;
   const plain = (name) => ({ name, occurrence: null });
-  const pin = (name, at) => ({
+  const pin = (name, at, of) => ({
     name,
-    occurrence: { index: at.index, label: widgetLabel(at.widget), widget: at.widget },
+    occurrence: { index: at.index, of, label: widgetLabel(at.widget), widget: at.widget },
   });
 
   // 1. EXACT NAME on the whole string — brackets, dots and all. Never rewritten, and no
@@ -292,8 +300,8 @@ export function resolveWidgetAddress(node, requested) {
   //    called `foo.bar` outranks splitting the string at `foo`.
   const wholeSelector = parseOccurrenceSelector(requested);
   if (wholeSelector) {
-    const at = pinnedOccurrence(node, wholeSelector);
-    if (at) return pin(wholeSelector.base, at);
+    const hit = pinnedOccurrence(node, wholeSelector);
+    if (hit) return pin(wholeSelector.base, hit.at, hit.of);
   }
 
   const dot = requested.indexOf(".");
@@ -306,8 +314,8 @@ export function resolveWidgetAddress(node, requested) {
   // 4. OCCURRENCE SELECTOR on the head segment: "NAME[1].field".
   const selector = dot > 0 ? parseOccurrenceSelector(head) : null;
   if (selector) {
-    const at = pinnedOccurrence(node, selector);
-    if (at) return pin(`${selector.base}${tail}`, at);
+    const hit = pinnedOccurrence(node, selector);
+    if (hit) return pin(`${selector.base}${tail}`, hit.at, hit.of);
   }
 
   // 4. DISPLAY LABEL — last, and only for the WHOLE string, so it can never pre-empt a
@@ -337,5 +345,5 @@ export function resolveWidgetAddress(node, requested) {
   // A label that names a UNIQUE widget still resolves through the ordinary name path —
   // pinning an occurrence there would put an index on a write that never needed one, and
   // needlessly cross the deferral gate below.
-  return occurrences.length > 1 ? pin(name, at) : plain(name);
+  return occurrences.length > 1 ? pin(name, at, occurrences.length) : plain(name);
 }

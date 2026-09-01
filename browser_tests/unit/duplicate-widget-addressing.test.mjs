@@ -40,7 +40,12 @@ const BYPASSER = "Fast Groups Bypasser (rgthree)";
 function addr(node, requested) {
   const a = resolveWidgetAddress(node, requested);
   if (!a) return null;
-  return { name: a.name, index: a.occurrence?.index ?? null, label: a.occurrence?.label ?? null };
+  return {
+    name: a.name,
+    index: a.occurrence?.index ?? null,
+    of: a.occurrence?.of ?? null,
+    label: a.occurrence?.label ?? null,
+  };
 }
 const ROW = "RGTHREE_TOGGLE_AND_NAV";
 
@@ -160,14 +165,19 @@ test("#2143: an EXACT widget name always wins, brackets and all", () => {
   const node = { id: 1, type: "T", widgets: [{ name: "foo[1]" }, { name: "foo" }, { name: "foo" }] };
   // The literal name resolves to itself with no occurrence pinned — the bracket is never
   // interpreted when a widget actually carries that spelling.
-  assert.deepEqual(addr(node, "foo[1]"), { name: "foo[1]", index: null, label: null });
+  assert.deepEqual(addr(node, "foo[1]"), { name: "foo[1]", index: null, of: null, label: null });
 });
 
 test("#2143: a duplicated name addresses a specific occurrence, and composes with sub-fields", () => {
   const node = { id: 59, type: BYPASSER, widgets: [{ name: ROW }, { name: ROW }] };
-  assert.deepEqual(addr(node, `${ROW}[1]`), { name: ROW, index: 1, label: null });
-  assert.deepEqual(addr(node, `${ROW}[0]`), { name: ROW, index: 0, label: null });
-  assert.deepEqual(addr(node, `${ROW}[1].toggled`), { name: `${ROW}.toggled`, index: 1, label: null });
+  assert.deepEqual(addr(node, `${ROW}[1]`), { name: ROW, index: 1, of: 2, label: null });
+  assert.deepEqual(addr(node, `${ROW}[0]`), { name: ROW, index: 0, of: 2, label: null });
+  assert.deepEqual(addr(node, `${ROW}[1].toggled`), {
+    name: `${ROW}.toggled`,
+    index: 1,
+    of: 2,
+    label: null,
+  });
   // The row OBJECT is pinned too — the only thing that can tell two identically-labelled
   // (or unlabelled) rows apart after a reorder.
   assert.equal(resolveWidgetAddress(node, `${ROW}[1]`).occurrence.widget, node.widgets[1]);
@@ -186,6 +196,7 @@ test("#2143: a duplicated name addresses a specific occurrence, and composes wit
   assert.deepEqual(addr(labelled, `${ROW}[1]`), {
     name: ROW,
     index: 1,
+    of: 2,
     label: "Enable VRAM optimizations 2",
   });
 });
@@ -205,13 +216,13 @@ test("#2143: a duplicated widget whose NAME contains dots is addressable", () =>
     ],
   };
   assert.deepEqual(duplicateWidgetRows(node)["foo.bar"].map((r) => r.index), [0, 1]);
-  assert.deepEqual(addr(node, "foo.bar[1]"), { name: "foo.bar", index: 1, label: "second" });
+  assert.deepEqual(addr(node, "foo.bar[1]"), { name: "foo.bar", index: 1, of: 2, label: "second" });
 
   // …and a real widget named `foo` still wins the DOTTED split, because the selector only
   // ever fires when no widget carries the requested string. Here `foo.on[0]` is not a
   // widget name and `foo.on` is not either, so it is a sub-field write on `foo`.
   const composite = { id: 8, type: "T", widgets: [{ name: "foo", value: { on: true } }] };
-  assert.deepEqual(addr(composite, "foo.on"), { name: "foo.on", index: null, label: null });
+  assert.deepEqual(addr(composite, "foo.on"), { name: "foo.on", index: null, of: null, label: null });
 });
 
 test("#2143: the selector index is the SAME number duplicate_widgets publishes", () => {
@@ -282,6 +293,7 @@ test("#2143: a display label carried by exactly one row is an address, and pins 
   assert.deepEqual(addr(node, "Enable VRAM optimizations 2"), {
     name: ROW,
     index: 1,
+    of: 2,
     label: "Enable VRAM optimizations 2",
   });
 });
@@ -307,7 +319,7 @@ test("#2143: a name that already resolves is returned untouched, with no occurre
     type: "KSampler",
     widgets: [{ name: "seed", label: "Sampler seed" }, { name: "steps" }],
   };
-  const plain = (name) => ({ name, index: null, label: null });
+  const plain = (name) => ({ name, index: null, of: null, label: null });
   // The two shapes every ordinary write takes: a plain name, and a #560 dotted sub-field.
   assert.deepEqual(addr(node, "seed"), plain("seed"));
   assert.deepEqual(addr(node, "seed.on"), plain("seed.on"));
@@ -499,6 +511,44 @@ test("#2143: identity ACCEPTS the unmoved row, so an ordinary pinned write still
   assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]]);
 });
 
+test("#2143: a rebuild that CHANGED THE NUMBER of rows is refused, labels or no labels", () => {
+  // The shape a Fast Groups node actually produces when it rebuilds: a group was added or
+  // removed while the write was in flight, so every index after it can mean a different
+  // group. Caught by the pinned COUNT — and, unlike the label, it still catches it when the
+  // row that ended up at that index happens to carry the label that was pinned, and when
+  // the rows carry no labels at all.
+  //
+  // A plain node, not the Bypasser fixture: a Fast Groups row with no live `group` refuses
+  // in the #2146 mode journal before this check is ever consulted, which would make the
+  // test pass for a reason that has nothing to do with the count.
+  for (const label of ["two", undefined]) {
+    const node = {
+      id: 7,
+      type: "T",
+      widgets: [
+        { name: "row", type: "string", value: "a", label: label && "one" },
+        { name: "row", type: "string", value: "b", label },
+        { name: "row", type: "string", value: "c", label },
+      ],
+    };
+    const ghost = { name: "row", label };
+
+    assert.throws(
+      () =>
+        applyWidgetWrite(node, "row", "written", {
+          occurrence: { index: 1, of: 2, label: label ?? null, widget: ghost },
+        }),
+      WidgetWriteError,
+      `label ${JSON.stringify(label)}`,
+    );
+    assert.deepEqual(
+      node.widgets.map((w) => w.value),
+      ["a", "b", "c"],
+      "nothing was written",
+    );
+  }
+});
+
 test("#2143: a REBUILD that replaces the row objects falls back to the label, not a refusal", () => {
   // Identity is inconclusive here — the addressed object is gone entirely, which is what an
   // rgthree Fast Groups rebuild does. Refusing on that would block the ordinary case; the
@@ -507,7 +557,7 @@ test("#2143: a REBUILD that replaces the row objects falls back to the label, no
   const ghost = { name: ROW, label: "Enable VRAM optimizations 2" };
 
   applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
-    occurrence: { index: 1, label: "Enable VRAM optimizations 2", widget: ghost },
+    occurrence: { index: 1, of: 2, label: "Enable VRAM optimizations 2", widget: ghost },
   });
   assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]], "the rebuilt row was written");
 });
