@@ -171,8 +171,7 @@ function hasValueSetter(widget) {
 }
 
 /**
- * The widget a `(name, occurrenceIndex, occurrenceLabel)` address names on the LIVE node,
- * never throwing.
+ * The widget a `(name, occurrence)` address names on the LIVE node, never throwing.
  *
  * #2143 — the address matters here for the same reason it matters at the write: on a node
  * with several widgets sharing one name, `find(w => w.name === n)` answers about the FIRST
@@ -206,11 +205,11 @@ function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrence = null) {
 /**
  * #2025 — never-throwing live read of one named widget. Used by the timeout
  * readback so a missing node or a hostile getter cannot replace the ack.
- * #2143 — `occurrenceIndex` is the widget's POSITION on the node (the number
- * `duplicate_widgets` publishes), and `occurrenceLabel` is the label that row carried when
- * the address was resolved. A row that moved reads as NOT FOUND, which downgrades the ack
- * to the honest outcome-unknown rather than verifying against a row nobody addressed.
- * Without either, the behaviour is the first-match read it has always been.
+ * #2143 — `occurrence` is the pin the address resolved to: `{index, of, label, widget}`,
+ * where `index` is the widget's POSITION on the node (the number `duplicate_widgets`
+ * publishes). A row that moved reads as NOT FOUND, which downgrades the ack to the honest
+ * outcome-unknown rather than verifying against a row nobody addressed. Without it, the
+ * behaviour is the first-match read it has always been.
  */
 export function readLiveWidgetValue(node, widgetName, occurrence = null) {
   try {

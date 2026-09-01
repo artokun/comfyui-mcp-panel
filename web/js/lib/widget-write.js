@@ -414,22 +414,24 @@ export function isCompositeObjectWidget(widget) {
  * widgets. Exact spelling always wins; a case-insensitive fallback remains for
  * older callers, but only when it names exactly one widget (#524).
  *
- * `occurrenceIndex` (#2143) is set ONLY when the caller EXPLICITLY addressed one of
- * several widgets sharing `widgetName` — "NAME[1]", or a display label that names
- * exactly one row. It is a POSITION IN `node.widgets`, the same number
- * `duplicate_widgets` publishes, not an ordinal counted over same-named rows. When it is
- * set, three things change and nothing else does:
+ * `occurrence` (#2143) is set ONLY when the caller EXPLICITLY addressed one of several
+ * widgets sharing `widgetName` — "NAME[1]", or a display label that names exactly one row.
+ * Its `index` is a POSITION IN `node.widgets`, the same number `duplicate_widgets`
+ * publishes, not an ordinal counted over same-named rows. When it is set, three things
+ * change and nothing else does:
  *
- *   * the widget AT that position is returned, and only if it still carries the
- *     requested name;
- *   * a position that no longer holds that name returns null rather than the first
- *     match — the caller's dotted/base retry gets its turn and, failing that, the
- *     refusal below fires. Silently writing row 0 for an address that named row 1 is
- *     the defect, not an acceptable fallback;
+ *   * the widget AT that position is returned, and only if it still carries the requested
+ *     name AND is still the row that was addressed — `widgetAtOccurrence` weighs the
+ *     pinned identity, then the row count, then the label, and it is SHARED with the ack
+ *     readback so the write and the readback cannot name different widgets;
+ *   * anything it will not vouch for returns null rather than the first match — the
+ *     caller's dotted/base retry gets its turn and, failing that, the refusal below fires.
+ *     Silently writing row 0 for an address that named row 1 is the defect, not an
+ *     acceptable fallback;
  *   * the case-insensitive fallback is SKIPPED, because a position pinned against an
  *     exact name means nothing against a differently-cased one.
  *
- * With no `occurrenceIndex` — every call that existed before #2143 — this function is
+ * With no `occurrence` — every call that existed before #2143 — this function is
  * byte-identical to what it was.
  */
 function resolveWidgetByName(node, widgetName, occurrence = null) {
