@@ -665,6 +665,56 @@ function fastModeTransactionKind(node, widget) {
   return typeof doModeChange === "function" ? "linked" : null;
 }
 
+/**
+ * #2151 — the linked nodes of a Fast Bypasser / Fast Muter, in the pack's OWN order.
+ *
+ * A faithful transcription of `getConnectedInputNodesAndFilterPassThroughs` (rgthree
+ * `utils.ts` → `getConnectedNodesInfo` + `filterOutPassthroughNodes`), because the row-to-node
+ * mapping is POSITIONAL — `handleLinkedNodesStabilization` pairs `this.widgets[index]` with
+ * `linkedNodes[index]` — so an order that merely contains the right nodes is not enough.
+ *
+ * The pack's walk, reproduced exactly: input slots in order; push each link's origin; if that
+ * origin is a pass-through (Reroute / Node Combiner / Node Collector) recurse into it and append
+ * what it reaches, depth-first; dedupe by node identity GLOBALLY across slots; then drop the
+ * pass-throughs from the result. A Node Collector therefore contributes several entries for one
+ * slot, which is why this cannot be simplified to one node per slot.
+ */
+function linkedNodesInOrder(node, owner) {
+  const ordered = [];
+  const seen = new Set();
+  const walk = (current) => {
+    let slots;
+    try {
+      slots = current?.inputs;
+    } catch {
+      throw modeTransactionFailure(owner, `node ${current?.id ?? "?"}'s inputs are unreadable`);
+    }
+    if (!Array.isArray(slots)) return;
+    let graph;
+    try {
+      graph = current?.graph ?? owner?.graph;
+    } catch {
+      throw modeTransactionFailure(owner, "a linked mode path is unreadable");
+    }
+    for (const slot of slots) {
+      let origin;
+      try {
+        const linkId = slot?.link;
+        if (typeof linkId !== "number") continue;
+        origin = graph?.getNodeById?.(graph?.links?.[linkId]?.origin_id);
+      } catch {
+        throw modeTransactionFailure(owner, "a linked mode path is unreadable");
+      }
+      if (!origin || seen.has(origin)) continue;
+      seen.add(origin);
+      if (isModePassThrough(origin)) walk(origin);
+      else ordered.push(origin);
+    }
+  };
+  walk(node);
+  return ordered;
+}
+
 function relayDispatchesMode(node, owner) {
   try {
     const inputs = node.inputs;
@@ -699,6 +749,8 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
   if (!kind) return null;
 
   const groups = [];
+  // #2151 — the row-to-linked-node pairing for the "linked" kind, in the pack's own order.
+  let linkedTargets = null;
   if (kind === "groups") {
     const rows = [
       writtenWidget,
@@ -872,12 +924,47 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
       throw modeTransactionFailure(node, "the node's inputs are unreadable");
     }
     if (!Array.isArray(inputs)) throw modeTransactionFailure(node, "the node has no readable input list");
-    connectedRoots(node, "input", null, false);
+    linkedTargets = linkedNodesInOrder(node, node);
+    for (const linkedNode of linkedTargets) addNodeTree(linkedNode);
     // A row exists only because the pack found a linked node for it. If we cannot see that node,
     // the rollback boundary is not established and the action must not run — the whole point of
     // the journal is that `doModeChange` mutates modes this writer would otherwise not restore.
     if (!entries.length) {
       throw modeTransactionFailure(node, "no linked node was reachable from the row's inputs");
+    }
+
+    // #2151 (codex gate P1) — the CURRENT wiring is not the whole boundary. The pack rebuilds a
+    // row's `doModeChange` closure ONLY when the row's NAME changes:
+    //
+    //     let name = `Enable ${linkedNode.title}`;
+    //     if (widget.name !== name) { ...install a closure over THIS linkedNode... }
+    //
+    // so rewiring a slot from node A to a DIFFERENT node B with the SAME TITLE leaves the
+    // closure pointing at A — and default titles are the node's display name, so two
+    // identically-titled nodes are ordinary, not exotic. The action would then mutate A while
+    // this journal held only B, and a failed write would report a clean rollback over a node it
+    // had left switched. A stale closure's target is not discoverable from the row (the closure
+    // is opaque), so the only sound superset is every node the graph can offer.
+    //
+    // LENIENT, deliberately, unlike the strict capture of the intended targets above: this sweep
+    // spans nodes the write has nothing to do with, and one hostile third-party `mode` getter
+    // anywhere in a 300-node workflow must not refuse every Fast Bypasser write. A node it has
+    // to skip simply is not in the journal — exactly today's coverage for it — while the nodes
+    // the row is SUPPOSED to drive stay strictly captured, and `unrestored()` still reports
+    // honestly on everything that IS journalled.
+    let graphNodes;
+    try {
+      graphNodes = node?.graph?.nodes;
+    } catch {
+      graphNodes = null;
+    }
+    for (const candidate of Array.isArray(graphNodes) ? graphNodes : []) {
+      if (candidate === node) continue;
+      try {
+        addNodeTree(candidate);
+      } catch {
+        /* best-effort superset; the strict capture above owns the intended targets */
+      }
     }
   }
 
@@ -922,6 +1009,63 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
   };
 
   return {
+    /**
+     * #2151 (codex gate P1) — did the action land on the node this ROW NAMES?
+     *
+     * A wider journal makes a stale-closure write rollback-able; it does not stop it being
+     * reported as a SUCCESS. `doModeChange` sets `widget.value` unconditionally at the end, so
+     * the ordinary read-back passes even when the mode it changed belonged to a node the row no
+     * longer represents — which is the same false-success shape this whole issue is about, just
+     * one level down. So check the EFFECT, on the node the row's position maps to.
+     *
+     * Returns a reason string when the write must fail, or null when it is settled — including
+     * when the pairing is not knowable, where "not knowable" is itself a refusal: mid-rebuild
+     * the row's title, its closure and the wiring can all disagree, and a write nobody can
+     * attribute to a node must not be reported as one that set it.
+     */
+    targetSettled(requested) {
+      if (kind !== "linked") return null;
+      let rowIndex;
+      let widgetCount;
+      try {
+        widgetCount = Array.isArray(node?.widgets) ? node.widgets.length : -1;
+        rowIndex = Array.isArray(node?.widgets) ? node.widgets.indexOf(writtenWidget) : -1;
+      } catch {
+        return "the node's widget rows are unreadable, so the row cannot be paired with a node";
+      }
+      // The pack keeps `widgets.length === linkedNodes.length` (it truncates the list at the end
+      // of every stabilization), so a mismatch means the node is mid-rebuild or is carrying rows
+      // this pairing does not describe.
+      if (rowIndex < 0 || widgetCount !== linkedTargets.length) {
+        return (
+          `the node carries ${widgetCount} row(s) for ${linkedTargets.length} linked node(s), so ` +
+          `which node this row drives cannot be established`
+        );
+      }
+      const target = linkedTargets[rowIndex];
+      if (!target) return "this row has no linked node to drive";
+      let modeOn;
+      let modeOff;
+      let actual;
+      try {
+        modeOn = node.modeOn;
+        modeOff = node.modeOff;
+        actual = target.mode;
+      } catch {
+        return "the node's on/off modes or the linked node's mode are unreadable";
+      }
+      if (typeof modeOn !== "number" || typeof modeOff !== "number") {
+        return "the node does not declare numeric on/off modes";
+      }
+      const wanted = requested ? modeOn : modeOff;
+      if (Object.is(actual, wanted)) return null;
+      return (
+        `the row's action did not set node ${target.id} ("${target.title}") — it is mode ` +
+        `${actual}, not the ${requested ? "enabled" : "disabled"} mode ${wanted}. rgthree rebuilds ` +
+        `a row's mode closure only when the row's NAME changes, so rewiring a slot to a ` +
+        `different node with the SAME TITLE leaves the row driving the node it used to name`
+      );
+    },
     changed() {
       let unreadable = false;
       for (const entry of entries) {
@@ -3816,6 +3960,22 @@ export function applyWidgetWrite(
             `verified.`
           : `Fast Bypasser row action did not change any linked node modes; refusing to report ` +
             `the toggle as applied.`;
+    }
+  }
+
+  // #2151 — and for a Fast Bypasser / Fast Muter row, the action is not a successful write
+  // unless it landed on the node the ROW NAMES. `doModeChange` assigns `widget.value` whatever
+  // node it just switched, so the retention check above cannot see a row driving a stale target.
+  // Runs after that check so a row the node itself refused to switch (toggleRestriction) keeps
+  // its clearer "did not retain the requested value" message.
+  if (!failure && fastBypasserAction && fastBypasserModes?.targetSettled) {
+    const unsettled = fastBypasserModes.targetSettled(fastBypasserAction.requested);
+    if (unsettled) {
+      failure =
+        `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) was written, but ` +
+        `${unsettled}. Rolled back rather than report a mode change on a node you did not address ` +
+        `(#2151). Re-title or re-open the workflow so the node rebuilds its rows, or set the ` +
+        `target node's mode directly.`;
     }
   }
 

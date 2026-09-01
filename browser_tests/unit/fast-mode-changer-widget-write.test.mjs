@@ -263,6 +263,39 @@ test("#2151: a row whose linked node cannot be found is refused, not written bli
   assert.equal(fixture.linked[0].mode, 0);
 });
 
+test("#2151: a row left driving a same-title node it no longer names is refused and rolled back", () => {
+  // The codex gate's P1, and it is the pack's own lifecycle: `setWidget` installs the
+  // `doModeChange` closure ONLY inside `if (widget.name !== name)`, and the name is
+  // `Enable ${linkedNode.title}`. Rewire slot 0 from A to a DIFFERENT node B with the SAME
+  // title and the row still drives A — while its label, and the wiring this writer reads, both
+  // say B. Default titles are the node's display name, so two identically-titled nodes are
+  // ordinary. Without the effect check the write would report success having switched A.
+  const fixture = makeModeChanger({ linkedModes: [0] });
+  const stale = fixture.linked[0]; // A — what the closure captured
+  const fresh = { id: 900, type: "LC_Effect", title: stale.title, mode: 0, graph: fixture.graph };
+  fixture.nodes.set(fresh.id, fresh);
+  // The rewire: the slot now resolves to B. The row's closure is NOT rebuilt, because the pack
+  // compares titles and they are identical.
+  fixture.graph.links[101] = { origin_id: fresh.id, target_id: fixture.node.id };
+  fixture.node.graph.nodes = [fixture.node, stale, fresh];
+
+  assert.throws(
+    () => applyWidgetWrite(fixture.node, `Enable ${stale.title}`, false, {}),
+    (error) =>
+      error instanceof WidgetWriteError &&
+      /did not set node 900/.test(error.message) &&
+      /SAME TITLE/.test(error.message),
+  );
+  assert.equal(fresh.mode, 0, "the node the row names was never switched");
+  assert.equal(
+    stale.mode,
+    0,
+    "and the node the stale closure DID switch is rolled back — it is in the journal only " +
+      "because the sweep covers the whole graph, not just the current wiring",
+  );
+  assert.equal(fixture.widgets[0].value, true, "the row value is restored too");
+});
+
 test("#2151: a non-row widget on the same node type keeps the ordinary write path", () => {
   const fixture = makeModeChanger({ linkedModes: [0] });
   const plain = { name: "some_other_widget", type: "text", value: "before" };
