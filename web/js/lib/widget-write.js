@@ -3269,7 +3269,13 @@ export function applyWidgetWrite(
   // numeric rail that normalized its value is not `widgetMatchesExpected`, so the repair
   // is skipped and the definition-moved verdict stands), and a message that described an
   // attempt that never happened would be a claim about a check nothing performed.
-  let definitionRepairAttempted = false;
+  // WHICH check blocked the repair — "rail" | "inner" | "display", or null when it was
+  // never attempted. The refusal below names it. A single "the repair was attempted" flag
+  // let one message speak for three different situations: a separable rail whose #477
+  // display proxy simply follows the definition is NOT a rail that is one store with it,
+  // and telling that caller to unpack the subgraph sends them to rebuild a graph over a
+  // projection that would have re-rendered.
+  let definitionRepairBlockedBy = null;
   // STRICTLY retained, deliberately — not `widgetMatchesExpected`.
   //
   // That helper also accepts a live custom-text widget whose DOM EDITOR holds the value
@@ -3290,7 +3296,6 @@ export function applyWidgetWrite(
     }
   };
   if (definitionMoved && strictlyRetained(valueWidget)) {
-    definitionRepairAttempted = true;
     // What the WRITE left on the inner widget, so a repair that does not verify can be
     // put back. Without this the failure path reports the REPAIR instead of the write: on
     // a rail that is one store with the definition, restoring the inner widget drags the
@@ -3312,14 +3317,18 @@ export function applyWidgetWrite(
     } catch {
       /* the read-back on the next line is authoritative */
     }
-    if (
-      structurallyEqual(w.value, previousClone) &&
-      strictlyRetained(valueWidget) &&
-      displayWidgets.every((dw) => strictlyRetained(dw))
-    ) {
+    const innerRestored = structurallyEqual(w.value, previousClone);
+    const railKeptValue = strictlyRetained(valueWidget);
+    const displaysKeptValue = displayWidgets.every((dw) => strictlyRetained(dw));
+    if (innerRestored && railKeptValue && displaysKeptValue) {
       definitionMoved = false;
       definitionRepaired = true;
     } else {
+      // Ordered by how fundamental the obstacle is: a rail dragged back with the
+      // definition is the two being one store; an inner widget that will not take its own
+      // value back is the definition being unrestorable; a stale display proxy is neither
+      // — the value stores separated fine and a parent-facing VIEW did not.
+      definitionRepairBlockedBy = !railKeptValue ? "rail" : !innerRestored ? "inner" : "display";
       try {
         restoreWidgetValue(w, innerAfterWrite);
       } catch {
@@ -3397,12 +3406,10 @@ export function applyWidgetWrite(
       // reaching this branch after the repair ran means the two could not be separated:
       // restoring the inner widget dragged the rail back with it, and the rail and the
       // shared definition really are one store. Said ONLY when the repair was ATTEMPTED.
-      (definitionRepairAttempted
-        ? ` Restoring the inner widget on its own did not separate the two, so this rail and ` +
-          `the shared definition are one store here (comfyui-mcp#2689). Edit this widget ` +
-          `inside the subgraph definition if every instance should take the value, or unpack ` +
-          `the subgraph to give this instance its own copy.`
-        : "");
+      definitionRepairBlockedNote(definitionRepairBlockedBy, {
+        widgetName: w.name,
+        subgraphNodeId: node.id,
+      });
   } else if (boundProperty?.reachable && !matchesExpected(boundPropertyActual)) {
     // #1268 / comfyui-mcp#1658 — the widget kept the value and the node's own bound
     // property did NOT. This is the read the old verification never took: `w.value` came
@@ -4221,6 +4228,49 @@ export function applyWidgetWrite(
         }
       : {}),
   };
+}
+
+/**
+ * comfyui-mcp#2689 — say WHY the repair could not be accepted, when one was attempted.
+ *
+ * The repair undoes the rail's collateral assignment to the shared definition and accepts the
+ * write only if the definition came back AND every parent-facing projection kept the requested
+ * value. Three different things can block that, and they have three different remedies — so
+ * the refusal names the one that actually happened rather than asserting the most dramatic:
+ *
+ *   "rail"     restoring the inner widget dragged the rail back, so the two are one store.
+ *   "inner"    the shared definition would not take its own value back at all.
+ *   "display"  the stores separated fine; a parent-facing VIEW of the definition did not.
+ *
+ * Returns "" when no repair was attempted, so a refusal that never ran the check cannot be
+ * read as reporting its outcome.
+ */
+export function definitionRepairBlockedNote(blockedBy, { widgetName, subgraphNodeId } = {}) {
+  if (blockedBy === "rail") {
+    return (
+      ` Restoring the inner widget on its own did not separate the two — the rail came back ` +
+      `with it — so this rail and the shared definition are one store here ` +
+      `(comfyui-mcp#2689). Edit this widget inside the subgraph definition if every instance ` +
+      `should take the value, or unpack the subgraph to give this instance its own copy.`
+    );
+  }
+  if (blockedBy === "inner") {
+    return (
+      ` The rail kept the requested value, but the shared definition's inner widget would not ` +
+      `take its own value back, so the write could not be separated from it ` +
+      `(comfyui-mcp#2689).`
+    );
+  }
+  if (blockedBy === "display") {
+    return (
+      ` The two value stores DID separate — the rail kept the requested value and the shared ` +
+      `definition came back — but subgraph node ${subgraphNodeId}'s parent-facing display ` +
+      `widget for "${widgetName}" reads the definition, so undoing the write there would ` +
+      `leave the wrapper rendering the OLD value (comfyui-mcp#2689). This is a stale ` +
+      `PROJECTION, not a shared store: reopening the workflow rebuilds it.`
+    );
+  }
+  return "";
 }
 
 /**

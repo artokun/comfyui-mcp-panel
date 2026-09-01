@@ -371,6 +371,7 @@ test("comfyui-mcp#2689: a rail that is genuinely ONE store with the definition i
   // …and it says WHICH shape this is, so the caller is not told to retry something that
   // will fail identically forever.
   assert.match(err.message, /are one store here/);
+  assert.match(err.message, /the rail came back with it/);
   assert.match(err.message, /comfyui-mcp#2689/);
 
   // The requested value survives nowhere, and the SHARED definition is whole.
@@ -577,6 +578,8 @@ test("comfyui-mcp#2689: an inner widget that will not take the restore is NOT a 
   assert.match(err.message, /ALSO changed the shared subgraph definition/);
   // …and the state it actually left is reported, not a rollback it did not achieve.
   assert.equal(sg.definition(), 1024, "the definition is genuinely still moved");
+  assert.match(err.message, /would not take its own value back/, "and the refusal names THAT, not a shared store");
+  assert.doesNotMatch(err.message, /are one store here/);
   assert.match(err.message, /did not take effect/, "so the partial state is disclosed, not hidden");
 });
 
@@ -601,6 +604,13 @@ test("comfyui-mcp#2689: a repair that leaves a #477 display proxy stale is rejec
   }
   assert.ok(err instanceof WidgetWriteError, "a repair that cannot keep every projection in sync is refused");
   assert.match(err.message, /ALSO changed the shared subgraph definition/);
+  // And it says WHY. The two value stores DID separate here — the rail kept the value and
+  // the definition came back — so telling this caller the rail and the definition are one
+  // store, and to unpack the subgraph, would send them to rebuild a graph over a stale
+  // parent-facing PROJECTION that a reopen rebuilds.
+  assert.match(err.message, /parent-facing display widget/);
+  assert.match(err.message, /stale PROJECTION, not a shared store/);
+  assert.doesNotMatch(err.message, /are one store here/);
   assert.equal(sg.definition(), 512, "and the shared definition is restored");
   assert.equal(target.displayProxy.value, 512, "the outer node is not left rendering the requested value");
 });
