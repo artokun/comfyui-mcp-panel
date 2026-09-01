@@ -544,6 +544,10 @@ import {
   openWorkflowNotFoundMessage,
 } from "./lib/open-workflow-not-found.js";
 import { classifyDiskProbe } from "./lib/workflow-disk-probe.js";
+import {
+  classifyOpenSwitchFailure,
+  openSwitchFailureMessage,
+} from "./lib/open-switch-failure.js";
 /** #1448 — wall-clock bound on the refusal-path /userdata probe. Generous: it only
  *  ever runs when the open is already failing, and a slow answer still beats none. */
 const WORKFLOW_DISK_PROBE_MS = 4000;
@@ -22145,13 +22149,22 @@ const GRAPH_TOOL_EXECUTORS = {
     // did NOT apply" fact, and a caller whose reply was lost mid-command needs that
     // negative just as much as the positive: without it the only remaining evidence is
     // the post-reconnect `active` pointer, which proves nothing (#433).
-    const failOpen = (err) => {
+    // #2158 — `applied` and `resolved` are PARAMETERS, not constants.
+    //
+    // Every caller below this line that leaves them at their defaults is a throw from
+    // BEFORE the native switch — no workflow resolved, nothing touched — where `false`
+    // is a measured fact about a mutation that provably never started.
+    //
+    // The native-switch catch is NOT one of those, and hardcoding them here is what let
+    // it journal "nothing was applied" about a store that had already been mutated. It
+    // passes what it measured instead; see the throw site at the end of this executor.
+    const failOpen = (err, { applied = false, resolved = null } = {}) => {
       noteOpenAttempt({
         cmd: "workflow_open",
         rid,
         requested: path,
-        resolved: null,
-        applied: false,
+        resolved,
+        applied,
         error: coerceMessageText(err?.message ?? err),
       });
       return err;
@@ -22462,6 +22475,28 @@ const GRAPH_TOOL_EXECUTORS = {
     // reads it fresh from disk. openWorkflow does NOT mutate originalContent for an
     // already-open tab (its load() early-returns), so the baseline stays valid.
     const wasOpen = !!target.changeTracker;
+    // #2158 — is the target listed among the OPEN TABS? Deliberately a different question
+    // from `wasOpen`, which asks whether its CONTENT is loaded.
+    //
+    // The store pushes the path into `openWorkflowPaths` BEFORE it reads the file, and
+    // `openWorkflows` is a computed over that array — so a switch whose read then fails
+    // leaves the target listed as an open tab with nothing behind it. That residue is the
+    // fact the failure path used to deny ("nothing was applied"), and denying it needs a
+    // BEFORE reading: the target may perfectly well have been listed already.
+    //
+    // `null` means the store did not expose a readable list — never "no".
+    const targetIsListedOpen = () => {
+      try {
+        const list = s?.openWorkflows;
+        if (!Array.isArray(list)) return null;
+        return list.some(
+          (w) => w && (sameWorkflowObject(w, target) === true || (w.path && w.path === target.path)),
+        );
+      } catch {
+        return null;
+      }
+    };
+    const targetWasListedOpen = targetIsListedOpen();
     // #442 / codex — SNAPSHOT the tab's unsaved-edit state BEFORE the mutating
     // awaits (`openWorkflow`, the freeze, the re-baseline). The #1641 handshake
     // wait above is not one of those: it does not touch `isModified`. The flag
@@ -22517,6 +22552,10 @@ const GRAPH_TOOL_EXECUTORS = {
     let reloaded = false;
     let reloadError = null;
     let openFailed = null;
+    // #2158 — what the panel MEASURED about the store after the native switch threw.
+    // Null while no switch failure has happened; the throw site at the end of this
+    // executor turns it into the receipt's `applied` verdict.
+    let openSwitchObservations = null;
     let rebindFailed = null;
     // #1001 — the per-node geometry the frontend rewrote while reproducing this load
     // faithfully. Non-null means the content proof passed WITHOUT being byte-identical,
@@ -22610,11 +22649,68 @@ const GRAPH_TOOL_EXECUTORS = {
               sameWorkflowObject(nativeOpenHistory[0], target) === true);
         activePointerEpochAtOpen = activePointerEpoch;
       } catch (err) {
-        // The native switch itself failed — nothing was applied. Recorded, then rethrown
-        // through failOpen below (outside the freeze) so the negative is journaled.
-        openFailed = err instanceof Error ? err : new Error(coerceMessageText(err));
-        // #968 r2 — the claim was staked before the switch; the switch did not happen, so
-        // release it rather than let a later move inherit this command's name.
+        // #2158 — the native switch threw. MEASURE what it left behind; do not assert it.
+        //
+        // This used to read "nothing was applied", and journal `applied: false` to match.
+        // Both halves were wrong. The store mutates its open-tab list BEFORE the read that
+        // throws, and the throw can also come from AFTER the active pointer moved (the
+        // `bg_tint` write on a null canvas is the reachable one) — in which case "confirmed
+        // not applied" is asserted about a canvas that HAS become the target's.
+        //
+        // Read the pointer here, while the failure is fresh, and let the classifier decide
+        // the verdict from what was actually seen. Every read is guarded: an observation
+        // that throws is `null` ("not observable"), never `false`.
+        const thrown = err instanceof Error ? err : new Error(coerceMessageText(err));
+        // RECORD THE FAILURE FIRST, then enrich it. Everything below is diagnosis, and
+        // diagnosis must never be able to lose the diagnosis's subject: a throw raised
+        // inside a catch block lands in this executor's OUTER handler, which reads it as
+        // a disk-read warning, leaves `openFailed` null, and lets the open walk on down
+        // its SUCCESS path — reporting a workflow switch that threw as one that worked.
+        openFailed = thrown;
+        try {
+          let activeNow = null;
+          let activeReadable = true;
+          try {
+            activeNow = activeWorkflowRef();
+          } catch {
+            activeReadable = false;
+          }
+          const provenSame = (a, b) => {
+            try {
+              return sameWorkflowObject(a, b) === true;
+            } catch {
+              return null;
+            }
+          };
+          const listedNow = targetIsListedOpen();
+          openSwitchObservations = {
+            // `sameWorkflowObject` proves sameness and never proves difference, so only a
+            // `true` is acted on downstream — a `false` here is "not proven", which the
+            // classifier treats as unknown rather than as a negative.
+            activeIsTarget: activeReadable ? provenSame(activeNow, target) : null,
+            activeIsSource: activeReadable ? provenSame(activeNow, activeBefore) : null,
+            // A residue only if it was NOT already listed before the switch.
+            tabAppeared: targetWasListedOpen === false ? listedNow : false,
+            contentLoaded: wasOpen === false ? !!target.changeTracker : false,
+          };
+          openFailed = new Error(
+            openSwitchFailureMessage({
+              path,
+              err: thrown,
+              ...openSwitchObservations,
+              sourceLabel: workflowTabId(activeBefore) || activeBefore?.path || null,
+            }),
+            { cause: thrown },
+          );
+        } catch (diagnosisFailed) {
+          // Keep the raw failure and say the diagnosis is missing, rather than silently
+          // presenting an unclassified error as though it had been examined.
+          console.warn("[comfyui-mcp-panel] workflow_open switch-failure diagnosis failed:", diagnosisFailed);
+        }
+        // #968 r2 — the claim was staked before the switch; release it rather than let a
+        // later move inherit this command's name. Unconditional, exactly as before: the
+        // claim is about who OWNS the next observed move, and this command is no longer a
+        // candidate whether or not the pointer turned out to have moved.
         claimActiveWorkflowMove(null, null);
       } finally {
         endWorkflowReloadStep(reloadGuardToken);
@@ -23847,7 +23943,40 @@ const GRAPH_TOOL_EXECUTORS = {
     // inside the freeze, before re-baseline, so they cannot fail the open and
     // cannot dirty a tab that was just marked clean. Skip here if that ran, or
     // if the disk re-read already applied the on-disk graph.
-    if (openFailed) throw failOpen(openFailed);
+    if (openFailed) {
+      // #2158 — journal the MEASURED verdict, not a hardcoded `false`.
+      //
+      // `applied` is the #402 field the orchestrator turns into advice: `false` becomes
+      // "confirmed not applied … It is safe to retry", `"unknown"` becomes "inspect the
+      // current workflow before deciding whether to retry". The reported transport
+      // failure keeps `false` — the pointer is measurably still on the source and the
+      // call that threw is a GET, so retrying really is safe — while a switch that moved
+      // the pointer before throwing, or one the panel could not observe, now degrades to
+      // `"unknown"` instead of claiming a negative it never checked.
+      //
+      // `resolved` is passed for the same reason: a receipt that reports a verdict while
+      // withholding WHICH workflow it is about cannot be acted on. The orchestrator's
+      // correlator requires the resolved path to match the request before it will read
+      // `applied` at all, so a null here made the measurement unreachable.
+      let applied = "unknown";
+      try {
+        applied = classifyOpenSwitchFailure({
+          err: openFailed?.cause ?? openFailed,
+          ...(openSwitchObservations ?? {}),
+        }).applied;
+      } catch {
+        // Fail to the honest side. "unknown" costs the caller an extra look at the
+        // active workflow; a fabricated `false` costs them a wrong-graph edit.
+      }
+      throw failOpen(openFailed, {
+        applied,
+        resolved: {
+          path: target.path,
+          filename: target.filename,
+          routing_key: workflowTabId(target),
+        },
+      });
+    }
     if (rebindFailed) {
       // #1089 follow-up — the foreign-source finding rides the FAILURE too.
       //

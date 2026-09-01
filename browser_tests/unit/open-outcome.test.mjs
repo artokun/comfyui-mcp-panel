@@ -461,8 +461,24 @@ test("#402 wiring: workflow_open BOUNDS the post-open disk read and never claims
 test("#402/#721 wiring: workflow_open journals clean negatives and partial rebind outcomes", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = handlerBody(src, "async workflow_open({");
-  assert.match(body, /const failOpen = \(err\) => \{/, "there must be a single negative-journal helper");
-  assert.match(body, /applied: false/, "the failure path must journal applied:false");
+  // Still ONE negative-journal helper. #2158 gave it an options bag so the native-switch
+  // catch can journal what it MEASURED, but the default is pinned to the clean negative:
+  // every pre-switch caller keeps journaling `applied:false` without saying so.
+  assert.match(
+    body,
+    /const failOpen = \(err, \{ applied = false, resolved = null \} = \{\}\) => \{/,
+    "there must be a single negative-journal helper, defaulting to the clean negative",
+  );
+  // Exactly ONE `failOpen` call may override the default, and it is the native-switch
+  // throw. Every other one is a genuine "nothing started" and must keep the clean
+  // negative — an override creeping onto those would silently turn real negatives into
+  // "undetermined" and cost the caller the "safe to retry" answer.
+  const code = stripComments(body);
+  const calls = [...code.matchAll(/throw failOpen\(([\s\S]{0,400}?)\);/g)].map((m) => m[1]);
+  const overriding = calls.filter((c) => /,\s*\{/.test(c));
+  assert.equal(overriding.length, 1, "exactly one failOpen call passes a measured verdict");
+  assert.match(overriding[0], /^openFailed\s*,/, "and it is the native-switch failure");
+  assert.ok(calls.length > overriding.length, "the pre-switch throws still use the bare default");
   assert.match(body, /noteOpenAttempt\(\{[\s\S]*?cmd: "workflow_open",[\s\S]*?applied: true,/, "the success path must journal a receipt");
   // A failed post-switch repaint is not a clean negative: the active workflow may
   // already have changed. It must be journaled UNKNOWN, while every other throw
