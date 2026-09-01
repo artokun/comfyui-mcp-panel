@@ -2621,16 +2621,17 @@ export function applyWidgetWrite(
       out: coerceOutcome,
     }, occurrence);
 
-  // #2143 — WHICH same-named row this write resolved to, captured BEFORE any mutation and
-  // by widget IDENTITY, so a callback that rebuilds the node cannot make the reply describe
-  // a different row than the one that was written. Null unless the name is genuinely carried
-  // by more than one widget, so every ordinary write replies byte-identically to before.
+  // #2143 — WHICH same-named row this write resolved to, by widget IDENTITY. Captured here,
+  // before any mutation, as the FALLBACK for a row the write's own callback then removes;
+  // the reply prefers a fresh identity lookup taken after everything has run, because this
+  // number is an ADDRESS and a pre-write position can be stale by the time it is read. See
+  // the reply.
   //
   // Reported for the DIRECT target only. On a promoted subgraph write the value can land on
   // the parent's rail rather than the inner widget (comfyui-mcp#1707's instance scope), so
-  // one ordinal would have to describe two different widget lists; #366 already refuses a
+  // one index would have to describe two different widget lists; #366 already refuses a
   // promoted write whose name is duplicated, so there is nothing here to disambiguate.
-  const widgetOccurrence = promotedFrom ? null : widgetOccurrenceOf(targetNode, w);
+  const preWriteOccurrence = promotedFrom ? null : widgetOccurrenceOf(targetNode, w);
 
   // The rail object captured before /object_info may be a stale inner Primitive
   // handle. Re-read the live host projections at write time so the store-backed
@@ -3843,6 +3844,28 @@ export function applyWidgetWrite(
   //
   // It NEVER decides this write's verdict: a throwing hook is disclosed on the success
   // result, the same containment the widget callback and #1282's refresh press get.
+  // #2143 — THE REPORTED INDEX IS AN ADDRESS, so it is resolved LAST and by IDENTITY.
+  //
+  // `widget_occurrence.index` is the number a caller sends straight back as "NAME[i]" — that
+  // round trip is the whole point of matching `duplicate_widgets`. A position captured
+  // before the write is not that number: the write fires the widget's own callback, and a
+  // Fast Groups row action changes the groups its rows are derived FROM, so the node can
+  // reorder them. Reporting the pre-write position then names a row this write never
+  // touched, and re-using it writes that other row — the exact silent-wrong-row this issue
+  // exists to remove, reintroduced by the field added to prevent it.
+  //
+  // Unlike `verifiedName`/`verifiedValue` above, a fresh read is CORRECT here and a stale
+  // capture is not: #1519 keeps those pre-hook because a post-hook read would report a value
+  // nothing verified, whereas this is anchored to the written widget by identity, so it can
+  // only ever name that row — wherever the row has moved to.
+  //
+  // A row the callback REMOVED has no current address, so the pre-write capture is reported
+  // with `stale: true` rather than silently dropped: the caller still learns which row was
+  // written, and is told not to reuse the number.
+  const liveOccurrence = promotedFrom ? null : widgetOccurrenceOf(valueNode, valueWidget);
+  const widgetOccurrence =
+    liveOccurrence ?? (preWriteOccurrence ? { ...preWriteOccurrence, stale: true } : null);
+
   const verifiedValue = valueWidget.value;
   const verifiedName = valueWidget.name;
   const previousForHook = instanceScoped ? previousParent : previous;

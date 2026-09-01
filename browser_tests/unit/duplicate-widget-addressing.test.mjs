@@ -438,6 +438,63 @@ test("#2143: a sub-field address reaches the addressed occurrence too", () => {
   assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]]);
 });
 
+test("#2143: the REPORTED index is a live address, not the position the row had before", () => {
+  // `widget_occurrence.index` is the number a caller sends straight back as "NAME[i]" — the
+  // round trip with duplicate_widgets is the whole point of it. The write fires the widget's
+  // own callback, and a Fast Groups row action changes the groups its rows come FROM, so the
+  // node can reorder them. Reporting the pre-write position then names a row this write
+  // never touched, and re-using it writes that row: the silent-wrong-row this issue is
+  // about, reintroduced by the field added to prevent it.
+  const node = { id: 59, type: "T", widgets: [] };
+  const a = { name: "row", type: "string", value: "a", label: "A" };
+  const b = {
+    name: "row",
+    type: "string",
+    value: "b",
+    label: "B",
+    callback() {
+      node.widgets = [node.widgets[1], node.widgets[0]];
+    },
+  };
+  node.widgets = [a, b];
+
+  const res = applyWidgetWrite(node, "row", "new", {
+    occurrence: { index: 1, of: 2, label: "B", widget: b },
+  });
+
+  assert.equal(b.value, "new", "row B is the one that was written");
+  assert.equal(node.widgets.indexOf(b), 0, "and the callback moved it to index 0");
+  assert.deepEqual(res.widget_occurrence, { index: 0, of: 2, label: "B" });
+  // The round trip: feeding the reported index straight back reaches the SAME row.
+  assert.equal(
+    resolveWidgetAddress(node, `row[${res.widget_occurrence.index}]`).occurrence.widget,
+    b,
+  );
+});
+
+test("#2143: a row the callback REMOVED is reported stale rather than as a usable address", () => {
+  const node = { id: 59, type: "T", widgets: [] };
+  const a = { name: "row", type: "string", value: "a", label: "A" };
+  const b = {
+    name: "row",
+    type: "string",
+    value: "b",
+    label: "B",
+    callback() {
+      node.widgets = [node.widgets[0]];
+    },
+  };
+  node.widgets = [a, b];
+
+  const res = applyWidgetWrite(node, "row", "new", {
+    occurrence: { index: 1, of: 2, label: "B", widget: b },
+  });
+
+  // The row has no current address, so the pre-write capture is reported — flagged, so the
+  // caller learns which row was written without being handed a number to reuse.
+  assert.deepEqual(res.widget_occurrence, { index: 1, of: 2, label: "B", stale: true });
+});
+
 test("#2143: an ordinary node with unique widget names replies with no occurrence field", () => {
   const node = { id: 3, type: "KSampler", widgets: [{ name: "steps", type: "number", value: 20 }] };
   const result = applyWidgetWrite(node, "steps", 30);
