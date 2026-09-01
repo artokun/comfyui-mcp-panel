@@ -1303,6 +1303,47 @@ test("#2143: a row REMOVED during the flush is reported stale, not as a live add
   assert.deepEqual(res.set.widget_occurrence, { index: 1, of: 2, stale: true });
 });
 
+test("#2143: a write verified against a REPLACEMENT row says so, rather than claiming a clean hit", async () => {
+  // The case retention cannot adjudicate: the addressed row was replaced during the rebuild
+  // by one that holds the requested value. Whether that is "the rebuild carried my value
+  // across" or "a stranger already had it" is not answerable from the node — and it does not
+  // need to be for the VERDICT, because #1922 asks whether the value is in effect at the
+  // address the caller gave, not what caused it. Refusing here would report failure for the
+  // ordinary value-carrying rebuild, which is the very next test.
+  //
+  // What the caller must not be left believing is that the row they addressed is still the
+  // row this index names. It is not, and the reply says so.
+  const row0 = { name: "row", type: "string", value: "a" };
+  const row1 = {
+    name: "row",
+    type: "string",
+    value: "b",
+    callback() {
+      node.widgets = [row0, { name: "row", type: "string", value: "new" }];
+    },
+  };
+  const node = {
+    id: 1,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [row0, row1],
+  };
+
+  const res = await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: row1 },
+  });
+
+  assert.equal(res.applied, true, "the value IS in effect at the address that was given");
+  assert.equal(node.widgets.includes(row1), false, "…but not on the row that was addressed");
+  assert.equal(
+    res.set.widget_occurrence.stale,
+    true,
+    "so the index is flagged rather than handed back as a live address",
+  );
+});
+
 test("#2143: retention accepts an ordinary rebuild that CARRIES THE VALUE forward", async () => {
   // Why retention keys on name+position once the written object is gone, rather than
   // demanding identity as the write does. A rebuild that replaces the row objects and

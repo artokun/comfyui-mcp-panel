@@ -1374,6 +1374,11 @@ async function runSetWidgetBody(
     // node now draws there — not a question about causation. The retry is not left
     // unguarded: `rewrite()` goes back through applyWidgetWrite, whose pin refuses a row
     // that MOVED, and refuses outright when a rebuild left rows nothing can tell apart.
+    //
+    // And the one thing this cannot establish is not swallowed: when the verdict came from a
+    // row that is NOT the one that was written, `withLiveOccurrence` has already found the
+    // written row detached, so the reply carries `widget_occurrence.stale`. The caller is
+    // told the index no longer names the row they addressed — as data, not prose.
     const occurrence = set?.widget_occurrence;
     for (const host of [...prefer, ...rest]) {
       const live = occurrence
