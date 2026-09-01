@@ -20,9 +20,11 @@ import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "no
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-const REPO = "https://github.com/benjiyaya/Calliope";
-// The commit this module was validated against (Calliope 1.2.1 API). Move it deliberately.
-const PINNED_REF = "b4e2d7d";
+// Our fork. Upstream is benjiyaya/Calliope; the fork carries the fixes this module needs
+// before they land upstream (first: PATCH can clear a nullable scene field) and is where
+// we are free to deviate. Move the pin deliberately; the client snapshot is 1.2.1's API.
+const REPO = process.env.CALLIOPE_REPO || "https://github.com/artokun/Calliope";
+const PINNED_REF = process.env.CALLIOPE_REF || "73b0e79";
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.CALLIOPE_PORT || 8247);
 const BASE_URL = process.env.CALLIOPE_BASE_URL || `http://${HOST}:${PORT}`;
