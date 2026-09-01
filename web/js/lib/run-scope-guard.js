@@ -676,6 +676,113 @@ function ideogramQueueTimeDerivedInput(node) {
   }
 }
 
+/**
+ * comfyui-mcp#2712 — DaSiWa_SeedControl rolls its seed by patching
+ * `app.graphToPrompt` ITSELF, so it is invisible to every signal above and it
+ * defeats retrying by construction.
+ *
+ * MEASURED, not guessed, against the pack's own source
+ * (darksidewalker/ComfyUI-DaSiWa-Nodes@main:js/dasiwa_seed_control.js):
+ *
+ *   app.graphToPrompt = async function (...args) {
+ *     dasiwaSeedControlPrepareAll();          // rolls every random-mode node
+ *     return originalGraphToPrompt(...args);
+ *   };
+ *
+ * and the roll writes exactly two serialized inputs:
+ *
+ *   node.__dasiwaSeedPrepareSeed = () => {
+ *     if (dasiwaSeedControlHasExternalSeed() || controlState?.mode !== "random") return;
+ *     ... widget.value = value;               // seed_value
+ *     ... dasiwaSeedControlEmit();            // seed_control_state {mode,last_seed,recent}
+ *   };
+ *
+ * WHY RETRYING CANNOT WIN, and why this must be an exclusion. `fingerprintOnce`
+ * builds the stamp by calling `app.graphToPrompt()` — the very function the pack
+ * wraps. So OUR OWN STAMP rolls a seed, and the dispatch's serialization rolls a
+ * different one. The two hashes disagree on an idle canvas, deterministically,
+ * forever. That is why the orchestrator's #2120 re-issues (dispatches 1-3) all
+ * lost: a retry budget cannot converge against a roller that fires once per
+ * serialization. Only removing the pair from the compared content can.
+ *
+ * NARROW BY CONSTRUCTION, mirroring the pack's own gates one for one:
+ *  - exact registered class, on `comfyClass` (what the pack keys on) or `type`;
+ *  - BOTH backing widgets present — `dasiwaSeedControlInstall` returns early
+ *    without ever defining the roll when either is missing;
+ *  - a LINKED `seed` input rolls nothing (`dasiwaSeedControlHasExternalSeed`),
+ *    so an externally-driven node keeps full drift coverage;
+ *  - `mode === "fixed"` rolls nothing, exactly like the `value === "fixed"` gate
+ *    the stock control_after_generate carrier already uses.
+ *
+ * `mode` IS READ THE WAY THE PACK READS IT, and that asymmetry is the point:
+ * `dasiwaSeedControlParseState` normalises with
+ * `state.mode = state.mode === "fixed" ? "fixed" : "random"`, so ONLY the literal
+ * string "fixed" suppresses the roll. An absent, empty, or unparseable state
+ * widget is RANDOM and does roll — a freshly-dropped node is the common case.
+ * Testing for `mode === "random"` instead would have left exactly those nodes
+ * refused, which is the bug.
+ *
+ * DELIBERATELY NO MUTE/BYPASS GATE, unlike the rgthree signal.
+ * `dasiwaSeedControlPrepareAll` iterates every node in the graph tree and
+ * `__dasiwaSeedPrepareSeed` checks neither `mode` nor bypass, so a muted node
+ * still rolls. (Its inputs also drop out of both serializations, so the pair is
+ * moot there either way — but keying on bypass would be a false claim about
+ * someone else's code.)
+ *
+ * BOTH NAMES OR NEITHER. The roll rewrites `seed_value` and the `last_seed` /
+ * `recent[]` fields inside `seed_control_state` together, so excluding one alone
+ * would still refuse the run. Conversely a fixed-mode node excludes NEITHER, so a
+ * real mid-window mode flip is still drift — the same judgment the orchestrator's
+ * #2120 classifier makes when it refuses `seed_control_state` on its own.
+ *
+ * Defensive like its neighbours: an unreadable node yields no names, which fails
+ * TOWARD detecting drift.
+ */
+const DASIWA_QUEUE_ROLLING_SEED_TYPES = new Set(["DaSiWa_SeedControl"]);
+const DASIWA_SEED_VALUE_INPUT = "seed_value";
+const DASIWA_SEED_STATE_INPUT = "seed_control_state";
+
+function dasiwaQueueTimeSeedInputs(node) {
+  try {
+    if (
+      !DASIWA_QUEUE_ROLLING_SEED_TYPES.has(node?.comfyClass) &&
+      !DASIWA_QUEUE_ROLLING_SEED_TYPES.has(node?.type)
+    ) {
+      return [];
+    }
+    const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+    const seedWidget = widgets.find((w) => w?.name === DASIWA_SEED_VALUE_INPUT);
+    const stateWidget = widgets.find((w) => w?.name === DASIWA_SEED_STATE_INPUT);
+    // `if (!seedWidget() || !stateWidget()) return;` — the pack installs no roll.
+    if (!seedWidget || !stateWidget) return [];
+    // `node.inputs?.find(i => i.name === "seed")?.link != null` — external seed.
+    const seedInput = (Array.isArray(node?.inputs) ? node.inputs : []).find(
+      (i) => i?.name === "seed",
+    );
+    if (seedInput?.link != null) return [];
+    if (dasiwaSeedControlModeIsFixed(stateWidget.value)) return [];
+    return [DASIWA_SEED_VALUE_INPUT, DASIWA_SEED_STATE_INPUT];
+  } catch {
+    return [];
+  }
+}
+
+/** True ONLY for the literal "fixed", matching dasiwaSeedControlParseState. */
+function dasiwaSeedControlModeIsFixed(raw) {
+  let parsed = null;
+  if (typeof raw === "string") {
+    if (!raw.trim()) return false; // empty state → the pack defaults to random
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return false; // unparseable → the pack defaults to random
+    }
+  } else if (raw && typeof raw === "object") {
+    parsed = raw;
+  }
+  return parsed && typeof parsed === "object" ? parsed.mode === "fixed" : false;
+}
+
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
   const addPair = (execId, name) => {
@@ -795,6 +902,13 @@ export function collectVolatileInputs(rootGraph) {
       // backed input drift-covered.
       const ideogramDerivedInput = ideogramQueueTimeDerivedInput(node);
       if (ideogramDerivedInput != null) addPair(execId, ideogramDerivedInput);
+      // comfyui-mcp#2712 — THE SEVENTH VOLATILITY SIGNAL. DaSiWa_SeedControl
+      // wraps `app.graphToPrompt` and rolls a random-mode seed on EVERY call,
+      // so it rolls once for our stamp and again for the dispatch. Unlike every
+      // race above, no retry budget can converge on it. Exactly two inputs, on a
+      // node that self-identifies and is armed in random mode with no external
+      // seed; a fixed-mode or externally-driven node keeps full drift coverage.
+      for (const name of dasiwaQueueTimeSeedInputs(node)) addPair(execId, name);
       if (node.subgraph) walk(node.subgraph, execId);
     }
     // Leave the path so a SIBLING instance of this same definition is still
