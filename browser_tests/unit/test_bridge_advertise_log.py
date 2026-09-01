@@ -195,6 +195,18 @@ class LogLineFraming(unittest.TestCase):
             ["[comfyui-mcp-panel] secure bridge advertised: wss://tunnel.example/bridge\n"],
         )
 
+    def test_a_console_less_host_is_silent_rather_than_fatal(self):
+        # print() returns silently when sys.stdout is None (pythonw, a detached
+        # service); sys.stdout.write raises AttributeError there. _register_routes
+        # logs at import time, so a raise would abort the pack import and the
+        # sidebar would never load.
+        old = sys.stdout
+        sys.stdout = None
+        try:
+            self.assertIsNone(mod._log("nowhere to write this"))
+        finally:
+            sys.stdout = old
+
     def test_consecutive_lines_do_not_concatenate_timestamps(self):
         # The reported symptom: "…trycloudflare.com/2026-09-01T19:07:18.981112 - "
         # — a second entry's timestamp landing inside the first entry's text

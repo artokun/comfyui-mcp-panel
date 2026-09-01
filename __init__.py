@@ -122,10 +122,19 @@ def _log(msg):
     # line-oriented parsing) plus a bare "<ts> - " with nothing after it.
     # print(..., end="") does NOT fix it — it still writes the empty end string
     # as a second call. sys.stdout.write is the only single-write form.
+    #
+    # The None check keeps print()'s contract: a console-less host (pythonw, a
+    # detached service) leaves sys.stdout None, where print() returns silently
+    # but sys.stdout.write raises AttributeError. _register_routes logs on the
+    # way out at import time, so raising here would abort the pack import and
+    # the sidebar would never load — a far worse bug than the one being fixed.
+    stream = sys.stdout
+    if stream is None:
+        return
     line = "[comfyui-mcp-panel] " + msg
     if not line.endswith("\n"):
         line += "\n"
-    sys.stdout.write(line)
+    stream.write(line)
 
 
 def _launcher_config_path():
