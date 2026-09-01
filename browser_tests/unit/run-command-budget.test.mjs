@@ -684,6 +684,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  */
 function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef, runDispatchIdentityRef, resolveRunToNodeTargetRef }) {
   const seen = { dispatchArgs: null };
+  const localRunToken = Symbol("test local graph run");
   const deps = {
     RUN_COMMAND_BUDGET_MS: budgetMs,
     RUN_SERIALIZE_TIMEOUT_MS: serializeMs,
@@ -697,6 +698,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     captureRunDispatchIdentity,
     compareRunDispatchIdentity,
     downgradeUnstableRunResult,
+    LOCAL_GRAPH_RUN_TOKEN: localRunToken,
     graphMutationReconnectGate,
     reconnectRefusalError,
     comfyBackendIsDown: () => false,
@@ -772,7 +774,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     `const executors = {${runMatch[0]}};
      return executors.graph_run;`,
   );
-  return { graph_run: factory(...names.map((n) => deps[n])), seen };
+  return { graph_run: factory(...names.map((n) => deps[n])), seen, localRunToken };
 }
 
 test("#248 production path: a scoped and full app.queuePrompt throw retains browser source context", async () => {
@@ -2056,6 +2058,70 @@ test("#1565 P1: a HEALTHY full run is untouched — same accept result, no budge
     const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
     const res = await built.graph_run({});
     assert.deepEqual(res, { queued: true, batch_count: 1, prompt_id: "srv-1" });
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: local /run queues without an advertised bridge route", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: null,
+      routeReady: false,
+      routeIdentityProven: false,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late", drainMs: 5 });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const result = await built.graph_run({ [built.localRunToken]: true });
+    assert.deepEqual(result, { queued: true, batch_count: 1, prompt_id: "srv-1" });
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "local /run must still reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: local /run keeps workflow fencing without a bridge route", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: null,
+      routeReady: false,
+      routeIdentityProven: false,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    app.graphToPrompt = async () => {
+      state.workflowUuid = "22222222-2222-4222-8222-222222222222";
+      return { output: OUR_OUTPUT, workflow: {} };
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    await assert.rejects(
+      () => built.graph_run({ [built.localRunToken]: true }),
+      /panel_run was NOT applied.*workflow.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "a local workflow handoff must not reach /prompt");
   } finally {
     stop();
   }

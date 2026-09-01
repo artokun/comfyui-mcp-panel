@@ -80,6 +80,30 @@ test("route readiness is required for a live identity", () => {
   assert.deepEqual(result.changed, ["route readiness"]);
 });
 
+test("a local dispatch may omit the bridge route without weakening other identity fences", () => {
+  const result = compareRunDispatchIdentity(
+    identity({ routeId: null, routeReady: false, routeIdentityProven: false }),
+    identity({ routeId: null, routeReady: false, routeIdentityProven: false }),
+    { requireBridgeRoute: false },
+  );
+  assert.equal(result.stable, true);
+});
+
+test("a local dispatch still rejects a workflow handoff while the bridge is absent", () => {
+  const result = compareRunDispatchIdentity(
+    identity({ routeId: null, routeReady: false, routeIdentityProven: false }),
+    identity({
+      routeId: null,
+      routeReady: false,
+      routeIdentityProven: false,
+      workflowUuid: "22222222-2222-4222-8222-222222222222",
+    }),
+    { requireBridgeRoute: false },
+  );
+  assert.equal(result.stable, false);
+  assert.deepEqual(result.changed, ["workflow"]);
+});
+
 test("equal socket-down identities are never stable", () => {
   const result = compareRunDispatchIdentity(
     identity({ backendSocketState: "down" }),
@@ -147,6 +171,16 @@ test("the production identity provider publishes proof, not a swallowed null UUI
   assert.match(provider, /workflowIdentityAmbiguous/);
   assert.match(provider, /isCanonicalWorkflowInstanceUuid\(candidate\)/);
   assert.doesNotMatch(provider, /workflowUuid = workflowStableUuid\(\);/);
+});
+
+test("the local /run route exemption is a private capability, not bridge input", () => {
+  assert.match(PANEL_SRC, /const LOCAL_GRAPH_RUN_TOKEN = Symbol\("local graph run"\);/);
+  assert.match(PANEL_SRC, /const localRun = arguments\[0\]\?\.\[LOCAL_GRAPH_RUN_TOKEN\] === true;/);
+  assert.match(
+    PANEL_SRC,
+    /const localArgs = cmd === "graph_run" \? \{ \.\.\.args, \[LOCAL_GRAPH_RUN_TOKEN\]: true \} : args;/,
+  );
+  assert.match(PANEL_SRC, /requireBridgeRoute: !localRun/);
 });
 
 test("an unstable scoped receipt keeps queued_prompt_ids while removing queued:true", () => {

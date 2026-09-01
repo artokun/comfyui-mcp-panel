@@ -68,10 +68,14 @@ export function captureRunDispatchIdentity({
 /**
  * Compare two observations. Null is an identity value, not a wildcard: an
  * identity that becomes unreadable or appears late cannot authorize a run.
+ * `requireBridgeRoute:false` is reserved for the direct local `/run` path;
+ * all workflow, target, reconnect, and transport fences still apply there.
+ * Bridge-originated dispatches keep the default route requirement.
  */
-export function compareRunDispatchIdentity(before, after) {
+export function compareRunDispatchIdentity(before, after, options = {}) {
   const left = captureRunDispatchIdentity(before);
   const right = captureRunDispatchIdentity(after);
+  const requireBridgeRoute = options?.requireBridgeRoute !== false;
   const changed = [];
   if (left.reconnectEpoch !== right.reconnectEpoch) changed.push("reconnect");
   if (left.backendSocketState === "down" || right.backendSocketState === "down") {
@@ -79,8 +83,10 @@ export function compareRunDispatchIdentity(before, after) {
   } else if (left.backendSocketState !== "available" || right.backendSocketState !== "available") {
     changed.push("backend socket unavailable");
   }
-  if (left.routeId !== right.routeId) changed.push("bridge route");
-  else if (!left.routeIdentityProven || !right.routeIdentityProven) changed.push("bridge route unavailable");
+  if (requireBridgeRoute) {
+    if (left.routeId !== right.routeId) changed.push("bridge route");
+    else if (!left.routeIdentityProven || !right.routeIdentityProven) changed.push("bridge route unavailable");
+  }
   if (left.workflowUuid !== right.workflowUuid) changed.push("workflow");
   if (left.workflowIdentityAmbiguous || right.workflowIdentityAmbiguous) {
     changed.push("workflow identity ambiguous");
@@ -88,7 +94,7 @@ export function compareRunDispatchIdentity(before, after) {
     changed.push("workflow identity unavailable");
   }
   if (left.targetId !== right.targetId) changed.push("run target");
-  if (!left.routeReady || !right.routeReady) changed.push("route readiness");
+  if (requireBridgeRoute && (!left.routeReady || !right.routeReady)) changed.push("route readiness");
   return { stable: changed.length === 0, changed, before: left, after: right };
 }
 

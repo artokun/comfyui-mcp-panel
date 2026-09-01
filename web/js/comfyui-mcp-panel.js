@@ -1094,6 +1094,10 @@ let runReceiptSessionRef = null;
 // route, workflow instance, and ComfyUI reconnect epoch are therefore read at
 // both sides of the actual dispatch, not only by the outer command fence.
 let runDispatchIdentityRef = null;
+// A local slash-command invocation may run while the optional agent bridge is
+// disconnected. This capability is a Symbol so bridge-supplied JSON cannot
+// forge the local-only route exemption.
+const LOCAL_GRAPH_RUN_TOKEN = Symbol("local graph run");
 // A callback from an old mount must never register into a replacement tracker or
 // sweep. This owner is a stable object per mount rather than a mutable generation
 // number that an old callback could accidentally match after wrap/reuse.
@@ -19864,6 +19868,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // Keep the established destructuring signature (several shipped source-order
     // guards key off it), while accepting the bridge's correlation id as metadata.
     const requestedRid = arguments[0]?.rid;
+    const localRun = arguments[0]?.[LOCAL_GRAPH_RUN_TOKEN] === true;
     const receiptRid = typeof requestedRid === "string" && requestedRid.trim() ? requestedRid.trim() : null;
     // Freeze this mount's sender for the whole dispatch. A late /prompt response
     // can outlive graph_run itself, but it must never use a newer mount's bridge.
@@ -20037,7 +20042,9 @@ const GRAPH_TOOL_EXECUTORS = {
         }
       }
       const currentIdentity = readRunDispatchIdentity(partialTargets?.[0] ?? null);
-      const comparison = compareRunDispatchIdentity(dispatchIdentityBefore, currentIdentity);
+      const comparison = compareRunDispatchIdentity(dispatchIdentityBefore, currentIdentity, {
+        requireBridgeRoute: !localRun,
+      });
       if (!comparison.stable) refuseUnstableRunDispatch(comparison, "preparing to dispatch");
     };
     // comfyui-mcp#1460 — PRE-FLIGHT the node types. An unregistered type still draws
@@ -20555,6 +20562,7 @@ const GRAPH_TOOL_EXECUTORS = {
     const dispatchIdentityComparison = compareRunDispatchIdentity(
       dispatchIdentityBefore,
       readRunDispatchIdentityAfter(),
+      { requireBridgeRoute: !localRun },
     );
     // #1728: capturePromptId registers accepted ids immediately, including ids
     // delivered after this bounded dispatch has returned. Keep the result-local
@@ -43868,7 +43876,8 @@ function buildPanel() {
   // ---- slash commands (run locally, no agent round-trip) ----
   async function runLocalCommand(cmd, args) {
     try {
-      const result = await GRAPH_TOOL_EXECUTORS[cmd](args);
+      const localArgs = cmd === "graph_run" ? { ...args, [LOCAL_GRAPH_RUN_TOKEN]: true } : args;
+      const result = await GRAPH_TOOL_EXECUTORS[cmd](localArgs);
       appendActivity(cmd, args, { ok: true, result });
     } catch (err) {
       appendActivity(cmd, args, { ok: false, error: coerceMessageText(err?.message ?? err) });
