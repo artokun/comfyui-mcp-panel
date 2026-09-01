@@ -678,13 +678,37 @@ function ideogramQueueTimeDerivedInput(node) {
 
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
-  const seen = new Set();
   const addPair = (execId, name) => {
     if (name != null) pairs.add(`${execId} ${String(name)}`);
   };
+  // comfyui-mcp#2699 — the ANCESTOR PATH, not a visited set. See the walk.
+  const onPath = new Set();
   const walk = (graph, prefix) => {
-    if (!graph || seen.has(graph)) return;
-    seen.add(graph);
+    // comfyui-mcp#2699 — the walk MUST NOT dedup by graph object. ComfyUI's
+    // subgraph INSTANCES share one definition object, and every pair emitted
+    // here is prefixed with the INSTANCE's execId — so a `seen.has(graph)`
+    // guard walked a twice-instantiated definition once, under the FIRST
+    // instance's prefix, and left every other instance with NO exclusions.
+    // Measured on a MiniMax H3 graph whose second-pass subgraph is a second
+    // instance of the first pass's definition: the #1331 leftover link-driven
+    // `model` widget was excluded at `100:29` and hashed at `135:29`, so every
+    // scoped run was refused as "the graph CHANGED" naming exactly
+    // `135:29 model` — deterministically, on an idle canvas, retry included.
+    // use-everywhere-links.js states this same constraint for its own walk.
+    //
+    // Termination is therefore a CYCLE guard on the current ancestor path, not
+    // a fixed depth cap (codex gate r1, P1): ComfyUI documents subgraph nesting
+    // far deeper than any cap worth writing, and a cap that trips would silently
+    // drop exclusions in the deepest subgraph — reintroducing exactly the
+    // permanent "graph CHANGED" refusal this fix removes, one level further
+    // down. A definition cannot legally contain itself, so a definition already
+    // on its OWN path is malformed and stops there; every other nesting shape
+    // is a finite DAG whose expansion is the flattened prompt. The walk visits
+    // one entry per flattened prompt node — the same size canonicalizePrompt
+    // already iterates — so per-instance re-walking costs nothing this path was
+    // not already paying.
+    if (!graph || onPath.has(graph)) return;
+    onPath.add(graph);
     for (const node of graph._nodes ?? []) {
       if (!node || node.id == null) continue;
       const execId = prefix ? `${prefix}:${node.id}` : String(node.id);
@@ -773,6 +797,10 @@ export function collectVolatileInputs(rootGraph) {
       if (ideogramDerivedInput != null) addPair(execId, ideogramDerivedInput);
       if (node.subgraph) walk(node.subgraph, execId);
     }
+    // Leave the path so a SIBLING instance of this same definition is still
+    // walked — dropping this line turns the cycle guard back into the
+    // once-per-definition dedup that caused comfyui-mcp#2699.
+    onPath.delete(graph);
   };
   walk(rootGraph, "");
   // #1273 — THE THIRD VOLATILITY SIGNAL. cg-use-everywhere's queuePrompt patch

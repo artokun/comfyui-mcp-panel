@@ -1282,6 +1282,131 @@ test("#1331 collectVolatileInputs: a FIXED hookless control excludes nothing", (
   assert.equal(collectVolatileInputs(graph).size, 0);
 });
 
+// ---------------------------------------------------------------------------
+// comfyui-mcp#2699 — the volatile-input walk must run ONCE PER INSTANCE, not
+// once per subgraph DEFINITION. ComfyUI's subgraph instances share one
+// definition object, and every pair collectVolatileInputs emits is prefixed
+// with the INSTANCE's execId. A `seen.has(graph)` dedup therefore covered the
+// first instance and silently left every other one hashed.
+//
+// Field shape (MiniMax H3 SEEDHUNTER v121): the second-pass subgraph is a
+// second instance of the first pass's definition. The #1331 leftover
+// link-driven `model` widget was excluded at `100:29` and hashed at `135:29`,
+// so panel_run(to_node_id) refused every scoped run as "the graph CHANGED"
+// naming exactly `135:29 model` — deterministically, on an idle canvas, both
+// the first dispatch and the post-settle retry.
+// ---------------------------------------------------------------------------
+
+/** One definition object, instantiated at several root ids — the live shape. */
+const sharedH3Definition = () => {
+  const definition = { _nodes: [minimaxH3Node(29)] };
+  return {
+    definition,
+    rootGraph: {
+      _nodes: [
+        { id: 100, widgets: [], inputs: [], subgraph: definition },
+        { id: 135, widgets: [], inputs: [], subgraph: definition },
+      ],
+    },
+  };
+};
+
+test("#2699 collectVolatileInputs: a shared subgraph definition is covered at EVERY instance prefix", () => {
+  const { rootGraph } = sharedH3Definition();
+  const pairs = collectVolatileInputs(rootGraph);
+  // The first instance was never the bug — it is the control that must survive.
+  assert.ok(pairs.has("100:29 clip"), "first instance keeps its #1331 coverage");
+  assert.ok(pairs.has("100:29 vae"));
+  assert.ok(pairs.has("100:29 length"));
+  // The second instance is the report: same inner node, different exec prefix.
+  assert.ok(pairs.has("135:29 clip"), "second instance of the SAME definition is covered");
+  assert.ok(pairs.has("135:29 vae"));
+  assert.ok(pairs.has("135:29 length"));
+  // Coverage widened by instance, never by input name.
+  assert.ok(!pairs.has("100:29 prompt"), "an unlinked sibling stays drift-covered on instance one");
+  assert.ok(!pairs.has("135:29 prompt"), "…and on instance two");
+});
+
+test("#2699 promptContentHash: the leftover→link flip stamps EQUAL on the SECOND instance too", () => {
+  const { rootGraph } = sharedH3Definition();
+  const volatileInputs = collectVolatileInputs(rootGraph);
+  const inner = (inputs) => ({ class_type: "MiniMaxH3ReferenceToVideo", inputs });
+  const leftovers = { clip: "clip_l.safetensors", vae: "ae.safetensors", length: 81, prompt: "a cat" };
+  const links = (p) => ({ clip: [`${p}:4`, 0], vae: [`${p}:5`, 0], length: [`${p}:9`, 0], prompt: "a cat" });
+  const stamped = { "100:29": inner(leftovers), "135:29": inner(leftovers) };
+  const posted = (secondPass) => ({ "100:29": inner(links("100")), "135:29": inner(secondPass) });
+
+  const atHash = promptContentHash(stamped, volatileInputs);
+  assert.equal(
+    promptContentHash(posted(links("135")), volatileInputs),
+    atHash,
+    "an untouched two-instance graph stamps equal — the scoped run is no longer refused",
+  );
+  assert.deepEqual(
+    diffPromptCanons(
+      canonicalizePrompt(stamped, volatileInputs),
+      canonicalizePrompt(posted(links("135")), volatileInputs),
+    ),
+    [],
+    "and the refusal's differing-entry list is empty",
+  );
+});
+
+test("#2699 promptContentHash: a real edit INSIDE the second instance is still drift", () => {
+  // The false-negative direction. Widening coverage per instance must not
+  // widen it per input: a mid-window edit to a non-excluded input of the
+  // second instance has to keep failing the stamp closed.
+  const { rootGraph } = sharedH3Definition();
+  const volatileInputs = collectVolatileInputs(rootGraph);
+  const inner = (inputs) => ({ class_type: "MiniMaxH3ReferenceToVideo", inputs });
+  const leftovers = { clip: "clip_l.safetensors", vae: "ae.safetensors", length: 81, prompt: "a cat" };
+  const links = (p, prompt) => ({ clip: [`${p}:4`, 0], vae: [`${p}:5`, 0], length: [`${p}:9`, 0], prompt });
+  const stamped = { "100:29": inner(leftovers), "135:29": inner(leftovers) };
+  const edited = { "100:29": inner(links("100", "a cat")), "135:29": inner(links("135", "a dog")) };
+
+  assert.notEqual(
+    promptContentHash(edited, volatileInputs),
+    promptContentHash(stamped, volatileInputs),
+    "an edit to the second instance's prompt widget still refuses",
+  );
+  assert.deepEqual(
+    diffPromptCanons(canonicalizePrompt(stamped, volatileInputs), canonicalizePrompt(edited, volatileInputs)),
+    ["135:29 prompt"],
+    "and it is named, at the instance that actually changed",
+  );
+});
+
+test("#2699 collectVolatileInputs: a self-referencing definition terminates on the ancestor-path cycle guard", () => {
+  // Dropping the graph-object dedup means termination now rests on the cycle
+  // guard alone. ComfyUI forbids a subgraph containing itself, but a malformed
+  // or hand-edited file must not hang the stamp path — it runs before EVERY
+  // scoped dispatch. A definition already on its OWN path stops there; the
+  // instances reached before the cycle keep full coverage.
+  const definition = { _nodes: [minimaxH3Node(29)] };
+  definition._nodes.push({ id: 7, widgets: [], inputs: [], subgraph: definition });
+  const pairs = collectVolatileInputs({ _nodes: [{ id: 1, widgets: [], inputs: [], subgraph: definition }] });
+  assert.ok(pairs.has("1:29 clip"), "the reachable instance is still covered");
+  assert.ok(!pairs.has("1:7:29 clip"), "the self-reference is where the walk stops");
+  assert.ok(pairs.size > 0 && pairs.size < 200, `bounded, not unbounded (got ${pairs.size})`);
+});
+
+test("#2699 collectVolatileInputs: coverage does not stop at an arbitrary nesting depth", () => {
+  // codex gate r1, P1 — a fixed depth cap silently drops the exclusions of the
+  // DEEPEST subgraph, which is the same permanent "graph CHANGED" refusal this
+  // fix removes, just one level further down. ComfyUI's own subgraph docs put
+  // the supported nesting far past any cap worth writing, so there is no cap.
+  const DEPTH = 40;
+  let inner = { _nodes: [minimaxH3Node(29)] };
+  const path = [];
+  for (let i = DEPTH; i >= 1; i--) {
+    path.unshift(i);
+    inner = { _nodes: [{ id: i, widgets: [], inputs: [], subgraph: inner }] };
+  }
+  const pairs = collectVolatileInputs(inner);
+  const deepest = `${path.join(":")}:29 clip`;
+  assert.ok(pairs.has(deepest), `the widget ${DEPTH} levels down is covered (${deepest})`);
+  assert.ok(!pairs.has(`${path.join(":")}:29 prompt`), "and its unlinked sibling still is not");
+});
 test("#1331 promptContentHash: hookless randomize seed churn is not drift — a sibling edit still is", () => {
   const control = hooklessControl("randomize");
   const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
