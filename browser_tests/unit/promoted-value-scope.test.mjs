@@ -46,6 +46,10 @@ function makeReusableSubgraph({
   // the rail and the definition ONE store, so the repair below provably cannot
   // separate them and the write must stay refused.
   railIsInnerView = false,
+  // comfyui-mcp#2689 — a #477 parent-facing DISPLAY proxy that READS the shared inner
+  // widget. Restoring the definition drags it back to the old value, so a repair that
+  // only looked at the rail would report success with a proxy rendering the OLD value.
+  displayProxyViewsDefinition = false,
 } = {}) {
   const events = { innerCallback: [], railCallback: [], railSets: [] };
   const inner = {
@@ -152,12 +156,27 @@ function makeReusableSubgraph({
     if (widgetId) {
       Object.defineProperty(rail, "widgetId", { value: widgetId, enumerable: false, configurable: true });
     }
+    // #477: newer ComfyUI can reference a REAL second widget here — the parent-facing
+    // display proxy — alongside the serializing rail. It carries no `widgetId`, which is
+    // how resolveHostPromotedWidgets tells the two apart.
+    const displayProxy = displayProxyViewsDefinition
+      ? {
+          name: "width",
+          type: "INT",
+          get value() {
+            return inner.widgets[0].value;
+          },
+          set value(next) {
+            inner.widgets[0].value = next;
+          },
+        }
+      : null;
     const input = {
       name: "width",
       widgetId,
       _widget: rail,
       // Real ComfyUI stores only a NAME STUB here, never a widget object.
-      widget: { name: "width" },
+      widget: displayProxy ?? { name: "width" },
       _subgraphSlot: { name: "width" },
     };
     const node = {
@@ -167,10 +186,10 @@ function makeReusableSubgraph({
       inputs: [input],
       // `SubgraphNode.widgets` is a GETTER that projects the promoted widgets.
       get widgets() {
-        return [rail];
+        return displayProxy ? [rail, displayProxy] : [rail];
       },
     };
-    return { node, rail, input, widgetId };
+    return { node, rail, input, widgetId, displayProxy };
   }
 
   // What queue compilation reads for an unlinked promoted input
@@ -483,6 +502,107 @@ test("comfyui-mcp#2689: the REPORTED shape — a promoted multiline prompt on a 
   assert.equal(set.node_id, 5646);
   assert.equal(set.value, "a NEW prompt");
   assert.equal(set.promoted_from.shared_definition_write_through, true);
+});
+
+test("comfyui-mcp#2689: a refusal the repair never ATTEMPTED does not claim it was attempted", () => {
+  // The repair only runs when the rail RETAINED the requested value exactly, so a rail
+  // that snapped it onto its own grid AND writes through to the definition is refused
+  // without one. The message must not then describe an attempt nothing made — "restoring
+  // the inner widget did not separate the two" would be a claim about a check that never
+  // ran, and it points the caller at the wrong remedy.
+  const sg = makeReusableSubgraph({ definitionValue: 512, railWritesDefinition: true });
+  const target = sg.instance(293);
+  const state = sg.store.get(target.widgetId);
+  state.options = { min: 1, step: 2 };
+  const snap = (v) => (typeof v === "number" ? state.options.min + Math.round((v - state.options.min) / 2) * 2 : v);
+  Object.defineProperty(target.rail, "value", {
+    get: () => state.value,
+    set: (next) => {
+      state.value = snap(next);
+      sg.inner.widgets[0].value = state.value;
+    },
+    configurable: true,
+  });
+  Object.defineProperty(target.rail, "callback", {
+    value: (next) => {
+      state.value = snap(next);
+      sg.inner.widgets[0].value = state.value;
+    },
+    configurable: true,
+  });
+
+  let err = null;
+  try {
+    applyWidgetWrite(target.node, "width", 4096, { resolveSource });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof WidgetWriteError, "a write-through rail that also normalizes is still refused");
+  assert.match(err.message, /ALSO changed the shared subgraph definition/);
+  assert.doesNotMatch(
+    err.message,
+    /did not separate the two/,
+    "the repair was skipped, so the message must not report its outcome",
+  );
+  assert.equal(sg.definition(), 512, "and the shared definition is restored either way");
+});
+
+test("comfyui-mcp#2689: an inner widget that will not take the restore is NOT a repaired write", () => {
+  // The repair is only worth anything if it is VERIFIED. Here the shared inner widget
+  // latches: it takes the rail's write-through and then ignores every later assignment,
+  // so the definition stays moved. Claiming `value_scope: "instance"` on the strength of
+  // having ATTEMPTED the restore would be the exact false claim #1707 exists to stop —
+  // worse than the old refusal, because the leak would now be reported as a success.
+  const sg = makeReusableSubgraph({ definitionValue: 512, railWritesDefinition: true });
+  const target = sg.instance(293);
+  const innerWidget = sg.inner.widgets[0];
+  let backing = innerWidget.value;
+  let accepted = 0;
+  Object.defineProperty(innerWidget, "value", {
+    get: () => backing,
+    set: (next) => {
+      if (accepted === 0) backing = next;
+      accepted += 1;
+    },
+    configurable: true,
+  });
+
+  let err = null;
+  try {
+    applyWidgetWrite(target.node, "width", 1024, { resolveSource });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof WidgetWriteError, "an unverifiable repair must not become a success");
+  assert.match(err.message, /ALSO changed the shared subgraph definition/);
+  // …and the state it actually left is reported, not a rollback it did not achieve.
+  assert.equal(sg.definition(), 1024, "the definition is genuinely still moved");
+  assert.match(err.message, /did not take effect/, "so the partial state is disclosed, not hidden");
+});
+
+test("comfyui-mcp#2689: a repair that leaves a #477 display proxy stale is rejected", () => {
+  // The parent-facing display proxy READS the shared inner widget, so restoring the
+  // definition drags the outer node's rendered value back to the old one while the
+  // serializing rail keeps the new one. Checking only the rail would report success with
+  // the wrapper still showing the OLD prompt — #477's stale-outer-widget symptom.
+  const sg = makeReusableSubgraph({
+    definitionValue: 512,
+    railWritesDefinition: true,
+    displayProxyViewsDefinition: true,
+  });
+  const target = sg.instance(293);
+  assert.ok(target.displayProxy, "precondition: the promotion exposes a display proxy");
+
+  let err = null;
+  try {
+    applyWidgetWrite(target.node, "width", 1024, { resolveSource });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof WidgetWriteError, "a repair that cannot keep every projection in sync is refused");
+  assert.match(err.message, /ALSO changed the shared subgraph definition/);
+  assert.equal(sg.definition(), 512, "and the shared definition is restored");
+  assert.equal(target.displayProxy.value, 512, "the outer node is not left rendering the requested value");
 });
 
 test("#1707: a failed instance-scoped write does not touch the definition on the ROLLBACK either", () => {
