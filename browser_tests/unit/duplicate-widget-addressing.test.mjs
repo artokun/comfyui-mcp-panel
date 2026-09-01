@@ -34,6 +34,14 @@ import {
 } from "../../web/js/lib/widget-occurrence.js";
 
 const BYPASSER = "Fast Groups Bypasser (rgthree)";
+
+/** The address, flattened for assertion. `occurrence.widget` is the row OBJECT, so it is
+ *  checked separately where it matters rather than deep-compared everywhere. */
+function addr(node, requested) {
+  const a = resolveWidgetAddress(node, requested);
+  if (!a) return null;
+  return { name: a.name, index: a.occurrence?.index ?? null, label: a.occurrence?.label ?? null };
+}
 const ROW = "RGTHREE_TOGGLE_AND_NAV";
 
 function defineMode(node, initial) {
@@ -152,30 +160,17 @@ test("#2143: an EXACT widget name always wins, brackets and all", () => {
   const node = { id: 1, type: "T", widgets: [{ name: "foo[1]" }, { name: "foo" }, { name: "foo" }] };
   // The literal name resolves to itself with no occurrence pinned — the bracket is never
   // interpreted when a widget actually carries that spelling.
-  assert.deepEqual(resolveWidgetAddress(node, "foo[1]"), {
-    name: "foo[1]",
-    occurrenceIndex: null,
-    occurrenceLabel: null,
-  });
+  assert.deepEqual(addr(node, "foo[1]"), { name: "foo[1]", index: null, label: null });
 });
 
 test("#2143: a duplicated name addresses a specific occurrence, and composes with sub-fields", () => {
   const node = { id: 59, type: BYPASSER, widgets: [{ name: ROW }, { name: ROW }] };
-  assert.deepEqual(resolveWidgetAddress(node, `${ROW}[1]`), {
-    name: ROW,
-    occurrenceIndex: 1,
-    occurrenceLabel: null,
-  });
-  assert.deepEqual(resolveWidgetAddress(node, `${ROW}[0]`), {
-    name: ROW,
-    occurrenceIndex: 0,
-    occurrenceLabel: null,
-  });
-  assert.deepEqual(resolveWidgetAddress(node, `${ROW}[1].toggled`), {
-    name: `${ROW}.toggled`,
-    occurrenceIndex: 1,
-    occurrenceLabel: null,
-  });
+  assert.deepEqual(addr(node, `${ROW}[1]`), { name: ROW, index: 1, label: null });
+  assert.deepEqual(addr(node, `${ROW}[0]`), { name: ROW, index: 0, label: null });
+  assert.deepEqual(addr(node, `${ROW}[1].toggled`), { name: `${ROW}.toggled`, index: 1, label: null });
+  // The row OBJECT is pinned too — the only thing that can tell two identically-labelled
+  // (or unlabelled) rows apart after a reorder.
+  assert.equal(resolveWidgetAddress(node, `${ROW}[1]`).occurrence.widget, node.widgets[1]);
 
   // A bracket address pins the LABEL of the row it landed on, exactly as the label route
   // does. Without it a `[1]` address carries only a position, and a rebuild that reorders
@@ -188,11 +183,35 @@ test("#2143: a duplicated name addresses a specific occurrence, and composes wit
       { name: ROW, label: "Enable VRAM optimizations 2" },
     ],
   };
-  assert.deepEqual(resolveWidgetAddress(labelled, `${ROW}[1]`), {
+  assert.deepEqual(addr(labelled, `${ROW}[1]`), {
     name: ROW,
-    occurrenceIndex: 1,
-    occurrenceLabel: "Enable VRAM optimizations 2",
+    index: 1,
+    label: "Enable VRAM optimizations 2",
   });
+});
+
+test("#2143: a duplicated widget whose NAME contains dots is addressable", () => {
+  // Widget names really do contain dots here — #560 exists because of that, and #2140's
+  // DynamicCombo children are `format.codec.encoding.crf`. Parsing the bracket only after
+  // splitting at the first dot made a duplicated dotted name unreachable: "foo.bar[1]"
+  // looked for a widget called "foo", found none, and refused — while duplicate_widgets
+  // happily reported two `foo.bar` rows.
+  const node = {
+    id: 7,
+    type: "T",
+    widgets: [
+      { name: "foo.bar", label: "first", value: "a" },
+      { name: "foo.bar", label: "second", value: "b" },
+    ],
+  };
+  assert.deepEqual(duplicateWidgetRows(node)["foo.bar"].map((r) => r.index), [0, 1]);
+  assert.deepEqual(addr(node, "foo.bar[1]"), { name: "foo.bar", index: 1, label: "second" });
+
+  // …and a real widget named `foo` still wins the DOTTED split, because the selector only
+  // ever fires when no widget carries the requested string. Here `foo.on[0]` is not a
+  // widget name and `foo.on` is not either, so it is a sub-field write on `foo`.
+  const composite = { id: 8, type: "T", widgets: [{ name: "foo", value: { on: true } }] };
+  assert.deepEqual(addr(composite, "foo.on"), { name: "foo.on", index: null, label: null });
 });
 
 test("#2143: the selector index is the SAME number duplicate_widgets publishes", () => {
@@ -215,7 +234,7 @@ test("#2143: the selector index is the SAME number duplicate_widgets publishes",
 
   for (const index of published) {
     assert.equal(
-      resolveWidgetAddress(node, `${ROW}[${index}]`).occurrenceIndex,
+      resolveWidgetAddress(node, `${ROW}[${index}]`).occurrence.index,
       index,
       `duplicate_widgets index ${index} must be a valid address`,
     );
@@ -260,10 +279,10 @@ test("#2143: a display label carried by exactly one row is an address, and pins 
       { name: ROW, label: "Enable VRAM optimizations 2" },
     ],
   };
-  assert.deepEqual(resolveWidgetAddress(node, "Enable VRAM optimizations 2"), {
+  assert.deepEqual(addr(node, "Enable VRAM optimizations 2"), {
     name: ROW,
-    occurrenceIndex: 1,
-    occurrenceLabel: "Enable VRAM optimizations 2",
+    index: 1,
+    label: "Enable VRAM optimizations 2",
   });
 });
 
@@ -288,13 +307,13 @@ test("#2143: a name that already resolves is returned untouched, with no occurre
     type: "KSampler",
     widgets: [{ name: "seed", label: "Sampler seed" }, { name: "steps" }],
   };
-  const plain = (name) => ({ name, occurrenceIndex: null, occurrenceLabel: null });
+  const plain = (name) => ({ name, index: null, label: null });
   // The two shapes every ordinary write takes: a plain name, and a #560 dotted sub-field.
-  assert.deepEqual(resolveWidgetAddress(node, "seed"), plain("seed"));
-  assert.deepEqual(resolveWidgetAddress(node, "seed.on"), plain("seed.on"));
+  assert.deepEqual(addr(node, "seed"), plain("seed"));
+  assert.deepEqual(addr(node, "seed.on"), plain("seed.on"));
   // A label on a UNIQUELY-named widget resolves to the ordinary name path: no ordinal is
   // pinned, so nothing about that write changes.
-  assert.deepEqual(resolveWidgetAddress(node, "Sampler seed"), plain("seed"));
+  assert.deepEqual(addr(node, "Sampler seed"), plain("seed"));
   // Nothing matches at all — the caller's own missing-widget refusal stays in charge.
   assert.equal(resolveWidgetAddress(node, "nope"), null);
   assert.equal(resolveWidgetAddress(node, "nope[0]"), null);
@@ -331,7 +350,7 @@ test("#2143: an occurrence-1 address bypasses the SECOND group and leaves the fi
   const fixture = twoGroupBypasser();
   assert.deepEqual(fixture.modes(), [[0, 0], [0, 0]]);
 
-  const result = applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrenceIndex: 1 });
+  const result = applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrence: { index: 1 } });
 
   assert.deepEqual(
     fixture.modes(),
@@ -366,7 +385,7 @@ test("#2143: a BARE duplicated name still writes the first row — unchanged beh
 
 test("#2143: an occurrence-0 address is explicit about the row every bare name took", () => {
   const fixture = twoGroupBypasser();
-  applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrenceIndex: 0 });
+  applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrence: { index: 0 } });
   assert.deepEqual(fixture.modes(), [[4, 4], [0, 0]]);
 });
 
@@ -381,18 +400,18 @@ test("#2143: the WRITE indexes positions, not occurrences, when a widget precede
     "the read publishes positions 1 and 2 on this node",
   );
 
-  applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrenceIndex: 1 });
+  applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrence: { index: 1 } });
   assert.deepEqual(fixture.modes(), [[4, 4], [0, 0]], "index 1 is the FIRST group's row");
 
   const other = twoGroupBypasser({ lead: true });
-  applyWidgetWrite(other.bypasser, ROW, { toggled: false }, { occurrenceIndex: 2 });
+  applyWidgetWrite(other.bypasser, ROW, { toggled: false }, { occurrence: { index: 2 } });
   assert.deepEqual(other.modes(), [[0, 0], [4, 4]], "index 2 is the SECOND group's row");
 
   // …and index 0 is the leading widget, not a toggle row, so it is refused rather than
   // resolved to whichever row an ordinal would have picked.
   const third = twoGroupBypasser({ lead: true });
   assert.throws(
-    () => applyWidgetWrite(third.bypasser, ROW, { toggled: false }, { occurrenceIndex: 0 }),
+    () => applyWidgetWrite(third.bypasser, ROW, { toggled: false }, { occurrence: { index: 0 } }),
     WidgetWriteError,
   );
   assert.deepEqual(third.modes(), [[0, 0], [0, 0]], "nothing moved");
@@ -401,7 +420,7 @@ test("#2143: the WRITE indexes positions, not occurrences, when a widget precede
 test("#2143: a sub-field address reaches the addressed occurrence too", () => {
   const fixture = twoGroupBypasser();
 
-  applyWidgetWrite(fixture.bypasser, `${ROW}.toggled`, false, { occurrenceIndex: 1 });
+  applyWidgetWrite(fixture.bypasser, `${ROW}.toggled`, false, { occurrence: { index: 1 } });
 
   assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]]);
 });
@@ -420,10 +439,10 @@ test("#2143: an ordinal with no row behind it at write time refuses instead of w
   fixture.bypasser.widgets = [fixture.rows[0]];
 
   assert.throws(
-    () => applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrenceIndex: 1 }),
+    () => applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrence: { index: 1 } }),
     (err) =>
       err instanceof WidgetWriteError &&
-      /index 1 is no longer one of them/.test(err.message) &&
+      /index 1 no longer names the row this call addressed/.test(err.message) &&
       /Nothing was written/.test(err.message),
   );
   assert.deepEqual(fixture.modes(), [[0, 0], [0, 0]], "no mode moved");
@@ -434,28 +453,69 @@ test("#2143: a row that MOVED between resolution and the write is refused, not w
   const fixture = twoGroupBypasser();
   // The address was resolved against [group one, group two]; by write time a rebuild has
   // swapped them. Index 1 is still a perfectly valid RGTHREE_TOGGLE_AND_NAV — it is just a
-  // different group, which the ordinal alone cannot tell. The pinned label can.
+  // different group, which the position alone cannot tell. The pinned label can.
   fixture.bypasser.widgets = [fixture.rows[1], fixture.rows[0]];
 
   assert.throws(
     () =>
       applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
-        occurrenceIndex: 1,
-        occurrenceLabel: "Enable VRAM optimizations 2",
+        occurrence: { index: 1, label: "Enable VRAM optimizations 2" },
       }),
     (err) =>
       err instanceof WidgetWriteError &&
-      /is now labelled "Enable VRAM optimizations 1"/.test(err.message) &&
+      /the row at that index is a different one/.test(err.message) &&
+      /Enable VRAM optimizations 1, not "Enable VRAM optimizations 2"/.test(err.message) &&
       /Nothing was written/.test(err.message),
   );
   assert.deepEqual(fixture.modes(), [[0, 0], [0, 0]], "neither group moved");
 });
 
+test("#2143: a reorder is caught by IDENTITY even when the labels cannot tell the rows apart", () => {
+  // The case a label pin alone cannot cover, and the reason the row OBJECT is pinned too:
+  // two rows whose labels are identical (or absent). The label check would compare "same"
+  // to "same", pass, and toggle the wrong group.
+  for (const labels of [["same", "same"], [undefined, undefined]]) {
+    const fixture = twoGroupBypasser({ labels });
+    const addressed = fixture.rows[1];
+    fixture.bypasser.widgets = [fixture.rows[1], fixture.rows[0]];
+
+    assert.throws(
+      () =>
+        applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
+          occurrence: { index: 1, label: labels[1] ?? null, widget: addressed },
+        }),
+      (err) => err instanceof WidgetWriteError && /the rows were REORDERED and it is now at index 0/.test(err.message),
+      `labels ${JSON.stringify(labels)}`,
+    );
+    assert.deepEqual(fixture.modes(), [[0, 0], [0, 0]], "neither group moved");
+  }
+});
+
+test("#2143: identity ACCEPTS the unmoved row, so an ordinary pinned write still lands", () => {
+  const fixture = twoGroupBypasser({ labels: ["same", "same"] });
+  applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
+    occurrence: { index: 1, label: "same", widget: fixture.rows[1] },
+  });
+  assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]]);
+});
+
+test("#2143: a REBUILD that replaces the row objects falls back to the label, not a refusal", () => {
+  // Identity is inconclusive here — the addressed object is gone entirely, which is what an
+  // rgthree Fast Groups rebuild does. Refusing on that would block the ordinary case; the
+  // label is what says the rebuild put the same row back in the same place.
+  const fixture = twoGroupBypasser();
+  const ghost = { name: ROW, label: "Enable VRAM optimizations 2" };
+
+  applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
+    occurrence: { index: 1, label: "Enable VRAM optimizations 2", widget: ghost },
+  });
+  assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]], "the rebuilt row was written");
+});
+
 test("#2143: a pinned label that still matches writes normally", () => {
   const fixture = twoGroupBypasser();
   applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, {
-    occurrenceIndex: 1,
-    occurrenceLabel: "Enable VRAM optimizations 2",
+    occurrence: { index: 1, label: "Enable VRAM optimizations 2" },
   });
   assert.deepEqual(fixture.modes(), [[0, 0], [4, 4]]);
 });
@@ -476,7 +536,7 @@ test("#2143: an occurrence address on a PROMOTED subgraph widget is refused, not
     () =>
       applyWidgetWrite(subgraphNode, "steps", 30, {
         resolveSource,
-        occurrenceIndex: 1,
+        occurrence: { index: 1 },
         promotedResolution: {
           promoted: true,
           target: {
@@ -488,7 +548,7 @@ test("#2143: an occurrence address on a PROMOTED subgraph widget is refused, not
           },
         },
       }),
-    (err) => err instanceof WidgetWriteError && /cannot select occurrence 1/.test(err.message),
+    (err) => err instanceof WidgetWriteError && /cannot select index 1/.test(err.message),
   );
   assert.equal(inner.widgets[0].value, 20, "nothing was written to the inner widget");
   assert.equal(subgraphNode.widgets[0].value, 20, "nothing was written to the rail");
@@ -520,8 +580,8 @@ test("#2143: the timeout readback reads the row that was written, not the first 
   // Without the ordinal this answers about row 0 — and row 0 holding the requested value is
   // exactly how a timed-out write to row 1 was reported "applied and verified".
   assert.deepEqual(readLiveWidgetValue(bypasser, ROW).value, { toggled: false });
-  assert.deepEqual(readLiveWidgetValue(bypasser, ROW, 1).value, { toggled: true });
-  assert.equal(readLiveWidgetValue(bypasser, ROW, 5).found, false);
+  assert.deepEqual(readLiveWidgetValue(bypasser, ROW, { index: 1 }).value, { toggled: true });
+  assert.equal(readLiveWidgetValue(bypasser, ROW, { index: 5 }).found, false);
 });
 
 test("#2143: the readback and the write agree on the row when the name does NOT start at 0", () => {
@@ -539,9 +599,9 @@ test("#2143: the readback and the write agree on the row when the name does NOT 
     ],
   };
   const address = resolveWidgetAddress(node, `${ROW}[1]`);
-  assert.equal(address.occurrenceIndex, 1);
+  assert.equal(address.occurrence.index, 1);
 
-  const live = readLiveWidgetValue(node, ROW, address.occurrenceIndex, address.occurrenceLabel);
+  const live = readLiveWidgetValue(node, ROW, address.occurrence);
   assert.equal(live.widget, node.widgets[1], "the readback must read the row the write targets");
   assert.deepEqual(live.value, { toggled: true });
 
@@ -567,7 +627,7 @@ test("#2143: a readback whose row MOVED reports not-found rather than verifying 
   // perfectly valid RGTHREE_TOGGLE_AND_NAV — a different group's.
   bypasser.widgets = [rows[1], rows[0]];
 
-  const live = readLiveWidgetValue(bypasser, ROW, 1, "Enable VRAM optimizations 2");
+  const live = readLiveWidgetValue(bypasser, ROW, { index: 1, label: "Enable VRAM optimizations 2" });
   assert.equal(live.found, false, "the pinned label refuses the row that moved into that slot");
 
   const receipt = widgetWriteTimeoutReadback({
@@ -583,7 +643,7 @@ test("#2143: a readback whose row MOVED reports not-found rather than verifying 
 test("#2143: the timeout receipt carries the same row attribution the write's own reply would", () => {
   const { bypasser, rows } = twoGroupBypasser();
   rows[1].value = { toggled: false };
-  const live = readLiveWidgetValue(bypasser, ROW, 1);
+  const live = readLiveWidgetValue(bypasser, ROW, { index: 1 });
 
   const receipt = widgetWriteTimeoutReadback({
     requested: { toggled: false },
@@ -660,7 +720,7 @@ test("#2143: the post-write retention check re-reads the row that was written", 
     ],
   };
 
-  const res = await runSetWidget(node, "row", "new", { ...wiredDeps("DupRows"), occurrenceIndex: 1 });
+  const res = await runSetWidget(node, "row", "new", { ...wiredDeps("DupRows"), occurrence: { index: 1 } });
 
   assert.equal(res.set.value, "new");
   assert.equal(node.widgets[1].value, "new", "the addressed row was written");
@@ -696,7 +756,7 @@ test("#2143: retention survives a callback that RELABELS the row it just wrote",
     ],
   };
 
-  const res = await runSetWidget(node, "row", "new", { ...wiredDeps("DupRows"), occurrenceIndex: 1 });
+  const res = await runSetWidget(node, "row", "new", { ...wiredDeps("DupRows"), occurrence: { index: 1 } });
 
   assert.equal(res.set.value, "new");
   assert.equal(node.widgets[1].value, "new");
@@ -758,8 +818,7 @@ test("#2143: the shipped graph_set_widget resolves the address BEFORE every name
   }
   // …and the resolved ordinal AND its pinned label are handed to the write, not merely
   // computed. The label is what makes a reorder across the handler's own await detectable.
-  assert.match(body, /occurrenceIndex: widgetOccurrenceIndex/);
-  assert.match(body, /occurrenceLabel: widgetOccurrenceLabel/);
+  assert.match(body, /occurrence: widgetOccurrence,/);
 });
 
 test("#2143: runSetWidget forwards the ordinal to the write and to its own ack readback", () => {
@@ -768,21 +827,19 @@ test("#2143: runSetWidget forwards the ordinal to the write and to its own ack r
     "utf8",
   ).replace(/\r\n/g, "\n");
   // applyWidgetWrite is the only thing that can select the row…
-  assert.match(setWidgetSource, /applyWidgetWrite\(node, widgetName, value, \{[\s\S]*?\n\s*occurrenceIndex,/);
-  assert.match(setWidgetSource, /applyWidgetWrite\(node, widgetName, value, \{[\s\S]*?\n\s*occurrenceLabel,/);
+  assert.match(setWidgetSource, /applyWidgetWrite\(node, widgetName, value, \{[\s\S]*?\n\s*occurrence,/);
   // …and the #2025 timeout readback must consult the same row — WITH the same label pin —
   // or a write that timed out on one row can be acked from another row's value.
-  assert.match(setWidgetSource, /readLiveWidgetValue\(node, widget, occurrenceIndex, occurrenceLabel\)/);
+  assert.match(setWidgetSource, /readLiveWidgetValue\(node, widget, occurrence\)/);
   // The readback and the write must share ONE definition of what the index means. Two local
   // implementations is how they came to disagree in the first place.
-  assert.match(setWidgetSource, /widgetAtOccurrence\(node, widgetName, occurrenceIndex, occurrenceLabel\)/);
+  assert.match(setWidgetSource, /widgetAtOccurrence\(node, widgetName, occurrence\.index, occurrence\)/);
   // …and report which row it read.
   assert.match(setWidgetSource, /widget_occurrence: live\.widget \? widgetOccurrenceOf\(node, live\.widget\) : null/);
   // …and the ack WRAPPER must hand both halves of the address on. The readback can only
   // honour a pin it was given, so dropping either here is invisible to every test that
   // calls readLiveWidgetValue directly.
-  assert.match(setWidgetSource, /occurrenceIndex: opts\.occurrenceIndex \?\? null,/);
-  assert.match(setWidgetSource, /occurrenceLabel: opts\.occurrenceLabel \?\? null,/);
+  assert.match(setWidgetSource, /occurrence: opts\.occurrence \?\? null,/);
 });
 
 test("#2143: the write resolves the row through the SHARED definition, not its own copy", () => {
@@ -794,5 +851,5 @@ test("#2143: the write resolves the row through the SHARED definition, not its o
   // one" drifting apart — the write moved to positions, the readback stayed on ordinals.
   // Keeping both call sites on the one exported rule is what stops them naming different
   // widgets again.
-  assert.match(widgetWriteSource, /return widgetAtOccurrence\(node, wanted, occurrenceIndex\);/);
+  assert.match(widgetWriteSource, /return widgetAtOccurrence\(node, wanted, occurrence\.index, occurrence\);/);
 });

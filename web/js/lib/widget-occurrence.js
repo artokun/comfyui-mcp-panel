@@ -100,23 +100,42 @@ export function occurrenceLabelOf(widget) {
 }
 
 /**
- * THE ONE DEFINITION of what `occurrenceIndex` means, so the write and the readback cannot
- * drift apart. It is a POSITION in `node.widgets` — the number `duplicate_widgets`
- * publishes — never an ordinal counted over same-named rows: the two agree only when the
- * duplicated name starts at widget 0, and disagreeing silently is how the write lands on
- * one row while the readback reports another (and, if that other row happens to hold the
- * requested value, acks an uncertain write as verified).
+ * THE ONE DEFINITION of what an occurrence address resolves to, so the write and the
+ * readback cannot drift apart. `index` is a POSITION in `node.widgets` — the number
+ * `duplicate_widgets` publishes — never an ordinal counted over same-named rows: the two
+ * agree only when the duplicated name starts at widget 0, and disagreeing silently is how
+ * the write lands on one row while the readback reports another (and, if that other row
+ * happens to hold the requested value, acks an uncertain write as verified).
  *
- * Null unless the widget at that position still carries `name` — and, when a label was
- * PINNED at resolution, still carries that label too, so a rebuild that reordered the rows
- * cannot be mistaken for the row that was addressed. `pinnedLabel` of `null`/`undefined`
- * checks nothing: a row with no label is indistinguishable from its siblings anyway.
+ * Null unless the widget at that position still carries `name`. Beyond that, "is this
+ * still the row that was addressed" is answered in the order of how much each answer
+ * actually establishes, because the address is resolved before an await and used after it:
+ *
+ *   1. IDENTITY. `pin.widget` is the row object captured at resolution. If the object at
+ *      this position is that object, this is definitively the same row — including when
+ *      the rows carry no labels, or identical ones, where nothing else can tell them apart.
+ *      If that object is still on the node but somewhere ELSE, the rows were REORDERED and
+ *      the index is stale: null, so the write refuses rather than mutating a stranger.
+ *   2. LABEL, only once identity is inconclusive — i.e. the addressed object is gone,
+ *      which is a REBUILD, which is exactly what an rgthree Fast Groups node does whenever
+ *      the groups it matches change. A matching label says the rebuild put the same row
+ *      back here; a different one says it did not.
+ *   3. Neither available (no pin object, no label): position and name alone, which is what
+ *      a direct helper call with a bare index gets. Documented rather than defended: with
+ *      no identity and no label there is nothing on the node that could distinguish the
+ *      rows, and none of this is reachable from the panel, which always pins both.
  */
-export function widgetAtOccurrence(node, name, index, pinnedLabel = null) {
+export function widgetAtOccurrence(node, name, index, pin = null) {
   if (!Number.isInteger(index) || index < 0) return null;
-  const at = widgetsOf(node)[index];
+  const widgets = widgetsOf(node);
+  const at = widgets[index];
   if (!at || widgetName(at) !== name) return null;
-  if (pinnedLabel != null && widgetLabel(at) !== pinnedLabel) return null;
+  const pinned = pin && typeof pin === "object" ? pin : null;
+  if (pinned?.widget) {
+    if (at === pinned.widget) return at;
+    if (widgets.includes(pinned.widget)) return null;
+  }
+  if (pinned?.label != null && widgetLabel(at) !== pinned.label) return null;
   return at;
 }
 
@@ -199,6 +218,25 @@ export function duplicateAddressHint(node) {
 }
 
 /**
+ * The occurrence a parsed `NAME[i]` selector names, or null when NO widget on the node
+ * carries `NAME` at all (so the caller can try its other routes). An index that names no
+ * row of a name the node DOES carry is a loud refusal: falling back to another row is the
+ * defect this module exists to remove.
+ */
+function pinnedOccurrence(node, selector) {
+  const occurrences = occurrencesOf(node, selector.base);
+  if (!occurrences.length) return null;
+  const at = occurrences.find((entry) => entry.index === selector.index);
+  if (at) return at;
+  throw new WidgetAddressError(
+    `Node ${node?.id} (${node?.type}) carries no widget named "${selector.base}" at index ` +
+      `${selector.index}. The index is the widget's position in the node, the same one ` +
+      `panel_query_graph's duplicate_widgets reports — valid here: ` +
+      `${describeOccurrences(selector.base, occurrences)}. Nothing was written.`,
+  );
+}
+
+/**
  * Resolve the caller's `widget` string to a CANONICAL widget name plus, when the caller
  * addressed a specific one of several same-named widgets, the occurrence to write.
  *
@@ -207,22 +245,27 @@ export function duplicateAddressHint(node) {
  * case-insensitive fallback, #560 dotted sub-field, and finally the missing-widget
  * refusal) runs completely unchanged.
  *
- * Returns `{ name, occurrenceIndex, occurrenceLabel }` otherwise:
+ * Returns `{ name, occurrence }` otherwise:
  *   * `name` is what every downstream name-keyed lookup, classifier and refusal should use
  *     — the widget's REAL name, never the selector or the label. This matters for more than
  *     tidiness: `classifyRgthreeFastGroupsWrite` and friends key on the widget NAME, so
  *     resolving a label here and passing the label onward would let a label address slip
  *     past a name-keyed safety refusal.
- *   * `occurrenceIndex` is the widget's position in `node.widgets` — the SAME number
- *     `duplicate_widgets` publishes — and is set ONLY when the caller addressed one
- *     EXPLICITLY. A plain name resolves with `occurrenceIndex: null`, so its write path is
- *     byte-identical to before this change.
- *   * `occurrenceLabel` is the display label that row carried AT RESOLUTION TIME (null when
- *     it carries none). An index is a position, and a position is only as good as the list
- *     it indexes: the write happens after an `await getFreshObjectInfo()`, and a Fast Groups
- *     node rebuilds and REORDERS its rows when the groups it matches change. Pinning the
- *     label lets the write refuse a row that moved instead of toggling whichever group
- *     happens to sit at that index now.
+ *   * `occurrence` is `{ index, label, widget }` — or null, which is every address that is
+ *     not explicitly occurrence-scoped, and so every call that existed before #2143.
+ *       - `index` is the widget's position in `node.widgets`, the SAME number
+ *         `duplicate_widgets` publishes, so a reported index pastes straight back.
+ *       - `widget` is the row OBJECT, held only to be COMPARED — never written through, so
+ *         it cannot become the stale-target hazard #458 is about. It is the definitive
+ *         answer to "is this still the row I addressed", and the only one that works when
+ *         the rows are indistinguishable by label.
+ *       - `label` is the display label that row carried at resolution (null when it carries
+ *         none). It is the FALLBACK for the case identity cannot cover: a rebuild that
+ *         replaces the row objects but keeps the rows, which is what an rgthree Fast Groups
+ *         node does whenever the groups it matches change.
+ *     An index is a position, and a position is only as good as the list it indexes — the
+ *     write happens after an `await getFreshObjectInfo()`. Carrying identity AND label lets
+ *     the write tell "same row" from "a different row that moved into that slot".
  *
  * Throws WidgetAddressError for an address that parsed but cannot be honoured.
  */
@@ -230,41 +273,41 @@ export function resolveWidgetAddress(node, requested) {
   if (typeof requested !== "string" || requested === "") return null;
   const widgets = widgetsOf(node);
   if (!widgets.length) return null;
-  const plain = (name) => ({ name, occurrenceIndex: null, occurrenceLabel: null });
+  const plain = (name) => ({ name, occurrence: null });
+  const pin = (name, at) => ({
+    name,
+    occurrence: { index: at.index, label: widgetLabel(at.widget), widget: at.widget },
+  });
 
   // 1. EXACT NAME on the whole string — brackets, dots and all. Never rewritten, and no
   //    occurrence is pinned: this is the address that already worked.
   if (occurrencesOf(node, requested).length) return plain(requested);
 
+  // 2. OCCURRENCE SELECTOR on the WHOLE string, before any dotted split. A widget name may
+  //    itself contain dots (#560 exists because of that, and #2140's DynamicCombo children
+  //    are `format.codec.encoding.crf`), so splitting first would make a duplicated DOTTED
+  //    name unaddressable: `foo.bar[1]` would look for a widget called `foo`, find none, and
+  //    refuse — while duplicate_widgets happily reported two `foo.bar` rows. Ordered ahead of
+  //    the dotted base for the same reason exact-name-first is: a widget that really is
+  //    called `foo.bar` outranks splitting the string at `foo`.
+  const wholeSelector = parseOccurrenceSelector(requested);
+  if (wholeSelector) {
+    const at = pinnedOccurrence(node, wholeSelector);
+    if (at) return pin(wholeSelector.base, at);
+  }
+
   const dot = requested.indexOf(".");
   const head = dot > 0 ? requested.slice(0, dot) : requested;
   const tail = dot > 0 ? requested.slice(dot) : "";
 
-  // 2. EXACT NAME on the #560 dotted BASE — likewise already worked, likewise untouched.
+  // 3. EXACT NAME on the #560 dotted BASE — likewise already worked, likewise untouched.
   if (dot > 0 && occurrencesOf(node, head).length) return plain(requested);
 
-  // 3. OCCURRENCE SELECTOR on the head segment: "NAME[1]" / "NAME[1].field". The number is
-  //    the position in `node.widgets`, so it is exactly the `index` duplicate_widgets
-  //    publishes — a caller can paste one straight back without re-deriving anything.
-  const selector = parseOccurrenceSelector(head);
+  // 4. OCCURRENCE SELECTOR on the head segment: "NAME[1].field".
+  const selector = dot > 0 ? parseOccurrenceSelector(head) : null;
   if (selector) {
-    const occurrences = occurrencesOf(node, selector.base);
-    if (occurrences.length) {
-      const at = occurrences.find((entry) => entry.index === selector.index);
-      if (!at) {
-        throw new WidgetAddressError(
-          `Node ${node?.id} (${node?.type}) carries no widget named "${selector.base}" at index ` +
-            `${selector.index}. The index is the widget's position in the node, the same one ` +
-            `panel_query_graph's duplicate_widgets reports — valid here: ` +
-            `${describeOccurrences(selector.base, occurrences)}. Nothing was written.`,
-        );
-      }
-      return {
-        name: `${selector.base}${tail}`,
-        occurrenceIndex: at.index,
-        occurrenceLabel: widgetLabel(at.widget),
-      };
-    }
+    const at = pinnedOccurrence(node, selector);
+    if (at) return pin(`${selector.base}${tail}`, at);
   }
 
   // 4. DISPLAY LABEL — last, and only for the WHOLE string, so it can never pre-empt a
@@ -294,7 +337,5 @@ export function resolveWidgetAddress(node, requested) {
   // A label that names a UNIQUE widget still resolves through the ordinary name path —
   // pinning an occurrence there would put an index on a write that never needed one, and
   // needlessly cross the deferral gate below.
-  return occurrences.length > 1
-    ? { name, occurrenceIndex: at.index, occurrenceLabel: requested }
-    : plain(name);
+  return occurrences.length > 1 ? pin(name, at) : plain(name);
 }

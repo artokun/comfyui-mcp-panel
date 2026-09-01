@@ -17934,14 +17934,12 @@ const GRAPH_TOOL_EXECUTORS = {
     //
     // An address that is neither of those forms is returned unchanged with no occurrence, so
     // every call that worked before this line existed takes the identical path.
-    let widgetOccurrenceIndex = null;
-    let widgetOccurrenceLabel = null;
+    let widgetOccurrence = null;
     try {
       const address = resolveWidgetAddress(node, widget);
       if (address) {
         widget = address.name;
-        widgetOccurrenceIndex = address.occurrenceIndex;
-        widgetOccurrenceLabel = address.occurrenceLabel;
+        widgetOccurrence = address.occurrence;
       }
     } catch (err) {
       if (!(err instanceof WidgetAddressError)) throw err;
@@ -17968,7 +17966,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // ordinal resolved now would pin a different row then. Refused rather than replayed
       // against a row nobody chose. Only occurrence-ADDRESSED writes reach this — a bare
       // duplicated name defers exactly as it always has, onto the first row.
-      if (widgetOccurrenceIndex != null) {
+      if (widgetOccurrence) {
         throw new Error(
           `graph_set_widget cannot defer an occurrence-addressed write to "${widget}" on node ` +
             `${node?.id ?? node_id}: the deferred replay re-resolves the widget by NAME, and this ` +
@@ -18863,8 +18861,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // #2143 — WHICH of the same-named rows this address named. Resolved above, against
       // the same node this write targets, and re-applied to the LIVE widget list at the
       // synchronous write boundary rather than pinned to a widget object.
-      occurrenceIndex: widgetOccurrenceIndex,
-      occurrenceLabel: widgetOccurrenceLabel,
+      occurrence: widgetOccurrence,
       // #2116 — if the write lands after this bound, persist the receipt so
       // retry_of can resolve the outcome without a duplicate mutation.
       onLateSuccess: (result) => {

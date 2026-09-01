@@ -185,18 +185,18 @@ function hasValueSetter(widget) {
  * must name the same widget or the readback reports on a row the write never touched, and
  * two local implementations of "the i-th one" is exactly how they came to disagree.
  */
-function liveWidgetAt(node, widgetName, occurrenceIndex = null, occurrenceLabel = null) {
+function liveWidgetAt(node, widgetName, occurrence = null) {
   const widgets = node?.widgets;
   if (!Array.isArray(widgets)) return undefined;
-  if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0) {
-    return widgetAtOccurrence(node, widgetName, occurrenceIndex, occurrenceLabel) ?? undefined;
+  if (occurrence) {
+    return widgetAtOccurrence(node, widgetName, occurrence.index, occurrence) ?? undefined;
   }
   return widgets.find((candidate) => candidate?.name === widgetName);
 }
 
-function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrenceIndex = null, occurrenceLabel = null) {
+function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrence = null) {
   try {
-    const widget = liveWidgetAt(node, widgetName, occurrenceIndex, occurrenceLabel);
+    const widget = liveWidgetAt(node, widgetName, occurrence);
     return widget?.type === "custom" || hasValueSetter(widget);
   } catch {
     return false;
@@ -212,9 +212,9 @@ function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrenceIndex = nul
  * to the honest outcome-unknown rather than verifying against a row nobody addressed.
  * Without either, the behaviour is the first-match read it has always been.
  */
-export function readLiveWidgetValue(node, widgetName, occurrenceIndex = null, occurrenceLabel = null) {
+export function readLiveWidgetValue(node, widgetName, occurrence = null) {
   try {
-    const live = liveWidgetAt(node, widgetName, occurrenceIndex, occurrenceLabel);
+    const live = liveWidgetAt(node, widgetName, occurrence);
     if (!live) return { found: false, value: undefined };
     // `widget` is returned so the caller can attribute the read to the row it came from by
     // IDENTITY (#2143) rather than re-deriving it from the ordinal it asked for.
@@ -255,8 +255,7 @@ export function readLiveWidgetValue(node, widgetName, occurrenceIndex = null, oc
 export async function awaitSetWidgetAck(writePromise, {
   node,
   widget,
-  occurrenceIndex = null,
-  occurrenceLabel = null,
+  occurrence = null,
   requested,
   timeoutMs,
   timers,
@@ -290,7 +289,7 @@ export async function awaitSetWidgetAck(writePromise, {
   captured.then((settled) => {
     if (settled?.ok) noteLateSuccess(honestWidgetAck(settled.result));
   }, () => {});
-  const live = readLiveWidgetValue(node, widget, occurrenceIndex, occurrenceLabel);
+  const live = readLiveWidgetValue(node, widget, occurrence);
   const verified = widgetWriteTimeoutReadback({
     requested,
     actual: live.value,
@@ -437,12 +436,7 @@ const ACK_STATE = Symbol("set-widget-ack-state");
 export async function runSetWidget(node, widgetName, value, opts = {}) {
   if (!opts[ACK_WRAPPED]) {
     const ackState = { abandoned: false };
-    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(
-      node,
-      widgetName,
-      opts.occurrenceIndex ?? null,
-      opts.occurrenceLabel ?? null,
-    );
+    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName, opts.occurrence ?? null);
     return awaitSetWidgetAck(
       runSetWidgetBody(node, widgetName, value, {
         ...opts,
@@ -453,8 +447,7 @@ export async function runSetWidget(node, widgetName, value, opts = {}) {
         node,
         widget: widgetName,
         // #2143 — the ack's own readback must consult the SAME row the write targeted.
-        occurrenceIndex: opts.occurrenceIndex ?? null,
-        occurrenceLabel: opts.occurrenceLabel ?? null,
+        occurrence: opts.occurrence ?? null,
         requested: value,
         timeoutMs: opts.timeoutMs,
         timers: opts.ackTimers,
@@ -592,10 +585,7 @@ async function runSetWidgetBody(
     // classifier, refusal and readback on this path keeps working unchanged; this ordinal is
     // the only thing that says which row. Null for every address that is not explicitly
     // occurrence-scoped, which is every call that existed before #2143.
-    occurrenceIndex = null,
-    // …and the label that row carried when the address was resolved, so a REORDER between
-    // resolution and the write is refused rather than written over (#2143).
-    occurrenceLabel = null,
+    occurrence = null,
   } = {},
 ) {
   const assertNotAbandoned = () => {
@@ -1177,8 +1167,7 @@ async function runSetWidgetBody(
         setDirty,
         assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
         promotedResolution,
-        occurrenceIndex,
-        occurrenceLabel,
+        occurrence,
         ...extra,
       });
       // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
