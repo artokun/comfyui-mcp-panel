@@ -329,6 +329,33 @@ test("#2144 a transient /system_stats miss mid-settle keeps the reading that ans
   assert.equal(settled.after[0].vram_used_mb, 1500);
 });
 
+test("#2144 a miss on the LAST sample keeps the numbers, it does not erase them", async () => {
+  // The mid-settle case is recovered by the next read; this one is not, so the guard that
+  // keeps the last reading that ANSWERED is the only thing standing between a measured
+  // `unload_not_observed` and a numberless bare receipt.
+  const clock = fakeClock();
+  let n = 0;
+  const fetchApi = async () => {
+    n += 1;
+    if (n === 1) return jsonRes(stats(9426, 12282)); // answered, still pinned
+    return jsonRes({}, 503); // and every later sample misses
+  };
+  const before = vramOccupancyFromStats(stats(9426, 12282));
+  const settled = await settleVramOccupancyAfterFree(fetchApi, before, {
+    budgetMs: 300,
+    pollMs: 250,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  assert.ok(n > 1, `the settle must have sampled again, got ${n} read(s)`);
+  assert.notEqual(settled.after, null, "the reading that answered must survive a later miss");
+  assert.equal(settled.after[0].vram_used_mb, 9426);
+  assert.equal(settled.observed, false);
+  const result = freeVramSuccessResult({ before, after: settled.after });
+  assert.equal(result.branch, "unload_not_observed");
+  assert.notEqual(result.branch, "bare_free_receipt");
+  assert.equal(result.occupancy.after_mb, 9426);
+});
 test("#2144 an unreadable settle degrades to the bare receipt, never to a failure", async () => {
   const clock = fakeClock();
   const settled = await settleVramOccupancyAfterFree(async () => jsonRes({}, 500), null, {
