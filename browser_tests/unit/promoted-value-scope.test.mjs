@@ -788,6 +788,92 @@ test("comfyui-mcp#2689: a repair is judged on the STORE, not on a textarea the r
   assert.equal(innerWidget.value, "OLD PROMPT", "and the shared definition is whole");
 });
 
+test("comfyui-mcp#2689: an inner widget that locks after the repair's restore cannot produce a success", () => {
+  // Raised by the merge gate: if the UNDO of a blocked repair is itself rejected, the
+  // re-classification sees the definition sitting on its pre-write value and clears
+  // `definitionMoved` — so, the argument went, a rail that kept the requested value could
+  // return a clean instance-scoped success over a stale definition or display proxy.
+  //
+  // It cannot, and this is the shape that was claimed to do it: the inner widget accepts
+  // the rail's write-through and accepts the repair's restore, then refuses every later
+  // write, so BOTH undo attempts (the captured reference and the post-write clone) fail.
+  // Two things stop it. `definitionMoved` is a LIVE structural read against the pre-write
+  // clone, so "not moved" and "stale definition" are contradictory by construction; and a
+  // display proxy left behind is caught by the #477 branch below it, which does not depend
+  // on the repair at all.
+  const store = new Map();
+  const widgetId = `${ROOT_GRAPH_ID}:293:width`;
+  store.set(widgetId, { name: "width", type: "INT", value: 512, options: {} });
+  const innerWidget = { name: "width", type: "INT" };
+  let backing = 512;
+  let sawNew = false;
+  let locked = false;
+  Object.defineProperty(innerWidget, "value", {
+    get: () => backing,
+    set: (next) => {
+      if (locked) return;
+      backing = next;
+      if (next === 1024) sawNew = true;
+      else if (next === 512 && sawNew) locked = true; // the repair's restore is the last write it takes
+    },
+    configurable: true,
+  });
+  const inner = { id: 10, type: "EmptyLatentImage", widgets: [innerWidget] };
+  const subgraph = { id: "sg", _nodes: [inner], getNodeById: (id) => (String(id) === "10" ? inner : null) };
+  const rail = {
+    name: "width",
+    type: "INT",
+    options: {},
+    get value() {
+      return store.get(widgetId).value;
+    },
+    set value(next) {
+      store.get(widgetId).value = next;
+      innerWidget.value = next; // the write-through
+    },
+    callback(next) {
+      store.get(widgetId).value = next;
+    },
+  };
+  Object.defineProperty(rail, "widgetId", { value: widgetId, enumerable: false, configurable: true });
+  const displayProxy = {
+    name: "width",
+    type: "INT",
+    get value() {
+      return innerWidget.value;
+    },
+    set value(next) {
+      innerWidget.value = next;
+    },
+  };
+  const input = { name: "width", widgetId, _widget: rail, widget: displayProxy, _subgraphSlot: { name: "width" } };
+  const host = {
+    id: 293,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [input],
+    get widgets() {
+      return [rail, displayProxy];
+    },
+  };
+
+  let err = null;
+  let result = null;
+  try {
+    result = applyWidgetWrite(host, "width", 1024, { resolveSource });
+  } catch (e) {
+    err = e;
+  }
+  assert.equal(result, null, "no success may be reported for this shape");
+  assert.ok(err instanceof WidgetWriteError);
+  assert.ok(locked, "precondition: the inner widget really did refuse both undo attempts");
+  assert.match(err.message, /stale parent-facing widget \(#477\)/);
+  // Nothing is left claiming a write: not the definition, not the store, not the proxy.
+  assert.equal(innerWidget.value, 512);
+  assert.equal(store.get(widgetId).value, 512);
+  assert.equal(displayProxy.value, 512);
+});
+
 test("#1707: a failed instance-scoped write does not touch the definition on the ROLLBACK either", () => {
   const sg = makeReusableSubgraph({ definitionValue: 512 });
   const target = sg.instance(293);
