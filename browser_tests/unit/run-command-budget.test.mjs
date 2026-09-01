@@ -89,6 +89,12 @@ import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js
 import { createRunReceiptOutbox } from "../../web/js/lib/run-receipt-outbox.js";
 import { createRehelloGate, routeIsStale } from "../../web/js/lib/rehello-gate.js";
 import { coerceMessageText } from "../../web/js/lib/chat-serialize.js";
+import { graphMutationReconnectGate, reconnectRefusalError } from "../../web/js/lib/reconnect-recovery.js";
+import {
+  captureRunDispatchIdentity,
+  compareRunDispatchIdentity,
+  downgradeUnstableRunResult,
+} from "../../web/js/lib/run-dispatch-identity.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -675,7 +681,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef, runDispatchIdentityRef, resolveRunToNodeTargetRef }) {
   const seen = { dispatchArgs: null };
   const deps = {
     RUN_COMMAND_BUDGET_MS: budgetMs,
@@ -687,10 +693,17 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     window: { LiteGraph: { registered_node_types: {} } },
     getGraphCtx: () => ({ app, graph: app.graph, rootGraph: app.graph }),
     assertGraphBoundToActiveWorkflow: () => {},
+    captureRunDispatchIdentity,
+    compareRunDispatchIdentity,
+    downgradeUnstableRunResult,
+    graphMutationReconnectGate,
+    reconnectRefusalError,
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
     MUTATION_BINDING_BAR,
     // Target resolution is not what this test is about; the run-to-node resolver has its
     // own suite (subgraph-scope). Answer the way it answers for a root-level output node.
-    resolveRunToNodeTarget: () => ({ ok: true, execId: "327", node: { type: "SaveImage" } }),
+    resolveRunToNodeTarget: resolveRunToNodeTargetRef ?? (() => ({ ok: true, execId: "327", node: { type: "SaveImage" } })),
     dispatchScopedRun: async (args) => {
       seen.dispatchArgs = args;
       return dispatch ? dispatch(args) : { outcome: "unverified", queueMark: 1, verified: 0, error: "stub" };
@@ -738,6 +751,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     runReceiptSender: runReceiptSender ?? null,
     runReceiptRouteRef: runReceiptRouteRef ?? (() => null),
     runReceiptSessionRef: runReceiptSessionRef ?? (() => null),
+    runDispatchIdentityRef: runDispatchIdentityRef ?? null,
     panelRunOwnerRef: panelRunOwnerRef ?? { current: {} },
   };
   const names = Object.keys(deps);
@@ -2030,6 +2044,93 @@ test("#1565 P1: a HEALTHY full run is untouched — same accept result, no budge
     const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
     const res = await built.graph_run({});
     assert.deepEqual(res, { queued: true, batch_count: 1, prompt_id: "srv-1" });
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: a reconnect during preflight refuses before any prompt leaves the panel", async () => {
+  const stop = keepAlive();
+  try {
+    const state = { routeId: "route-166", routeReady: true, workflowUuid: "wf-166", reconnectEpoch: 0 };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    app.graphToPrompt = async () => {
+      state.reconnectEpoch = 1;
+      return { output: OUR_OUTPUT, workflow: {} };
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runReceiptRouteRef: () => state.routeId,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    await assert.rejects(
+      () => built.graph_run({}),
+      /panel_run was NOT applied.*reconnect.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "preflight reconnect must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: an accepted receipt is downgraded when reconnect crosses the queue call", async () => {
+  const stop = keepAlive();
+  try {
+    const state = { routeId: "route-166", routeReady: true, workflowUuid: "wf-166", reconnectEpoch: 0 };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late", drainMs: 5 });
+    const queuePrompt = app.queuePrompt;
+    app.queuePrompt = async (...args) => {
+      const result = await queuePrompt(...args);
+      state.reconnectEpoch = 1;
+      return result;
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runReceiptRouteRef: () => state.routeId,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const res = await built.graph_run({});
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "the prompt was genuinely attempted");
+    assert.equal(res.queued_unknown, true, "reconnect makes persistence of the accepted receipt uncertain");
+    assert.equal(res.queued, undefined, "a crossed reconnect must not claim queued:true");
+    assert.equal(res.prompt_id, "srv-1", "the concrete receipt remains available for reconciliation");
+    assert.deepEqual(res.dispatch_identity.changed, ["reconnect"]);
+    assert.match(String(res.retry_guidance), /queue or history/i);
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: a changed run-to-node target refuses before dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    let resolveCalls = 0;
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      resolveRunToNodeTargetRef: () => ({
+        ok: true,
+        execId: resolveCalls++ === 0 ? "327" : "9",
+        node: { type: "SaveImage" },
+      }),
+    });
+    await assert.rejects(
+      () => built.graph_run({ to_node_id: 327 }),
+      /panel_run was NOT applied.*run target.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "a changed target must not reach /prompt");
   } finally {
     stop();
   }
