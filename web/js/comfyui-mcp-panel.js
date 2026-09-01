@@ -399,6 +399,7 @@ import {
   reconnectRefusalError,
   readReconnectRefusal,
   backendSocketIsDown,
+  backendSocketTransportState,
   classifyBackendStatusEvent,
   describeGraphMutationReadiness,
 } from "./lib/reconnect-recovery.js";
@@ -41092,6 +41093,7 @@ function buildPanel() {
     let workflowUuid = null;
     let workflowIdentityProven = false;
     let workflowIdentityAmbiguous = false;
+    let backendSocketState = "unknown";
     try {
       routeId = panelRunReceiptRouteRef();
       routeIdentityProven = typeof routeId === "string" && routeId.trim().length > 0;
@@ -41122,6 +41124,12 @@ function buildPanel() {
         workflowIdentityProven = true;
       }
     } catch {}
+    try {
+      const transportState = backendSocketTransportState({
+        socketReadyState: comfyBackendSocketReadyState(),
+      });
+      backendSocketState = comfyBackendSocketDown === true ? "down" : transportState;
+    } catch {}
     return {
       routeId,
       routeReady,
@@ -41129,7 +41137,7 @@ function buildPanel() {
       workflowUuid,
       workflowIdentityProven,
       workflowIdentityAmbiguous,
-      backendSocketDown: comfyBackendSocketDown === true ? true : comfyBackendSocketDown === false ? false : null,
+      backendSocketState,
       reconnectEpoch: backendReconnectEpoch,
       targetId,
     };

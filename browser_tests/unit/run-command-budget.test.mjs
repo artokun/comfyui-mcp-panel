@@ -760,7 +760,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
         routeIdentityProven: true,
         workflowUuid: PROVEN_WORKFLOW_UUID,
         workflowIdentityProven: true,
-        backendSocketDown: false,
+        backendSocketState: "available",
         reconnectEpoch: 0,
         targetId,
       })),
@@ -2070,7 +2070,7 @@ test("#166 production path: a reconnect during preflight refuses before any prom
       routeIdentityProven: true,
       workflowUuid: PROVEN_WORKFLOW_UUID,
       workflowIdentityProven: true,
-      backendSocketDown: false,
+      backendSocketState: "available",
       reconnectEpoch: 0,
     };
     const apiTarget = { fetchApi: makeServer() };
@@ -2106,7 +2106,7 @@ test("#166 production path: the reconnecting socket signal refuses before prompt
       routeIdentityProven: true,
       workflowUuid: PROVEN_WORKFLOW_UUID,
       workflowIdentityProven: true,
-      backendSocketDown: false,
+      backendSocketState: "available",
       reconnectEpoch: 0,
     };
     const apiTarget = { fetchApi: makeServer() };
@@ -2114,7 +2114,7 @@ test("#166 production path: the reconnecting socket signal refuses before prompt
     app.graphToPrompt = async () => {
       // Models ComfyUI's `reconnecting` event. The epoch does not advance until
       // `reconnected`, so this is the race the old identity provider missed.
-      state.backendSocketDown = true;
+      state.backendSocketState = "down";
       return { output: OUR_OUTPUT, workflow: {} };
     };
     const built = realGraphRun({
@@ -2134,6 +2134,37 @@ test("#166 production path: the reconnecting socket signal refuses before prompt
   }
 });
 
+test("#166 production path: an unknown socket transport refuses before prompt dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-unknown-pre",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "unknown",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    await assert.rejects(
+      () => built.graph_run({}),
+      /panel_run was NOT applied.*backend socket unavailable.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "unknown transport must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
 test("#166 production path: an accepted receipt is downgraded when reconnect crosses the queue call", async () => {
   const stop = keepAlive();
   try {
@@ -2143,7 +2174,7 @@ test("#166 production path: an accepted receipt is downgraded when reconnect cro
       routeIdentityProven: true,
       workflowUuid: PROVEN_WORKFLOW_UUID,
       workflowIdentityProven: true,
-      backendSocketDown: false,
+      backendSocketState: "available",
       reconnectEpoch: 0,
     };
     const apiTarget = { fetchApi: makeServer() };
@@ -2174,6 +2205,44 @@ test("#166 production path: an accepted receipt is downgraded when reconnect cro
   }
 });
 
+test("#166 production path: an unknown transport after queueing downgrades the accepted receipt", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-unknown-post",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late", drainMs: 5 });
+    const queuePrompt = app.queuePrompt;
+    app.queuePrompt = async (...args) => {
+      const result = await queuePrompt(...args);
+      state.backendSocketState = "unknown";
+      return result;
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const result = await built.graph_run({});
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "the prompt was genuinely attempted");
+    assert.equal(result.queued_unknown, true, "unknown transport makes persistence uncertain");
+    assert.equal(result.queued, undefined, "unknown transport must not claim queued:true");
+    assert.equal(result.prompt_id, "srv-1", "the concrete receipt remains available for reconciliation");
+    assert.deepEqual(result.dispatch_identity.changed, ["backend socket unavailable"]);
+  } finally {
+    stop();
+  }
+});
+
 test("#166 production path: a crossed socket-down rejection keeps its receipt unknown", async () => {
   const stop = keepAlive();
   try {
@@ -2183,7 +2252,7 @@ test("#166 production path: a crossed socket-down rejection keeps its receipt un
       routeIdentityProven: true,
       workflowUuid: PROVEN_WORKFLOW_UUID,
       workflowIdentityProven: true,
-      backendSocketDown: false,
+      backendSocketState: "available",
       reconnectEpoch: 0,
     };
     const apiTarget = {
@@ -2199,7 +2268,7 @@ test("#166 production path: a crossed socket-down rejection keeps its receipt un
     const queuePrompt = app.queuePrompt;
     app.queuePrompt = async (...args) => {
       const result = await queuePrompt(...args);
-      state.backendSocketDown = true;
+      state.backendSocketState = "down";
       return result;
     };
     const built = realGraphRun({
@@ -2230,7 +2299,7 @@ test("#166 production path: an ordinary rejection stays queued:false across sock
       routeIdentityProven: true,
       workflowUuid: PROVEN_WORKFLOW_UUID,
       workflowIdentityProven: true,
-      backendSocketDown: false,
+      backendSocketState: "available",
       reconnectEpoch: 0,
     };
     const apiTarget = {
@@ -2245,7 +2314,7 @@ test("#166 production path: an ordinary rejection stays queued:false across sock
     const queuePrompt = app.queuePrompt;
     app.queuePrompt = async (...args) => {
       const result = await queuePrompt(...args);
-      state.backendSocketDown = true;
+      state.backendSocketState = "down";
       return result;
     };
     const built = realGraphRun({
@@ -2281,7 +2350,7 @@ test("#166 production path: an absent workflow identity refuses even when the ro
         routeIdentityProven: true,
         workflowUuid: null,
         workflowIdentityProven: false,
-        backendSocketDown: false,
+        backendSocketState: "available",
         reconnectEpoch: 0,
         targetId,
       }),
@@ -2312,7 +2381,7 @@ test("#166 production path: an absent route identity refuses even when the route
         routeIdentityProven: false,
         workflowUuid: PROVEN_WORKFLOW_UUID,
         workflowIdentityProven: true,
-        backendSocketDown: false,
+        backendSocketState: "available",
         reconnectEpoch: 0,
         targetId,
       }),
@@ -2339,7 +2408,7 @@ test("#166 production path: invalid and ambiguous workflow identities refuse bef
           routeIdentityProven: true,
           workflowUuid: "not-a-uuid",
           workflowIdentityProven: true,
-          backendSocketDown: false,
+          backendSocketState: "available",
           reconnectEpoch: 0,
         },
         expected: /panel_run was NOT applied.*workflow identity unavailable.*nothing was sent/,
@@ -2353,7 +2422,7 @@ test("#166 production path: invalid and ambiguous workflow identities refuse bef
           workflowUuid: PROVEN_WORKFLOW_UUID,
           workflowIdentityProven: true,
           workflowIdentityAmbiguous: true,
-          backendSocketDown: false,
+          backendSocketState: "available",
           reconnectEpoch: 0,
         },
         expected: /panel_run was NOT applied.*workflow identity ambiguous.*nothing was sent/,

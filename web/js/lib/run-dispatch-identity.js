@@ -6,6 +6,9 @@
  * in place while the panel was waiting for the frontend queue wrapper.
  * Missing or unproven identities are not stable merely because both reads are
  * null; callers must provide explicit proof for every dispatch identity.
+ * Transport proof is three-state: only `available` authorizes a stable
+ * comparison. A legacy boolean `false` without a ready-state proof is
+ * normalized to `unknown`, never to proven availability.
  * Keep this comparison dependency-free so the executor can fail closed and
  * the production-path tests can drive the exact boundary.
  */
@@ -34,6 +37,8 @@ export function captureRunDispatchIdentity({
   workflowUuid = null,
   workflowIdentityProven = false,
   workflowIdentityAmbiguous = false,
+  backendSocketState = null,
+  // Legacy boolean-only readers cannot prove that false means an OPEN socket.
   backendSocketDown = null,
   reconnectEpoch = null,
   targetId = null,
@@ -41,8 +46,11 @@ export function captureRunDispatchIdentity({
   const normalizedWorkflowUuid = text(workflowUuid);
   const normalizedRouteId = text(routeId);
   const ambiguous = workflowIdentityAmbiguous === true;
-  const normalizedBackendSocketDown =
-    backendSocketDown === true ? true : backendSocketDown === false ? false : null;
+  const normalizedBackendSocketState = ["available", "down", "unknown"].includes(backendSocketState)
+    ? backendSocketState
+    : backendSocketDown === true
+      ? "down"
+      : "unknown";
   return {
     routeId: normalizedRouteId,
     routeReady: routeReady === true,
@@ -51,7 +59,7 @@ export function captureRunDispatchIdentity({
     workflowIdentityProven:
       workflowIdentityProven === true && !ambiguous && canonicalWorkflowUuid(normalizedWorkflowUuid),
     workflowIdentityAmbiguous: ambiguous,
-    backendSocketDown: normalizedBackendSocketDown,
+    backendSocketState: normalizedBackendSocketState,
     reconnectEpoch: epoch(reconnectEpoch),
     targetId: text(targetId),
   };
@@ -66,9 +74,9 @@ export function compareRunDispatchIdentity(before, after) {
   const right = captureRunDispatchIdentity(after);
   const changed = [];
   if (left.reconnectEpoch !== right.reconnectEpoch) changed.push("reconnect");
-  if (left.backendSocketDown === true || right.backendSocketDown === true) {
+  if (left.backendSocketState === "down" || right.backendSocketState === "down") {
     changed.push("backend socket down");
-  } else if (left.backendSocketDown !== false || right.backendSocketDown !== false) {
+  } else if (left.backendSocketState !== "available" || right.backendSocketState !== "available") {
     changed.push("backend socket unavailable");
   }
   if (left.routeId !== right.routeId) changed.push("bridge route");

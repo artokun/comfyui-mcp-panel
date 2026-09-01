@@ -26,6 +26,7 @@ import {
   reconnectRefusalError,
   readReconnectRefusal,
   backendSocketIsDown,
+  backendSocketTransportState,
   classifyBackendStatusEvent,
   describeGraphMutationReadiness,
   WS_OPEN,
@@ -36,6 +37,15 @@ const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
 
 const instantSleep = () => Promise.resolve();
+
+test("#166: dispatch transport state proves OPEN, known non-OPEN, and unknown", () => {
+  assert.equal(backendSocketTransportState({ socketReadyState: WS_OPEN }), "available");
+  assert.equal(backendSocketTransportState({ socketReadyState: 0 }), "down", "CONNECTING");
+  assert.equal(backendSocketTransportState({ socketReadyState: 2 }), "down", "CLOSING");
+  assert.equal(backendSocketTransportState({ socketReadyState: 3 }), "down", "CLOSED");
+  assert.equal(backendSocketTransportState({}), "unknown", "missing readyState");
+  assert.equal(backendSocketTransportState({ socketReadyState: NaN }), "unknown", "invalid readyState");
+});
 
 // ---------------------------------------------------------------------------
 // watchPostReconnectSettle
