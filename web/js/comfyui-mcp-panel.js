@@ -72,7 +72,11 @@ import {
 } from "./lib/widget-write.js";
 import { missingWidgetMessage } from "./lib/missing-widget.js";
 import { resolveWidgetAddress, WidgetAddressError } from "./lib/widget-occurrence.js";
-import { freeVramSuccessResult, readVramOccupancy } from "./lib/vram-occupancy.js";
+import {
+  freeVramSuccessResult,
+  readVramOccupancy,
+  settleVramOccupancyAfterFree,
+} from "./lib/vram-occupancy.js";
 import { nodeInstanceIdentity } from "./lib/node-identity.js";
 import { describeVoiceError } from "./lib/voice-error.js";
 import { voiceRecognitionLang } from "./lib/voice-language.js";
@@ -27632,8 +27636,16 @@ const GRAPH_TOOL_EXECUTORS = {
         }),
       );
     }
-    const after = await readVramOccupancy((path, init) => api.fetchApi(path, init));
-    return freeVramSuccessResult({ before, after });
+    // #2144 — the /free 200 above is a receipt that ComfyUI SET a flag on its prompt queue,
+    // not that any memory moved: the unload runs later, on the prompt-worker thread. Reading
+    // occupancy on this line used to race that thread and report the PRE-free numbers as
+    // `verified_system_stats … freed_mb: 0`. Settle instead — poll until occupancy drops, or
+    // until the budget expires and the reply says PENDING rather than claiming a free.
+    const { after, waitedMs, polls } = await settleVramOccupancyAfterFree(
+      (path, init) => api.fetchApi(path, init),
+      before,
+    );
+    return freeVramSuccessResult({ before, after, waitedMs, polls });
   },
 };
 
@@ -32194,6 +32206,17 @@ function describeCommand(cmd, msg, reply) {
       };
     }
     case "free_vram":
+      // #2144 — the executor no longer claims freed:true on occupancy it re-read and watched
+      // NOT move, so this row must not keep saying "freed VRAM" for that reply either. A
+      // pending unload is the flag being queued behind whatever the worker thread is doing.
+      if (r.freed === false)
+        return {
+          icon: "pi-info-circle",
+          text: tr(
+            "panel.free_vram_pending",
+            "Asked ComfyUI to unload models — VRAM not freed yet",
+          ),
+        };
       return { icon: "pi-bolt", text: tr("panel.unloaded_models_freed_vram", "Unloaded models — freed VRAM") };
     case "workflow_save":
       return { icon: "pi-save", text: tr("panel.workflow_saved", "Saved “{workflow}”", { workflow: r.workflow }) };
