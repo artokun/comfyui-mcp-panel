@@ -28932,6 +28932,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         const inFlightMark = rehelloGate.began(msg.cmd);
         const settleRid = commandRidLedger.begin(msg.rid, fingerprint, commandEpoch);
         let reply;
+        // #584 — an agent-commanded frontend reload must ACK on this socket
+        // before the page navigates and tears that socket down. The callback is
+        // deliberately kept out of the wire result and consumed only after the
+        // reply has actually been handed to this socket below.
+        let afterReply = null;
         // #581 — retain the tracker belonging to the command's completed edit.
         // We schedule its full-graph serialization only after the bridge reply
         // has been handed to the socket below, so a large nested subgraph cannot
@@ -28982,7 +28987,20 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             if (!onReload) throw new Error("This panel build can't soft-reload.");
             const scope = msg.scope === "frontend" ? "frontend" : "orchestrator";
             if (scope === "frontend") {
-              result = await onReload(scope);
+              const reloadDecision = await onReload(scope);
+              if (
+                reloadDecision &&
+                typeof reloadDecision === "object" &&
+                Object.prototype.hasOwnProperty.call(reloadDecision, "afterReply")
+              ) {
+                if (typeof reloadDecision.afterReply !== "function") {
+                  throw new Error("The frontend reload did not provide a valid post-reply action.");
+                }
+                afterReply = reloadDecision.afterReply;
+                result = reloadDecision.result;
+              } else {
+                result = reloadDecision;
+              }
               if (result == null) throw new Error("The frontend reload did not produce a decision.");
             } else {
               result = `soft reload (${scope}) scheduled`;
@@ -29421,17 +29439,33 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // sender with no outcome at all — the "registered tab that never acknowledges
         // anything" wedge. So: always attempt the reply; gate only the UI continuation.
         const superseded = !isActive();
+        let replyDelivered = false;
         if (deliverReply(reply, msg.cmd, superseded, inFlightMark)) {
+          replyDelivered = true;
           // #402 — the open receipt records that its answer was handed to a live socket.
           // ADVISORY only: a socket can still die before the bytes land, so this never
           // becomes a claim about what the caller received — only `applied` is that.
           markOpenReceiptReplySent(openReceipts, msg.rid);
         }
+        if (superseded) return;
+        // #584 — only a successful, non-superseded ACK may release the deferred
+        // frontend navigation. If the socket was already lost, do not run a
+        // stale command's destructive continuation on a replacement session.
+        let navigatedAfterReply = false;
+        if (replyDelivered && !superseded && reply?.ok && afterReply) {
+          const finishReload = afterReply;
+          afterReply = null;
+          try {
+            navigatedAfterReply = finishReload() === true;
+          } catch (err) {
+            console.warn("[comfyui-mcp-panel] deferred frontend reload navigation failed:", err);
+          }
+        }
+        if (navigatedAfterReply) return;
         // panel#1563 r2 — ownership, re-read on every attempt: the retry chain can still
         // be armed when another workflow opens, and a capture writes the LIVE canvas into
         // this tracker's state. See `trackerStillOwnsCanvas`.
         deferChangeTrackerSnapshot(changeTrackerToSnapshot, undefined, undefined, trackerStillOwnsCanvas);
-        if (superseded) return;
         // ask_user / request_secret paint their OWN cards and their replies carry
         // user input (a choice, or a SECRET) — never echo them as an activity card
         // (and never record them). The CivitAI/training DRIVE cmds animate the
@@ -43572,6 +43606,9 @@ function buildPanel() {
           clearSidebarReopen: () => ssSet(SIDEBAR_REOPEN_KEY, null),
           appendSystem,
           armNotice: () => armReloadBlockedNotice({ notify: (m) => appendSystem(m) }),
+          // #584 — return the decision to the bridge before it navigates, so
+          // panel_reload does not wait for a reply from a destroyed socket.
+          deferNavigation: true,
           navigate: () => {
             try {
               const u = new URL(window.location.href);
@@ -43583,7 +43620,10 @@ function buildPanel() {
           },
         });
         if (!reloadResult.ok) throw new Error(reloadResult.error);
-        return `soft reload (${scope}) scheduled`;
+        return {
+          result: `soft reload (${scope}) scheduled`,
+          afterReply: reloadResult.afterReply,
+        };
       }
       // Nothing to respawn — just re-fetch the panel with a cache-bust. The
       // session id persists in sessionStorage, so we reconnect + resume on load.
