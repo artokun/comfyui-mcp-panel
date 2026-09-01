@@ -676,19 +676,14 @@ function ideogramQueueTimeDerivedInput(node) {
   }
 }
 
-/**
- * The cycle guard for collectVolatileInputs' walk (comfyui-mcp#2699). Graph-object
- * dedup cannot be used — see the walk — so termination rests on this bound, the
- * same one and for the same reason as use-everywhere-links.js's MAX_UE_WALK_DEPTH.
- */
-const MAX_VOLATILE_WALK_DEPTH = 16;
-
 export function collectVolatileInputs(rootGraph) {
   const pairs = new Set();
   const addPair = (execId, name) => {
     if (name != null) pairs.add(`${execId} ${String(name)}`);
   };
-  const walk = (graph, prefix, depth) => {
+  // comfyui-mcp#2699 — the ANCESTOR PATH, not a visited set. See the walk.
+  const onPath = new Set();
+  const walk = (graph, prefix) => {
     // comfyui-mcp#2699 — the walk MUST NOT dedup by graph object. ComfyUI's
     // subgraph INSTANCES share one definition object, and every pair emitted
     // here is prefixed with the INSTANCE's execId — so a `seen.has(graph)`
@@ -699,12 +694,21 @@ export function collectVolatileInputs(rootGraph) {
     // `model` widget was excluded at `100:29` and hashed at `135:29`, so every
     // scoped run was refused as "the graph CHANGED" naming exactly
     // `135:29 model` — deterministically, on an idle canvas, retry included.
-    // use-everywhere-links.js states this same constraint for its own walk and
-    // uses a depth bound as its cycle guard; this is the same bound, for the
-    // same reason. Nesting is shallow by construction (a subgraph cannot
-    // contain itself), so re-walking a shared definition per instance is what
-    // correctness costs here.
-    if (!graph || depth <= 0) return;
+    // use-everywhere-links.js states this same constraint for its own walk.
+    //
+    // Termination is therefore a CYCLE guard on the current ancestor path, not
+    // a fixed depth cap (codex gate r1, P1): ComfyUI documents subgraph nesting
+    // far deeper than any cap worth writing, and a cap that trips would silently
+    // drop exclusions in the deepest subgraph — reintroducing exactly the
+    // permanent "graph CHANGED" refusal this fix removes, one level further
+    // down. A definition cannot legally contain itself, so a definition already
+    // on its OWN path is malformed and stops there; every other nesting shape
+    // is a finite DAG whose expansion is the flattened prompt. The walk visits
+    // one entry per flattened prompt node — the same size canonicalizePrompt
+    // already iterates — so per-instance re-walking costs nothing this path was
+    // not already paying.
+    if (!graph || onPath.has(graph)) return;
+    onPath.add(graph);
     for (const node of graph._nodes ?? []) {
       if (!node || node.id == null) continue;
       const execId = prefix ? `${prefix}:${node.id}` : String(node.id);
@@ -791,10 +795,14 @@ export function collectVolatileInputs(rootGraph) {
       // backed input drift-covered.
       const ideogramDerivedInput = ideogramQueueTimeDerivedInput(node);
       if (ideogramDerivedInput != null) addPair(execId, ideogramDerivedInput);
-      if (node.subgraph) walk(node.subgraph, execId, depth - 1);
+      if (node.subgraph) walk(node.subgraph, execId);
     }
+    // Leave the path so a SIBLING instance of this same definition is still
+    // walked — dropping this line turns the cycle guard back into the
+    // once-per-definition dedup that caused comfyui-mcp#2699.
+    onPath.delete(graph);
   };
-  walk(rootGraph, "", MAX_VOLATILE_WALK_DEPTH);
+  walk(rootGraph, "");
   // #1273 — THE THIRD VOLATILITY SIGNAL. cg-use-everywhere's queuePrompt patch
   // converts its broadcasts to REAL links before the post body is serialized
   // and restores them after, so the stamp's graphToPrompt and the dispatch's

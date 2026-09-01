@@ -1376,19 +1376,37 @@ test("#2699 promptContentHash: a real edit INSIDE the second instance is still d
   );
 });
 
-test("#2699 collectVolatileInputs: a self-referencing definition terminates on the depth bound", () => {
-  // Dropping the graph-object dedup means termination now rests on the depth
-  // bound alone. ComfyUI forbids a subgraph containing itself, but a malformed
+test("#2699 collectVolatileInputs: a self-referencing definition terminates on the ancestor-path cycle guard", () => {
+  // Dropping the graph-object dedup means termination now rests on the cycle
+  // guard alone. ComfyUI forbids a subgraph containing itself, but a malformed
   // or hand-edited file must not hang the stamp path — it runs before EVERY
-  // scoped dispatch.
+  // scoped dispatch. A definition already on its OWN path stops there; the
+  // instances reached before the cycle keep full coverage.
   const definition = { _nodes: [minimaxH3Node(29)] };
   definition._nodes.push({ id: 7, widgets: [], inputs: [], subgraph: definition });
   const pairs = collectVolatileInputs({ _nodes: [{ id: 1, widgets: [], inputs: [], subgraph: definition }] });
-  assert.ok(pairs.has("1:29 clip"), "the reachable instances are still covered");
-  assert.ok(pairs.has("1:7:29 clip"), "…including one level down");
+  assert.ok(pairs.has("1:29 clip"), "the reachable instance is still covered");
+  assert.ok(!pairs.has("1:7:29 clip"), "the self-reference is where the walk stops");
   assert.ok(pairs.size > 0 && pairs.size < 200, `bounded, not unbounded (got ${pairs.size})`);
 });
 
+test("#2699 collectVolatileInputs: coverage does not stop at an arbitrary nesting depth", () => {
+  // codex gate r1, P1 — a fixed depth cap silently drops the exclusions of the
+  // DEEPEST subgraph, which is the same permanent "graph CHANGED" refusal this
+  // fix removes, just one level further down. ComfyUI's own subgraph docs put
+  // the supported nesting far past any cap worth writing, so there is no cap.
+  const DEPTH = 40;
+  let inner = { _nodes: [minimaxH3Node(29)] };
+  const path = [];
+  for (let i = DEPTH; i >= 1; i--) {
+    path.unshift(i);
+    inner = { _nodes: [{ id: i, widgets: [], inputs: [], subgraph: inner }] };
+  }
+  const pairs = collectVolatileInputs(inner);
+  const deepest = `${path.join(":")}:29 clip`;
+  assert.ok(pairs.has(deepest), `the widget ${DEPTH} levels down is covered (${deepest})`);
+  assert.ok(!pairs.has(`${path.join(":")}:29 prompt`), "and its unlinked sibling still is not");
+});
 test("#1331 promptContentHash: hookless randomize seed churn is not drift — a sibling edit still is", () => {
   const control = hooklessControl("randomize");
   const seed = { name: "noise_seed", value: 111, linkedWidgets: [control] };
