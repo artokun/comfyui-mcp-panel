@@ -18858,9 +18858,11 @@ const GRAPH_TOOL_EXECUTORS = {
       // #2109 — locating the enclosing SubgraphNode when this call addressed the
       // inner promoted terminal (the subgraph is the current view).
       rootGraph,
-      // #2143 — WHICH of the same-named rows this address named. Resolved above, against
-      // the same node this write targets, and re-applied to the LIVE widget list at the
-      // synchronous write boundary rather than pinned to a widget object.
+      // #2143 — WHICH of the same-named rows this address named: `{index, of, label, widget}`,
+      // resolved above against the same node this write targets. Re-applied to the LIVE
+      // widget list at the synchronous write boundary, never followed blindly — the row
+      // object is there to be COMPARED, so a rebuild across the /object_info await is caught
+      // rather than written over.
       occurrence: widgetOccurrence,
       // #2116 — if the write lands after this bound, persist the receipt so
       // retry_of can resolve the outcome without a duplicate mutation.

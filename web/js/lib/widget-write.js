@@ -2583,12 +2583,12 @@ export function applyWidgetWrite(
     // a non-empty string as written. Default false ⇒ the unreadable case is a RETRYABLE
     // combo rejection, so a transient callback failure is re-read before any decision.
     acceptUnreadableComboOptions = false,
-    // #2143 — WHICH of several widgets sharing this name the caller addressed. Resolved
-    // once at the command boundary (graph_set_widget) from the "NAME[i]" / display-label
-    // form, and re-applied HERE against the live widget list rather than pinned to a widget
-    // object: an rgthree Fast Groups node rebuilds its toggle rows whenever the groups it
-    // matches change, so a captured object can be detached from the node by write time
-    // while the ordinal still names the row the caller meant.
+    // #2143 — WHICH of several widgets sharing this name the caller addressed:
+    // `{index, of, label, widget}`, resolved once at the command boundary (graph_set_widget)
+    // from the "NAME[i]" / display-label form. Re-applied HERE against the LIVE widget list;
+    // the row object it carries is COMPARED, never followed, because an rgthree Fast Groups
+    // node rebuilds its toggle rows whenever the groups it matches change and a captured
+    // object can be detached from the node by write time.
     occurrence = null,
     // #2143 — OUT-param: filled with `valueWidget`, the widget object this write's value
     // landed on. The post-write retention check re-reads THAT object rather than whatever is
