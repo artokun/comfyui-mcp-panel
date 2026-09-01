@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_reload({scope:"frontend"}) now acknowledges a successful soft reload before cache-busted navigation, with a final fail-closed workflow fence so stale-bundle recovery does not time out on the socket it is replacing (#584)
+
 ## [0.15.150] - 2026-09-01
 
 ### Fixed

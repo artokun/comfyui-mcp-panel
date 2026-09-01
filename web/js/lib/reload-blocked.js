@@ -167,7 +167,8 @@ export function reloadBlockerUnreadableMessage() {
  * @param {(message: string) => void} deps.appendSystem
  * @param {() => void} deps.armNotice
  * @param {() => void} deps.navigate
- * @returns {Promise<{ok: true}|{ok: false, stage: string, error: string}>}
+ * @param {boolean} deps.deferNavigation
+ * @returns {Promise<{ok: true, afterReply?: () => boolean}|{ok: false, stage: string, error: string}>}
  */
 export async function runAgentFrontendReload({
   getBlockers,
@@ -176,6 +177,7 @@ export async function runAgentFrontendReload({
   appendSystem,
   armNotice,
   navigate,
+  deferNavigation = false,
 } = {}) {
   // #1839 — an empty array is the CLEAN signal that permits navigation, so
   // returning [] on a throw made an unreadable blocker state mean "nothing is
@@ -220,6 +222,27 @@ export async function runAgentFrontendReload({
   if (!beforeNavigation.readable) return refuse("pre-navigation", [], false);
   if (beforeNavigation.blockers.length) return refuse("pre-navigation", beforeNavigation.blockers);
 
+  // A commanded frontend reload must let the bridge hand its success reply to
+  // the caller before the page tears down the very socket carrying that reply.
+  // This last fence runs in the same task as the eventual navigation, so the
+  // deferred path does not trade the timeout fix for a dirty-workflow TOCTOU.
+  const finalizeNavigation = () => {
+    const final = blockersNow();
+    if (!final.readable) {
+      refuse("post-reply", [], false);
+      return false;
+    }
+    if (final.blockers.length) {
+      refuse("post-reply", final.blockers);
+      return false;
+    }
+    armNotice?.();
+    navigate?.();
+    return true;
+  };
+  if (deferNavigation) return { ok: true, afterReply: finalizeNavigation };
+  // Preserve the original direct-call behavior for callers that do not need
+  // to hand a bridge reply across the navigation boundary.
   armNotice?.();
   navigate?.();
   return { ok: true };

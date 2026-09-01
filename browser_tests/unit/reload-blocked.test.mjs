@@ -470,7 +470,7 @@ test("#1830 lifecycle: the bridge returns the post-prime refusal to the agent", 
   }
 });
 
-test("#1830 WIRING: the frontend soft_reload awaits the decision and returns its refusal", async () => {
+test("#1830/#584 WIRING: frontend soft_reload awaits the decision and returns its refusal", async () => {
   const { readFileSync } = await import("node:fs")
   const { fileURLToPath } = await import("node:url")
   const { dirname, join } = await import("node:path")
@@ -481,11 +481,113 @@ test("#1830 WIRING: the frontend soft_reload awaits the decision and returns its
   const i = src.indexOf('msg.cmd === "soft_reload"')
   assert.ok(i > 0)
   const block = src.slice(i, i + 1800)
-  assert.match(block, /if \(scope === "frontend"\)\s*\{\s*result = await onReload\(scope\)/)
+  assert.match(block, /if \(scope === "frontend"\)\s*\{\s*const reloadDecision = await onReload\(scope\)/)
   assert.match(block, /if \(result == null\) throw new Error\("The frontend reload did not produce a decision\."\)/)
+  assert.match(block, /afterReply = reloadDecision\.afterReply/)
   assert.match(block, /else \{[\s\S]*setTimeout\(\(\) => onReload\(scope\), 60\)/)
   assert.doesNotMatch(block, /setTimeout\(\(\) => onReload\(scope\), 60\)[\s\S]*if \(scope === "frontend"\)/)
 })
+
+test("#584 deferred frontend reload rechecks blockers after the bridge decision", async () => {
+  let reads = 0;
+  let dirty = false;
+  let armed = 0;
+  let navigations = 0;
+  const surfaced = [];
+  const result = await runAgentFrontendReload({
+    getBlockers: () => {
+      reads += 1;
+      return dirty ? ["Untitled.json"] : [];
+    },
+    prime: async () => {},
+    clearSidebarReopen: () => {},
+    appendSystem: (message) => surfaced.push(message),
+    armNotice: () => { armed += 1; },
+    navigate: () => { navigations += 1; },
+    deferNavigation: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(typeof result.afterReply, "function");
+  assert.equal(reads, 3, "the decision still runs the initial, post-prime, and pre-navigation fences");
+  assert.equal(armed, 0, "the notice waits until after the bridge reply");
+  assert.equal(navigations, 0, "navigation waits until after the bridge reply");
+
+  dirty = true;
+  assert.equal(result.afterReply(), false, "a new edit after the decision refuses the destructive action");
+  assert.equal(reads, 4, "the deferred action performs its own final blocker read");
+  assert.equal(armed, 0, "a post-reply refusal never arms the cancelled-navigation notice");
+  assert.equal(navigations, 0, "a post-reply refusal never navigates");
+  assert.equal(surfaced.length, 1);
+  assert.match(surfaced[0], /Did NOT reload/);
+});
+
+test("#584 deferred frontend reload refuses an unreadable post-ACK blocker state", async () => {
+  let reads = 0;
+  let armed = 0;
+  let navigations = 0;
+  const surfaced = [];
+  const result = await runAgentFrontendReload({
+    getBlockers: () => {
+      reads += 1;
+      if (reads === 4) throw new Error("openWorkflows unavailable");
+      return [];
+    },
+    prime: async () => {},
+    clearSidebarReopen: () => {},
+    appendSystem: (message) => surfaced.push(message),
+    armNotice: () => { armed += 1; },
+    navigate: () => { navigations += 1; },
+    deferNavigation: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.afterReply(), false);
+  assert.equal(reads, 4);
+  assert.equal(armed, 0, "an unreadable final fence never arms navigation recovery");
+  assert.equal(navigations, 0, "an unreadable final fence never navigates");
+  assert.deepEqual(surfaced, [reloadBlockerUnreadableMessage()]);
+});
+
+test("#584 production bridge: frontend soft_reload ACK is handed over before navigation", async () => {
+  let commandSocket = null;
+  const events = [];
+  const onReload = async (scope) => {
+    assert.equal(scope, "frontend");
+    const decision = await runAgentFrontendReload({
+      getBlockers: () => [],
+      prime: async () => {},
+      clearSidebarReopen: () => {},
+      appendSystem: () => {},
+      armNotice: () => { events.push("arm"); },
+      navigate: () => {
+        events.push("navigate");
+        commandSocket.close();
+      },
+      deferNavigation: true,
+    });
+    if (!decision.ok) throw new Error(decision.error);
+    return { result: `soft reload (${scope}) scheduled`, afterReply: decision.afterReply };
+  };
+  const built = buildCommandReplyClient(onReload);
+  try {
+    built.client.start();
+    commandSocket = built.socket();
+    commandSocket.open();
+    commandSocket.receive({ type: "models", epoch: "epoch-584", models: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    commandSocket.receive({ rid: "reload-rid-584", cmd: "soft_reload", scope: "frontend", epoch: "epoch-584" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const reply = commandSocket.sent.find((frame) => frame.rid === "reload-rid-584");
+    assert.ok(reply, "the command reply must be sent before the reload closes the socket");
+    assert.equal(reply.ok, true);
+    assert.deepEqual(events, ["arm", "navigate"]);
+    assert.equal(commandSocket.readyState, CommandReplySocket.CLOSED, "the simulated page navigation closes the bridge");
+  } finally {
+    built.client.stop();
+  }
+});
 
 // #1839 — a destructive reload used to fail OPEN when the blocker read threw.
 // blockersNow() caught and returned [], and [] is the CLEAN signal that permits
