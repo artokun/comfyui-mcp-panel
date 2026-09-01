@@ -1195,6 +1195,51 @@ test("#2143: a flush reorder does not make retention refuse a write that landed"
   assert.equal(row0.value, "a", "the other row was never written — there was no retry");
 });
 
+test("#2143: a reply RESHAPED by a post-write refresh keeps its row identity", async () => {
+  // `write()` does not always hand back applyWidgetWrite's own reply — the #1282 dynamic-input
+  // press and the #1932 generated-widget rebuild each SPREAD it into a new object to attach
+  // their disclosure. While the written row was recorded against the pre-spread reply, every
+  // downstream consumer held a different object, so the lookup missed: retention fell back to
+  // a position an `Update inputs` callback had already invalidated, and refused a write that
+  // had landed.
+  //
+  // Driven through the real runSetWidget with a node that both reorders its rows and triggers
+  // the dynamic-input refresh, so the reply that comes back is a reshaped one.
+  let callbacks = 0;
+  const node = {
+    id: 1,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    inputs: [],
+    widgets: [],
+  };
+  const row0 = { name: "row", type: "string", value: "a" };
+  const row1 = {
+    name: "row",
+    type: "string",
+    value: "b",
+    callback() {
+      callbacks += 1;
+      // The reorder AND the slot rebuild an "Update inputs" press performs.
+      node.widgets = [row1, row0];
+      node.inputs = [{ name: "grown" }];
+    },
+  };
+  node.widgets = [row0, row1];
+
+  const res = await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: row1 },
+  });
+
+  assert.equal(res.set.value, "new");
+  assert.equal(row1.value, "new", "the addressed row holds the value");
+  assert.equal(row0.value, "a", "the other row was never written — there was no retry");
+  assert.equal(callbacks, 1, "one callback, one mutation");
+  assert.equal(res.set.widget_occurrence.index, 0, "and the reply names where that row ended up");
+});
+
 test("#2143: a rename during the flush cannot publish an address under the old name", async () => {
   // The rename case again, in the flush window this time. The reply's `widget` is the name
   // that was written; counting rows under the widget's NEW name would publish `{index, of}`

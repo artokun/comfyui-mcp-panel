@@ -1105,7 +1105,7 @@ async function runSetWidgetBody(
   // to the orchestrator and a widget reaches the whole graph through `node.graph`.
   const writtenWidgets = new WeakMap();
 
-  const write = (extra = {}) => {
+  const writeAttempt = (extra, writeOut) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
     // flight therefore refuses before touching either canvas; retry and upload
@@ -1168,7 +1168,6 @@ async function runSetWidgetBody(
     // shared write path is not on offer, and pretending otherwise is what cost a round.
     const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
     try {
-      const writeOut = {};
       const set = applyWidgetWrite(node, widgetName, value, {
         resolveSource,
         canvas,
@@ -1181,7 +1180,6 @@ async function runSetWidgetBody(
         out: writeOut,
         ...extra,
       });
-      if (set && typeof set === "object" && writeOut.valueWidget) writtenWidgets.set(set, writeOut);
       // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
       // landed on, inside the SAME synchronous stretch (no await since the fence, so
       // the press cannot interleave with a workflow switch or another command frame).
@@ -1281,6 +1279,27 @@ async function runSetWidgetBody(
       }
       throw err;
     }
+  };
+
+  /**
+   * #2143 — REGISTER THE WRITTEN ROW AGAINST THE OBJECT THE CALLER ACTUALLY RECEIVES.
+   *
+   * `writeAttempt` does not always return applyWidgetWrite's own reply: the #1282 dynamic-input
+   * press and the #1932 generated-widget rebuild each SPREAD it into a new object to attach
+   * their disclosure. Keying the WeakMap inside, on the pre-spread reply, therefore pinned an
+   * object nobody downstream ever holds — retention looked the row up, missed, and fell back
+   * to a position that a reordering `Update inputs` callback had already invalidated, refusing
+   * an applied write. Registering out here, on whatever comes back, is immune to that: it
+   * cannot be defeated by a spread added later, because there is exactly one place the value
+   * leaves this function.
+   */
+  const write = (extra = {}) => {
+    const writeOut = {};
+    const result = writeAttempt(extra, writeOut);
+    if (result && typeof result === "object" && writeOut.valueWidget) {
+      writtenWidgets.set(result, writeOut);
+    }
+    return result;
   };
 
   const flushFrontendWidgets =
