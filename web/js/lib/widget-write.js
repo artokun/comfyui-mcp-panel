@@ -3312,11 +3312,24 @@ export function applyWidgetWrite(
     // whatever was last assigned — including the pre-write value we just restored FROM.
     const innerAfterWrite = w.value;
     const innerAfterWriteClone = deepClone(innerAfterWrite);
+    // In its OWN undo envelope, like the rollback below — and for the same reason.
+    // These hooks ARE litegraph's `graph.beforeChange`/`afterChange` (see the panel's call
+    // site), and `panel_set_widget` advertises "Undoable with Ctrl+Z". A mutation of the
+    // SHARED definition taken outside a bracket is invisible to that history: the snapshot
+    // taken when the write's envelope closed still holds the write-through this repair
+    // removes, so a redo would put the leak back into every sibling instance. Bracketed,
+    // the repair is a step of its own and the history and the live graph agree.
+    safeBefore();
     try {
       restoreWidgetValue(w, previous);
     } catch {
-      /* the read-back on the next line is authoritative */
+      /* the read-back below is authoritative */
+    } finally {
+      safeAfter();
     }
+    // Read AFTER that envelope closed, never inside it: an afterChange hook can itself
+    // re-stale a widget or re-run a setter, and the accept decision has to see what the
+    // hooks LEFT — the same discipline the write's own verification follows.
     const innerRestored = structurallyEqual(w.value, previousClone);
     const railKeptValue = strictlyRetained(valueWidget);
     const displaysKeptValue = displayWidgets.every((dw) => strictlyRetained(dw));
@@ -3329,17 +3342,26 @@ export function applyWidgetWrite(
       // value back is the definition being unrestorable; a stale display proxy is neither
       // — the value stores separated fine and a parent-facing VIEW did not.
       definitionRepairBlockedBy = !railKeptValue ? "rail" : !innerRestored ? "inner" : "display";
+      // The undo is bracketed too — it is a second mutation of the shared definition, and
+      // leaving it out of the history would strand the repair's step there with nothing
+      // that reverses it. Each restore keeps its own catch inside the one envelope, so a
+      // throwing setter on the first cannot skip the clone fallback.
+      safeBefore();
       try {
-        restoreWidgetValue(w, innerAfterWrite);
-      } catch {
-        /* re-classified from the LIVE value below, not from what was attempted */
-      }
-      if (!structurallyEqual(w.value, innerAfterWriteClone)) {
         try {
-          restoreWidgetValue(w, innerAfterWriteClone);
+          restoreWidgetValue(w, innerAfterWrite);
         } catch {
-          /* still re-classified from the LIVE value below */
+          /* re-classified from the LIVE value below, not from what was attempted */
         }
+        if (!structurallyEqual(w.value, innerAfterWriteClone)) {
+          try {
+            restoreWidgetValue(w, innerAfterWriteClone);
+          } catch {
+            /* still re-classified from the LIVE value below */
+          }
+        }
+      } finally {
+        safeAfter();
       }
       // Taken from what is actually there now, never from what the undo tried to do: an
       // inner widget that refused to take the write-through value back is not a moved
