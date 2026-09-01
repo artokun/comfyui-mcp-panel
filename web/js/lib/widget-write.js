@@ -563,6 +563,38 @@ const FAST_GROUPS_TOGGLE_WIDGET = "RGTHREE_TOGGLE_AND_NAV";
 const NODE_MODE_REPEATER_TYPE = "Mute / Bypass Repeater (rgthree)";
 const NODE_MODE_RELAY_TYPE = "Mute / Bypass Relay (rgthree)";
 
+// #2151 — rgthree's NON-group Fast Bypasser / Fast Muter rows are the same kind of action
+// control, reached through a different mechanism, and they were left on the ordinary
+// assign-then-fire-the-callback path. That path is actively destructive here, because the row's
+// callback IGNORES the value the write just assigned. From the pack's own
+// `base_node_mode_changer.js` (shipped, unminified), one row per linked node:
+//
+//     widget.doModeChange = (forceValue, skipOtherNodeCheck) => {
+//       let newValue = forceValue == null ? linkedNode.mode === this.modeOff : forceValue;
+//       ...
+//       changeModeOfNodes(linkedNode, (newValue ? this.modeOn : this.modeOff));
+//       widget.value = newValue;
+//     };
+//     widget.callback = () => { widget.doModeChange(); };
+//
+// The callback takes NO arguments, so `forceValue == null` always, so the new value is derived
+// from THE LINKED NODE'S CURRENT MODE. The row's callback is a TOGGLE, not a setter.
+//
+// Measured against this module before the fix, with a fixture transcribed from that file:
+//   - write `false` to a row whose linked node is ALWAYS  -> toggles to bypass. Correct BY LUCK.
+//   - write `false` to a row whose linked node is already BYPASSED -> toggles it back to
+//     ALWAYS. The read-back then fails and rolls the ROW value back, but nothing rolls the
+//     linked node's mode back, so the caller is told the write failed while the node they
+//     asked to disable has been silently RE-ENABLED and renders (#2151).
+//   - write `true` to an already-enabled row -> the same inversion in the other direction:
+//     the node is silently BYPASSED.
+//
+// So the requested value only has to AGREE with the row for the write to invert the graph. The
+// fix drives `doModeChange(requested)` — the pack's own forced-value entry point, the one
+// `forceWidgetOn`/`forceWidgetOff` use — and journals the reachable modes for rollback, exactly
+// as #2146 does for the group rows.
+const FAST_MODE_CHANGER_TYPES = new Set(["Fast Bypasser (rgthree)", "Fast Muter (rgthree)"]);
+
 function runtimeNodeType(node) {
   try {
     if (typeof node?.type === "string") return node.type;
@@ -589,11 +621,48 @@ function isModePassThrough(node) {
 }
 
 function modeTransactionFailure(node, detail) {
+  // #2151 — names the node's OWN type instead of always saying "Fast Groups Bypasser". The
+  // journal now covers Fast Bypasser / Fast Muter too, and a refusal that names the wrong node
+  // kind sends the reader to the wrong pack code.
+  const kind = runtimeNodeType(node) || "rgthree mode changer";
   return new WidgetWriteError(
-    `Cannot set widget on node ${node?.id} (${node?.type}): cannot establish the Fast Groups ` +
-      `Bypasser mode rollback boundary (${detail}); refusing before the callback can mutate ` +
-      `linked node modes (#2146).`,
+    `Cannot set widget on node ${node?.id} (${node?.type}): cannot establish the ${kind} ` +
+      `mode rollback boundary (${detail}); refusing before the row action can mutate ` +
+      `linked node modes (#2146/#2151).`,
   );
+}
+
+/**
+ * #2151 — which mode-journal seeding this node+row needs, or null when it needs none.
+ *
+ *   "groups" — Fast Groups Bypasser: seed from each toggle row's matched GROUP (#2146).
+ *   "linked" — Fast Bypasser / Fast Muter: seed from the nodes wired into this node's inputs,
+ *              which is the set its rows' `doModeChange` closures can reach.
+ *
+ * The "linked" arm is keyed on the node type AND on the row exposing a callable `doModeChange`,
+ * deliberately. The type alone would hijack any other widget these nodes may carry; the method
+ * alone would claim an unrelated node that happens to define one. `doModeChange` is rgthree's
+ * own row API (`forceWidgetOn`/`forceWidgetOff` call it), so its presence is what makes the row
+ * a mode-changer row — the NAME cannot be used, because the pack mints it from the linked node's
+ * title (`Enable ${linkedNode.title}`) and it is different on every row of every graph.
+ */
+function fastModeTransactionKind(node, widget) {
+  const type = runtimeNodeType(node);
+  if (type === FAST_GROUPS_BYPASSER_TYPE) {
+    return normalizedWidgetBaseName(widget?.name) === FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
+      ? "groups"
+      : null;
+  }
+  if (!FAST_MODE_CHANGER_TYPES.has(type)) return null;
+  let doModeChange;
+  try {
+    doModeChange = widget?.doModeChange;
+  } catch {
+    // An unreadable accessor on a node type whose rows DO mutate modes is exactly the case that
+    // must not fall through to the naive path.
+    throw modeTransactionFailure(node, "the row's mode action is unreadable");
+  }
+  return typeof doModeChange === "function" ? "linked" : null;
 }
 
 function relayDispatchesMode(node, owner) {
@@ -626,36 +695,34 @@ function relayDispatchesMode(node, owner) {
  * used to verify the canonical action changed a reachable mode and to roll it back on failure.
  */
 function captureFastBypasserModeTransaction(node, writtenWidget) {
-  if (
-    runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
-    normalizedWidgetBaseName(writtenWidget?.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
-  ) {
-    return null;
-  }
+  const kind = fastModeTransactionKind(node, writtenWidget);
+  if (!kind) return null;
 
-  const rows = [
-    writtenWidget,
-    ...(Array.isArray(node?.widgets) ? node.widgets : []),
-  ].filter((candidate, index, all) => {
-    if (!candidate || normalizedWidgetBaseName(candidate.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()) {
-      return false;
-    }
-    return all.indexOf(candidate) === index;
-  });
   const groups = [];
-  for (const row of rows) {
-    let group;
-    try {
-      group = row.group;
-    } catch {
-      throw modeTransactionFailure(node, "a toggle row's group is unreadable");
+  if (kind === "groups") {
+    const rows = [
+      writtenWidget,
+      ...(Array.isArray(node?.widgets) ? node.widgets : []),
+    ].filter((candidate, index, all) => {
+      if (!candidate || normalizedWidgetBaseName(candidate.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()) {
+        return false;
+      }
+      return all.indexOf(candidate) === index;
+    });
+    for (const row of rows) {
+      let group;
+      try {
+        group = row.group;
+      } catch {
+        throw modeTransactionFailure(node, "a toggle row's group is unreadable");
+      }
+      if (!group || (typeof group !== "object" && typeof group !== "function")) {
+        throw modeTransactionFailure(node, "a toggle row has no live group");
+      }
+      if (!groups.includes(group)) groups.push(group);
     }
-    if (!group || (typeof group !== "object" && typeof group !== "function")) {
-      throw modeTransactionFailure(node, "a toggle row has no live group");
-    }
-    if (!groups.includes(group)) groups.push(group);
+    if (!groups.length) throw modeTransactionFailure(node, "no live toggle-row group was found");
   }
-  if (!groups.length) throw modeTransactionFailure(node, "no live toggle-row group was found");
 
   const entries = [];
   const seenNodes = new Set();
@@ -782,6 +849,38 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
     for (const groupNode of groupNodes) addNodeTree(groupNode);
   }
 
+  // #2151 — Fast Bypasser / Fast Muter seeding. Each row's `doModeChange` closes over ONE
+  // linked node, and the pack derives those from `getConnectedInputNodesAndFilterPassThroughs`
+  // over this node's inputs. `connectedRoots(..., "input", ...)` walks exactly that: it follows
+  // Reroute / Node Combiner / Node Collector (rgthree's `PassThroughFollowing.ALL`, mirrored by
+  // `isModePassThrough`) and captures the first non-pass-through origin on each chain.
+  //
+  // The union across ALL rows, not just the written one, matching the group arm above: the
+  // widget-to-linked-node mapping is positional inside the pack (`widgets[index]` ↔
+  // `linkedNodes[index]`) and is not exposed on the row, so which single node this row reaches
+  // is not knowable from here. A journal that is a superset of what the action can touch still
+  // restores correctly; a subset would not, so the superset is the fail-safe direction.
+  //
+  // `addNodeTree` already descends subgraphs, which is what `changeModeOfNodes` does
+  // (`reduceNodesDepthFirst` walks `node.subgraph.nodes`), and it already marks repeaters and
+  // dispatching relays so the propagation drain below follows them.
+  if (kind === "linked") {
+    let inputs;
+    try {
+      inputs = node?.inputs;
+    } catch {
+      throw modeTransactionFailure(node, "the node's inputs are unreadable");
+    }
+    if (!Array.isArray(inputs)) throw modeTransactionFailure(node, "the node has no readable input list");
+    connectedRoots(node, "input", null, false);
+    // A row exists only because the pack found a linked node for it. If we cannot see that node,
+    // the rollback boundary is not established and the action must not run — the whole point of
+    // the journal is that `doModeChange` mutates modes this writer would otherwise not restore.
+    if (!entries.length) {
+      throw modeTransactionFailure(node, "no linked node was reachable from the row's inputs");
+    }
+  }
+
   while (propagationQueue.length) {
     const current = propagationQueue.shift();
     const type = runtimeNodeType(current);
@@ -866,11 +965,48 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
 }
 
 function resolveFastBypasserAction(node, widget, coerced, previous) {
-  if (
-    runtimeNodeType(node) !== FAST_GROUPS_BYPASSER_TYPE ||
-    normalizedWidgetBaseName(widget?.name) !== FAST_GROUPS_TOGGLE_WIDGET.toLowerCase()
-  ) {
-    return null;
+  const kind = fastModeTransactionKind(node, widget);
+  if (!kind) return null;
+  // #2151 — Fast Bypasser / Fast Muter row. Its value is a plain boolean and its canonical
+  // FORCED-VALUE entry point is `doModeChange(value)`, the same one the node's own
+  // `forceWidgetOn` / `forceWidgetOff` use. Driving it — rather than assigning `.value` and
+  // firing `widget.callback`, which derives the new value from the linked node's current mode
+  // and therefore TOGGLES — is what makes this write a setter.
+  if (kind === "linked") {
+    if (typeof coerced !== "boolean") {
+      // Refuse rather than fall through: the fall-through IS the destructive path.
+      throw modeTransactionFailure(
+        node,
+        `the row action takes a boolean and the value is ${JSON.stringify(coerced)}`,
+      );
+    }
+    let doModeChange;
+    try {
+      doModeChange = widget.doModeChange;
+    } catch {
+      throw modeTransactionFailure(node, "the row's mode action is unreadable");
+    }
+    if (typeof doModeChange !== "function") {
+      throw modeTransactionFailure(node, "the live row has no canonical mode action");
+    }
+    return {
+      action: doModeChange,
+      requested: coerced,
+      // Deliberately FALSE, unlike the group arm. That assertion ("a reachable mode must have
+      // changed") is right for a toggle whose requested value differs from the row's, and wrong
+      // for a forced value: the row's value and its linked node's mode diverge routinely —
+      // bypassing the node on canvas with Ctrl+B moves the mode while the row keeps its old
+      // value, because the pack re-syncs a row only when its NAME changes. Forcing the already-
+      // correct mode is then a legitimate no-op repair, and asserting a mode change would fail
+      // it and roll back a write that did exactly what was asked.
+      //
+      // What verifies this path instead is that the value is NOT assigned here: `doModeChange`
+      // sets `widget.value = newValue` itself, on the line after `changeModeOfNodes`, so the
+      // ordinary read-back seeing the requested value establishes that the action ran AND that
+      // it ran with `newValue === requested` — i.e. that it set the linked node's mode to the
+      // matching one. A stub that changed nothing would leave the row on its old value and fail.
+      requiresModeChange: false,
+    };
   }
   if (
     coerced === null ||
@@ -892,7 +1028,7 @@ function resolveFastBypasserAction(node, widget, coerced, previous) {
     throw modeTransactionFailure(node, "the live row has no canonical toggle action");
   }
   return {
-    toggle,
+    action: toggle,
     requested: coerced.toggled,
     requiresModeChange: previous?.toggled !== coerced.toggled,
   };
@@ -3330,7 +3466,10 @@ export function applyWidgetWrite(
     // here, so it needs no callback of its own.
     if (!instanceScoped) {
       if (fastBypasserAction) {
-        Reflect.apply(fastBypasserAction.toggle, valueWidget, [fastBypasserAction.requested]);
+        // #2146 group row: `toggle(value)`. #2151 Fast Bypasser / Fast Muter row:
+        // `doModeChange(value)`. Both take the forced value as their first argument and both
+        // set the row's own value themselves, which is why nothing is assigned here.
+        Reflect.apply(fastBypasserAction.action, valueWidget, [fastBypasserAction.requested]);
       } else {
         assignWidgetValue(w, coerced);
       }
