@@ -55,7 +55,13 @@ function defineMode(node, initial) {
  * `RGTHREE_TOGGLE_AND_NAV`. Each row's action moves only ITS OWN group's node modes, which
  * is what makes "which occurrence was written" observable rather than cosmetic.
  */
-function twoGroupBypasser({ labels = ["Enable VRAM optimizations 1", "Enable VRAM optimizations 2"] } = {}) {
+function twoGroupBypasser({
+  labels = ["Enable VRAM optimizations 1", "Enable VRAM optimizations 2"],
+  // A widget BEFORE the toggle rows. With it, the position of a row and its ordinal among
+  // same-named rows differ by one — which is the only shape that can tell the two apart,
+  // and the shape `duplicate_widgets` reports indexes 1 and 2 for.
+  lead = false,
+} = {}) {
   const members = [
     [
       { id: 11, type: "LoadAudio" },
@@ -87,6 +93,7 @@ function twoGroupBypasser({ labels = ["Enable VRAM optimizations 1", "Enable VRA
     properties: {},
     widgets: [],
   };
+  if (lead) bypasser.widgets.push({ name: "matchColors", type: "string", value: "" });
 
   const rows = members.map((groupNodes, i) => {
     const group = {
@@ -361,6 +368,34 @@ test("#2143: an occurrence-0 address is explicit about the row every bare name t
   const fixture = twoGroupBypasser();
   applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrenceIndex: 0 });
   assert.deepEqual(fixture.modes(), [[4, 4], [0, 0]]);
+});
+
+test("#2143: the WRITE indexes positions, not occurrences, when a widget precedes the rows", () => {
+  // Without a leading widget the two readings coincide and a per-name-ordinal write passes
+  // every behavioural test in this file. With one they diverge: `ROW[1]` is the FIRST toggle
+  // row, so an ordinal reading would silently bypass the SECOND group instead.
+  const fixture = twoGroupBypasser({ lead: true });
+  assert.deepEqual(
+    duplicateWidgetRows(fixture.bypasser)[ROW].map((r) => r.index),
+    [1, 2],
+    "the read publishes positions 1 and 2 on this node",
+  );
+
+  applyWidgetWrite(fixture.bypasser, ROW, { toggled: false }, { occurrenceIndex: 1 });
+  assert.deepEqual(fixture.modes(), [[4, 4], [0, 0]], "index 1 is the FIRST group's row");
+
+  const other = twoGroupBypasser({ lead: true });
+  applyWidgetWrite(other.bypasser, ROW, { toggled: false }, { occurrenceIndex: 2 });
+  assert.deepEqual(other.modes(), [[0, 0], [4, 4]], "index 2 is the SECOND group's row");
+
+  // …and index 0 is the leading widget, not a toggle row, so it is refused rather than
+  // resolved to whichever row an ordinal would have picked.
+  const third = twoGroupBypasser({ lead: true });
+  assert.throws(
+    () => applyWidgetWrite(third.bypasser, ROW, { toggled: false }, { occurrenceIndex: 0 }),
+    WidgetWriteError,
+  );
+  assert.deepEqual(third.modes(), [[0, 0], [0, 0]], "nothing moved");
 });
 
 test("#2143: a sub-field address reaches the addressed occurrence too", () => {
@@ -639,4 +674,21 @@ test("#2143: runSetWidget forwards the ordinal to the write and to its own ack r
   assert.match(setWidgetSource, /widgetAtOccurrence\(node, widgetName, occurrenceIndex, occurrenceLabel\)/);
   // …and report which row it read.
   assert.match(setWidgetSource, /widget_occurrence: live\.widget \? widgetOccurrenceOf\(node, live\.widget\) : null/);
+  // …and the ack WRAPPER must hand both halves of the address on. The readback can only
+  // honour a pin it was given, so dropping either here is invisible to every test that
+  // calls readLiveWidgetValue directly.
+  assert.match(setWidgetSource, /occurrenceIndex: opts\.occurrenceIndex \?\? null,/);
+  assert.match(setWidgetSource, /occurrenceLabel: opts\.occurrenceLabel \?\? null,/);
+});
+
+test("#2143: the write resolves the row through the SHARED definition, not its own copy", () => {
+  const widgetWriteSource = readFileSync(
+    new URL("../../web/js/lib/widget-write.js", import.meta.url),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  // The defect the gate caught between rounds was two local implementations of "the i-th
+  // one" drifting apart — the write moved to positions, the readback stayed on ordinals.
+  // Keeping both call sites on the one exported rule is what stops them naming different
+  // widgets again.
+  assert.match(widgetWriteSource, /return widgetAtOccurrence\(node, wanted, occurrenceIndex\);/);
 });
