@@ -139,12 +139,19 @@ function widgetValuesEqual(expected, actual) {
  * equals the request, the mutation already landed and must not be reported
  * as outcome-unknown.
  *
+ * #2143 — `widget_occurrence` rides along when the write addressed one of several widgets
+ * sharing a name. This receipt is a full stand-in for the write's own reply, so without it
+ * a duplicate-row write that landed after the bound came back naming only
+ * `RGTHREE_TOGGLE_AND_NAV` — the very ambiguity the address was chosen to remove, restored
+ * by the one path that reports on a write it did not itself perform.
+ *
  * @param {{
  *   requested?: any,
  *   actual?: any,
  *   found?: boolean,
  *   node_id?: any,
  *   widget?: any,
+ *   widget_occurrence?: {index: number, of: number, label?: string} | null,
  *   delivered?: boolean,
  * }} [input]
  */
@@ -154,6 +161,7 @@ export function widgetWriteTimeoutReadback({
   found = false,
   node_id,
   widget,
+  widget_occurrence = null,
   delivered = true,
 } = {}) {
   if (!delivered) return honestWidgetAck({}, { timeout: true });
@@ -161,7 +169,12 @@ export function widgetWriteTimeoutReadback({
     return {
       applied: true,
       verified: true,
-      set: { node_id, widget, value: actual },
+      set: {
+        node_id,
+        widget,
+        ...(widget_occurrence ? { widget_occurrence } : {}),
+        value: actual,
+      },
       ack_note: APPLIED_AND_VERIFIED_NOTE,
     };
   }

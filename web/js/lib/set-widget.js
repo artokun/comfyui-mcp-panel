@@ -59,6 +59,7 @@ import {
 } from "./input-asset.js";
 import { withTimeout } from "./bounded-step.js";
 import { honestWidgetAck, widgetWriteTimeoutReadback } from "./delivery-ack.js";
+import { widgetOccurrenceOf, widgetAtOccurrence } from "./widget-occurrence.js";
 
 /**
  * Fire an undo-history hook that can never escape.
@@ -169,9 +170,32 @@ function hasValueSetter(widget) {
   return false;
 }
 
-function shouldAbandonSetWidgetOnTimeout(node, widgetName) {
+/**
+ * The widget a `(name, occurrence)` address names on the LIVE node, never throwing.
+ *
+ * #2143 — the address matters here for the same reason it matters at the write: on a node
+ * with several widgets sharing one name, `find(w => w.name === n)` answers about the FIRST
+ * row whichever row was written. For the timeout readback below that is not merely
+ * imprecise — another row's value can equal the requested one while the row the write
+ * targeted never changed, and the ack would then report "applied and verified" about a
+ * write whose outcome is genuinely unknown.
+ *
+ * `widgetAtOccurrence` is SHARED with the write's own resolution, deliberately: these two
+ * must name the same widget or the readback reports on a row the write never touched, and
+ * two local implementations of "the i-th one" is exactly how they came to disagree.
+ */
+function liveWidgetAt(node, widgetName, occurrence = null) {
+  const widgets = node?.widgets;
+  if (!Array.isArray(widgets)) return undefined;
+  if (occurrence) {
+    return widgetAtOccurrence(node, widgetName, occurrence.index, occurrence) ?? undefined;
+  }
+  return widgets.find((candidate) => candidate?.name === widgetName);
+}
+
+function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrence = null) {
   try {
-    const widget = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    const widget = liveWidgetAt(node, widgetName, occurrence);
     return widget?.type === "custom" || hasValueSetter(widget);
   } catch {
     return false;
@@ -181,12 +205,19 @@ function shouldAbandonSetWidgetOnTimeout(node, widgetName) {
 /**
  * #2025 — never-throwing live read of one named widget. Used by the timeout
  * readback so a missing node or a hostile getter cannot replace the ack.
+ * #2143 — `occurrence` is the pin the address resolved to: `{index, of, label, widget}`,
+ * where `index` is the widget's POSITION on the node (the number `duplicate_widgets`
+ * publishes). A row that moved reads as NOT FOUND, which downgrades the ack to the honest
+ * outcome-unknown rather than verifying against a row nobody addressed. Without it, the
+ * behaviour is the first-match read it has always been.
  */
-export function readLiveWidgetValue(node, widgetName) {
+export function readLiveWidgetValue(node, widgetName, occurrence = null) {
   try {
-    const live = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    const live = liveWidgetAt(node, widgetName, occurrence);
     if (!live) return { found: false, value: undefined };
-    return { found: true, value: live.value };
+    // `widget` is returned so the caller can attribute the read to the row it came from by
+    // IDENTITY (#2143) rather than re-deriving it from the ordinal it asked for.
+    return { found: true, value: live.value, widget: live };
   } catch {
     return { found: false, value: undefined };
   }
@@ -223,6 +254,7 @@ export function readLiveWidgetValue(node, widgetName) {
 export async function awaitSetWidgetAck(writePromise, {
   node,
   widget,
+  occurrence = null,
   requested,
   timeoutMs,
   timers,
@@ -256,13 +288,17 @@ export async function awaitSetWidgetAck(writePromise, {
   captured.then((settled) => {
     if (settled?.ok) noteLateSuccess(honestWidgetAck(settled.result));
   }, () => {});
-  const live = readLiveWidgetValue(node, widget);
+  const live = readLiveWidgetValue(node, widget, occurrence);
   const verified = widgetWriteTimeoutReadback({
     requested,
     actual: live.value,
     found: live.found,
     node_id: node?.id,
     widget,
+    // #2143 — this receipt stands in for the write's own reply, so it must carry the same
+    // row attribution. Derived from the widget that was actually READ (by identity), not
+    // from the requested ordinal, so it describes the row this readback saw.
+    widget_occurrence: live.widget ? widgetOccurrenceOf(node, live.widget) : null,
     delivered,
   });
   // Only short-circuit when the live widget already equals the request. A
@@ -399,7 +435,7 @@ const ACK_STATE = Symbol("set-widget-ack-state");
 export async function runSetWidget(node, widgetName, value, opts = {}) {
   if (!opts[ACK_WRAPPED]) {
     const ackState = { abandoned: false };
-    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName);
+    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName, opts.occurrence ?? null);
     return awaitSetWidgetAck(
       runSetWidgetBody(node, widgetName, value, {
         ...opts,
@@ -409,6 +445,8 @@ export async function runSetWidget(node, widgetName, value, opts = {}) {
       {
         node,
         widget: widgetName,
+        // #2143 — the ack's own readback must consult the SAME row the write targeted.
+        occurrence: opts.occurrence ?? null,
         requested: value,
         timeoutMs: opts.timeoutMs,
         timers: opts.ackTimers,
@@ -540,6 +578,13 @@ async function runSetWidgetBody(
     awaitFrontendWidgetFlush: awaitFrontendWidgetFlushInjected,
     [ACK_STATE]: ackState,
     clear,
+    // #2143 — WHICH of several widgets sharing `widgetName` the caller addressed, resolved
+    // at the command boundary from the "NAME[i]" / display-label form. `widgetName` itself is
+    // always the widget's REAL name by the time it reaches here, so every name-keyed
+    // classifier, refusal and readback on this path keeps working unchanged; this ordinal is
+    // the only thing that says which row. Null for every address that is not explicitly
+    // occurrence-scoped, which is every call that existed before #2143.
+    occurrence = null,
   } = {},
 ) {
   const assertNotAbandoned = () => {
@@ -1050,7 +1095,17 @@ async function runSetWidgetBody(
             `${err.message}`,
         );
 
-  const write = (extra = {}) => {
+  // #2143 — what each write ATTEMPT landed on, keyed by the reply it produced: the widget
+  // object, its node, and the occurrence captured before the write. `retainVerifiedWrite`
+  // below awaits a frontend flush, and that flush can reorder or rebuild the node's rows
+  // AFTER applyWidgetWrite resolved the reported address — so both the retention re-read and
+  // the address in the reply have to be re-answered from the written row itself. Per attempt,
+  // because `rewrite()` re-enters this closure and a rebuild between the two can hand the
+  // retry a different row. A WeakMap rather than a reply field: the reply is JSON-serialized
+  // to the orchestrator and a widget reaches the whole graph through `node.graph`.
+  const writtenWidgets = new WeakMap();
+
+  const writeAttempt = (extra, writeOut) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
     // flight therefore refuses before touching either canvas; retry and upload
@@ -1121,6 +1176,8 @@ async function runSetWidgetBody(
         setDirty,
         assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
         promotedResolution,
+        occurrence,
+        out: writeOut,
         ...extra,
       });
       // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
@@ -1224,6 +1281,27 @@ async function runSetWidgetBody(
     }
   };
 
+  /**
+   * #2143 — REGISTER THE WRITTEN ROW AGAINST THE OBJECT THE CALLER ACTUALLY RECEIVES.
+   *
+   * `writeAttempt` does not always return applyWidgetWrite's own reply: the #1282 dynamic-input
+   * press and the #1932 generated-widget rebuild each SPREAD it into a new object to attach
+   * their disclosure. Keying the WeakMap inside, on the pre-spread reply, therefore pinned an
+   * object nobody downstream ever holds — retention looked the row up, missed, and fell back
+   * to a position that a reordering `Update inputs` callback had already invalidated, refusing
+   * an applied write. Registering out here, on whatever comes back, is immune to that: it
+   * cannot be defeated by a spread added later, because there is exactly one place the value
+   * leaves this function.
+   */
+  const write = (extra = {}) => {
+    const writeOut = {};
+    const result = writeAttempt(extra, writeOut);
+    if (result && typeof result === "object" && writeOut.valueWidget) {
+      writtenWidgets.set(result, writeOut);
+    }
+    return result;
+  };
+
   const flushFrontendWidgets =
     typeof awaitFrontendWidgetFlushInjected === "function"
       ? awaitFrontendWidgetFlushInjected
@@ -1250,8 +1328,62 @@ async function runSetWidgetBody(
     const hosts = [node, resolvedTargetNode, authTarget].filter(Boolean);
     const prefer = hosts.filter((host) => host.id === set?.node_id);
     const rest = hosts.filter((host) => host.id !== set?.node_id);
+    // #2143 — WHICH row, when the name is carried by more than one. `find` by name answers
+    // about the FIRST, so a verified write to row 1 was checked against row 0's value: the
+    // retention check would see a mismatch it could not fix, retry the write, see it again,
+    // and REFUSE — reporting "nothing was applied" about a mutation that had landed twice.
+    // The occurrence comes off the write's own reply, so it names the row the write actually
+    // reached (including the bare-name case, where row 0 was chosen implicitly) rather than
+    // the ordinal the request asked for. Absent for every unique name, where `find` is exact.
+    //
+    // IDENTITY FIRST, because the index CAN be stale by the time this runs. It is resolved
+    // at the end of applyWidgetWrite, and the flush awaited just above happens after that —
+    // long enough for the node to reorder its rows again. Re-reading by position then
+    // verifies a row nothing wrote to, or, when its value differs, retries and refuses an
+    // already-applied write. Only while the row is still ATTACHED: a rebuild that detached it
+    // leaves an object whose `.value` reads a widget the canvas no longer draws.
+    const written = writtenWidgets.get(set);
+    if (written?.valueWidget) {
+      for (const host of [...prefer, ...rest]) {
+        if (Array.isArray(host.widgets) && host.widgets.includes(written.valueWidget)) {
+          try {
+            return { found: true, value: written.valueWidget.value };
+          } catch {
+            return { found: false, value: undefined };
+          }
+        }
+      }
+    }
+    // NAME AND POSITION — the fallback once the written row is gone. Two things are
+    // deliberately NOT required here, for different reasons:
+    //
+    //   * the pinned LABEL adds nothing. `set.widget_occurrence` is resolved AFTER the write
+    //     (see widget-write.js), so its label is already the post-write reading and a
+    //     comparison against the live row is a tautology. It is left out because it would
+    //     assert a check it does not perform, not because it would be harmful — that was
+    //     true while the occurrence was captured pre-write, and stopped being true when the
+    //     reported index became a live address.
+    //   * requiring IDENTITY here would refuse every rebuild that CARRIES THE VALUE FORWARD,
+    //     which is the ordinary thing a rebuild does. From this vantage "the row I wrote was
+    //     replaced by one already holding the value" and "the rebuild kept my value" are the
+    //     same observation, and the second is the common case — so refusing would report
+    //     failure for a command whose asked-for effect is on the canvas at the address the
+    //     caller gave.
+    //
+    // What this check answers is #1922's question — is the value in effect on the row the
+    // node now draws there — not a question about causation. The retry is not left
+    // unguarded: `rewrite()` goes back through applyWidgetWrite, whose pin refuses a row
+    // that MOVED, and refuses outright when a rebuild left rows nothing can tell apart.
+    //
+    // And the one thing this cannot establish is not swallowed: when the verdict came from a
+    // row that is NOT the one that was written, `withLiveOccurrence` has already found the
+    // written row detached, so the reply carries `widget_occurrence.stale`. The caller is
+    // told the index no longer names the row they addressed — as data, not prose.
+    const occurrence = set?.widget_occurrence;
     for (const host of [...prefer, ...rest]) {
-      const live = host.widgets?.find((candidate) => candidate?.name === set?.widget);
+      const live = occurrence
+        ? widgetAtOccurrence(host, set?.widget, occurrence.index)
+        : host.widgets?.find((candidate) => candidate?.name === set?.widget);
       if (live) return { found: true, value: live.value };
     }
     return { found: false, value: undefined };
@@ -1269,17 +1401,47 @@ async function runSetWidgetBody(
    * write once more (the init has now run, which is why the reporter's second
    * call stuck); if it still does not hold, refuse.
    */
+  /**
+   * #2143 — RE-RESOLVE THE REPORTED ADDRESS AFTER THE FLUSH.
+   *
+   * `widget_occurrence.index` is the number a caller sends straight back as "NAME[i]".
+   * applyWidgetWrite resolves it as the last thing it does, but the flush below happens
+   * after that and the node can reorder or rebuild its rows in that window — so the number
+   * that reaches the caller has to be answered again, from the written row, at the moment
+   * the reply is formed. Same rule applyWidgetWrite uses: a live position when the row
+   * still has one, otherwise the pre-write capture flagged `stale` so the caller knows
+   * which row was written without being handed a number to reuse.
+   *
+   * Applied on retainVerifiedWrite's OWN returns rather than at each ack site. There are
+   * two of those — the ordinary success and the stale/unreadable-combo recovery — and the
+   * recovery one was missed when this lived at the call site, which is the whole argument
+   * for putting it where the flush is instead of where the reply is.
+   */
+  const withLiveOccurrence = (set) => {
+    const written = writtenWidgets.get(set);
+    if (!written?.valueWidget || !set || typeof set !== "object") return set;
+    const live = widgetOccurrenceOf(written.valueNode, written.valueWidget, set.widget);
+    const next =
+      live ?? (written.preWriteOccurrence ? { ...written.preWriteOccurrence, stale: true } : null);
+    if (next === null) {
+      if (!("widget_occurrence" in set)) return set;
+      const { widget_occurrence: _dropped, ...rest } = set;
+      return rest;
+    }
+    return { ...set, widget_occurrence: next };
+  };
+
   async function retainVerifiedWrite(set, rewrite) {
     await flushFrontendWidgets();
     assertNotAbandoned();
     assertTargetStillCurrentNow();
-    if (widgetStillHolds(set)) return set;
+    if (widgetStillHolds(set)) return withLiveOccurrence(set);
     assertNotAbandoned();
     const retried = rewrite();
     await flushFrontendWidgets();
     assertNotAbandoned();
     assertTargetStillCurrentNow();
-    if (widgetStillHolds(retried)) return retried;
+    if (widgetStillHolds(retried)) return withLiveOccurrence(retried);
     const live = readLiveWritten(retried);
     throw new WidgetWriteError(
       `Widget "${retried?.widget}" on node ${retried?.node_id} (${node?.type}) did not retain the ` +
@@ -1289,6 +1451,17 @@ async function runSetWidgetBody(
     );
   }
 
+  /**
+   * #2143 — RE-RESOLVE THE REPORTED ADDRESS AFTER THE FLUSH.
+   *
+   * `widget_occurrence.index` is the number a caller sends straight back as "NAME[i]".
+   * applyWidgetWrite resolves it as the last thing it does, but `retainVerifiedWrite` then
+   * awaits a frontend flush, and the node can reorder or rebuild its rows in that window —
+   * so the number that reaches the caller has to be answered again, from the written row,
+   * at the moment the reply is actually formed. Same rule applyWidgetWrite uses: a live
+   * position when the row still has one, otherwise the pre-write capture flagged `stale`
+   * so the caller knows which row was written without being handed a number to reuse.
+   */
   async function succeedWrite(extra = {}, extraResult = {}) {
     const set = await retainVerifiedWrite(write(extra), () => write(extra));
     return withWarning(honestWidgetAck({ set, ...extraResult }));

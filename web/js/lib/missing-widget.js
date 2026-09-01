@@ -14,6 +14,7 @@
  * each widget name once.
  */
 import { pressableWidgetHint } from "./pressable-widget.js";
+import { duplicateAddressHint } from "./widget-occurrence.js";
 
 const RGTHREE_FAST_GROUPS_TYPES = new Set([
   "Fast Groups Bypasser (rgthree)",
@@ -100,5 +101,10 @@ export function missingWidgetMessage(node, widgetName) {
   const head =
     `Node ${node?.id} (${node?.type}) has no widget "${widgetName}" (available: ${available}).`;
   if (isNodePropertyName(node, widgetName)) return head + propertyRouteHint(node, widgetName);
-  return head + pressableWidgetHint(node, widgetName);
+  // #2143 — the available-list is DE-DUPLICATED (that is this module's own #1956 fix), so on
+  // a Fast Groups node it prints one `RGTHREE_TOGGLE_AND_NAV` for rows the canvas draws
+  // several of. That reads as "there is one of these", which is what left the reporter with
+  // no address for the second group's toggle. Name the rows and the syntax that reaches
+  // them. Empty for every node whose widget names are unique.
+  return head + pressableWidgetHint(node, widgetName) + duplicateAddressHint(node);
 }

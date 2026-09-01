@@ -21,6 +21,7 @@ import {
 } from "../../web/js/lib/rgthree-lora-row.js";
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
 import { setWidgetCommandBudgetDeps } from "./_panel-constants.mjs";
+import { resolveWidgetAddress, WidgetAddressError } from "../../web/js/lib/widget-occurrence.js";
 
 const SLOT = { on: true, lora: "x.safetensors", strength: 0.5, strengthTwo: null };
 
@@ -802,12 +803,16 @@ const PANEL_SRC = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", impo
 const SET_WIDGET_LIB_SRC = readFileSync(new URL("../../web/js/lib/set-widget.js", import.meta.url), "utf8");
 
 test("#757 NO AWAIT separates the creation from the write", () => {
-  // The rule the whole feature now rests on. `write()` is runSetWidget's synchronous
+  // The rule the whole feature now rests on. `writeAttempt()` is runSetWidget's synchronous
   // boundary: fence, then prepareWriteTarget, then applyWidgetWrite, then the undo on
   // failure — with nothing awaited in between. An `await` anywhere in that stretch reopens
   // every window this design closes: a transient row visible to an undo capture, to a
   // concurrent command frame, and to the user's own hands.
-  const start = SET_WIDGET_LIB_SRC.indexOf("const write = (extra = {}) => {");
+  //
+  // #2143 wrapped it in a synchronous `write()` that records which row the attempt landed on.
+  // The boundary is therefore the pair, and BOTH halves are checked here — a wrapper that
+  // awaited would reopen the window just as surely as an await inside.
+  const start = SET_WIDGET_LIB_SRC.indexOf("const writeAttempt = (extra, writeOut) => {");
   assert.notEqual(start, -1, "could not locate the write boundary");
   const end = SET_WIDGET_LIB_SRC.indexOf("\n  };", start);
   const body = SET_WIDGET_LIB_SRC.slice(start, end);
@@ -817,13 +822,21 @@ test("#757 NO AWAIT separates the creation from the write", () => {
   // Comments in this block DISCUSS the await that used to be here, so judge the code only.
   const code = body.replace(/^\s*\/\/.*$/gm, "");
   assert.ok(!/\bawait\b/.test(code), `no await may appear between them:\n${code}`);
+
+  // …and the wrapper that drives it awaits nothing either, so the whole boundary is synchronous.
+  const wrapStart = SET_WIDGET_LIB_SRC.indexOf("const write = (extra = {}) => {");
+  assert.notEqual(wrapStart, -1, "could not locate the write wrapper");
+  const wrap = SET_WIDGET_LIB_SRC.slice(wrapStart, SET_WIDGET_LIB_SRC.indexOf("\n  };", wrapStart));
+  assert.match(wrap, /writeAttempt\(extra, writeOut\)/, "the wrapper drives the boundary");
+  assert.ok(!/\bawait\b/.test(wrap.replace(/^\s*\/\/.*$/gm, "")), "the wrapper awaits nothing");
 });
 
 test("#757 the creation runs AFTER the workflow fence", () => {
   // A row must never be grown on a canvas the caller did not address (#570/#718). The fence
   // is runSetWidget's own, re-checked at the write boundary, so the creation is now behind
   // the SAME check the write is.
-  const start = SET_WIDGET_LIB_SRC.indexOf("const write = (extra = {}) => {");
+  const start = SET_WIDGET_LIB_SRC.indexOf("const writeAttempt = (extra, writeOut) => {");
+  assert.notEqual(start, -1, "could not locate the write boundary");
   const body = SET_WIDGET_LIB_SRC.slice(start, SET_WIDGET_LIB_SRC.indexOf("\n  };", start));
   const fence = body.indexOf("assertTargetStillCurrentNow()");
   const mint = body.indexOf("prepareWriteTarget()");
@@ -1315,6 +1328,11 @@ const SET_WIDGET_SRC = (() => {
 const EXECUTOR_DEPS = [
   "getGraphCtx",
   "resolveNode",
+  // #2143 — the shipped handler resolves the widget ADDRESS before every name-keyed guard.
+  // The REAL resolver is injected, not a stub, so this harness keeps exercising the line
+  // that decides which same-named row a write is about.
+  "resolveWidgetAddress",
+  "WidgetAddressError",
   "classifyLtxTimelineWrite",
   "derivedTimelineRefusal",
   "applyLtxTimelineWrite",
@@ -1489,6 +1507,8 @@ function executor(node, overrides = {}) {
   const deps = {
     getGraphCtx: () => ({ app: { canvas: null }, graph, LG: { registered_node_types: {} }, rootGraph: graph }),
     resolveNode: () => node,
+    resolveWidgetAddress,
+    WidgetAddressError,
     classifyLtxTimelineWrite: () => null,
     classifyPromptRelayTimelineWrite: () => null,
     classifyRgthreeFastGroupsWrite: () => null,

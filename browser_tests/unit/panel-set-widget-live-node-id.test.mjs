@@ -6,6 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolveLiveNode } from "../../web/js/lib/node-id.js";
+import { resolveWidgetAddress, WidgetAddressError } from "../../web/js/lib/widget-occurrence.js";
 
 const panelPath = new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url);
 const panelSource = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -43,6 +44,8 @@ function shippedPanelSetWidget({ getGraphCtx, classifyTarget }) {
     "getGraphCtx",
     "describeActiveGraph",
     "resolveNode",
+    "resolveWidgetAddress",
+    "WidgetAddressError",
     "classifyMiniMaxH3DirectorWrite",
     "miniMaxH3DirectorPromptRefusal",
     `const executors = { ${panelSource.slice(handlerStart, handlerEnd)} };\nreturn executors.graph_set_widget;`,
@@ -53,6 +56,8 @@ function shippedPanelSetWidget({ getGraphCtx, classifyTarget }) {
     getGraphCtx,
     () => ({ scope: "root" }),
     shippedResolveNode,
+    resolveWidgetAddress,
+    WidgetAddressError,
     classifyTarget,
     (widget, nodeId) => `resolved ${nodeId} as the live target`,
   );
