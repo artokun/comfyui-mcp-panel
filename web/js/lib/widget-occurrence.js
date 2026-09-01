@@ -154,10 +154,12 @@ export function widgetAtOccurrence(node, name, index, pin = null) {
   // that is left. Require it to name exactly ONE of the rows sharing this name; otherwise
   // refuse rather than write whichever row happens to have landed here.
   //
-  // `> 1` is the scope on purpose: with exactly one row left carrying the name there is no
-  // wrong choice available — a bare-name write would reach that same widget — so refusing
-  // would refuse an address that is not actually ambiguous.
-  if (rebuilt && sameName.length > 1) {
+  // This does NOT carve out "only one row is left". The caller did not ask for whichever row
+  // is called this — they addressed a specific one, and it is gone; writing the survivor
+  // substitutes a different group's toggle just as silently as picking between two would.
+  // (An earlier revision did carve it out, reasoning that a bare-name write would reach the
+  // same widget. It would — but the caller deliberately did not send one.)
+  if (rebuilt) {
     const labelNamesOneRow =
       pinned.label != null &&
       sameName.filter((entry) => widgetLabel(entry.widget) === pinned.label).length === 1;

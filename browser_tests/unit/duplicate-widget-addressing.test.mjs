@@ -530,24 +530,38 @@ test("#2143: a hook that RENAMES the written row cannot make the reply self-cont
   assert.deepEqual(res2.widget_occurrence, { index: 1, of: 2, label: "B", stale: true });
 });
 
-test("#2143: a rebuild down to ONE row of that name resolves — there is nothing to be wrong about", () => {
-  // The scope of the indistinguishable-rebuild refusal, deliberately: it fires only when
-  // MORE THAN ONE row still carries the name. With exactly one candidate there is no wrong
-  // choice available — a bare `row` write would reach the same widget — so refusing would
-  // refuse an address that is not ambiguous.
+test("#2143: a rebuild down to ONE row of that name is still refused, not substituted", () => {
+  // The addressed row is gone and an unlabelled survivor sits at that index. It is tempting
+  // to write it — a bare `row` write would reach it — but the caller deliberately did not
+  // send a bare name: they addressed one of several rows, and on a Fast Groups node the
+  // survivor is a DIFFERENT group's toggle. Substituting it is the same silent-wrong-row
+  // this issue is about, so the refusal covers this case too.
   const node = {
     id: 7,
     type: "T",
     widgets: [{ name: "x" }, { name: "x" }, { name: "row", type: "string", value: "c" }],
   };
 
-  const res = applyWidgetWrite(node, "row", "written", {
-    occurrence: { index: 2, label: null, widget: { name: "row" } },
-  });
+  assert.throws(
+    () =>
+      applyWidgetWrite(node, "row", "written", {
+        occurrence: { index: 2, label: null, widget: { name: "row" } },
+      }),
+    WidgetWriteError,
+  );
+  assert.equal(node.widgets[2].value, "c", "the survivor was not written");
 
+  // A survivor the pinned label still names IS resolvable — the refusal is about being
+  // unable to establish the row, not about rebuilds as such.
+  const labelled = {
+    id: 7,
+    type: "T",
+    widgets: [{ name: "x" }, { name: "x" }, { name: "row", type: "string", value: "c", label: "L" }],
+  };
+  const res = applyWidgetWrite(labelled, "row", "written", {
+    occurrence: { index: 2, label: "L", widget: { name: "row", label: "L" } },
+  });
   assert.equal(res.value, "written");
-  assert.equal(node.widgets[2].value, "written");
-  assert.equal("widget_occurrence" in res, false, "one row of that name — nothing to disclose");
 });
 
 test("#2143: a row the callback REMOVED is reported stale rather than as a usable address", () => {
@@ -1112,6 +1126,136 @@ test("#2143: a name that only BECOMES duplicated during the write is still read 
   assert.equal(only.value, "new", "the widget that was written holds the value");
   assert.equal(callbacks, 1, "and it was written once — no retry against the prepended row");
   assert.equal(node.widgets[0].value, "old", "the prepended row is untouched");
+});
+
+test("#2143: a reorder during the FLUSH is caught — the window after the write resolved", async () => {
+  // The window neither the write nor its hooks can see. `applyWidgetWrite` resolves the
+  // reported address as the last thing it does, and `retainVerifiedWrite` then awaits a
+  // frontend flush — the node can reorder its rows in there. Two things go wrong if the
+  // written row is not carried through it:
+  //
+  //   * retention re-reads by position and checks a row nothing wrote to (here row 0 was
+  //     seeded with the requested value, so it "verifies" against a stranger);
+  //   * the reply hands back an index that now names that stranger, and replaying it writes
+  //     the wrong row.
+  const row0 = { name: "row", type: "string", value: "new" };
+  const row1 = { name: "row", type: "string", value: "b" };
+  const node = {
+    id: 1,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [row0, row1],
+  };
+
+  const res = await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: row1 },
+    awaitFrontendWidgetFlush: async () => {
+      node.widgets = [row1, row0];
+    },
+  });
+
+  assert.equal(row1.value, "new", "the addressed row holds the value");
+  assert.equal(node.widgets.indexOf(row1), 0, "and the flush moved it to index 0");
+  assert.equal(res.set.widget_occurrence.index, 0, "the reply reports where it ended up");
+  assert.equal(
+    resolveWidgetAddress(node, `row[${res.set.widget_occurrence.index}]`).occurrence.widget,
+    row1,
+    "so the reported index round-trips back to the row that was written",
+  );
+});
+
+test("#2143: a flush reorder does not make retention refuse a write that landed", async () => {
+  // What only RETENTION'S identity key can answer, as distinct from the reported address.
+  // The flush swaps the rows and the row now at the addressed index holds its ORIGINAL
+  // value — so a positional re-read sees a mismatch it cannot fix, retries, and the retry's
+  // own pin refuses the reorder. The command then reports "nothing was applied" about a
+  // write that landed. Reading the row that was written instead sees the value and stops.
+  const row0 = { name: "row", type: "string", value: "a" };
+  const row1 = { name: "row", type: "string", value: "b" };
+  const node = {
+    id: 1,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [row0, row1],
+  };
+
+  const res = await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: row1 },
+    awaitFrontendWidgetFlush: async () => {
+      node.widgets = [row1, row0];
+    },
+  });
+
+  assert.equal(res.set.value, "new");
+  assert.equal(row1.value, "new");
+  assert.equal(row0.value, "a", "the other row was never written — there was no retry");
+});
+
+test("#2143: a rename during the flush cannot publish an address under the old name", async () => {
+  // The rename case again, in the flush window this time. The reply's `widget` is the name
+  // that was written; counting rows under the widget's NEW name would publish `{index, of}`
+  // about a name the reply never mentions.
+  //
+  // The row is renamed INTO an already-duplicated name on purpose: renaming it to something
+  // unique would leave the occurrence null either way, so the fixture could not tell an
+  // anchored lookup from an unanchored one.
+  const row0 = { name: "row", type: "string", value: "a" };
+  const row1 = { name: "row", type: "string", value: "b" };
+  const alreadyRenamed = { name: "renamed", type: "string", value: "z" };
+  const node = {
+    id: 1,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [row0, row1, alreadyRenamed],
+  };
+
+  const res = await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: row1 },
+    awaitFrontendWidgetFlush: async () => {
+      row1.name = "renamed";
+    },
+  });
+
+  assert.equal(res.set.widget, "row");
+  assert.deepEqual(
+    res.set.widget_occurrence,
+    { index: 1, of: 2, stale: true },
+    "reported as the row it was, flagged — never as a live `row[i]` the name no longer has",
+  );
+});
+
+test("#2143: a row REMOVED during the flush is reported stale, not as a live address", async () => {
+  // The other half of the flush window: the flush REPLACED the written row with a fresh
+  // object that carries the value forward, so retention is satisfied (the value is in effect
+  // at the address the caller gave) but the row that was written is gone. It therefore has no
+  // current address — the caller still learns which row was written, flagged, rather than
+  // being handed a number whose meaning nobody can vouch for.
+  const row0 = { name: "row", type: "string", value: "a" };
+  const row1 = { name: "row", type: "string", value: "b" };
+  const node = {
+    id: 1,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [row0, row1],
+  };
+
+  const res = await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: row1 },
+    awaitFrontendWidgetFlush: async () => {
+      node.widgets = [row0, { name: "row", type: "string", value: row1.value }];
+    },
+  });
+
+  assert.equal(node.widgets.includes(row1), false, "the written row was replaced");
+  assert.deepEqual(res.set.widget_occurrence, { index: 1, of: 2, stale: true });
 });
 
 test("#2143: retention accepts an ordinary rebuild that CARRIES THE VALUE forward", async () => {

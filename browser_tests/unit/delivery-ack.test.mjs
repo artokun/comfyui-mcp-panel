@@ -157,6 +157,11 @@ test("#1995 wiring: graph_run returns through honestRunAck", () => {
 
 test("#1995 wiring: the widget write path acks through honestWidgetAck after a bounded flush", () => {
   assert.match(SET_WIDGET_SRC, /withTimeout\(flush, FRONTEND_WIDGET_FLUSH_MS/);
-  assert.match(SET_WIDGET_SRC, /return withWarning\(honestWidgetAck\(\{ set, \.\.\.extraResult \}\)\);/);
+  // #2143 — the `set` handed to honestWidgetAck now passes through `withLiveOccurrence`,
+  // which re-resolves the reported row address after the flush. What this row is for is
+  // that the ack goes through honestWidgetAck carrying THAT write's result, so it is
+  // matched on the call and its `set` argument rather than on one literal spelling of the
+  // object; pinning the shorthand made an unrelated, additive change look like a rewiring.
+  assert.match(SET_WIDGET_SRC, /return withWarning\(honestWidgetAck\(\{ set: [^,]+, \.\.\.extraResult \}\)\);/);
   assert.match(SET_WIDGET_SRC, /from "\.\/delivery-ack\.js";/);
 });

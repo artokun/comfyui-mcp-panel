@@ -2590,6 +2590,13 @@ export function applyWidgetWrite(
     // node rebuilds its toggle rows whenever the groups it matches change and a captured
     // object can be detached from the node by write time.
     occurrence = null,
+    // #2143 — OUT-param, filled with `valueWidget`: the widget object this write's value
+    // landed on. The caller's post-write flush (#1922) runs AFTER this function returns and
+    // can reorder the node's rows again, so the caller needs the written row itself both to
+    // verify retention against it and to re-resolve the reported address. Never a field on
+    // the returned reply: that reply is JSON-serialized to the orchestrator and a widget
+    // reaches the whole graph through `node.graph`.
+    out = null,
   } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
@@ -3863,6 +3870,12 @@ export function applyWidgetWrite(
 
   // #2143 — RESOLVED AFTER THE LAST THING THAT CAN MOVE A ROW.
   //
+  // "Last" is meant literally and is worth keeping that way: this pair of statements is the
+  // final executable code before the reply is built, so nothing inside this function can
+  // reorder, rebuild or rename a row after it. Anything added below must go ABOVE it, or the
+  // address goes stale again — which is how this landed here in the first place, one hook at
+  // a time (the widget callback, then `onWidgetChanged`, then its rename).
+  //
   // `widget_occurrence.index` is an ADDRESS: the number a caller sends straight back as
   // "NAME[i]", which is why it matches what `duplicate_widgets` publishes. Two hooks can
   // reorder or rebuild `node.widgets` after the value lands — the widget's own callback,
@@ -3878,6 +3891,11 @@ export function applyWidgetWrite(
   // row — wherever the row has moved to. A row a hook REMOVED has no current address, so the
   // pre-write capture is reported with `stale: true` rather than silently dropped: the caller
   // still learns which row was written, and is told not to reuse the number.
+  if (out && typeof out === "object") {
+    out.valueWidget = valueWidget;
+    out.valueNode = valueNode;
+    out.preWriteOccurrence = preWriteOccurrence;
+  }
   const liveOccurrence = promotedFrom
     ? null
     : widgetOccurrenceOf(valueNode, valueWidget, verifiedName);
