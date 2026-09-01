@@ -1095,6 +1095,14 @@ async function runSetWidgetBody(
             `${err.message}`,
         );
 
+  // #2143 — the widget object each write attempt landed on, keyed by the reply it produced,
+  // and read by `readLiveWritten` below. Declared HERE, immediately above the only writer,
+  // rather than beside the reader: `write` is a closure invoked from several places, and a
+  // `const` declared after them is a temporal-dead-zone ReferenceError for any caller that
+  // runs first. A WeakMap rather than a field on the reply because that reply is
+  // JSON-serialized to the orchestrator and a widget reaches the whole graph via `node.graph`.
+  const writtenWidgets = new WeakMap();
+
   const write = (extra = {}) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
@@ -1158,6 +1166,11 @@ async function runSetWidgetBody(
     // shared write path is not on offer, and pretending otherwise is what cost a round.
     const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
     try {
+      // #2143 — the widget object this attempt writes to, for the retention re-read below.
+      // Per ATTEMPT, not per command: `rewrite()` re-enters here and a rebuild between the
+      // two can hand the retry a different row object, so the association must follow the
+      // `set` it belongs to rather than a single command-scoped variable.
+      const writeOut = {};
       const set = applyWidgetWrite(node, widgetName, value, {
         resolveSource,
         canvas,
@@ -1167,8 +1180,12 @@ async function runSetWidgetBody(
         assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
         promotedResolution,
         occurrence,
+        out: writeOut,
         ...extra,
       });
+      if (set && typeof set === "object" && writeOut.valueWidget) {
+        writtenWidgets.set(set, writeOut.valueWidget);
+      }
       // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
       // landed on, inside the SAME synchronous stretch (no await since the fence, so
       // the press cannot interleave with a workflow switch or another command frame).
@@ -1304,13 +1321,35 @@ async function runSetWidgetBody(
     // reached (including the bare-name case, where row 0 was chosen implicitly) rather than
     // the ordinal the request asked for. Absent for every unique name, where `find` is exact.
     //
-    // NAME AND POSITION ONLY — the pinned LABEL is deliberately not applied here, unlike at
-    // the write and at the ack readback. This runs AFTER the widget's own callback, and a
-    // Fast Groups row action re-derives its rows' labels from the groups it just changed; a
-    // label pin would then reject the very row it had written and turn a landed write into a
-    // retry and a refusal — the same false report this whole check exists to avoid. The
-    // retry is not left unguarded by that: `rewrite()` goes back through applyWidgetWrite,
-    // whose own label pin refuses a row that MOVED rather than writing the wrong one.
+    // IDENTITY FIRST. A position is not stable across the frame this check waits for: the
+    // write already fired the widget's own callback, and a Fast Groups row action changes
+    // the groups its rows are derived FROM, so the node can reorder them before
+    // `flushFrontendWidgets` resolves. Re-reading by position then verifies a row nothing
+    // wrote to — or, when its value differs, retries and refuses an already-applied write.
+    // The written widget is the exact thing this check is about, so key on it.
+    //
+    // Only while it is still ATTACHED to one of the hosts: a rebuild that detached it leaves
+    // a live-looking object whose `.value` is a stale reading of a widget the canvas no
+    // longer draws, which is a worse answer than falling through.
+    const written = writtenWidgets.get(set);
+    if (written) {
+      for (const host of [...prefer, ...rest]) {
+        if (Array.isArray(host.widgets) && host.widgets.includes(written)) {
+          try {
+            return { found: true, value: written.value };
+          } catch {
+            return { found: false, value: undefined };
+          }
+        }
+      }
+    }
+    // NAME AND POSITION — the fallback for a rebuild that replaced the object. The pinned
+    // LABEL is deliberately NOT applied here, unlike at the write and at the ack readback:
+    // a Fast Groups row action re-derives its rows' labels from the groups it just changed,
+    // so a label pin would reject the very row it had written and turn a landed write into
+    // a retry and a refusal — the same false report this check exists to avoid. The retry is
+    // not left unguarded by that: `rewrite()` goes back through applyWidgetWrite, whose own
+    // pin refuses a row that MOVED rather than writing the wrong one.
     const occurrence = set?.widget_occurrence;
     for (const host of [...prefer, ...rest]) {
       const live = occurrence

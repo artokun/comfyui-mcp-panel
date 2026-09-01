@@ -2590,6 +2590,12 @@ export function applyWidgetWrite(
     // matches change, so a captured object can be detached from the node by write time
     // while the ordinal still names the row the caller meant.
     occurrence = null,
+    // #2143 — OUT-param: filled with `valueWidget`, the widget object this write's value
+    // landed on. The post-write retention check re-reads THAT object rather than whatever is
+    // at its position afterwards, because a widget callback (a Fast Groups row action fires
+    // one) can reorder the node's rows in the frame retention waits for. Never returned in
+    // the reply — see the assignment for why.
+    out = null,
   } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
@@ -2692,6 +2698,13 @@ export function applyWidgetWrite(
   // and every definition-scoped write they are the inner/own target, unchanged.
   const valueWidget = instanceScoped ? parentWidget : w;
   const valueNode = instanceScoped ? node : targetNode;
+  // #2143 — hand the caller the widget OBJECT this write's value lands on, so the
+  // post-write retention check can re-read the row it actually wrote instead of whatever is
+  // at that position afterwards. Deliberately an out-param and NOT a field on the returned
+  // reply: that reply is JSON-serialized and sent to the orchestrator, and a widget carries
+  // `node` → `graph` → every node, so putting it there would either throw on the cycle or
+  // ship the whole graph.
+  if (out && typeof out === "object") out.valueWidget = valueWidget;
 
   // #507 (codex round-3, MODERATE): coerceWidgetValue validated the value against the
   // IMMEDIATE inner widget's option list only — but a promoted write assigns the SAME

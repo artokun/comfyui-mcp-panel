@@ -800,6 +800,79 @@ test("#2143: the post-write retention check re-reads the row that was written", 
   assert.deepEqual(res.set.widget_occurrence, { index: 1, of: 2 });
 });
 
+test("#2143: retention follows the row it wrote when a callback REORDERS the node's rows", async () => {
+  // The write already fired the widget's own callback — a Fast Groups row action fires one —
+  // and the node can reorder its rows in the frame retention waits for. Re-reading by
+  // POSITION then checks a row nothing wrote to: here row 0 keeps its old value, so
+  // retention would see a mismatch, retry, and refuse an already-applied write.
+  let callbacks = 0;
+  const node = {
+    id: 59,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [
+      { name: "row", type: "string", value: "old-0" },
+      {
+        name: "row",
+        type: "string",
+        value: "old-1",
+        callback() {
+          callbacks += 1;
+          node.widgets = [node.widgets[1], node.widgets[0]];
+        },
+      },
+    ],
+  };
+  const addressed = node.widgets[1];
+
+  const res = await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: addressed },
+  });
+
+  assert.equal(res.set.value, "new");
+  assert.equal(addressed.value, "new", "the addressed row holds the written value");
+  assert.equal(callbacks, 1, "the write was not retried — one callback, one mutation");
+  assert.equal(node.widgets[1].value, "old-0", "and the row now AT index 1 was not touched");
+});
+
+test("#2143: retention does not verify against a row the rebuild DETACHED", async () => {
+  // Identity is only an answer while the object is still on the node. A rebuild that
+  // detaches it leaves a live-looking object whose `.value` is a reading of a widget the
+  // canvas no longer draws — so the check must fall through, not vouch for the write.
+  const node = {
+    id: 59,
+    type: "DupRows",
+    constructor: nodeCtor(),
+    graph: { links: {} },
+    widgets: [{ name: "row", type: "string", value: "old-0" }, null],
+  };
+  const detached = {
+    name: "row",
+    type: "string",
+    value: "old-1",
+    callback() {
+      // The rebuild replaces the row entirely, and the replacement did NOT take the value —
+      // the #1922 shape retention exists for.
+      node.widgets = [node.widgets[0], { name: "row", type: "string", value: "old-1" }];
+    },
+  };
+  node.widgets[1] = detached;
+
+  await runSetWidget(node, "row", "new", {
+    ...wiredDeps("DupRows"),
+    occurrence: { index: 1, widget: detached },
+  });
+
+  // If the detached object could vouch, retention would pass on its `.value` and the
+  // replacement — the row the canvas actually draws — would keep "old-1", which is exactly
+  // the silent-stale success #1922 exists to prevent. Falling through to name+position sees
+  // the mismatch and re-writes, so the live row holds the value.
+  assert.equal(node.widgets[1].value, "new", "the row the node actually carries was written");
+  assert.notEqual(node.widgets[1], detached, "and it is the replacement, not the detached object");
+});
+
 test("#2143: retention survives a callback that RELABELS the row it just wrote", async () => {
   // The write's callback re-derives the row labels — which is what a Fast Groups row action
   // does, since it changes the very groups the labels come from. Retention runs after that
