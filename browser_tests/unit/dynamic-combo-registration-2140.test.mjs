@@ -269,6 +269,70 @@ test("#2140 a socket-only child is not mistaken for a stripped row", () => {
   assert.deepEqual(describeUnresolvedDynamicCombos({ _nodes: [node] })[0].missing, ["format.codec"]);
 });
 
+test("#2140 an OPTIONAL top-level DynamicCombo root is named too", () => {
+  // SaveVideo declares one (a hidden top-level `codec`), and ComfyUI's io schema allows
+  // any DynamicCombo to be optional. The serializer throw it produces is the same bare,
+  // node-less string, so naming may not stop at `input.required` — reconcile's write path
+  // does, but only because a replay is an authorized mutation. This is read-only.
+  const { node } = makeSaveVideo();
+  const optional = node.widgets.find((widget) => widget.name === "format.codec");
+  // Re-home a live dynamic combo under the node's OPTIONAL top-level `codec` declaration.
+  optional.name = "codec";
+  node.inputs.find((input) => input.name === "format.codec").name = "codec";
+  node.widgets.find((widget) => widget.name === "format").name = "format_disabled";
+  assert.equal(
+    describeUnresolvedDynamicCombos({ _nodes: [node] }).some((entry) => entry.root === "codec"),
+    false,
+    "codec=auto declares no children — nothing is missing yet",
+  );
+
+  optional.value = "h264";
+  assert.ok(node.widgets.some((widget) => widget.name === "codec.encoding"));
+  node.widgets.splice(
+    node.widgets.findIndex((widget) => widget.name === "codec.encoding"),
+    1,
+  );
+  node.inputs.splice(
+    node.inputs.findIndex((input) => input.name === "codec.encoding"),
+    1,
+  );
+
+  const found = describeUnresolvedDynamicCombos({ _nodes: [node] });
+  const optionalEntry = found.find((entry) => entry.root === "codec");
+  assert.ok(optionalEntry, `the optional root must be named; got ${JSON.stringify(found)}`);
+  assert.equal(optionalEntry.selected, "h264");
+  assert.deepEqual(optionalEntry.missing, ["codec.encoding"]);
+  // The renamed required root is reported separately, and only because it is REQUIRED.
+  assert.deepEqual(
+    found.filter((entry) => entry.root === "format"),
+    [
+      {
+        nodeId: 21,
+        nodeType: "SaveVideo",
+        root: "format",
+        selected: null,
+        missing: [],
+        reason: "root-missing",
+      },
+    ],
+  );
+});
+
+test("#2140 an optional root the node never materialised is NOT reported missing", () => {
+  // The healthy SaveVideo shape: the #1931 relocate path deliberately removes the hidden
+  // top-level `codec` row. Reporting that as a defect would fire on every SaveVideo.
+  const { node } = makeSaveVideo();
+  assert.equal(
+    node.widgets.some((widget) => widget.name === "codec"),
+    false,
+    "the optional hidden codec row is not materialised here",
+  );
+  assert.deepEqual(describeUnresolvedDynamicCombos({ _nodes: [node] }), []);
+  assert.deepEqual(describeDynamicComboCandidates({ _nodes: [node] }), [
+    { nodeId: 21, nodeType: "SaveVideo", roots: ["format"] },
+  ]);
+});
+
 test("#2140 a duplicated dotted row is named too — the sweep's other residue", () => {
   const { node } = makeSaveVideo();
   const codec = node.widgets.find((widget) => widget.name === "format.codec");

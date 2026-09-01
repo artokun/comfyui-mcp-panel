@@ -538,6 +538,10 @@ function findWidgetByName(node, name) {
   return null;
 }
 
+function hasOwn(object, key) {
+  return !!object && typeof object === "object" && Object.prototype.hasOwnProperty.call(object, key);
+}
+
 function hasInputNamed(node, name) {
   for (const input of Array.isArray(node?.inputs) ? node.inputs : []) {
     if (input?.name === name) return true;
@@ -561,14 +565,16 @@ function hasInputNamed(node, name) {
  * with `panel_get_errors` clean, and why they had to read the schema of 21 nodes to work
  * out which one the message was about.
  */
-function collectUnresolvedDynamicCombos(node, rootName, spec, out, depth) {
+function collectUnresolvedDynamicCombos(node, rootName, spec, out, depth, required = true) {
   if (depth > DYNAMIC_COMBO_MAX_DEPTH) return;
   const widget = findWidgetByName(node, rootName);
   if (!widget) {
     // Only a REQUIRED top-level root earns its own entry. A nested child is already
-    // reported in its parent's `missing` list; reporting it twice double-counts one
-    // defect and would make the repair round-trip the same root twice.
-    if (depth === 0) {
+    // reported in its parent's `missing` list, and an OPTIONAL root is allowed to have no
+    // row at all — SaveVideo declares a hidden optional top-level `codec` that the #1931
+    // relocate path deliberately removes, so reporting it absent would fire on every
+    // healthy SaveVideo on the canvas.
+    if (depth === 0 && required) {
       out.push({ root: rootName, selected: null, missing: [], reason: "root-missing" });
     }
     return;
@@ -637,12 +643,19 @@ export function describeUnresolvedDynamicCombos(graph) {
   const found = [];
   for (const node of graphNodes(graph)) {
     try {
-      const required = nodeDef(node)?.input?.required;
-      if (required && typeof required === "object") {
-        for (const [name, spec] of Object.entries(required)) {
+      const input = nodeDef(node)?.input;
+      // BOTH groups. `reconcileFreshDynamicWidgets` reads only `required` because a
+      // replay is an authorized WRITE; this is read-only naming, and a node whose
+      // DynamicCombo is declared optional produces exactly the same bare, node-less
+      // serializer throw. SaveVideo itself declares a top-level optional `codec`.
+      for (const group of ["required", "optional"]) {
+        const groupInputs = input?.[group];
+        if (!groupInputs || typeof groupInputs !== "object") continue;
+        for (const [name, spec] of Object.entries(groupInputs)) {
           if (!isDynamicComboSpec(spec)) continue;
+          if (group === "optional" && hasOwn(input?.required, name)) continue;
           const perRoot = [];
-          collectUnresolvedDynamicCombos(node, name, spec, perRoot, 0);
+          collectUnresolvedDynamicCombos(node, name, spec, perRoot, 0, group === "required");
           for (const entry of perRoot) {
             found.push({
               nodeId: node.id,
@@ -673,13 +686,19 @@ export function describeDynamicComboCandidates(graph) {
   const found = [];
   for (const node of graphNodes(graph)) {
     try {
-      const required = nodeDef(node)?.input?.required;
-      const roots =
-        required && typeof required === "object"
-          ? Object.entries(required)
-              .filter(([, spec]) => isDynamicComboSpec(spec))
-              .map(([name]) => name)
-          : [];
+      const input = nodeDef(node)?.input;
+      const roots = [];
+      for (const group of ["required", "optional"]) {
+        const groupInputs = input?.[group];
+        if (!groupInputs || typeof groupInputs !== "object") continue;
+        for (const [name, spec] of Object.entries(groupInputs)) {
+          if (!isDynamicComboSpec(spec) || roots.includes(name)) continue;
+          // An optional root with no row is not a candidate to inspect — it is a
+          // declaration the node was free not to materialise.
+          if (group === "optional" && !findWidgetByName(node, name)) continue;
+          roots.push(name);
+        }
+      }
       if (roots.length) {
         found.push({
           nodeId: node.id,
