@@ -22,6 +22,14 @@
  * v0.52.122 (`8282e05`), so no receipt could arrive and every replay minted a
  * fresh agent turn.
  *
+ * #2150 — that version is an EXAMPLE of a peer that never answers, not the only
+ * one, and reading it as the only one is what sent a 0.52.146 report here
+ * instead of upstream. A current orchestrator withholds the receipt whenever the
+ * completion cannot be tied to a live run ticket (evicted, `reused`, a changed
+ * tab/conversation, or a re-minted key) — see comfyui-mcp#2700 and the note in
+ * run-completion.js. These pins are therefore about a peer that does not answer
+ * for ANY reason; they deliberately do not model why.
+ *
  * WHAT IS COUNTED is deliberately "frames the transport ACCEPTED for this run
  * and no receipt has retired", not "reconcile passes": a refusal gives its own
  * slot back but must never reset the count, or a flapping transport mints one
