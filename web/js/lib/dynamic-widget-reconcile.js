@@ -9,6 +9,9 @@ const DYNAMIC_WIDGET_MISSING_RE = /Dynamic widget doesn't exist on node/i;
 const GRAPH_TO_PROMPT_RECONCILE = Symbol.for("comfyui-mcp.graphToPromptDynamicReconcile");
 const DYNAMIC_COMBO_PRESERVE_CHILDREN = Symbol.for("comfyui-mcp.dynamicComboPreserveChildren");
 const rawApply = Reflect.apply;
+// A DynamicCombo option tree is a handful of levels deep (SaveVideo: format → codec →
+// encoding → crf). The bound exists so a self-referential definition cannot spin.
+const DYNAMIC_COMBO_MAX_DEPTH = 8;
 
 function hasValueSetter(widget) {
   try {
@@ -164,20 +167,36 @@ function capturePrefixedValues(node, rootName) {
   return values;
 }
 
+function liveWidgetByName(node, name) {
+  let found = null;
+  for (const widget of node?.widgets ?? []) {
+    if (widget?.name === name) found = widget;
+  }
+  return found;
+}
+
 function restorePrefixedValues(node, values) {
   if (!values.size) return;
-  const byName = new Map(
-    (node.widgets ?? [])
-      .filter((widget) => typeof widget?.name === "string")
-      .map((widget) => [widget.name, widget]),
-  );
   const names = [...values.keys()].sort((a, b) => a.split(".").length - b.split(".").length);
   for (const name of names) {
-    const widget = byName.get(name);
+    // #2140 — RE-RESOLVE for every name. This used to read one map built before the loop
+    // started, and that map goes stale as the loop runs: restoring the shallowest child
+    // (`format.codec`) drives a native rebuild that REPLACES every widget below it, so
+    // each deeper name still pointed at a widget the node was no longer carrying. Two
+    // things followed. The value went nowhere — a plain prompt build silently reset
+    // SaveVideo's `format.codec.encoding.crf` to the schema default. And for a dynamic
+    // child the write drove a DETACHED accessor, whose `updateWidgets` deletes the
+    // group's rows and their widget-store entries BEFORE it checks that it is still
+    // attached: it strips the live rows, then throws into the catch below.
+    //
+    // That is what separated the two recoveries #2140's reporter measured. A same-value
+    // write runs this restore and did not recover the node; a real option round trip
+    // skips it and did — on identical final widget values.
+    const widget = liveWidgetByName(node, name);
     if (!widget) continue;
     const next = values.get(name);
-    if (widget.value === next) continue;
     try {
+      if (widget.value === next) continue;
       widget.value = next;
     } catch {
       // A restore that the native setter rejects is not a reason to fail the reconcile;
@@ -469,6 +488,213 @@ export function reconcileGraphDynamicWidgets(graph) {
   return results;
 }
 
+/**
+ * The child names a DynamicCombo option DECLARES for the currently selected key.
+ *
+ * `null` (not `[]`) when the spec is not a DynamicCombo or the live value names no
+ * declared option — in both cases the definition proves nothing about what the node
+ * should be carrying, so no conclusion is drawn.
+ *
+ * @param {unknown} spec
+ * @param {unknown} selected
+ * @returns {string[] | null}
+ */
+function selectedOptionChildNames(spec, selected) {
+  if (!isDynamicComboSpec(spec)) return null;
+  const option = selectedOption(spec, selected);
+  if (!option) return null;
+  const names = [];
+  const inputs = option.inputs;
+  if (inputs && typeof inputs === "object") {
+    for (const group of ["required", "optional"]) {
+      const groupInputs = inputs[group];
+      if (!groupInputs || typeof groupInputs !== "object") continue;
+      for (const childName of Object.keys(groupInputs)) {
+        if (typeof childName === "string" && childName) names.push(childName);
+      }
+    }
+  }
+  return names;
+}
+
+function selectedOption(spec, selected) {
+  const options = spec?.[1]?.options;
+  if (!Array.isArray(options)) return null;
+  return options.find((option) => option?.key === selected) ?? null;
+}
+
+function readWidgetValue(widget) {
+  try {
+    return { ok: true, value: widget.value };
+  } catch {
+    return { ok: false, value: undefined };
+  }
+}
+
+function findWidgetByName(node, name) {
+  for (const widget of Array.isArray(node?.widgets) ? node.widgets : []) {
+    if (widget?.name === name) return widget;
+  }
+  return null;
+}
+
+function hasInputNamed(node, name) {
+  for (const input of Array.isArray(node?.inputs) ? node.inputs : []) {
+    if (input?.name === name) return true;
+  }
+  return false;
+}
+
+/**
+ * Walk one required DynamicCombo root against the live widget rows.
+ *
+ * A root is UNRESOLVED when the option it currently selects declares a child the node is
+ * not carrying. That is the observable signature of #2140. The native
+ * `dynamicComboWidget` rebuild removes a group's rows — and deletes their widget-store
+ * entries — BEFORE it checks that the accessor driving it is still attached to the node,
+ * and only then throws `Dynamic widget doesn't exist on node`. So a rebuild driven
+ * through a detached accessor strips the live rows and leaves a root whose declared
+ * children simply are not there.
+ *
+ * `describeOrphanDynamicWidgets` cannot see that state: there is no orphan and no
+ * residue to strip. That is why #2140 reached its reporter as a bare, node-less string
+ * with `panel_get_errors` clean, and why they had to read the schema of 21 nodes to work
+ * out which one the message was about.
+ */
+function collectUnresolvedDynamicCombos(node, rootName, spec, out, depth) {
+  if (depth > DYNAMIC_COMBO_MAX_DEPTH) return;
+  const widget = findWidgetByName(node, rootName);
+  if (!widget) {
+    // Only a REQUIRED top-level root earns its own entry. A nested child is already
+    // reported in its parent's `missing` list; reporting it twice double-counts one
+    // defect and would make the repair round-trip the same root twice.
+    if (depth === 0) {
+      out.push({ root: rootName, selected: null, missing: [], reason: "root-missing" });
+    }
+    return;
+  }
+  const read = readWidgetValue(widget);
+  if (!read.ok) return;
+  const declared = selectedOptionChildNames(spec, read.value);
+  if (!Array.isArray(declared)) return;
+  const missing = [];
+  for (const childName of declared) {
+    const fullName = `${rootName}.${childName}`;
+    if (findWidgetByName(node, fullName)) continue;
+    // A declared child is not always a widget ROW. `addInputWidget` returns before
+    // creating one when the input is forceInput or its type has no registered widget
+    // constructor, leaving only the socket — legitimately absent from node.widgets. The
+    // #2140 state removes the socket too, because the native sweep clears node.inputs
+    // before node.widgets and throws before it can restore either. So a surviving socket
+    // is the discriminator: it means this child was never meant to have a row.
+    if (hasInputNamed(node, fullName)) continue;
+    missing.push(fullName);
+  }
+  if (missing.length) {
+    out.push({ root: rootName, selected: read.value, missing, reason: "children-missing" });
+  }
+  // A second, structurally unambiguous signature of a half-completed rebuild: the native
+  // sweep removes a group's rows by NAME PREFIX and then appends the new ones, so two
+  // live rows can never legitimately share one dotted child name. When they do, one of
+  // them is a leftover the sweep did not reach, and the accessor that owns it is not the
+  // one the node is carrying.
+  const duplicated = [];
+  const seen = new Set();
+  for (const widget of Array.isArray(node?.widgets) ? node.widgets : []) {
+    const name = widget?.name;
+    if (typeof name !== "string" || !name.startsWith(`${rootName}.`)) continue;
+    if (isInternalRelocationName(name)) continue;
+    if (seen.has(name)) {
+      if (!duplicated.includes(name)) duplicated.push(name);
+      continue;
+    }
+    seen.add(name);
+  }
+  if (duplicated.length) {
+    out.push({ root: rootName, selected: read.value, missing: duplicated, reason: "duplicate-rows" });
+  }
+  const option = selectedOption(spec, read.value);
+  for (const group of ["required", "optional"]) {
+    const groupInputs = option?.inputs?.[group];
+    if (!groupInputs || typeof groupInputs !== "object") continue;
+    for (const [childName, childSpec] of Object.entries(groupInputs)) {
+      if (!isDynamicComboSpec(childSpec)) continue;
+      const nestedName = `${rootName}.${childName}`;
+      if (!findWidgetByName(node, nestedName)) continue;
+      collectUnresolvedDynamicCombos(node, nestedName, childSpec, out, depth + 1);
+    }
+  }
+}
+
+/**
+ * Nodes carrying a required DynamicCombo whose SELECTED option declares a child row the
+ * node does not have.
+ *
+ * @param {object} graph
+ * @returns {Array<{nodeId: unknown, nodeType: string, root: string, selected: unknown, missing: string[], reason: string}>}
+ */
+export function describeUnresolvedDynamicCombos(graph) {
+  const found = [];
+  for (const node of graphNodes(graph)) {
+    try {
+      const required = nodeDef(node)?.input?.required;
+      if (required && typeof required === "object") {
+        for (const [name, spec] of Object.entries(required)) {
+          if (!isDynamicComboSpec(spec)) continue;
+          const perRoot = [];
+          collectUnresolvedDynamicCombos(node, name, spec, perRoot, 0);
+          for (const entry of perRoot) {
+            found.push({
+              nodeId: node.id,
+              nodeType: typeof node.type === "string" ? node.type : "node",
+              ...entry,
+            });
+          }
+        }
+      }
+      if (node?.subgraph) found.push(...describeUnresolvedDynamicCombos(node.subgraph));
+    } catch {
+      // A hostile node must not hide the rest of the graph.
+    }
+  }
+  return found;
+}
+
+/**
+ * Nodes that declare a required DynamicCombo at all — the LAST-RESORT identity.
+ *
+ * Used only when nothing more specific was found. Three candidate node ids is not a
+ * diagnosis, but it is a bisection the reporter of #2140 did not have.
+ *
+ * @param {object} graph
+ * @returns {Array<{nodeId: unknown, nodeType: string, roots: string[]}>}
+ */
+export function describeDynamicComboCandidates(graph) {
+  const found = [];
+  for (const node of graphNodes(graph)) {
+    try {
+      const required = nodeDef(node)?.input?.required;
+      const roots =
+        required && typeof required === "object"
+          ? Object.entries(required)
+              .filter(([, spec]) => isDynamicComboSpec(spec))
+              .map(([name]) => name)
+          : [];
+      if (roots.length) {
+        found.push({
+          nodeId: node.id,
+          nodeType: typeof node.type === "string" ? node.type : "node",
+          roots,
+        });
+      }
+      if (node?.subgraph) found.push(...describeDynamicComboCandidates(node.subgraph));
+    } catch {
+      // A hostile node must not hide the rest of the graph.
+    }
+  }
+  return found;
+}
+
 export function isDynamicWidgetMissingError(error) {
   let raw = "";
   try {
@@ -525,6 +751,7 @@ export function describeOrphanDynamicWidgets(graph) {
 function namedDynamicWidgetError(error, graph) {
   const orphans = describeOrphanDynamicWidgets(graph);
   const primitives = describeTypedPrimitiveWidgets(graph);
+  const unresolved = describeUnresolvedDynamicCombos(graph);
   const listedParts = [
     ...orphans.map(
       (entry) => `${entry.nodeType} node ${entry.nodeId} has ${entry.nested} and orphan ${entry.orphan}`,
@@ -533,7 +760,31 @@ function namedDynamicWidgetError(error, graph) {
       (entry) =>
         `${entry.nodeType} node ${entry.nodeId} has typed ${entry.outputType} ${entry.widgetName} widget`,
     ),
+    // #2140 — the state that reached the reporter as a bare string: a DynamicCombo root
+    // whose selected option declares children the node is not carrying. No orphan, no
+    // residue, so neither describer above says anything about it.
+    ...unresolved.map((entry) => {
+      if (entry.reason === "root-missing") {
+        return `${entry.nodeType} node ${entry.nodeId} is missing dynamic root ${entry.root}`;
+      }
+      const verb = entry.reason === "duplicate-rows" ? "has duplicate" : "is missing";
+      return `${entry.nodeType} node ${entry.nodeId} ${entry.root}=${JSON.stringify(entry.selected)} ${verb} ${entry.missing.join(", ")}`;
+    }),
   ];
+  // Last resort. #2140's reporter had a clean panel_get_errors and a message naming no
+  // node, and reconstructed the culprit by reading the schema of 21 nodes by hand. Three
+  // candidate ids is not a diagnosis, but it is a place to start bisecting.
+  if (!listedParts.length) {
+    const candidates = describeDynamicComboCandidates(graph);
+    if (candidates.length) {
+      const named = candidates
+        .slice(0, 3)
+        .map((entry) => `${entry.nodeType} node ${entry.nodeId} (${entry.roots.join(", ")})`)
+        .join("; ");
+      const more = candidates.length > 3 ? ` and ${candidates.length - 3} more` : "";
+      listedParts.push(`no node could be identified; dynamic-combo nodes on this graph: ${named}${more}`);
+    }
+  }
   let base = "";
   try {
     base = error instanceof Error ? error.message : String(error ?? "");
