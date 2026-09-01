@@ -605,6 +605,108 @@ test("comfyui-mcp#2689: a repair that leaves a #477 display proxy stale is rejec
   assert.equal(target.displayProxy.value, 512, "the outer node is not left rendering the requested value");
 });
 
+test("comfyui-mcp#2689: a rail holding the value only in its TEXTAREA is not repaired on that evidence", () => {
+  // The repair spends its judgement erasing the only other copy of the value, so it needs
+  // the rail's OWN store — the per-widgetId entry queue compilation reads — to hold it.
+  // #2020's allowance accepts a live custom-text widget whose DOM editor holds the value
+  // while `.value` does not, which is right for judging a write that has already landed
+  // and wrong here: restoring the definition would leave the write nowhere durable at all.
+  const store = new Map();
+  const widgetId = `${ROOT_GRAPH_ID}:5646:text`;
+  const inner = {
+    id: 5606,
+    type: "CLIPTextEncode",
+    widgets: [{ name: "text", type: "customtext", value: "OLD PROMPT", options: { multiline: true } }],
+  };
+  const subgraph = { id: "sg", _nodes: [inner], getNodeById: (id) => (String(id) === "5606" ? inner : null) };
+  store.set(widgetId, { value: "OLD PROMPT" });
+  const editor = { tagName: "TEXTAREA", value: "OLD PROMPT" };
+  const rail = {
+    name: "text",
+    type: "customtext",
+    inputEl: editor,
+    get value() {
+      return store.get(widgetId).value;
+    },
+    // The store REFUSES the write — the shape #2020 describes, where the widget's own
+    // value accessor has not caught up with the editor.
+    set value(_next) {},
+    options: {
+      getValue: () => store.get(widgetId).value,
+      setValue: (next) => {
+        // …while the write-through to the SHARED definition happens anyway.
+        inner.widgets[0].value = next;
+      },
+    },
+  };
+  const input = { name: "text", widgetId, _widget: rail, widget: { name: "text" }, _subgraphSlot: { name: "text" } };
+  const host = {
+    id: 5646,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [input],
+    get widgets() {
+      return [rail];
+    },
+  };
+  const resolve = (_n, si) => (si?.name === "text" ? { sourceNodeId: "5606", sourceWidgetName: "text" } : null);
+
+  let err = null;
+  try {
+    applyWidgetWrite(host, "text", "a NEW prompt", { resolveSource: resolve });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof WidgetWriteError, "a rail whose own store did not take the value is not repaired");
+  // …and the refusal does not claim the two stores are inseparable. They were never
+  // TESTED for that: the repair was skipped because the rail's own store is stale, and a
+  // message asserting the outcome of a check that did not run sends the caller to unpack
+  // a subgraph over what is really a rail that did not take the value.
+  assert.doesNotMatch(err.message, /are one store here/);
+  assert.equal(store.get(widgetId).value, "OLD PROMPT", "precondition held: the store never took it");
+  assert.equal(inner.widgets[0].value, "OLD PROMPT", "and the shared definition is restored");
+});
+
+test("comfyui-mcp#2689: the repair is structural — an OBJECT-valued promoted widget repairs too", () => {
+  // The repair compares the definition STRUCTURALLY against a pre-write deep clone, so it
+  // has to work for a widget whose value is an object and not only for the scalars the
+  // rest of these fixtures use.
+  const store = new Map();
+  const widgetId = `${ROOT_GRAPH_ID}:7:cfg`;
+  const inner = { id: 11, type: "Composite", widgets: [{ name: "cfg", type: "OBJECT", value: { steps: 20 } }] };
+  const subgraph = { id: "sg", _nodes: [inner], getNodeById: (id) => (String(id) === "11" ? inner : null) };
+  store.set(widgetId, { value: { steps: 20 } });
+  const rail = {
+    name: "cfg",
+    type: "OBJECT",
+    get value() {
+      return store.get(widgetId).value;
+    },
+    set value(next) {
+      store.get(widgetId).value = next;
+      inner.widgets[0].value = next; // the write-through
+    },
+  };
+  const input = { name: "cfg", widgetId, _widget: rail, widget: { name: "cfg" }, _subgraphSlot: { name: "cfg" } };
+  const host = {
+    id: 7,
+    type: "SubgraphNode",
+    subgraph,
+    inputs: [input],
+    get widgets() {
+      return [rail];
+    },
+  };
+  const resolve = (_n, si) => (si?.name === "cfg" ? { sourceNodeId: "11", sourceWidgetName: "cfg" } : null);
+
+  const set = applyWidgetWrite(host, "cfg", { steps: 40 }, { resolveSource: resolve });
+
+  assert.deepEqual(store.get(widgetId).value, { steps: 40 }, "the wrapper's own store took the object");
+  assert.deepEqual(inner.widgets[0].value, { steps: 20 }, "and the shared definition is structurally restored");
+  assert.equal(set.promoted_from.value_scope, "instance");
+  assert.equal(set.promoted_from.shared_definition_write_through, true);
+});
+
 test("#1707: a failed instance-scoped write does not touch the definition on the ROLLBACK either", () => {
   const sg = makeReusableSubgraph({ definitionValue: 512 });
   const target = sg.instance(293);

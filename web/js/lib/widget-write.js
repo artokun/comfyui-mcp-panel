@@ -3270,7 +3270,26 @@ export function applyWidgetWrite(
   // is skipped and the definition-moved verdict stands), and a message that described an
   // attempt that never happened would be a claim about a check nothing performed.
   let definitionRepairAttempted = false;
-  if (definitionMoved && widgetMatchesExpected(valueWidget)) {
+  // STRICTLY retained, deliberately — not `widgetMatchesExpected`.
+  //
+  // That helper also accepts a live custom-text widget whose DOM EDITOR holds the value
+  // while its own `.value` does not (#2020), which is right for judging a write that has
+  // already landed. It is the wrong evidence for THIS decision: the repair spends that
+  // judgement erasing the only other copy of the value. A promoted rail's `.value` reads
+  // the per-widgetId store — the entry queue compilation reads — so a rail showing the
+  // value only in its textarea has not been shown to have landed it anywhere durable, and
+  // restoring the definition could leave the write nowhere at all. Such a rail keeps the
+  // old refusal instead of being repaired on weaker evidence, and — because the repair is
+  // never ATTEMPTED there — that refusal does not claim the two stores are inseparable
+  // when all that happened is the rail's own store did not take the value.
+  const strictlyRetained = (widget) => {
+    try {
+      return matchesExpected(widget?.value);
+    } catch {
+      return false;
+    }
+  };
+  if (definitionMoved && strictlyRetained(valueWidget)) {
     definitionRepairAttempted = true;
     // What the WRITE left on the inner widget, so a repair that does not verify can be
     // put back. Without this the failure path reports the REPAIR instead of the write: on
@@ -3279,7 +3298,15 @@ export function applyWidgetWrite(
     // definition" (true, and actionable) to "did not retain the requested value" (false —
     // the rail retained it; this code took it away). A repair that cannot be verified must
     // leave EXACTLY the state the write left, so every verdict below describes the write.
+    //
+    // Kept as BOTH the reference and a structural CLONE. The reference is what a restore
+    // must reinstate (this module restores prior REFERENCES everywhere, so a rollback
+    // hands back the object the node already had); the clone is what says whether that
+    // reinstatement actually reproduced the post-write value, because a widget whose
+    // setter mutates its current value object IN PLACE turns the captured reference into
+    // whatever was last assigned — including the pre-write value we just restored FROM.
     const innerAfterWrite = w.value;
+    const innerAfterWriteClone = deepClone(innerAfterWrite);
     try {
       restoreWidgetValue(w, previous);
     } catch {
@@ -3287,8 +3314,8 @@ export function applyWidgetWrite(
     }
     if (
       structurallyEqual(w.value, previousClone) &&
-      widgetMatchesExpected(valueWidget) &&
-      displayWidgets.every((dw) => widgetMatchesExpected(dw))
+      strictlyRetained(valueWidget) &&
+      displayWidgets.every((dw) => strictlyRetained(dw))
     ) {
       definitionMoved = false;
       definitionRepaired = true;
@@ -3297,6 +3324,13 @@ export function applyWidgetWrite(
         restoreWidgetValue(w, innerAfterWrite);
       } catch {
         /* re-classified from the LIVE value below, not from what was attempted */
+      }
+      if (!structurallyEqual(w.value, innerAfterWriteClone)) {
+        try {
+          restoreWidgetValue(w, innerAfterWriteClone);
+        } catch {
+          /* still re-classified from the LIVE value below */
+        }
       }
       // Taken from what is actually there now, never from what the undo tried to do: an
       // inner widget that refused to take the write-through value back is not a moved
