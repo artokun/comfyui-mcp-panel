@@ -296,6 +296,57 @@ test("#2151: a row left driving a same-title node it no longer names is refused 
   assert.equal(fixture.widgets[0].value, true, "the row value is restored too");
 });
 
+test("#2151: a Node Collector fanning several nodes into one slot still pairs row to node", () => {
+  // A DESIGNED rgthree usage, and the case that makes the row-to-node pairing non-trivial: a
+  // pass-through contributes SEVERAL entries for ONE input slot, so the pack's linked-node list
+  // is longer than its input list and the pairing cannot be "one node per slot". If the walk
+  // here disagreed with the pack's, `targetSettled` would refuse writes that are perfectly fine.
+  const graph = { links: {}, getNodeById: (id) => nodes.get(id) ?? null };
+  const nodes = new Map();
+  const bypasser = {
+    id: 143,
+    type: FAST_BYPASSER,
+    modeOn: 0,
+    modeOff: 4,
+    properties: {},
+    widgets: [],
+    inputs: [],
+    graph,
+  };
+  const collector = { id: 50, type: "Node Collector (rgthree)", mode: 0, graph, inputs: [] };
+  nodes.set(collector.id, collector);
+  const effects = ["Grain", "Halation", "Bloom"].map((title, i) => {
+    const n = { id: 60 + i, type: "LC_Effect", title, mode: 0, graph };
+    nodes.set(n.id, n);
+    graph.links[200 + i] = { origin_id: n.id, target_id: collector.id };
+    collector.inputs.push({ link: 200 + i });
+    return n;
+  });
+  graph.links[100] = { origin_id: collector.id, target_id: bypasser.id };
+  bypasser.inputs.push({ link: 100 }, { link: null });
+  graph.nodes = [bypasser, collector, ...effects];
+
+  // One row per COLLECTED node — what handleLinkedNodesStabilization builds.
+  for (const effect of effects) {
+    const widget = { name: `Enable ${effect.title}`, type: "toggle", value: true };
+    widget.doModeChange = (forceValue) => {
+      const nv = forceValue == null ? effect.mode === bypasser.modeOff : forceValue;
+      effect.mode = nv ? bypasser.modeOn : bypasser.modeOff;
+      widget.value = nv;
+    };
+    widget.callback = () => widget.doModeChange();
+    bypasser.widgets.push(widget);
+  }
+
+  applyWidgetWrite(bypasser, "Enable Halation", false, {});
+  assert.deepEqual(
+    effects.map((n) => n.mode),
+    [0, 4, 0],
+    "the middle collected node is the one bypassed — the pairing walked through the collector",
+  );
+  assert.equal(collector.mode, 0, "the pass-through itself is not switched");
+});
+
 test("#2151: a non-row widget on the same node type keeps the ordinary write path", () => {
   const fixture = makeModeChanger({ linkedModes: [0] });
   const plain = { name: "some_other_widget", type: "text", value: "before" };
