@@ -105,10 +105,36 @@ _ADVERTISED_BRIDGE_URL = None
 # the browser's first dial; accepted now so an orchestrator that starts
 # sending it (mcp#2030) is followed instead of a compiled default.
 _ADVERTISED_LOCAL_URL = None
+# #2162 — the last advertisement LINE written to the log for each of the two
+# URLs, so the orchestrator's 5 s re-advertise heartbeat and its per-hello
+# bursts stay silent. See _log_bridge_advertisement.
+_LOGGED_BRIDGE_LINE = None
+_LOGGED_LOCAL_LINE = None
 
 
 def _log(msg):
-    print("[comfyui-mcp-panel] " + msg)
+    # #2162 — ONE write call per log line, terminator included. ComfyUI's
+    # LogInterceptor (app/logger.py) appends one entry to its capped
+    # /internal/logs deque per sys.stdout.write(), each stamped with its own
+    # datetime.now(). print() writes the text and the "\n" separately, so every
+    # panel line burned two of that ring's slots: an unterminated message (onto
+    # which the next entry's timestamp visibly concatenates, breaking
+    # line-oriented parsing) plus a bare "<ts> - " with nothing after it.
+    # print(..., end="") does NOT fix it — it still writes the empty end string
+    # as a second call. sys.stdout.write is the only single-write form.
+    #
+    # The None check keeps print()'s contract: a console-less host (pythonw, a
+    # detached service) leaves sys.stdout None, where print() returns silently
+    # but sys.stdout.write raises AttributeError. _register_routes logs on the
+    # way out at import time, so raising here would abort the pack import and
+    # the sidebar would never load — a far worse bug than the one being fixed.
+    stream = sys.stdout
+    if stream is None:
+        return
+    line = "[comfyui-mcp-panel] " + msg
+    if not line.endswith("\n"):
+        line += "\n"
+    stream.write(line)
 
 
 def _launcher_config_path():
@@ -866,6 +892,46 @@ def _advertised_bridge_payload():
     return {"url": _ADVERTISED_BRIDGE_URL, "local_url": _ADVERTISED_LOCAL_URL}
 
 
+def _log_bridge_advertisement(advertised):
+    """Announce an accepted advertisement, but only when it says something new.
+
+    #2162 — the orchestrator re-POSTs its advertisement on a 5 s heartbeat
+    (comfyui-mcp ``syncReadvertise``) and again on every panel hello, both
+    deliberately: a POST missed across a pod-side ComfyUI restart otherwise
+    leaves a stale token that no browser refresh can recover from. Logging each
+    accepted POST therefore wrote ~720 lines/hour into ComfyUI's size-capped
+    ``/internal/logs`` ring and evicted every startup, model-load and traceback
+    line, and the hello bursts wrote the same line several times within
+    milliseconds.
+
+    We keep the announcement (it is genuinely useful once) and drop the
+    repetition: remember the LINE last written for each of the two URLs and
+    speak only on a change — first establish, a new tunnel, or a reconnect that
+    moves the loopback port. Comparing the rendered line rather than the raw URL
+    also keeps a bare token rotation silent, since the visible text is
+    identical.
+
+    Returns the messages logged; empty for a heartbeat repeat.
+    """
+    global _LOGGED_BRIDGE_LINE, _LOGGED_LOCAL_LINE
+    url = advertised.get("url")
+    local_url = advertised.get("local_url")
+    messages = []
+    if url:
+        line = "secure bridge advertised: {}".format(url.split("?")[0])
+        if line != _LOGGED_BRIDGE_LINE:
+            _LOGGED_BRIDGE_LINE = line
+            messages.append(line)
+    if local_url:
+        line = "local bridge advertised: {}".format(local_url)
+        if line != _LOGGED_LOCAL_LINE:
+            _LOGGED_LOCAL_LINE = line
+            messages.append(line)
+    for message in messages:
+        _log(message)
+    return messages
+
+
 def _status_bridge_url(live_port=None):
     if live_port is not None:
         return "ws://{}:{}".format(_BRIDGE_HOST, live_port)
@@ -1227,11 +1293,9 @@ def _register_routes():
         ok, message, status = _store_advertised_bridge(body if isinstance(body, dict) else None)
         if not ok:
             return web.json_response({"ok": False, "message": message}, status=status)
-        advertised = _advertised_bridge_payload()
-        if advertised["url"]:
-            _log("secure bridge advertised: {}".format(advertised["url"].split("?")[0]))
-        if advertised["local_url"]:
-            _log("local bridge advertised: {}".format(advertised["local_url"]))
+        # #2162 — announce on a CHANGE only; this route is hit on a 5 s
+        # heartbeat and once per hello, and ComfyUI's log ring is small.
+        _log_bridge_advertisement(_advertised_bridge_payload())
         return web.json_response({"ok": True})
 
     @routes.get("/comfyui_mcp_panel/bridge_url")
