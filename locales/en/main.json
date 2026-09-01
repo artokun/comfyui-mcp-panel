@@ -517,6 +517,8 @@
       "found_errors": "Found errors — {findings}",
       "found_nodes_one": "Found {found} of {count} node",
       "found_nodes_other": "Found {found} of {count} nodes",
+      "free_vram_pending": "Asked ComfyUI to unload models — VRAM not freed yet",
+      "free_vram_pinned": "Unloaded models — but VRAM is still held by this ComfyUI",
       "friendly_api_key": "{friendly} API key",
       "gemini": "Gemini",
       "general": "General",
