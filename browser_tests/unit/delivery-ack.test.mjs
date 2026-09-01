@@ -150,7 +150,7 @@ test("#1995 the flush bound is short of the 30s relay window", () => {
 });
 
 test("#1995 wiring: graph_run returns through honestRunAck", () => {
-  assert.match(PANEL_SRC, /if \(rejection\) return honestRunAck\(rejection\);/);
+  assert.match(PANEL_SRC, /if \(rejection\) return honestRunAck\(downgradeUnstableRunResult\(rejection, dispatchIdentityComparison\)\);/);
   assert.match(PANEL_SRC, /return honestRunAck\(downgradeUnstableRunResult\(accept, dispatchIdentityComparison\)\);/);
   assert.match(PANEL_SRC, /import \{ honestRunAck \} from "\.\/lib\/delivery-ack\.js";/);
 });

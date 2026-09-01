@@ -760,6 +760,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
         routeIdentityProven: true,
         workflowUuid: PROVEN_WORKFLOW_UUID,
         workflowIdentityProven: true,
+        backendSocketDown: false,
         reconnectEpoch: 0,
         targetId,
       })),
@@ -2069,6 +2070,7 @@ test("#166 production path: a reconnect during preflight refuses before any prom
       routeIdentityProven: true,
       workflowUuid: PROVEN_WORKFLOW_UUID,
       workflowIdentityProven: true,
+      backendSocketDown: false,
       reconnectEpoch: 0,
     };
     const apiTarget = { fetchApi: makeServer() };
@@ -2095,6 +2097,43 @@ test("#166 production path: a reconnect during preflight refuses before any prom
   }
 });
 
+test("#166 production path: the reconnecting socket signal refuses before prompt dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-socket",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketDown: false,
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    app.graphToPrompt = async () => {
+      // Models ComfyUI's `reconnecting` event. The epoch does not advance until
+      // `reconnected`, so this is the race the old identity provider missed.
+      state.backendSocketDown = true;
+      return { output: OUR_OUTPUT, workflow: {} };
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    await assert.rejects(
+      () => built.graph_run({}),
+      /panel_run was NOT applied.*backend socket down.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "a reconnecting socket must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
 test("#166 production path: an accepted receipt is downgraded when reconnect crosses the queue call", async () => {
   const stop = keepAlive();
   try {
@@ -2104,6 +2143,7 @@ test("#166 production path: an accepted receipt is downgraded when reconnect cro
       routeIdentityProven: true,
       workflowUuid: PROVEN_WORKFLOW_UUID,
       workflowIdentityProven: true,
+      backendSocketDown: false,
       reconnectEpoch: 0,
     };
     const apiTarget = { fetchApi: makeServer() };
@@ -2134,6 +2174,97 @@ test("#166 production path: an accepted receipt is downgraded when reconnect cro
   }
 });
 
+test("#166 production path: a crossed socket-down rejection keeps its receipt unknown", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-rejection",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketDown: false,
+      reconnectEpoch: 0,
+    };
+    const apiTarget = {
+      fetchApi: makeServerSequence([
+        { prompt_id: "receipt-166" },
+        {
+          status: 400,
+          body: { error: { type: "prompt_outputs_failed_validation", message: "later refusal" } },
+        },
+      ]),
+    };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const queuePrompt = app.queuePrompt;
+    app.queuePrompt = async (...args) => {
+      const result = await queuePrompt(...args);
+      state.backendSocketDown = true;
+      return result;
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const result = await built.graph_run({ batch_count: 2 });
+    assert.equal(apiTarget.fetchApi.calls.length, 2, "both production /prompt attempts were observed");
+    assert.equal(result.queued, undefined, "an unstable receipt-bearing rejection cannot claim queued:true/false");
+    assert.equal(result.queued_unknown, true);
+    assert.equal(result.prompt_id, "receipt-166", "the accepted receipt remains available for reconciliation");
+    assert.deepEqual(result.dispatch_identity.changed, ["backend socket down"]);
+    assert.match(String(result.error), /prompt receipt|backend socket down/i);
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: an ordinary rejection stays queued:false across socket-down", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-ordinary-rejection",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketDown: false,
+      reconnectEpoch: 0,
+    };
+    const apiTarget = {
+      fetchApi: makeServerSequence([
+        {
+          status: 400,
+          body: { error: { type: "missing_node_type", message: "ordinary refusal" } },
+        },
+      ]),
+    };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const queuePrompt = app.queuePrompt;
+    app.queuePrompt = async (...args) => {
+      const result = await queuePrompt(...args);
+      state.backendSocketDown = true;
+      return result;
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const result = await built.graph_run({});
+    assert.equal(result.queued, false, "a refusal with no receipt remains a definite refusal");
+    assert.equal(result.queued_unknown, undefined);
+    assert.equal(result.prompt_id, undefined);
+    assert.match(String(result.error), /ordinary refusal/i);
+  } finally {
+    stop();
+  }
+});
+
 test("#166 production path: an absent workflow identity refuses even when the route is ready", async () => {
   const stop = keepAlive();
   try {
@@ -2150,6 +2281,7 @@ test("#166 production path: an absent workflow identity refuses even when the ro
         routeIdentityProven: true,
         workflowUuid: null,
         workflowIdentityProven: false,
+        backendSocketDown: false,
         reconnectEpoch: 0,
         targetId,
       }),
@@ -2180,6 +2312,7 @@ test("#166 production path: an absent route identity refuses even when the route
         routeIdentityProven: false,
         workflowUuid: PROVEN_WORKFLOW_UUID,
         workflowIdentityProven: true,
+        backendSocketDown: false,
         reconnectEpoch: 0,
         targetId,
       }),
@@ -2206,6 +2339,7 @@ test("#166 production path: invalid and ambiguous workflow identities refuse bef
           routeIdentityProven: true,
           workflowUuid: "not-a-uuid",
           workflowIdentityProven: true,
+          backendSocketDown: false,
           reconnectEpoch: 0,
         },
         expected: /panel_run was NOT applied.*workflow identity unavailable.*nothing was sent/,
@@ -2219,6 +2353,7 @@ test("#166 production path: invalid and ambiguous workflow identities refuse bef
           workflowUuid: PROVEN_WORKFLOW_UUID,
           workflowIdentityProven: true,
           workflowIdentityAmbiguous: true,
+          backendSocketDown: false,
           reconnectEpoch: 0,
         },
         expected: /panel_run was NOT applied.*workflow identity ambiguous.*nothing was sent/,

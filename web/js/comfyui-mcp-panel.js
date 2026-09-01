@@ -20744,7 +20744,7 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     // #1995 — a minted prompt id is a queue receipt. Never rewrite that as a
     // user-rejected tool result; a lost ack without an id is unknown, not refused.
-    if (rejection) return honestRunAck(rejection);
+    if (rejection) return honestRunAck(downgradeUnstableRunResult(rejection, dispatchIdentityComparison));
     // Surface the queued prompt_id(s) so the agent can correlate/track the run —
     // #370 reconciliation and mcp#531 (panel_run must return the prompt_id even
     // when a render is already running) both depend on this being reported.
@@ -41129,6 +41129,7 @@ function buildPanel() {
       workflowUuid,
       workflowIdentityProven,
       workflowIdentityAmbiguous,
+      backendSocketDown: comfyBackendSocketDown === true ? true : comfyBackendSocketDown === false ? false : null,
       reconnectEpoch: backendReconnectEpoch,
       targetId,
     };

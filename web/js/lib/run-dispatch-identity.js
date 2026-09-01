@@ -34,12 +34,15 @@ export function captureRunDispatchIdentity({
   workflowUuid = null,
   workflowIdentityProven = false,
   workflowIdentityAmbiguous = false,
+  backendSocketDown = null,
   reconnectEpoch = null,
   targetId = null,
 } = {}) {
   const normalizedWorkflowUuid = text(workflowUuid);
   const normalizedRouteId = text(routeId);
   const ambiguous = workflowIdentityAmbiguous === true;
+  const normalizedBackendSocketDown =
+    backendSocketDown === true ? true : backendSocketDown === false ? false : null;
   return {
     routeId: normalizedRouteId,
     routeReady: routeReady === true,
@@ -48,6 +51,7 @@ export function captureRunDispatchIdentity({
     workflowIdentityProven:
       workflowIdentityProven === true && !ambiguous && canonicalWorkflowUuid(normalizedWorkflowUuid),
     workflowIdentityAmbiguous: ambiguous,
+    backendSocketDown: normalizedBackendSocketDown,
     reconnectEpoch: epoch(reconnectEpoch),
     targetId: text(targetId),
   };
@@ -62,6 +66,11 @@ export function compareRunDispatchIdentity(before, after) {
   const right = captureRunDispatchIdentity(after);
   const changed = [];
   if (left.reconnectEpoch !== right.reconnectEpoch) changed.push("reconnect");
+  if (left.backendSocketDown === true || right.backendSocketDown === true) {
+    changed.push("backend socket down");
+  } else if (left.backendSocketDown !== false || right.backendSocketDown !== false) {
+    changed.push("backend socket unavailable");
+  }
   if (left.routeId !== right.routeId) changed.push("bridge route");
   else if (!left.routeIdentityProven || !right.routeIdentityProven) changed.push("bridge route unavailable");
   if (left.workflowUuid !== right.workflowUuid) changed.push("workflow");

@@ -21,6 +21,7 @@ const identity = (overrides = {}) =>
     routeIdentityProven: true,
     workflowUuid: "11111111-1111-4111-8111-111111111111",
     workflowIdentityProven: true,
+    backendSocketDown: false,
     reconnectEpoch: 4,
     targetId: "10:7",
     ...overrides,
@@ -79,6 +80,24 @@ test("route readiness is required for a live identity", () => {
   assert.deepEqual(result.changed, ["route readiness"]);
 });
 
+test("equal socket-down identities are never stable", () => {
+  const result = compareRunDispatchIdentity(
+    identity({ backendSocketDown: true }),
+    identity({ backendSocketDown: true }),
+  );
+  assert.equal(result.stable, false);
+  assert.deepEqual(result.changed, ["backend socket down"]);
+});
+
+test("an unknown socket state is never stable", () => {
+  const result = compareRunDispatchIdentity(
+    identity({ backendSocketDown: null }),
+    identity({ backendSocketDown: null }),
+  );
+  assert.equal(result.stable, false);
+  assert.deepEqual(result.changed, ["backend socket unavailable"]);
+});
+
 test("equal absent or invalid workflow identities are never stable", () => {
   for (const workflowUuid of [null, "not-a-uuid"]) {
     const result = compareRunDispatchIdentity(
@@ -107,6 +126,7 @@ test("the production identity provider publishes proof, not a swallowed null UUI
   assert.match(provider, /let routeReady = false;/);
   assert.match(provider, /let routeIdentityProven = false;/);
   assert.match(provider, /routeIdentityProven = typeof routeId === "string"/);
+  assert.match(provider, /backendSocketDown: comfyBackendSocketDown/);
   assert.match(provider, /const probe = probeActiveWorkflow\(\);/);
   assert.match(provider, /const candidate =/);
   assert.match(provider, /workflowObjectUuid\(workflow\)/);
