@@ -36,7 +36,7 @@ function ensureCss() {
   const link = document.createElement("link");
   link.rel = "stylesheet";
   // Stamped like the JS import below, so a re-vendor cannot leave a browser on the old CSS.
-  link.href = new URL("./style.css?v=f533a3374285", import.meta.url).href;
+  link.href = new URL("./style.css?v=45fed8de9387", import.meta.url).href;
   document.head.appendChild(link);
 }
 
@@ -62,7 +62,7 @@ export function createDirectorContent(ctx, shell, opts = {}) {
       // hash. Without it the browser caches this module indefinitely: the panel is served raw
       // with no bundler, so nothing else busts it, and a user who updated the pack would keep
       // running the old editor with no way to tell.
-      const mod = await import("./director-app.js?v=f533a3374285");
+      const mod = await import("./director-app.js?v=45fed8de9387");
       // The pane can be torn down while the dynamic import is in flight; mounting into a
       // detached node would leak a React root that nothing will ever unmount.
       if (mountEl !== bodyEl || !bodyEl.isConnected) return;
