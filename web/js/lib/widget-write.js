@@ -3036,6 +3036,134 @@ export function applyWidgetWrite(
   // CAPTURED (not rethrown here) so that VERIFICATION runs AFTER afterChange has
   // fired its hooks: an afterChange hook can itself re-stale a widget or change the
   // promotion topology, and that must be caught too (not just callback-time drift).
+  // comfyui-mcp#2689 — REPAIR the collateral definition write instead of refusing the
+  // whole write.
+  //
+  // A rail that WRITES THROUGH to the inner widget is not the same failure as a rail whose
+  // value and the definition's are one store. The store the queue compiler reads is this
+  // wrapper's own entry (`store[input.widgetId]`), and the rail's setter landed the value
+  // there; what it ALSO did was assign the shared inner widget, which nothing asked it to
+  // do. Undoing exactly that second assignment leaves the write where it was addressed and
+  // the definition where it was — so `value_scope: "instance"` becomes a statement the code
+  // has OBSERVED rather than one it refused to make.
+  //
+  // That was the whole cost of the old refusal: on the reported frontends every promoted
+  // STRING rail writes through, so a promoted prompt could not be set AT ALL — not from the
+  // wrapper, and not by entering the subgraph (that path resolves to the same rail).
+  //
+  // FAIL CLOSED, still. The repair is accepted only when BOTH halves are verified after it:
+  // the shared definition is structurally back on its captured value, AND the rail (and
+  // every #477 display proxy) still holds the requested one. A shape that forwards in BOTH
+  // directions fails the second check — restoring the inner drags the rail back with it —
+  // and keeps the old refusal and the old rollback, unchanged.
+  //
+  // Stays TRUE for the rest of this call once a repair has landed, because the rollback
+  // still has to restore the inner widget if some LATER check fails: the rail's own restore
+  // forwards onto it a second time (#2132), and skipping the inner restore would leave the
+  // SHARED definition holding the rail's captured value.
+  let definitionRepaired = false;
+  // WHICH check blocked the repair — "rail" | "inner" | "display", or null when it was
+  // never attempted. The refusal names it. A single "the repair was attempted" flag let one
+  // message speak for three different situations: a separable rail whose #477 display proxy
+  // simply follows the definition is NOT a rail that is one store with it, and telling that
+  // caller to unpack the subgraph sends them to rebuild a graph over a projection that would
+  // have re-rendered.
+  let definitionRepairBlockedBy = null;
+  // STRICTLY retained, deliberately — not `widgetMatchesExpected`.
+  //
+  // That helper also accepts a live custom-text widget whose DOM EDITOR holds the value while
+  // its own `.value` does not (#2020), which is right for judging a write that has already
+  // landed. It is the wrong evidence for THIS decision: the repair spends that judgement
+  // erasing the only other copy of the value. A promoted rail's `.value` reads the
+  // per-widgetId store — the entry queue compilation reads — so a rail showing the value only
+  // in its textarea has not been shown to have landed it anywhere durable, and restoring the
+  // definition could leave the write nowhere at all. Such a rail keeps the old refusal instead
+  // of being repaired on weaker evidence, and — because the repair is never ATTEMPTED there —
+  // that refusal does not claim the two stores are inseparable when all that happened is the
+  // rail's own store did not take the value.
+  const strictlyRetained = (widget) => {
+    try {
+      return matchesExpected(widget?.value);
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * comfyui-mcp#2689 — undo the rail's collateral assignment to the SHARED definition.
+   *
+   * Runs INSIDE the write's own undo envelope (from its `finally`, before `safeAfter()`),
+   * for the reason #1533's number restore is there: `panel_set_widget` advertises "Undoable
+   * with Ctrl+Z", these hooks ARE litegraph's `graph.beforeChange`/`afterChange`, and the
+   * repair mutates the shared subgraph definition. Recorded as a SEPARATE transaction it
+   * would be strictly worse than not recording it at all — one Ctrl+Z would undo only the
+   * repair and reinstate the definition move while the instance rail kept the new value,
+   * i.e. hand the user a one-keystroke path to the very leak this exists to prevent. Inside,
+   * the write and its repair are one step: undo goes to the pre-write state, redo to the
+   * repaired one.
+   *
+   * Everything it reads and writes is captured before the envelope opens, and it is total —
+   * a throw here must never become the write's `threw`, which is attribution this module is
+   * careful about elsewhere.
+   *
+   * The accept decision is therefore taken BEFORE `afterChange` fires. That is a real
+   * narrowing and it is the right one: the alternative is a second transaction. A hook that
+   * re-moves the definition afterwards is still caught, by the LIVE `definitionMoved`
+   * re-classification after the envelope closes, which is what actually decides the verdict.
+   */
+  const repairSharedDefinitionWriteThrough = () => {
+    try {
+      if (!instanceScoped) return;
+      if (structurallyEqual(w.value, previousClone)) return;
+      if (!strictlyRetained(valueWidget)) return;
+      // What the WRITE left on the inner widget, so a repair that does not verify can be put
+      // back. Without this the failure path reports the REPAIR instead of the write: on a
+      // rail that is one store with the definition, restoring the inner widget drags the rail
+      // down with it, and the verdict flips from "ALSO changed the shared subgraph definition"
+      // (true, and actionable) to "did not retain the requested value" (false — the rail
+      // retained it; this code took it away). A repair that cannot be verified must leave
+      // EXACTLY the state the write left, so every verdict describes the write.
+      //
+      // Kept as BOTH the reference and a structural CLONE. The reference is what a restore
+      // must reinstate (this module restores prior REFERENCES everywhere, so a rollback hands
+      // back the object the node already had); the clone is what says whether that
+      // reinstatement actually reproduced the post-write value, because a widget whose setter
+      // mutates its current value object IN PLACE turns the captured reference into whatever
+      // was last assigned — including the pre-write value we just restored FROM.
+      const innerAfterWrite = w.value;
+      const innerAfterWriteClone = deepClone(innerAfterWrite);
+      try {
+        restoreWidgetValue(w, previous);
+      } catch {
+        /* the read-back below is authoritative */
+      }
+      const innerRestored = structurallyEqual(w.value, previousClone);
+      const railKeptValue = strictlyRetained(valueWidget);
+      const displaysKeptValue = displayWidgets.every((dw) => strictlyRetained(dw));
+      if (innerRestored && railKeptValue && displaysKeptValue) {
+        definitionRepaired = true;
+        return;
+      }
+      // Ordered by how fundamental the obstacle is: a rail dragged back with the definition
+      // is the two being one store; an inner widget that will not take its own value back is
+      // the definition being unrestorable; a stale display proxy is neither — the value
+      // stores separated fine and a parent-facing VIEW did not.
+      definitionRepairBlockedBy = !railKeptValue ? "rail" : !innerRestored ? "inner" : "display";
+      try {
+        restoreWidgetValue(w, innerAfterWrite);
+      } catch {
+        /* the LIVE re-classification after the envelope decides, not what was attempted */
+      }
+      if (!structurallyEqual(w.value, innerAfterWriteClone)) {
+        try {
+          restoreWidgetValue(w, innerAfterWriteClone);
+        } catch {
+          /* still decided from the LIVE value */
+        }
+      }
+    } catch {
+      /* never let the repair become the write's throw; the verdict is taken from live state */
+    }
+  };
   let threw = null;
   // #976 (codex NO-SHIP round 2): a captured throw cannot be detected by testing
   // `threw` for truthiness — `throw undefined`, `throw null`, `throw 0`, `throw ""`
@@ -3190,6 +3318,11 @@ export function applyWidgetWrite(
     didThrow = true;
     threw = err;
   } finally {
+    // comfyui-mcp#2689 — inside this envelope, so the write and the undo of its collateral
+    // definition assignment are ONE undoable step. In the `finally` rather than at the end
+    // of the `try`, because the write-through happens during the value assignments: a
+    // callback that throws afterwards must not leave the shared definition moved.
+    repairSharedDefinitionWriteThrough();
     safeAfter();
   }
 
@@ -3234,8 +3367,14 @@ export function applyWidgetWrite(
       return UNREADABLE_PROPERTY;
     }
   };
+  // comfyui-mcp#2689 — classified from the LIVE definition value, AFTER afterChange, so an
+  // `afterChange` hook that re-assigns the shared inner widget is caught here even though
+  // the repair itself ran inside the envelope. `definitionRepaired` records that the repair
+  // landed at the time it ran; this line decides whether the definition is still whole now.
+  let definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
   // Read ONCE, after the envelope closed. Two reads of a stateful accessor can disagree,
-  // and the verdict and the message it prints must be the same observation.
+  // and the verdict and the message it prints must be the same observation. Taken after
+  // the #2689 repair so the one reading describes the state this call actually leaves.
   const boundPropertyActual = boundProperty?.reachable ? readBoundProperty() : undefined;
   // #805 — a value the widget's OWN declared grid explains is NORMALIZATION, not a
   // failed write. `matchesExpected` is a strict equality, so a numeric widget doing
@@ -3261,7 +3400,7 @@ export function applyWidgetWrite(
   // the write rolls back and says so instead of reporting an instance-scoped write it
   // did not perform. Compared structurally against the pre-mutation clone, so a
   // callback mutating a captured object in place is caught too.
-  const definitionMoved = instanceScoped && !structurallyEqual(w.value, previousClone);
+  // (classified above, before the bound-property read, so the #2689 repair can clear it)
   if (!widgetMatchesExpected(valueWidget) && !normalization) {
     failure =
       `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) did not retain the ` +
@@ -3286,7 +3425,16 @@ export function applyWidgetWrite(
       `${targetNode.id} (${JSON.stringify(previous)} → ${JSON.stringify(w.value)}). That value is ` +
       `read by every other instance of this subgraph, so the write is not scoped to the ` +
       `instance it was addressed to. Rolled back rather than report an instance-scoped write ` +
-      `that was not one (comfyui-mcp#1707).`;
+      `that was not one (comfyui-mcp#1707).` +
+      // comfyui-mcp#2689 — a write-through rail is REPAIRED, not refused, whenever undoing
+      // the collateral inner assignment leaves the rail holding the requested value. So
+      // reaching this branch after the repair ran means the two could not be separated:
+      // restoring the inner widget dragged the rail back with it, and the rail and the
+      // shared definition really are one store. Said ONLY when the repair was ATTEMPTED.
+      definitionRepairBlockedNote(definitionRepairBlockedBy, {
+        widgetName: w.name,
+        subgraphNodeId: node.id,
+      });
   } else if (boundProperty?.reachable && !matchesExpected(boundPropertyActual)) {
     // #1268 / comfyui-mcp#1658 — the widget kept the value and the node's own bound
     // property did NOT. This is the read the old verification never took: `w.value` came
@@ -3614,7 +3762,7 @@ export function applyWidgetWrite(
       // genuinely cannot both be restored, and the read-back below still reports that
       // as the partial state it is — with the SHARED definition, not the single rail,
       // as the one that is made whole.
-      if (!instanceScoped || definitionMoved) {
+      if (!instanceScoped || definitionMoved || definitionRepaired) {
         try {
           restoreWidgetValue(w, previous);
         } catch {
@@ -4061,6 +4209,26 @@ export function applyWidgetWrite(
             // path — the failure branch above rolls back rather than let "instance" stand
             // for a write that moved the definition.
             value_scope: valueScope,
+            // comfyui-mcp#2689 — the rail's setter ALSO assigned the shared definition's
+            // inner widget, and that assignment was undone and verified undone before this
+            // result was built. Emitted as DATA so a caller does not have to read prose to
+            // learn that the definition was touched and put back, and ONLY on the path that
+            // actually did it — every rail that does not write through replies exactly as it
+            // always did. `value_scope` stays "instance" because that is what was OBSERVED:
+            // the wrapper's own store entry holds the value and the definition is structurally
+            // identical to its pre-write clone.
+            ...(definitionRepaired
+              ? {
+                  shared_definition_write_through: true,
+                  shared_definition_write_through_note: sharedDefinitionWriteThroughNote({
+                    widgetName: w?.name,
+                    innerNodeId: targetNode?.id,
+                    innerNodeType: targetNode?.type,
+                    innerValue: previous,
+                    subgraphNodeId: node?.id,
+                  }),
+                }
+              : {}),
             // #1492 — the side effects this write did NOT run, stated as DATA next to
             // the scope decision that caused it. Emitted ONLY when a callback was
             // actually observed on the shared inner widget (or could not be read at
@@ -4085,6 +4253,85 @@ export function applyWidgetWrite(
         }
       : {}),
   };
+}
+
+/**
+ * comfyui-mcp#2689 — say WHY the repair could not be accepted, when one was attempted.
+ *
+ * The repair undoes the rail's collateral assignment to the shared definition and accepts the
+ * write only if the definition came back AND every parent-facing projection kept the requested
+ * value. Three different things can block that, and they have three different remedies — so
+ * the refusal names the one that actually happened rather than asserting the most dramatic:
+ *
+ *   "rail"     restoring the inner widget dragged the rail back, so the two are one store.
+ *   "inner"    the shared definition would not take its own value back at all.
+ *   "display"  the stores separated fine; a parent-facing VIEW of the definition did not.
+ *
+ * Returns "" when no repair was attempted, so a refusal that never ran the check cannot be
+ * read as reporting its outcome.
+ */
+export function definitionRepairBlockedNote(blockedBy, { widgetName, subgraphNodeId } = {}) {
+  if (blockedBy === "rail") {
+    return (
+      ` Restoring the inner widget on its own did not separate the two — the rail came back ` +
+      `with it — so this rail and the shared definition are one store here ` +
+      `(comfyui-mcp#2689). Edit this widget inside the subgraph definition if every instance ` +
+      `should take the value, or unpack the subgraph to give this instance its own copy.`
+    );
+  }
+  if (blockedBy === "inner") {
+    return (
+      ` The rail kept the requested value, but the shared definition's inner widget would not ` +
+      `take its own value back, so the write could not be separated from it ` +
+      `(comfyui-mcp#2689).`
+    );
+  }
+  if (blockedBy === "display") {
+    return (
+      ` The two value stores DID separate — the rail kept the requested value and the shared ` +
+      `definition came back — but subgraph node ${subgraphNodeId}'s parent-facing display ` +
+      `widget for "${widgetName}" reads the definition, so undoing the write there would ` +
+      `leave the wrapper rendering the OLD value (comfyui-mcp#2689). This is a stale ` +
+      `PROJECTION, not a shared store: reopening the workflow rebuilds it.`
+    );
+  }
+  return "";
+}
+
+/**
+ * comfyui-mcp#2689 — say that the shared subgraph definition was written THROUGH and put back.
+ *
+ * On the reported frontends the parent rail for a promoted STRING does not only write this
+ * wrapper's own promoted-value store — its setter also assigns the shared definition's inner
+ * widget. That second assignment is nobody's intent: an on-canvas edit of the promoted control
+ * never performs it, and every sibling instance reads the widget it lands on. So the write
+ * undoes it and verifies the definition is structurally back on its captured value before
+ * reporting anything.
+ *
+ * WORDED FOR WHAT IS ESTABLISHED. It says the definition was assigned and restored — both
+ * OBSERVED — and does not claim the inner widget's own callback did or did not run during the
+ * rail's write-through: that is the rail's code, not this module's, and nothing here can see
+ * it. What this module can and does state separately (`inner_callback_not_invoked`) is that it
+ * never invoked that callback itself.
+ */
+export function sharedDefinitionWriteThroughNote({
+  widgetName,
+  innerNodeId,
+  innerNodeType,
+  innerValue,
+  subgraphNodeId,
+} = {}) {
+  const inner = `node ${innerNodeId}${innerNodeType ? ` (${innerNodeType})` : ""}`;
+  return (
+    `The value IS in effect on subgraph node ${subgraphNodeId}: it was written to this ` +
+    `instance's own promoted-value store, which is what serializes at queue time. This ` +
+    `frontend's promoted rail ALSO assigned the shared subgraph definition's inner widget ` +
+    `"${widgetName}" on ${inner} — an assignment every sibling instance would have inherited, ` +
+    `and one an on-canvas edit of the promoted control never makes. It was undone: that widget ` +
+    `was verified structurally back on ${JSON.stringify(innerValue)} after the rail kept the ` +
+    `requested value, which is why this write is reported as instance-scoped. Sibling ` +
+    `instances, and instances created later from this definition, are unaffected.`
+  );
 }
 
 /**
