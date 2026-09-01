@@ -489,6 +489,62 @@ test("#2143: the timeout readback reads the row that was written, not the first 
   assert.equal(readLiveWidgetValue(bypasser, ROW, 5).found, false);
 });
 
+test("#2143: the readback and the write agree on the row when the name does NOT start at 0", () => {
+  // The case that separates a POSITION from a per-name ordinal. `ROW[1]` is widgets[1] — the
+  // FIRST toggle row. A readback that counted occurrences instead would answer about the
+  // SECOND, and if that row already held the requested value it would ack an uncertain write
+  // as "applied and verified" from a row nothing wrote to.
+  const node = {
+    id: 59,
+    type: BYPASSER,
+    widgets: [
+      { name: "matchColors", value: "" },
+      { name: ROW, label: "group one", value: { toggled: true } },
+      { name: ROW, label: "group two", value: { toggled: false } },
+    ],
+  };
+  const address = resolveWidgetAddress(node, `${ROW}[1]`);
+  assert.equal(address.occurrenceIndex, 1);
+
+  const live = readLiveWidgetValue(node, ROW, address.occurrenceIndex, address.occurrenceLabel);
+  assert.equal(live.widget, node.widgets[1], "the readback must read the row the write targets");
+  assert.deepEqual(live.value, { toggled: true });
+
+  const receipt = widgetWriteTimeoutReadback({
+    requested: { toggled: false },
+    actual: live.value,
+    found: live.found,
+    node_id: node.id,
+    widget: ROW,
+    widget_occurrence: widgetOccurrenceOf(node, live.widget),
+  });
+  assert.notEqual(
+    receipt.ack_note,
+    "applied and verified",
+    "row 2 holding the requested value must not verify a write aimed at row 1",
+  );
+});
+
+test("#2143: a readback whose row MOVED reports not-found rather than verifying a stranger", () => {
+  const { bypasser, rows } = twoGroupBypasser();
+  rows[1].value = { toggled: false };
+  // A rebuild swapped the rows after the address was resolved. Position 1 still holds a
+  // perfectly valid RGTHREE_TOGGLE_AND_NAV — a different group's.
+  bypasser.widgets = [rows[1], rows[0]];
+
+  const live = readLiveWidgetValue(bypasser, ROW, 1, "Enable VRAM optimizations 2");
+  assert.equal(live.found, false, "the pinned label refuses the row that moved into that slot");
+
+  const receipt = widgetWriteTimeoutReadback({
+    requested: { toggled: false },
+    actual: live.value,
+    found: live.found,
+    node_id: bypasser.id,
+    widget: ROW,
+  });
+  assert.notEqual(receipt.ack_note, "applied and verified");
+});
+
 test("#2143: the timeout receipt carries the same row attribution the write's own reply would", () => {
   const { bypasser, rows } = twoGroupBypasser();
   rows[1].value = { toggled: false };
@@ -575,9 +631,12 @@ test("#2143: runSetWidget forwards the ordinal to the write and to its own ack r
   // applyWidgetWrite is the only thing that can select the row…
   assert.match(setWidgetSource, /applyWidgetWrite\(node, widgetName, value, \{[\s\S]*?\n\s*occurrenceIndex,/);
   assert.match(setWidgetSource, /applyWidgetWrite\(node, widgetName, value, \{[\s\S]*?\n\s*occurrenceLabel,/);
-  // …and the #2025 timeout readback must consult the same row, or a write that timed out on
-  // row 1 can be acked from row 0's value.
-  assert.match(setWidgetSource, /readLiveWidgetValue\(node, widget, occurrenceIndex\)/);
+  // …and the #2025 timeout readback must consult the same row — WITH the same label pin —
+  // or a write that timed out on one row can be acked from another row's value.
+  assert.match(setWidgetSource, /readLiveWidgetValue\(node, widget, occurrenceIndex, occurrenceLabel\)/);
+  // The readback and the write must share ONE definition of what the index means. Two local
+  // implementations is how they came to disagree in the first place.
+  assert.match(setWidgetSource, /widgetAtOccurrence\(node, widgetName, occurrenceIndex, occurrenceLabel\)/);
   // …and report which row it read.
   assert.match(setWidgetSource, /widget_occurrence: live\.widget \? widgetOccurrenceOf\(node, live\.widget\) : null/);
 });

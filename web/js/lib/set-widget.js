@@ -59,7 +59,7 @@ import {
 } from "./input-asset.js";
 import { withTimeout } from "./bounded-step.js";
 import { honestWidgetAck, widgetWriteTimeoutReadback } from "./delivery-ack.js";
-import { widgetOccurrenceOf } from "./widget-occurrence.js";
+import { widgetOccurrenceOf, widgetAtOccurrence } from "./widget-occurrence.js";
 
 /**
  * Fire an undo-history hook that can never escape.
@@ -171,27 +171,32 @@ function hasValueSetter(widget) {
 }
 
 /**
- * The widget a `(name, occurrenceIndex)` address names on the LIVE node, never throwing.
+ * The widget a `(name, occurrenceIndex, occurrenceLabel)` address names on the LIVE node,
+ * never throwing.
  *
- * #2143 — the ordinal matters here for the same reason it matters at the write: on a node
+ * #2143 — the address matters here for the same reason it matters at the write: on a node
  * with several widgets sharing one name, `find(w => w.name === n)` answers about the FIRST
  * row whichever row was written. For the timeout readback below that is not merely
- * imprecise — the first row's value can equal the requested one while the row the write
+ * imprecise — another row's value can equal the requested one while the row the write
  * targeted never changed, and the ack would then report "applied and verified" about a
  * write whose outcome is genuinely unknown.
+ *
+ * `widgetAtOccurrence` is SHARED with the write's own resolution, deliberately: these two
+ * must name the same widget or the readback reports on a row the write never touched, and
+ * two local implementations of "the i-th one" is exactly how they came to disagree.
  */
-function liveWidgetAt(node, widgetName, occurrenceIndex = null) {
+function liveWidgetAt(node, widgetName, occurrenceIndex = null, occurrenceLabel = null) {
   const widgets = node?.widgets;
   if (!Array.isArray(widgets)) return undefined;
   if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0) {
-    return widgets.filter((candidate) => candidate?.name === widgetName)[occurrenceIndex];
+    return widgetAtOccurrence(node, widgetName, occurrenceIndex, occurrenceLabel) ?? undefined;
   }
   return widgets.find((candidate) => candidate?.name === widgetName);
 }
 
-function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrenceIndex = null) {
+function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrenceIndex = null, occurrenceLabel = null) {
   try {
-    const widget = liveWidgetAt(node, widgetName, occurrenceIndex);
+    const widget = liveWidgetAt(node, widgetName, occurrenceIndex, occurrenceLabel);
     return widget?.type === "custom" || hasValueSetter(widget);
   } catch {
     return false;
@@ -201,12 +206,15 @@ function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrenceIndex = nul
 /**
  * #2025 — never-throwing live read of one named widget. Used by the timeout
  * readback so a missing node or a hostile getter cannot replace the ack.
- * #2143 — `occurrenceIndex` selects among widgets sharing the name; without it the
- * behaviour is the first-match read it has always been.
+ * #2143 — `occurrenceIndex` is the widget's POSITION on the node (the number
+ * `duplicate_widgets` publishes), and `occurrenceLabel` is the label that row carried when
+ * the address was resolved. A row that moved reads as NOT FOUND, which downgrades the ack
+ * to the honest outcome-unknown rather than verifying against a row nobody addressed.
+ * Without either, the behaviour is the first-match read it has always been.
  */
-export function readLiveWidgetValue(node, widgetName, occurrenceIndex = null) {
+export function readLiveWidgetValue(node, widgetName, occurrenceIndex = null, occurrenceLabel = null) {
   try {
-    const live = liveWidgetAt(node, widgetName, occurrenceIndex);
+    const live = liveWidgetAt(node, widgetName, occurrenceIndex, occurrenceLabel);
     if (!live) return { found: false, value: undefined };
     // `widget` is returned so the caller can attribute the read to the row it came from by
     // IDENTITY (#2143) rather than re-deriving it from the ordinal it asked for.
@@ -248,6 +256,7 @@ export async function awaitSetWidgetAck(writePromise, {
   node,
   widget,
   occurrenceIndex = null,
+  occurrenceLabel = null,
   requested,
   timeoutMs,
   timers,
@@ -281,7 +290,7 @@ export async function awaitSetWidgetAck(writePromise, {
   captured.then((settled) => {
     if (settled?.ok) noteLateSuccess(honestWidgetAck(settled.result));
   }, () => {});
-  const live = readLiveWidgetValue(node, widget, occurrenceIndex);
+  const live = readLiveWidgetValue(node, widget, occurrenceIndex, occurrenceLabel);
   const verified = widgetWriteTimeoutReadback({
     requested,
     actual: live.value,
@@ -428,7 +437,12 @@ const ACK_STATE = Symbol("set-widget-ack-state");
 export async function runSetWidget(node, widgetName, value, opts = {}) {
   if (!opts[ACK_WRAPPED]) {
     const ackState = { abandoned: false };
-    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName, opts.occurrenceIndex ?? null);
+    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(
+      node,
+      widgetName,
+      opts.occurrenceIndex ?? null,
+      opts.occurrenceLabel ?? null,
+    );
     return awaitSetWidgetAck(
       runSetWidgetBody(node, widgetName, value, {
         ...opts,
@@ -440,6 +454,7 @@ export async function runSetWidget(node, widgetName, value, opts = {}) {
         widget: widgetName,
         // #2143 — the ack's own readback must consult the SAME row the write targeted.
         occurrenceIndex: opts.occurrenceIndex ?? null,
+        occurrenceLabel: opts.occurrenceLabel ?? null,
         requested: value,
         timeoutMs: opts.timeoutMs,
         timers: opts.ackTimers,

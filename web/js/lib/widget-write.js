@@ -3,7 +3,7 @@ import { missingWidgetMessage } from "./missing-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
 import { isPromotedContainer } from "./graph-read.js";
-import { widgetOccurrenceOf, occurrenceLabelOf } from "./widget-occurrence.js";
+import { widgetOccurrenceOf, occurrenceLabelOf, widgetAtOccurrence } from "./widget-occurrence.js";
 import {
   boundPropertyFailure,
   boundPropertyState,
@@ -436,8 +436,11 @@ function resolveWidgetByName(node, widgetName, occurrenceIndex = null) {
   const wanted = String(widgetName);
   const widgets = node?.widgets ?? [];
   if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0) {
-    const at = widgets[occurrenceIndex];
-    return at?.name === wanted ? at : null;
+    // Shared with the ack readback (widgetAtOccurrence), so the row this write lands on and
+    // the row a timed-out readback reports on can never be two different widgets. The label
+    // pin is deliberately NOT applied here: a mismatch gets its own worded refusal below,
+    // which is more useful than "that index is not one of them".
+    return widgetAtOccurrence(node, wanted, occurrenceIndex);
   }
   const exact = widgets.find((cand) => cand?.name === wanted);
   if (exact) return exact;

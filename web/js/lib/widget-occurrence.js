@@ -100,6 +100,27 @@ export function occurrenceLabelOf(widget) {
 }
 
 /**
+ * THE ONE DEFINITION of what `occurrenceIndex` means, so the write and the readback cannot
+ * drift apart. It is a POSITION in `node.widgets` — the number `duplicate_widgets`
+ * publishes — never an ordinal counted over same-named rows: the two agree only when the
+ * duplicated name starts at widget 0, and disagreeing silently is how the write lands on
+ * one row while the readback reports another (and, if that other row happens to hold the
+ * requested value, acks an uncertain write as verified).
+ *
+ * Null unless the widget at that position still carries `name` — and, when a label was
+ * PINNED at resolution, still carries that label too, so a rebuild that reordered the rows
+ * cannot be mistaken for the row that was addressed. `pinnedLabel` of `null`/`undefined`
+ * checks nothing: a row with no label is indistinguishable from its siblings anyway.
+ */
+export function widgetAtOccurrence(node, name, index, pinnedLabel = null) {
+  if (!Number.isInteger(index) || index < 0) return null;
+  const at = widgetsOf(node)[index];
+  if (!at || widgetName(at) !== name) return null;
+  if (pinnedLabel != null && widgetLabel(at) !== pinnedLabel) return null;
+  return at;
+}
+
+/**
  * The occurrence report for a widget that has already been resolved: WHICH of the
  * same-named rows this is, and how many there are. Null when the name is unique on the
  * node (the overwhelmingly common shape), so a caller emits nothing rather than a
