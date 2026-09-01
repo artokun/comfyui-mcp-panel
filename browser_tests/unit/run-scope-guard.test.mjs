@@ -4937,3 +4937,218 @@ test("#1504 integration: a SCOPED run reports the outputs ComfyUI dropped from t
     stop();
   }
 });
+
+// ── comfyui-mcp#2712 — DaSiWa_SeedControl queue-time seed roll ──────────────
+// The pack wraps `app.graphToPrompt` and rolls seed_value + seed_control_state
+// on EVERY call, so our stamp (which calls graphToPrompt) rolls one seed and the
+// dispatch rolls another. Node ids are the reporter's: 2739 is the seed control,
+// 2568 the scoped output.
+const dasiwaState = (mode, lastSeed = "42") =>
+  JSON.stringify({ mode, last_seed: lastSeed, recent: [lastSeed] });
+
+function dasiwaNode(id, opts = {}) {
+  const { state = dasiwaState("random"), seedLink = null, widgets, type = "DaSiWa_SeedControl" } = opts;
+  // `in`, not a default parameter: a default would silently re-supply the class
+  // for an EXPLICIT `comfyClass: undefined`, so the fail-closed assertion below
+  // would have passed while testing a fully-classed node.
+  const comfyClass = "comfyClass" in opts ? opts.comfyClass : "DaSiWa_SeedControl";
+  // The pack defines __dasiwaSeedPrepareSeed only at the END of a successful
+  // install; `rollInstalled: false` is the node whose install bailed early.
+  const rollInstalled = opts.rollInstalled !== false;
+  return {
+    id,
+    type,
+    comfyClass,
+    ...(rollInstalled ? { __dasiwaSeedPrepareSeed: () => {} } : {}),
+    inputs: [{ name: "seed", link: seedLink }],
+    widgets: widgets ?? [
+      { name: "seed_value", value: 42 },
+      { name: "seed_control_state", value: state },
+    ],
+  };
+}
+
+test("comfyui-mcp#2712 collectVolatileInputs: a random-mode DaSiWa_SeedControl excludes BOTH rolled inputs", () => {
+  const pairs = collectVolatileInputs({ _nodes: [dasiwaNode(2739)] });
+  assert.deepEqual(
+    [...pairs].sort(),
+    ["2739 seed_control_state", "2739 seed_value"],
+    "the roll rewrites both together, so both must be excluded together",
+  );
+});
+
+test("comfyui-mcp#2712 collectVolatileInputs: ONLY the literal \"fixed\" suppresses the roll", () => {
+  // dasiwaSeedControlParseState: `state.mode = state.mode === "fixed" ? "fixed" : "random"`.
+  // A freshly-dropped node has an EMPTY state widget and still rolls — testing for
+  // mode === "random" would have left exactly those nodes permanently refused.
+  for (const [label, state] of [
+    ["explicit random", dasiwaState("random")],
+    ["empty state widget", ""],
+    ["whitespace state widget", "   "],
+    ["unparseable JSON", "{not json"],
+    ["absent mode field", JSON.stringify({ last_seed: "7" })],
+    ["a non-fixed mode string", JSON.stringify({ mode: "shuffle" })],
+  ]) {
+    assert.deepEqual(
+      [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { state })] })].sort(),
+      ["2739 seed_control_state", "2739 seed_value"],
+      `${label} defaults to random and rolls`,
+    );
+  }
+  assert.deepEqual(
+    [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { state: dasiwaState("fixed") })] })],
+    [],
+    "fixed mode rolls nothing and keeps FULL drift coverage",
+  );
+});
+
+test("comfyui-mcp#2712 collectVolatileInputs: narrow by construction", () => {
+  const cases = [
+    ["an externally linked seed passes through unrolled", dasiwaNode(2739, { seedLink: 55 }), []],
+    [
+      "no seed_control_state widget means the mode is unreadable, so nothing is excluded",
+      dasiwaNode(2739, { widgets: [{ name: "seed_value", value: 42 }] }),
+      [],
+    ],
+    [
+      "codex r3 P1: a seed_value widget removed AFTER a successful install still excludes - the pack re-checks widgets only at install time and keeps rolling",
+      dasiwaNode(2739, { widgets: [{ name: "seed_control_state", value: dasiwaState("random") }] }),
+      ["2739 seed_control_state", "2739 seed_value"],
+    ],
+    [
+      "a foreign node carrying the same widget names is NOT this pack",
+      dasiwaNode(2739, { comfyClass: "Other_SeedThing", type: "Other_SeedThing" }),
+      [],
+    ],
+    [
+      "codex r2 P1: both widgets present but the pack never installed its roll (__dasiwaSeedInstalled was set before the widget check, so a later install is a no-op)",
+      dasiwaNode(2739, { rollInstalled: false }),
+      [],
+    ],
+  ];
+  for (const [label, node, expected] of cases) {
+    assert.deepEqual([...collectVolatileInputs({ _nodes: [node] })].sort(), expected, label);
+  }
+  // codex gate r1, P1 — comfyClass ONLY. The pack dispatches with
+  // `if (DASIWASEED_NODE_TYPES.has(node.comfyClass)) node.__dasiwaSeedPrepareSeed?.()`,
+  // so a node matching by `type` alone is never rolled and MUST stay drift-covered.
+  assert.deepEqual(
+    [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { comfyClass: undefined })] })],
+    [],
+    "the registered type alone is not proof the pack will roll this node",
+  );
+  assert.deepEqual(
+    [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { comfyClass: "Other_SeedThing" })] })],
+    [],
+    "a mismatched comfyClass is not this pack, whatever `type` says",
+  );
+});
+
+test("comfyui-mcp#2712 codex r3 P2: a non-enumerable `mode` is dropped by the pack's spread, so the node still rolls", () => {
+  // The pack builds state with `{ mode: "random", ..., ...parsed }`. A spread copies
+  // only enumerable OWN properties, so these two shapes stay RANDOM there — reading
+  // `parsed.mode` directly would call them fixed and reinstate the refusal.
+  const nonEnumerable = Object.defineProperty({}, "mode", { value: "fixed", enumerable: false });
+  const inherited = Object.create({ mode: "fixed" });
+  for (const [label, value] of [
+    ["non-enumerable own mode", nonEnumerable],
+    ["inherited mode", inherited],
+  ]) {
+    assert.deepEqual(
+      [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { state: value })] })].sort(),
+      ["2739 seed_control_state", "2739 seed_value"],
+      label + " is dropped by the pack's spread, so the node is random and rolls",
+    );
+  }
+  // A plain enumerable own `mode` object IS honoured, exactly as the spread would.
+  assert.deepEqual(
+    [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { state: { mode: "fixed" } })] })],
+    [],
+  );
+});
+
+test("comfyui-mcp#2712 collectVolatileInputs: nested instances keep their own execId prefix", () => {
+  const pairs = collectVolatileInputs({
+    _nodes: [
+      dasiwaNode(2739),
+      { id: 300, widgets: [], subgraph: { _nodes: [dasiwaNode(11)] } },
+    ],
+  });
+  assert.deepEqual(
+    [...pairs].sort(),
+    ["2739 seed_control_state", "2739 seed_value", "300:11 seed_control_state", "300:11 seed_value"],
+    "prefixed pairs, per #2699",
+  );
+});
+
+test("comfyui-mcp#2712 the reporter's refusal: the seed roll no longer reads as graph drift", () => {
+  const graph = { _nodes: [dasiwaNode(2739)] };
+  const volatileInputs = collectVolatileInputs(graph);
+  // What our stamp serialized (graphToPrompt rolled once, for US).
+  const stamped = {
+    "2739": {
+      class_type: "DaSiWa_SeedControl",
+      inputs: { seed_value: 111111111111, seed_control_state: dasiwaState("random", "111111111111") },
+    },
+    "2568": { class_type: "SaveImage", inputs: { images: ["2739", 0], filename_prefix: "out" } },
+  };
+  // What the dispatch POSTed (graphToPrompt rolled AGAIN, a different number).
+  const dispatched = JSON.parse(JSON.stringify(stamped));
+  dispatched["2739"].inputs.seed_value = 999999999999;
+  dispatched["2739"].inputs.seed_control_state = dasiwaState("random", "999999999999");
+
+  assert.equal(
+    promptContentHashFromBody(JSON.stringify({ prompt: dispatched }), volatileInputs),
+    promptContentHash(stamped, volatileInputs),
+    "a fresh roll between stamp and POST is queue-time volatility, not drift",
+  );
+  assert.deepEqual(
+    diffPromptCanons(
+      canonicalizePrompt(stamped, volatileInputs),
+      canonicalizePrompt(dispatched, volatileInputs),
+    ),
+    [],
+    "nothing left to name in the refusal",
+  );
+
+  // CONTROL 1 — without the exclusion this is exactly the reporter's message.
+  assert.deepEqual(
+    diffPromptCanons(canonicalizePrompt(stamped, null), canonicalizePrompt(dispatched, null)),
+    ["2739 seed_control_state", "2739 seed_value"],
+    "the drift this fix removes is the one the report quoted",
+  );
+
+  // CONTROL 2 — a REAL edit alongside the roll still fails closed.
+  const alsoEdited = JSON.parse(JSON.stringify(dispatched));
+  alsoEdited["2568"].inputs.filename_prefix = "somewhere_else";
+  assert.notEqual(
+    promptContentHashFromBody(JSON.stringify({ prompt: alsoEdited }), volatileInputs),
+    promptContentHash(stamped, volatileInputs),
+    "#556 still catches a graph that genuinely changed under a stamped run",
+  );
+  assert.deepEqual(
+    diffPromptCanons(
+      canonicalizePrompt(stamped, volatileInputs),
+      canonicalizePrompt(alsoEdited, volatileInputs),
+    ),
+    ["2568 filename_prefix"],
+  );
+});
+
+test("comfyui-mcp#2712 a FIXED-mode DaSiWa seed that changes is still drift", () => {
+  const graph = { _nodes: [dasiwaNode(2739, { state: dasiwaState("fixed") })] };
+  const volatileInputs = collectVolatileInputs(graph);
+  const stamped = {
+    "2739": {
+      class_type: "DaSiWa_SeedControl",
+      inputs: { seed_value: 42, seed_control_state: dasiwaState("fixed") },
+    },
+  };
+  const changed = JSON.parse(JSON.stringify(stamped));
+  changed["2739"].inputs.seed_value = 43;
+  assert.notEqual(
+    promptContentHashFromBody(JSON.stringify({ prompt: changed }), volatileInputs),
+    promptContentHash(stamped, volatileInputs),
+    "a fixed seed does not roll, so a change to it is a real user edit",
+  );
+});
