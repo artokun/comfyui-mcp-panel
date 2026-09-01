@@ -690,6 +690,28 @@ test("#2143: a readback whose row MOVED reports not-found rather than verifying 
   assert.notEqual(receipt.ack_note, "applied and verified");
 });
 
+test("#2143: a DOTTED address reads as not-found, exactly as it did before — and fails safe", () => {
+  // Recorded so it is a known limit rather than something rediscovered as a defect: the
+  // #2025 readback has never resolved a sub-field address, and this change does not alter
+  // that. `origin/main` does `find(w => w.name === widgetName)`, which cannot match
+  // "row.toggled" either. Both answer not-found, which downgrades the ack to the honest
+  // outcome-unknown — never a false "applied and verified".
+  const node = { id: 1, widgets: [{ name: "row", value: { toggled: true } }, { name: "row", value: { toggled: false } }] };
+  assert.equal(readLiveWidgetValue(node, "row.toggled").found, false, "no occurrence: not found");
+  assert.equal(readLiveWidgetValue(node, "row.toggled", { index: 1 }).found, false, "with one: the same");
+  // And resolving the base would not change the outcome anyway: a dotted write's requested
+  // value is the SUB-FIELD, while the widget holds the composite, so the comparison cannot
+  // verify in either direction.
+  const asIfFound = widgetWriteTimeoutReadback({
+    requested: false,
+    actual: { toggled: false },
+    found: true,
+    node_id: 1,
+    widget: "row",
+  });
+  assert.notEqual(asIfFound.ack_note, "applied and verified");
+});
+
 test("#2143: the timeout receipt carries the same row attribution the write's own reply would", () => {
   const { bypasser, rows } = twoGroupBypasser();
   rows[1].value = { toggled: false };
