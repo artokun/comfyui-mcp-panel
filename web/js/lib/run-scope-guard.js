@@ -706,7 +706,13 @@ function ideogramQueueTimeDerivedInput(node) {
  * serialization. Only removing the pair from the compared content can.
  *
  * NARROW BY CONSTRUCTION, mirroring the pack's own gates one for one:
- *  - exact registered class, on `comfyClass` (what the pack keys on) or `type`;
+ *  - exact registered class on `comfyClass`, and ONLY `comfyClass` (codex gate r1,
+ *    P1). The pack's dispatcher is
+ *    `if (DASIWASEED_NODE_TYPES.has(node.comfyClass)) node.__dasiwaSeedPrepareSeed?.()`,
+ *    so a node carrying the registered `type` while its `comfyClass` is missing or
+ *    different is NOT rolled by the pack. Falling back to `type` would drop both
+ *    seed inputs from the hash for a node that never mutates, silently retiring
+ *    drift coverage on it — the one direction this signal must never fail;
  *  - BOTH backing widgets present — `dasiwaSeedControlInstall` returns early
  *    without ever defining the roll when either is missing;
  *  - a LINKED `seed` input rolls nothing (`dasiwaSeedControlHasExternalSeed`),
@@ -744,12 +750,7 @@ const DASIWA_SEED_STATE_INPUT = "seed_control_state";
 
 function dasiwaQueueTimeSeedInputs(node) {
   try {
-    if (
-      !DASIWA_QUEUE_ROLLING_SEED_TYPES.has(node?.comfyClass) &&
-      !DASIWA_QUEUE_ROLLING_SEED_TYPES.has(node?.type)
-    ) {
-      return [];
-    }
+    if (!DASIWA_QUEUE_ROLLING_SEED_TYPES.has(node?.comfyClass)) return [];
     const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
     const seedWidget = widgets.find((w) => w?.name === DASIWA_SEED_VALUE_INPUT);
     const stateWidget = widgets.find((w) => w?.name === DASIWA_SEED_STATE_INPUT);

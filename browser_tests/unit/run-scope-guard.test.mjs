@@ -4946,7 +4946,12 @@ test("#1504 integration: a SCOPED run reports the outputs ComfyUI dropped from t
 const dasiwaState = (mode, lastSeed = "42") =>
   JSON.stringify({ mode, last_seed: lastSeed, recent: [lastSeed] });
 
-function dasiwaNode(id, { state = dasiwaState("random"), seedLink = null, widgets, comfyClass = "DaSiWa_SeedControl", type = "DaSiWa_SeedControl" } = {}) {
+function dasiwaNode(id, opts = {}) {
+  const { state = dasiwaState("random"), seedLink = null, widgets, type = "DaSiWa_SeedControl" } = opts;
+  // `in`, not a default parameter: a default would silently re-supply the class
+  // for an EXPLICIT `comfyClass: undefined`, so the fail-closed assertion below
+  // would have passed while testing a fully-classed node.
+  const comfyClass = "comfyClass" in opts ? opts.comfyClass : "DaSiWa_SeedControl";
   return {
     id,
     type,
@@ -5015,12 +5020,18 @@ test("comfyui-mcp#2712 collectVolatileInputs: narrow by construction", () => {
   for (const [label, node, expected] of cases) {
     assert.deepEqual([...collectVolatileInputs({ _nodes: [node] })].sort(), expected, label);
   }
-  // The pack keys on comfyClass; `type` is accepted as a fallback for a node
-  // whose comfyClass was not carried onto the instance.
+  // codex gate r1, P1 — comfyClass ONLY. The pack dispatches with
+  // `if (DASIWASEED_NODE_TYPES.has(node.comfyClass)) node.__dasiwaSeedPrepareSeed?.()`,
+  // so a node matching by `type` alone is never rolled and MUST stay drift-covered.
   assert.deepEqual(
-    [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { comfyClass: undefined })] })].sort(),
-    ["2739 seed_control_state", "2739 seed_value"],
-    "type alone still identifies the pack's node",
+    [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { comfyClass: undefined })] })],
+    [],
+    "the registered type alone is not proof the pack will roll this node",
+  );
+  assert.deepEqual(
+    [...collectVolatileInputs({ _nodes: [dasiwaNode(2739, { comfyClass: "Other_SeedThing" })] })],
+    [],
+    "a mismatched comfyClass is not this pack, whatever `type` says",
   );
 });
 
