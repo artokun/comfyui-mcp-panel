@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import {
   FREE_VRAM_SETTLE_BUDGET_MS,
   FREE_VRAM_SETTLE_POLL_MS,
+  comparableUsedMb,
   freeVramSuccessResult,
   readVramOccupancy,
   settleVramOccupancyAfterFree,
@@ -43,6 +44,17 @@ const stats = (usedMb, totalMb = 16384) => ({
   ],
 });
 
+/** A multi-GPU /system_stats payload. Each entry is `[usedMb, index]`; ComfyUI emits
+ *  `type` and `index` per device, which is what makes a device identifiable. */
+const multiStats = (entries, totalMb = 12282) => ({
+  devices: entries.map(([usedMb, index]) => ({
+    name: `cuda:${index} NVIDIA GeForce RTX 4070 Ti`,
+    type: "cuda",
+    index,
+    vram_total: totalMb * MB,
+    vram_free: (totalMb - usedMb) * MB,
+  })),
+});
 function jsonRes(body, status = 200) {
   return {
     ok: status >= 200 && status < 300,
@@ -105,6 +117,10 @@ function asyncFreeingComfy({ usedBefore = 9426, usedAfter = 1500, dropAfterReads
   };
   return { fetchApi, calls, statsReads: () => postFreeReads };
 }
+
+/** The NAIVE total the pre-review code compared on — kept only to demonstrate that the
+ *  hazard is real, never used by production. */
+const usedTotal = (rows) => rows.reduce((sum, d) => sum + d.vram_used_mb, 0);
 
 /** Deterministic clock + sleep: `sleep(ms)` advances the clock instead of waiting. */
 function fakeClock() {
@@ -457,4 +473,116 @@ test("#2144 the panel row stops saying 'freed VRAM' for a pending unload", () =>
     row.indexOf("r.freed === false") < row.indexOf("panel.unloaded_models_freed_vram"),
     "the pending branch must be reached BEFORE the unconditional 'freed VRAM' row",
   );
+});
+
+// ---------------------------------------------------------------------------
+// #2144 review round 1 — the verdict must not rest on a cross-device TOTAL.
+// ---------------------------------------------------------------------------
+
+test("#2144 a device that stops answering must not look like a free", () => {
+  // cuda:0 8000 MB + cuda:1 2000 MB before; only cuda:0 answers after, unchanged.
+  // A sum-based verdict sees 10000 -> 8000 and reports freed_mb 2000 for an unload
+  // that never happened.
+  const before = vramOccupancyFromStats(multiStats([[8000, 0], [2000, 1]]));
+  const after = vramOccupancyFromStats(multiStats([[8000, 0]]));
+  assert.equal(usedTotal(before), 10000, "the naive total really does fall");
+  assert.equal(usedTotal(after), 8000);
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.freed, false);
+  assert.equal(result.branch, "unload_not_observed");
+  assert.equal(result.occupancy.freed_mb, 0, "the vanished device must not be counted as freed");
+  assert.equal(result.occupancy.before_mb, 8000);
+  assert.equal(result.occupancy.after_mb, 8000);
+  assert.deepEqual(result.occupancy.compared_devices, ["cuda:0"]);
+});
+
+test("#2144 a device with unreadable counters vanishes from the rows — same hazard", () => {
+  // vramOccupancyFromStats DROPS a device whose vram_free is not a number, so this
+  // needs one flaky row, not a physically removed GPU.
+  const before = vramOccupancyFromStats(multiStats([[8000, 0], [2000, 1]]));
+  const flaky = multiStats([[8000, 0], [2000, 1]]);
+  flaky.devices[1].vram_free = null;
+  const after = vramOccupancyFromStats(flaky);
+  assert.equal(after.length, 1, "the flaky row is dropped by the parser");
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.freed, false);
+  assert.equal(result.occupancy.freed_mb, 0);
+});
+
+test("#2144 a real free on one card is still verified when another card vanishes", () => {
+  const before = vramOccupancyFromStats(multiStats([[8000, 0], [2000, 1]]));
+  const after = vramOccupancyFromStats(multiStats([[1000, 0]]));
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.freed, true);
+  assert.equal(result.branch, "verified_system_stats");
+  assert.equal(result.occupancy.freed_mb, 7000, "only the matched device is counted");
+  assert.deepEqual(result.occupancy.compared_devices, ["cuda:0"]);
+});
+
+test("#2144 multi-GPU frees add up across the devices present on both sides", () => {
+  const before = vramOccupancyFromStats(multiStats([[8000, 0], [2000, 1]]));
+  const after = vramOccupancyFromStats(multiStats([[1000, 0], [500, 1]]));
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.freed, true);
+  assert.equal(result.occupancy.before_mb, 10000);
+  assert.equal(result.occupancy.after_mb, 1500);
+  assert.equal(result.occupancy.freed_mb, 8500);
+  assert.deepEqual(result.occupancy.compared_devices, ["cuda:0", "cuda:1"]);
+});
+
+test("#2144 an APPEARING device cannot be counted as occupancy that failed to free", () => {
+  const before = vramOccupancyFromStats(multiStats([[8000, 0]]));
+  const after = vramOccupancyFromStats(multiStats([[1000, 0], [9000, 1]]));
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.freed, true, "cuda:0 really did drop 8000 -> 1000");
+  assert.equal(result.occupancy.freed_mb, 7000);
+});
+
+test("#2144 no matchable device at all is a receipt, never a claimed free", () => {
+  const before = vramOccupancyFromStats(multiStats([[8000, 0]]));
+  const after = vramOccupancyFromStats(multiStats([[1000, 7]]));
+  assert.equal(comparableUsedMb(before, after), null);
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.freed, true, "an unanswerable comparison must not fail a /free that landed");
+  assert.equal(result.branch, "after_only_occupancy");
+  assert.notEqual(result.branch, "verified_system_stats");
+  assert.equal(result.occupancy.freed_mb, undefined);
+  assert.match(result.note, /could not be matched|comparable baseline/i);
+});
+
+test("#2144 a duplicated device key is ambiguous, so it is excluded from the compare", () => {
+  const before = vramOccupancyFromStats(multiStats([[8000, 0], [2000, 0]]));
+  const after = vramOccupancyFromStats(multiStats([[1000, 0], [500, 0]]));
+  assert.equal(comparableUsedMb(before, after), null, "two cuda:0 rows cannot be matched");
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.branch, "after_only_occupancy");
+});
+
+test("#2144 a device row with no type/index falls back to its name as the key", () => {
+  // The single-GPU payload the other tests use carries no `type`/`index` at all.
+  const before = vramOccupancyFromStats(stats(9426, 12282));
+  const after = vramOccupancyFromStats(stats(1500, 12282));
+  assert.match(before[0].device_key, /^name:/);
+  const result = freeVramSuccessResult({ before, after });
+  assert.equal(result.branch, "verified_system_stats");
+  assert.equal(result.occupancy.freed_mb, 7926);
+});
+
+test("#2144 the settle does not end early when a device drops out mid-wait", async () => {
+  const clock = fakeClock();
+  let n = 0;
+  const fetchApi = async () => {
+    n += 1;
+    // cuda:1 disappears from the second sample onwards; cuda:0 never moves.
+    return jsonRes(n === 1 ? multiStats([[8000, 0], [2000, 1]]) : multiStats([[8000, 0]]));
+  };
+  const before = vramOccupancyFromStats(multiStats([[8000, 0], [2000, 1]]));
+  const settled = await settleVramOccupancyAfterFree(fetchApi, before, {
+    budgetMs: 1000,
+    pollMs: 250,
+    now: clock.now,
+    sleep: clock.sleep,
+  });
+  assert.equal(settled.observed, false, "a vanished device is not an observed free");
+  assert.equal(settled.waitedMs, 1000, "it waits out the whole budget rather than stopping");
 });

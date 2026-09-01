@@ -31,14 +31,20 @@
  *   - `unload_not_observed`    — re-read for the whole budget, no drop.    freed:false,
  *                                outcome:"pending" — the flag is set, ComfyUI has not
  *                                applied it yet.
- *   - `after_only_occupancy`   — the BEFORE read missed, so there is no baseline and this
- *                                call cannot say whether anything moved.  freed:true
+ *   - `after_only_occupancy`   — no comparable baseline: the BEFORE read missed, or no
+ *                                device in it could be matched to the after reading, so
+ *                                this call cannot say whether anything moved.  freed:true
  *   - `bare_free_receipt`      — occupancy was not readable at all.        freed:true
  *
  * The #1956 rule still holds, and #2144 does not weaken it: an occupancy read that MISSES
  * never decides the command — it degrades to a receipt rather than failing a free that
  * already landed. What changed is the other half: an occupancy read that ANSWERS, and
  * answers "unchanged", is evidence, and is no longer allowed to be labelled verified.
+ *
+ * BECAUSE the numbers now decide `freed`, they are compared per DEVICE and never as a bare
+ * total (`comparableUsedMb`). A device that drops out of `/system_stats` between the two
+ * reads shrinks a total exactly like a successful unload does, so a sum-based verdict would
+ * report a free that never happened — the same lie in the opposite direction.
  */
 
 const BYTES_PER_MB = 1024 * 1024;
@@ -62,6 +68,54 @@ function roundMb(n) {
 }
 
 /**
+ * A VRAM counter, or `null` when the payload did not actually carry one.
+ *
+ * `Number()` alone is not enough: `Number(null)`, `Number("")`, `Number(false)` and
+ * `Number([])` are all `0` and all finite, so a device reporting `vram_free: null` used to
+ * parse as "0 bytes free" — the whole card occupied. That was cosmetic while these numbers
+ * only decorated the reply; since #2144 they decide `freed`, so a counter that is not a
+ * number is an UNREADABLE device, not a full one.
+ */
+function counterOf(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "boolean" || typeof value === "object") return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Stable identity for one `/system_stats` device row, so a before/after comparison can
+ * match devices instead of trusting a total.
+ *
+ * ComfyUI emits `{name, type, index, …}` per device (`server.py`'s `/system_stats` builds
+ * them from `get_all_torch_devices()`), so `type:index` is the exact key. `name` is the
+ * fallback for older payloads that omit them — it carries the ordinal anyway
+ * ("cuda:0 NVIDIA GeForce RTX 4070 Ti"). A row that yields neither is UNIDENTIFIABLE and
+ * gets `null`, which excludes it from every comparison: an unmatchable device must not be
+ * able to move a verdict.
+ */
+function deviceKeyOf(d) {
+  let type = "";
+  let index = null;
+  try {
+    type = typeof d?.type === "string" ? d.type : "";
+    index = Number(d?.index);
+  } catch {
+    type = "";
+    index = null;
+  }
+  if (type && Number.isFinite(index)) return `${type}:${index}`;
+  let name = "";
+  try {
+    name = typeof d?.name === "string" ? d.name : "";
+  } catch {
+    name = "";
+  }
+  return name ? `name:${name}` : null;
+}
+
+/**
  * Device occupancy rows from a ComfyUI `/system_stats` payload.
  * Unreadable devices are skipped; an unreadable payload is `[]`.
  */
@@ -72,12 +126,12 @@ export function vramOccupancyFromStats(stats) {
     let total;
     let free;
     try {
-      total = Number(d?.vram_total);
-      free = Number(d?.vram_free);
+      total = counterOf(d?.vram_total);
+      free = counterOf(d?.vram_free);
     } catch {
       continue;
     }
-    if (!Number.isFinite(total) || !Number.isFinite(free)) continue;
+    if (total === null || free === null) continue;
     let name = "";
     try {
       name = typeof d?.name === "string" ? d.name : "";
@@ -86,6 +140,7 @@ export function vramOccupancyFromStats(stats) {
     }
     out.push({
       name,
+      device_key: deviceKeyOf(d),
       vram_total_mb: roundMb(total),
       vram_free_mb: roundMb(free),
       vram_used_mb: roundMb(total - free),
@@ -100,6 +155,55 @@ function usedMb(rows) {
 
 function occupancyRows(value) {
   return Array.isArray(value) && value.length ? value : null;
+}
+
+/** Rows indexed by device key. A key that appears twice in one reading is ambiguous, so
+ *  BOTH copies are dropped rather than one of them silently winning. */
+function keyedRows(rows) {
+  const list = occupancyRows(rows);
+  if (!list) return null;
+  const byKey = new Map();
+  const ambiguous = new Set();
+  for (const row of list) {
+    const key = row?.device_key;
+    if (typeof key !== "string" || !key) continue;
+    if (byKey.has(key)) {
+      ambiguous.add(key);
+      continue;
+    }
+    byKey.set(key, row);
+  }
+  for (const key of ambiguous) byKey.delete(key);
+  return byKey;
+}
+
+/**
+ * Used MB on each side, summed over the devices that appear — uniquely and identifiably —
+ * in BOTH readings. `null` when no device can be matched.
+ *
+ * Comparing bare totals is what makes a DISAPPEARING device look like a free: with
+ * `cuda:0` at 8000 MB and `cuda:1` at 2000 MB before, and only `cuda:0` answering after,
+ * the totals fall 10000 → 8000 and a sum-based verdict reports `freed_mb: 2000` although
+ * nothing was unloaded. `vramOccupancyFromStats` drops any device whose counters are
+ * unreadable, so that shape needs only one flaky row, not a physically removed GPU. Before
+ * #2144 the totals only decorated the reply; they now decide `freed`, so they have to be
+ * about the same devices on both sides.
+ */
+export function comparableUsedMb(before, after) {
+  const b = keyedRows(before);
+  const a = keyedRows(after);
+  if (!b || !a) return null;
+  let beforeMb = 0;
+  let afterMb = 0;
+  const devices = [];
+  for (const [key, row] of b) {
+    const other = a.get(key);
+    if (!other) continue;
+    beforeMb += row.vram_used_mb;
+    afterMb += other.vram_used_mb;
+    devices.push(key);
+  }
+  return devices.length ? { beforeMb, afterMb, devices } : null;
 }
 
 /** Monotonic default clock — never runs backwards, so a wall-clock correction cannot make
@@ -145,6 +249,10 @@ export async function readVramOccupancy(fetchApi) {
  * deferred to the next 10 s tick. The drop is therefore one contiguous event, not a
  * staircase we would under-report by leaving early.
  *
+ * "Dropped" is measured per DEVICE, not on a total — see `comparableUsedMb`. A device that
+ * stops answering mid-settle would otherwise shrink the total and end the wait as if it had
+ * been freed.
+ *
  * Waits only when there is a baseline to compare against and something to free: with no
  * `before`, or a baseline of 0 MB, no amount of polling can produce an observation, so
  * burning the budget would only slow the command down.
@@ -165,14 +273,17 @@ export async function settleVramOccupancyAfterFree(fetchApi, before, opts = {}) 
 
   const startedAt = now();
   const baseline = occupancyRows(before);
-  const baselineMb = baseline ? usedMb(baseline) : null;
+  // Only devices that can be identified can ever be compared, so only their occupancy is
+  // worth waiting on: an unidentifiable row can never produce an observation.
+  const identifiable = baseline ? [...(keyedRows(baseline)?.values() ?? [])] : [];
+  const baselineMb = identifiable.length ? usedMb(identifiable) : null;
 
   let after = await readVramOccupancy(fetchApi);
   let polls = 1;
   const elapsed = () => Math.max(0, Math.round(now() - startedAt));
   const dropped = () => {
-    const rows = occupancyRows(after);
-    return rows != null && baselineMb != null && usedMb(rows) < baselineMb;
+    const cmp = comparableUsedMb(baseline, after);
+    return cmp != null && cmp.afterMb < cmp.beforeMb;
   };
 
   if (baselineMb == null || baselineMb <= 0) {
@@ -233,13 +344,16 @@ export function freeVramSuccessResult({ before = null, after = null, waitedMs, p
   const base = { unload_models: true, free_memory: true };
   const beforeOcc = occupancyRows(before);
   const afterOcc = occupancyRows(after);
-  if (beforeOcc && afterOcc) {
-    const beforeMb = usedMb(beforeOcc);
-    const afterMb = usedMb(afterOcc);
+  // The verdict, and every number quoted beside it, come from the SAME matched device set.
+  // Reporting a total the verdict was not taken on is how a reply ends up self-contradicting.
+  const cmp = beforeOcc && afterOcc ? comparableUsedMb(beforeOcc, afterOcc) : null;
+  if (cmp) {
+    const { beforeMb, afterMb, devices } = cmp;
     const occupancy = {
       before_mb: beforeMb,
       after_mb: afterMb,
       freed_mb: beforeMb - afterMb,
+      compared_devices: devices,
       ...settleFields(waitedMs, polls),
       devices_before: beforeOcc,
       devices_after: afterOcc,
@@ -264,12 +378,14 @@ export function freeVramSuccessResult({ before = null, after = null, waitedMs, p
       occupancy: {
         after_mb: usedMb(afterOcc),
         ...settleFields(waitedMs, polls),
+        ...(beforeOcc ? { devices_before: beforeOcc } : {}),
         devices_after: afterOcc,
       },
       note:
-        "POST /free accepted this request (unload_models and free_memory). /system_stats did not " +
-        "answer BEFORE the free, so there is no baseline and this reply cannot say how much was " +
-        "freed — after_mb is the occupancy now, not a measured change.",
+        "POST /free accepted this request (unload_models and free_memory), but there is no " +
+        "comparable baseline: either /system_stats did not answer BEFORE the free, or no device " +
+        "in that reading could be matched to a device in this one. So this reply cannot say how " +
+        "much was freed — after_mb is the occupancy now, not a measured change.",
     };
   }
   return {
