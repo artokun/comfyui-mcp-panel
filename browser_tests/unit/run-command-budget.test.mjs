@@ -89,9 +89,16 @@ import { createRunReconcileSweep } from "../../web/js/lib/run-reconcile-sweep.js
 import { createRunReceiptOutbox } from "../../web/js/lib/run-receipt-outbox.js";
 import { createRehelloGate, routeIsStale } from "../../web/js/lib/rehello-gate.js";
 import { coerceMessageText } from "../../web/js/lib/chat-serialize.js";
+import { graphMutationReconnectGate, reconnectRefusalError } from "../../web/js/lib/reconnect-recovery.js";
+import {
+  captureRunDispatchIdentity,
+  compareRunDispatchIdentity,
+  downgradeUnstableRunResult,
+} from "../../web/js/lib/run-dispatch-identity.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
+const PROVEN_WORKFLOW_UUID = "11111111-1111-4111-8111-111111111111";
 
 function extractFunctionSource(source, marker, endMarker) {
   const start = source.indexOf(marker);
@@ -675,8 +682,9 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef, runDispatchIdentityRef, resolveRunToNodeTargetRef }) {
   const seen = { dispatchArgs: null };
+  const localRunToken = Symbol("test local graph run");
   const deps = {
     RUN_COMMAND_BUDGET_MS: budgetMs,
     RUN_SERIALIZE_TIMEOUT_MS: serializeMs,
@@ -687,10 +695,18 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     window: { LiteGraph: { registered_node_types: {} } },
     getGraphCtx: () => ({ app, graph: app.graph, rootGraph: app.graph }),
     assertGraphBoundToActiveWorkflow: () => {},
+    captureRunDispatchIdentity,
+    compareRunDispatchIdentity,
+    downgradeUnstableRunResult,
+    LOCAL_GRAPH_RUN_TOKEN: localRunToken,
+    graphMutationReconnectGate,
+    reconnectRefusalError,
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
     MUTATION_BINDING_BAR,
     // Target resolution is not what this test is about; the run-to-node resolver has its
     // own suite (subgraph-scope). Answer the way it answers for a root-level output node.
-    resolveRunToNodeTarget: () => ({ ok: true, execId: "327", node: { type: "SaveImage" } }),
+    resolveRunToNodeTarget: resolveRunToNodeTargetRef ?? (() => ({ ok: true, execId: "327", node: { type: "SaveImage" } })),
     dispatchScopedRun: async (args) => {
       seen.dispatchArgs = args;
       return dispatch ? dispatch(args) : { outcome: "unverified", queueMark: 1, verified: 0, error: "stub" };
@@ -738,6 +754,18 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     runReceiptSender: runReceiptSender ?? null,
     runReceiptRouteRef: runReceiptRouteRef ?? (() => null),
     runReceiptSessionRef: runReceiptSessionRef ?? (() => null),
+    runDispatchIdentityRef:
+      runDispatchIdentityRef ??
+      ((targetId) => ({
+        routeId: "test-route",
+        routeReady: true,
+        routeIdentityProven: true,
+        workflowUuid: PROVEN_WORKFLOW_UUID,
+        workflowIdentityProven: true,
+        backendSocketState: "available",
+        reconnectEpoch: 0,
+        targetId,
+      })),
     panelRunOwnerRef: panelRunOwnerRef ?? { current: {} },
   };
   const names = Object.keys(deps);
@@ -746,7 +774,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     `const executors = {${runMatch[0]}};
      return executors.graph_run;`,
   );
-  return { graph_run: factory(...names.map((n) => deps[n])), seen };
+  return { graph_run: factory(...names.map((n) => deps[n])), seen, localRunToken };
 }
 
 test("#248 production path: a scoped and full app.queuePrompt throw retains browser source context", async () => {
@@ -2030,6 +2058,486 @@ test("#1565 P1: a HEALTHY full run is untouched — same accept result, no budge
     const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
     const res = await built.graph_run({});
     assert.deepEqual(res, { queued: true, batch_count: 1, prompt_id: "srv-1" });
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: local /run queues without an advertised bridge route", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: null,
+      routeReady: false,
+      routeIdentityProven: false,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late", drainMs: 5 });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const result = await built.graph_run({ [built.localRunToken]: true });
+    assert.deepEqual(result, { queued: true, batch_count: 1, prompt_id: "srv-1" });
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "local /run must still reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: local /run keeps workflow fencing without a bridge route", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: null,
+      routeReady: false,
+      routeIdentityProven: false,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    app.graphToPrompt = async () => {
+      state.workflowUuid = "22222222-2222-4222-8222-222222222222";
+      return { output: OUR_OUTPUT, workflow: {} };
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    await assert.rejects(
+      () => built.graph_run({ [built.localRunToken]: true }),
+      /panel_run was NOT applied.*workflow.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "a local workflow handoff must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: a reconnect during preflight refuses before any prompt leaves the panel", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    app.graphToPrompt = async () => {
+      state.reconnectEpoch = 1;
+      return { output: OUR_OUTPUT, workflow: {} };
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runReceiptRouteRef: () => state.routeId,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    await assert.rejects(
+      () => built.graph_run({}),
+      /panel_run was NOT applied.*reconnect.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "preflight reconnect must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: the reconnecting socket signal refuses before prompt dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-socket",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    app.graphToPrompt = async () => {
+      // Models ComfyUI's `reconnecting` event. The epoch does not advance until
+      // `reconnected`, so this is the race the old identity provider missed.
+      state.backendSocketState = "down";
+      return { output: OUR_OUTPUT, workflow: {} };
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    await assert.rejects(
+      () => built.graph_run({}),
+      /panel_run was NOT applied.*backend socket down.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "a reconnecting socket must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: an unknown socket transport refuses before prompt dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-unknown-pre",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "unknown",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    await assert.rejects(
+      () => built.graph_run({}),
+      /panel_run was NOT applied.*backend socket unavailable.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "unknown transport must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: an accepted receipt is downgraded when reconnect crosses the queue call", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late", drainMs: 5 });
+    const queuePrompt = app.queuePrompt;
+    app.queuePrompt = async (...args) => {
+      const result = await queuePrompt(...args);
+      state.reconnectEpoch = 1;
+      return result;
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runReceiptRouteRef: () => state.routeId,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const res = await built.graph_run({});
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "the prompt was genuinely attempted");
+    assert.equal(res.queued_unknown, true, "reconnect makes persistence of the accepted receipt uncertain");
+    assert.equal(res.queued, undefined, "a crossed reconnect must not claim queued:true");
+    assert.equal(res.prompt_id, "srv-1", "the concrete receipt remains available for reconciliation");
+    assert.deepEqual(res.dispatch_identity.changed, ["reconnect"]);
+    assert.match(String(res.retry_guidance), /queue or history/i);
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: an unknown transport after queueing downgrades the accepted receipt", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-unknown-post",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late", drainMs: 5 });
+    const queuePrompt = app.queuePrompt;
+    app.queuePrompt = async (...args) => {
+      const result = await queuePrompt(...args);
+      state.backendSocketState = "unknown";
+      return result;
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const result = await built.graph_run({});
+    assert.equal(apiTarget.fetchApi.calls.length, 1, "the prompt was genuinely attempted");
+    assert.equal(result.queued_unknown, true, "unknown transport makes persistence uncertain");
+    assert.equal(result.queued, undefined, "unknown transport must not claim queued:true");
+    assert.equal(result.prompt_id, "srv-1", "the concrete receipt remains available for reconciliation");
+    assert.deepEqual(result.dispatch_identity.changed, ["backend socket unavailable"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: a crossed socket-down rejection keeps its receipt unknown", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-rejection",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = {
+      fetchApi: makeServerSequence([
+        { prompt_id: "receipt-166" },
+        {
+          status: 400,
+          body: { error: { type: "prompt_outputs_failed_validation", message: "later refusal" } },
+        },
+      ]),
+    };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const queuePrompt = app.queuePrompt;
+    app.queuePrompt = async (...args) => {
+      const result = await queuePrompt(...args);
+      state.backendSocketState = "down";
+      return result;
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const result = await built.graph_run({ batch_count: 2 });
+    assert.equal(apiTarget.fetchApi.calls.length, 2, "both production /prompt attempts were observed");
+    assert.equal(result.queued, undefined, "an unstable receipt-bearing rejection cannot claim queued:true/false");
+    assert.equal(result.queued_unknown, true);
+    assert.equal(result.prompt_id, "receipt-166", "the accepted receipt remains available for reconciliation");
+    assert.deepEqual(result.dispatch_identity.changed, ["backend socket down"]);
+    assert.match(String(result.error), /prompt receipt|backend socket down/i);
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: an ordinary rejection stays queued:false across socket-down", async () => {
+  const stop = keepAlive();
+  try {
+    const state = {
+      routeId: "route-166-ordinary-rejection",
+      routeReady: true,
+      routeIdentityProven: true,
+      workflowUuid: PROVEN_WORKFLOW_UUID,
+      workflowIdentityProven: true,
+      backendSocketState: "available",
+      reconnectEpoch: 0,
+    };
+    const apiTarget = {
+      fetchApi: makeServerSequence([
+        {
+          status: 400,
+          body: { error: { type: "missing_node_type", message: "ordinary refusal" } },
+        },
+      ]),
+    };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const queuePrompt = app.queuePrompt;
+    app.queuePrompt = async (...args) => {
+      const result = await queuePrompt(...args);
+      state.backendSocketState = "down";
+      return result;
+    };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({ ...state, targetId }),
+    });
+    const result = await built.graph_run({});
+    assert.equal(result.queued, false, "a refusal with no receipt remains a definite refusal");
+    assert.equal(result.queued_unknown, undefined);
+    assert.equal(result.prompt_id, undefined);
+    assert.match(String(result.error), /ordinary refusal/i);
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: an absent workflow identity refuses even when the route is ready", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({
+        routeId: "route-166",
+        routeReady: true,
+        routeIdentityProven: true,
+        workflowUuid: null,
+        workflowIdentityProven: false,
+        backendSocketState: "available",
+        reconnectEpoch: 0,
+        targetId,
+      }),
+    });
+    await assert.rejects(
+      () => built.graph_run({}),
+      /panel_run was NOT applied.*workflow identity unavailable.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "an absent workflow identity must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: an absent route identity refuses even when the route is ready", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      runDispatchIdentityRef: (targetId) => ({
+        routeId: null,
+        routeReady: true,
+        routeIdentityProven: false,
+        workflowUuid: PROVEN_WORKFLOW_UUID,
+        workflowIdentityProven: true,
+        backendSocketState: "available",
+        reconnectEpoch: 0,
+        targetId,
+      }),
+    });
+    await assert.rejects(
+      () => built.graph_run({}),
+      /panel_run was NOT applied.*bridge route unavailable.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "an absent route identity must not reach /prompt");
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: invalid and ambiguous workflow identities refuse before dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    const cases = [
+      {
+        label: "invalid",
+        identity: {
+          routeId: "route-166-invalid",
+          routeReady: true,
+          routeIdentityProven: true,
+          workflowUuid: "not-a-uuid",
+          workflowIdentityProven: true,
+          backendSocketState: "available",
+          reconnectEpoch: 0,
+        },
+        expected: /panel_run was NOT applied.*workflow identity unavailable.*nothing was sent/,
+      },
+      {
+        label: "ambiguous",
+        identity: {
+          routeId: "route-166-ambiguous",
+          routeReady: true,
+          routeIdentityProven: true,
+          workflowUuid: PROVEN_WORKFLOW_UUID,
+          workflowIdentityProven: true,
+          workflowIdentityAmbiguous: true,
+          backendSocketState: "available",
+          reconnectEpoch: 0,
+        },
+        expected: /panel_run was NOT applied.*workflow identity ambiguous.*nothing was sent/,
+      },
+    ];
+    for (const item of cases) {
+      const apiTarget = { fetchApi: makeServer() };
+      const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+      const built = realGraphRun({
+        app,
+        apiTarget,
+        runDispatchIdentityRef: (targetId) => ({ ...item.identity, targetId }),
+        budgetMs: 15000,
+        serializeMs: 8000,
+      });
+      await assert.rejects(
+        () => built.graph_run({}),
+        item.expected,
+        item.label,
+      );
+      assert.equal(apiTarget.fetchApi.calls.length, 0, `${item.label} identity must not reach /prompt`);
+    }
+  } finally {
+    stop();
+  }
+});
+
+test("#166 production path: a changed run-to-node target refuses before dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    let resolveCalls = 0;
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 15000,
+      serializeMs: 8000,
+      resolveRunToNodeTargetRef: () => ({
+        ok: true,
+        execId: resolveCalls++ === 0 ? "327" : "9",
+        node: { type: "SaveImage" },
+      }),
+    });
+    await assert.rejects(
+      () => built.graph_run({ to_node_id: 327 }),
+      /panel_run was NOT applied.*run target.*nothing was sent/i,
+    );
+    assert.equal(apiTarget.fetchApi.calls.length, 0, "a changed target must not reach /prompt");
   } finally {
     stop();
   }

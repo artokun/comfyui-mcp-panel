@@ -1,0 +1,136 @@
+/**
+ * Identity observed around a panel_run dispatch.
+ *
+ * A prompt_id proves that ComfyUI accepted a request at one instant. It does
+ * not prove that the same backend, workflow target, or bridge route remained
+ * in place while the panel was waiting for the frontend queue wrapper.
+ * Missing or unproven identities are not stable merely because both reads are
+ * null; callers must provide explicit proof for every dispatch identity.
+ * Transport proof is three-state: only `available` authorizes a stable
+ * comparison. A legacy boolean `false` without a ready-state proof is
+ * normalized to `unknown`, never to proven availability.
+ * Keep this comparison dependency-free so the executor can fail closed and
+ * the production-path tests can drive the exact boundary.
+ */
+
+function text(value) {
+  if (typeof value !== "string") return value == null ? null : String(value);
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function epoch(value) {
+  return Number.isFinite(value) ? value : null;
+}
+
+function canonicalWorkflowUuid(value) {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+  );
+}
+
+export function captureRunDispatchIdentity({
+  routeId = null,
+  routeReady = true,
+  routeIdentityProven = false,
+  workflowUuid = null,
+  workflowIdentityProven = false,
+  workflowIdentityAmbiguous = false,
+  backendSocketState = null,
+  // Legacy boolean-only readers cannot prove that false means an OPEN socket.
+  backendSocketDown = null,
+  reconnectEpoch = null,
+  targetId = null,
+} = {}) {
+  const normalizedWorkflowUuid = text(workflowUuid);
+  const normalizedRouteId = text(routeId);
+  const ambiguous = workflowIdentityAmbiguous === true;
+  const normalizedBackendSocketState = ["available", "down", "unknown"].includes(backendSocketState)
+    ? backendSocketState
+    : backendSocketDown === true
+      ? "down"
+      : "unknown";
+  return {
+    routeId: normalizedRouteId,
+    routeReady: routeReady === true,
+    routeIdentityProven: routeIdentityProven === true && !!normalizedRouteId,
+    workflowUuid: normalizedWorkflowUuid,
+    workflowIdentityProven:
+      workflowIdentityProven === true && !ambiguous && canonicalWorkflowUuid(normalizedWorkflowUuid),
+    workflowIdentityAmbiguous: ambiguous,
+    backendSocketState: normalizedBackendSocketState,
+    reconnectEpoch: epoch(reconnectEpoch),
+    targetId: text(targetId),
+  };
+}
+
+/**
+ * Compare two observations. Null is an identity value, not a wildcard: an
+ * identity that becomes unreadable or appears late cannot authorize a run.
+ * `requireBridgeRoute:false` is reserved for the direct local `/run` path;
+ * all workflow, target, reconnect, and transport fences still apply there.
+ * Bridge-originated dispatches keep the default route requirement.
+ */
+export function compareRunDispatchIdentity(before, after, options = {}) {
+  const left = captureRunDispatchIdentity(before);
+  const right = captureRunDispatchIdentity(after);
+  const requireBridgeRoute = options?.requireBridgeRoute !== false;
+  const changed = [];
+  if (left.reconnectEpoch !== right.reconnectEpoch) changed.push("reconnect");
+  if (left.backendSocketState === "down" || right.backendSocketState === "down") {
+    changed.push("backend socket down");
+  } else if (left.backendSocketState !== "available" || right.backendSocketState !== "available") {
+    changed.push("backend socket unavailable");
+  }
+  if (requireBridgeRoute) {
+    if (left.routeId !== right.routeId) changed.push("bridge route");
+    else if (!left.routeIdentityProven || !right.routeIdentityProven) changed.push("bridge route unavailable");
+  }
+  if (left.workflowUuid !== right.workflowUuid) changed.push("workflow");
+  if (left.workflowIdentityAmbiguous || right.workflowIdentityAmbiguous) {
+    changed.push("workflow identity ambiguous");
+  } else if (!left.workflowIdentityProven || !right.workflowIdentityProven) {
+    changed.push("workflow identity unavailable");
+  }
+  if (left.targetId !== right.targetId) changed.push("run target");
+  if (requireBridgeRoute && (!left.routeReady || !right.routeReady)) changed.push("route readiness");
+  return { stable: changed.length === 0, changed, before: left, after: right };
+}
+
+/**
+ * Keep accepted prompt receipts, but remove a positive queued claim when the
+ * dispatch crossed an identity boundary. The receipt still lets reconciliation
+ * check the exact prompt instead of inviting a blind duplicate retry.
+ */
+export function downgradeUnstableRunResult(result, comparison) {
+  if (comparison?.stable || !result || typeof result !== "object") return result;
+  const ids = [
+    ...(Array.isArray(result.prompt_ids) ? result.prompt_ids : []),
+    ...(Array.isArray(result.queued_prompt_ids) ? result.queued_prompt_ids : []),
+    ...(result.prompt_id != null ? [result.prompt_id] : []),
+  ]
+    .map((id) => String(id).trim())
+    .filter((id, index, all) => id && all.indexOf(id) === index);
+  // A result with no accepted receipt is already fail-closed. Only rewrite a
+  // positive/partially-positive result: the prompt_id(s) remain valuable for
+  // reconciliation, but queued:true would overstate survival across the change.
+  if (result.queued !== true && !ids.length) return result;
+  const out = { ...result };
+  delete out.queued;
+  out.queued_unknown = true;
+  if (ids.length) {
+    out.prompt_id = ids[0];
+    out.queued_count = ids.length;
+    if (ids.length > 1) out.prompt_ids = ids;
+  }
+  out.dispatch_identity = { stable: false, changed: comparison.changed };
+  out.error =
+    `ComfyUI returned a prompt receipt, but the ${comparison.changed.join(", ")} ` +
+    `changed during dispatch. The receipt proves acceptance at the earlier instant, ` +
+    `not that this run survived the reconnect/target handoff.`;
+  out.retry_guidance =
+    `Check the ComfyUI queue or history for ${ids.length ? `prompt_id${ids.length > 1 ? "s" : ""} ${ids.join(", ")} ` : "this run "}` +
+    `before retrying. An empty queue/history during a handoff is ambiguous, and a blind retry can duplicate the render.`;
+  return out;
+}

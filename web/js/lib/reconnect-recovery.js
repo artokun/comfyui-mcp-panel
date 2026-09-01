@@ -288,6 +288,19 @@ export function backendSocketIsDown({ flaggedDown = false, socketReadyState } = 
 }
 
 /**
+ * Transport state for a mutating dispatch fence. Unlike backendSocketIsDown,
+ * this does not treat an absent readyState as available: the dispatch must
+ * prove either an OPEN socket or a known non-OPEN state. The reconnecting
+ * signal is applied by the panel because it is a restore boundary even while
+ * the old socket is briefly still OPEN.
+ */
+export function backendSocketTransportState({ socketReadyState } = {}) {
+  if (socketReadyState === WS_OPEN) return "available";
+  if (socketReadyState === 0 || socketReadyState === 2 || socketReadyState === 3) return "down";
+  return "unknown";
+}
+
+/**
  * #1325 — classify a ComfyUI `status` event for the mutation-guard flag.
  *
  *   - "alive"  — a real queue/status payload; the backend is talking

@@ -263,7 +263,7 @@ test("#1181 graph_run discloses a virtual-fed subgraph input at QUEUE time, scop
   // how the run is scoped. Pin that the scan comes AFTER that block closes.
   const exempt = src.indexOf("if (!partialTargets) {");
   const scan = src.indexOf("collectVirtualSourceFeeds(rootGraph)");
-  const blockEnd = src.indexOf("return honestRunAck(accept);", exempt);
+  const blockEnd = src.indexOf("return honestRunAck(downgradeUnstableRunResult(accept", exempt);
   assert.ok(exempt > 0 && scan > blockEnd - 4000 && scan < blockEnd, "scan runs outside the scoped-run exemption");
 });
 

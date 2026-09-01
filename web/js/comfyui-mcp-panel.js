@@ -399,6 +399,7 @@ import {
   reconnectRefusalError,
   readReconnectRefusal,
   backendSocketIsDown,
+  backendSocketTransportState,
   classifyBackendStatusEvent,
   describeGraphMutationReadiness,
 } from "./lib/reconnect-recovery.js";
@@ -900,6 +901,11 @@ import {
 import { summarizePromptRejection, buildQueueAcceptResult } from "./lib/queue-rejection.js";
 import { honestRunAck } from "./lib/delivery-ack.js";
 import {
+  captureRunDispatchIdentity,
+  compareRunDispatchIdentity,
+  downgradeUnstableRunResult,
+} from "./lib/run-dispatch-identity.js";
+import {
   createRunFetchInterceptor,
   dispatchScopedRun,
   invokeQueuePromptWithBrowserStack,
@@ -1084,6 +1090,14 @@ let runReceiptRouteRef = null;
 // The dispatch captures the actual agent conversation session, not the panel
 // mount generation. A route can remain stable while SESSION_KEY changes.
 let runReceiptSessionRef = null;
+// A panel_run can span frontend serialization and queue work. The live bridge
+// route, workflow instance, and ComfyUI reconnect epoch are therefore read at
+// both sides of the actual dispatch, not only by the outer command fence.
+let runDispatchIdentityRef = null;
+// A local slash-command invocation may run while the optional agent bridge is
+// disconnected. This capability is a Symbol so bridge-supplied JSON cannot
+// forge the local-only route exemption.
+const LOCAL_GRAPH_RUN_TOKEN = Symbol("local graph run");
 // A callback from an old mount must never register into a replacement tracker or
 // sweep. This owner is a stable object per mount rather than a mutable generation
 // number that an old callback could accidentally match after wrap/reuse.
@@ -19854,6 +19868,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // Keep the established destructuring signature (several shipped source-order
     // guards key off it), while accepting the bridge's correlation id as metadata.
     const requestedRid = arguments[0]?.rid;
+    const localRun = arguments[0]?.[LOCAL_GRAPH_RUN_TOKEN] === true;
     const receiptRid = typeof requestedRid === "string" && requestedRid.trim() ? requestedRid.trim() : null;
     // Freeze this mount's sender for the whole dispatch. A late /prompt response
     // can outlive graph_run itself, but it must never use a newer mount's bridge.
@@ -19870,10 +19885,41 @@ const GRAPH_TOOL_EXECUTORS = {
     const dispatchOwner = panelRunOwnerRef.current;
     const dispatchRunCompletion = runCompletionRef;
     const dispatchArmRunReconcileSweep = armRunReconcileSweepRef;
+    const dispatchIdentityReader = runDispatchIdentityRef;
+    const readRunDispatchIdentity = (targetId = null) => {
+      if (typeof dispatchIdentityReader === "function") {
+        try {
+          const observed = dispatchIdentityReader(targetId);
+          if (!observed || typeof observed !== "object") {
+            return captureRunDispatchIdentity({ routeReady: false, targetId });
+          }
+          return captureRunDispatchIdentity({
+            ...observed,
+            targetId,
+          });
+        } catch {
+          // An unreadable live identity is represented by routeReady:false and fails closed.
+          return captureRunDispatchIdentity({ routeReady: false, targetId });
+        }
+      }
+      // No mounted identity reader means there is no proven workflow/route snapshot.
+      // A mounted panel always installs runDispatchIdentityRef in buildPanel; direct
+      // callers must fail closed rather than queue without that proof.
+      return captureRunDispatchIdentity({
+        routeId: dispatchReceiptRoute,
+        routeReady: false,
+        targetId,
+      });
+    };
     // Mark the dispatch before queuePrompt can produce a fast execution_success.
     // The tracker holds that completion until the delayed /prompt response gives
     // it a prompt-scoped key, then replays the exact batch keyed.
     const dispatchPanelRunToken = dispatchRunCompletion?.beginPanelRun?.() ?? null;
+    const releaseUnqueuedRunDispatch = () => {
+      try {
+        dispatchRunCompletion?.endPanelRun?.(dispatchPanelRunToken);
+      } catch {}
+    };
     const { app, graph, rootGraph } = getGraphCtx();
     // /run invokes this executor directly rather than through bridge dispatch.
     // Queueing a stale root would render the wrong workflow even though no graph
@@ -19953,6 +19999,54 @@ const GRAPH_TOOL_EXECUTORS = {
       partialTargets = [res.execId];
       runToNodeInfo = { nodeId: to_node_id, nodeType: res.node?.type };
     }
+    // Capture the identity BEFORE the first asynchronous serializer/preflight step.
+    // A prompt_id earned after a reconnect or target swap is not enough to prove this
+    // command reached the workflow the caller named.
+    const dispatchIdentityBefore = readRunDispatchIdentity(partialTargets?.[0] ?? null);
+
+    const refuseUnstableRunDispatch = (comparison, phase) => {
+      const changed = comparison.changed.join(", ") || "live dispatch identity";
+      throw new Error(
+        `panel_run was NOT applied — ${changed} changed while the run was ${phase}; ` +
+        `nothing was sent to ComfyUI. Retry after the reconnect/target settles.`,
+      );
+    };
+
+    const assertRunDispatchReady = () => {
+      // The outer bridge fence runs before the executor, but graph_run can spend time
+      // in frontend serialization after that fence. Re-read the same backend gate at
+      // the write boundary so a reconnect that starts during preflight cannot enqueue
+      // onto a canvas the restore is about to replace.
+      const reconnectGate = graphMutationReconnectGate({
+        cmd: "graph_run",
+        backendDown: comfyBackendIsDown(),
+        bindingSettleWindow: postReconnectBindingSettleWindow(),
+      });
+      if (reconnectGate) throw reconnectRefusalError(reconnectGate);
+
+      const currentContext = getGraphCtx();
+      if (currentContext.graph !== graph || currentContext.rootGraph !== rootGraph) {
+        refuseUnstableRunDispatch(
+          { changed: ["workflow graph target"] },
+          "preparing to dispatch",
+        );
+      }
+      assertGraphBoundToActiveWorkflow(currentContext.graph, currentContext.rootGraph, {
+        ...MUTATION_BINDING_BAR,
+      });
+      if (partialTargets) {
+        const viewing = currentContext.graph !== currentContext.rootGraph ? currentContext.graph : null;
+        const currentTarget = resolveRunToNodeTarget(currentContext.rootGraph, viewing, to_node_id);
+        if (!currentTarget.ok || currentTarget.execId !== partialTargets[0]) {
+          refuseUnstableRunDispatch({ changed: ["run target"] }, "preparing to dispatch");
+        }
+      }
+      const currentIdentity = readRunDispatchIdentity(partialTargets?.[0] ?? null);
+      const comparison = compareRunDispatchIdentity(dispatchIdentityBefore, currentIdentity, {
+        requireBridgeRoute: !localRun,
+      });
+      if (!comparison.stable) refuseUnstableRunDispatch(comparison, "preparing to dispatch");
+    };
     // comfyui-mcp#1460 — PRE-FLIGHT the node types. An unregistered type still draws
     // on the canvas and is still included by ComfyUI's own graphToPrompt, with
     // `class_type: undefined` — so the server answers "has no class_type" for ONE
@@ -20260,6 +20354,18 @@ const GRAPH_TOOL_EXECUTORS = {
         rgthreeSeeds = []; /* a warning must never take down the run */
       }
     }
+    // This is the last synchronous boundary before either queue path can hand a
+    // prompt to ComfyUI. Anything that changed while graphToPrompt/preflight awaited
+    // is a clean refusal; no prompt was sent and retry is safe.
+    try {
+      assertRunDispatchReady();
+    } catch (error) {
+      // This boundary is before either queue path. No prompt can arrive later
+      // from a dispatch that was refused here, so do not retain its late-capture
+      // hold for the full timer window.
+      releaseUnqueuedRunDispatch();
+      throw error;
+    }
     if (!partialTargets) {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
@@ -20435,6 +20541,29 @@ const GRAPH_TOOL_EXECUTORS = {
         /* keep the unfiltered scan - over-warning is the safe direction here */
       }
     }
+    const readRunDispatchIdentityAfter = () => {
+      let targetId = partialTargets?.[0] ?? null;
+      if (partialTargets) {
+        try {
+          const currentContext = getGraphCtx();
+          if (currentContext.graph !== graph || currentContext.rootGraph !== rootGraph) {
+            targetId = null;
+          } else {
+            const viewing = currentContext.graph !== currentContext.rootGraph ? currentContext.graph : null;
+            const currentTarget = resolveRunToNodeTarget(currentContext.rootGraph, viewing, to_node_id);
+            targetId = currentTarget.ok ? currentTarget.execId : null;
+          }
+        } catch {
+          targetId = null;
+        }
+      }
+      return readRunDispatchIdentity(targetId);
+    };
+    const dispatchIdentityComparison = compareRunDispatchIdentity(
+      dispatchIdentityBefore,
+      readRunDispatchIdentityAfter(),
+      { requireBridgeRoute: !localRun },
+    );
     // #1728: capturePromptId registers accepted ids immediately, including ids
     // delivered after this bounded dispatch has returned. Keep the result-local
     // list for the synchronous response and for the existing idempotent return
@@ -20478,7 +20607,7 @@ const GRAPH_TOOL_EXECUTORS = {
         };
         // #1998 — attach control-repetition warning and observations to the result
         attachControlRepetitionNote(result, controlDriveObservations, repeatingControls, batch, scopedBatchDriveNote, scopedBatchSeedNote);
-        return result;
+        return downgradeUnstableRunResult(result, dispatchIdentityComparison);
       }
       // Nothing verified. But "nothing verified" is still not always "nothing
       // queued": an indeterminate dispatch left the panel and may have been
@@ -20564,7 +20693,7 @@ const GRAPH_TOOL_EXECUTORS = {
         };
         // #1998 — attach control-repetition warning and observations to the result
         attachControlRepetitionNote(result, controlDriveObservations, repeatingControls, batch, scopedBatchDriveNote, scopedBatchSeedNote);
-        return result;
+        return downgradeUnstableRunResult(result, dispatchIdentityComparison);
       }
       // NOTHING CONFIRMED. `queued` is OMITTED rather than set false, and that holds even
       // when NOTHING has left the panel yet — which is the one thing this branch got wrong
@@ -20624,7 +20753,7 @@ const GRAPH_TOOL_EXECUTORS = {
     });
     // #1995 — a minted prompt id is a queue receipt. Never rewrite that as a
     // user-rejected tool result; a lost ack without an id is unknown, not refused.
-    if (rejection) return honestRunAck(rejection);
+    if (rejection) return honestRunAck(downgradeUnstableRunResult(rejection, dispatchIdentityComparison));
     // Surface the queued prompt_id(s) so the agent can correlate/track the run —
     // #370 reconciliation and mcp#531 (panel_run must return the prompt_id even
     // when a render is already running) both depend on this being reported.
@@ -20864,7 +20993,7 @@ const GRAPH_TOOL_EXECUTORS = {
     } catch {
       /* a diagnostic must never take down the run it describes */
     }
-    return honestRunAck(accept);
+    return honestRunAck(downgradeUnstableRunResult(accept, dispatchIdentityComparison));
   },
 
   // WHY IS THAT NODE RED? — the single error surface. LiteGraph only sets a
@@ -40965,6 +41094,62 @@ function buildPanel() {
   };
   const panelRunReceiptSender = (rid, promptId, routeId, completionKey) =>
     runReceiptOutbox.enqueue(rid, promptId, routeId, completionKey);
+  const panelRunDispatchIdentity = (targetId = null) => {
+    let routeId = null;
+    let routeReady = false;
+    let routeIdentityProven = false;
+    let workflowUuid = null;
+    let workflowIdentityProven = false;
+    let workflowIdentityAmbiguous = false;
+    let backendSocketState = "unknown";
+    try {
+      routeId = panelRunReceiptRouteRef();
+      routeIdentityProven = typeof routeId === "string" && routeId.trim().length > 0;
+    } catch {}
+    try {
+      routeReady = client.isRouteReady?.() === true;
+    } catch {}
+    try {
+      // This is deliberately a pure read of an identity established by the
+      // graph-binding fence. Calling workflowStableUuid() here could mint a
+      // plausible value after the active workflow probe became unreadable.
+      const probe = probeActiveWorkflow();
+      const workflow = probe.workflow;
+      const candidate =
+        probe.readable && workflow && typeof workflow === "object"
+          ? workflowObjectUuid(workflow)
+          : null;
+      const owner = candidate ? workflowUuidOwner(candidate) : null;
+      workflowIdentityAmbiguous =
+        !!owner && !!workflow && !sameWorkflowObject(owner, workflow);
+      if (
+        !workflowIdentityAmbiguous &&
+        !!owner &&
+        !!workflow &&
+        isCanonicalWorkflowInstanceUuid(candidate)
+      ) {
+        workflowUuid = candidate;
+        workflowIdentityProven = true;
+      }
+    } catch {}
+    try {
+      const transportState = backendSocketTransportState({
+        socketReadyState: comfyBackendSocketReadyState(),
+      });
+      backendSocketState = comfyBackendSocketDown === true ? "down" : transportState;
+    } catch {}
+    return {
+      routeId,
+      routeReady,
+      routeIdentityProven,
+      workflowUuid,
+      workflowIdentityProven,
+      workflowIdentityAmbiguous,
+      backendSocketState,
+      reconnectEpoch: backendReconnectEpoch,
+      targetId,
+    };
+  };
   const panelRunReceiptTransport = {
     routeId: panelRunReceiptRouteRef,
     ready: () => client.isRouteReady?.() === true,
@@ -40974,6 +41159,7 @@ function buildPanel() {
   runReceiptRouteRef = panelRunReceiptRouteRef;
   const panelRunReceiptSessionRef = () => ssGet(SESSION_KEY);
   runReceiptSessionRef = panelRunReceiptSessionRef;
+  runDispatchIdentityRef = panelRunDispatchIdentity;
   runReceiptSender = panelRunReceiptSender;
 
   // #758 — announce an update once the transcript exists to receive it. Deliberately
@@ -43690,7 +43876,8 @@ function buildPanel() {
   // ---- slash commands (run locally, no agent round-trip) ----
   async function runLocalCommand(cmd, args) {
     try {
-      const result = await GRAPH_TOOL_EXECUTORS[cmd](args);
+      const localArgs = cmd === "graph_run" ? { ...args, [LOCAL_GRAPH_RUN_TOKEN]: true } : args;
+      const result = await GRAPH_TOOL_EXECUTORS[cmd](localArgs);
       appendActivity(cmd, args, { ok: true, result });
     } catch (err) {
       appendActivity(cmd, args, { ok: false, error: coerceMessageText(err?.message ?? err) });
@@ -46018,6 +46205,7 @@ function buildPanel() {
       if (runCompletionRef === runCompletion) runCompletionRef = null;
       if (runReceiptRouteRef === panelRunReceiptRouteRef) runReceiptRouteRef = null;
       if (runReceiptSessionRef === panelRunReceiptSessionRef) runReceiptSessionRef = null;
+      if (runDispatchIdentityRef === panelRunDispatchIdentity) runDispatchIdentityRef = null;
       if (runReceiptSender === panelRunReceiptSender) runReceiptSender = null;
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).

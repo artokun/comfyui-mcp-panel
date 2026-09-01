@@ -26,6 +26,7 @@ import {
   reconnectRefusalError,
   readReconnectRefusal,
   backendSocketIsDown,
+  backendSocketTransportState,
   classifyBackendStatusEvent,
   describeGraphMutationReadiness,
   WS_OPEN,
@@ -36,6 +37,15 @@ const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
 const SRC = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
 
 const instantSleep = () => Promise.resolve();
+
+test("#166: dispatch transport state proves OPEN, known non-OPEN, and unknown", () => {
+  assert.equal(backendSocketTransportState({ socketReadyState: WS_OPEN }), "available");
+  assert.equal(backendSocketTransportState({ socketReadyState: 0 }), "down", "CONNECTING");
+  assert.equal(backendSocketTransportState({ socketReadyState: 2 }), "down", "CLOSING");
+  assert.equal(backendSocketTransportState({ socketReadyState: 3 }), "down", "CLOSED");
+  assert.equal(backendSocketTransportState({}), "unknown", "missing readyState");
+  assert.equal(backendSocketTransportState({ socketReadyState: NaN }), "unknown", "invalid readyState");
+});
 
 // ---------------------------------------------------------------------------
 // watchPostReconnectSettle
@@ -510,13 +520,13 @@ test("#1529 reader: non-errors and ordinary failures answer null", () => {
 // clean answer for a function 1500 lines away. Same lesson as #1478 — a wiring
 // scan that mis-bounds is worse than a note, because it reports PASS.
 
-test("#1529 wiring: both gate call sites throw the STRUCTURED error", () => {
+test("#1529 wiring: all gate call sites throw the STRUCTURED error", () => {
   // A call site left on `new Error(gate)` would stringify the object to
   // "[object Object]" — the gate's own message lost AND no field published.
   assert.equal(
     (SRC.match(/if \(reconnectGate\) throw reconnectRefusalError\(reconnectGate\);/g) ?? []).length,
-    2,
-    "both graph-mutation entry points throw the structured refusal",
+    3,
+    "all graph-mutation entry points throw the structured refusal",
   );
   assert.doesNotMatch(
     SRC,
@@ -586,22 +596,23 @@ test("#1529 audit: NO shipped module touches the raw property outside a comment"
   );
 });
 
-test("#1529 audit: the mint has exactly the two known, PRE-EXECUTOR call sites", () => {
+test("#1529 audit: the mint has exactly the three known, PRE-EXECUTOR call sites", () => {
   // Gate-provenance stops a FORGED refusal but not a genuine one raised late: a
   // caller could invoke the gate after a write and throw its refusal. Nothing in
   // the type system can see that, so the remaining guarantee is positional, and
-  // this is what pins it — a third call site fails here and has to be justified.
+  // this is what pins it — a fourth call site fails here and has to be justified.
   //
-  // The two that exist: revalidateGraphMutationContext's preflight (before
-  // getGraphCtx, before any write) and the dispatch gate (before the executor).
+  // The three that exist: revalidateGraphMutationContext's preflight (before
+  // getGraphCtx, before any write), graph_run's async preflight recheck (before
+  // its queue call), and the bridge dispatch gate (before the executor).
   // Counts every REFERENCE to the identifier, not `name(` — `(reconnectRefusalError)(gate)`,
   // `const mint = reconnectRefusalError`, or a re-export all read as zero call
-  // sites to a `name\(` regex while adding one (review r3). Three references:
-  // the import binding, and the two throws.
+  // sites to a `name\(` regex while adding one (review r3). Four references:
+  // the import binding, and the three throws.
   const refs = [...SRC.matchAll(/\breconnectRefusalError\b/g)].length;
-  assert.equal(refs, 3, "a new mint reference must be reviewed for 'is this before the executor?'");
-  // …and the two that exist are still the throws, not something else.
-  assert.equal([...SRC.matchAll(/throw reconnectRefusalError\(reconnectGate\);/g)].length, 2);
+  assert.equal(refs, 4, "a new mint reference must be reviewed for 'is this before the executor?'");
+  // …and the three that exist are still the throws, not something else.
+  assert.equal([...SRC.matchAll(/throw reconnectRefusalError\(reconnectGate\);/g)].length, 3);
 });
 
 // NOT PROVABLE HERE, and stated rather than implied: none of the above shows
