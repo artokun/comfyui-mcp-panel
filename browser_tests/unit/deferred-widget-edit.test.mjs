@@ -209,6 +209,7 @@ function runProductionDeferredBranch({
   expected = "old",
   value = "new",
   expectedNodeIdentity,
+  widget = "text",
 }) {
   const { safety, branch } = buildProductionDeferredSafety();
   let currentQueuePayload = queuePayload;
@@ -284,7 +285,7 @@ function runProductionDeferredBranch({
     call: () => {
       const args = {
         node_id: node.id,
-        widget: "text",
+        widget,
         value,
         expected_value: expected,
         defer_until_idle: true,
@@ -294,6 +295,50 @@ function runProductionDeferredBranch({
     },
   };
 }
+
+test("#2143 production graph_set_widget refuses to DEFER an occurrence-addressed write", async () => {
+  // Two rows sharing one name — an rgthree Fast Groups node. The deferred replay re-resolves
+  // the widget by NAME (`liveNode.widgets.find(w => w.name === widget)`), and the node's rows
+  // can change while the queue drains, so an ordinal resolved now would pin a different row
+  // then. Refusing costs the caller one direct write; replaying would toggle a group nobody
+  // chose.
+  const node = {
+    id: 59,
+    type: "Fast Groups Bypasser (rgthree)",
+    widgets: [
+      { name: "RGTHREE_TOGGLE_AND_NAV", label: "group one", value: "old" },
+      { name: "RGTHREE_TOGGLE_AND_NAV", label: "group two", value: "old" },
+    ],
+  };
+  const run = runProductionDeferredBranch({
+    node,
+    widget: "RGTHREE_TOGGLE_AND_NAV[1]",
+    queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+  });
+  await assert.rejects(run.call(), /cannot defer an occurrence-addressed write/);
+  assert.equal(run.deferredQueue.pending(), 0, "nothing was parked");
+  assert.equal(node.widgets[1].value, "old", "nothing was written");
+});
+
+test("#2143 production graph_set_widget still defers a BARE duplicated name, unchanged", async () => {
+  // Only an EXPLICIT occurrence address is refused. A bare name defers exactly as it always
+  // did — onto the first row — so this change cannot have narrowed the deferral path.
+  const node = {
+    id: 59,
+    type: "Fast Groups Bypasser (rgthree)",
+    widgets: [
+      { name: "text", label: "group one", value: "old" },
+      { name: "text", label: "group two", value: "old" },
+    ],
+  };
+  const run = runProductionDeferredBranch({
+    node,
+    queuePayload: { queue_running: ["render-1"], queue_pending: [] },
+  });
+  const result = await run.call();
+  assert.equal(result.deferred, true);
+  assert.equal(run.deferredQueue.pending(), 1);
+});
 
 test("#1716 production graph_set_widget parks a safe scalar edit while render is running", async () => {
   const node = { id: 7, type: "KSampler", widgets: [{ name: "text", value: "old" }] };
