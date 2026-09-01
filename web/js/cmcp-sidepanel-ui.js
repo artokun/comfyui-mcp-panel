@@ -427,6 +427,12 @@ export function openSidePanel(ctx = {}, opts = {}) {
     read: (o) => readCivitai(o),
     close: closeResident,
   };
+  // Panel MODULES drive through one generic call: the module's content-provider exposes
+  // `drive.cmd(name, args)` and owns the vocabulary. The shell only gates on the active tab.
+  const director = {
+    cmd: (name, args) => _driveOf("director", "director pane not open", "cmd", [name, args]),
+    close: closeResident,
+  };
   const training = {
     getState: () => _driveOf("training", "training wizard not open", "getState", []),
     setField: (n, v) => _driveOf("training", "training wizard not open", "setField", [n, v]),
@@ -443,6 +449,9 @@ export function openSidePanel(ctx = {}, opts = {}) {
     activeTab: () => activeKey,
     isDocked: () => shell.isDocked(),
     setDocked,
+    // Generic pane state for the orchestrator's pane-read tool — which surface is showing and how it sits.
+    readPane: () => ({ open: isOpen, tab: activeKey, docked: shell.isDocked(), centered: shell.isCentered() }),
+    director,
     readCivitai,
     focus: () => { try { if (searchEl.style.display !== "none") searchEl.focus(); } catch { /* detached */ } },
     // RunPod status frames → re-render the active content (no-op unless Local).

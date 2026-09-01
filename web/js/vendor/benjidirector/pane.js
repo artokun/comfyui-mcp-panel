@@ -22,7 +22,7 @@
 //      the throw is load-bearing — do not soften it into a no-op.
 //
 // The React bundle is imported LAZILY, on first mount. Opening CivitAI must not pay for
-// ~250KB of editor the user did not ask for.
+// ~350KB of editor the user did not ask for.
 
 let _cssInjected = false;
 /**
@@ -61,7 +61,7 @@ export function createDirectorContent(ctx, shell, opts = {}) {
       // hash. Without it the browser caches this module indefinitely: the panel is served raw
       // with no bundler, so nothing else busts it, and a user who updated the pack would keep
       // running the old editor with no way to tell.
-      const mod = await import("./director-app.js?v=d733e5066c4f");
+      const mod = await import("./director-app.js?v=c8d553b38cf3");
       // The pane can be torn down while the dynamic import is in flight; mounting into a
       // detached node would leak a React root that nothing will ever unmount.
       if (mountEl !== bodyEl || !bodyEl.isConnected) return;
@@ -112,10 +112,13 @@ export function createDirectorContent(ctx, shell, opts = {}) {
       }
     },
 
-    // Agent-facing surface. Every method must tolerate the pane having closed underneath it:
-    // the orchestrator unmounts these tools on close, but a call already in flight can land.
+    // Agent-facing surface. One generic entry point: the editor owns the command vocabulary
+    // (`outline`, `add_node`, `connect`, `promote`, …) and mints every id. Every method must
+    // tolerate the pane having closed underneath it — the orchestrator unmounts these tools on
+    // close, but a call already in flight can still land — hence the throw.
     drive: {
-      outline: (...a) => (handle?.drive ? handle.drive.outline(...a) : notMounted()),
+      cmd: (name, args) => (handle?.ready?.() ? handle.drive(name, args || {}) : notMounted()),
+      read: () => ({ mounted: !!handle?.ready?.(), loading }),
     },
   };
 }

@@ -28151,7 +28151,7 @@ function noteActiveWorkflowMove() {
   }
 }
 
-function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onTrainingCmd, onUiRender, onUiUpdate, onUiDismiss, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert, onHelloLanded }) {
+function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCommandReceived, onAsk, onSecret, onSecretSaved, onReload, onTodo, onShowMedia, onOpenCivitai, onCivitaiCmd, onDirectorCmd, onTrainingCmd, onUiRender, onUiUpdate, onUiDismiss, onDownloads, onThinking, onAgentStatus, onSession, onModels, onCommands, onBackends, onAck, onTurn, onAction, onTurnAnchor, getResume, getBackend, onHandshakeTimeout, onBridgeClosed, onPairUrl, onPairError, onRunpodStatus, onComfyuiTarget, onRunpodAlert, onHelloLanded }) {
   let sock = null;
   let url = loadBridgeUrl();
   let closed = false;
@@ -29048,6 +29048,15 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // the user can visually pick a resource.
             if (!onOpenCivitai) throw new Error("This panel build can't open the CivitAI browser.");
             result = onOpenCivitai(msg) || { ok: true };
+          } else if (
+            msg.cmd === "module_open" || msg.cmd === "pane_close" || msg.cmd === "pane_read" ||
+            msg.cmd === "pane_set_dock" || (typeof msg.cmd === "string" && msg.cmd.startsWith("director_"))
+          ) {
+            // Panel modules (the Director today) and the generic pane lifecycle. The module's
+            // own content-provider owns the director_* vocabulary; onDirectorCmd throws an
+            // honest "director pane not open" when it is not live.
+            if (!onDirectorCmd) throw new Error("This panel build cannot drive panel modules.");
+            result = await onDirectorCmd(msg);
           } else if (
             msg.cmd === "civitai_results" || msg.cmd === "civitai_highlight" ||
             msg.cmd === "civitai_clear_highlight" || msg.cmd === "civitai_switch_tab" ||
@@ -35343,6 +35352,32 @@ function buildPanel() {
       if (btn) btn.classList.toggle("cmcp-toolbtn-active", k === key);
     }
   }
+  // Which side-panel tabs are panel MODULES whose tools the orchestrator mounts and unmounts
+  // with the pane. The other four tabs have always-registered tools and announce nothing.
+  const PANEL_MODULE_KEYS = ["director"];
+  let _openPaneModule = null;
+  /**
+   * Tell the orchestrator a module pane opened or closed. This is the switch for its
+   * mountable tool groups: the Director's canvas tools exist in tools/list only while this
+   * says the pane is open. Sent as an agent_event so it rides the same lane as every other
+   * panel-initiated push; re-sent on (re)connect so a fresh socket cannot leave the
+   * orchestrator with a stale picture.
+   */
+  function announcePaneState(module, open) {
+    if (!PANEL_MODULE_KEYS.includes(module)) return false;
+    try {
+      return !!liveBridgeClient?.sendFrame({ type: "agent_event", kind: "pane_state", module, open });
+    } catch { return false; }
+  }
+  function onPaneTabChange(key) {
+    setActiveToolbarTab(key);
+    if (_openPaneModule && _openPaneModule !== key) announcePaneState(_openPaneModule, false);
+    _openPaneModule = PANEL_MODULE_KEYS.includes(key) ? key : null;
+    if (_openPaneModule) announcePaneState(_openPaneModule, true);
+  }
+  function reannouncePaneState() {
+    if (_openPaneModule) announcePaneState(_openPaneModule, true);
+  }
   /** Open the unified side panel on `tab`, or switch to it if already open. */
   function openSidePanelTab(tab, { tabOpts, dock = true } = {}) {
     if (_sidePanelHandle?.isOpen?.()) {
@@ -35353,11 +35388,17 @@ function buildPanel() {
       tab,
       dock,
       ...(tabOpts ? { tabOpts: { [tab]: tabOpts } } : {}),
-      // The toolbar buttons are the tabs — highlight the active one on every switch.
-      onTabChange: setActiveToolbarTab,
+      // The toolbar buttons are the tabs — highlight the active one on every switch, and
+      // tell the orchestrator when a MODULE pane comes or goes.
+      onTabChange: onPaneTabChange,
       // Null the stored handle whenever the panel closes (✕, Escape, backdrop) so
       // post-open drive cmds get an honest "not open" error; clear the toolbar too.
-      onClose: () => { if (_sidePanelHandle === handle) _sidePanelHandle = null; setActiveToolbarTab(null); },
+      onClose: () => {
+        if (_sidePanelHandle === handle) _sidePanelHandle = null;
+        setActiveToolbarTab(null);
+        if (_openPaneModule) announcePaneState(_openPaneModule, false);
+        _openPaneModule = null;
+      },
     });
     _sidePanelHandle = handle;
     return handle;
@@ -40301,6 +40342,28 @@ function buildPanel() {
     // re-search, read results, glow-highlight). Routes to the unified side-panel
     // handle's civitai facade; throws an honest "civitai browser not open" error
     // (guard here, plus the facade re-checks the active tab).
+    // Panel modules + the generic pane lifecycle (module_open / pane_read / pane_close /
+    // pane_set_dock / director_*). One entry point so a future module is a switch case here
+    // and a facade in the shell, not a fifth copy of this function.
+    onDirectorCmd(msg) {
+      if (msg.cmd === "module_open") {
+        if (msg.module !== "director") throw new Error(`unknown panel module "${msg.module}"`);
+        openDirector({ dock: msg.dock !== false });
+        return { ok: true, module: "director" };
+      }
+      if (msg.cmd === "pane_close") return closeSidePanelHandle(_sidePanelHandle);
+      if (msg.cmd === "pane_set_dock") return setSidePanelDocked(_sidePanelHandle, msg.docked);
+      if (msg.cmd === "pane_read") {
+        const h = _sidePanelHandle;
+        if (!h) return { open: false, tab: null, modules: PANEL_MODULE_KEYS };
+        const base = typeof h.readPane === "function" ? h.readPane() : { open: !!h.isOpen?.(), tab: h.activeTab?.() };
+        return { ...base, modules: PANEL_MODULE_KEYS };
+      }
+      const h = _sidePanelHandle;
+      if (!h || !h.director) throw new Error("director pane not open");
+      const { cmd, rid: _rid, ...args } = msg;
+      return h.director.cmd(cmd.slice("director_".length), args);
+    },
     onCivitaiCmd(msg) {
       if (msg.cmd === "civitai_close") return closeSidePanelHandle(_sidePanelHandle);
       if (msg.cmd === "civitai_read") return readCivitaiPaneHandle(_sidePanelHandle, {
@@ -41126,6 +41189,9 @@ function buildPanel() {
   });
   // This is now THE live client for the page.
   liveBridgeClient = client;
+  // A reconnect rebuilds the orchestrator's view of us; say which module pane is open.
+  try { reannouncePaneState(); } catch { /* not yet */ }
+  setTimeout(() => { try { reannouncePaneState(); } catch { /* still not open */ } }, 1500);
   const panelRunReceiptRouteRef = () => {
     try {
       return bridgeRouteId();
