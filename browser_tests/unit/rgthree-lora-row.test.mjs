@@ -21,6 +21,7 @@ import {
 } from "../../web/js/lib/rgthree-lora-row.js";
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
 import { setWidgetCommandBudgetDeps } from "./_panel-constants.mjs";
+import { resolveWidgetAddress, WidgetAddressError } from "../../web/js/lib/widget-occurrence.js";
 
 const SLOT = { on: true, lora: "x.safetensors", strength: 0.5, strengthTwo: null };
 
@@ -1315,6 +1316,11 @@ const SET_WIDGET_SRC = (() => {
 const EXECUTOR_DEPS = [
   "getGraphCtx",
   "resolveNode",
+  // #2143 — the shipped handler resolves the widget ADDRESS before every name-keyed guard.
+  // The REAL resolver is injected, not a stub, so this harness keeps exercising the line
+  // that decides which same-named row a write is about.
+  "resolveWidgetAddress",
+  "WidgetAddressError",
   "classifyLtxTimelineWrite",
   "derivedTimelineRefusal",
   "applyLtxTimelineWrite",
@@ -1489,6 +1495,8 @@ function executor(node, overrides = {}) {
   const deps = {
     getGraphCtx: () => ({ app: { canvas: null }, graph, LG: { registered_node_types: {} }, rootGraph: graph }),
     resolveNode: () => node,
+    resolveWidgetAddress,
+    WidgetAddressError,
     classifyLtxTimelineWrite: () => null,
     classifyPromptRelayTimelineWrite: () => null,
     classifyRgthreeFastGroupsWrite: () => null,

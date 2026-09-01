@@ -16,6 +16,7 @@ import {
   sameDeferredWidgetValue,
 } from "../../web/js/lib/deferred-widget-edit.js";
 import { resolvePromotedInnerTarget } from "../../web/js/lib/widget-write.js";
+import { resolveWidgetAddress, WidgetAddressError } from "../../web/js/lib/widget-occurrence.js";
 import { nodeInstanceIdentity } from "../../web/js/lib/node-identity.js";
 
 const panelSource = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
@@ -232,6 +233,11 @@ function runProductionDeferredBranch({
     "monotonicNow",
     "getGraphCtx",
     "resolveNode",
+    // #2143 — the REAL address resolver, not a stub: the shipped branch rewrites `widget`
+    // through it before any deferral check runs, so a stub here would hide a regression in
+    // the one line that decides which row a deferred edit is even about.
+    "resolveWidgetAddress",
+    "WidgetAddressError",
     "classifyMiniMaxH3DirectorWrite",
     "miniMaxH3DirectorPromptRefusal",
     "deferredWidgetSafetyReason",
@@ -247,6 +253,8 @@ function runProductionDeferredBranch({
     () => 0,
     () => ({ app: {}, graph, rootGraph: graph, LG: {} }),
     (g, id) => g.getNodeById(id),
+    resolveWidgetAddress,
+    WidgetAddressError,
     () => null,
     () => "refused",
     safety,

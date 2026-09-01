@@ -71,6 +71,7 @@ import {
   resolvePromotedInnerTarget,
 } from "./lib/widget-write.js";
 import { missingWidgetMessage } from "./lib/missing-widget.js";
+import { resolveWidgetAddress, WidgetAddressError } from "./lib/widget-occurrence.js";
 import { freeVramSuccessResult, readVramOccupancy } from "./lib/vram-occupancy.js";
 import { nodeInstanceIdentity } from "./lib/node-identity.js";
 import { describeVoiceError } from "./lib/voice-error.js";
@@ -17914,6 +17915,36 @@ const GRAPH_TOOL_EXECUTORS = {
     const commandViewing =
       typeof describeActiveGraph === "function" ? describeActiveGraph(graph) : null;
     const node = resolveNode(graph, node_id);
+    // #2143 — RESOLVE THE WIDGET ADDRESS ONCE, HERE, BEFORE ANYTHING READS IT.
+    //
+    // rgthree's Fast Groups Bypasser/Muter names EVERY group-toggle row
+    // `RGTHREE_TOGGLE_AND_NAV`. `panel_query_graph` has reported each of them with a stable
+    // index and its own label since #1402, but the write side resolved by name alone and so
+    // always took the first — the second group's toggle had no address at all, and on a
+    // Bypasser that row's callback is what changes the modes of the group's nodes.
+    //
+    // `resolveWidgetAddress` accepts the two forms that name a specific row — "NAME[1]" and
+    // a display label carried by exactly one widget — and answers with the widget's REAL
+    // name plus the occurrence to write. Rewriting `widget` to that real name is the point
+    // of doing it HERE rather than deeper in the write: every guard below this line keys on
+    // the widget NAME (`classifyMiniMaxH3DirectorWrite`, `classifyLtxTimelineWrite`,
+    // `classifyRgthreeFastGroupsWrite`, `deferredWidgetSafetyReason`, the expected_scope
+    // witnesses…), so resolving a label any later would let a label-shaped address walk
+    // straight past a name-keyed safety refusal.
+    //
+    // An address that is neither of those forms is returned unchanged with no occurrence, so
+    // every call that worked before this line existed takes the identical path.
+    let widgetOccurrenceIndex = null;
+    try {
+      const address = resolveWidgetAddress(node, widget);
+      if (address) {
+        widget = address.name;
+        widgetOccurrenceIndex = address.occurrenceIndex;
+      }
+    } catch (err) {
+      if (!(err instanceof WidgetAddressError)) throw err;
+      throw new Error(`panel_set_widget refused "${String(widget)}" on node ${node?.id}: ${err.message}`);
+    }
     // #1679 / #1935 — keep derived MiniMax prompt / builder_state / timeline_data
     // writes refused before the first await, including when a caller asks for
     // deferral. Deferral must never become a side door around an existing
@@ -17929,6 +17960,21 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error("graph_set_widget cannot combine defer_until_idle with an internal replay");
     }
     if (defer_until_idle === true) {
+      // #2143 — a deferred write is REPLAYED later by NAME (`liveNode.widgets.find(w =>
+      // w.name === widget)`), and a name shared by several rows cannot survive that trip:
+      // the node may have gained or lost toggle rows while the queue drained, so the
+      // ordinal resolved now would pin a different row then. Refused rather than replayed
+      // against a row nobody chose. Only occurrence-ADDRESSED writes reach this — a bare
+      // duplicated name defers exactly as it always has, onto the first row.
+      if (widgetOccurrenceIndex != null) {
+        throw new Error(
+          `graph_set_widget cannot defer an occurrence-addressed write to "${widget}" on node ` +
+            `${node?.id ?? node_id}: the deferred replay re-resolves the widget by NAME, and this ` +
+            `node carries more than one widget with that name, so the row this call chose cannot ` +
+            `be identified at replay time. Write it directly (without defer_until_idle), or defer ` +
+            `a widget whose name is unique on the node (#2143).`,
+        );
+      }
       const safetyReason = deferredWidgetSafetyReason(node, widget, value, expected_value);
       if (safetyReason) {
         throw new Error(
@@ -18812,6 +18858,10 @@ const GRAPH_TOOL_EXECUTORS = {
       // #2109 — locating the enclosing SubgraphNode when this call addressed the
       // inner promoted terminal (the subgraph is the current view).
       rootGraph,
+      // #2143 — WHICH of the same-named rows this address named. Resolved above, against
+      // the same node this write targets, and re-applied to the LIVE widget list at the
+      // synchronous write boundary rather than pinned to a widget object.
+      occurrenceIndex: widgetOccurrenceIndex,
       // #2116 — if the write lands after this bound, persist the receipt so
       // retry_of can resolve the outcome without a duplicate mutation.
       onLateSuccess: (result) => {

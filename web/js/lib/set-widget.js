@@ -169,9 +169,28 @@ function hasValueSetter(widget) {
   return false;
 }
 
-function shouldAbandonSetWidgetOnTimeout(node, widgetName) {
+/**
+ * The widget a `(name, occurrenceIndex)` address names on the LIVE node, never throwing.
+ *
+ * #2143 — the ordinal matters here for the same reason it matters at the write: on a node
+ * with several widgets sharing one name, `find(w => w.name === n)` answers about the FIRST
+ * row whichever row was written. For the timeout readback below that is not merely
+ * imprecise — the first row's value can equal the requested one while the row the write
+ * targeted never changed, and the ack would then report "applied and verified" about a
+ * write whose outcome is genuinely unknown.
+ */
+function liveWidgetAt(node, widgetName, occurrenceIndex = null) {
+  const widgets = node?.widgets;
+  if (!Array.isArray(widgets)) return undefined;
+  if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0) {
+    return widgets.filter((candidate) => candidate?.name === widgetName)[occurrenceIndex];
+  }
+  return widgets.find((candidate) => candidate?.name === widgetName);
+}
+
+function shouldAbandonSetWidgetOnTimeout(node, widgetName, occurrenceIndex = null) {
   try {
-    const widget = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    const widget = liveWidgetAt(node, widgetName, occurrenceIndex);
     return widget?.type === "custom" || hasValueSetter(widget);
   } catch {
     return false;
@@ -181,10 +200,12 @@ function shouldAbandonSetWidgetOnTimeout(node, widgetName) {
 /**
  * #2025 — never-throwing live read of one named widget. Used by the timeout
  * readback so a missing node or a hostile getter cannot replace the ack.
+ * #2143 — `occurrenceIndex` selects among widgets sharing the name; without it the
+ * behaviour is the first-match read it has always been.
  */
-export function readLiveWidgetValue(node, widgetName) {
+export function readLiveWidgetValue(node, widgetName, occurrenceIndex = null) {
   try {
-    const live = node?.widgets?.find((candidate) => candidate?.name === widgetName);
+    const live = liveWidgetAt(node, widgetName, occurrenceIndex);
     if (!live) return { found: false, value: undefined };
     return { found: true, value: live.value };
   } catch {
@@ -223,6 +244,7 @@ export function readLiveWidgetValue(node, widgetName) {
 export async function awaitSetWidgetAck(writePromise, {
   node,
   widget,
+  occurrenceIndex = null,
   requested,
   timeoutMs,
   timers,
@@ -256,7 +278,7 @@ export async function awaitSetWidgetAck(writePromise, {
   captured.then((settled) => {
     if (settled?.ok) noteLateSuccess(honestWidgetAck(settled.result));
   }, () => {});
-  const live = readLiveWidgetValue(node, widget);
+  const live = readLiveWidgetValue(node, widget, occurrenceIndex);
   const verified = widgetWriteTimeoutReadback({
     requested,
     actual: live.value,
@@ -399,7 +421,7 @@ const ACK_STATE = Symbol("set-widget-ack-state");
 export async function runSetWidget(node, widgetName, value, opts = {}) {
   if (!opts[ACK_WRAPPED]) {
     const ackState = { abandoned: false };
-    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName);
+    const abandonOnTimeout = shouldAbandonSetWidgetOnTimeout(node, widgetName, opts.occurrenceIndex ?? null);
     return awaitSetWidgetAck(
       runSetWidgetBody(node, widgetName, value, {
         ...opts,
@@ -409,6 +431,8 @@ export async function runSetWidget(node, widgetName, value, opts = {}) {
       {
         node,
         widget: widgetName,
+        // #2143 — the ack's own readback must consult the SAME row the write targeted.
+        occurrenceIndex: opts.occurrenceIndex ?? null,
         requested: value,
         timeoutMs: opts.timeoutMs,
         timers: opts.ackTimers,
@@ -540,6 +564,13 @@ async function runSetWidgetBody(
     awaitFrontendWidgetFlush: awaitFrontendWidgetFlushInjected,
     [ACK_STATE]: ackState,
     clear,
+    // #2143 — WHICH of several widgets sharing `widgetName` the caller addressed, resolved
+    // at the command boundary from the "NAME[i]" / display-label form. `widgetName` itself is
+    // always the widget's REAL name by the time it reaches here, so every name-keyed
+    // classifier, refusal and readback on this path keeps working unchanged; this ordinal is
+    // the only thing that says which row. Null for every address that is not explicitly
+    // occurrence-scoped, which is every call that existed before #2143.
+    occurrenceIndex = null,
   } = {},
 ) {
   const assertNotAbandoned = () => {
@@ -1121,6 +1152,7 @@ async function runSetWidgetBody(
         setDirty,
         assertTargetWritable: (targetNode) => assertResolvedTargetRegistered(liveRegistry(), targetNode),
         promotedResolution,
+        occurrenceIndex,
         ...extra,
       });
       // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write

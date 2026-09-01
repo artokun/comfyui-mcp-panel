@@ -27,6 +27,7 @@ import assert from "node:assert/strict";
 import { runSetWidget, COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
 import { makeRefreshCoalescer, REFRESH_JOIN_ABANDONED } from "../../web/js/lib/refresh-coalesce.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { resolveWidgetAddress, WidgetAddressError } from "../../web/js/lib/widget-occurrence.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "../../web/js/lib/object-info-retry.js";
 import {
   createObjectInfoCache,
@@ -249,6 +250,10 @@ const SET_WIDGET_SRC = (() => {
 const EXECUTOR_DEPS = [
   "getGraphCtx",
   "resolveNode",
+  // #2143 — kept in step with the rgthree-lora-row list: the shipped handler resolves the
+  // widget address before every name-keyed guard, with the REAL resolver.
+  "resolveWidgetAddress",
+  "WidgetAddressError",
   "classifyLtxTimelineWrite",
   "derivedTimelineRefusal",
   "applyLtxTimelineWrite",
@@ -412,6 +417,8 @@ function realGraphSetWidget({
   const deps = {
     getGraphCtx: () => context,
     resolveNode: () => node,
+    resolveWidgetAddress,
+    WidgetAddressError,
     classifyLtxTimelineWrite: () => null,
     classifyPromptRelayTimelineWrite: () => null,
     classifyRgthreeFastGroupsWrite: () => null,

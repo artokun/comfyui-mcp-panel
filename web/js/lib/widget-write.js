@@ -3,6 +3,7 @@ import { missingWidgetMessage } from "./missing-widget.js";
 import { explainNumericNormalization, normalizationNote } from "./widget-normalization.js";
 import { isNonSerializingValueSource } from "./virtual-source-promotion.js";
 import { isPromotedContainer } from "./graph-read.js";
+import { widgetOccurrenceOf } from "./widget-occurrence.js";
 import {
   boundPropertyFailure,
   boundPropertyState,
@@ -412,10 +413,29 @@ export function isCompositeObjectWidget(widget) {
  * Resolve a widget name without silently choosing between case-colliding
  * widgets. Exact spelling always wins; a case-insensitive fallback remains for
  * older callers, but only when it names exactly one widget (#524).
+ *
+ * `occurrenceIndex` (#2143) is set ONLY when the caller EXPLICITLY addressed one of
+ * several widgets sharing `widgetName` — "NAME[1]", or a display label that names
+ * exactly one row. When it is set, three things change and nothing else does:
+ *
+ *   * the i-th exact-name match is returned instead of the first;
+ *   * an index that no longer has a widget behind it returns null rather than the
+ *     first — the caller's dotted/base retry gets its turn and, failing that, the
+ *     ordinary missing-widget refusal fires. Silently writing occurrence 0 for an
+ *     address that asked for occurrence 1 is the defect, not an acceptable fallback;
+ *   * the case-insensitive fallback is SKIPPED, because an occurrence ordinal counted
+ *     over exact-name matches means nothing against a differently-cased name.
+ *
+ * With no `occurrenceIndex` — every call that existed before #2143 — this function is
+ * byte-identical to what it was.
  */
-function resolveWidgetByName(node, widgetName) {
+function resolveWidgetByName(node, widgetName, occurrenceIndex = null) {
   const wanted = String(widgetName);
   const widgets = node?.widgets ?? [];
+  if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0) {
+    const sameName = widgets.filter((cand) => cand?.name === wanted);
+    return sameName[occurrenceIndex] ?? null;
+  }
   const exact = widgets.find((cand) => cand?.name === wanted);
   if (exact) return exact;
 
@@ -2299,6 +2319,10 @@ export function resolveWidgetWrite(
   assertTargetWritable,
   promotedResolution,
   coerceOpts,
+  // #2143 — WHICH of several widgets sharing `widgetName` this write addressed, when the
+  // caller said so explicitly ("NAME[1]" or a unique display label; see widget-occurrence.js).
+  // Null on every other write, which is every write that existed before #2143.
+  occurrenceIndex = null,
 ) {
   let targetNode = node;
   let widget = null;
@@ -2325,6 +2349,20 @@ export function resolveWidgetWrite(
       if (!res.target) {
         throw new WidgetWriteError(
           res.error || `promoted widget "${widgetName}" could not be resolved to an inner widget.`,
+        );
+      }
+      // #2143 — a promotion resolves by NAME through the subgraph's promotion metadata,
+      // which has no notion of "the second widget called X"; #366 already refuses a
+      // promoted write whose name is duplicated. So an occurrence-addressed write that
+      // lands here would have its ordinal SILENTLY DROPPED and write occurrence 0's
+      // promotion — the exact silent-wrong-row this issue is about, one layer up. Refuse
+      // before any coercion or mutation.
+      if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0) {
+        throw new WidgetWriteError(
+          `"${widgetName}" on subgraph node ${node.id} is a PROMOTED widget, and a promotion is ` +
+            `resolved by name — it cannot select occurrence ${occurrenceIndex} of a duplicated ` +
+            `name. Nothing was written. Enter the subgraph (panel_enter_subgraph) and address ` +
+            `the row on the node that owns it (#2143).`,
         );
       }
       targetNode = res.target.node;
@@ -2401,7 +2439,7 @@ export function resolveWidgetWrite(
   if (!widget) {
     // EXACT-NAME FIRST: a widget whose own name is literally `widgetName` (dots and
     // all) always wins — the split is never taken when an exact match exists.
-    widget = resolveWidgetByName(targetNode, widgetName);
+    widget = resolveWidgetByName(targetNode, widgetName, occurrenceIndex);
   }
   if (!widget && isPromotedContainer(node)) {
     // #560 SAFETY: on a SUBGRAPH parent, a dotted name that did not resolve as a
@@ -2431,7 +2469,7 @@ export function resolveWidgetWrite(
     if (dot > 0) {
       const baseName = nameStr.slice(0, dot);
       const sub = nameStr.slice(dot + 1);
-      const baseWidget = resolveWidgetByName(targetNode, baseName);
+      const baseWidget = resolveWidgetByName(targetNode, baseName, occurrenceIndex);
       if (baseWidget) {
         if (sub === "") {
           throw new WidgetWriteError(
@@ -2452,6 +2490,23 @@ export function resolveWidgetWrite(
     }
   }
   if (!widget) {
+    // #2143 — an occurrence-addressed write whose ordinal no longer has a row behind it.
+    // The plain missing-widget refusal would list the name as AVAILABLE (it is — just not
+    // that many times), which reads as a contradiction. Say what actually happened: the
+    // node's rows changed between the address being resolved and the write boundary, which
+    // is exactly what an rgthree Fast Groups node does when its matched groups change.
+    if (Number.isInteger(occurrenceIndex) && occurrenceIndex >= 0) {
+      const base = String(widgetName).split(".")[0];
+      const rows = (targetNode?.widgets ?? []).filter((cand) => cand?.name === base).length;
+      if (rows) {
+        throw new WidgetWriteError(
+          `Node ${targetNode?.id} (${targetNode?.type}) now carries ${rows} widget` +
+            `${rows === 1 ? "" : "s"} named "${base}", so occurrence ${occurrenceIndex} no longer ` +
+            `exists — the node's rows changed after the address was resolved. Nothing was written; ` +
+            `re-read panel_query_graph's duplicate_widgets and address the row again.`,
+        );
+      }
+    }
     // #757 — pressable-widget hint for a button that CREATES the missing slot.
     // #1956 — if the name is a node PROPERTY (rgthree Fast Groups matchTitle/…),
     // point at panel_set_property instead of a click dead-end, and list each
@@ -2504,6 +2559,13 @@ export function applyWidgetWrite(
     // a non-empty string as written. Default false ⇒ the unreadable case is a RETRYABLE
     // combo rejection, so a transient callback failure is re-read before any decision.
     acceptUnreadableComboOptions = false,
+    // #2143 — WHICH of several widgets sharing this name the caller addressed. Resolved
+    // once at the command boundary (graph_set_widget) from the "NAME[i]" / display-label
+    // form, and re-applied HERE against the live widget list rather than pinned to a widget
+    // object: an rgthree Fast Groups node rebuilds its toggle rows whenever the groups it
+    // matches change, so a captured object can be detached from the node by write time
+    // while the ordinal still names the row the caller meant.
+    occurrenceIndex = null,
   } = {},
 ) {
   // resolveWidgetWrite runs assertTargetWritable on the RESOLVED target (inner
@@ -2527,7 +2589,18 @@ export function applyWidgetWrite(
       // membership. Read below; NEVER re-derived by reading the option list again, since
       // a stateful dynamic source can answer differently on a second call.
       out: coerceOutcome,
-    });
+    }, occurrenceIndex);
+
+  // #2143 — WHICH same-named row this write resolved to, captured BEFORE any mutation and
+  // by widget IDENTITY, so a callback that rebuilds the node cannot make the reply describe
+  // a different row than the one that was written. Null unless the name is genuinely carried
+  // by more than one widget, so every ordinary write replies byte-identically to before.
+  //
+  // Reported for the DIRECT target only. On a promoted subgraph write the value can land on
+  // the parent's rail rather than the inner widget (comfyui-mcp#1707's instance scope), so
+  // one ordinal would have to describe two different widget lists; #366 already refuses a
+  // promoted write whose name is duplicated, so there is nothing here to disambiguate.
+  const widgetOccurrence = promotedFrom ? null : widgetOccurrenceOf(targetNode, w);
 
   // The rail object captured before /object_info may be a stale inner Primitive
   // handle. Re-read the live host projections at write time so the store-backed
@@ -3773,6 +3846,13 @@ export function applyWidgetWrite(
     widget: verifiedName,
     previous: parentWidget ? previousParent : previous,
     value: verifiedValue,
+    // #2143 — WHICH of the same-named rows this write landed on: `{index, of, label?}`,
+    // using the same ordinal and the same display label `panel_query_graph`'s
+    // duplicate_widgets reports, so the two halves of the surface agree. Present ONLY when
+    // the name is carried by more than one widget — which is the only case where "widget:
+    // RGTHREE_TOGGLE_AND_NAV" does not identify what was written — so every node with unique
+    // widget names replies exactly as it did before.
+    ...(widgetOccurrence ? { widget_occurrence: widgetOccurrence } : {}),
     // #1126 — the COERCION-TIME verdict, so the caller reports WHAT HAPPENED instead of
     // inferring it from the rejection that led here. `options.values` is a callback and
     // can answer differently per call: the final attempt may well have been admitted by
