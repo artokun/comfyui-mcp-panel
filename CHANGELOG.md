@@ -6,8 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.155] - 2026-09-02
+
 ### Fixed
 - panel_search_nodes keeps serialized browser transport failures classified and diagnosable when ComfyUI-Manager mappings returns no HTTP response (#2024)
+
 
 ## [0.15.154] - 2026-09-02
 
