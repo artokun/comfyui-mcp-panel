@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.157] - 2026-09-02
+
+### Fixed
+- panel_set_widget on rgthree Fast Bypasser/Muter rows now applies the requested mode idempotently through the forced-value path, authenticates row-to-node closures, and journals all reachable mode changes for fail-closed rollback (#2151)
+
+
 ## [0.15.156] - 2026-09-02
 
 ### Fixed
