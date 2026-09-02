@@ -70,13 +70,7 @@ function makeModeChanger({
 
   // Counted so a test can prove the toggling callback was NOT the thing that ran.
   let callbackCalls = 0;
-  for (const ln of linked) {
-    const widget = {
-      name: `Enable ${ln.title}`,
-      type: "toggle",
-      options: { on: "yes", off: "no" },
-      value: ln.mode === node.modeOn,
-    };
+  const installRowAction = (widget, ln) => {
     widget.doModeChange = (forceValue, skipOtherNodeCheck) => {
       let newValue = forceValue == null ? ln.mode === node.modeOff : forceValue;
       if (skipOtherNodeCheck !== true) {
@@ -93,8 +87,32 @@ function makeModeChanger({
       callbackCalls++;
       widget.doModeChange();
     };
+  };
+  for (const ln of linked) {
+    const widget = {
+      name: `Enable ${ln.title}`,
+      type: "toggle",
+      options: { on: "yes", off: "no" },
+      value: ln.mode === node.modeOn,
+    };
+    installRowAction(widget, ln);
     node.widgets.push(widget);
   }
+  node.handleLinkedNodesStabilization = (linkedNodes) => {
+    for (const [index, linkedNode] of linkedNodes.entries()) {
+      const widget = node.widgets[index];
+      if (!widget) continue;
+      const expectedName = `Enable ${linkedNode.title}`;
+      if (widget.name !== expectedName) {
+        widget.name = expectedName;
+        widget.options = { on: "yes", off: "no" };
+        widget.value = linkedNode.mode === node.modeOn;
+        installRowAction(widget, linkedNode);
+      }
+    }
+    if (node.widgets.length > linkedNodes.length) node.widgets.length = linkedNodes.length;
+    return false;
+  };
   return { node, graph, nodes, linked, widgets: node.widgets, callbackCalls: () => callbackCalls };
 }
 
@@ -263,13 +281,14 @@ test("#2151: a row whose linked node cannot be found is refused, not written bli
   assert.equal(fixture.linked[0].mode, 0);
 });
 
-test("#2151: a row left driving a same-title node it no longer names is refused and rolled back", () => {
+test("#2151: a same-title rewire rebinds the row before the forced write", () => {
   // The codex gate's P1, and it is the pack's own lifecycle: `setWidget` installs the
   // `doModeChange` closure ONLY inside `if (widget.name !== name)`, and the name is
   // `Enable ${linkedNode.title}`. Rewire slot 0 from A to a DIFFERENT node B with the SAME
   // title and the row still drives A — while its label, and the wiring this writer reads, both
   // say B. Default titles are the node's display name, so two identically-titled nodes are
-  // ordinary. Without the effect check the write would report success having switched A.
+  // ordinary. Without rebinding, the write would switch A; with the authoritative stabilizer,
+  // the row is rebuilt over B before the forced setter runs.
   const fixture = makeModeChanger({ linkedModes: [0] });
   const stale = fixture.linked[0]; // A — what the closure captured
   const fresh = { id: 900, type: "LC_Effect", title: stale.title, mode: 0, graph: fixture.graph };
@@ -279,28 +298,61 @@ test("#2151: a row left driving a same-title node it no longer names is refused 
   fixture.graph.links[101] = { origin_id: fresh.id, target_id: fixture.node.id };
   fixture.node.graph.nodes = [fixture.node, stale, fresh];
 
-  assert.throws(
-    () => applyWidgetWrite(fixture.node, `Enable ${stale.title}`, false, {}),
-    (error) =>
-      error instanceof WidgetWriteError &&
-      /did not set node 900/.test(error.message) &&
-      /SAME TITLE/.test(error.message),
-  );
-  assert.equal(fresh.mode, 0, "the node the row names was never switched");
+  const result = applyWidgetWrite(fixture.node, `Enable ${stale.title}`, false, {});
+  assert.equal(result.value, false);
+  assert.equal(fresh.mode, 4, "the current same-title node receives the forced mode");
   assert.equal(
     stale.mode,
     0,
-    "and the node the stale closure DID switch is rolled back — it is in the journal only " +
-      "because the sweep covers the whole graph, not just the current wiring",
+    "and the stale closure target is not mutated because the authoritative stabilizer replaced " +
+      "the closure before the action ran",
   );
-  assert.equal(fixture.widgets[0].value, true, "the row value is restored too");
+  assert.equal(fixture.widgets[0].value, false, "the row retains the forced value");
+});
+
+test("#2151: same-title rewire is safe when the current target is already at the requested mode", () => {
+  const fixture = makeModeChanger({ linkedModes: [0] });
+  const stale = fixture.linked[0];
+  const current = { id: 901, type: "LC_Effect", title: stale.title, mode: 4, graph: fixture.graph };
+  fixture.nodes.set(current.id, current);
+  fixture.graph.links[101] = { origin_id: current.id, target_id: fixture.node.id };
+  fixture.graph.nodes = [fixture.node, stale, current];
+
+  // Before the repair the opaque closure toggled `stale` to mode 4, while the old target-only
+  // readback saw `current` already at mode 4 and falsely returned success. Rebinding must leave
+  // the stale node untouched and keep the requested current target at modeOff.
+  const result = applyWidgetWrite(fixture.node, `Enable ${stale.title}`, false, {});
+  assert.equal(result.value, false);
+  assert.equal(current.mode, 4, "the current same-title target remains disabled");
+  assert.equal(stale.mode, 0, "the old closure target is not mutated");
+  assert.equal(fixture.widgets[0].value, false);
+});
+
+test("#2151: a detached foreign closure target is rebound before it can mutate", () => {
+  const fixture = makeModeChanger({ linkedModes: [0] });
+  const current = fixture.linked[0];
+  const foreign = { id: 902, type: "Foreign_Effect", title: current.title, mode: 0 };
+  fixture.graph.nodes = [fixture.node, current];
+
+  // Simulate a stale closure whose target has left the graph entirely. The current row still has
+  // the same canonical address, but the foreign object is not graph-visible and cannot be journaled.
+  fixture.widgets[0].doModeChange = (forceValue) => {
+    foreign.mode = forceValue ? fixture.node.modeOn : fixture.node.modeOff;
+    fixture.widgets[0].value = forceValue;
+  };
+
+  applyWidgetWrite(fixture.node, `Enable ${current.title}`, false, {});
+  assert.equal(current.mode, 4, "the current wired target receives the write");
+  assert.equal(foreign.mode, 0, "the detached foreign target is never mutated");
+  assert.equal(fixture.widgets[0].value, false);
 });
 
 test("#2151: a Node Collector fanning several nodes into one slot still pairs row to node", () => {
   // A DESIGNED rgthree usage, and the case that makes the row-to-node pairing non-trivial: a
   // pass-through contributes SEVERAL entries for ONE input slot, so the pack's linked-node list
   // is longer than its input list and the pairing cannot be "one node per slot". If the walk
-  // here disagreed with the pack's, `targetSettled` would refuse writes that are perfectly fine.
+  // here disagreed with the pack's, the authoritative row authentication would refuse a write
+  // whose positional target could not be established.
   const graph = { links: {}, getNodeById: (id) => nodes.get(id) ?? null };
   const nodes = new Map();
   const bypasser = {
@@ -327,16 +379,33 @@ test("#2151: a Node Collector fanning several nodes into one slot still pairs ro
   graph.nodes = [bypasser, collector, ...effects];
 
   // One row per COLLECTED node — what handleLinkedNodesStabilization builds.
-  for (const effect of effects) {
-    const widget = { name: `Enable ${effect.title}`, type: "toggle", value: true };
+  const installRowAction = (widget, effect) => {
     widget.doModeChange = (forceValue) => {
       const nv = forceValue == null ? effect.mode === bypasser.modeOff : forceValue;
       effect.mode = nv ? bypasser.modeOn : bypasser.modeOff;
       widget.value = nv;
     };
     widget.callback = () => widget.doModeChange();
+  };
+  for (const effect of effects) {
+    const widget = { name: `Enable ${effect.title}`, type: "toggle", value: true };
+    installRowAction(widget, effect);
     bypasser.widgets.push(widget);
   }
+  bypasser.handleLinkedNodesStabilization = (linkedNodes) => {
+    for (const [index, linkedNode] of linkedNodes.entries()) {
+      const widget = bypasser.widgets[index];
+      if (!widget) continue;
+      if (widget.name !== `Enable ${linkedNode.title}`) {
+        widget.name = `Enable ${linkedNode.title}`;
+        widget.options = { on: "yes", off: "no" };
+        widget.value = linkedNode.mode === bypasser.modeOn;
+        installRowAction(widget, linkedNode);
+      }
+    }
+    if (bypasser.widgets.length > linkedNodes.length) bypasser.widgets.length = linkedNodes.length;
+    return false;
+  };
 
   applyWidgetWrite(bypasser, "Enable Halation", false, {});
   assert.deepEqual(

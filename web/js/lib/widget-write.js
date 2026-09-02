@@ -715,6 +715,98 @@ function linkedNodesInOrder(node, owner) {
   return ordered;
 }
 
+/**
+ * #2151 — authenticate the row closures against the current linked-node list.
+ *
+ * rgthree's `doModeChange` closes over its linked node and exposes no target property.  A
+ * same-title rewire can therefore leave that closure pointing at a detached or foreign node.
+ * `handleLinkedNodesStabilization` is the pack's authoritative rebinding path: its `setWidget`
+ * arm installs the closure over the linked node supplied at the same position.  Force that arm
+ * for every row, then verify that the graph and widget identities did not move while it ran.
+ * Refuse before the forced action if the rebinding contract is unavailable or incomplete.
+ */
+function authenticateFastModeChangerRows(node, linkedTargets) {
+  let rows;
+  let stabilize;
+  try {
+    rows = node?.widgets;
+    stabilize = node?.handleLinkedNodesStabilization;
+  } catch {
+    throw modeTransactionFailure(node, "the row rebinding contract is unreadable");
+  }
+  if (!Array.isArray(rows) || rows.length !== linkedTargets.length) {
+    throw modeTransactionFailure(
+      node,
+      `the node carries ${Array.isArray(rows) ? rows.length : "an unreadable number of"} row(s) ` +
+        `for ${linkedTargets.length} linked node(s)`,
+    );
+  }
+  if (typeof stabilize !== "function") {
+    throw modeTransactionFailure(node, "the pack exposes no authoritative row rebinding method");
+  }
+
+  const snapshots = [];
+  let authenticated = false;
+  try {
+    for (const [index, row] of rows.entries()) {
+      snapshots.push({
+        row,
+        name: row?.name,
+        value: row?.value,
+        options: row?.options,
+        doModeChange: row?.doModeChange,
+        callback: row?.callback,
+      });
+      row.name = `\u0000cmcp-2151-rebind-${index}`;
+    }
+    Reflect.apply(stabilize, node, [linkedTargets]);
+
+    const reboundRows = node?.widgets;
+    if (!Array.isArray(reboundRows) || reboundRows.length !== linkedTargets.length) {
+      throw modeTransactionFailure(node, "the pack changed the row count during authoritative rebinding");
+    }
+    for (const [index, target] of linkedTargets.entries()) {
+      const row = reboundRows[index];
+      if (row !== snapshots[index].row) {
+        throw modeTransactionFailure(node, "the pack replaced a row during authoritative rebinding");
+      }
+      if (row?.name !== `Enable ${target?.title}` || typeof row?.doModeChange !== "function") {
+        throw modeTransactionFailure(node, "the pack did not rebuild every row over the current linked node");
+      }
+    }
+
+    const currentTargets = linkedNodesInOrder(node, node);
+    if (
+      currentTargets.length !== linkedTargets.length ||
+      currentTargets.some((target, index) => target !== linkedTargets[index])
+    ) {
+      throw modeTransactionFailure(node, "the linked-node wiring changed during authoritative rebinding");
+    }
+    authenticated = true;
+  } catch (error) {
+    if (error instanceof WidgetWriteError) throw error;
+    throw modeTransactionFailure(node, "the pack's authoritative row rebinding threw");
+  } finally {
+    // Rebinding initializes row values from the current modes. Restore the caller-visible values
+    // before applyWidgetWrite snapshots `previous`; the newly installed action/callback bindings
+    // intentionally stay in place on success. On refusal, restore the prior row shape as well.
+    for (const snapshot of snapshots) {
+      try {
+        if (!authenticated) {
+          snapshot.row.name = snapshot.name;
+          snapshot.row.doModeChange = snapshot.doModeChange;
+          snapshot.row.callback = snapshot.callback;
+        }
+        snapshot.row.value = snapshot.value;
+        snapshot.row.options = snapshot.options;
+      } catch {
+        // The refusal above remains authoritative; no forced mode action is invoked.
+      }
+    }
+  }
+  return rows;
+}
+
 function relayDispatchesMode(node, owner) {
   try {
     const inputs = node.inputs;
@@ -744,13 +836,11 @@ function relayDispatchesMode(node, owner) {
  * This intentionally does not walk or snapshot the graph generally. The returned journal is
  * used to verify the canonical action changed a reachable mode and to roll it back on failure.
  */
-function captureFastBypasserModeTransaction(node, writtenWidget) {
+function captureFastBypasserModeTransaction(node, writtenWidget, authenticatedLinkedTargets = null) {
   const kind = fastModeTransactionKind(node, writtenWidget);
   if (!kind) return null;
 
   const groups = [];
-  // #2151 — the row-to-linked-node pairing for the "linked" kind, in the pack's own order.
-  let linkedTargets = null;
   if (kind === "groups") {
     const rows = [
       writtenWidget,
@@ -901,70 +991,24 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
     for (const groupNode of groupNodes) addNodeTree(groupNode);
   }
 
-  // #2151 — Fast Bypasser / Fast Muter seeding. Each row's `doModeChange` closes over ONE
-  // linked node, and the pack derives those from `getConnectedInputNodesAndFilterPassThroughs`
-  // over this node's inputs. `connectedRoots(..., "input", ...)` walks exactly that: it follows
-  // Reroute / Node Combiner / Node Collector (rgthree's `PassThroughFollowing.ALL`, mirrored by
-  // `isModePassThrough`) and captures the first non-pass-through origin on each chain.
-  //
-  // The union across ALL rows, not just the written one, matching the group arm above: the
-  // widget-to-linked-node mapping is positional inside the pack (`widgets[index]` ↔
-  // `linkedNodes[index]`) and is not exposed on the row, so which single node this row reaches
-  // is not knowable from here. A journal that is a superset of what the action can touch still
-  // restores correctly; a subset would not, so the superset is the fail-safe direction.
-  //
-  // `addNodeTree` already descends subgraphs, which is what `changeModeOfNodes` does
-  // (`reduceNodesDepthFirst` walks `node.subgraph.nodes`), and it already marks repeaters and
-  // dispatching relays so the propagation drain below follows them.
+  // #2151 — the direct Fast Bypasser / Fast Muter row closures were authenticated and rebound
+  // against the current linked-node list before this capture. Journal only those current graph
+  // targets and their reachable propagation; an opaque closure that was not rebound must never
+  // be invoked, because its detached target cannot be restored here.
   if (kind === "linked") {
-    let inputs;
-    try {
-      inputs = node?.inputs;
-    } catch {
-      throw modeTransactionFailure(node, "the node's inputs are unreadable");
+    if (!Array.isArray(authenticatedLinkedTargets)) {
+      throw modeTransactionFailure(node, "the row closure was not authenticated against current wiring");
     }
-    if (!Array.isArray(inputs)) throw modeTransactionFailure(node, "the node has no readable input list");
-    linkedTargets = linkedNodesInOrder(node, node);
+    const linkedTargets = linkedNodesInOrder(node, node);
+    if (
+      linkedTargets.length !== authenticatedLinkedTargets.length ||
+      linkedTargets.some((target, index) => target !== authenticatedLinkedTargets[index])
+    ) {
+      throw modeTransactionFailure(node, "the linked-node wiring changed after closure authentication");
+    }
     for (const linkedNode of linkedTargets) addNodeTree(linkedNode);
-    // A row exists only because the pack found a linked node for it. If we cannot see that node,
-    // the rollback boundary is not established and the action must not run — the whole point of
-    // the journal is that `doModeChange` mutates modes this writer would otherwise not restore.
     if (!entries.length) {
       throw modeTransactionFailure(node, "no linked node was reachable from the row's inputs");
-    }
-
-    // #2151 (codex gate P1) — the CURRENT wiring is not the whole boundary. The pack rebuilds a
-    // row's `doModeChange` closure ONLY when the row's NAME changes:
-    //
-    //     let name = `Enable ${linkedNode.title}`;
-    //     if (widget.name !== name) { ...install a closure over THIS linkedNode... }
-    //
-    // so rewiring a slot from node A to a DIFFERENT node B with the SAME TITLE leaves the
-    // closure pointing at A — and default titles are the node's display name, so two
-    // identically-titled nodes are ordinary, not exotic. The action would then mutate A while
-    // this journal held only B, and a failed write would report a clean rollback over a node it
-    // had left switched. A stale closure's target is not discoverable from the row (the closure
-    // is opaque), so the only sound superset is every node the graph can offer.
-    //
-    // LENIENT, deliberately, unlike the strict capture of the intended targets above: this sweep
-    // spans nodes the write has nothing to do with, and one hostile third-party `mode` getter
-    // anywhere in a 300-node workflow must not refuse every Fast Bypasser write. A node it has
-    // to skip simply is not in the journal — exactly today's coverage for it — while the nodes
-    // the row is SUPPOSED to drive stay strictly captured, and `unrestored()` still reports
-    // honestly on everything that IS journalled.
-    let graphNodes;
-    try {
-      graphNodes = node?.graph?.nodes;
-    } catch {
-      graphNodes = null;
-    }
-    for (const candidate of Array.isArray(graphNodes) ? graphNodes : []) {
-      if (candidate === node) continue;
-      try {
-        addNodeTree(candidate);
-      } catch {
-        /* best-effort superset; the strict capture above owns the intended targets */
-      }
     }
   }
 
@@ -1009,63 +1053,6 @@ function captureFastBypasserModeTransaction(node, writtenWidget) {
   };
 
   return {
-    /**
-     * #2151 (codex gate P1) — did the action land on the node this ROW NAMES?
-     *
-     * A wider journal makes a stale-closure write rollback-able; it does not stop it being
-     * reported as a SUCCESS. `doModeChange` sets `widget.value` unconditionally at the end, so
-     * the ordinary read-back passes even when the mode it changed belonged to a node the row no
-     * longer represents — which is the same false-success shape this whole issue is about, just
-     * one level down. So check the EFFECT, on the node the row's position maps to.
-     *
-     * Returns a reason string when the write must fail, or null when it is settled — including
-     * when the pairing is not knowable, where "not knowable" is itself a refusal: mid-rebuild
-     * the row's title, its closure and the wiring can all disagree, and a write nobody can
-     * attribute to a node must not be reported as one that set it.
-     */
-    targetSettled(requested) {
-      if (kind !== "linked") return null;
-      let rowIndex;
-      let widgetCount;
-      try {
-        widgetCount = Array.isArray(node?.widgets) ? node.widgets.length : -1;
-        rowIndex = Array.isArray(node?.widgets) ? node.widgets.indexOf(writtenWidget) : -1;
-      } catch {
-        return "the node's widget rows are unreadable, so the row cannot be paired with a node";
-      }
-      // The pack keeps `widgets.length === linkedNodes.length` (it truncates the list at the end
-      // of every stabilization), so a mismatch means the node is mid-rebuild or is carrying rows
-      // this pairing does not describe.
-      if (rowIndex < 0 || widgetCount !== linkedTargets.length) {
-        return (
-          `the node carries ${widgetCount} row(s) for ${linkedTargets.length} linked node(s), so ` +
-          `which node this row drives cannot be established`
-        );
-      }
-      const target = linkedTargets[rowIndex];
-      if (!target) return "this row has no linked node to drive";
-      let modeOn;
-      let modeOff;
-      let actual;
-      try {
-        modeOn = node.modeOn;
-        modeOff = node.modeOff;
-        actual = target.mode;
-      } catch {
-        return "the node's on/off modes or the linked node's mode are unreadable";
-      }
-      if (typeof modeOn !== "number" || typeof modeOff !== "number") {
-        return "the node does not declare numeric on/off modes";
-      }
-      const wanted = requested ? modeOn : modeOff;
-      if (Object.is(actual, wanted)) return null;
-      return (
-        `the row's action did not set node ${target.id} ("${target.title}") — it is mode ` +
-        `${actual}, not the ${requested ? "enabled" : "disabled"} mode ${wanted}. rgthree rebuilds ` +
-        `a row's mode closure only when the row's NAME changes, so rewiring a slot to a ` +
-        `different node with the SAME TITLE leaves the row driving the node it used to name`
-      );
-    },
     changed() {
       let unreadable = false;
       for (const entry of entries) {
@@ -1113,9 +1100,9 @@ function resolveFastBypasserAction(node, widget, coerced, previous) {
   if (!kind) return null;
   // #2151 — Fast Bypasser / Fast Muter row. Its value is a plain boolean and its canonical
   // FORCED-VALUE entry point is `doModeChange(value)`, the same one the node's own
-  // `forceWidgetOn` / `forceWidgetOff` use. Driving it — rather than assigning `.value` and
-  // firing `widget.callback`, which derives the new value from the linked node's current mode
-  // and therefore TOGGLES — is what makes this write a setter.
+  // `forceWidgetOn` / `forceWidgetOff` use. Its closure target is opaque, however, so the
+  // canonical action is safe only after the pack's authoritative stabilizer has rebound every
+  // row to the current linked-node list.
   if (kind === "linked") {
     if (typeof coerced !== "boolean") {
       // Refuse rather than fall through: the fall-through IS the destructive path.
@@ -1124,6 +1111,12 @@ function resolveFastBypasserAction(node, widget, coerced, previous) {
         `the row action takes a boolean and the value is ${JSON.stringify(coerced)}`,
       );
     }
+    const linkedTargets = linkedNodesInOrder(node, node);
+    if (!linkedTargets.length) {
+      throw modeTransactionFailure(node, "no linked node was reachable from the row's inputs");
+    }
+    authenticateFastModeChangerRows(node, linkedTargets);
+
     let doModeChange;
     try {
       doModeChange = widget.doModeChange;
@@ -1136,6 +1129,7 @@ function resolveFastBypasserAction(node, widget, coerced, previous) {
     return {
       action: doModeChange,
       requested: coerced,
+      authenticatedLinkedTargets: linkedTargets,
       // Deliberately FALSE, unlike the group arm. That assertion ("a reachable mode must have
       // changed") is right for a toggle whose requested value differs from the row's, and wrong
       // for a forced value: the row's value and its linked node's mode diverge routinely —
@@ -1144,11 +1138,8 @@ function resolveFastBypasserAction(node, widget, coerced, previous) {
       // correct mode is then a legitimate no-op repair, and asserting a mode change would fail
       // it and roll back a write that did exactly what was asked.
       //
-      // What verifies this path instead is that the value is NOT assigned here: `doModeChange`
-      // sets `widget.value = newValue` itself, on the line after `changeModeOfNodes`, so the
-      // ordinary read-back seeing the requested value establishes that the action ran AND that
-      // it ran with `newValue === requested` — i.e. that it set the linked node's mode to the
-      // matching one. A stub that changed nothing would leave the row on its old value and fail.
+      // The action has already been authenticated against the current linked-node list, so the
+      // ordinary read-back plus the mode journal verify the current target and its propagation.
       requiresModeChange: false,
     };
   }
@@ -3417,7 +3408,11 @@ export function applyWidgetWrite(
   // #2146 — capture the narrow Fast Bypasser mode boundary before the undo envelope opens.
   // If the live row shape cannot be bounded, refuse before invoking the action rather than
   // allowing it to mutate linked modes that this writer cannot restore.
-  const fastBypasserModes = captureFastBypasserModeTransaction(targetNode, w);
+  const fastBypasserModes = captureFastBypasserModeTransaction(
+    targetNode,
+    w,
+    fastBypasserAction?.authenticatedLinkedTargets,
+  );
   // #2146 — Fast Bypasser rows do not expose a widget.callback. Their supported UI action is
   // the row's own toggle(value), which mutates the row value and invokes doModeChange().
   // Bridge that canonical action instead of assigning the value and falsely reporting success.
@@ -3960,22 +3955,6 @@ export function applyWidgetWrite(
             `verified.`
           : `Fast Bypasser row action did not change any linked node modes; refusing to report ` +
             `the toggle as applied.`;
-    }
-  }
-
-  // #2151 — and for a Fast Bypasser / Fast Muter row, the action is not a successful write
-  // unless it landed on the node the ROW NAMES. `doModeChange` assigns `widget.value` whatever
-  // node it just switched, so the retention check above cannot see a row driving a stale target.
-  // Runs after that check so a row the node itself refused to switch (toggleRestriction) keeps
-  // its clearer "did not retain the requested value" message.
-  if (!failure && fastBypasserAction && fastBypasserModes?.targetSettled) {
-    const unsettled = fastBypasserModes.targetSettled(fastBypasserAction.requested);
-    if (unsettled) {
-      failure =
-        `Widget "${valueWidget.name}" on node ${valueNode.id} (${valueNode.type}) was written, but ` +
-        `${unsettled}. Rolled back rather than report a mode change on a node you did not address ` +
-        `(#2151). Re-title or re-open the workflow so the node rebuilds its rows, or set the ` +
-        `target node's mode directly.`;
     }
   }
 
