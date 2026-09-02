@@ -14,6 +14,7 @@ const READ_OPERATIONS = new Map([
   ["system_stats", "/system_stats"],
   ["logs", "/internal/logs"],
   ["object_info", "/object_info"],
+  ["workflow_templates", "/workflow_templates"],
 ]);
 const LOGS_TRANSPORT_PATH = "/internal/logs/raw";
 
@@ -73,7 +74,7 @@ export function validateFetchComfyUIReadArgs(args) {
     throw invalidInput("operation is required");
   }
   if (typeof args.operation !== "string" || !READ_OPERATIONS.has(args.operation)) {
-    throw invalidInput("operation must be one of history, system_stats, logs, object_info");
+    throw invalidInput("operation must be one of history, system_stats, logs, object_info, workflow_templates");
   }
   return { operation: args.operation, path: READ_OPERATIONS.get(args.operation) };
 }
