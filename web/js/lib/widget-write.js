@@ -298,6 +298,91 @@ function restoreFiniteNumberIfUnstored(widget, expected) {
   }
 }
 
+// #1533 — VHS_LoadVideo replaces custom_width/custom_height.options when its format
+// changes, then replays the same VHSINT callback. Keep the finite value across that
+// later replay too; the one-shot restore below this write cannot protect future callbacks.
+const guardedVhsDimensionCallbacks = new WeakSet();
+
+function guardVhsDimensionCallback(widget) {
+  let type;
+  let name;
+  try {
+    type = String(widget?.type ?? "").toLowerCase();
+    name = widget?.name;
+  } catch {
+    return { matched: false };
+  }
+  if (type !== "vhs.annotated" || (name !== "custom_width" && name !== "custom_height")) {
+    return { matched: false };
+  }
+
+  const callback = widget.callback;
+  if (typeof callback !== "function" || guardedVhsDimensionCallbacks.has(callback)) {
+    return { matched: true, callback };
+  }
+
+  const guarded = function (...args) {
+    let previous;
+    try {
+      previous = this?.value;
+    } catch {
+      previous = undefined;
+    }
+    try {
+      return reflectApply(callback, this, args);
+    } finally {
+      try {
+        restoreFiniteNumberIfUnstored(this, previous);
+      } catch {
+        /* the enclosing write's verification remains authoritative */
+      }
+    }
+  };
+  guardedVhsDimensionCallbacks.add(guarded);
+  try {
+    widget.callback = guarded;
+    return { matched: true, callback: guarded };
+  } catch {
+    return { matched: true, callback };
+  }
+}
+
+function guardVhsDimensionCallbacksOnNode(node, skipWidget = null) {
+  let nodeType;
+  let triggerType;
+  let triggerName;
+  try {
+    nodeType = String(node?.type ?? "").toLowerCase();
+    triggerType = String(skipWidget?.type ?? "").toLowerCase();
+    triggerName = skipWidget?.name;
+  } catch {
+    return;
+  }
+  const triggerIsDimension =
+    triggerType === "vhs.annotated" && (triggerName === "custom_width" || triggerName === "custom_height");
+  if (nodeType !== "vhs_loadvideo" || (triggerName !== "format" && !triggerIsDimension)) return;
+
+  let widgets;
+  try {
+    widgets = node?.widgets;
+  } catch {
+    return;
+  }
+  try {
+    if (!Array.isArray(widgets)) return;
+    for (const widget of widgets) {
+      if (widget === skipWidget) continue;
+      try {
+        guardVhsDimensionCallback(widget);
+      } catch {
+        /* the normal callback path remains authoritative for unreadable widgets */
+      }
+    }
+  } catch {
+    /* the normal callback path remains authoritative for an unreadable widget list */
+  }
+}
+
 /**
  * Does `node.widgets` have a STABLE IDENTITY — is it one array the node keeps, so that
  * comparing the array OBJECT says something and re-pointing it restores something — or
@@ -3185,8 +3270,18 @@ export function applyWidgetWrite(
   // Captured at lookup so the disclosure can describe it WITHOUT reading `w.callback`
   // a second time (it may be an accessor with side effects, or a throwing one).
   let widgetCallback = null;
+  let guardedDimensionCallback = null;
+  let guardedDimensionCallbackMatched = false;
   safeBefore();
   try {
+    if (!fastBypasserAction && !liveCustomTextWrite) {
+      // Install before assignment because a frontend value setter may invoke the
+      // callback as part of the assignment itself.
+      guardVhsDimensionCallbacksOnNode(targetNode, valueWidget);
+      const guarded = guardVhsDimensionCallback(valueWidget);
+      guardedDimensionCallbackMatched = guarded.matched;
+      guardedDimensionCallback = guarded.callback;
+    }
     // Assign BOTH values first — EXCEPT on an instance-scoped promoted write, where
     // the inner widget is not a second copy of this value but the SHARED SUBGRAPH
     // DEFINITION every sibling instance reads (comfyui-mcp#1707). There the rail IS
@@ -3286,7 +3381,7 @@ export function applyWidgetWrite(
     // editor + options.setValue path above is what serializes; read-back
     // still decides whether the write stuck.
     if (!fastBypasserAction && !liveCustomTextWrite) {
-      widgetCallback = valueWidget.callback;
+      widgetCallback = guardedDimensionCallbackMatched ? guardedDimensionCallback : valueWidget.callback;
       if (widgetCallback !== null && widgetCallback !== undefined) {
         const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
         threwFromCallback = true;
