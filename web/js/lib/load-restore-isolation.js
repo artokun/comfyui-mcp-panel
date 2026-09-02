@@ -70,6 +70,28 @@ function graphLinkEntries(graph) {
   return [];
 }
 
+function missingLinkEndpointSlotMethod(graph, node, link, direction, serializedType) {
+  const isImpactSwitch =
+    node?.type === "ImpactSwitch" || node?.comfyClass === "ImpactSwitch" || serializedType === "ImpactSwitch";
+  const requiredMethod = direction === 2 ? "findOutputSlot" : direction === 1 ? "findInputSlot" : null;
+  if (!isImpactSwitch || !requiredMethod) return null;
+  const nodeId = node?.id;
+  if (nodeId == null || !link || typeof graph?.getNodeById !== "function") return null;
+  const nodeIsOrigin = sameNodeId(link.origin_id, nodeId);
+  const nodeIsTarget = sameNodeId(link.target_id, nodeId);
+  const farId = nodeIsOrigin ? link.target_id : nodeIsTarget ? link.origin_id : null;
+  if (farId == null) return null;
+  try {
+    const far = graph.getNodeById(farId);
+    if (far == null) return null;
+    if (typeof far[requiredMethod] !== "function") return requiredMethod;
+  } catch {
+    // A graph or endpoint that cannot be inspected is not evidence. The
+    // callback is allowed to run and any resulting throw is handled below.
+  }
+  return null;
+}
+
 function hasBrokenLinkEndpoint(graph, node, err) {
   const nodeId = node?.id;
   if (nodeId == null || typeof graph?.getNodeById !== "function") return false;
@@ -240,8 +262,73 @@ export function installNodeConfigureIsolation(LG, graph = null) {
       // An uncloneable payload cannot be safely verified after a throw.
       serializedSnapshot = null;
     }
+    const callback = this?.onConnectionsChange;
+    const hasOwnCallback = Object.prototype.hasOwnProperty.call(this ?? {}, "onConnectionsChange");
+    const ownCallback = hasOwnCallback ? this.onConnectionsChange : undefined;
+    let containedCallbackFailure = null;
+    let containedCallbackEvidence = false;
+    let callbackWrapper = null;
+    if (typeof callback === "function") {
+      callbackWrapper = function (...args) {
+        const missingSlotMethod = missingLinkEndpointSlotMethod(
+          this?.graph ?? graph,
+          this,
+          args?.[3],
+          args?.[0],
+          info?.type,
+        );
+        if (missingSlotMethod) {
+          // ImpactSwitch's restore callback can call a string-slot connect on a
+          // plain/stale far endpoint. That call would invoke a missing
+          // findInputSlot/findOutputSlot API. Leave the serialized link records
+          // untouched and verify the completed node instead of making the call.
+          containedCallbackFailure ??= new TypeError(
+            `link restore callback skipped: far endpoint lacks ${missingSlotMethod}`,
+          );
+          containedCallbackEvidence = true;
+          return undefined;
+        }
+        try {
+          return callback.apply(this, args);
+        } catch (err) {
+          // Impact Pack's dynamic-slot hook can call a LiteGraph slot lookup on
+          // a stale/plain far endpoint while configure is restoring links. Only
+          // contain the exact crash when the live graph proves that endpoint is
+          // broken; absent graph APIs remain fail-closed and propagate into the
+          // normal configure-failure record below.
+          if (!isLinkDisconnectCrash(err) || !hasBrokenLinkEndpoint(this?.graph ?? graph, this, err)) {
+            throw err;
+          }
+          containedCallbackFailure ??= err;
+          containedCallbackEvidence = true;
+          return undefined;
+        }
+      };
+      try {
+        this.onConnectionsChange = callbackWrapper;
+      } catch {
+        callbackWrapper = null;
+      }
+    }
     try {
-      return original.call(this, info);
+      const result = original.call(this, info);
+      if (containedCallbackFailure) {
+        const ownerGraph = this?.graph ?? null;
+        const evidenceGraph = this?.graph ?? graph ?? null;
+        failures.push({
+          id: info?.id ?? this?.id ?? null,
+          type: info?.type ?? this?.type ?? null,
+          error: errorText(containedCallbackFailure),
+          linkDisconnectCrash: true,
+          linkDisconnectEvidence:
+            containedCallbackEvidence || hasBrokenLinkEndpoint(evidenceGraph, this, containedCallbackFailure),
+          callbackContained: true,
+          ownerGraph,
+          ownerGraphToken: graphIdentityToken(ownerGraph),
+          info: serializedSnapshot,
+        });
+      }
+      return result;
     } catch (err) {
       const ownerGraph = this?.graph ?? null;
       const evidenceGraph = this?.graph ?? graph ?? null;
@@ -261,6 +348,16 @@ export function installNodeConfigureIsolation(LG, graph = null) {
         info: serializedSnapshot,
       });
       return undefined;
+    } finally {
+      if (callbackWrapper && this.onConnectionsChange === callbackWrapper) {
+        try {
+          if (hasOwnCallback) this.onConnectionsChange = ownCallback;
+          else delete this.onConnectionsChange;
+        } catch {
+          // A frontend-defined non-configurable callback remains installed; it
+          // is safer to leave that state than to replace somebody else's hook.
+        }
+      }
     }
   };
   proto.configure = wrapped;
@@ -375,6 +472,33 @@ export async function retryNodeRestores(graph, failures, options = {}) {
         type: failure.type,
         error: "active workflow changed during restore retry",
         retry: "workflow-switched",
+      });
+      continue;
+    }
+    if (linkDisconnectCrash && failure.callbackContained === true) {
+      // The node configure completed; only its link callback was contained.
+      // Do not invoke that callback again after isolation has been removed. A
+      // strict snapshot check is the only safe way to accept this path.
+      const verification = verifyNodeRestore(node, failure.info);
+      if (verification.verified) {
+        restored.push({ id: failure.id, type: failure.type });
+        const ownerGraphToken = failure.ownerGraphToken ?? graphIdentityToken(failure.ownerGraph);
+        recovered.push({
+          id: failure.id,
+          type: failure.type,
+          ...(ownerGraphToken != null ? { ownerGraphToken } : {}),
+          linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences,
+        });
+        continue;
+      }
+      failed.push({
+        id: failure.id,
+        type: failure.type,
+        error: failure.error ?? "link-disconnect restore failure",
+        ...(verification.differences.length ? { widgetDifferences: verification.differences } : {}),
+        ...(verification.linkDrivenWidgetDifferences.length
+          ? { linkDrivenWidgetDifferences: verification.linkDrivenWidgetDifferences }
+          : {}),
       });
       continue;
     }
