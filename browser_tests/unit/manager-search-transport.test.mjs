@@ -138,6 +138,15 @@ test("#2024 a bare tagged Failed to fetch is reconstructed into the wrap, not le
   assert.match(res.message, /\/v2\/customnode\/getmappings\?mode=cache/);
 });
 
+test("#2024 a bridge-added Error prefix cannot bury the transport wrap", () => {
+  const cause = transportWrap();
+  const prefixed = new Error(`Error: ${cause.message}`);
+  const res = managerUnavailableResult("Spectrum MiniMax H3", prefixed);
+  assert.equal(res.transportFailure, true);
+  assert.match(res.message, /^ComfyUI-Manager request to \/v2\/customnode\/getmappings\?mode=cache/);
+  assert.match(res.message, /TRANSPORT failure/);
+});
+
 test("#2024 v2 transport wrap still uses the absolute legacy getmappings route", async () => {
   const wrap = transportWrap(SEARCH_MAPPINGS_ROUTE);
   assert.equal(isManagerUnreachable(wrap), true);

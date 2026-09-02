@@ -969,9 +969,23 @@ export function managerUnavailableResult(query, err) {
 /** Keep the #1472 wrap at the FRONT of `message`. MCP #2492 extractText()s that
  *  field and only host-HTTP-falls-back when it starts with the wrap. */
 function managerSearchTransportMessage(reason) {
-  const wrap = /^ComfyUI-Manager request to \S+ did not complete:/i.test(reason)
-    ? reason
+  // A ToolResult/error crossing the bridge may stringify the original Error and
+  // prepend `Error:`. Strip only that standard decoration before preserving the
+  // #1472 wrap; otherwise the host-side fallback sees a non-matching first token
+  // and the useful transport evidence is buried behind a generic re-wrap.
+  const normalizedReason = String(reason ?? "")
+    .trim()
+    .replace(/^(?:Error:\s*)+/i, "");
+  let wrap = /^ComfyUI-Manager request to \S+ did not complete:/i.test(normalizedReason)
+    ? normalizedReason
     : managerFetchFailureMessage(SEARCH_MAPPINGS_ROUTE, reason);
+  // Some bridge serializers retain only the short wrapped message and its
+  // `cause`; the route is preserved but the explanatory suffix is not. The
+  // classification above is still proof this was a no-response failure, so
+  // restore the minimum disclosure before appending the route diagnostics.
+  if (!/TRANSPORT failure/i.test(wrap)) {
+    wrap += " This is a TRANSPORT failure — no usable response reached the browser.";
+  }
   return (
     `${wrap} Both the v2 mappings route (${SEARCH_MAPPINGS_ROUTES[0]}) and the ` +
     `legacy absolute route (${SEARCH_MAPPINGS_ROUTES[1]}) were attempted from this ` +
