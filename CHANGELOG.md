@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.154] - 2026-09-02
+
+### Fixed
+- allow workflow template reads
+- prioritize live error scans in get_errors
+
+
 ## [0.15.153] - 2026-09-02
 
 ### Fixed
