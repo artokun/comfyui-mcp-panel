@@ -36,7 +36,7 @@ function ensureCss() {
   const link = document.createElement("link");
   link.rel = "stylesheet";
   // Stamped like the JS import below, so a re-vendor cannot leave a browser on the old CSS.
-  link.href = new URL("./style.css?v=c9801e0a7d79", import.meta.url).href;
+  link.href = new URL("./style.css?v=13a5b6cb15dc", import.meta.url).href;
   document.head.appendChild(link);
   // Geist (the design language's face). Google Fonts is reachable from the ComfyUI page; if it
   // is not, the stack falls through to the system UI font and nothing breaks.
@@ -88,7 +88,7 @@ export function createDirectorContent(ctx, shell, opts = {}) {
       // hash. Without it the browser caches this module indefinitely: the panel is served raw
       // with no bundler, so nothing else busts it, and a user who updated the pack would keep
       // running the old editor with no way to tell.
-      const mod = await import("./director-app.js?v=c9801e0a7d79");
+      const mod = await import("./director-app.js?v=13a5b6cb15dc");
       // The pane can be torn down while the dynamic import is in flight; mounting into a
       // detached node would leak a React root that nothing will ever unmount.
       if (mountEl !== bodyEl || !bodyEl.isConnected) return;
