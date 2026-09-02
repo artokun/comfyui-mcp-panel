@@ -21060,6 +21060,75 @@ const GRAPH_TOOL_EXECUTORS = {
     const errorsBudgetStart = monotonicNow();
     const errorsStepBudget = (capMs) =>
       getErrorsStepBudgetMs(monotonicNow() - errorsBudgetStart, capMs);
+
+    // Capture and validate the graph before any elective await. The live scan is the
+    // core answer this command exists to provide; it must not lose its remaining budget
+    // to stale missing-asset cleanup that can be retried on the next call. The final
+    // binding fence below rejects the result if a tab/workflow switch crosses either
+    // await, so prioritising the scan cannot mix two workflows.
+    const preScanWorkflow = activeWorkflowRef();
+    const preScanCtx = getGraphCtx();
+    const preScanGraph = preScanCtx.graph;
+    const preScanRootGraph = preScanCtx.rootGraph;
+    const missingNodeState = getPiniaStore("missingNodesError");
+    assertGraphBoundToActiveWorkflow(preScanGraph, preScanRootGraph, {
+      ...graphCommandBindingBar("graph_get_errors"),
+      includeBaselineReadGuard: true,
+      missingNodeState,
+    });
+    const scanNodes = preScanGraph._nodes ?? [];
+    // #745 — ask the SERVER about the widget values actually on the canvas now before
+    // the optional load-time missing-asset refresh. Per-class /object_info is small,
+    // deduped and independently authoritative; giving it first use of the shared
+    // budget prevents a slow stale-store refresh from leaving a small graph unchecked.
+    let liveScan = null;
+    try {
+      // #1357 — the scan's combo lists cannot enumerate an input file below the
+      // input root nor an annotated value, so those paths ask the server directly.
+      // Read the server platform before the scan so Windows separator semantics remain
+      // exact; this is still charged to the same shared budget.
+      const statsBudget = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
+      const backslashIsSeparator =
+        statsBudget > 0 ? await inputAssetServerUsesWindowsPaths(statsBudget) : false;
+      const scanBudgetMs = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
+      if (scanBudgetMs > 0) {
+        liveScan = await scanComboAvailability(
+          scanNodes,
+          async (cls, signal) => {
+            const outcome = await fetchSingleNodeInfo(
+              cls,
+              (route, options) => api?.fetchApi?.(route, options),
+              signal,
+            );
+            // #1709 — get_errors' per-class reader is a live authority too. A definitive
+            // present answer may describe a changed schema, and `{}` is explicit absence;
+            // retire every reusable schema authority. Unknown/timeout outcomes remain
+            // non-authoritative and preserve the later silent-add fallback semantics.
+            if (outcome?.kind === "present" || outcome?.kind === "absent") {
+              objectInfoCache.invalidate();
+              objectInfoSnapshot.clear();
+              verifiedNodeDefCache.invalidate(cls);
+            }
+            return outcome;
+          },
+          {
+            budgetMs: scanBudgetMs,
+            now: monotonicNow,
+            backslashIsSeparator,
+            confirmServerAsset: (_value, ref) =>
+              probeInputAssetPresence(ref, errorsStepBudget(GET_ERRORS_STEP_CAP_MS)),
+          },
+        );
+      } else {
+        liveScan = { unavailable: [], unknown: [], unchecked_budget_exhausted: true };
+      }
+    } catch {
+      liveScan = {
+        unavailable: [],
+        unknown: [{ reason: "the live error scan could not complete" }],
+      }; // never let the scan take down the error report
+    }
+
     let comboTrustedForQuery = false;
     try {
       const refreshBudgetMs = hasRawMissingAssetCandidates()
@@ -21084,7 +21153,6 @@ const GRAPH_TOOL_EXECUTORS = {
     // asset+validation state, fabricating and omitting per-node errors (codex round-9 P1).
     // Reading it here binds every downstream surface to ONE consistent post-await graph.
     const { app: comfy, graph, rootGraph } = getGraphCtx();
-    const missingNodeState = getPiniaStore("missingNodesError");
     // panel#389: refuse a false-clean empty read when the live graph is desynced
     // from the active workflow (empty canvas graph while the workflow reports nodes)
     // — otherwise get_errors reports "no errors" for a workflow whose red nodes the
@@ -21133,82 +21201,6 @@ const GRAPH_TOOL_EXECUTORS = {
         errorsStepBudget(GET_ERRORS_STEP_CAP_MS),
       );
     }
-    // #745 — the load-time missing-asset stores never see a node added since the
-    // load, so ask the SERVER about the widget values actually on the canvas now.
-    // Per-class /object_info (5,694 bytes vs 5,413,770 for the whole document), so
-    // this is a handful of small reads, deduped per node type.
-    //
-    // Shares the same budget as every other elective server wait here and fails
-    // CLOSED: with no budget left the scan is skipped, and whatever it did not
-    // reach is reported as UNCHECKED rather than as clean. Overrunning would be a
-    // "did not reply" that leaves the agent no error surface at all (#589) —
-    // worse than the omission this closes.
-    let liveScan = null;
-    try {
-      // #1357 — the scan's combo lists cannot enumerate an input file below the
-      // input root (LoadImage.INPUT_TYPES is `os.listdir` + `isfile`, top level
-      // only, nodes.py) nor an `[output]`/`[temp]`/`[input]`-annotated value, so
-      // for those it asks the server directly rather than calling a present file
-      // missing. The same /view EVIDENCE panel_set_widget accepts the very same
-      // value on (#387) — the two must not confirm and deny one value in one
-      // session. NOT byte-for-byte the same probe, and it diverges BOTH ways:
-      //   - `sub\a.png` on a POSIX server — set_widget normalises the backslash
-      //     and would clear it; this declines to split, so the value stays
-      //     reported. STRICTER.
-      //   - `x.png [output]` — set_widget always asks the `input` root and would
-      //     404; this parses the annotation and asks `output`, which is the root
-      //     `folder_paths.get_annotated_filepath` actually resolves. LOOSER, and
-      //     correct — that is the #743 false positive.
-      // An unknown platform keeps POSIX semantics, so a backslash is never
-      // re-read as a separator the server would not honour (#513). Read
-      // BEFORE the scan's own budget is taken, so a slow /system_stats shortens
-      // the scan rather than letting it start with a full step it no longer has
-      // (it is cached for the session, and the media probe above normally warms
-      // it, so this is free in the common case).
-      const statsBudget = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
-      const backslashIsSeparator =
-        statsBudget > 0 ? await inputAssetServerUsesWindowsPaths(statsBudget) : false;
-      const scanBudgetMs = errorsStepBudget(GET_ERRORS_STEP_CAP_MS);
-      if (scanBudgetMs > 0) {
-        liveScan = await scanComboAvailability(
-          nodes,
-          async (cls, signal) => {
-            const outcome = await fetchSingleNodeInfo(
-              cls,
-              (route, options) => api?.fetchApi?.(route, options),
-              signal,
-            );
-            // #1709 — get_errors' per-class reader is a live authority too. A definitive
-            // present answer may describe a changed schema, and `{}` is explicit absence;
-            // retire every reusable schema authority: a per-class answer can establish that
-            // the old whole map is stale even though it cannot replace that map. Unknown/
-            // timeout outcomes remain non-authoritative and preserve the later silent-add
-            // fallback semantics.
-            if (outcome?.kind === "present" || outcome?.kind === "absent") {
-              objectInfoCache.invalidate();
-              objectInfoSnapshot.clear();
-              verifiedNodeDefCache.invalidate(cls);
-            }
-            return outcome;
-          },
-          {
-            budgetMs: scanBudgetMs,
-            now: monotonicNow,
-            backslashIsSeparator,
-            confirmServerAsset: (_value, ref) =>
-              probeInputAssetPresence(ref, errorsStepBudget(GET_ERRORS_STEP_CAP_MS)),
-          },
-        );
-      } else {
-        liveScan = { unavailable: [], unknown: [], unchecked_budget_exhausted: true };
-      }
-    } catch {
-      liveScan = {
-        unavailable: [],
-        unknown: [{ reason: "the live error scan could not complete" }],
-      }; // never let the scan take down the error report
-    }
-
     let postProbeRootGraph = null;
     try {
       postProbeRootGraph = getGraphCtx().rootGraph ?? null;
@@ -21217,6 +21209,12 @@ const GRAPH_TOOL_EXECUTORS = {
     }
     if (
       graphReadBindingChanged({
+        beforeWorkflow: preScanWorkflow,
+        afterWorkflow: activeWorkflowRef(),
+        beforeRootGraph: preScanRootGraph,
+        afterRootGraph: postProbeRootGraph,
+      }) ||
+      graphReadBindingChanged({
         beforeWorkflow: preProbeWorkflow,
         afterWorkflow: activeWorkflowRef(),
         beforeRootGraph: preProbeRootGraph,
@@ -21224,9 +21222,10 @@ const GRAPH_TOOL_EXECUTORS = {
       })
     ) {
       throw new Error(
-        "The active workflow changed while panel_get_errors was verifying nested input media " +
-          "with the server, so this read's graph snapshot and asset verdicts now belong to " +
-          "DIFFERENT workflows. Retry panel_get_errors — it re-reads the now-active workflow.",
+        "The active workflow changed while panel_get_errors was verifying live errors or " +
+          "nested input media with the server, so this read's graph snapshot and asset " +
+          "verdicts now belong to DIFFERENT workflows. Retry panel_get_errors — it re-reads " +
+          "the now-active workflow.",
       );
     }
     // #1332 — the missing-node-type store is a LOAD-TIME snapshot. After a
