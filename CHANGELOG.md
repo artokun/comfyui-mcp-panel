@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.152] - 2026-09-02
+
+### Fixed
+- retain current promoted DOM rails (#1707)
+
+
 ## [0.15.151] - 2026-09-02
 
 ### Fixed
