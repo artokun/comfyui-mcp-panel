@@ -1537,6 +1537,32 @@ function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
     );
     return [keyed[0], ...displays];
   }
+  // comfyui-frontend's app-level promoted multiline widget is a live DOM
+  // projection owned by the host input. Its serialization binding is
+  // `hostInput.widgetId`; the DOM widget itself deliberately has no
+  // `widgetId` (createPromotedMultilineWidget returns it before the generic
+  // store projection is built). It is therefore safe to retain when it has a
+  // distinct editor from the shared inner widget. Dropping it would make the
+  // getter materialize the generic projection, whose cloned inner options can
+  // write through to the shared definition and trigger the #2689 refusal for
+  // an otherwise valid one-instance STRING write (#1707).
+  //
+  // The editor-identity check matters: a stale inner/link-driven handle can
+  // also be unkeyed and live in node.widgets. That object must still be
+  // rematerialized so the host-keyed store projection is selected (#366).
+  if (hostId && promotedValueScope(subgraphNode, hostInput) === "instance") {
+    const hostDom = current.find(
+      (widget) =>
+        readProjectionWidgetId(widget) == null &&
+        hasDistinctLiveTextEditor(widget, innerWidget),
+    );
+    if (hostDom) {
+      const displays = current.filter(
+        (widget) => widget !== hostDom && readProjectionWidgetId(widget) == null,
+      );
+      return [hostDom, ...displays];
+    }
+  }
   // No host key: unkeyed identity-linked projections are the rail. A host key
   // with only an unkeyed clone must rematerialize first — returning the clone
   // here is the CLIPTextEncode.text recurrence (inner written, parent store stale).
@@ -1546,6 +1572,13 @@ function liveHostPromotedWidgets(subgraphNode, hostInput, innerWidget) {
   const recovered = recoverHostPromotedWidgetsAfterLoad(subgraphNode, hostInput, innerWidget);
   if (recovered.length) return recovered;
   return current;
+}
+
+function hasDistinctLiveTextEditor(widget, innerWidget) {
+  const hostEditor = liveTextEditorElement(widget);
+  if (!hostEditor) return false;
+  const innerEditor = liveTextEditorElement(innerWidget);
+  return hostEditor !== innerEditor;
 }
 
 /**
