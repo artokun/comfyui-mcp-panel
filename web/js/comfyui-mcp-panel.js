@@ -9760,6 +9760,10 @@ function assertGraphBoundToActiveWorkflow(
     // #2125 (gate r2 P1) — the caller's OWN observation of the active workflow, when
     // it already made one as part of proving nothing changed. See below.
     workflowProbe = null,
+    // #389 — the read caller's same-tick observation of ComfyUI's load-time
+    // missing-node store. Keep it with the rest of this call's evidence so the
+    // resolver can refuse an empty root instead of dropping the observation.
+    missingNodeState = null,
   } = {},
 ) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
@@ -9990,6 +9994,7 @@ function assertGraphBoundToActiveWorkflow(
     requireDirtyMutationBinding,
     postReconnectWindow: postReconnectSettleWindow(),
     graphLoading,
+    missingNodeState,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }
@@ -14542,6 +14547,7 @@ const GRAPH_TOOL_EXECUTORS = {
   // raw node dump makes you reconstruct). Read-only.
   graph_outline({ max_chars } = {}) {
     const { graph, rootGraph } = getGraphCtx();
+    const missingNodeState = getPiniaStore("missingNodesError");
     // panel#389: refuse a false-clean empty read when the live graph is desynced
     // from the active workflow (empty canvas graph while the workflow reports nodes).
     // panel#1233: re-assert on this command's OWN read bar, not bare defaults. The
@@ -14554,6 +14560,7 @@ const GRAPH_TOOL_EXECUTORS = {
     assertGraphBoundToActiveWorkflow(graph, rootGraph, {
       ...graphCommandBindingBar("graph_outline"),
       includeBaselineReadGuard: true,
+      missingNodeState,
     });
     // #429: geometric group membership is tested boundingRect-first, so resync every
     // node's cached rect to its live pos/size BEFORE computing membership — a node
@@ -21077,6 +21084,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // asset+validation state, fabricating and omitting per-node errors (codex round-9 P1).
     // Reading it here binds every downstream surface to ONE consistent post-await graph.
     const { app: comfy, graph, rootGraph } = getGraphCtx();
+    const missingNodeState = getPiniaStore("missingNodesError");
     // panel#389: refuse a false-clean empty read when the live graph is desynced
     // from the active workflow (empty canvas graph while the workflow reports nodes)
     // — otherwise get_errors reports "no errors" for a workflow whose red nodes the
@@ -21087,6 +21095,7 @@ const GRAPH_TOOL_EXECUTORS = {
     assertGraphBoundToActiveWorkflow(graph, rootGraph, {
       ...graphCommandBindingBar("graph_get_errors"),
       includeBaselineReadGuard: true,
+      missingNodeState,
     });
     const nodes = graph._nodes ?? [];
     const byId = new Map(nodes.map((n) => [String(n.id), n]));

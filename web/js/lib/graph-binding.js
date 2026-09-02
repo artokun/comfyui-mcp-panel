@@ -88,6 +88,34 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
 }
 
 /**
+ * True when ComfyUI's load-time missing-node store positively reports missing
+ * nodes. The store is independent from both LiteGraph's live graph and the
+ * workflow ChangeTracker, so it is useful evidence specifically in the
+ * recurrence where those two other surfaces both look empty. A malformed
+ * store is not evidence: preserve the existing fail-open behavior unless the
+ * frontend explicitly says it has missing nodes and carries either a count or
+ * a record we can observe.
+ */
+export function missingNodeStateReportsNodes(missingNodeState) {
+  try {
+    if (!missingNodeState?.hasMissingNodes) return false;
+    if (Number(missingNodeState.missingNodeCount) > 0) return true;
+    const raw = missingNodeState.missingNodesError;
+    // Match collectMissingAssets' parser exactly: an object whose selected
+    // record array is present but empty is absence, not positive evidence.
+    const records = Array.isArray(raw)
+      ? raw
+      : raw && typeof raw === "object"
+        ? (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
+        : [];
+    return records.length > 0;
+  } catch {
+    // An unreadable optional store cannot prove a mismatch.
+  }
+  return false;
+}
+
+/**
  * The active workflow's OWN current-state node count, or `null` when that state
  * is absent/malformed. Unlike activeWorkflowNodeCount this NEVER falls back to
  * the load/save baseline (`initialState`): a baseline legitimately differs from
@@ -186,11 +214,18 @@ export function graphEmptyBindingUnproven({
   activeWorkflow,
   activeWorkflowUuid,
   graphLoading = false,
+  missingNodeState = null,
 } = {}) {
   if (!!rootGraph && graph && graph !== rootGraph) return false; // subgraph scope
   const live = rootGraph?._nodes;
   if (!Array.isArray(live) || live.length !== 0) return false; // populated or unobservable
   if (!activeWorkflow) return false; // no workflow service — legacy availability
+  // A positive load-time missing-node report is independent evidence that the
+  // empty canvas is not a clean, authoritative read. This must run before the
+  // identity-tag/proven-empty relaxations: a reused root can still carry the
+  // active tag while the loaded workflow's missing-node state names content the
+  // live graph does not contain (#389 recurrence).
+  if (missingNodeStateReportsNodes(missingNodeState)) return true;
   if (activeWorkflowProvenEmpty(activeWorkflow)) return false; // PROVEN empty — truthful 0
   if (graphRootWorkflowUuidMatches({ rootGraph, activeWorkflowUuid })) return false; // positively bound
   // #833 — both sides provably content-free. The clause above cannot fire on a blank
@@ -2998,6 +3033,7 @@ export function resolveGraphBindingVerdict({
   requireDirtyMutationBinding = false,
   postReconnectWindow = false,
   graphLoading = false,
+  missingNodeState = null,
 } = {}) {
   const nodeCount = Number.isFinite(Number(liveNodeCount))
     ? Number(liveNodeCount)
@@ -3092,7 +3128,14 @@ export function resolveGraphBindingVerdict({
       ...(reason === "root-shape-mismatch" ? { structureMatches: structureMatches === true } : {}),
     };
   }
-  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid, graphLoading })) {
+  if (missingNodeStateReportsNodes(missingNodeState) && !inSubgraph && nodeCount === 0) {
+    return {
+      reason: "empty-graph-missing-nodes",
+      expected: activeWorkflowNodeCount(activeWorkflow),
+      live: nodeCount,
+    };
+  }
+  if (graphEmptyBindingUnproven({ graph, rootGraph, activeWorkflow, activeWorkflowUuid, graphLoading, missingNodeState })) {
     return { reason: "empty-binding-unproven", expected: activeWorkflowNodeCount(activeWorkflow) };
   }
   return null;
@@ -3131,6 +3174,14 @@ export function graphBindingRefusalMessage(verdict) {
       `reconnect, or a failed open, and node_count 0 could be a FALSE-EMPTY reading, so this ` +
       `command was NOT applied as authoritative. Retry in a moment once the tab settles; if it ` +
       `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`
+    );
+  }
+  if (verdict.reason === "empty-graph-missing-nodes") {
+    return (
+      `[empty-graph-missing-nodes] The live root canvas reads EMPTY while the active session reports ` +
+      `missing node state, so node_count 0 is not a trustworthy clean graph read. This command ` +
+      `was NOT applied as authoritative. Re-open the active workflow tab (panel_open_workflow) ` +
+      `or reload the panel, then retry once the loaded graph and missing-node state agree.`
     );
   }
   // #606 — name the firing predicate honestly, and order the remedies by which
