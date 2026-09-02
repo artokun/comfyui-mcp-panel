@@ -343,6 +343,38 @@ test("#2027 SHIPPED: a current bundle still attempts refresh (fail-open on match
   assert.ok(wrapped.beginReplacementCalls > 0, "a current-bundle refresh still fences while it runs");
 });
 
+test("#2124 SHIPPED: a verified preloaded schema bypasses stale-bundle refusal", async () => {
+  const staleVerdict = describeStaleBundleRefresh({ running: "0.15.123", installed: "0.15.124" });
+  let staleProbeCalls = 0;
+  const { registerComfyNodeDefs } = buildRegisterComfyNodeDefs({
+    objectInfoSnapshot: createObjectInfoSnapshot(),
+    refuseStaleBundleRefresh: async () => {
+      staleProbeCalls += 1;
+      return staleVerdict;
+    },
+    apiValue: {
+      getNodeDefs: async () => {
+        throw new Error("the preloaded path must not fetch again");
+      },
+    },
+  });
+
+  const verdict = await registerComfyNodeDefs(
+    {
+      LoadImage: {
+        name: "LoadImage",
+        input: { required: { image: [["a.png"], {}] } },
+        output: ["IMAGE", "MASK"],
+      },
+    },
+    { preloadedWholeSchema: true },
+  );
+
+  assert.equal(staleProbeCalls, 0, "a supplied authoritative schema needs no bundle-version refusal");
+  assert.notEqual(verdict.reason, "stale_bundle");
+  assert.equal(verdict.refreshed, true, "the supplied schema is registered in place");
+});
+
 test("#2027 SHIPPED refuseStaleBundleRefresh compares PANEL_VERSION to the installed marker", async () => {
   const body = extractFunction("async function refuseStaleBundleRefresh(");
   const factory = new Function(

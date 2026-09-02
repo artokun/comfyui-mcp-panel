@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_add_node reuses the freshly fetched node definition when repairing stale registered schemas, so a stale-bundle refusal on a second whole-schema refresh cannot block LoadImage (#2124)
+
 ## [0.15.155] - 2026-09-02
 
 ### Fixed
