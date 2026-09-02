@@ -6,10 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.151] - 2026-09-02
+
 ### Fixed
 - The panel stops flooding ComfyUI's log ring buffer with bridge advertisements. The orchestrator re-POSTs `/comfyui_mcp_panel/advertise_bridge` on a deliberate 5 s heartbeat and again on every panel hello (it self-heals an advertise lost across a pod-side ComfyUI restart, which otherwise leaves a stale token no browser refresh can recover from), and the pack logged `secure bridge advertised` / `local bridge advertised` for every accepted POST. That is ~1440 lines an hour into the size-capped deque ComfyUI serves from `GET /internal/logs`: a reporter diagnosing a `LoadImageOutput` node fetched 25,006 characters that were 100% panel heartbeat, with every startup, model-load and traceback line already evicted, on a remote Colab instance with no filesystem fallback. The advertisement is now announced on a CHANGE only - first establish, a new tunnel, or a reconnect that moves the loopback port - which also collapses the seven-deep bursts a fresh connection emitted within ~10 ms. The heartbeat itself is untouched; it is load-bearing and belongs to the orchestrator. Separately, EVERY panel log line now costs one ring entry instead of two: ComfyUI's `LogInterceptor` appends one timestamped entry per `sys.stdout.write()` call, and `print()` writes the text and the newline separately - so each line was stored unterminated, with the following entry's timestamp visibly concatenated onto it (`...trycloudflare.com/2026-09-01T19:07:18.981112 - `), followed by a second, empty entry. `print(..., end="")` does not fix that (it still writes the empty terminator as a second call); the line is now emitted in a single write (#2162)
 - panel_run(to_node_id) stops refusing every scoped run on a workflow containing a random-mode DaSiWa_SeedControl. That node rolls its seed by wrapping `app.graphToPrompt` itself, and the panel's pre-dispatch graph stamp builds its fingerprint BY calling `app.graphToPrompt` — so the stamp rolled one seed and the dispatch rolled a different one, and the two serializations disagreed on `seed_value` and `seed_control_state` every time, on a completely idle canvas. The panel refused with `the workflow graph CHANGED after the run was queued. The differing entries: 2739 seed_control_state; 2739 seed_value` and queued nothing; because the roll fires once per serialization, neither the panel's own restamp nor the orchestrator's re-issues could ever converge, so all three dispatches lost and run-to-node was unusable on those graphs. The queue-time volatile-input walk now recognizes this pack as a seventh volatility signal, alongside rgthree (#1124), cg-use-everywhere (#1273), VHS (#2099) and Ideogram (#2130). The gates mirror the pack's own source one for one: the exact node class, both backing widgets present, no external `seed` link, and a mode that is not the literal `"fixed"` — an absent, empty or unparseable state widget is RANDOM and does roll, which is the freshly-dropped node. Drift coverage is otherwise unchanged: a fixed-mode or externally-driven SeedControl keeps both inputs hashed, and any other edit in the same window (including on the same node) is still detected and still named (comfyui-mcp#2712)
 - panel_reload({scope:"frontend"}) now acknowledges a successful soft reload before cache-busted navigation, with a final fail-closed workflow fence so stale-bundle recovery does not time out on the socket it is replacing (#584)
+
+- retain VHS dimensions across format updates (#2167)
+- refuse empty graph reads with missing-node state (#2166)
+- treat DaSiWa_SeedControl's queue-time seed roll as volatility, not graph drift (#2163)
+- classify and MEASURE a failed workflow switch instead of asserting it (#2159)
+
+### Changed
+- pin the #2148 repair on a promoted MULTILINE rail (#2160)
+- a missing completion receipt is not only an old orchestrator (#2156)
+
 
 ## [0.15.150] - 2026-09-01
 
