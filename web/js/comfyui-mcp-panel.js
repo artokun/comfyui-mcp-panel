@@ -20129,8 +20129,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // graph or replace it with a less useful queue-time error.
         throw new Error(graphToPromptFailureRefusal(preflightBuild.error));
       }
-      const built = preflightBuild.value;
-      preflightPrompt = built;
+      let built = preflightBuild.value;
       // comfyui-mcp#1582 — SERIALIZATION ITSELF CAN FAIL, and this is where that has to
       // be caught. `unrunnableNodeIds(undefined)` answers `[]` — correctly, since a
       // result that does not exist has no unrunnable entries in it — and the check below
@@ -20158,6 +20157,44 @@ const GRAPH_TOOL_EXECUTORS = {
           ),
         );
       }
+      // #2180 — graph_load is shared by panel_load_workflow and panel_flatten_workflow.
+      // A programmatic load can leave real custom-node instances on the canvas before
+      // this tab has their classes in LiteGraph.registered_node_types. The first prompt
+      // then carries missing class_type values even though the backend's /object_info can
+      // repair the registry. Refresh and reserialize once; if either operation cannot
+      // prove recovery, the existing refusal below remains the fail-closed outcome.
+      if (unrunnableNodeIdsInScope(built, partialTargets).length) {
+        // Keep 5s for the queue/receipt path after this recovery refresh.
+        const refreshBudget = budget.bounded(5000);
+        try {
+          await refreshComfyNodeDefs(undefined, {
+            force: true,
+            joinMs: refreshBudget,
+            runBudgetMs: refreshBudget,
+            // The refresh's own reapply sweep already has the fetched definitions and
+            // repairs the loaded instances; avoid paying for a second /object_info read.
+            skipDuplicateComboRefresh: true,
+          });
+        } catch {
+          // The retry below is deliberately still made: a late single-flight refresh may
+          // have completed its registration, and a failed refresh must not become a new
+          // panel_run failure mode.
+        }
+        const retryBuild = await withTimeout(
+          Promise.resolve(app.graphToPrompt()).then(
+            (value) => ({ value }),
+            (error) => ({ error }),
+          ),
+          budget.bounded(RUN_SERIALIZE_TIMEOUT_MS),
+          () => null,
+        );
+        if (retryBuild == null) throw new Error("graph_run recovery pre-flight: graphToPrompt did not answer in time");
+        if ("error" in retryBuild) {
+          throw new Error(graphToPromptFailureRefusal(retryBuild.error));
+        }
+        built = retryBuild.value;
+      }
+      preflightPrompt = built;
       // comfyui-mcp#1871 — SCOPED to the requested branch. The refusal's own premise ("a
       // run carrying an unregistered type cannot succeed") holds for a full run and stopped
       // holding for a run-to-node once #1511 let ComfyUI's refusal of an excluded branch be
