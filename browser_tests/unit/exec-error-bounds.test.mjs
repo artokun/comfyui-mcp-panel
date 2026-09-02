@@ -430,6 +430,60 @@ test("#1691 production graph_get_errors batches live class reads and keeps uncer
   assert.equal(result.note, undefined, "an unchecked live scan must not emit a clean note");
 });
 
+test("#1691 production graph_get_errors gives the live scan first use of the shared budget", async () => {
+  let clock = 0;
+  const nodes = [
+    { id: 1, type: "LoadImage", widgets: [{ name: "image", value: "missing.png" }] },
+    ...Array.from({ length: 4 }, (_, i) => ({
+      id: i + 2,
+      type: `SmallGraph${i}`,
+      widgets: [{ name: "choice", value: "ok" }],
+    })),
+  ];
+  const graph = {
+    _nodes: nodes,
+    getNodeById: (id) => nodes.find((node) => String(node.id) === String(id)) ?? null,
+  };
+  const classBody = (type, name) => ({
+    [type]: { input: { required: { [name]: [[name === "image" ? "present.png" : "ok"], {}] } } },
+  });
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastExecFailure: null,
+    monotonicNow: () => clock,
+    stepBudget: (elapsed, cap) => Math.max(0, Math.min(cap, 18000 - elapsed)),
+    hasRawMissingAssetCandidates: () => true,
+    refreshMissingAssetTrust: async () => {
+      clock += 15000;
+      return true;
+    },
+    collectMissingAssets: () => ({
+      models: [],
+      media: [{ node_id: 1, file: "missing.png" }],
+      nodeTypes: [],
+      nodeCount: 0,
+    }),
+    filterServerConfirmedInputSubfolderMedia: async (media) => {
+      // Model the slow elective media cleanup that starved the live scan before
+      // this fix. It remains bounded and fail-closed; it simply runs later now.
+      clock += 3000;
+      return media;
+    },
+    inputAssetServerUsesWindowsPaths: async () => false,
+    scan: scanComboAvailability,
+    fetchSingleNodeInfo: async (type) =>
+      classBody(type, type === "LoadImage" ? "image" : "choice"),
+  });
+
+  assert.equal(result.unavailable_widget_values.length, 1, "the known LoadImage miss remains visible");
+  assert.equal(result.unavailable_widget_values[0].type, "LoadImage");
+  assert.equal(result.missing_media.length, 1, "the raw missing-media evidence remains visible");
+  assert.equal(result.unchecked_nodes, undefined, "the small graph was fully live-scanned");
+  assert.equal(result.unchecked_budget_exhausted, undefined, "the prioritized scan did not exhaust its budget");
+  assert.equal(result.note, undefined, "a reported LoadImage miss is not clean");
+});
+
 test("#1709 production graph_get_errors retires add proof on definitive class presence and absence", async () => {
   const node = {
     id: 31,
