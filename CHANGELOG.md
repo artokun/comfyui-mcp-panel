@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.159] - 2026-09-02
+
+### Fixed
+- rehydrate loaded node defs before run (#2188)
+
+
 ## [0.15.158] - 2026-09-02
 
 ### Fixed
