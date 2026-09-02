@@ -70,7 +70,11 @@ function graphLinkEntries(graph) {
   return [];
 }
 
-function missingLinkEndpointSlotMethod(graph, node, link) {
+function missingLinkEndpointSlotMethod(graph, node, link, direction, serializedType) {
+  const isImpactSwitch =
+    node?.type === "ImpactSwitch" || node?.comfyClass === "ImpactSwitch" || serializedType === "ImpactSwitch";
+  const requiredMethod = direction === 2 ? "findOutputSlot" : direction === 1 ? "findInputSlot" : null;
+  if (!isImpactSwitch || !requiredMethod) return null;
   const nodeId = node?.id;
   if (nodeId == null || !link || typeof graph?.getNodeById !== "function") return null;
   const nodeIsOrigin = sameNodeId(link.origin_id, nodeId);
@@ -80,9 +84,7 @@ function missingLinkEndpointSlotMethod(graph, node, link) {
   try {
     const far = graph.getNodeById(farId);
     if (far == null) return null;
-    for (const method of ["findInputSlot", "findOutputSlot"]) {
-      if (typeof far[method] !== "function") return method;
-    }
+    if (typeof far[requiredMethod] !== "function") return requiredMethod;
   } catch {
     // A graph or endpoint that cannot be inspected is not evidence. The
     // callback is allowed to run and any resulting throw is handled below.
@@ -268,7 +270,13 @@ export function installNodeConfigureIsolation(LG, graph = null) {
     let callbackWrapper = null;
     if (typeof callback === "function") {
       callbackWrapper = function (...args) {
-        const missingSlotMethod = missingLinkEndpointSlotMethod(this?.graph ?? graph, this, args?.[3]);
+        const missingSlotMethod = missingLinkEndpointSlotMethod(
+          this?.graph ?? graph,
+          this,
+          args?.[3],
+          args?.[0],
+          info?.type,
+        );
         if (missingSlotMethod) {
           // ImpactSwitch's restore callback can call a string-slot connect on a
           // plain/stale far endpoint. That call would invoke a missing
