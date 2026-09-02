@@ -21,6 +21,7 @@ import {
   activeWorkflowProvenEmpty,
   graphEmptyBindingUnproven,
   graphReadDesynced,
+  missingNodeStateReportsNodes,
   graphRootMidPopulation,
   graphRootMismatchesActiveWorkflow,
   graphRootContentDriftOnBoundCanvas,
@@ -504,6 +505,56 @@ test("graphReadDesynced: FALSE — descended into an empty subgraph (legitimatel
 test("graphReadDesynced: defensive — missing args never throw, default to not-desynced", () => {
   assert.equal(graphReadDesynced(), false);
   assert.equal(graphReadDesynced({}), false);
+});
+
+test("missingNodeStateReportsNodes: only positive, shaped missing-node state is evidence", () => {
+  assert.equal(missingNodeStateReportsNodes(null), false);
+  assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: false, missingNodeCount: 4 }), false);
+  assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 2 }), true);
+  assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 0, missingNodesError: ["MissingType"] }), true);
+  assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 0, missingNodesError: { types: ["MissingType"] } }), true);
+  assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 0, missingNodesError: [] }), false);
+});
+
+test("#389 recurrence: a bound empty root is still refused when the session reports missing nodes", () => {
+  const root = {
+    _nodes: [],
+    extra: { comfyui_mcp: { workflow_uuid: "workflow-A" } },
+    serialize: () => ({ nodes: [], links: [], groups: [] }),
+  };
+  const activeWorkflow = {
+    isModified: false,
+    changeTracker: { activeState: { nodes: [], links: [], groups: [] } },
+  };
+  const verdict = resolveGraphBindingVerdict({
+    graph: root,
+    rootGraph: root,
+    activeWorkflow,
+    activeWorkflowUuid: "workflow-A",
+    liveNodeCount: 0,
+    missingNodeState: {
+      hasMissingNodes: true,
+      missingNodeCount: 2,
+      missingNodesError: ["MissingNodeA", "MissingNodeB"],
+    },
+  });
+  assert.equal(verdict?.reason, "empty-graph-missing-nodes");
+  assert.equal(verdict?.live, 0);
+  assert.match(graphBindingRefusalMessage(verdict), /NOT applied/);
+  assert.match(graphBindingRefusalMessage(verdict), /missing node state/);
+});
+
+test("#389 production wiring: both graph read executors pass the live missing-node store to the fence", () => {
+  const src = readFileSync(PANEL_JS, "utf8").replace(/\r\n/g, "\n");
+  const outline = src.indexOf("graph_outline({ max_chars }");
+  const errors = src.indexOf("async graph_get_errors()");
+  assert.ok(outline >= 0 && errors > outline, "read executors are present in production panel");
+  const outlineBlock = src.slice(outline, errors);
+  assert.match(outlineBlock, /const missingNodeState = getPiniaStore\("missingNodesError"\);/);
+  assert.match(outlineBlock, /missingNodeState,\s*\n\s*\}\);/);
+  const errorsBlock = src.slice(errors, errors + 6500);
+  assert.match(errorsBlock, /const missingNodeState = getPiniaStore\("missingNodesError"\);/);
+  assert.match(errorsBlock, /missingNodeState,\s*\n\s*\}\);/);
 });
 
 test("graphRootMismatchesActiveWorkflow: TRUE - a nonempty prior tab remains on the canvas (#349)", () => {
