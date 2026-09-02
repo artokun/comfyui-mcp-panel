@@ -8,6 +8,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { runSetWidget } from "../../web/js/lib/set-widget.js";
+import { applyWidgetWrite } from "../../web/js/lib/widget-write.js";
 
 const TYPE = "VHS_LoadVideo";
 const REGISTRY = { [TYPE]: {} };
@@ -84,6 +85,46 @@ const oracle = {
   registry: REGISTRY,
   getFreshObjectInfo: async () => FRESH,
 };
+
+test("#1533 a throwing VHS callback accessor cannot block the assignment", () => {
+  const { node, widthWidget } = makeVhsNode();
+  let reads = 0;
+  Object.defineProperty(widthWidget, "callback", {
+    configurable: true,
+    get() {
+      reads += 1;
+      throw new Error("VHS callback accessor boom");
+    },
+  });
+
+  const result = applyWidgetWrite(node, "custom_width", 832, {});
+
+  assert.equal(widthWidget.value, 832);
+  assert.equal(result.value, 832);
+  assert.equal(reads, 1);
+  assert.match(result.write_warning ?? "", /VHS callback accessor boom/);
+  assert.equal(result.write_warning_source, undefined);
+});
+
+test("#1533 does not wrap same-shaped dimensions on unrelated nodes", () => {
+  const widthWidget = makeDimension("custom_width");
+  let runs = 0;
+  const callback = function () {
+    runs += 1;
+    this.value = NaN;
+  };
+  widthWidget.callback = callback;
+  const unrelatedNode = { id: 1534, type: "UnrelatedNode", widgets: [widthWidget] };
+
+  const result = applyWidgetWrite(unrelatedNode, "custom_width", 832, {});
+
+  assert.equal(result.value, 832);
+  assert.equal(runs, 1);
+  assert.equal(widthWidget.callback, callback);
+  widthWidget.callback(999);
+  assert.equal(runs, 2);
+  assert.ok(Number.isNaN(widthWidget.value));
+});
 
 test("#1533 non-zero custom dimensions survive VHS format callback and serialization", async () => {
   const { node, format, widthWidget, heightWidget } = makeVhsNode();

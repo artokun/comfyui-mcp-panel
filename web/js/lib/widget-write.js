@@ -303,16 +303,26 @@ function restoreFiniteNumberIfUnstored(widget, expected) {
 // later replay too; the one-shot restore below this write cannot protect future callbacks.
 const guardedVhsDimensionCallbacks = new WeakSet();
 
-function guardVhsDimensionCallback(widget) {
+function guardVhsDimensionCallback(node, widget) {
   let type;
   let name;
+  let widgets;
   try {
+    if (String(node?.type ?? "").toLowerCase() !== "vhs_loadvideo") {
+      return { matched: false };
+    }
     type = String(widget?.type ?? "").toLowerCase();
     name = widget?.name;
+    widgets = node?.widgets;
   } catch {
     return { matched: false };
   }
-  if (type !== "vhs.annotated" || (name !== "custom_width" && name !== "custom_height")) {
+  if (
+    !Array.isArray(widgets) ||
+    !widgets.includes(widget) ||
+    type !== "vhs.annotated" ||
+    (name !== "custom_width" && name !== "custom_height")
+  ) {
     return { matched: false };
   }
 
@@ -373,7 +383,7 @@ function guardVhsDimensionCallbacksOnNode(node, skipWidget = null) {
     for (const widget of widgets) {
       if (widget === skipWidget) continue;
       try {
-        guardVhsDimensionCallback(widget);
+        guardVhsDimensionCallback(node, widget);
       } catch {
         /* the normal callback path remains authoritative for unreadable widgets */
       }
@@ -3270,18 +3280,8 @@ export function applyWidgetWrite(
   // Captured at lookup so the disclosure can describe it WITHOUT reading `w.callback`
   // a second time (it may be an accessor with side effects, or a throwing one).
   let widgetCallback = null;
-  let guardedDimensionCallback = null;
-  let guardedDimensionCallbackMatched = false;
   safeBefore();
   try {
-    if (!fastBypasserAction && !liveCustomTextWrite) {
-      // Install before assignment because a frontend value setter may invoke the
-      // callback as part of the assignment itself.
-      guardVhsDimensionCallbacksOnNode(targetNode, valueWidget);
-      const guarded = guardVhsDimensionCallback(valueWidget);
-      guardedDimensionCallbackMatched = guarded.matched;
-      guardedDimensionCallback = guarded.callback;
-    }
     // Assign BOTH values first — EXCEPT on an instance-scoped promoted write, where
     // the inner widget is not a second copy of this value but the SHARED SUBGRAPH
     // DEFINITION every sibling instance reads (comfyui-mcp#1707). There the rail IS
@@ -3381,7 +3381,13 @@ export function applyWidgetWrite(
     // editor + options.setValue path above is what serializes; read-back
     // still decides whether the write stuck.
     if (!fastBypasserAction && !liveCustomTextWrite) {
-      widgetCallback = guardedDimensionCallbackMatched ? guardedDimensionCallback : valueWidget.callback;
+      // #1533 — callback observation and VHS callback guarding happen only AFTER all
+      // value assignments. A callback accessor is widget code, not a preflight gate:
+      // if it throws, the established post-assignment verification/warning path owns
+      // the receipt and the requested value is not undone merely because it was read.
+      guardVhsDimensionCallbacksOnNode(targetNode, valueWidget);
+      const guarded = guardVhsDimensionCallback(targetNode, valueWidget);
+      widgetCallback = guarded.matched ? guarded.callback : valueWidget.callback;
       if (widgetCallback !== null && widgetCallback !== undefined) {
         const callbackArgs = [coerced, canvas, valueNode, valueNode.pos, undefined];
         threwFromCallback = true;
