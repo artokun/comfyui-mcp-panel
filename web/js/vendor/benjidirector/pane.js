@@ -36,8 +36,34 @@ function ensureCss() {
   const link = document.createElement("link");
   link.rel = "stylesheet";
   // Stamped like the JS import below, so a re-vendor cannot leave a browser on the old CSS.
-  link.href = new URL("./style.css?v=f9977f066d91", import.meta.url).href;
+  link.href = new URL("./style.css?v=bd5026ae3244", import.meta.url).href;
   document.head.appendChild(link);
+  // Geist (the design language's face). Google Fonts is reachable from the ComfyUI page; if it
+  // is not, the stack falls through to the system UI font and nothing breaks.
+  if (!document.querySelector('link[data-bd-fonts="1"]')) {
+    const fonts = document.createElement("link");
+    fonts.rel = "stylesheet";
+    fonts.dataset.bdFonts = "1";
+    fonts.href = "https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap";
+    document.head.appendChild(fonts);
+  }
+}
+
+/**
+ * Markdown → safe HTML for the editor's notes, from the host's own `marked` + `DOMPurify`.
+ * Returns undefined when either is missing so the editor falls back to escaped plain text —
+ * a note must never render unsanitised HTML because the sanitiser was absent. A `marked` in
+ * async mode hands back a Promise; that throws here, and the editor's guard falls back too.
+ */
+function markdownRenderer(ctx) {
+  const marked = ctx?.marked;
+  const purify = ctx?.DOMPurify;
+  if (typeof marked?.parse !== "function" || typeof purify?.sanitize !== "function") return undefined;
+  return (md) => {
+    const html = marked.parse(String(md ?? ""));
+    if (typeof html !== "string") throw new Error("marked.parse returned no HTML (async mode?)");
+    return purify.sanitize(html);
+  };
 }
 
 /**
@@ -62,13 +88,14 @@ export function createDirectorContent(ctx, shell, opts = {}) {
       // hash. Without it the browser caches this module indefinitely: the panel is served raw
       // with no bundler, so nothing else busts it, and a user who updated the pack would keep
       // running the old editor with no way to tell.
-      const mod = await import("./director-app.js?v=f9977f066d91");
+      const mod = await import("./director-app.js?v=bd5026ae3244");
       // The pane can be torn down while the dynamic import is in flight; mounting into a
       // detached node would leak a React root that nothing will ever unmount.
       if (mountEl !== bodyEl || !bodyEl.isConnected) return;
       bodyEl.textContent = "";
       handle = mod.mountDirector(bodyEl, {
         calliopeBaseUrl: opts.calliopeBaseUrl,
+        renderMarkdown: markdownRenderer(ctx),
       });
     } catch (err) {
       if (mountEl === bodyEl && bodyEl.isConnected) {
