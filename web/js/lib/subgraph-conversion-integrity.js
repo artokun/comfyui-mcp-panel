@@ -445,7 +445,7 @@ function linkLookup(links) {
 const linkOriginId = (link) => link?.origin_id ?? (Array.isArray(link) ? link[1] : undefined);
 
 /**
- * Ids of the nodes FEEDING `node` — its upstream producers.
+ * Ids of the nodes FEEDING `node` — its direct upstream producers.
  *
  * Deliberately not "everything wired to it" (gate r5 P1). Direction decides whether a
  * detached neighbour is fatal, and only the upstream side is, read out of the installed
@@ -469,7 +469,9 @@ const linkOriginId = (link) => link?.origin_id ?? (Array.isArray(link) ? link[1]
  * exists for.
  *
  * Takes a prepared `lookup` rather than the link table, so a caller sweeping a whole
- * selection indexes a serialized (array) table once instead of once per node.
+ * selection indexes a serialized (array) table once instead of once per node. The caller
+ * follows these direct edges transitively; keeping this helper one-hop makes the edge
+ * direction explicit and gives the traversal a cycle boundary.
  */
 function upstreamProducerIds(node, lookup) {
   const ids = new Set();
@@ -510,9 +512,12 @@ function carriesAnyLink(node) {
  * unwired.
  *
  * A detached downstream CONSUMER is deliberately absent: the conversion never reads its
- * `graph`, so refusing on it would block a conversion the frontend completes. See
- * {@link upstreamProducerIds} for that trace, and {@link carriesAnyLink} for the
- * matching narrowing on the selection side.
+ * `graph`, so refusing on it would block a conversion the frontend completes. The
+ * producer walk is transitive because the recurrence that motivated this follow-up had
+ * a detached ancestor beyond the selection's immediate input producer; a one-hop check
+ * let that selection reach the raw frontend throw. See {@link upstreamProducerIds} for
+ * the edge trace, and {@link carriesAnyLink} for the matching narrowing on the selection
+ * side.
  *
  * Ownership is proved by NODE identity (`getNodeById(id)` returns this very object),
  * never by graph identity. `node.graph !== graph` would read a Vue proxy of the live
@@ -521,7 +526,8 @@ function carriesAnyLink(node) {
  * that is unambiguous: the graph lists the node, the node denies the graph.
  *
  * Returns `[]` for anything unreadable — a graph this cannot inspect must fall through
- * to the conversion, not be refused by it.
+ * to the conversion, not be refused by it. A readable cycle is bounded by object
+ * identity and does not turn into an infinite preflight.
  */
 export function detachedConversionNodes(graph, nodes) {
   const selection = Array.isArray(nodes) ? nodes : [];
@@ -531,6 +537,7 @@ export function detachedConversionNodes(graph, nodes) {
   const lookup = linkLookup(graph?.links);
   const found = [];
   const seen = new Set();
+  const walked = new Set();
   const consider = (node, role) => {
     if (!node || seen.has(node)) return;
     seen.add(node);
@@ -541,10 +548,21 @@ export function detachedConversionNodes(graph, nodes) {
     found.push({ id: node.id, role });
   };
   // Selection first, so a node that is both selected and someone's producer is reported
-  // once, under the role whose consequence lands first.
+  // once, under the role whose consequence lands first. Then walk every upstream input
+  // origin, not only the first boundary hop. The graph lookup and identity check keep
+  // this on the graph being converted; `walked` bounds cycles and repeated fan-in.
   for (const node of selection) consider(node, "selected");
-  for (const node of selection) {
-    for (const id of upstreamProducerIds(node, lookup)) consider(graph.getNodeById(id), "producer");
+  const pending = [...selection];
+  let next = 0;
+  while (next < pending.length) {
+    const node = pending[next++];
+    if (!node || walked.has(node) || !owns(node)) continue;
+    walked.add(node);
+    for (const id of upstreamProducerIds(node, lookup)) {
+      const producer = graph.getNodeById(id);
+      consider(producer, "producer");
+      if (producer && owns(producer)) pending.push(producer);
+    }
   }
   return found;
 }

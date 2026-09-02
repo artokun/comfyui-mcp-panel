@@ -127,6 +127,13 @@ test("a detached upstream PRODUCER is found — that is the destructive case", (
   assert.deepEqual(detachedConversionNodes(graph, [n2, n3]), [{ id: 1, role: "producer" }]);
 });
 
+test("a detached producer beyond the immediate input hop is found", () => {
+  const { graph, n2, n3, n4 } = chain();
+  n2.graph = null; // selection [4] sees 3 first; the detached ancestor is two hops away
+  assert.deepEqual(detachedConversionNodes(graph, [n4]), [{ id: 2, role: "producer" }]);
+  assert.deepEqual(detachedConversionNodes(graph, [n3]), [{ id: 2, role: "producer" }]);
+});
+
 test("a detached SELECTED node is found too", () => {
   const { graph, n2, n3 } = chain();
   n2.graph = null;
@@ -643,6 +650,16 @@ test("EXECUTED: a detached NEIGHBOUR is refused and the frontend is never called
   );
   assert.ok(!calls.includes("convertToSubgraph"), "the conversion must not have been attempted");
   assert.ok(!calls.includes("beforeChange"), "and no change window must have been opened");
+});
+
+test("EXECUTED: a detached ancestor beyond the immediate hop is refused before conversion", () => {
+  const { graph, canvas, calls, n2, n4 } = rig();
+  n2.graph = null;
+  assert.throws(
+    () => runner({ graph, canvas, nodes: [n4], what: "panel_create_subgraph" }),
+    /graph lists node 2 feeding it/i,
+  );
+  assert.deepEqual(calls, ["selectItems"], "the raw conversion and change window must not run");
 });
 
 test("EXECUTED: a detached SELECTED node is refused and the frontend is never called", () => {
