@@ -73,7 +73,7 @@ async function rejection(promise, code) {
   });
 }
 
-test("#2283: the allowed operations use only their fixed same-origin routes", async () => {
+test("#2196/#2283: the allowed operations use only their fixed same-origin routes", async () => {
   const apiURLCalls = [];
   const fileURLCalls = [];
   const apiCalls = [];
@@ -83,6 +83,7 @@ test("#2283: the allowed operations use only their fixed same-origin routes", as
     system_stats: '{"system":{"os":"windows"},"devices":[]}',
     logs: "ERROR: render failed\n",
     object_info: '{"KSampler":{"input":{"required":{}}}}',
+    workflow_templates: '{"templates":[]}',
   };
   for (const operation of Object.keys(bodies)) {
     const result = await fetchComfyUIReadForMcp(
@@ -118,9 +119,9 @@ test("#2283: the allowed operations use only their fixed same-origin routes", as
     });
   }
 
-  assert.deepEqual(apiURLCalls, ["/history", "/system_stats", "/object_info"]);
+  assert.deepEqual(apiURLCalls, ["/history", "/system_stats", "/object_info", "/workflow_templates"]);
   assert.deepEqual(fileURLCalls, ["/internal/logs/raw"]);
-  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats", "/object_info"]);
+  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats", "/object_info", "/workflow_templates"]);
   assert.deepEqual(rawCalls.map(({ url }) => url), ["https://panel.test/comfy/internal/logs/raw"]);
   for (const { init } of [...apiCalls, ...rawCalls]) {
     assert.equal(init.method, "GET");
