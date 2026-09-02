@@ -9760,6 +9760,10 @@ function assertGraphBoundToActiveWorkflow(
     // #2125 (gate r2 P1) — the caller's OWN observation of the active workflow, when
     // it already made one as part of proving nothing changed. See below.
     workflowProbe = null,
+    // #389 — the read caller's same-tick observation of ComfyUI's load-time
+    // missing-node store. Keep it with the rest of this call's evidence so the
+    // resolver can refuse an empty root instead of dropping the observation.
+    missingNodeState = null,
   } = {},
 ) {
   const liveNodeCount = rootGraph?._nodes?.length ?? 0;
@@ -9990,6 +9994,7 @@ function assertGraphBoundToActiveWorkflow(
     requireDirtyMutationBinding,
     postReconnectWindow: postReconnectSettleWindow(),
     graphLoading,
+    missingNodeState,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }

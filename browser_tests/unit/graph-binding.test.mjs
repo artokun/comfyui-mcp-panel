@@ -513,6 +513,7 @@ test("missingNodeStateReportsNodes: only positive, shaped missing-node state is 
   assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 2 }), true);
   assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 0, missingNodesError: ["MissingType"] }), true);
   assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 0, missingNodesError: { types: ["MissingType"] } }), true);
+  assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 0, missingNodesError: { types: [] } }), false);
   assert.equal(missingNodeStateReportsNodes({ hasMissingNodes: true, missingNodeCount: 0, missingNodesError: [] }), false);
 });
 
@@ -555,6 +556,33 @@ test("#389 production wiring: both graph read executors pass the live missing-no
   const errorsBlock = src.slice(errors, errors + 6500);
   assert.match(errorsBlock, /const missingNodeState = getPiniaStore\("missingNodesError"\);/);
   assert.match(errorsBlock, /missingNodeState,\s*\n\s*\}\);/);
+});
+
+test("#389 production fence: the executable helper forwards missing-node evidence into the resolver", () => {
+  // This extracts and runs the production assertGraphBoundToActiveWorkflow helper
+  // with the same dependency injection used by the surrounding fence tests. If
+  // the option is removed from either the destructuring or the resolver call,
+  // this genuinely-empty/tagged root no longer refuses and the test fails.
+  const h = buildDirtyStaleRouteHarness({
+    rootUuid: "workflow-A-1",
+    foreignClaim: "none",
+    rootNodeCount: 0,
+    activeModified: false,
+    activeTracker: { activeState: { nodes: [], links: [], groups: [] } },
+    rootSerializer: () => ({ nodes: [], links: [], groups: [] }),
+  });
+  assert.throws(
+    () =>
+      h.assertBound(h.rootB, h.rootB, {
+        includeBaselineReadGuard: true,
+        missingNodeState: {
+          hasMissingNodes: true,
+          missingNodeCount: 1,
+          missingNodesError: ["MissingNode"],
+        },
+      }),
+    /\[empty-graph-missing-nodes\]/,
+  );
 });
 
 test("graphRootMismatchesActiveWorkflow: TRUE - a nonempty prior tab remains on the canvas (#349)", () => {

@@ -101,10 +101,14 @@ export function missingNodeStateReportsNodes(missingNodeState) {
     if (!missingNodeState?.hasMissingNodes) return false;
     if (Number(missingNodeState.missingNodeCount) > 0) return true;
     const raw = missingNodeState.missingNodesError;
-    if (Array.isArray(raw)) return raw.length > 0;
-    if (raw && typeof raw === "object") {
-      return Object.keys(raw).length > 0 || Object.values(raw).some((value) => Array.isArray(value) && value.length > 0);
-    }
+    // Match collectMissingAssets' parser exactly: an object whose selected
+    // record array is present but empty is absence, not positive evidence.
+    const records = Array.isArray(raw)
+      ? raw
+      : raw && typeof raw === "object"
+        ? (Object.values(raw).find(Array.isArray) ?? Object.keys(raw))
+        : [];
+    return records.length > 0;
   } catch {
     // An unreadable optional store cannot prove a mismatch.
   }
