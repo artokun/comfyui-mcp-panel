@@ -20193,6 +20193,19 @@ const GRAPH_TOOL_EXECUTORS = {
           throw new Error(graphToPromptFailureRefusal(retryBuild.error));
         }
         built = retryBuild.value;
+        // The recovery serializer is independently untrusted: a refresh can repair the
+        // registry while the second graphToPrompt still returns no usable prompt. Keep the
+        // same fail-closed refusal before this recovered value can reach queuePrompt.
+        if (graphToPromptUnusable(built)) {
+          throw new Error(
+            unserializableGraphRefusal(
+              unresolvedNodeTypes(
+                rootGraph ?? graph,
+                (window.LiteGraph ?? globalThis.LiteGraph)?.registered_node_types ?? {},
+              ),
+            ),
+          );
+        }
       }
       preflightPrompt = built;
       // comfyui-mcp#1871 — SCOPED to the requested branch. The refusal's own premise ("a
