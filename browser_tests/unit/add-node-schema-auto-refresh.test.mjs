@@ -13,12 +13,13 @@
 // caller could perform.
 //
 // THE FIX: the drift branch of `graph_add_node` now RUNS the panel_refresh_nodes
-// recovery itself — `refreshComfyNodeDefs(undefined, { force: true })`, the same
-// forced re-register — then re-reads the registry nodeData and re-checks the
-// drift. A drift the refresh clears is added from the CURRENT definition, with
-// the recovery disclosed on the result; only a drift that SURVIVES a real
-// re-registration is refused, and that refusal says the recovery already ran
-// (and why it did not complete, when the refresh said so).
+// recovery itself — carrying the already-fetched `freshDefs` into the forced
+// re-register — then re-reads the registry nodeData and re-checks the drift. A
+// drift the refresh clears is added from the CURRENT definition, with the recovery
+// disclosed on the result; only a drift that SURVIVES a real re-registration is
+// refused, and that refusal says the recovery already ran (and why it did not
+// complete, when the refresh said so). Carrying the class-scoped payload also keeps
+// a stale-bundle refusal on a second whole-schema fetch from blocking this add (#2124).
 //
 // The re-check reads the REGISTRY, not the refresh's verdict: a refresh that
 // only claims to have run must not be able to wave a stale schema through.
@@ -453,8 +454,9 @@ function realGraphAddNode(comfy, overrides = {}) {
     objectInfoSnapshot: { record: () => true, clear: () => {} },
     backendReconnectEpoch: 0,
     api,
-    // The default is the refresh the reporter ran by hand: forced, whole-schema,
-    // and it re-registers the CURRENT defs — the recovery that clears the drift.
+    // The default is the refresh the reporter ran by hand: forced, and it re-registers
+    // the CURRENT defs — the recovery that clears the drift. The shipped add now carries
+    // the class-scoped payload it already fetched; the override records that contract.
     // Tests that need it to fail or to lie pass their own through overrides.
     refreshComfyNodeDefs: async (defs, opts) => {
       refreshCalls.push({ defs, opts });
@@ -529,8 +531,12 @@ test("#1242: the reporter's add succeeds in one call — the panel refreshes fir
   assert.deepEqual(res.added.widgets, ["image"], "the node is built from the CURRENT definition");
   assert.equal(comfy.graph._nodes.length, 1);
   assert.equal(refreshCalls.length, 1, "exactly one refresh — the recovery, not a retry storm");
-  assert.equal(refreshCalls[0].defs, undefined, "the refresh is the whole-schema forced one");
-  assert.equal(refreshCalls[0].opts.force, true, "the recovery is the forced whole-schema one");
+  assert.deepEqual(
+    refreshCalls[0].defs,
+    { LoadImage: backendObjectInfo().LoadImage },
+    "the recovery reuses the already-fetched current class definition",
+  );
+  assert.equal(refreshCalls[0].opts.force, true, "the recovery remains forced");
   // #1192 — and it is BOUNDED now. This recovery awaits any refresh already in flight before
   // queueing its own; unbounded that wait is the composition defect #1192 is about, arriving
   // at the one await inside this command that named no bound. Asserting the bound EXISTS is
@@ -541,9 +547,35 @@ test("#1242: the reporter's add succeeds in one call — the panel refreshes fir
   );
   assert.deepEqual(
     Object.keys(refreshCalls[0].opts).sort(),
-    ["force", "joinMs"],
-    "…and nothing else is passed",
+    ["force", "joinMs", "preloadedWholeSchema"],
+    "the recovery carries its payload scope as well as its budget",
   );
+  assert.equal(refreshCalls[0].opts.preloadedWholeSchema, false);
+});
+
+test("#2124: a stale-bundle verdict on the discarded whole refresh cannot block LoadImage", async () => {
+  const comfy = makeComfy({ stale: true });
+  const refreshCalls = [];
+  const { graph_add_node } = realGraphAddNode(comfy, {
+    refreshComfyNodeDefs: async (defs, opts) => {
+      refreshCalls.push({ defs, opts });
+      // Model the production stale-bundle guard: a refresh that still needs to
+      // fetch the whole schema is refused, but a payload already fetched for this
+      // class is safe to register in place.
+      if (!defs) return { refreshed: false, reason: "stale_bundle" };
+      await comfy.app.registerNodesFromDefs(defs);
+      return { refreshed: true };
+    },
+  });
+
+  const res = await graph_add_node({ class_type: "LoadImage" });
+
+  assert.equal(res.added.type, "LoadImage");
+  assert.deepEqual(res.added.widgets, ["image"]);
+  assert.equal(refreshCalls.length, 1, "the add performs one payload-carrying recovery");
+  assert.ok(refreshCalls[0].defs?.LoadImage, "the recovery carries LoadImage");
+  assert.equal(refreshCalls[0].opts.preloadedWholeSchema, false);
+  assert.equal(comfy.graph._nodes.length, 1);
 });
 
 test("#1242: the recovery is disclosed on the result, not silent", async () => {

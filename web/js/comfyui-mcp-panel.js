@@ -1853,9 +1853,14 @@ async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   if (replacementMayReplaceWholeSnapshot) {
     // #2027 — a stale browser bundle must not fence or clear last-known schema.
     // Ask before invalidate/beginReplacement so a large-/object_info miss on an
-    // older tab cannot worsen the next widget edit.
-    const staleBundle = await refuseStaleBundleRefresh();
-    if (staleBundle) return staleBundle;
+    // older tab cannot worsen the next widget edit. A caller that already supplied
+    // a verified payload has no refresh fetch to protect: the payload is the
+    // authoritative answer this command just obtained, so do not discard it merely
+    // because the bundle-version probe says a later on-disk bundle exists (#2124).
+    if (preloadedDefs == null) {
+      const staleBundle = await refuseStaleBundleRefresh();
+      if (staleBundle) return staleBundle;
+    }
     // #716 — drop the widget-write burst cache at the START of this run, not after it
     // succeeds (codex). This function runs on exactly the events that change the schema —
     // refresh_nodes, a completed install/download, reconnect — and a refresh that FAILS is
@@ -16303,12 +16308,17 @@ const GRAPH_TOOL_EXECUTORS = {
         // already partly spent, and on the reported scenario (a ComfyUI restart, whose
         // reconnect refresh is still running) it could park here until the relay gave up
         // and the user got the bare "did not reply" this whole change exists to replace.
+        // #2124 — the resolver has already obtained an authoritative definition. Carry
+        // that payload into the recovery instead of throwing it away and starting another
+        // whole-schema fetch; the class-scoped payload is enough to replace this class and
+        // avoids turning a stale-bundle verdict for the second fetch into a false refusal.
         //
         // Same allowance as the resolver's join, and the same reserve held back, so a
         // drift recovery cannot eat the window the widget-registration wait still needs.
-        const verdict = await refreshComfyNodeDefs(undefined, {
+        const verdict = await refreshComfyNodeDefs(freshDefs, {
           force: true,
           joinMs: budget.remaining() - ADD_NODE_POST_REFRESH_RESERVE_MS,
+          preloadedWholeSchema: !freshDefsAreSingleClass,
         });
         if (verdict === REFRESH_JOIN_ABANDONED) {
           // A NAMED reason, not the "unknown" the generic branch below produces for a

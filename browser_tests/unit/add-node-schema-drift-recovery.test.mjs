@@ -106,16 +106,15 @@ test("#1242: the add runs the refresh itself, then re-checks, BEFORE the refusal
   const refusalAt = PANEL.indexOf("added or retyped since this page loaded its node schema");
   assert.ok(checkAt > 0 && refusalAt > checkAt, "the drift check must precede the refusal");
   const between = PANEL.slice(checkAt, refusalAt);
-  // #1192 — the call now spans lines because it carries a bound, so this matches the SHAPE
-  // rather than one spelling of it. STRONGER than the literal it replaces: it pins that the
-  // drift recovery is forced AND that its wait draws from the command budget, which is the
-  // property #1192 needs and the literal could not express.
+  // #1192/#2124 — the call now carries the already-fetched schema payload and a bound, so
+  // this matches the SHAPE rather than one spelling of it. It pins that the drift recovery
+  // is forced, payload-backed, scoped, AND that its wait draws from the command budget.
   const forced = between.match(
-    /refreshComfyNodeDefs\(undefined, \{\s*force: true,\s*joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS,\s*\}\)/,
+    /refreshComfyNodeDefs\(freshDefs, \{\s*force: true,\s*joinMs: budget\.remaining\(\) - ADD_NODE_POST_REFRESH_RESERVE_MS,\s*preloadedWholeSchema: !freshDefsAreSingleClass,\s*\}\)/,
   );
   assert.ok(
     forced,
-    "the drift branch must run the forced refresh itself, bounded by the command budget",
+    "the drift branch must reuse the fresh payload in a forced, scoped refresh bounded by the command budget",
   );
   const refreshAt = forced.index;
   assert.ok(refreshAt > 0, "the drift branch must run the forced refresh itself");
