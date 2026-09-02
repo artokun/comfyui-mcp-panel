@@ -37521,6 +37521,7 @@ function buildPanel() {
     // register it under a freshly minted id, so panel_ui_update would keep failing —
     // for a new reason instead of the old one. Identity is the half that was missing.
     rec.cardId = handle.cardId;
+    if (typeof rec.id === "string" && rec.id) handle.el.dataset.messageId = rec.id;
     liveA2uiCards.set(handle.cardId, { handle, rec });
     log.appendChild(handle.el);
     if (rec.spec?.surface === "wide") setChatSurfaceForCards();
@@ -37565,7 +37566,9 @@ function buildPanel() {
         mountLiveA2UICard(m, typeof m.cardId === "string" ? m.cardId : undefined);
         return;
       }
-      log.appendChild(renderA2UIInert(m.spec, m.choice));
+      const inert = renderA2UIInert(m.spec, m.choice);
+      if (typeof m?.id === "string" && m.id) inert.dataset.messageId = m.id;
+      log.appendChild(inert);
     } catch {
       log.appendChild(renderA2UIFailCard(m?.spec, [tr("panel.stored_card_failed_to_render", "stored card failed to render")]));
     }
@@ -40581,6 +40584,32 @@ function buildPanel() {
       }
       const cards = dismissAllLiveA2uiCards(liveA2uiCards, { removeEl: true });
       for (const rec of cards.recs) persistRec(rec);
+      // A no-card_id recovery can arrive during the reload/rebind window, after
+      // resetFeed() has dropped the transient live handles but before the active
+      // thread has been painted live again. Resolve only unresolved A2UI records
+      // in the thread currently on screen. This preserves workflow/session
+      // anchoring and makes the dismissal durable, so the next repaint cannot
+      // resurrect the card the fallback was meant to remove.
+      const fallbackCardIds = [];
+      let fallbackDismissed = 0;
+      try {
+        for (const rec of thread?.msgs || []) {
+          if (rec?.kind !== "a2ui" || rec.resolved === true) continue;
+          rec.resolved = true;
+          historyStore.touchMessage(rec);
+          fallbackDismissed += 1;
+          if (typeof rec.cardId === "string" && rec.cardId) fallbackCardIds.push(rec.cardId);
+          if (typeof rec.id === "string" && rec.id) {
+            for (const el of log.querySelectorAll(".cmcp-a2ui")) {
+              if (el.dataset?.messageId === rec.id) el.remove();
+            }
+          }
+        }
+      } catch {
+        // A recovery dismissal is best-effort around a torn-down panel; the live
+        // registry path above still provides the normal synchronous cleanup.
+      }
+      if (fallbackDismissed) persistThreads();
       if (_activeLightboxClose) {
         try { _activeLightboxClose(); } catch { /* already gone */ }
         _activeLightboxClose = null;
@@ -40589,8 +40618,8 @@ function buildPanel() {
       setChatSurfaceForCards();
       return {
         ok: true,
-        dismissed: cards.dismissed,
-        card_ids: cards.card_ids,
+        dismissed: cards.dismissed + fallbackDismissed,
+        card_ids: [...new Set([...cards.card_ids, ...fallbackCardIds])],
         media_unloaded: media.unloaded,
       };
     },

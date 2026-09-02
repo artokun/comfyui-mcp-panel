@@ -260,7 +260,8 @@ export const A2UI_CSS = `
 }
 .cmcp-a2ui { border: 1px solid var(--p-content-border-color, #3f3f46); border-left: 3px solid var(--p-primary-color, #3a7bd5);
   border-radius: 8px; padding: 0.6rem 0.7rem; margin: 0.35rem 0; background: var(--p-content-background, #1f1f23);
-  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); position: relative; }
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); position: relative;
+  max-height: min(70vh, 42rem, calc(100% - 2rem)); overflow-y: auto; }
 .cmcp-a2ui.resolved { opacity: 0.85; }
 .cmcp-a2ui-title { font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8862); text-transform: uppercase; letter-spacing: 0.05em;
   opacity: 0.7; margin-bottom: 0.4rem; padding-right: 1.2rem; }
