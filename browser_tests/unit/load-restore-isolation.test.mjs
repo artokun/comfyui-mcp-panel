@@ -358,6 +358,112 @@ test("#1668 records the narrow link-disconnect crash and verifies a linked-widge
   assert.deepEqual(verifyNodeRestore(node, info).linkDrivenWidgetDifferences, ["select"]);
 });
 
+test("#1668 skips an ImpactSwitch callback before a missing endpoint API and verifies the completed node", async () => {
+  class LGraphNode {
+    constructor(id) {
+      this.id = id;
+      this.type = "ImpactSwitch";
+      this.widgets = [{ name: "select" }, { name: "input1" }];
+      this.inputs = [];
+      this.outputs = [];
+    }
+
+    onConnectionsChange() {
+      throw new Error("the missing endpoint API was called");
+    }
+
+    configure(info) {
+      this.inputs = info.inputs;
+      this.widgets_values = info.widgets_values;
+      this.onConnectionsChange(1, 1, true, this.graph._links.get(901), this.inputs[1]);
+    }
+
+    serialize() {
+      return {
+        id: this.id,
+        type: this.type,
+        inputs: this.inputs,
+        widgets_values: this.widgets_values,
+      };
+    }
+  }
+  const LG = { LGraphNode };
+  const node = new LGraphNode(122);
+  const farNode = {
+    id: 321,
+    connectCalls: 0,
+    connect() {
+      this.connectCalls += 1;
+      return this.findInputSlot("input1");
+    },
+  };
+  const graph = {
+    _links: new Map([[901, { id: 901, origin_id: 321, target_id: 122 }]]),
+    getNodeById: (id) => (id === 122 ? node : id === 321 ? farNode : null),
+  };
+  node.graph = graph;
+  const info = {
+    id: 122,
+    type: "ImpactSwitch",
+    inputs: [
+      { name: "select", link: null, widget: { name: "select" } },
+      { name: "input1", link: 901, widget: { name: "input1" } },
+    ],
+    widgets_values: ["saved-selection", "saved-input"],
+  };
+  const isolation = installNodeConfigureIsolation(LG, graph);
+  try {
+    assert.doesNotThrow(() => node.configure(info), "only the proven link callback failure is contained");
+  } finally {
+    isolation.restore();
+  }
+  assert.equal(isolation.failures.length, 1);
+  assert.equal(isolation.failures[0].callbackContained, true);
+  assert.equal(isolation.failures[0].linkDisconnectEvidence, true);
+  assert.match(isolation.failures[0].error, /findInputSlot/);
+  assert.equal(farNode.connectCalls, 0, "the missing endpoint API was never reached");
+  assert.equal(graph._links.has(901), true, "the serialized link record remains intact");
+  assert.equal(node.inputs[1].link, 901, "the serialized input link remains intact");
+
+  let configureCalls = 0;
+  const originalConfigure = node.configure;
+  node.configure = (...args) => {
+    configureCalls += 1;
+    return originalConfigure.apply(node, args);
+  };
+  const result = await retryNodeRestores(graph, isolation.failures);
+  assert.equal(configureCalls, 0, "the known-bad callback is not invoked a second time");
+  assert.deepEqual(result.restored, [{ id: 122, type: "ImpactSwitch" }]);
+  assert.deepEqual(result.failed, []);
+  assert.deepEqual(result.recovered, [{
+    id: 122,
+    type: "ImpactSwitch",
+    ownerGraphToken: isolation.failures[0].ownerGraphToken,
+    linkDrivenWidgetDifferences: [],
+  }]);
+});
+
+test("#1668 keeps callback containment fail-closed when the graph endpoint API is absent", () => {
+  class LGraphNode {
+    onConnectionsChange() {
+      throw new TypeError("t.findInputSlot is not a function");
+    }
+
+    configure() {
+      this.onConnectionsChange(1, 0, true, null, null);
+    }
+  }
+  const isolation = installNodeConfigureIsolation({ LGraphNode });
+  try {
+    new LGraphNode().configure({ id: 122, type: "ImpactSwitch" });
+  } finally {
+    isolation.restore();
+  }
+  assert.equal(isolation.failures.length, 1);
+  assert.equal(isolation.failures[0].callbackContained, undefined);
+  assert.equal(isolation.failures[0].linkDisconnectEvidence, false);
+});
+
 test("#1668 records mirror-write evidence when the far node is valid but its referenced slot is missing", () => {
   const LG = makeLiteGraph();
   const base = LG.LGraphNode.prototype.configure;
