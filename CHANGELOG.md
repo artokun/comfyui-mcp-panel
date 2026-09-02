@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.158] - 2026-09-02
+
+### Fixed
+- panel_create_subgraph and panel_subgraph_group now preflight the full transitive upstream chain for detached nodes and refuse before ComfyUI's conversion can throw or partially mutate the live graph; graph-ownership and cycle guards preserve valid downstream and unlinked selections, while measured throw verdicts remain in place (#1463, #2186)
+
+
 ## [0.15.157] - 2026-09-02
 
 ### Fixed
