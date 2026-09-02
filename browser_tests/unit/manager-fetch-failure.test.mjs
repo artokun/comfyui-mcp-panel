@@ -16,6 +16,7 @@ import {
   isTransportFailure,
   managerFetchFailureMessage,
 } from "../../web/js/lib/manager-fetch-failure.js";
+import { managerUnavailableResult } from "../../web/js/lib/manager-install.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -111,6 +112,19 @@ test("#1472 transport detection covers the real browser strings", () => {
   }
 });
 
+test("#2024 transport detection survives serialized TypeError and plain error-like objects", () => {
+  for (const value of [
+    "TypeError: Failed to fetch",
+    "Error: NetworkError when attempting to fetch resource",
+    { message: "TypeError: Failed to fetch" },
+  ]) {
+    assert.equal(isTransportFailure(value), true, JSON.stringify(value));
+    const msg = managerFetchFailureMessage("customnode/getmappings?mode=cache", value);
+    assert.match(msg, /TRANSPORT failure/);
+    assert.match(msg, /no HTTP status/);
+  }
+});
+
 test("#1472 a missing message still yields a usable error", () => {
   for (const bad of [undefined, null, new Error("")]) {
     const msg = managerFetchFailureMessage("manager/queue/task", bad);
@@ -187,6 +201,20 @@ test("#2024 isManagerTransportWrap matches the wrap and a bare Failed to fetch",
   assert.equal(isManagerTransportWrap(wrap), true);
   assert.equal(isManagerTransportWrap(new Error("Manager customnode/getmappings: HTTP 500")), false);
   assert.equal(isManagerTransportWrap(new Error("fetch failed for upstream registry")), false);
+});
+
+test("#2024 a serialized transport wrap remains visible to the search result", () => {
+  const wrapped = {
+    message:
+      "Error: ComfyUI-Manager request to /v2/customnode/getmappings?mode=cache did not complete: " +
+      "TypeError: Failed to fetch",
+  };
+  assert.equal(isManagerTransportWrap(wrapped), true);
+  const result = managerUnavailableResult("Spectrum MiniMax H3", wrapped);
+  assert.equal(result.transportFailure, true);
+  assert.equal(result.reason_code, "manager_search_transport");
+  assert.match(result.message, /^ComfyUI-Manager request to \/v2\/customnode\/getmappings\?mode=cache/);
+  assert.match(result.message, /TRANSPORT failure/);
 });
 
 test("#2024 WIRING: managerCall names the ABSOLUTE route, not /v2/", () => {

@@ -42,7 +42,7 @@
 
 /** Is this the browser's transport-level failure (no response ever arrived)? */
 export function isTransportFailure(err) {
-  const msg = (err instanceof Error ? err.message : String(err ?? "")).trim();
+  const msg = transportMessage(err);
   // ANCHORED, and deliberately so. Review found the original substring test would
   // reclassify a Manager-ORIGINATED rejection that merely mentions one of these
   // phrases — "Package validation failed: NetworkError in dependency metadata", or
@@ -54,6 +54,26 @@ export function isTransportFailure(err) {
   // them, so anchoring costs nothing real. An unrecognised shape falls through to the
   // caller's own message, which is the honest outcome for an error we cannot classify.
   return TRANSPORT_MESSAGES.some((re) => re.test(msg));
+}
+
+/**
+ * Fetch errors cross the panel/bridge boundary in more than one shape. Keep the
+ * classifier strict about the browser's wording, but tolerate the standard
+ * `TypeError:`/`Error:` decoration added by String(error) or serialization and
+ * plain error-like objects carrying a `message` field. This is still anchored at
+ * the beginning, so Manager-originated sentences that merely mention a transport
+ * word remain rejections, not no-response failures.
+ */
+function transportMessage(err) {
+  let raw = "";
+  try {
+    if (err instanceof Error) raw = err.message;
+    else if (err && typeof err === "object" && typeof err.message === "string") raw = err.message;
+    else raw = String(err ?? "");
+  } catch {
+    return "";
+  }
+  return raw.trim().replace(/^(?:(?:Error|TypeError|DOMException):\s*)+/i, "");
 }
 
 /**
@@ -91,7 +111,14 @@ const TRANSPORT_MESSAGES = [
  * fetch is not labelled as a v2 route (#2024).
  */
 export function managerFetchFailureMessage(route, err, { prefix = "/v2/" } = {}) {
-  const raw = err instanceof Error ? err.message : String(err ?? "");
+  let raw = "";
+  try {
+    if (err instanceof Error) raw = err.message;
+    else if (err && typeof err === "object" && typeof err.message === "string") raw = err.message;
+    else raw = String(err ?? "");
+  } catch {
+    raw = "";
+  }
   const base = String(prefix ?? "/v2/");
   const path = `${base.endsWith("/") ? base : `${base}/`}${String(route ?? "").replace(/^\/+/, "")}`;
   if (!isTransportFailure(err)) {
@@ -124,9 +151,7 @@ export function managerFetchFailureMessage(route, err, { prefix = "/v2/" } = {})
 export function isManagerTransportWrap(err) {
   if (isTransportFailure(err)) return true;
   if (err && typeof err === "object" && isTransportFailure(err.cause)) return true;
-  const msg = (err instanceof Error ? err.message : String(err ?? ""))
-    .trim()
-    .replace(/^(?:Error:\s*)+/i, "");
+  const msg = transportMessage(err);
   const match = /^ComfyUI-Manager request to (\S+) did not complete:\s*([\s\S]+)$/i.exec(msg);
   if (!match) return false;
   return isTransportFailure(match[2]);
