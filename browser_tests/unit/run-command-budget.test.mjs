@@ -2656,7 +2656,7 @@ test("#1565 P1: the run interceptor COUNTS what left the panel, so the reply sta
       await gate;
       return { status: 200, clone: () => ({ json: async () => ({ prompt_id: "p1" }) }), text: async () => "{}" };
     };
-    const interceptor = createRunFetchInterceptor({ origFetchApi: inner });
+    const interceptor = createRunFetchInterceptor({ recoverDelayMs: 0, origFetchApi: inner });
     assert.deepEqual(interceptor.state, { posted: 0, inFlight: 0, missingPromptIds: 0 });
     const post = interceptor("/prompt", { method: "POST", body: JSON.stringify({ prompt: {} }) });
     assert.deepEqual(interceptor.state, { posted: 1, inFlight: 1, missingPromptIds: 0 }, "counted BEFORE the request leaves");
@@ -2679,7 +2679,7 @@ test("#1565 P1: an unreadable request cannot stop a fetch that previously went o
       reached = true;
       return { status: 200, clone: () => ({ json: async () => ({}) }), text: async () => "{}" };
     };
-    const interceptor = createRunFetchInterceptor({ origFetchApi: inner });
+    const interceptor = createRunFetchInterceptor({ recoverDelayMs: 0, origFetchApi: inner });
     // Classification moved BEFORE the await, so a throwing `options` must not become a
     // request that never leaves — this used to run only after the fetch.
     const hostile = new Proxy({}, { get() { throw new Error("hostile options"); } });

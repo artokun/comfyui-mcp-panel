@@ -1709,6 +1709,11 @@ export function createRunFetchInterceptor({
   onRejection = null,
   onPromptId = null,
   onAcceptedNodeErrors = null,
+  // #2203 -- the post-dispatch recovery poll sleeps between attempts. Injectable
+  // so a unit test can drive it with no real timer: a pending 40ms timer that
+  // outlives the runner is reported as "Promise resolution is still pending but
+  // the event loop has already resolved", which cancels the whole file.
+  recoverDelayMs = undefined,
 } = {}) {
   const state = { posted: 0, inFlight: 0, missingPromptIds: 0 };
   const interceptor = async function runFetchInterceptor(route, options) {
@@ -1740,6 +1745,7 @@ export function createRunFetchInterceptor({
       const recovered = await recoverPromptIdAfterDispatch({
         fetchApi: origFetchApi,
         dispatchId,
+        ...(recoverDelayMs === undefined ? {} : { delayMs: recoverDelayMs }),
       });
       if (recovered.status !== "recovered") return false;
       try {
@@ -1829,6 +1835,7 @@ export function createScopedRunGuard({
   onPromptId = null,
   onAcceptedNodeErrors = null,
   onScopeDropped = null,
+  recoverDelayMs = undefined,
 } = {}) {
   const expected = (execIds ?? []).map(String);
   const maxBatch = Math.max(1, Math.floor(Number(batch)) || 1);
@@ -1970,6 +1977,7 @@ export function createScopedRunGuard({
           fetchApi: origFetchApi,
           dispatchId,
           queueMark,
+          ...(recoverDelayMs === undefined ? {} : { delayMs: recoverDelayMs }),
         });
       const applyRecovered = (recovered) => {
         if (recovered?.status !== "recovered") return false;

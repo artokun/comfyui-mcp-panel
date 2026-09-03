@@ -1568,7 +1568,7 @@ test("#630 guard: each distinct no-usable-scope state is reported as ITSELF, not
   try {
     const run = async (targetsValue) => {
       const orig = makeServer();
-      const guard = createScopedRunGuard({
+      const guard = createScopedRunGuard({ recoverDelayMs: 0,
         origFetchApi: orig,
         execIds: ["14"],
         contentHash: OUR_HASH,
@@ -1628,7 +1628,7 @@ test("#556 error messages: dropped names the node + nothing queued; unverified d
 test("#556 unscoped interceptor: captures top-level rejection and prompt_id, leaves the request untouched", async () => {
   const spy = makeServer(async () => jsonResponse(400, { error: { type: "missing_node_type" } }));
   let rejection = null;
-  const intercepted = createRunFetchInterceptor({ origFetchApi: spy, onRejection: (r) => (rejection = r) });
+  const intercepted = createRunFetchInterceptor({ recoverDelayMs: 0, origFetchApi: spy, onRejection: (r) => (rejection = r) });
   const [route, options] = promptPost({ prompt: {} });
   const res = await intercepted(route, options);
   assert.equal(spy.calls.length, 1);
@@ -1637,7 +1637,7 @@ test("#556 unscoped interceptor: captures top-level rejection and prompt_id, lea
   assert.deepEqual(rejection, { error: { type: "missing_node_type" }, node_errors: null });
 
   const ids = [];
-  const intercepted2 = createRunFetchInterceptor({ origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: 0 })), onPromptId: (p) => ids.push(p) });
+  const intercepted2 = createRunFetchInterceptor({ recoverDelayMs: 0, origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: 0 })), onPromptId: (p) => ids.push(p) });
   await intercepted2(...promptPost({ prompt: {} }));
   assert.deepEqual(ids, ["0"], "falsy-but-valid id 0 captured, string-normalized");
 });
@@ -1649,7 +1649,7 @@ test("#556 unscoped interceptor: captures top-level rejection and prompt_id, lea
 test("#556 guard: OUR marked post with signature+exact targets ⇒ observed, dispatched verbatim, prompt_id captured", async () => {
   const spy = makeServer();
   const ids = [];
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => ids.push(p) });
+  const guard = createScopedRunGuard({ recoverDelayMs: 0, origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => ids.push(p) });
   const [route, options] = promptPost(frontendBody({ targets: ["14"] }));
   const res = await guard(route, options);
   assert.equal(spy.calls.length, 1);
@@ -1662,7 +1662,7 @@ test("#556 guard: OUR marked post with signature+exact targets ⇒ observed, dis
 test("#556 r6: an attributed post whose fetch THROWS is a dispatch FAILURE — never counted as verified, never captured", async () => {
   const spy = makeServer(async () => { throw new Error("connection reset"); });
   let captured = null;
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
+  const guard = createScopedRunGuard({ recoverDelayMs: 0, origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
   await assert.rejects(guard(...promptPost(frontendBody({ targets: ["14"] }))), /connection reset/);
   assert.equal(guard.state.observed, 0, "a thrown fetch never satisfies the batch verdict");
   assert.match(guard.state.failed, /connection reset/);
@@ -1676,7 +1676,7 @@ test("#556 r6: an attributed post whose fetch THROWS is a dispatch FAILURE — n
 test("#2203 r6: a thrown /prompt fetch recovers the prompt_id from the queue via the stamped dispatch id", async () => {
   const spy = makeServerQueuedAfterThrow("recovered-prompt");
   const ids = [];
-  const guard = createScopedRunGuard({
+  const guard = createScopedRunGuard({ recoverDelayMs: 0,
     origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
     onPromptId: (p) => ids.push(p),
   });
@@ -1721,7 +1721,7 @@ test("#2203 r6 integration: thrown fetch after ComfyUI accepted still reports di
 test("#2203 unscoped interceptor recovers a thrown /prompt from /queue", async () => {
   const spy = makeServerQueuedAfterThrow("unscoped-recovered");
   const ids = [];
-  const intercepted = createRunFetchInterceptor({ origFetchApi: spy, onPromptId: (p) => ids.push(p) });
+  const intercepted = createRunFetchInterceptor({ recoverDelayMs: 0, origFetchApi: spy, onPromptId: (p) => ids.push(p) });
   await assert.rejects(intercepted(...promptPost({ prompt: OUR_OUTPUT })), /Failed to fetch/);
   assert.deepEqual(ids, ["unscoped-recovered"]);
   assert.equal(spy.calls.filter((c) => isPromptPostCall(c.route, c.options)).length, 1);
@@ -1731,7 +1731,7 @@ test("#556 r6: an attributed post with a MALFORMED response (200 without prompt_
   for (const bad of [jsonResponse(200, {}), jsonResponse(500, {}), jsonResponse(200, { prompt_id: null })]) {
     const spy = makeServer(async () => bad);
     let captured = null;
-    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
+    const guard = createScopedRunGuard({ recoverDelayMs: 0, origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onPromptId: (p) => (captured = p) });
     const res = await guard(...promptPost(frontendBody({ targets: ["14"] })));
     assert.equal(res, bad, "the real response passes back to the frontend");
     assert.equal(guard.state.observed, 0, `HTTP ${bad.status} malformed ⇒ not verified`);
@@ -1778,7 +1778,7 @@ test("#556 r6: a GENUINE server rejection still flows through the established #3
   const rejectionBody = { error: { type: "prompt_outputs_failed_validation", message: "bad input" } };
   const spy = makeServer(async () => jsonResponse(400, rejectionBody));
   let rejection = null;
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onRejection: (r) => (rejection = r) });
+  const guard = createScopedRunGuard({ recoverDelayMs: 0, origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onRejection: (r) => (rejection = r) });
   await guard(...promptPost(frontendBody({ targets: ["14"] })));
   assert.equal(guard.state.rejected, 1);
   assert.equal(guard.state.failed, null, "a server rejection is NOT a dispatch failure");
@@ -1790,7 +1790,7 @@ test("#556 guard: OUR marked post with MISSING or WRONG/EXTRA targets ⇒ refuse
   for (const bad of [null, ["9"], ["14", "9"]]) {
     const spy = makeServer();
     let dropped = null;
-    const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onScopeDropped: (m) => (dropped = m) });
+    const guard = createScopedRunGuard({ recoverDelayMs: 0, origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A, onScopeDropped: (m) => (dropped = m) });
     const res = await guard(...promptPost(frontendBody({ targets: bad })));
     assert.equal(spy.calls.length, 0, `targets ${JSON.stringify(bad)} must never leave the tab`);
     assert.equal(res.status, 400);
@@ -1802,7 +1802,7 @@ test("#556 guard: OUR marked post with MISSING or WRONG/EXTRA targets ⇒ refuse
 test("#556 r3 P0-3: an UNMARKED post is FOREIGN even with our node set AND our targets — never refused, never captured, never observed", async () => {
   const spy = makeServer();
   let captured = null, dropped = null;
-  const guard = createScopedRunGuard({
+  const guard = createScopedRunGuard({ recoverDelayMs: 0,
     origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
     onPromptId: (p) => (captured = p), onScopeDropped: (m) => (dropped = m),
   });
@@ -1822,7 +1822,7 @@ test("#556 r3 P0-3: an UNMARKED post is FOREIGN even with our node set AND our t
 
 test("#556 guard: a marked post whose graph CHANGED under the deferred item (signature mismatch) is corrupted ⇒ refused", async () => {
   const spy = makeServer();
-  const guard = createScopedRunGuard({ origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A });
+  const guard = createScopedRunGuard({ recoverDelayMs: 0, origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A });
   const changedOutput = { "3": { class_type: "KSampler" }, "20": { class_type: "SaveImage" } };
   const res = await guard(...promptPost(frontendBody({ output: changedOutput, targets: ["14"] })));
   assert.equal(res.status, 400, "scope is unverifiable against the changed graph — refuse");
@@ -2226,7 +2226,7 @@ test("#630 gate r2: an explicit partial_execution_targets:null is a PRESENT key,
   const stop = keepAlive();
   try {
     const orig = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: orig,
       execIds: ["14"],
       contentHash: OUR_HASH,
@@ -2239,7 +2239,7 @@ test("#630 gate r2: an explicit partial_execution_targets:null is a PRESENT key,
     assert.doesNotMatch(guard.state.dropped, /no partial_execution_targets key at all/);
     assert.match(guard.state.dropped, /was not a list \(null\)/);
     // …while a genuinely absent key still reads as absent.
-    const g2 = createScopedRunGuard({
+    const g2 = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: makeServer(), execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
     });
     await g2(...promptPost({ prompt: OUR_OUTPUT, client_id: "x", number: MARK_A }));
@@ -2506,7 +2506,7 @@ test("#630 gate r7 P0-1: only a genuinely ABSENT key is repaired — a PRESENT v
     ];
     for (const { targets, label } of cases) {
       const server = makeServer();
-      const guard = createScopedRunGuard({
+      const guard = createScopedRunGuard({ recoverDelayMs: 0,
         origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
         repairScope: true,
       });
@@ -2520,7 +2520,7 @@ test("#630 gate r7 P0-1: only a genuinely ABSENT key is repaired — a PRESENT v
     }
     // The one case that IS repaired: the key genuinely absent.
     const server = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
       repairScope: true,
     });
@@ -2727,7 +2727,7 @@ test("#630 gate r4: two CONCURRENT same-mark posts — the quota is a reservatio
       if (n++ === 0) await gate;
       return jsonResponse(200, { prompt_id: `srv-${n}` });
     });
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
       repairScope: true,
     });
@@ -2759,7 +2759,7 @@ test("#630 gate r4: a MALFORMED response keeps its slot — 'could not tell whet
       return jsonResponse(200, { no_prompt_id: true });
     };
     server.calls = calls;
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
       repairScope: true,
     });
@@ -2795,7 +2795,7 @@ test("#630 gate r6: a THROWN fetch is INDETERMINATE, not proof of non-arrival �
       throw new Error("connection reset");
     };
     server.calls = calls;
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
       repairScope: true,
     });
@@ -2889,7 +2889,7 @@ test("#630 gate r2 P1: a refusal is ALWAYS recorded, so a description failure ca
   const stop = keepAlive();
   try {
     const orig = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: orig, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
     });
     // A body whose partial_execution_targets is valid JSON but pathological to
@@ -2918,7 +2918,7 @@ test("#630 gate r2 P1: describeObserved never throws — and beyond the batch bu
   const stop = keepAlive();
   try {
     const orig = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: orig, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
     });
     // Three attributed scopeless posts against a batch budget of 1.
@@ -2966,7 +2966,7 @@ test("#630 gate r2 P2: an unparseable or non-object body is FOREIGN by identity 
   try {
     for (const body of ["not-json{", JSON.stringify([1, 2, 3]), JSON.stringify(42), "null"]) {
       const orig = makeServer();
-      const guard = createScopedRunGuard({
+      const guard = createScopedRunGuard({ recoverDelayMs: 0,
         origFetchApi: orig, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
         repairScope: true,
       });
@@ -2996,7 +2996,7 @@ test("#630 gate r2 P2: a body that PARSED but is not a request object is not rep
     // End to end through the guard: an array body parses, and is classified as
     // a shape problem, not a parse problem and not an absent key.
     const orig = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: orig, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
     });
     // Marked via a top-level `number`… an array cannot carry one, so it is
@@ -3042,7 +3042,7 @@ test("#630 integration: repair is scoped to OUR OWN post — a stranger's scopel
   try {
     const apiTarget = { fetchApi: makeServer() };
     const orig = apiTarget.fetchApi;
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: orig,
       execIds: ["14"],
       contentHash: OUR_HASH,
@@ -3073,7 +3073,7 @@ test("#630 integration: an UNPARSEABLE own-post body is refused, not 'repaired' 
   try {
     const apiTarget = { fetchApi: makeServer() };
     const orig = apiTarget.fetchApi;
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: orig,
       execIds: ["14"],
       contentHash: OUR_HASH,
@@ -4050,7 +4050,7 @@ test("#659 guard: OUR marked post whose body lacks only a JSON-invisible input i
     "3": { class_type: "KSampler", inputs: { steps: 20, model: undefined } },
     "14": { class_type: "PreviewAny", inputs: {} },
   };
-  const guard = createScopedRunGuard({
+  const guard = createScopedRunGuard({ recoverDelayMs: 0,
     origFetchApi: spy,
     execIds: ["14"],
     contentHash: promptContentHash(outputAtQueue),
@@ -4073,7 +4073,7 @@ test("#659 guard: normalization is NOT tolerance — the previously-undefined in
     "3": { class_type: "KSampler", inputs: { steps: 20, model: undefined } },
     "14": { class_type: "PreviewAny", inputs: {} },
   };
-  const guard = createScopedRunGuard({
+  const guard = createScopedRunGuard({ recoverDelayMs: 0,
     origFetchApi: spy,
     execIds: ["14"],
     contentHash: promptContentHash(outputAtQueue),
@@ -4332,7 +4332,7 @@ test("#752 the repair keeps WHAT THE BODY CONTAINED, not just that it repaired",
   const stop = keepAlive();
   try {
     const server = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14,
       queueMark: MARK_A, repairScope: true,
     });
@@ -4359,7 +4359,7 @@ test("#752 the recorded keys are the FIRST repair's, not a growing list", async 
   const stop = keepAlive();
   try {
     const server = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 2, toNodeId: 14,
       queueMark: MARK_A, repairScope: true,
     });
@@ -4378,7 +4378,7 @@ test("#752 an unrepaired run reports no keys, rather than an empty list", async 
   const stop = keepAlive();
   try {
     const server = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14,
       queueMark: MARK_A, repairScope: true,
     });
@@ -4674,7 +4674,7 @@ test("#1782 exact-target fallback: a store-layer options object in the body is r
   const stop = keepAlive();
   try {
     const server = makeServer();
-    const guard = createScopedRunGuard({
+    const guard = createScopedRunGuard({ recoverDelayMs: 0,
       origFetchApi: server,
       execIds: ["14"],
       contentHash: OUR_HASH,
@@ -4920,7 +4920,7 @@ test("#1871 integration: an UNSCOPED run is never pruned — the caller asked fo
     // The unscoped path uses the historical capture wrap, which has no scope and no
     // prune: a full run that names a missing node is a real failure of what was asked.
     const rejections = [];
-    apiTarget.fetchApi = createRunFetchInterceptor({
+    apiTarget.fetchApi = createRunFetchInterceptor({ recoverDelayMs: 0,
       origFetchApi: server,
       onRejection: (r) => rejections.push(r),
     });
@@ -4989,7 +4989,7 @@ test("#1504 unscoped interceptor: a 200 with node_errors yields prompt_id + ACCE
   let rejection = null;
   const ids = [];
   const dropped = [];
-  const intercepted = createRunFetchInterceptor({
+  const intercepted = createRunFetchInterceptor({ recoverDelayMs: 0,
     origFetchApi: spy,
     onRejection: (r) => (rejection = r),
     onPromptId: (p) => ids.push(p),
@@ -5005,7 +5005,7 @@ test("#1504 unscoped interceptor: a clean 200 reports NO drops", async () => {
   // Empty / absent / non-object node_errors must never fire the partial disclosure.
   for (const node_errors of [undefined, null, {}, [], "no"]) {
     const dropped = [];
-    const intercepted = createRunFetchInterceptor({
+    const intercepted = createRunFetchInterceptor({ recoverDelayMs: 0,
       origFetchApi: makeServer(async () => jsonResponse(200, { prompt_id: "p1", node_errors })),
       onAcceptedNodeErrors: (ne) => dropped.push(ne),
     });
@@ -5019,7 +5019,7 @@ test("#1504 interceptor: a 400 rejection body is NOT reported as accepted drops"
   // the accepted-drops channel or the caller would be told a refused prompt is running.
   const dropped = [];
   let rejection = null;
-  const intercepted = createRunFetchInterceptor({
+  const intercepted = createRunFetchInterceptor({ recoverDelayMs: 0,
     origFetchApi: makeServer(async () => jsonResponse(400, { error: null, node_errors: PARTIAL_NODE_ERRORS })),
     onRejection: (r) => (rejection = r),
     onAcceptedNodeErrors: (ne) => dropped.push(ne),
