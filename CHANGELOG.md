@@ -9,6 +9,12 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_connect no longer overwrites an unrelated link (#2108). A link id is minted as
 
+## [0.15.164] - 2026-09-03
+
+### Fixed
+- The agent TODO tray can be collapsed from its Plan header (and re-expanded) so a forgotten panel_set_todo no longer pins up to 9rem of the chat column; empty panel_set_todo still clears it (#2165, #2219)
+
+
 ## [0.15.163] - 2026-09-03
 
 ### Fixed
