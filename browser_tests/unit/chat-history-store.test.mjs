@@ -38,7 +38,7 @@ function createMemoryStorage({ throwOnSet = null } = {}) {
 
 function createFakeIndexedDb(
   initialState = null,
-  { blockedThenSuccess = false, stores = ['snapshots'] } = {}
+  { blockedThenSuccess = false, stores = ['snapshots'], abortReadsAfterSuccess = false } = {}
 ) {
   // KEYED, like the real thing. This used to be a single slot: get() ignored the key
   // and put() replaced everything, so a SECOND key in a store silently destroyed the
@@ -70,6 +70,17 @@ function createFakeIndexedDb(
               const held = data.get(at(name, key))
               request.result = held === undefined ? undefined : structuredClone(held)
               request.onsuccess?.()
+              // A real readonly transaction COMPLETES once its requests finish.
+              // The double fired oncomplete only for writes, so any reader that
+              // (correctly) waits for the transaction rather than the request
+              // hung here -- a gap in the model, not in the code under test.
+              //
+              // `abortReadsAfterSuccess` models the case the review named: the
+              // request SUCCEEDS and the transaction aborts afterwards. A reader
+              // that settles on `onsuccess` reports that as canonical.
+              queueMicrotask(() =>
+                abortReadsAfterSuccess ? tx.onabort?.() : tx.oncomplete?.()
+              )
             })
             return request
           },
@@ -80,6 +91,7 @@ function createFakeIndexedDb(
                 .filter(([held]) => held.startsWith(name + ' :: '))
                 .map(([, value]) => structuredClone(value))
               request.onsuccess?.()
+              queueMicrotask(() => tx.oncomplete?.())
             })
             return request
           },
@@ -1882,6 +1894,21 @@ test('clear all fails closed when the canonical IndexedDB store is unavailable',
   assert.equal(result.retryable, true)
   assert.equal(result.code, 'history-clear-canonical-unavailable')
   assert.equal(storage.getItem(CHAT_HISTORY_LOCAL_SNAPSHOT_KEY), before)
+})
+
+test('an ABORTED canonical read is not authoritative, so no shadow promotion happens', async () => {
+  // The request SUCCEEDS and the transaction aborts afterwards. Resolving in
+  // `req.onsuccess` settled the promise first, which made the tx.onabort handler
+  // dead code and reported the aborted read as available -- so `load()` would
+  // promote a possibly-trimmed localStorage shadow as the write intent, which is
+  // precisely the reset this change exists to prevent (review of #2201).
+  const storage = createMemoryStorage()
+  const indexedDb = createFakeIndexedDb(null, { abortReadsAfterSuccess: true })
+  const store = new ChatHistoryStore({ storage, indexedDb })
+
+  const merged = await store.load()
+
+  assert.equal(merged.canonicalAvailable, false, 'an aborted read is not an available one')
 })
 
 test('blocked IndexedDB opens can continue to success and always close the connection', async () => {

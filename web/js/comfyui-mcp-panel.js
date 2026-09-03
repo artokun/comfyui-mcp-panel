@@ -46267,8 +46267,12 @@ function buildPanel() {
 
     // For the exact conversation already owned by this tab, sessionStorage is
     // authoritative even when empty. The stored id is only a full-restart fallback.
+    // The LIVE pointer, falling back to the mount-time capture. On the initial
+    // hydration these are the same value; on a DELAYED one they are not, and using
+    // the capture would revert a session that rotated while the retry waited.
+    const liveSessionId = ssGet(SESSION_KEY);
     const storedSessionId = durableActive.id === reloadThreadId
-      ? reloadSessionId
+      ? (liveSessionId ?? reloadSessionId)
       : (durableActive.sessionId || null);
     const boundSessionId = resumableSessionId({
       ...durableActive,
@@ -46303,6 +46307,13 @@ function buildPanel() {
         }
         await settingsHydrated;
         if (generation !== historyRestoreGeneration) return;
+        // The generation only moves on destroy(), so it cannot see a user who
+        // selected or created a chat while IndexedDB was recovering. Applying then
+        // would reselect the MOUNT-time thread, repaint its transcript over the one
+        // they are reading, and can fence an in-flight reply. The pointer is the
+        // evidence the generation is not: if it moved, this result is stale and the
+        // user's own choice wins.
+        if (ssGet(CURRENT_THREAD_KEY) !== reloadThreadId) return;
         applyHydratedHistory(loaded, true);
         return;
       } catch {

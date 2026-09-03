@@ -45,6 +45,10 @@ function createFakeIndexedDb(initialState = null) {
               const held = data.get(at(name, key))
               request.result = held === undefined ? undefined : structuredClone(held)
               request.onsuccess?.()
+              // A real readonly transaction COMPLETES once its requests finish;
+              // this double only did so for writes, which hung any reader that
+              // (correctly) waits for the transaction rather than the request.
+              queueMicrotask(() => tx.oncomplete?.())
             })
             return request
           },
@@ -55,6 +59,10 @@ function createFakeIndexedDb(initialState = null) {
                 .filter(([held]) => held.startsWith(name + ' :: '))
                 .map(([, value]) => structuredClone(value))
               request.onsuccess?.()
+              // A real readonly transaction COMPLETES once its requests finish;
+              // this double only did so for writes, which hung any reader that
+              // (correctly) waits for the transaction rather than the request.
+              queueMicrotask(() => tx.oncomplete?.())
             })
             return request
           },

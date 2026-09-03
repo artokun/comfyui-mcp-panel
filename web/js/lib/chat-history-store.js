@@ -1583,9 +1583,20 @@ async function idbRead(indexedDb) {
         resolve({ available: false, snapshot: null });
         return;
       }
+      // Availability is decided by the TRANSACTION, not the request. A `get` can
+      // succeed and its transaction abort afterwards; resolving in `onsuccess`
+      // settled the promise first and made these `tx` handlers dead code, so an
+      // ABORTED read was reported as canonical -- which is exactly what re-enables
+      // the destructive reset this change exists to prevent (review of #2201).
+      let outcome = { available: false, snapshot: null };
       const req = tx.objectStore("snapshots").get(CHAT_HISTORY_STATE_KEY);
-      req.onsuccess = () => resolve({ available: true, snapshot: req.result || null });
-      req.onerror = () => resolve({ available: false, snapshot: null });
+      req.onsuccess = () => {
+        outcome = { available: true, snapshot: req.result || null };
+      };
+      req.onerror = () => {
+        outcome = { available: false, snapshot: null };
+      };
+      tx.oncomplete = () => resolve(outcome);
       tx.onerror = () => resolve({ available: false, snapshot: null });
       tx.onabort = () => resolve({ available: false, snapshot: null });
     });
