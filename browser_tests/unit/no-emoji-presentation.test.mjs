@@ -30,18 +30,44 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PANEL_JS = readFileSync(join(HERE, "../../web/js/comfyui-mcp-panel.js"), "utf8");
+const WEB_JS = join(HERE, "../../web/js");
+const PANEL_JS = readFileSync(join(WEB_JS, "comfyui-mcp-panel.js"), "utf8");
 
-test("panel#2023 nothing REQUESTS emoji presentation", () => {
+/**
+ * EVERY shipped .js, not just the main bundle. The first version of this gate read
+ * `comfyui-mcp-panel.js` alone and passed while NINE more selectors sat in
+ * web/js/lib -- graph-revert, media-preview and run-completion-frame all RENDER
+ * theirs, so the crash surface the fix was meant to remove was still half there.
+ * One exit fixed, the siblings left.
+ *
+ * A pattern that must MATCH text containing the selector writes it as a
+ * backslash-uFE0F escape instead (see chat-serialize.js), so this stays a blanket
+ * rule with no exemption list to drift out of date.
+ */
+function shippedJsFiles(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...shippedJsFiles(full));
+    else if (entry.name.endsWith(".js")) out.push(full);
+  }
+  return out;
+}
+
+test("panel#2023 nothing REQUESTS emoji presentation, anywhere in web/js", () => {
   // U+FE0F forces the emoji face. U+FE0E (text presentation) is fine and is not
   // what this forbids — the point is not to demand a specific font file.
-  const forced = [...PANEL_JS].filter((c) => c === "️").length;
-  assert.equal(forced, 0, `${forced} U+FE0F (VARIATION SELECTOR-16) still in the bundle`);
+  const offenders = [];
+  for (const file of shippedJsFiles(WEB_JS)) {
+    const n = [...readFileSync(file, "utf8")].filter((c) => c === "️").length;
+    if (n > 0) offenders.push(`${file.slice(WEB_JS.length + 1)} (${n})`);
+  }
+  assert.deepEqual(offenders, [], `U+FE0F still shipped in: ${offenders.join(", ")}`);
 });
 
 test("panel#2023 the warning glyph itself is still there", () => {

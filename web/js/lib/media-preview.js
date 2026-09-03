@@ -968,7 +968,7 @@ async function buildSampledPreview(job, deps) {
       sampled: true,
     },
     note:
-      `📽️ ${job.name} — you were NOT shown this video. What exists for you is a SAMPLED PREVIEW of it: ` +
+      `📽 ${job.name} — you were NOT shown this video. What exists for you is a SAMPLED PREVIEW of it: ` +
       `${sheetClause(n, cells)}, built in the browser (its ${size}). ` +
       `${spacingClause(n, cells)} — they are NOT its frame count, ` +
       `its duration, or its frame rate, so do not describe the video as ${n} frames long, and do not ` +

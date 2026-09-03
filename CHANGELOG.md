@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
 
+- the emoji-presentation removal now covers every shipped web/js file rather than the main bundle alone (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
 ## [0.15.163] - 2026-09-03
 
 ### Fixed

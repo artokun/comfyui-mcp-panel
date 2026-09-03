@@ -284,9 +284,32 @@ test("#1310 hidden orchestrator notes and validation banners strip", () => {
   );
   assert.equal(
     stripAgentDirectedBlocks(
+      // Deliberately the OLD spelling with U+FE0F: chat persisted before #2023
+      // still carries it, and the strip patterns must keep matching both.
       "⚠️ GRAPH VALIDATION ERRORS — ComfyUI rejected the current graph at queue time;\n  node 1\nAddress these before running.\n\nfix it",
     ),
     "fix it",
+  );
+});
+
+test("#2023 the warning prefixes strip in the CURRENT spelling, without U+FE0F", () => {
+  // The regression this pins: #2023 dropped the selector from what the panel EMITS,
+  // but these three patterns still REQUIRED it -- so they matched nothing, and the
+  // agent-only blocks this list exists to hide started reaching the user, who reads
+  // the shouty grammar as a broken install. Both spellings must strip.
+  assert.equal(
+    stripAgentDirectedBlocks(
+      "\u26A0 GRAPH VALIDATION ERRORS -- rejected at queue time;\n  node 1\n\nfix it",
+    ),
+    "fix it",
+  );
+  assert.equal(
+    stripAgentDirectedBlocks("\u26A0 MISSING ASSETS -- RED nodes.\n\nwhat now"),
+    "what now",
+  );
+  assert.equal(
+    stripAgentDirectedBlocks("\u26A0 LAST RUN FAILED: boom\n\nplease help"),
+    "please help",
   );
 });
 
