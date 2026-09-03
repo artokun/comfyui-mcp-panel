@@ -2146,6 +2146,29 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
           if (state.signedIn) {
             toast(tr("civitai_ui.signed_in_to_civitai", "Signed in to CivitAI."));
             if (tabDef().fav) reload();
+          } else {
+            // #2044 — this branch used to do NOTHING. Four minutes of polling, then
+            // silence, while the popup showed a bare browser 403 that ComfyUI never
+            // logged. The user is left with no statement that sign-in failed, let
+            // alone why.
+            //
+            // What is ASSERTED here is only what was observed: the token never
+            // arrived. The cause is offered as the known one rather than as a
+            // finding — the popup is cross-origin, so this code cannot read its
+            // status, and claiming a 403 it did not see would be the same overreach
+            // the silence replaced. On a stock ComfyUI it is the right guess:
+            // `create_origin_only_middleware` rejects the cross-site redirect back
+            // from CivitAI with a 403 on the one branch that logs nothing, and it is
+            // installed by default whenever `--enable-cors-header` is absent.
+            //
+            // The remedy named is the one that works today and needs no flag: the
+            // panel already accepts a CivitAI API token server-side.
+            toast(
+              tr(
+                "civitai_ui.sign_in_timed_out",
+                "CivitAI sign-in did not complete. If the popup showed a 403, ComfyUI's cross-site protection blocked the redirect back — it rejects that request without logging anything. Use a CivitAI API token in Settings instead (see panel#2044).",
+              ),
+            );
           }
         }
       }, 2000);
