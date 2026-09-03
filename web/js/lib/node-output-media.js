@@ -15,6 +15,10 @@
 const STANDARD_MEDIA_KEYS = ["images", "gifs", "videos"];
 const STANDARD_MEDIA_KEY_SET = new Set(STANDARD_MEDIA_KEYS);
 const MEDIA_KEY_SUFFIX = /(?:images|gifs|videos)$/;
+// Same extension list the panel's `isVideoOutput` uses when `format` is absent.
+// Kept here so collectNodeOutputMedia can admit a custom-key saved video without
+// importing the panel bundle, and so the two cannot drift on the NKD recurrence.
+const VIDEO_FILENAME = /\.(mp4|webm|mov|mkv|m4v|avi)$/i;
 
 /**
  * #2126 — ComfyUI's own AUDIO bag, and a THIRD outcome next to deliverable and
@@ -170,6 +174,22 @@ export function isMediaDescriptor(entry) {
 }
 
 /**
+ * A ComfyUI `/view` descriptor that is a VIDEO rather than a still.
+ *
+ * Mirrors the panel's `isVideoOutput`: honour `format` first (`video/*` vs
+ * `image/*`, so an animated gif stays an image), then fall back to the
+ * filename extension. Used to lift a saved MP4 off an unrecognised key
+ * (NKDVideoViewer's `nkd_video`) onto the existing video path (#2128).
+ */
+export function isVideoMediaDescriptor(entry) {
+  if (!isMediaDescriptor(entry)) return false;
+  const fmt = String(entry.format || "").toLowerCase();
+  if (fmt.startsWith("video/")) return true;
+  if (fmt.startsWith("image/")) return false;
+  return VIDEO_FILENAME.test(entry.filename);
+}
+
+/**
  * Split one node's `executed` / `/history` outputs bag.
  *
  * `deliverable` is the existing three-key harvest (filename present is enough,
@@ -233,6 +253,7 @@ export function collectNodeOutputMedia(out) {
   const keys = [];
   const types = [];
   let count = 0;
+  let outputCount = 0;
   for (const [key, bag] of Object.entries(out)) {
     // Every key harvested above onto its own channel, so a single output cannot be
     // reported once as content and again as withheld. Only the standard three can
@@ -243,11 +264,29 @@ export function collectNodeOutputMedia(out) {
     if (key === AUDIO_MEDIA_KEY || key === MODEL_3D_MEDIA_KEY || key === MODEL_3D_RESULT_KEY) {
       continue;
     }
-    if (!Array.isArray(bag) || !MEDIA_KEY_SUFFIX.test(key)) continue;
+    if (!Array.isArray(bag)) continue;
+    const suffixKey = MEDIA_KEY_SUFFIX.test(key);
     let keyCount = 0;
     for (const m of bag) {
       if (!isMediaDescriptor(m)) continue;
+      // #2128 recurrence — NKDVideoViewer (and similar custom save nodes) put a
+      // real `{filename, subfolder, type:"output"}` descriptor under a key that
+      // does not end in images/gifs/videos (`nkd_video`). The suffix scan missed
+      // it, so a saved MP4 was invisible and the completion claimed no saved
+      // output node ran. Saved videos on those keys join `deliverable` so the
+      // existing storyboard path names them. Temps on unknown keys stay ignored
+      // so a random bag cannot invent a CompareFrames-scale dump. Other saved
+      // descriptors on unknown keys are counted as withheld so the stills note
+      // can see that a saved output ran without attaching unknown media.
+      if (!suffixKey) {
+        if (m.type === "output" && isVideoMediaDescriptor(m)) {
+          deliverable.push(m);
+          continue;
+        }
+        if (m.type !== "output") continue;
+      }
       keyCount += 1;
+      if (m.type === "output") outputCount += 1;
       if (m.type && !types.includes(m.type)) types.push(m.type);
     }
     if (keyCount) {
@@ -256,7 +295,12 @@ export function collectNodeOutputMedia(out) {
     }
   }
 
-  return { deliverable, audio, models3d, withheld: count ? { count, keys, types } : null };
+  return {
+    deliverable,
+    audio,
+    models3d,
+    withheld: count ? { count, keys, types, ...(outputCount > 0 ? { outputCount } : {}) } : null,
+  };
 }
 
 /**
@@ -317,11 +361,22 @@ export function mergeWithheldMedia(a, b) {
   for (const key of right.keys) if (!keys.includes(key)) keys.push(key);
   const types = [...left.types];
   for (const type of right.types) if (!types.includes(type)) types.push(type);
-  return { count: left.count + right.count, keys, types };
+  const outputCount = (left.outputCount ?? 0) + (right.outputCount ?? 0);
+  return {
+    count: left.count + right.count,
+    keys,
+    types,
+    ...(outputCount > 0 ? { outputCount } : {}),
+  };
 }
 
 function cloneWithheld(summary) {
-  return { count: summary.count, keys: [...summary.keys], types: [...summary.types] };
+  return {
+    count: summary.count,
+    keys: [...summary.keys],
+    types: [...summary.types],
+    ...(summary.outputCount > 0 ? { outputCount: summary.outputCount } : {}),
+  };
 }
 
 function formatKeyList(keys) {
