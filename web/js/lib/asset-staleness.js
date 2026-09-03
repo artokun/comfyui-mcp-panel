@@ -13,6 +13,7 @@
  */
 
 import { authoritativeComboValues, parseAnnotatedFilepath } from "./input-asset.js";
+import { isFrontendVirtualNode } from "./frontend-virtual-nodes.js";
 
 // mcp#1940 — `authoritativeComboValues` moved to the LEAF module input-asset.js so
 // `serverDeclaresEmptyComboOptions` (which lives there) can share the one canonical
@@ -351,6 +352,318 @@ export function combineNodeErrorMaps(nodeErrorsMaps) {
     }
   }
   return Object.keys(combined).length ? combined : null;
+}
+
+/** Read a link record out of a LiteGraph link store (Map in newer builds, object in older). */
+function lookupLink(links, linkId) {
+  if (links == null || linkId == null) return null;
+  return typeof links.get === "function" ? links.get(linkId) ?? null : links[linkId] ?? null;
+}
+
+/**
+ * True when this live node is one the prompt compiler would name as a link source.
+ *
+ * The frontend's serializer states the rule exactly (quoted in frontend-virtual-nodes.js):
+ *
+ *     if (e.isVirtualNode || e.mode === NEVER || e.mode === BYPASS) continue;
+ *
+ * so a Reroute, a Get/Set bus node, a subgraph container (also `isVirtualNode`), a MUTED
+ * node or a BYPASSED one never appears in the prompt — the type the input actually
+ * receives comes from further upstream, and this node's own output type is not evidence
+ * about it. Positive proof only: an unresolvable node answers false, i.e. keep the error.
+ */
+function originIsNamedInPrompt(originNode) {
+  if (!originNode || typeof originNode !== "object") return false;
+  if (isFrontendVirtualNode(originNode)) return false;
+  const mode = originNode.mode;
+  // 2 = NEVER (mute), 4 = BYPASS. `undefined`/0 is an ordinary always-execute node.
+  if (mode === 2 || mode === 4) return false;
+  return true;
+}
+
+/**
+ * True when the live graph proves a `return_type_mismatch` has been REPAIRED.
+ *
+ * ## Why this asks about types and not about the link the error names
+ *
+ * The obvious reading of `extra_info.linked_node` is "the error is about this link; if the
+ * input is fed by something else now, the error is stale". Four review rounds killed that
+ * reading, each for a different reason, and they share one cause: **`linked_node` is a
+ * coordinate in the COMPILED prompt and the panel only has the RAW graph.** The compiler
+ * flattens subgraphs, renames dynamic slots, and resolves through every virtual, muted and
+ * bypassed node, so "the link changed" and "the graph was repaired" are simply different
+ * questions. Worse, the final round showed the reading is not even sound when the link
+ * genuinely did change: moving an input from output 0 to output 1 of the SAME node repairs
+ * nothing when both outputs are `IMAGE`, yet the named link is now different.
+ *
+ * So the question this asks is the one that actually determines the verdict, and it is
+ * entirely local: **does the input's own type now exactly equal the type of the output
+ * feeding it?** If it does, ComfyUI cannot produce this mismatch from this graph — the
+ * repair is proven, whatever route the link took to get there. If it does not, the error
+ * is kept, and that covers every case the earlier reading got wrong for free:
+ *
+ *   - fed by a different node that still produces `IMAGE` — types still disagree → kept;
+ *   - moved to another same-typed output of the same node → kept (the round-6 case);
+ *   - fed through a reroute / bypass whose own output type is not the effective one →
+ *     `originIsNamedInPrompt` refuses to read it → kept;
+ *   - now unconnected → there is no source type to prove anything with → kept. (This also
+ *     retires an earlier judgement call: a disconnected input used to be treated as a
+ *     repair, which reported clean on a graph that may still be broken.)
+ *
+ * EXACT equality only. ComfyUI's own `validate_node_input` understands wildcards and
+ * comma-separated unions, and re-implementing it here would be a second compiler to get
+ * wrong; an identical string is the one case that needs no interpretation. A `*` on either
+ * side, an unreadable type, or a missing slot all answer false — the error is kept.
+ */
+function nodeErrorMismatchRepaired(node, error) {
+  // ONLY `return_type_mismatch`. Exactly two error types in execution.py carry a
+  // `linked_node`, and they file it under DIFFERENT nodes:
+  //
+  //   return_type_mismatch          → `errors.append(error)` — recorded on the node being
+  //                                   validated, so `input_name` IS an input of that node.
+  //                                   This function's whole premise.
+  //   exception_during_inner_validation
+  //                                 → `validated[o_id] = (False, reasons, o_id)` — recorded
+  //                                   on the UPSTREAM node, while `input_name` names an
+  //                                   input of the DOWNSTREAM one. Read with the premise
+  //                                   above it finds a same-named input on the wrong node.
+  //
+  // A whitelist rather than a blocklist, so an error type this panel has never seen — a
+  // newer ComfyUI's, or a custom validator's — is never judged by semantics borrowed from
+  // a different one.
+  if (error?.type !== "return_type_mismatch") return false;
+  const inputName = error?.extra_info?.input_name;
+  if (typeof inputName !== "string" || !inputName) return false;
+
+  const inputs = Array.isArray(node?.inputs) ? node.inputs : null;
+  if (!inputs) return false;
+  // A slot the live node does not have (renamed by a dynamic pack's position-based
+  // re-slotting, #1873) leaves the error unjudgeable — never repaired by absence.
+  const input = inputs.find((i) => i?.name === inputName);
+  if (!input) return false;
+  const inputType = readableSlotType(input);
+  if (!inputType) return false;
+  // The socket types read below are the FRONTEND's, from the node def this tab loaded.
+  // A pack update plus a reconnect can move the server ahead of them, and then an
+  // apparently-matching frontend type says nothing about what the server will accept
+  // (codex gate round 7). The error itself carries the server's own word on it:
+  // `extra_info.input_config` is execution.py's `info = (input_type, extra_info)`, so
+  // element 0 is the input type the SERVER validated against. Requiring the live socket
+  // to still agree with it turns "the frontend believes X" into "the frontend and the
+  // server agreed on X at queue time", which is what the proof below needs.
+  //
+  // Absent or non-string (a combo input's `input_type` is the option LIST, not a name)
+  // means there is nothing to corroborate against, so no proof is available — keep.
+  const serverInputType = error.extra_info.input_config?.[0];
+  if (typeof serverInputType !== "string" || serverInputType !== inputType) return false;
+  if (input.link == null) return false; // nothing feeds it ⇒ no source type ⇒ no proof
+
+  const links = node?.graph?.links;
+  if (links == null) return false;
+  const link = lookupLink(links, input.link);
+  if (link == null) return false;
+  const originId = link.origin_id ?? link[1];
+  if (originId == null) return false;
+  const originSlot = link.origin_slot ?? link[2];
+  if (!Number.isInteger(originSlot)) return false;
+
+  const source = node?.graph?.getNodeById?.(originId) ?? null;
+  if (!originIsNamedInPrompt(source)) return false;
+  const outputType = readableSlotType(source?.outputs?.[originSlot]);
+  if (!outputType) return false;
+
+  return outputType === inputType;
+}
+
+/** A slot's declared type, or "" when it is absent, non-string, or the `*` wildcard. */
+function readableSlotType(slot) {
+  const type = slot?.type;
+  if (typeof type !== "string") return "";
+  const trimmed = type.trim();
+  return !trimmed || trimmed === "*" ? "" : trimmed;
+}
+
+/**
+ * Drop validation-map entries that the LIVE graph CONTRADICTS (#2192).
+ *
+ * `node_errors` is the raw union of `app.lastNodeErrors` and the execution-error
+ * store — a snapshot of the LAST queue rejection, which the frontend only replaces on
+ * the NEXT queue attempt. Every other source `graph_get_errors` reports is correlated
+ * against the live graph before it ships: missing assets through `isStaleAssetCandidate`
+ * (still-referenced + active-graph scope, #316), the runtime failure by node id AND
+ * class type (#1448) with scoped-locator resolution (#1685). The validation map never
+ * was, so a `return_type_mismatch` naming a link the user has since repaired is echoed
+ * verbatim forever. It does not even reach the per-node join, because its key is a
+ * SCOPED locator ("249:252") that never string-equals a visible node's own id — which
+ * is how `errored_count: 0` came to ship beside a populated, contradicting `node_errors`.
+ *
+ * TWO checks, both requiring a RESOLVED live node and POSITIVE contradicting evidence:
+ *
+ *   1. the live node's class is not the entry's `class_type` — ComfyUI reuses ids across
+ *      workflows (#1448, applied to validation errors);
+ *   2. per error, `nodeErrorMismatchRepaired` above — the input the error names now
+ *      receives exactly the type it declares, so this mismatch cannot be produced from
+ *      this graph. Sibling errors on the same entry are untouched; an entry whose errors
+ *      ALL prove repaired is removed.
+ *
+ * An id that does NOT resolve is left alone — see the note on
+ * `classifyContradictedNodeError` for why that is load-bearing rather than lenient.
+ *
+ * Nothing here expires an entry by age, by a save, or by a re-read — only by
+ * contradiction. Every unexpected shape, unresolvable locator or unreadable link fails
+ * OPEN (keeps the error), so a genuine rejection is never swallowed.
+ *
+ * Returns `{ nodeErrors, dropped }`. `nodeErrors` is null when nothing survives, so the
+ * caller's `clean` verdict and its note are computed on the CORRECTED map; `dropped`
+ * carries one record per removed entry for in-band disclosure.
+ */
+export function pruneContradictedNodeErrors(rootGraph, nodeErrors) {
+  const dropped = [];
+  if (!nodeErrors || typeof nodeErrors !== "object" || Array.isArray(nodeErrors)) {
+    return { nodeErrors: nodeErrors ?? null, dropped };
+  }
+  // Redundant since neither remaining check can fire without a resolved node, and kept
+  // deliberately: it states at the entry point that no graph means no verdict, so a
+  // future check that reads absence cannot be added without meeting this line first.
+  if (!rootGraph) return { nodeErrors, dropped };
+  const kept = {};
+  for (const [id, entry] of Object.entries(nodeErrors)) {
+    let verdict = null;
+    try {
+      verdict = classifyContradictedNodeError(rootGraph, id, entry);
+    } catch {
+      verdict = null; // any throw ⇒ report the entry verbatim
+    }
+    if (!verdict) {
+      kept[id] = entry;
+      continue;
+    }
+    if (verdict.entry) kept[id] = verdict.entry;
+    dropped.push({
+      node_id: id,
+      ...(typeof entry?.class_type === "string" && entry.class_type
+        ? { class_type: entry.class_type }
+        : {}),
+      contradicted_by: verdict.reason,
+      // THE ERRORS THEMSELVES, in full. This is what stops a judgement here from
+      // destroying anything: an entry is not deleted, it is moved out of "errors the
+      // graph has right now" into "recorded at the last queue attempt, and the live
+      // graph disagrees". Every judgement rests on the FRONTEND's view of the graph,
+      // and a node def the tab loaded can fall behind the server's (a pack update plus
+      // a reconnect); carrying the payload makes the worst case of a wrong judgement a
+      // mislabelled error the caller can still read in full, rather than a lost one.
+      //
+      // Precisely: nothing is dropped SILENTLY. The caller's list of these is capped
+      // like every sibling list in that payload, and a cut is reported with the true
+      // total (`stale_node_errors_truncated` + its hint) — an honest cut, not a
+      // guarantee of unbounded delivery.
+      ...(verdict.errors?.length ? { errors: verdict.errors } : {}),
+    });
+  }
+  return { nodeErrors: Object.keys(kept).length ? kept : null, dropped };
+}
+
+/**
+ * Adjudicate each INDEPENDENT validation map on its own, then union the survivors.
+ *
+ * Order matters, and getting it backwards loses live errors (codex gate P1, reproduced).
+ * `combineNodeErrorMaps` merges same-id entries with `{...previous, ...entry}`, so the
+ * LAST map's `class_type` governs the merged entry while its `errors` array holds BOTH
+ * maps' errors. Pruning after that merge let one source's label decide the other
+ * source's fate: with a live `{2:{class_type:"Current",errors:[…]}}` in `app.lastNodeErrors`
+ * and a retained `{2:{class_type:"OldWorkflowType",errors:[…]}}` in the execution store,
+ * the class-type check saw a type the live node does not have and dropped the whole
+ * entry — `node_errors: null`, `errored_count: 0`, with a real error suppressed.
+ *
+ * Pruning FIRST keeps every entry paired with the `class_type` its own source recorded,
+ * which is the only label that says anything about its own errors. A stale store entry is
+ * then dropped alone and the live app entry survives untouched.
+ *
+ * `dropped` is deduplicated on (node id, reason): the same stale entry retained by both
+ * stores is one withheld fact, not two. A node can legitimately appear in BOTH the
+ * returned map and `dropped` — one of its recorded errors was contradicted and another
+ * was not — which is reported rather than hidden.
+ */
+export function pruneContradictedNodeErrorMaps(rootGraph, nodeErrorsMaps) {
+  const maps = Array.isArray(nodeErrorsMaps) ? nodeErrorsMaps : [nodeErrorsMaps];
+  const pruned = [];
+  const dropped = [];
+  const seen = new Map();
+  for (const map of maps) {
+    const result = pruneContradictedNodeErrors(rootGraph, map);
+    pruned.push(result.nodeErrors);
+    for (const record of result.dropped) {
+      // JSON-encoded pair, not a delimiter join: both halves are free-form strings and
+      // any separator character could occur inside one of them.
+      const key = JSON.stringify([record.node_id, record.contradicted_by]);
+      const existing = seen.get(key);
+      if (!existing) {
+        seen.set(key, record);
+        dropped.push(record);
+        continue;
+      }
+      // Same node and same reason — one withheld FACT — but the two stores can hold
+      // DIFFERENT errors that reduce to it. Skipping the second record here would
+      // discard them, breaking the non-loss guarantee inside the very step meant to
+      // tidy the list (codex gate round 9). Union instead, by identity, exactly as
+      // `combineNodeErrorMaps` does: a duplicate is noise, a dropped error is a defect.
+      const merged = Array.isArray(existing.errors) ? [...existing.errors] : [];
+      for (const error of record.errors ?? []) {
+        if (!merged.includes(error)) merged.push(error);
+      }
+      if (merged.length) existing.errors = merged;
+    }
+  }
+  return { nodeErrors: combineNodeErrorMaps(pruned), dropped };
+}
+
+/**
+ * Null when the entry must be reported as-is; otherwise `{ reason, entry }` where
+ * `entry` is the surviving remnant (null when the whole entry goes). Split out so both
+ * checks read in falsification order and each one's fail-open path is visible.
+ *
+ * NOTE ON WHAT IS DELIBERATELY *NOT* CHECKED. An earlier revision also dropped an entry
+ * whose recognized locator resolved to NO node, on the #316 reasoning that these stores
+ * survive a workflow-tab switch. That check produced two separate P1s in review, both the
+ * same mistake: a node that does not resolve is not a node that does not EXIST. It fails
+ * to resolve when the root graph is null (validationBanner's `getGraphCtx()` probe is
+ * try/catch-wrapped and yields null by design), and equally when the graph is momentarily
+ * EMPTY — ComfyUI clears and repopulates `_nodes` while loading a workflow, so a real
+ * rejection would be dropped and the banner would go silent mid-load.
+ *
+ * The check is gone rather than hardened, because no amount of hardening changes its
+ * shape: it is the only one that reads ABSENCE as evidence, and it was never what this
+ * issue needed — a stale cross-tab entry is over-reporting, which is the safe direction
+ * and the pre-existing behaviour. Both surviving checks require a RESOLVED live node and
+ * positive contradicting data, so an unresolvable id now simply leaves its entry alone.
+ */
+function classifyContradictedNodeError(rootGraph, id, entry) {
+  const node = findNodeByScopedId(rootGraph, id);
+  // Absence of a node is absence of evidence — never a verdict. See the note above.
+  if (node == null) return null;
+  // `class_type` comes from `node.comfyClass`, NOT `node.type` — the frontend's prompt
+  // compiler writes `class_type: e.comfyClass` (verified in the 1.49.6 bundle), and the
+  // two have genuinely different sources at registration: `registerNodeType(n.id, i)`
+  // sets the type while `i.comfyClass = t.name` sets the class. Comparing against `type`
+  // alone dropped live errors on any node where they diverge (codex gate round 2).
+  // Matching EITHER counts as agreement, which is the fail-open direction.
+  const claimedType = typeof entry?.class_type === "string" ? entry.class_type : "";
+  const liveTypes = [node?.comfyClass, node?.type].filter((t) => typeof t === "string" && t);
+  if (claimedType && liveTypes.length && !liveTypes.includes(claimedType)) {
+    return {
+      reason: `node ${id} is a ${liveTypes[0]} now, not the ${claimedType} this error is about`,
+      entry: null,
+      errors: Array.isArray(entry?.errors) ? entry.errors : [],
+    };
+  }
+  const errors = Array.isArray(entry?.errors) ? entry.errors : null;
+  if (!errors || !errors.length) return null;
+  const survivors = errors.filter((e) => !nodeErrorMismatchRepaired(node, e));
+  if (survivors.length === errors.length) return null;
+  const falsified = errors.filter((e) => nodeErrorMismatchRepaired(node, e));
+  const inputs = [...new Set(falsified.map((e) => e?.extra_info?.input_name))].join(", ");
+  const reason = `${inputs} on node ${id} now receives the type it declares`;
+  return { reason, entry: survivors.length ? { ...entry, errors: survivors } : null, errors: falsified };
 }
 
 /**

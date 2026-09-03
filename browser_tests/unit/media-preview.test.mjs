@@ -20,6 +20,7 @@ import {
   MEDIA_PREVIEW_TIMEOUT_MS,
   MEDIA_SIZE_PROBE_TIMEOUT_MS,
   MEDIA_VIEW_PROBE_TIMEOUT_MS,
+  normalizeComfyViewRef,
 } from "../../web/js/lib/media-preview.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 
@@ -193,6 +194,78 @@ test("an image-only call paints exactly as before and claims no sampled preview"
   assert.equal(reply.painted, 2);
   assert.doesNotMatch(reply.note, /SAMPLED PREVIEW/);
   assert.doesNotMatch(reply.note, /contact sheet/);
+});
+
+test("#2193: a combined video/ output filename is split for ComfyUI /view", () => {
+  const combined = normalizeComfyViewRef({
+    filename: "video/H3_final_refined_2MP_00007_.mp4",
+    type: "output",
+  });
+  assert.equal(combined.filename, "H3_final_refined_2MP_00007_.mp4");
+  assert.equal(combined.subfolder, "video");
+  assert.equal(combined.type, "output");
+
+  const alreadySplit = normalizeComfyViewRef({
+    filename: "H3_final_refined_2MP_00007_.mp4",
+    subfolder: "video",
+    type: "output",
+  });
+  assert.equal(alreadySplit.filename, "H3_final_refined_2MP_00007_.mp4");
+  assert.equal(alreadySplit.subfolder, "video");
+
+  const duplicated = normalizeComfyViewRef({
+    filename: "video/H3_final_refined_2MP_00007_.mp4",
+    subfolder: "video",
+    type: "output",
+  });
+  assert.equal(duplicated.filename, "H3_final_refined_2MP_00007_.mp4");
+  assert.equal(duplicated.subfolder, "video", "must not become video/video");
+
+  const nested = normalizeComfyViewRef({
+    filename: "renders/final/clip.mp4",
+    type: "output",
+  });
+  assert.equal(nested.filename, "clip.mp4");
+  assert.equal(nested.subfolder, "renders/final");
+});
+
+test("#2193: panel_show_media must not /view 404 a valid video/ output reference", async () => {
+  const probes = [];
+  const h = harness({
+    probeMedia: async (url, ref) => {
+      probes.push({ url, filename: ref.filename, subfolder: ref.subfolder });
+      // ComfyUI /view basename()s filename and looks only under subfolder.
+      // A combined filename with empty subfolder 404s even when the file exists.
+      const parsed = new URL(url, "http://comfy.local");
+      const filename = parsed.searchParams.get("filename") || "";
+      const subfolder = parsed.searchParams.get("subfolder") || "";
+      if (filename.includes("/")) {
+        return { ok: false, reason: "/view returned HTTP 404" };
+      }
+      if (filename === "H3_final_refined_2MP_00007_.mp4" && subfolder === "video") {
+        return { ok: true };
+      }
+      return { ok: false, reason: "/view returned HTTP 404" };
+    },
+  });
+  const reply = await composeShowMediaReply(
+    [{
+      kind: "viewRef",
+      viewRef: { filename: "video/H3_final_refined_2MP_00007_.mp4", type: "output" },
+      filename: "video/H3_final_refined_2MP_00007_.mp4",
+    }],
+    h.deps,
+  );
+
+  assert.equal(probes.length, 1, "the panel must probe the same /view URL it would paint");
+  assert.equal(probes[0].filename, "H3_final_refined_2MP_00007_.mp4");
+  assert.equal(probes[0].subfolder, "video");
+  assert.match(probes[0].url, /filename=H3_final_refined_2MP_00007_\.mp4/);
+  assert.match(probes[0].url, /subfolder=video/);
+  assert.doesNotMatch(probes[0].url, /filename=video%2F|filename=video\//);
+  assert.equal(reply.painted, 1, "a valid output video must not be dropped as a /view 404");
+  assert.equal(h.calls.paintedVideos.length, 1);
+  assert.doesNotMatch(reply.note ?? "", /HTTP 404/);
 });
 
 test("a remote /view outage is dropped before it can be counted as painted (#1620)", async () => {
@@ -1335,7 +1408,7 @@ test("the show_media dispatcher answers with the handler's reply, not a fixed ac
   const src = panelSource();
   assert.match(
     src,
-    /import \{ composeShowMediaReply \} from "\.\/lib\/media-preview\.js";/,
+    /import \{ composeShowMediaReply, normalizeComfyViewRef \} from "\.\/lib\/media-preview\.js";/,
     "the panel must import the reply composer",
   );
   const i = src.indexOf('msg.cmd === "show_media"');
@@ -1423,6 +1496,15 @@ test("onShowMedia routes through composeShowMediaReply with the storyboard pipel
   for (const dep of ["paintAudio", "paintFileLink"]) {
     assert.ok(handler[0].includes(dep), `onShowMedia must pass ${dep} through (#710)`);
   }
+});
+
+test("#2193: imageViewUrl splits a combined video/ filename before building /view", () => {
+  const fn = panelFunctionBody(panelSource(), "function imageViewUrl(");
+  assert.match(
+    fn,
+    /normalizeComfyViewRef/,
+    "onExecuted / run-completion /view URLs must split video/ the same way show_media does",
+  );
 });
 
 test("the #1620 /view probe uses the panel browser session and the same media URL", () => {

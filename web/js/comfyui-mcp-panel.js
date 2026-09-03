@@ -214,7 +214,11 @@ import {
   pruneGroundingIdentities,
   groundedWorkflowPath,
 } from "./lib/workflow-chat-identity.js";
-import { decideWorkflowSaveVerdict, workflowSaveRefusalError } from "./lib/save-path-guard.js";
+import {
+  decideWorkflowSaveVerdict,
+  rebindForeignStampIfIdentityMatches,
+  workflowSaveRefusalError,
+} from "./lib/save-path-guard.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
@@ -228,6 +232,7 @@ import {
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
+  pruneContradictedNodeErrorMaps,
   graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
@@ -372,7 +377,7 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
-import { objectInfoSnapshotProbeDeadline } from "./lib/object-info-probe-budget.js";
+import { objectInfoSnapshotProbeDeadline, objectInfoFetchBudgetMs } from "./lib/object-info-probe-budget.js";
 import {
   fetchWholeObjectInfo,
   objectInfoOracleFailureNote,
@@ -860,7 +865,7 @@ import {
   stripMisattachedExecutionPreviews,
 } from "./lib/execution-preview-attach.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
-import { composeShowMediaReply } from "./lib/media-preview.js";
+import { composeShowMediaReply, normalizeComfyViewRef } from "./lib/media-preview.js";
 import { appendImageCacheBust, appendStoryboardCacheBust, createStoryboardIdentity } from "./lib/storyboard-cache-identity.js";
 import {
   bindSourcePlayback,
@@ -1628,6 +1633,13 @@ function monotonicNow() {
 // unit-testable rather than loose module state in this bundle.
 const objectInfoHistory = createObjectInfoHistory();
 const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
+// #2050 — last successful whole-schema duration on this tab, so the next add can wait
+// that long instead of the warm-install 10s floor. Zero until a fetch actually lands.
+let lastWholeObjectInfoMs = 0;
+function noteWholeObjectInfoDuration(startedAt) {
+  const elapsed = monotonicNow() - startedAt;
+  if (Number.isFinite(elapsed) && elapsed > 0) lastWholeObjectInfoMs = elapsed;
+}
 // ONLY seedObjectInfoHistory() may call this. See the RECORD ONLY note in
 // registerComfyNodeDefs: any observation taken after an unobserved window cannot support
 // the "never backend-defined this session" claim a baseline makes.
@@ -1669,8 +1681,10 @@ function seedObjectInfoHistory() {
           // out — found no snapshot and was refused exactly as before the fix.
           const observedAtEpoch = backendReconnectEpoch;
           const observedAtGeneration = verifiedNodeDefCache.generation();
+          const fetchStartedAt = monotonicNow();
           const defs = await api.getNodeDefs();
           if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
+            noteWholeObjectInfoDuration(fetchStartedAt);
             const currentEpoch = backendReconnectEpoch;
             const currentGeneration = verifiedNodeDefCache.generation();
             if (currentEpoch !== observedAtEpoch || currentGeneration !== observedAtGeneration) continue;
@@ -3037,7 +3051,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // could never catch the real failure, that set-version.mjs was not run at all,
 // since one script writes them together. That is how 0.15.86..0.15.96 shipped
 // still announcing 0.15.85.
-const PANEL_VERSION = "0.15.159";
+const PANEL_VERSION = "0.15.162";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at
@@ -4694,6 +4708,35 @@ function installSavePathGuard(appRef) {
           // never be looking at different things.
           snapshotIsStale: saveWouldPersistStaleSnapshot(wf, state),
         });
+        // #2194 — leftover nested workflow_path on THIS tab's uuid. Restamp the
+        // snapshot (and the live extra when it carries the same uuid) so save
+        // does not send the caller through panel_open_workflow, whose ImpactSwitch
+        // restore can dead-end. Fail closed when uuid is missing or disagrees.
+        // `typeof` keeps a sliced test installer fail-closed if the helper is not
+        // injected — a throw here would hit the outer catch and ALLOW the write.
+        if (
+          verdict?.allow === false &&
+          verdict.reason === "stamped_path_foreign" &&
+          typeof rebindForeignStampIfIdentityMatches === "function" &&
+          rebindForeignStampIfIdentityMatches({
+            state,
+            destinationPath: wf?.path ?? null,
+            destinationUuid: typeof workflowObjectUuid === "function" ? workflowObjectUuid(wf) || null : null,
+          })
+        ) {
+          try {
+            const destUuid = typeof workflowObjectUuid === "function" ? workflowObjectUuid(wf) || null : null;
+            const liveExtra =
+              appRef?.rootGraph?.extra?.[WORKFLOW_META_NAMESPACE] ??
+              (typeof app !== "undefined" ? app?.rootGraph?.extra?.[WORKFLOW_META_NAMESPACE] : null);
+            if (liveExtra && destUuid && liveExtra[WORKFLOW_UUID_FIELD] === destUuid) {
+              liveExtra[WORKFLOW_PATH_FIELD] = wf.path;
+            }
+          } catch {
+            /* snapshot stamp is what the write serializes */
+          }
+          verdict = { allow: true };
+        }
       } catch {
         verdict = { allow: true }; // a guard that cannot read its evidence must never invent a refusal
       }
@@ -9077,12 +9120,15 @@ function normalizeImageList(images) {
 
 /** Build a ComfyUI /view URL for an output image descriptor. */
 function imageViewUrl(img) {
+  // #2193 — ComfyUI /view basename()s `filename` and looks under `subfolder`.
+  // A combined `video/clip.mp4` with empty subfolder 404s at output/clip.mp4.
+  const ref = normalizeComfyViewRef(img, coerceMessageText) || img;
   const qs = new URLSearchParams({
     // Coerce — a structured filename/subfolder must not become "[object Object]"
     // in the media URL (which reaches the agent via imageRefs / notes) (#276).
-    filename: coerceMessageText(img.filename),
-    subfolder: coerceMessageText(img.subfolder),
-    type: coerceMessageText(img.type) || "output",
+    filename: coerceMessageText(ref.filename),
+    subfolder: coerceMessageText(ref.subfolder),
+    type: coerceMessageText(ref.type) || "output",
   }).toString();
   const path = `/view?${qs}`;
   try {
@@ -12509,6 +12555,23 @@ async function validationBanner() {
   } catch {
     bannerStalePlaceholders = [];
   }
+  // #2192 — the SAME correlation graph_get_errors now runs, for the same reason and
+  // with more at stake: this banner asserts the user "is seeing these RIGHT NOW", so a
+  // rejection whose link has since been repaired makes the panel state something about
+  // the user's screen that is not true. `app.lastNodeErrors` is only replaced on the
+  // NEXT queue attempt, so nothing about repairing the graph clears it.
+  //
+  // Placed after the binding guard above, on the root graph that guard just proved is
+  // still the one this read started against — correlating against a graph that changed
+  // mid-read is how a live error would get dropped. Pruning HERE (not at the top, where
+  // nodeErrors is read) also puts the corrected map inside `missing.any`'s clean check
+  // and inside `sig`, so repairing the link both stops the banner and counts as a change
+  // — matching what the missing-asset entries in that signature already do.
+  try {
+    nodeErrors = pruneContradictedNodeErrorMaps(postProbeRootGraph, [nodeErrors]).nodeErrors;
+  } catch {
+    /* a banner must never throw; an unpruned map is the safe direction */
+  }
   missing.any = !!(
     missing.models.length ||
     missing.media.length ||
@@ -15920,7 +15983,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // seeds, so the next call succeeds without a reload.
     // #1192 — capped by the command budget. Standalone this waits 8000ms, which is a third
     // of the whole command spent before the backend has even been asked what it provides.
-    await awaitObjectInfoHistorySeed(budget.bounded(OBJECT_INFO_SEED_WAIT_MS));
+    // #2050 — a large-install seed is the same whole dump the 10s tool cap cannot finish.
+    // Wait up to what this command still has (padded by a prior success), so the seed can
+    // land and the add can consume it instead of starting a competing getNodeDefs.
+    await awaitObjectInfoHistorySeed(
+      budget.bounded(
+        objectInfoFetchBudgetMs({
+          observedMs: lastWholeObjectInfoMs,
+          remainingMs: budget.remaining(),
+          floorMs: OBJECT_INFO_SEED_WAIT_MS,
+          ceilingMs: ADD_NODE_COMMAND_BUDGET_MS,
+        }),
+      ),
+    );
     // Captured from the SAME fresh /object_info the resolvability assert just
     // fetched. The widget guards below scan THIS def — the backend's current
     // truth — not the possibly-stale registered nodeData: frontend-injected
@@ -16045,15 +16120,20 @@ const GRAPH_TOOL_EXECUTORS = {
           epoch: backendReconnectEpoch,
         };
         addNodeObservedAtEpoch = issued.epoch;
-        // #1192 — allowed 10,000 ms here, capped by the caller's remaining budget.
-        // #1418 — what this comment used to claim about the OTHER path was never true: it
-        // said `graph_set_widget`'s oracle "allows 10,000 ms" and that both were capped, but
-        // that oracle is fetchWholeObjectInfo at OBJECT_INFO_DEADLINE_MS (20,000 ms), and
-        // nothing capped it until #1418 gave it the same budget.bounded(...) treatment. The
-        // two paths genuinely agree now. The earlier sentence is left corrected rather than
-        // deleted because it did real harm twice: a reassurance-shaped claim concealed the
-        // very next occurrence of the defect it described (#1413's note, then this one).
-        const whole = await boundedGetNodeDefs(budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS));
+        // #1192 — capped by the caller's remaining budget.
+        // #2050 — that remainder IS the bound on a large install, not a nested 10s floor:
+        // a 21s `/object_info` completes inside the 25s command and is abandoned at 10s
+        // otherwise. A prior success pads the next wait; a never-arriving schema still
+        // fails closed at whatever this command has left.
+        const wholeFetchMs = objectInfoFetchBudgetMs({
+          observedMs: lastWholeObjectInfoMs,
+          remainingMs: budget.remaining(),
+          floorMs: NODE_DEFS_FETCH_TIMEOUT_MS,
+          ceilingMs: ADD_NODE_COMMAND_BUDGET_MS,
+        });
+        const fetchStartedAt = monotonicNow();
+        const whole = await boundedGetNodeDefs(budget.bounded(wholeFetchMs));
+        if (whole && whole !== NODE_DEFS_NO_ANSWER) noteWholeObjectInfoDuration(fetchStartedAt);
         if (!schemaProbeIsCurrent(issued)) {
           // A response issued on the previous cache generation or backend connection is no
           // answer for this command. In particular, do not let it become a whole-schema
@@ -21375,7 +21455,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // These are independent live stores. The app map can be an empty object
     // after a reset while the execution store still retains the actual rejected
     // prompt, so never let nullish selection make an empty app map mask it.
-    const nodeErrors = combineNodeErrorMaps([comfy?.lastNodeErrors ?? null, storeNodeErrors]);
+    // #2192 — that union is a snapshot of the LAST queue rejection and the frontend
+    // only replaces it on the NEXT one, so a repaired link keeps being reported. Drop
+    // the entries the LIVE graph contradicts before anything downstream reads them —
+    // the per-node join, `clean`, the red-outline adjudication and the payload all
+    // have to agree, and the contradiction the reporter saw (`errored_count: 0` beside
+    // a populated `node_errors`) is exactly what happens when they do not.
+    // Each map is adjudicated on its own and the survivors are unioned — never the other
+    // way round. Merging first lets the LAST map's `class_type` govern the FIRST map's
+    // errors, and a stale store entry then drops a live app error with it (codex gate P1).
+    const { nodeErrors, dropped: contradictedNodeErrors } = pruneContradictedNodeErrorMaps(
+      rootGraph,
+      [comfy?.lastNodeErrors ?? null, storeNodeErrors],
+    );
     if (nodeErrors) {
       for (const [id, entry] of Object.entries(nodeErrors)) {
         for (const e of entry?.errors ?? []) {
@@ -21586,6 +21678,31 @@ const GRAPH_TOOL_EXECUTORS = {
       // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
       last_execution_error: boundExecFailurePayload(execFailureDetail),
       node_errors: nodeErrors,
+      // #2192 — a removal is disclosed, never silent: the caller can see WHICH stale
+      // rejection was withheld and on what evidence, instead of wondering whether a
+      // real error went missing between two reads. Capped like its sibling lists — and
+      // the cut is stated, because a silently short list inside a list whose whole job
+      // is disclosure would be the same defect this field exists to close (#809).
+      ...(contradictedNodeErrors.length
+        ? {
+            stale_node_errors: contradictedNodeErrors.slice(0, MAX_STATE_NODES),
+            stale_node_errors_note: tr(
+              "panel.these_validation_errors_from_the_last_queue",
+              "Recorded at the LAST queue attempt; the live graph disagrees with each, so they are reported here rather than in node_errors (the frontend only replaces that map on the next queue attempt). Every entry carries its errors IN FULL plus the evidence in contradicted_by, so for the conservative reading treat these as still live. This judgement reads the node definitions THIS TAB loaded, which a server-side pack update can get ahead of; the list itself is capped, and a cut is always reported with the true total.",
+            ),
+            ...(contradictedNodeErrors.length > MAX_STATE_NODES
+              ? {
+                  stale_node_errors_truncated: true,
+                  stale_node_errors_truncation_hint: fixedCapNote(
+                    "dropped stale validation error(s)",
+                    MAX_STATE_NODES,
+                    contradictedNodeErrors.length,
+                    "These were withheld as contradicted, not reported as errors; there is no parameter to page them.",
+                  ),
+                }
+              : {}),
+          }
+        : {}),
       ...(clean ? { note: tr("panel.no_errors_recorded_since_the_last_execution", "no errors recorded since the last execution start") } : {}),
     };
   },

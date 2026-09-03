@@ -35,6 +35,7 @@ import { dirname, join } from "node:path";
 
 import {
   decideWorkflowSaveVerdict,
+  rebindForeignStampIfIdentityMatches,
   workflowSaveRefusalError,
   SAVE_PATH_GUARD_REASON,
 } from "../../web/js/lib/save-path-guard.js";
@@ -143,6 +144,55 @@ test("#1667 the refusal names both paths, states NOTHING was written, and names 
   // Honesty pin: the message must present the two readings, not assert one cause.
   assert.match(err.message, /stale/);
   assert.match(err.message, /deliberately/);
+  // #2194 — open-then-restore is no longer the only recovery; a matching uuid
+  // restamps the nested path without requiring ImpactSwitch configure to succeed.
+  assert.match(err.message, /restamping extra\.comfyui_mcp\.workflow_path/);
+  assert.match(err.message, /fail closed/);
+});
+
+test("#2194 matching canvas uuid restamps a nested leftover path", () => {
+  const state = {
+    extra: {
+      comfyui_mcp: {
+        workflow_uuid: "tab-uuid",
+        workflow_path: "workflows/iKki/Ultimate Illustrious SDXL Detailer.json",
+      },
+    },
+  };
+  assert.equal(
+    rebindForeignStampIfIdentityMatches({
+      state,
+      destinationPath: "workflows/Ultimate Illustrious SDXL Detailer.json",
+      destinationUuid: "tab-uuid",
+    }),
+    true,
+  );
+  assert.equal(state.extra.comfyui_mcp.workflow_path, "workflows/Ultimate Illustrious SDXL Detailer.json");
+});
+
+test("#2194 disagreeing or missing uuid fails closed — no restamp, no overwrite", () => {
+  const nested = "workflows/iKki/Ultimate Illustrious SDXL Detailer.json";
+  for (const { destinationUuid, stampedUuid } of [
+    { destinationUuid: "tab-a", stampedUuid: "tab-b" },
+    { destinationUuid: "tab-a", stampedUuid: "" },
+    { destinationUuid: "", stampedUuid: "tab-a" },
+    { destinationUuid: null, stampedUuid: "tab-a" },
+    { destinationUuid: "tab-a", stampedUuid: null },
+  ]) {
+    const state = {
+      extra: { comfyui_mcp: { workflow_uuid: stampedUuid, workflow_path: nested } },
+    };
+    assert.equal(
+      rebindForeignStampIfIdentityMatches({
+        state,
+        destinationPath: "workflows/Ultimate Illustrious SDXL Detailer.json",
+        destinationUuid,
+      }),
+      false,
+      `${JSON.stringify({ destinationUuid, stampedUuid })} must not restamp`,
+    );
+    assert.equal(state.extra.comfyui_mcp.workflow_path, nested);
+  }
 });
 
 test("#1667 a verdict with missing paths still produces a coherent refusal", () => {
@@ -187,7 +237,9 @@ function buildInstaller() {
     "WORKFLOW_PATH_FIELD",
     "sameWorkflowObject",
     "decideWorkflowSaveVerdict",
+    "rebindForeignStampIfIdentityMatches",
     "workflowSaveRefusalError",
+    "workflowObjectUuid",
     "activeWorkflowRef",
     "trackerCaptureSuppressed",
     "trackerExposesCaptureComparator",
@@ -207,7 +259,9 @@ function buildInstaller() {
         "workflow_path",
         sameWorkflowObject,
         decideWorkflowSaveVerdict,
+        rebindForeignStampIfIdentityMatches,
         workflowSaveRefusalError,
+        (wf) => wf?.uuid ?? null,
         () => activeWorkflow,
         trackerCaptureSuppressed,
         trackerExposesCaptureComparator,
@@ -246,6 +300,34 @@ function fakeStore({ stampedPath } = {}) {
   };
   return { store, wfA, appRef: { extensionManager: { workflow: store } } };
 }
+
+test("#2194 WRAPPER: a nested leftover path with matching uuid restamps and saves", async () => {
+  const { buildInstaller: build } = buildInstaller();
+  const install = build();
+  const { store, wfA, appRef } = fakeStore({
+    stampedPath: "workflows/B.json",
+  });
+  wfA.uuid = "tab-uuid";
+  wfA.changeTracker.activeState.extra.comfyui_mcp.workflow_uuid = "tab-uuid";
+  install(appRef);
+  await store.saveWorkflow(wfA);
+  assert.deepEqual(store.saved, ["workflows/A.json"]);
+  assert.equal(wfA.changeTracker.activeState.extra.comfyui_mcp.workflow_path, "workflows/A.json");
+});
+
+test("#2194 WRAPPER: a nested leftover path with a FOREIGN uuid is still refused", async () => {
+  const { buildInstaller: build } = buildInstaller();
+  const install = build();
+  const { store, wfA, appRef } = fakeStore({
+    stampedPath: "workflows/B.json",
+  });
+  wfA.uuid = "tab-a";
+  wfA.changeTracker.activeState.extra.comfyui_mcp.workflow_uuid = "tab-b";
+  install(appRef);
+  await assert.rejects(() => store.saveWorkflow(wfA), /REFUSED to save/);
+  assert.deepEqual(store.saved, []);
+  assert.equal(wfA.changeTracker.activeState.extra.comfyui_mcp.workflow_path, "workflows/B.json");
+});
 
 test("#1667 WRAPPER: a crossed save is refused and the original save is NEVER called", async () => {
   const { buildInstaller: build } = buildInstaller();
@@ -525,6 +607,20 @@ test("#1563 r2 WRAPPER: the reported case still refuses — comparability is a f
   install(fx.appRef);
   await assert.rejects(() => fx.store.saveWorkflow(fx.wfA), /BEHIND the live canvas/);
   assert.deepEqual(fx.store.saved, []);
+});
+
+test("#2194 WIRING: the save funnel restamps a matching-uuid leftover path before refusing", () => {
+  const source = PANEL_SRC();
+  const decide = source.indexOf("verdict = decideWorkflowSaveVerdict({");
+  assert.ok(decide > 0);
+  const body = source.slice(decide, source.indexOf("if (!verdict.allow)", decide) + 80);
+  assert.match(body, /rebindForeignStampIfIdentityMatches\(\{/);
+  assert.match(body, /destinationUuid: typeof workflowObjectUuid === "function"/);
+  assert.match(body, /verdict = \{ allow: true \}/);
+  assert.ok(
+    body.indexOf("rebindForeignStampIfIdentityMatches") < body.indexOf('if (!verdict.allow)'),
+    "the restamp must run before the refusal throw",
+  );
 });
 
 test("#1563 WIRING: the wrapper passes its own observation, not a constant", () => {

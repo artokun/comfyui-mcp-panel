@@ -2,7 +2,12 @@
 // production-path regressions can drive the shipped executor without importing and running
 // this file's unrelated test cases.
 import { PANEL_SRC } from "./_panel-constants.mjs";
-import { findNodeByScopedId, findVisibleNodeByScopedId } from "../../web/js/lib/asset-staleness.js";
+import {
+  combineNodeErrorMaps,
+  findNodeByScopedId,
+  findVisibleNodeByScopedId,
+  pruneContradictedNodeErrorMaps,
+} from "../../web/js/lib/asset-staleness.js";
 import { applyRuntimeExecFailure, boundExecFailurePayload } from "../../web/js/lib/exec-error-bounds.js";
 import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
 import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
@@ -71,6 +76,7 @@ const GRAPH_GET_ERRORS_DEPS = [
   "findNodeByScopedId",
   "getPiniaStore",
   "combineNodeErrorMaps",
+  "pruneContradictedNodeErrorMaps",
   "coerceMessageText",
   "lastExecFailure",
   "applyRuntimeExecFailure",
@@ -98,6 +104,8 @@ export async function runProductionGraphGetErrors({
   graph,
   rootGraph,
   lastExecFailure,
+  lastNodeErrors = null,
+  storeNodeErrors = null,
   scan = async () => null,
   fetchSingleNodeInfo = () => {},
   // The extracted executor's default scan is a no-op test double. Give it a
@@ -127,7 +135,7 @@ export async function runProductionGraphGetErrors({
     withRefreshTimeout,
     getRefreshInFlight,
     nodeDefRefreshInFlight: null,
-    getGraphCtx: () => ({ app: { lastNodeErrors: null }, graph, rootGraph }),
+    getGraphCtx: () => ({ app: { lastNodeErrors }, graph, rootGraph }),
     objectInfoCache,
     objectInfoSnapshot,
     verifiedNodeDefCache,
@@ -148,8 +156,11 @@ export async function runProductionGraphGetErrors({
     LiteGraph: {},
     findVisibleNodeByScopedId,
     findNodeByScopedId,
-    getPiniaStore: () => null,
-    combineNodeErrorMaps: () => null,
+    // The real validation-map union and the real live-graph correlation, so a
+    // production-path test drives the SHIPPED pruning rather than a stub of it.
+    getPiniaStore: () => (storeNodeErrors ? { lastNodeErrors: storeNodeErrors } : null),
+    combineNodeErrorMaps,
+    pruneContradictedNodeErrorMaps,
     coerceMessageText: (value) => String(value ?? ""),
     lastExecFailure,
     applyRuntimeExecFailure,
