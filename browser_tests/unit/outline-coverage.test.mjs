@@ -189,12 +189,19 @@ test("#809 the MAX_STATE_NODES views state their cap instead of a bare boolean",
   // Each capped view must carry prose the model actually reads, not just `truncated:true`.
   // Views whose cap is FIXED and has no lever: they must say so, using the shared
   // wording that is honest about there being nothing to raise.
-  for (const sig of ["graph_view_selected()", "graph_get_subgraph({"]) {
+  // graph_get_subgraph is not a listing view: MCP uses it as the promoted-write
+  // ownership envelope, and a listing cap there is a write veto (#2057).
+  for (const sig of ["graph_view_selected()"]) {
     const body = handlerBody(src, sig);
     assert.ok(body, `${sig} must exist`);
     assert.match(body, /truncation_hint:/, `${sig} must emit a remedy, not only a boolean`);
     assert.match(body, /fixedCapNote\(/, `${sig} must use the shared fixed-cap wording`);
   }
+
+  const subgraph = handlerBody(src, "graph_get_subgraph({");
+  assert.ok(subgraph, "graph_get_subgraph must exist");
+  assert.doesNotMatch(subgraph, /fixedCapNote\(/, "the ownership envelope must not use the listing-cap wording");
+  assert.match(subgraph, /truncated:\s*false/, "the ownership envelope emits truncated:false, not a listing cut");
 
   // #845 — the viewport view now HAS a lever (`max_chars`), because a 100-node cap
   // bounded the wrong unit and still emitted 135k characters. It must therefore NOT

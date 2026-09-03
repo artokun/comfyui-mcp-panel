@@ -14,6 +14,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - After a large custom-node install, adding a node waits for /object_info with an adaptive command-budget cap instead of a fixed 10s fetch, and still refuses if the schema never arrives (#2050)
 - panel_show_media splits a combined `video/<file>` output filename into `/view`'s `subfolder` + basename so a valid history reference no longer 404s (#2193)
+- graph_get_subgraph no longer caps its inner node list at MAX_STATE_NODES, so a large subgraph's ownership envelope stays `truncated:false` with `node_count === nodes.length` and panel_set_widget can dispatch a promoted write instead of treating the listing cap as an incomplete witness (#2057)
 
 
 ## [0.15.161] - 2026-09-03
