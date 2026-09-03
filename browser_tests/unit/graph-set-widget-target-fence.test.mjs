@@ -178,7 +178,7 @@ test("structured production projections carry the same node identity witness", (
   const summary = PANEL_SRC.slice(summaryStart, summaryEnd);
   assert.match(summary, /nodeInstanceIdentity\(node\)/);
   assert.match(summary, /node_identity/);
-  assert.match(PANEL_SRC, /nodes: inner\.slice\(0, MAX_STATE_NODES\)\.map\(summarizeNode\)/);
+  assert.match(PANEL_SRC, /nodes: inner\.map\(summarizeNode\)/);
   assert.match(PANEL_SRC, /capSummaryWidgets\(summarizeNode\(n\)/);
 });
 
