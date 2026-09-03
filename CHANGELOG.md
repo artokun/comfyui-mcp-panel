@@ -6,19 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-### Fixed
+## [0.15.162] - 2026-09-03
 
+### Fixed
 - After a large custom-node install, adding a node waits for /object_info with an adaptive command-budget cap instead of a fixed 10s fetch, and still refuses if the schema never arrives (#2050)
-- panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194)
-- the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
-  work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
-  saved tab carrying unsaved drift that is the one recovery that loses it, which is the
-  deadlock the report describes: save already refused as behind the canvas, mutations
-  fenced off, and the suggested escape destructive. The existing panel#1019 note asks
-  whether the tab CAN be re-opened; this asks what it COSTS. Warns only on a positive
-  isModified reading, because ComfyUI derives that flag from user-input captures and a
-  false is not evidence of safety (panel#882). The save/tracker deadlock itself is
-  unchanged and panel#2139 stays open.
+- panel_show_media splits a combined `video/<file>` output filename into `/view`'s `subfolder` + basename so a valid history reference no longer 404s (#2193)
+
 
 ## [0.15.161] - 2026-09-03
 
@@ -33,30 +26,36 @@ All notable changes to this project are documented here. This project adheres to
 - admit models inventory through fetch_comfyui_read (#2198)
 - panel_get_errors stops reporting validation errors the live graph disagrees with (#2195)
 
+
 ## [0.15.159] - 2026-09-02
 
 ### Fixed
 - rehydrate loaded node defs before run (#2188)
+
 
 ## [0.15.158] - 2026-09-02
 
 ### Fixed
 - panel_create_subgraph and panel_subgraph_group now preflight the full transitive upstream chain for detached nodes and refuse before ComfyUI's conversion can throw or partially mutate the live graph; graph-ownership and cycle guards preserve valid downstream and unlinked selections, while measured throw verdicts remain in place (#1463, #2186)
 
+
 ## [0.15.157] - 2026-09-02
 
 ### Fixed
 - panel_set_widget on rgthree Fast Bypasser/Muter rows now applies the requested mode idempotently through the forced-value path, authenticates row-to-node closures, and journals all reachable mode changes for fail-closed rollback (#2151)
+
 
 ## [0.15.156] - 2026-09-02
 
 ### Fixed
 - panel_add_node reuses the freshly fetched node definition when repairing stale registered schemas, so a stale-bundle refusal on a second whole-schema refresh cannot block LoadImage (#2124, #2181)
 
+
 ## [0.15.155] - 2026-09-02
 
 ### Fixed
 - panel_search_nodes keeps serialized browser transport failures classified and diagnosable when ComfyUI-Manager mappings returns no HTTP response (#2024)
+
 
 ## [0.15.154] - 2026-09-02
 
@@ -64,16 +63,19 @@ All notable changes to this project are documented here. This project adheres to
 - allow workflow template reads
 - prioritize live error scans in get_errors
 
+
 ## [0.15.153] - 2026-09-02
 
 ### Fixed
 - make restore callback preflight directional
 - prevent ImpactSwitch restore callback crash
 
+
 ## [0.15.152] - 2026-09-02
 
 ### Fixed
 - retain current promoted DOM rails (#1707)
+
 
 ## [0.15.151] - 2026-09-02
 
@@ -91,6 +93,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Changed
 - pin the #2148 repair on a promoted MULTILINE rail (#2160)
 - a missing completion receipt is not only an old orchestrator (#2156)
+
 
 ## [0.15.150] - 2026-09-01
 
@@ -111,6 +114,7 @@ All notable changes to this project are documented here. This project adheres to
 - repair a promoted rail's write-through instead of refusing the write (#2148)
 - address a duplicated widget name by occurrence or label, and say which row was written (#2145)
 
+
 ## [0.15.149] - 2026-08-30
 
 ### Fixed
@@ -118,20 +122,24 @@ All notable changes to this project are documented here. This project adheres to
 - panel_set_widget clear of an already-empty combo (VHS_LoadVideo video="") succeeds even when the dropdown has no empty option (#2010, #2121)
 - a wildcard-to-wildcard connect refusal is reported as unbound * ports needing a concrete typed producer, not a false type mismatch (#2028, #2120)
 
+
 ## [0.15.148] - 2026-08-30
 
 ### Fixed
 - panel_set_widget returns a late mutation receipt when graph_set_widget applies after the caller timeout, and retry_of replays that receipt by request id without a duplicate write (#2116)
+
 
 ## [0.15.147] - 2026-08-30
 
 ### Fixed
 - panel_set_widget no longer refuses promoted subgraph widget writes on a bound live canvas when Web Locks cannot mint an exclusive tab identity: hello still publishes a page-lifetime connection identity, and fail-closed omission is kept only when identity is actually unavailable (#2104, #2114)
 
+
 ## [0.15.146] - 2026-08-30
 
 ### Fixed
 - Generated images/videos no longer have to auto-post into the chat: a new Generated media in chat setting (on by default) can keep the transcript text-only without hiding agent-visible outputs, and Video previews in chat is labeled as inline playback so it is no longer mistaken for that switch (#2034)
+
 
 ## [0.15.145] - 2026-08-30
 
@@ -140,11 +148,13 @@ All notable changes to this project are documented here. This project adheres to
 - live graph reads recover after a manual canvas edit: a hung panel_graph_outline no longer pins retries, tracker snapshot flush stays mutation-only, and image/canvas widget values are clipped without a full stringify that could miss the 20s RPC window (#2003)
 - panel_save_subgraph rewrites legacy proxyWidgets object/null metadata to the string-tuple schema before publishing, and refuses with the affected inner node/widget and a demote repair when that mapping cannot be proved lossless (#2005)
 
+
 ## [0.15.144] - 2026-08-30
 
 ### Fixed
 - panel_set_widget acknowledges an inner-subgraph widget write once readback matches, instead of waiting out the 90s relay on a hanging widget callback or parent-rail restore (#2001)
 - panel_promote_widget refuses canvas-only callback widgets (control_after_generate) and writes only [nodeId, widgetName] string pairs through the legacy promotion store, so saved workflows stay loadable (#2002)
+
 
 ## [0.15.143] - 2026-08-30
 
@@ -152,10 +162,12 @@ All notable changes to this project are documented here. This project adheres to
 - panel_open_workflow of a listed unsaved tmp: tab after reconnect no longer false-negatives: it rechecks the active routing key before failing, and an applied switch that is still unreadable returns the receipt rather than a hard error (#2022)
 - panel_copy_nodes with explicit node_ids no longer copies a leftover additive canvas selection (#2004)
 
+
 ## [0.15.142] - 2026-08-30
 
 ### Fixed
 - chat autoscroll no longer yanks the transcript back to the bottom while the user is scrolling up: an upward gesture unsticks immediately, including inside the 48px slack, and the stabilizer waits until they return to the bottom or jump to latest (#2000)
+
 
 ## [0.15.141] - 2026-08-30
 
@@ -166,22 +178,26 @@ All notable changes to this project are documented here. This project adheres to
 - panel_run serializes a freshly typed PrimitiveNode STRING widget from the live graph instead of rejecting it as a missing dynamic widget (#2009)
 - KSampler nodes added with panel_add_node keep control_after_generate='randomize' armed, so the ordinary Queue button rolls the seed instead of cache-hitting on 0 until a tab reload (#2029)
 
+
 ## [0.15.140] - 2026-08-30
 
 ### Fixed
 - panel_search_nodes answers from installed /object_info when Manager search times out, and a timeout miss is a retryable named reason instead of an empty 15s hang (#2099)
 - panel_set_widget on a subgraph host's promoted CLIPTextEncode.text writes the parent rail, not only the inner converted-to-input widget, so queue serialization uses the new value (#366)
 
+
 ## [0.15.139] - 2026-08-30
 
 ### Fixed
 - after ComfyUI restart, re-hello the existing workflow tab without reloading unsaved in-memory edits, and panel_set_workflow_target({mode:"current"}) forces that re-register when the server is ready but the tab command channel is stale (#2030)
+
 
 ## [0.15.138] - 2026-08-30
 
 ### Fixed
 - panel_set_widget keeps COMFY_DYNAMICCOMBO_V3 dotted-child writes across queue-time reserialize instead of reverting to spec defaults (#2031, #2096)
 - surface the Manager install traceback in panel_install_node (#2012, #2075)
+
 
 ## [0.15.137] - 2026-08-30
 
@@ -199,12 +215,14 @@ All notable changes to this project are documented here. This project adheres to
 - panel_refresh_nodes publishes the workflow UUID of the canvas it refreshed, and refuses a retryable route-registration miss if the active route moves, instead of returning refreshed:true with another UUID (#2026)
 - panel_set_widget no longer reports outcome-unknown after the value has landed: the handler ack is flushed once graph_set_widget resolves, and a timeout after delivery returns applied and verified from an idempotent readback (#2025)
 
+
 ## [0.15.135] - 2026-08-30
 
 ### Fixed
 - keep the rendered changelog artifact synchronized when a release gains a late-merged entry
 
 - sync rendered changelog for v0.15.134
+
 
 ## [0.15.134] - 2026-08-30
 
@@ -213,21 +231,25 @@ All notable changes to this project are documented here. This project adheres to
 - panel_add_node can add a class from a type-scoped /object_info read when the full dump misses its fixed budget on a large install, without treating a stale whole cache as verified (#2050)
 - relay fixed `/object_info` reads for the headless MCP fallback when the configured ComfyUI route is unreachable (#2283)
 
+
 ## [0.15.133] - 2026-08-30
 
 ### Fixed
 - panel_search_nodes retries the legacy `/customnode/getmappings` route when the browser never gets an HTTP response from `/v2/customnode/getmappings`, and the structured miss names that transport failure instead of a bare Failed to fetch (#2024)
 - panel_connect by Autogrow name keeps later MiniMax H3 slots on their original wires (#2008)
 
+
 ## [0.15.132] - 2026-08-30
 
 ### Fixed
 - panel_set_widget no longer refuses a root PrimitiveNode as an unclassifiable promoted container: leftover `.subgraph` (even a live-looking inner graph or a throwing getter) keeps `is_subgraph:false` and graph_get_subgraph throws the definitive "is not a subgraph" line (#2006, #2073)
 
+
 ## [0.15.131] - 2026-08-30
 
 ### Fixed
 - the pre-publish registry parity scan now inspects the packaged archive rather than the repo, is wired into the publish job, and refuses to treat a Pending registry status as a pass (#1886)
+
 
 ## [0.15.130] - 2026-08-30
 
@@ -236,10 +258,12 @@ All notable changes to this project are documented here. This project adheres to
 - panel_run on frontend 1.49.6 delivers to_node_id natively when app.queuePrompt wrappers drop the third argument (#1782)
 - retry one readable workflow-open normalization race while keeping persistent content mismatches fail-closed (#1898)
 
+
 ## [0.15.129] - 2026-08-30
 
 ### Fixed
 - queued runs keep their receipt; applied widget writes do not hang on rAF (#2054)
+
 
 ## [0.15.128] - 2026-08-30
 
@@ -247,10 +271,12 @@ All notable changes to this project are documented here. This project adheres to
 - after reconnect, a queued run is never reported as user-rejected (#1995)
 - panel_set_widget writes DOM-backed multiline editors (StringMultilineTagEditor `text`) through the live input/contenteditable that getValue reads, so a no-op setValue after configure no longer refuses the update (#1997)
 
+
 ## [0.15.127] - 2026-08-30
 
 ### Fixed
 - SaveVideo DynamicCombo leftovers are cleaned again at queue time: a bare orphan `codec` next to nested `format.codec` is dropped before graphToPrompt, a first-serialize throw retries once, and the refusal names the node when it still fails (#1931)
+
 
 ## [0.15.126] - 2026-08-30
 
@@ -262,6 +288,7 @@ All notable changes to this project are documented here. This project adheres to
 - resolve the 18+ consent card before the 300s tools/call deadline so an idle user gets a structured timeout instead of a transport hang (#390)
 
 - preserve current untagged canvas capture so an already-current untagged root is not treated as the previous tab (#1215, #2038)
+
 
 ## [0.15.125] - 2026-08-30
 
@@ -287,10 +314,12 @@ All notable changes to this project are documented here. This project adheres to
 - raise default render stall threshold for long nodes
 - report host_links_reindexed on unexpose so MCP can skip the stale warning (#1993)
 
+
 ## [0.15.123] - 2026-08-28
 
 ### Fixed
 - treat LIST as a core socket even with leftover widget defaults (#751, #1990)
+
 
 ## [0.15.122] - 2026-08-27
 
@@ -305,6 +334,7 @@ All notable changes to this project are documented here. This project adheres to
 - the agent can read what the live CivitAI pane is actually showing (painted grid cards, query, dock, overlay presence, optional contact-sheet of already-decoded thumbs) from the pane itself — not by re-fetching the public API, which never serves CivitAI RED — and can dock or undock the unified side panel after #1952's close (#1961, #1962)
 
 - read the live CivitAI pane and dock it
+
 
 ## [0.15.121] - 2026-08-27
 
@@ -325,6 +355,7 @@ All notable changes to this project are documented here. This project adheres to
 - the Training / CivitAI side panel and live UI/media cards can now be closed/dismissed over the same bridge path the agent uses to open them, so a long session can shed resident renderer state (#1952, #1960)
 - panel_set_widget on an rgthree Fast Groups property (`matchTitle`/`matchColors`/`sort`/`toggleRestriction`) names `panel_set_property` instead of a pressable-widget dead end, and lists each available widget name once (#1956)
 
+
 ## [0.15.119] - 2026-08-27
 
 ### Fixed
@@ -341,10 +372,12 @@ All notable changes to this project are documented here. This project adheres to
 - panel_restart_comfyui restarts the ComfyUI bound to the live canvas, not the orchestrator's boot target (#1913)
 - panel_open_workflow no longer times out undetermined after a restart: an unsettled reconnect is a retryable refusal (`applied: false`) instead of a delivered command with no receipt (#1914)
 
+
 ## [0.15.117] - 2026-08-27
 
 ### Fixed
 - do not capture or admit the previous tab's graph after a switch (#1951)
+
 
 ## [0.15.116] - 2026-08-27
 
@@ -363,6 +396,7 @@ All notable changes to this project are documented here. This project adheres to
 - keep `is_subgraph` on oversized-node detail stubs so wide root nodes stay writable (artokun/comfyui-mcp#2436)
 - panel_unpack_subgraph no longer crashes when a subgraph rail serialises the same link id twice (#1938)
 
+
 ## [0.15.114] - 2026-08-27
 
 ### Fixed
@@ -370,6 +404,7 @@ All notable changes to this project are documented here. This project adheres to
 - a token COUNT is a generation control, not a credential (#1919)
 
 ### Changed
+
 
 ## [0.15.113] - 2026-08-27
 
@@ -387,6 +422,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+
 ## [0.15.112] - 2026-08-27
 
 ### Fixed
@@ -398,6 +434,7 @@ All notable changes to this project are documented here. This project adheres to
 - cut the registry network findings from six files to two (#1909)
 - reject stale canvas capture after tab switch
 
+
 ## [0.15.110] - 2026-08-27
 
 ### Fixed
@@ -405,6 +442,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 - Fix workflow open normalization race (#1898) (#1904)
+
 
 ## [0.15.109] - 2026-08-26
 
@@ -420,6 +458,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - de-duplicate the 0.15.106 changelog section (#1890)
+
 
 ## [0.15.106] - 2026-08-26
 
@@ -449,6 +488,7 @@ All notable changes to this project are documented here. This project adheres to
 - local YARA parity replica, and defuse the changelog's own network tokens (#1874)
 - drive the receipt-less completion end to end, through the real delivery boundary (#1872)
 
+
 ## [0.15.103] - 2026-08-26
 
 ### Fixed
@@ -458,6 +498,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 - add behavioural test for repeating_controls_note attachment (#1862)
+
 
 ## [0.15.102] - 2026-08-26
 
@@ -469,6 +510,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - atomically fence promoted widget receiver scope (#2314) (#1831)
 - bound the pre-receipt completion replay so it cannot storm the agent (#1850)
+
 
 ## [0.15.100] - 2026-08-26
 
@@ -493,6 +535,7 @@ All notable changes to this project are documented here. This project adheres to
 - the start command leads the setup card instead of trailing it (#1822)
 - the provider setup card scrolls instead of clipping its own tail (#1821)
 - the version gate compares an independent witness, and unsticks 0.15.85 (#1825)
+
 
 ## [0.15.96] - 2026-08-25
 
@@ -556,6 +599,7 @@ All notable changes to this project are documented here. This project adheres to
 - fence scoped schema evidence (#2249)
 - retain usable schema across refresh failures (#2249)
 
+
 ## [0.15.84] - 2026-08-25
 
 ### Fixed
@@ -563,11 +607,13 @@ All notable changes to this project are documented here. This project adheres to
 - classify empty completion results (#1781)
 - diagnose completion delivery outcomes (#1781)
 
+
 ## [0.15.83] - 2026-08-25
 
 ### Fixed
 - classify empty completion results (#1781)
 - diagnose completion delivery outcomes (#1781)
+
 
 ## [0.15.82] - 2026-08-25
 
@@ -579,6 +625,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - defer safe widget edits until queue idle (#1716)
 
+
 ## [0.15.80] - 2026-08-25
 
 ### Fixed
@@ -587,6 +634,7 @@ All notable changes to this project are documented here. This project adheres to
 - preserve restart confirmation answers (#1764)
 - resolve panel_set_widget against live node list (#1759)
 - explain workflow save transport failures (#1757)
+
 
 ## [0.15.79] - 2026-08-25
 
@@ -637,6 +685,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Added
 - add authenticated fetch_image bridge command (#1730)
 
+
 ## [0.15.70] - 2026-08-24
 
 ### Fixed
@@ -646,21 +695,25 @@ All notable changes to this project are documented here. This project adheres to
 - retire whole schema authority on class reads (#1709)
 - reuse verified add-node schema (#1709)
 
+
 ## [0.15.69] - 2026-08-24
 
 ### Fixed
 - name remote combo refusal provenance
+
 
 ## [0.15.68] - 2026-08-24
 
 ### Fixed
 - roll back Fast Bypasser linked modes (#2146)
 
+
 ## [0.15.67] - 2026-08-24
 
 ### Fixed
 - panel_refresh_nodes now follows chained forced refresh successors and never reports premature success while a later refresh is still running (#1695)
 - late combo refresh mutations remain fenced and combo trust stays fail-closed across reconnect refreshes (#1695)
+
 
 ## [0.15.66] - 2026-08-23
 
@@ -683,6 +736,7 @@ All notable changes to this project are documented here. This project adheres to
 - release-0.15.60 (#1700)
 - fix/1680 refresh completion handle (#1699)
 
+
 ## [0.15.65] - 2026-08-23
 
 ### Fixed
@@ -703,6 +757,7 @@ All notable changes to this project are documented here. This project adheres to
 - release-0.15.60 (#1700)
 - fix/1680 refresh completion handle (#1699)
 
+
 ## [0.15.64] - 2026-08-23
 
 ### Fixed
@@ -721,6 +776,7 @@ All notable changes to this project are documented here. This project adheres to
 - release-0.15.60 (#1700)
 - fix/1680 refresh completion handle (#1699)
 
+
 ## [0.15.63] - 2026-08-23
 
 ### Fixed
@@ -736,6 +792,7 @@ All notable changes to this project are documented here. This project adheres to
 - release-0.15.60 (#1700)
 - fix/1680 refresh completion handle (#1699)
 
+
 ## [0.15.62] - 2026-08-23
 
 ### Changed
@@ -745,6 +802,7 @@ All notable changes to this project are documented here. This project adheres to
 - release-0.15.60 (#1700)
 - fix/1680 refresh completion handle (#1699)
 
+
 ## [0.15.61] - 2026-08-23
 
 ### Changed
@@ -752,15 +810,18 @@ All notable changes to this project are documented here. This project adheres to
 - release-0.15.60 (#1700)
 - fix/1680 refresh completion handle (#1699)
 
+
 ## [0.15.60] - 2026-08-23
 
 ### Changed
 - fix/1680 refresh completion handle (#1699)
 
+
 ## [0.15.59] - 2026-08-23
 
 ### Fixed
 - refuse derived MiniMaxH3Director prompt writes (#1697)
+
 
 ## [0.15.58] - 2026-08-23
 
@@ -769,40 +830,48 @@ All notable changes to this project are documented here. This project adheres to
 - advertise expected node type fence
 - enforce expected target type at write boundary
 
+
 ## [0.15.57] - 2026-08-23
 
 ### Fixed
 - panel_find_nodes now matches raw quoted substrings in STRING widget values (#1678)
+
 
 ## [0.15.56] - 2026-08-23
 
 ### Fixed
 - refuse arbitrary Git URLs on Manager v4 before queueing (#1539)
 
+
 ## [0.15.55] - 2026-08-23
 
 ### Fixed
 - treat VHS date prefixes as queue-time volatile
+
 
 ## [0.15.54] - 2026-08-23
 
 ### Fixed
 - recover link-disconnect restore crashes
 
+
 ## [0.15.53] - 2026-08-23
 
 ### Fixed
 - normalize app mode canvas metadata
+
 
 ## [0.15.52] - 2026-08-23
 
 ### Fixed
 - preserve graph serializer failures (#1669)
 
+
 ## [0.15.51] - 2026-08-23
 
 ### Fixed
 - skip frontend-authored CustomCombo availability
+
 
 ## [0.15.50] - 2026-08-23
 
@@ -812,11 +881,13 @@ All notable changes to this project are documented here. This project adheres to
 - handle empty editor and palette state
 - rehydrate Ideogram region editor writes
 
+
 ## [0.15.49] - 2026-08-23
 
 ### Fixed
 - make path fallback explicit
 - prefer live ComfyUI base path
+
 
 ## [0.15.48] - 2026-08-22
 
@@ -826,20 +897,24 @@ All notable changes to this project are documented here. This project adheres to
 - harden fallback pack map keys
 - panel_list_nodes returns an inspectable fallback when Manager is unreachable
 
+
 ## [0.15.47] - 2026-08-22
 
 ### Changed
 - fix-late-workflow-save-receipts (#1657)
+
 
 ## [0.15.46] - 2026-08-22
 
 ### Fixed
 - first open of the active workflow after restart succeeds (#1643)
 
+
 ## [0.15.45] - 2026-08-22
 
 ### Fixed
 - outline reporting root after reconnect lets enter_subgraph use the root (#1639)
+
 
 ## [0.15.44] - 2026-08-22
 
@@ -851,10 +926,12 @@ All notable changes to this project are documented here. This project adheres to
 - installed nested models on Windows are not reported missing (#1637)
 - panel_set_widget no longer re-waits on silent schema probes (#1638)
 
+
 ## [0.15.43] - 2026-08-22
 
 ### Fixed
 - panel_new_workflow no longer claims a blank tab while the previous graph is still on the canvas (#1632)
+
 
 ## [0.15.42] - 2026-08-22
 
@@ -862,10 +939,12 @@ All notable changes to this project are documented here. This project adheres to
 - a restart confirmation card is brought on screen instead of timing out unseen: the Agent tab opens, stick-to-bottom is forced, and the card scrolls immediately rather than waiting on an rAF a backgrounded tab will never fire (#1625)
 - resolve Manager installed directory IDs before update
 
+
 ## [0.15.41] - 2026-08-22
 
 ### Fixed
 - fail honestly when remote /view is unavailable (#1623)
+
 
 ## [0.15.40] - 2026-08-22
 
@@ -877,6 +956,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - deliberate-sweep runs retain their prompt and SaveImage filename widgets when the frontend queue is already busy (#1588)
+
 
 ## [0.15.38] - 2026-08-22
 
@@ -902,6 +982,7 @@ All notable changes to this project are documented here. This project adheres to
 - the Agent tab appears in the sidebar after a clean load (#1609)
 - a save whose only drift is node geometry is no longer refused (#1606)
 - accept wildcard producers for custom sockets (#1584) (#1603)
+
 
 ## [0.15.35] - 2026-08-21
 
@@ -942,6 +1023,7 @@ All notable changes to this project are documented here. This project adheres to
 - serverDeclaresEmptyComboOptions reads the V2 combo shape (#1552)
 - a FLOAT widget's quantization is explained by the grid the frontend actually ran (#1550)
 
+
 ## [0.15.31] - 2026-08-20
 
 ### Fixed
@@ -952,10 +1034,12 @@ All notable changes to this project are documented here. This project adheres to
 - saved subgraph host widgets survive panel_load_workflow (#1547)
 - name a failed pack as the cause only when Manager's node map proves it owns the type (#1545)
 
+
 ## [0.15.30] - 2026-08-20
 
 ### Fixed
 - the default saveWorkflow test double writes the tab's own path (#1542)
+
 
 ## [0.15.29] - 2026-08-20
 
@@ -963,10 +1047,12 @@ All notable changes to this project are documented here. This project adheres to
 - a no-name save of a .app.json workflow writes that file, not a plain .json fork (#1538)
 - a long timestamp-less transcript keeps the order it was written in (#1536 / #1539)
 
+
 ## [0.15.28] - 2026-08-20
 
 ### Fixed
 - panel_set_widget retains VHS_LoadVideo custom dimensions (#1534)
+
 
 ## [0.15.27] - 2026-08-20
 
@@ -975,6 +1061,7 @@ All notable changes to this project are documented here. This project adheres to
 - a timestamp-less transcript keeps the order it was written in (#1530)
 - the slot snapshot is instrumentation, not a precondition for firing the hook
 - a programmatic widget write announces itself to the node, not just to the widget
+
 
 ## [0.15.26] - 2026-08-20
 
@@ -997,6 +1084,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Changed
 - EXECUTE the rider, so its workflow-key gate can be watched to fail (#1505)
 
+
 ## [0.15.24] - 2026-08-20
 
 ### Fixed
@@ -1005,10 +1093,12 @@ All notable changes to this project are documented here. This project adheres to
 - an instance-scoped promoted write discloses the inner callback it did not invoke (#1500)
 - the "you are inside a subgraph" remedy is now checked, not assumed (#1499)
 
+
 ## [0.15.23] - 2026-08-20
 
 ### Fixed
 - adopt a loopback bridge URL the orchestrator advertises, not just a tunnel one (#1487)
+
 
 ## [0.15.22] - 2026-08-20
 
@@ -1018,12 +1108,14 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - a silent Manager in_progress is named as a stall, not as progress (#1483)
 
+
 ## [0.15.21] - 2026-08-20
 
 ### Fixed
 - the video card mounts, reserves its real space, and pauses before it unmounts (#1481)
 - a tab switch no longer leaves graph reads refused on a stale root identity (#1478)
 - a schema read that timed out is UNKNOWN, not proof that nothing outputs the type (#1479)
+
 
 ## [0.15.20] - 2026-08-20
 
@@ -1033,11 +1125,13 @@ All notable changes to this project are documented here. This project adheres to
 ### Changed
 - bump @types/node from 22.20.0 to 26.2.0 (#1471)
 
+
 ## [0.15.19] - 2026-08-20
 
 ### Changed
 - bump the npm-minor-patch group with 2 updates (#1469)
 - bump the actions-all group with 3 updates (#1468)
+
 
 ## [0.15.18] - 2026-08-20
 
@@ -1052,6 +1146,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 - watch dependencies for advisories, weekly and grouped (#1464)
+
 
 ## [0.15.16] - 2026-08-20
 
@@ -1068,6 +1163,7 @@ All notable changes to this project are documented here. This project adheres to
 - the save timeout reports what it observed, never that the write landed (#1456)
 - promoted parent widget values survive inner subgraph edits (#1454)
 
+
 ## [0.15.14] - 2026-08-19
 
 ### Added
@@ -1083,6 +1179,7 @@ All notable changes to this project are documented here. This project adheres to
 - a pasted LoadImage file with spaces is no longer flagged missing (#1440)
 - panel_save_workflow replies when the save hangs instead of claiming the tab is frozen (#1439)
 
+
 ## [0.15.13] - 2026-08-19
 
 ### Fixed
@@ -1090,6 +1187,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_get_errors no longer attaches a stale execution error to a reused node id (#1451)
+
 
 ## [0.15.12] - 2026-08-19
 
@@ -1100,11 +1198,13 @@ All notable changes to this project are documented here. This project adheres to
 - editing a node keeps compact geometry instead of inflating it (#1446)
 - graph edits appear on the canvas, not only in the outline (#1445)
 
+
 ## [0.15.11] - 2026-08-19
 
 ### Added
 - Qwen Code as a selectable Agent Panel provider (#1438)
 - graph_get_virtual_types — serve the frontend's proven virtual-node registry (artokun/comfyui-mcp#1400) (#1441)
+
 
 ## [0.15.10] - 2026-08-19
 
@@ -1122,6 +1222,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - outline clip footer names note nodes whose text was clipped (#1435)
 
+
 ## [0.15.9] - 2026-08-19
 
 ### Fixed
@@ -1137,6 +1238,7 @@ All notable changes to this project are documented here. This project adheres to
 - stale-combo refusal tells the truth about the refresh, and the /view probe is bounded (#1425)
 - lightbox stage and collapsed cards honor the same honest failure state (#1424)
 
+
 ## [0.15.7] - 2026-08-19
 
 ### Fixed
@@ -1147,6 +1249,7 @@ All notable changes to this project are documented here. This project adheres to
 - refresh_nodes takes a command budget, so a contended refresh replies instead of timing out (#1409)
 - A2UI card buttons send a user message when clicked (#1410)
 - sanitize invalid properties.aux_id on node add/paste so one node can no longer poison every save/load (#1412)
+
 
 ## [0.15.6] - 2026-08-19
 
@@ -1182,6 +1285,7 @@ All notable changes to this project are documented here. This project adheres to
 - refuse workflow names with path separators instead of silently nesting (#1384)
 - a nested composite field inside a JSON widget validates against its own value's shape (#1382)
 - the load watch reports whether it was ENTERED, not just installed (#1387)
+
 
 ## [0.15.4] - 2026-08-19
 
@@ -1233,6 +1337,7 @@ All notable changes to this project are documented here. This project adheres to
 - a rename is announced as a rename, not a workflow switch (#1343)
 - the post-open frame wait is bounded — a starved rAF no longer latches the switch fence (#1341)
 
+
 ## [0.15.3] - 2026-08-19
 
 ### Fixed
@@ -1242,6 +1347,7 @@ All notable changes to this project are documented here. This project adheres to
 - a cg-use-everywhere graph's broadcast targets are queue-time volatile, so run-to-node's graph stamp matches on an untouched canvas (#1273)
 - panel_add_node refreshes a drifted node schema itself, then re-checks — the refusal is what survives (#1242)
 
+
 ## [0.15.2] - 2026-08-18
 
 ### Fixed
@@ -1250,6 +1356,7 @@ All notable changes to this project are documented here. This project adheres to
 - an open refused on a properties difference names the keys that differ (#886)
 - a first save publishes the identity it produced even when the swap carry fails safe (#978)
 - a widget callback's throw now names the file it surfaced from, origin scrubbed (#976)
+
 
 ## [0.15.1] - 2026-08-18
 
@@ -1265,6 +1372,7 @@ All notable changes to this project are documented here. This project adheres to
 - panel_set_widget refreshes a node's dynamic input slots after the write (#1313)
 - a same-node connect refusal is reported as LiteGraph's loopback guard, not a false type mismatch (#1311)
 
+
 ## [0.15.0] - 2026-08-17
 
 ### Added
@@ -1276,6 +1384,7 @@ All notable changes to this project are documented here. This project adheres to
 - dictation listens in the panel's language, not the browser's (#1289)
 - the desktop app disables dictation with the reason, instead of failing on every click (#1290)
 - a search limit above the cap is disclosed as limit_cap, not silently honored (#1287)
+
 
 ## [0.14.44] - 2026-08-16
 
@@ -1295,21 +1404,25 @@ All notable changes to this project are documented here. This project adheres to
 - a Manager task that terminally errored is not a queued install (#1539)
 - a widget the node computes from its own editor is not writable (#1569)
 
+
 ## [0.14.43] - 2026-08-15
 
 ### Fixed
 - a sidebar tab that is SELECTED but never paints now says so, once, with what was observed — the panel used to just look empty, with no way to tell a broken extension from a frontend that dropped the tab (#779)
 - the conversation is always panel-owned: the workflow/ask chat scopes are retired, so a session can no longer be scoped to anything but the orchestrator (mcp#884)
 
+
 ## [0.14.42] - 2026-08-15
 
 ### Fixed
 - run-to-node is no longer permanently refused when an armed Seed (rgthree) substitutes its value at queue time — that substitution is not graph drift, and every retry used to fail identically (#1124)
 
+
 ## [0.14.41] - 2026-08-15
 
 ### Fixed
 - graph_load now reports the workflow identity it actually loaded into on BOTH reply paths, including the API-format load the report came from (#1478)
+
 
 ## [0.14.40] - 2026-08-14
 
@@ -1326,26 +1439,31 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - translating the error disarmed every ComfyUI-Manager fallback (#1230)
 
+
 ## [0.14.37] - 2026-08-14
 
 ### Fixed
 - a run whose outcome could not be confirmed is reported as a neutral event instead of an urgent error, so cancelling a large batch no longer tells the agent every prompt ERRORED (#1226, comfyui-mcp#1489)
+
 
 ## [0.14.36] - 2026-08-14
 
 ### Fixed
 - panel_open_workflow now asks the SERVER whether the file exists before refusing, so a workflow staged into the workflows folder out-of-band is reported as a stale list rather than a missing file (#1222, comfyui-mcp#1448)
 
+
 ## [0.14.35] - 2026-08-14
 
 ### Fixed
 - a graph mutation refused during a reconnect now says so in a FIELD the caller can key on, instead of only in the sentence (#1216, comfyui-mcp#1529)
+
 
 ## [0.14.34] - 2026-08-14
 
 ### Fixed
 - every release since 0.14.31 writes two sections for one version (#1219)
 - rebuild combo options during the reapply sweep, and disclose an empty authoritative list (#1218)
+
 
 ## [0.14.33] - 2026-08-14
 
@@ -1550,6 +1668,7 @@ All notable changes to this project are documented here. This project adheres to
 - name every uninstalled node type before queueing, not one rejection at a time (#1129)
 - decode string escapes when extracting, so \n is a line break and not two characters (#1144)
 
+
 ## [0.14.18] - 2026-08-12
 
 ### Fixed
@@ -1629,6 +1748,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.14.2 (#1081)
 - 0.14.1 (#1076)
 - 0.13.9 (#1072)
+
 
 ## [0.14.16] - 2026-08-12
 
@@ -1774,6 +1894,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.14.1 (#1076)
 - 0.13.9 (#1072)
 
+
 ## [0.14.11] - 2026-08-11
 
 ### Fixed
@@ -1804,6 +1925,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.14.1 (#1076)
 - 0.13.9 (#1072)
 
+
 ## [0.14.10] - 2026-08-11
 
 ### Fixed
@@ -1831,6 +1953,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.14.2 (#1081)
 - 0.14.1 (#1076)
 - 0.13.9 (#1072)
+
 
 ## [0.14.9] - 2026-08-11
 
@@ -1940,6 +2063,7 @@ All notable changes to this project are documented here. This project adheres to
   overwriting your live edits or writing the wrong graph, and neither is worth doing on a
   guess.
 
+
 ## [0.14.4] - 2026-08-11
 
 ### Fixed
@@ -1954,6 +2078,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.14.2 (#1081)
 - 0.14.1 (#1076)
 - 0.13.9 (#1072)
+
 
 ## [0.14.3] - 2026-08-11
 
@@ -1983,6 +2108,7 @@ All notable changes to this project are documented here. This project adheres to
 
 - your seeds are never rewritten. This says what will happen; it does not change your values.
 
+
 ## [0.14.2] - 2026-08-11
 
 > #1062: asking the agent to add `SaveGLB` always failed. It is the only core node that
@@ -2007,6 +2133,7 @@ All notable changes to this project are documented here. This project adheres to
   widget rather than a connection — a gap found while making the above safe, which could
   have let a node be added with neither a value nor a connection on a required input. Where
   that name is one of the four built-in kinds, it needs nothing loaded and no longer waits.
+
 
 ## [0.14.1] - 2026-08-11
 
@@ -2040,6 +2167,7 @@ All notable changes to this project are documented here. This project adheres to
   that exists. What changed is only where that rule can be broken, and the check that catches
   it if it ever is.
 
+
 ## [0.14.0] - 2026-08-11
 
 > The panel shipped English-only while ComfyUI ships 12 languages, so setting ComfyUI to
@@ -2062,6 +2190,7 @@ All notable changes to this project are documented here. This project adheres to
 - this entry was written after the fact — 0.14.0 shipped without one, which meant the panel's
   own changelog view had nothing to show for the release.
 
+
 ## [0.13.9] - 2026-08-11
 
 > #1066: open an output image in ComfyUI and it mints a temporary workflow tab whose path is
@@ -2082,6 +2211,7 @@ All notable changes to this project are documented here. This project adheres to
   `://` in it, and a tab in such a folder now has its Save-As redirected to the workflows
   root. A redirected save is visible and recoverable; the 500 it replaces was not. Windows
   cannot hit this at all, since `:` is illegal in a filename there.
+
 
 ## [0.13.8] - 2026-08-11
 
@@ -2105,6 +2235,7 @@ All notable changes to this project are documented here. This project adheres to
   tab's **baseline**. Both pass honestly when the tab's own state is carrying another
   workflow's graph. Nobody compared the file to the canvas, even though that code path had
   already read the file.
+
 
 ## [0.13.7] - 2026-08-11
 
@@ -2147,6 +2278,7 @@ All notable changes to this project are documented here. This project adheres to
   today, so absent it the behaviour is unchanged; this half activates when the orchestrator
   sends the timeout it already computes.
 
+
 ## [0.13.6] - 2026-08-11
 
 > #968: three reports of the panel saying "bound to the requested workflow" while graph
@@ -2168,6 +2300,7 @@ All notable changes to this project are documented here. This project adheres to
   repaint itself and verifies it, both of its skip paths fail closed, and the report where
   the wrong workflow was queued ran on a build that already had both protections. So the
   binding is correct when it is made, and something re-points the tab afterwards.
+
 
 ## [0.13.5] - 2026-08-11
 
@@ -2214,6 +2347,7 @@ All notable changes to this project are documented here. This project adheres to
   value and the panel's assets ended up with a LOOSER policy than every other pack's. The
   shipped version matches the host's value, so that inversion cannot happen.
 
+
 ## [0.13.3] - 2026-08-10
 
 > #753: the panel's text was small and the obvious fix did nothing. Overriding
@@ -2239,6 +2373,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - the status caret set its size through a JS assignment rather than a stylesheet rule, so it
   had been missed by every sweep. It scales with the rest now.
+
 
 ## [0.13.2] - 2026-08-10
 
@@ -2266,6 +2401,7 @@ All notable changes to this project are documented here. This project adheres to
   moves where identity persists — it stops reaching the graph that a save serializes — and
   was reverted once for exactly that. Reading a field is not writing it.
 
+
 ## [0.13.1] - 2026-08-10
 
 > The other half of #952. A question card whose connection was replaced already stopped
@@ -2290,6 +2426,7 @@ All notable changes to this project are documented here. This project adheres to
   same process keeps its ledger scope. The earlier claim that a reconnect lands in a new
   scope and fails open into a duplicate card was wrong; that only happens across an
   orchestrator restart.
+
 
 ## [0.13.0] - 2026-08-10
 
@@ -2330,6 +2467,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.11.96 (#1015)
 - 0.11.95 (#1012)
 
+
 ## [0.12.2] - 2026-08-10
 
 > When the panel loses its connection while the agent is waiting on a question, the card
@@ -2364,6 +2502,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.11.96 (#1015)
 - 0.11.95 (#1012)
 
+
 ## [0.12.1] - 2026-08-10
 
 > When a command is refused because it targets a different workflow than the canvas, the
@@ -2395,6 +2534,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.11.97 (#1017)
 - 0.11.96 (#1015)
 - 0.11.95 (#1012)
+
 
 ## [0.12.0] - 2026-08-10
 
@@ -2428,6 +2568,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.11.96 (#1015)
 - 0.11.95 (#1012)
 
+
 ## [0.11.99] - 2026-08-10
 
 > After a Save-As, graph tools could keep refusing even for an agent that did exactly what
@@ -2457,6 +2598,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.11.97 (#1017)
 - 0.11.96 (#1015)
 - 0.11.95 (#1012)
+
 
 ## [0.11.98] - 2026-08-10
 
@@ -2489,6 +2631,7 @@ All notable changes to this project are documented here. This project adheres to
 - 0.11.96 (#1015)
 - 0.11.95 (#1012)
 
+
 ## [0.11.97] - 2026-08-10
 
 > A workflow with unsaved edits could have every graph tool refused after a tab switch,
@@ -2518,6 +2661,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Changed
 - 0.11.96 (#1015)
 - 0.11.95 (#1012)
+
 
 ## [0.11.96] - 2026-08-10
 
@@ -2550,6 +2694,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Changed
 - 0.11.95 (#1012)
 
+
 ## [0.11.95] - 2026-08-10
 
 > `panel_refresh_nodes` said `{ok:true, refreshed:true}` while `panel_get_errors` kept
@@ -2575,6 +2720,7 @@ All notable changes to this project are documented here. This project adheres to
   is now confined to types the frontend itself recorded as missing when the workflow
   loaded, and asks the client registry rather than `/object_info`: the server having a
   definition is not the same as this page being able to build the node.
+
 
 ## [0.11.94] - 2026-08-10
 
@@ -2605,6 +2751,7 @@ All notable changes to this project are documented here. This project adheres to
   request. The warning also says what it cannot know: it lists every such control in
   the workflow, because it cannot tell which ones a scoped run actually reaches.
 
+
 ## [0.11.93] - 2026-08-10
 
 > Covers changes since 0.11.92.
@@ -2634,6 +2781,7 @@ All notable changes to this project are documented here. This project adheres to
   file contents, and says so, and it does not claim a run did real work when all it can
   see is that the run was not suspiciously fast.
 
+
 ## [0.11.92] - 2026-08-10
 
 > Covers changes since 0.11.91.
@@ -2661,6 +2809,7 @@ All notable changes to this project are documented here. This project adheres to
   apart around a value it cannot account for. Refusing leaves everything intact and
   recoverable; guessing would not.
 
+
 ## [0.11.91] - 2026-08-10
 
 > Covers changes since 0.11.90.
@@ -2683,6 +2832,7 @@ All notable changes to this project are documented here. This project adheres to
   turning it into a version range would repeat a mistake this file has made before,
   when a range covering builds nobody had tested told three reporters their own
   evidence could not be happening.
+
 
 ## [0.11.90] - 2026-08-10
 
@@ -2716,6 +2866,7 @@ All notable changes to this project are documented here. This project adheres to
   warn about a run that was fine. The message says so, and tells you how to check.
   Muting a **top-level** subgraph — the ordinary way to switch a branch off — is
   silent, because that one genuinely works.
+
 
 ## [0.11.89] - 2026-08-10
 
@@ -2752,6 +2903,7 @@ All notable changes to this project are documented here. This project adheres to
   including subfolder-qualified ones with backslashes, every layer detected them
   correctly. A tool refusal in the same report pointed at a stale panel bundle in the
   browser instead, for which the remedy is a hard refresh.
+
 
 ## [0.11.88] - 2026-08-10
 
@@ -2799,6 +2951,7 @@ All notable changes to this project are documented here. This project adheres to
   #752), and e2e cleanup that no longer leaves saved workflows behind or passes against
   the wrong orchestrator (#907, #847).
 
+
 ## [0.11.87] - 2026-08-09
 
 ### Fixed
@@ -2813,6 +2966,7 @@ All notable changes to this project are documented here. This project adheres to
   prefer it over `install_custom_node` — which is backwards for this case, and following
   it leaves you stuck. The message now says the preference does not apply here, and notes
   where the fallback cannot help either: a remote ComfyUI has no local tree to clone into.
+
 
 ## [0.11.86] - 2026-08-09
 
@@ -2843,6 +2997,7 @@ All notable changes to this project are documented here. This project adheres to
   re-listed a fix 0.11.85 had already announced. It now takes whichever of the two is
   actually newer, decided by ancestry rather than by date.
 
+
 ## [0.11.85] - 2026-08-09
 
 > Covers changes since 0.11.84.
@@ -2863,9 +3018,11 @@ All notable changes to this project are documented here. This project adheres to
   detail — a retry that turned a real outage into a vaguer message would trade one wrong
   answer for another.
 
+
 ## [0.11.84] - 2026-08-09
 
 _No user-facing changes._
+
 
 ## [0.11.83] - 2026-08-09
 
@@ -2942,6 +3099,7 @@ _No user-facing changes._
 
 - Name the canvas swap point, from the canvas-rebuild side (#944).
 
+
 ## [0.11.80] - 2026-08-09
 
 > Covers changes since 0.11.79.
@@ -2972,6 +3130,7 @@ _No user-facing changes._
   session. One limit stays open and is documented rather than hidden — deleting a
   workflow and creating a new one with the same name can show the old chats under the
   new one, since a path is not proof of ownership.
+
 
 ## [0.11.79] - 2026-08-09
 
@@ -3034,6 +3193,7 @@ _No user-facing changes._
 
   This was worked around by hand for all fourteen releases from 0.11.63 to 0.11.76.
   A silent workaround is how a broken tool survives that long.
+
 
 ## [0.11.76] - 2026-08-09
 
@@ -3390,6 +3550,7 @@ _No user-facing changes._
   save outright if that refresh fails rather than writing something it knows is
   behind.
 
+
 ## [0.11.61] - 2026-08-09
 
 > Covers changes since 0.11.60.
@@ -3422,6 +3583,7 @@ _No user-facing changes._
   The panel now asks ComfyUI to capture the live canvas before it repaints, so what
   is on screen is what gets restored.
 
+
 ## [0.11.59] - 2026-08-09
 
 > Covers changes since 0.11.58.
@@ -3439,6 +3601,7 @@ _No user-facing changes._
   workflow object is replaced by the save, and "no other tab claims this id" is not
   the same as "this tab owned it". Guessing there would attach one workflow's
   conversations to another, so it stays unfixed and #847 stays open.
+
 
 ## [0.11.58] - 2026-08-09
 
@@ -3464,6 +3627,7 @@ _No user-facing changes._
   recomputes on load". Node colours are on that same list and nothing recomputes
   them, so that was untrue whenever a colour differed.
 
+
 ## [0.11.57] - 2026-08-09
 
 > Covers changes since 0.11.56.
@@ -3487,6 +3651,7 @@ _No user-facing changes._
   Deleting a chat now removes it for good, including from the new store, and a
   delete that fails is retried rather than quietly forgotten.
 
+
 ## [0.11.56] - 2026-08-09
 
 > Covers changes since 0.11.55.
@@ -3505,6 +3670,7 @@ _No user-facing changes._
   save are matched within the session; carrying that across a reload needs the
   stamps rewritten at the save boundary and is still open.
 
+
 ## [0.11.55] - 2026-08-09
 
 > Covers changes since 0.11.54.
@@ -3522,6 +3688,7 @@ _No user-facing changes._
   — and it stops after one check, so a session that genuinely has no canvas tools
   still reaches its remedies instead of searching forever.
 
+
 ## [0.11.54] - 2026-08-09
 
 > Covers changes since 0.11.53.
@@ -3537,6 +3704,7 @@ _No user-facing changes._
   along. Every branch now carries `target`, and the two failure messages name the
   host in prose; an unknown target is omitted rather than reported blank. The
   confirmation card and its timeout wording are orchestrator-side and unchanged.
+
 
 ## [0.11.53] - 2026-08-09
 
@@ -3747,6 +3915,7 @@ _No user-facing changes._
 - declare every reach into ComfyUI's own DOM (#787)
 - verify ONE node type, not the whole schema (#780)
 
+
 ## [0.11.41] - 2026-08-05
 
 ### Fixed
@@ -3771,6 +3940,7 @@ _No user-facing changes._
   could still reach the network unscoped — including a retrying run restoring its
   entry-time `fetchApi` over a concurrent run's guard. #581 needed no code: already fixed
   on main by #594 and #621.
+
 
 ## [0.11.40] - 2026-08-05
 
@@ -3800,6 +3970,7 @@ _No user-facing changes._
   polls completed. The injected delay now resolves instantly, and the test additionally asserts
   the loop's pacing, which it had been taking on trust (#652)
 
+
 ## [0.11.39] - 2026-08-04
 
 ### Fixed
@@ -3826,6 +3997,7 @@ _No user-facing changes._
 - refuse the false-empty authoritative read (empty-binding-unproven)
 - narrow + surface the volatile-input exclusion (codex gate)
 - exclude linked value-control targets from the scoped-run drift hash
+
 
 ## [0.11.38] - 2026-08-03
 
@@ -3879,6 +4051,7 @@ _No user-facing changes._
 - retain missing-node-type outlines
 - clear stale root outlines after subgraph conversion (#516)
 - restore CivitAI keyword search results
+
 
 ## [0.11.34] - 2026-08-02
 
@@ -3949,6 +4122,7 @@ _No user-facing changes._
 - report EFFECTIVE widget state + stop blobs starving the node you asked for (#607, #609) (#482)
 - recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
 
+
 ## [0.11.33] - 2026-08-02
 
 ### Fixed
@@ -3985,6 +4159,7 @@ _No user-facing changes._
 - report EFFECTIVE widget state + stop blobs starving the node you asked for (#607, #609) (#482)
 - recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
 
+
 ## [0.11.31] - 2026-08-01
 
 ### Fixed
@@ -4004,6 +4179,7 @@ _No user-facing changes._
 - report EFFECTIVE widget state + stop blobs starving the node you asked for (#607, #609) (#482)
 - recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
 
+
 ## [0.11.30] - 2026-08-01
 
 ### Added
@@ -4019,6 +4195,7 @@ _No user-facing changes._
 - report EFFECTIVE widget state + stop blobs starving the node you asked for (#607, #609) (#482)
 - recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
 
+
 ## [0.11.29] - 2026-08-01
 
 ### Added
@@ -4028,6 +4205,7 @@ _No user-facing changes._
 - report EFFECTIVE widget state + stop blobs starving the node you asked for (#607, #609) (#482)
 - recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
 
+
 ## [0.11.28] - 2026-08-01
 
 ### Added
@@ -4035,6 +4213,7 @@ _No user-facing changes._
 
 ### Fixed
 - recover run-completion missed on unobserved reconnect (#356) + refuse false-clean empty-graph reads (#389)
+
 
 ## [0.11.27] - 2026-08-01
 
@@ -4088,6 +4267,7 @@ _No user-facing changes._
 - **`set_widget` refuses a scalar/wrong-typed write to a composite widget instead of silently corrupting it (#560), and warns when a value is governed by `control_after_generate` (#558).** rgthree Power Lora Loader slots (`{on, lora, strength, strengthTwo}`) are now written via schema-validated sub-field addressing (`lora_1.on`) that fails closed on unknown fields and enforces each field's declared type independent of its current value — a bare scalar or wrong-typed write no longer overwrites part of the object and reports success, and a partially-corrupt row is repaired forward. `set_widget` also detects a governed `control_after_generate` control (side-effect-free) and warns that the written value will be overwritten on the next run; `graph_outline` annotates the widget. Verified by an independent 3-round adversarial codex review.
 - **`panel_save_workflow` reports its Save-As outcome so a rename-vs-copy is never silent, with no false data-loss alarms (#579, #363).** The result now describes what happened (`saved_as` / `copied_from` / `original_on_disk` / `first_save`) instead of a bare `{saved:true}`, and a post-write disk check flags a genuine loss — while never false-throwing on a legitimate first save, a transient probe failure, a non-200 2xx pre-probe, a root-relative external path, or a tab switch during the pre-probe. The Save-As copy semantics themselves (never move/clobber the source) were already in place from #375; this locks the reporting around them. Naming a workflow created by `panel_new_workflow` is accepted as a first save (#363). Verified by an independent 3-round adversarial codex review.
 
+
 ## [0.11.21] - 2026-07-31
 
 ### Fixed
@@ -4101,6 +4281,7 @@ _No user-facing changes._
 - `panel_update_node` reports a Manager task failure instead of false success (#364). (#382)
 - Author/repo install shorthand, dead-collapse fallback, storyboard input litter. (#424)
 - Consistent subgraph scope tracking + rail-id move + boundary cleanup + read/edit scope lockstep (#308, #302, #234, #220). (#373)
+
 
 ## [0.11.20] - 2026-07-30
 
@@ -4312,6 +4493,7 @@ _No user-facing changes._
   and a wildcard-bind comparison that exists precisely to rewrite the bind to
   loopback is marked `# nosec` with a reason. (#122)
 
+
 ## [0.10.0] - 2026-07-22
 
 ### Added
@@ -4345,6 +4527,7 @@ _No user-facing changes._
 - render each slot's help text in the API Keys card (#103)
 - crop, centre and whiten the header wordmark (#107)
 
+
 ## [0.9.9] - 2026-07-20
 
 ### Changed
@@ -4353,6 +4536,7 @@ _No user-facing changes._
   double-encoded em-dashes that rendered as mojibake on registry.comfy.org),
   and the icon/banner are the flat comfyui-mcp mark shared with the docs site
   and mobile app — the sidebar tab wears the same mark (#99)
+
 
 ## [0.9.8] - 2026-07-20
 
@@ -4366,6 +4550,7 @@ _No user-facing changes._
 ### Fixed
 - send content mode to the orchestrator + gate screenshots (fixes #90) (#97)
 
+
 ## [0.9.7] - 2026-07-20
 
 ### Changed
@@ -4376,6 +4561,7 @@ _No user-facing changes._
 ### Added
 - max + ultra on the Codex scale for GPT-5.6 (#94)
 
+
 ## [0.9.6] - 2026-07-19
 
 ### Fixed
@@ -4384,30 +4570,36 @@ _No user-facing changes._
 ### Changed
 - merge graph_view_errored_nodes into graph_get_errors (#92)
 
+
 ## [0.9.5] - 2026-07-19
 
 ### Fixed
 - carry exception_type, and surface runtime failures in the affordance
+
 
 ## [0.9.4] - 2026-07-19
 
 ### Fixed
 - correct the missing-node-types source; fall back for validation errors
 
+
 ## [0.9.3] - 2026-07-19
 
 ### Fixed
 - stop tripping the YARA SUSP_SVG scan
+
 
 ## [0.9.2] - 2026-07-19
 
 ### Added
 - view_selected / view_nodes_in_viewport / view_errored_nodes (#91)
 
+
 ## [0.9.1] - 2026-07-18
 
 ### Added
 - add Kimi K3 (Moonshot) provider chip (#89)
+
 
 ## [0.9.0] - 2026-07-17
 
@@ -4525,10 +4717,12 @@ _No user-facing changes._
 ### Fixed
 - replace expired invite with the permanent link (#82)
 
+
 ## [0.8.1] - 2026-07-14
 
 ### Fixed
 - keyed-provider hints lead with the API Keys card; custom endpoint advertises DeepSeek BYOK
+
 
 ## [0.8.0] - 2026-07-12
 
@@ -4541,6 +4735,7 @@ _No user-facing changes._
 
 ### Fixed
 - QR encodes the https lander URL — phone cameras refuse ws:// ("No usable data found")
+
 
 ## [0.7.3] - 2026-07-09
 
@@ -4557,12 +4752,14 @@ _No user-facing changes._
 - rapid sidebar tab switching no longer causes any bridge reconnect churn —
   the panel is built once per page instead of once per tab open
 
+
 ## [0.7.2] - 2026-07-09
 
 ### Fixed
 - the "Control via Mobile app (beta)" gate now actually hides the header QR
   button when off — the `hidden` attribute was overridden by the icon-button's
   `display: flex` CSS; switched to inline display toggling
+
 
 ## [0.7.1] - 2026-07-09
 
@@ -4580,6 +4777,7 @@ _No user-facing changes._
   discovery + panel settings so a live agent can't hijack specs or have its
   settings polluted by them
 
+
 ## [0.7.0] - 2026-07-09
 
 ### Added
@@ -4595,6 +4793,7 @@ _No user-facing changes._
 - comboSignature — text-safe NUL separator; raw NUL byte made git/scanners treat the bundle as binary
 - clear both Python findings from the release scan (#72)
 
+
 ## [0.6.9] - 2026-07-09
 
 ### Added
@@ -4603,6 +4802,7 @@ _No user-facing changes._
 
 ### Fixed
 - Fable 5 was invisible — dedupe pinned claude-* ids by resolvedModel, not pattern (#70)
+
 
 ## [0.6.8] - 2026-07-08
 

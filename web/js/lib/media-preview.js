@@ -129,6 +129,46 @@ function extensionOf(filename) {
 
 const defaultCoerce = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
 
+/**
+ * ComfyUI's /view handler always `os.path.basename()`s `filename` and looks
+ * under `subfolder` (or the type root when that is empty). A combined
+ * `filename: "video/clip.mp4"` with no subfolder therefore 404s: the basename
+ * `clip.mp4` is sought in output/, not output/video/ (#2193).
+ *
+ * Split a combined filename the way get_image already does. An explicit
+ * subfolder is kept — ComfyUI still basenames filename and uses that
+ * subfolder — so `video/clip.mp4` + subfolder `video` does not become
+ * `video/video`.
+ *
+ * Forward slashes only: ComfyUI history and agents join with POSIX `/`. A
+ * backslash is a literal filename character on POSIX servers (#513).
+ */
+function splitViewFilename(filename) {
+  const raw = String(filename ?? "");
+  const i = raw.lastIndexOf("/");
+  if (i < 0) return { subfolder: "", filename: raw };
+  const name = raw.slice(i + 1);
+  if (!name) return { subfolder: "", filename: raw };
+  return { subfolder: raw.slice(0, i), filename: name };
+}
+
+/** Normalize a ComfyUI `{filename, subfolder?, type?}` ref for `/view`. */
+export function normalizeComfyViewRef(ref, coerce = defaultCoerce) {
+  if (!ref || typeof ref !== "object" || Array.isArray(ref)) return ref;
+  const filenameRaw = coerce(ref.filename);
+  const subfolderRaw = coerce(ref.subfolder);
+  const typeRaw = coerce(ref.type);
+  const split = splitViewFilename(filenameRaw);
+  const filename = split.filename || filenameRaw;
+  const subfolder = subfolderRaw || split.subfolder;
+  const out = { ...ref, filename };
+  if (subfolder) out.subfolder = subfolder;
+  else if ("subfolder" in ref) out.subfolder = subfolderRaw;
+  if (typeRaw) out.type = typeRaw;
+  else if (!("type" in out) || out.type == null || out.type === "") out.type = "output";
+  return out;
+}
+
 function kindForExtension(ext) {
   if (VIDEO_EXTENSIONS.has(ext)) return "video";
   if (AUDIO_EXTENSIONS.has(ext)) return "audio";
@@ -444,7 +484,10 @@ export async function composeShowMediaReply(items, deps = {}) {
     let why = null;
     let name = text(item?.filename);
     if (item?.kind === "viewRef" && item?.viewRef) {
-      ref = item.viewRef;
+      // #2193 — split `video/clip.mp4` into subfolder + basename BEFORE the
+      // /view URL is built. ComfyUI basename()s filename, so a combined path
+      // 404s even when the file is a valid output (get_image already splits).
+      ref = normalizeComfyViewRef(item.viewRef, text);
       name = text(ref.filename) || name;
       try {
         url = imageViewUrl(ref);
