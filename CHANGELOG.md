@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
 
+- the stale-snapshot save refusal no longer promises that a still-open transaction clears by itself or that nudging the canvas fixes it (measured: it does not, and each nudge widens the gap), and it now warns against falling back to ComfyUI's own Save, which persists the same tracker snapshot silently (#2139)
 ## [0.15.163] - 2026-09-03
 
 ### Fixed
