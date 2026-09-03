@@ -15925,21 +15925,16 @@ const GRAPH_TOOL_EXECUTORS = {
       // per-instance override cannot be misread as stale data.
       ...safeProvenance,
       node_count: inner.length,
-      truncated: inner.length > MAX_STATE_NODES,
-      ...(inner.length > MAX_STATE_NODES
-        ? {
-            truncation_hint: fixedCapNote(
-              "inner node(s)",
-              MAX_STATE_NODES,
-              inner.length,
-              // Honest about the follow-up's OWN ceiling (codex gate): panel_query_graph
-              // clamps limit at 200 and has no cursor, so on a >200-node subgraph it is a
-              // way to read MORE, not a way to read all.
-              "panel_enter_subgraph into it, then panel_query_graph — which takes limit (max 200) and max_chars. It has no cursor, so beyond 200 inner nodes use its types/where filters to work through them.",
-            ),
-          }
-        : {}),
-      nodes: inner.slice(0, MAX_STATE_NODES).map(summarizeNode),
+      // #2057 — MCP's promoted-write fence treats `truncated !== false` as an
+      // incomplete ownership envelope and will not dispatch graph_set_widget.
+      // A listing cap here made a 162-node wrapper refuse its own promoted
+      // model_name write even though promoted_terminals was complete. This
+      // command IS the completeness proof (`node_count === nodes.length` and
+      // `truncated:false`); listing caps belong to graph_get_state /
+      // panel_query_graph. Emit the boolean even when false: older MCP treated
+      // an unset flag as a veto.
+      truncated: false,
+      nodes: inner.map(summarizeNode),
       // The hello capability promises a complete alias witness. Publish an
       // explicit empty array too, so the consumer can distinguish a subgraph
       // with no promoted aliases from a current/legacy capability-skewed
