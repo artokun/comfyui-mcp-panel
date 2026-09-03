@@ -9,10 +9,12 @@ import {
   CHAT_HISTORY_SCHEMA,
   ChatHistoryStore,
   createHistoryResetSnapshot,
+  IDB_OPEN_TIMEOUT_MS,
   isThreadInScope,
   mergeHistorySnapshots,
   normalizeThread,
   panelScopeKeyForBackend,
+  planRemountHistoryRestore,
   resolvePanelPointer,
   retainBoundedThreads,
   selectPanelThread,
@@ -2653,6 +2655,141 @@ test('#1171 a capped open reports failure exactly past the local shadow boundary
     }
     store.close()
   }
+})
+
+test('#2201 planRemountHistoryRestore preserves until canonical is positively available', () => {
+  const thread = { id: 'keep', sessionId: 'sess-codex', msgs: [{ id: 'm1', role: 'user', text: 'hi' }] }
+  assert.deepEqual(
+    planRemountHistoryRestore({ canonicalAvailable: false, durableActive: thread }),
+    { kind: 'preserve', retry: true },
+  )
+  assert.deepEqual(
+    planRemountHistoryRestore({ canonicalAvailable: undefined, durableActive: null }),
+    { kind: 'preserve', retry: true },
+  )
+  assert.deepEqual(
+    planRemountHistoryRestore({ canonicalAvailable: true, durableActive: null }),
+    { kind: 'reset' },
+  )
+  assert.deepEqual(
+    planRemountHistoryRestore({ canonicalAvailable: true, durableActive: thread }),
+    { kind: 'bind', thread },
+  )
+})
+
+test('#2201 load reports canonical unavailable on open timeout and does not persist an empty shadow over IndexedDB', async () => {
+  const canonical = {
+    schemaVersion: CHAT_HISTORY_SCHEMA,
+    updatedAt: 5_000,
+    threads: [{
+      id: 'keep',
+      workflowKey: 'panel:global',
+      provider: 'codex',
+      sessionId: 'sess-codex',
+      updatedAt: 5_000,
+      msgs: [{
+        id: 'keep-message',
+        role: 'user',
+        text: 'panel-wide codex turn',
+        createdAt: 5_000,
+      }],
+    }],
+    meta: {
+      updatedAt: 5_000,
+      activeByScope: { 'panel:backend:codex': 'keep' },
+    },
+  }
+  const inner = createFakeIndexedDb(canonical)
+  let hang = true
+  const indexedDb = {
+    open: () => {
+      if (hang) {
+        return {
+          set onsuccess(_) {},
+          set onerror(_) {},
+          set onblocked(_) {},
+          set onupgradeneeded(_) {},
+        }
+      }
+      return inner.open()
+    },
+    readState: inner.readState,
+  }
+  const storage = createMemoryStorage()
+  const store = new ChatHistoryStore({ storage, indexedDb })
+
+  const started = Date.now()
+  const loaded = await store.load({ protectedThreadIds: ['keep'] })
+  const elapsed = Date.now() - started
+  assert.ok(elapsed >= IDB_OPEN_TIMEOUT_MS - 50, `load() returned in ${elapsed}ms — it must wait out the open cap`)
+  assert.ok(elapsed < 4000, `load() took ${elapsed}ms — it must settle on the open cap, not hang`)
+  assert.equal(loaded.canonicalAvailable, false)
+  assert.equal(loaded.threads.length, 0)
+
+  const flushStarted = Date.now()
+  await store.flush()
+  assert.ok(
+    Date.now() - flushStarted < 500,
+    'an unavailable load must not enqueue a canonical write of the empty shadow',
+  )
+  assert.equal(inner.readState().threads[0].id, 'keep')
+  assert.equal(inner.readState().threads[0].msgs[0].text, 'panel-wide codex turn')
+  assert.equal(inner.readState().meta.activeByScope['panel:backend:codex'], 'keep')
+
+  const pointers = { threadId: 'keep', sessionId: 'sess-codex' }
+  const pointerWrites = []
+  const apply = (snapshot) => {
+    const durableActive = selectRestoreThread(snapshot.threads, snapshot.meta, {
+      panelOwned: true,
+      scopeKey: 'panel:backend:codex',
+      preferredThreadId: pointers.threadId,
+    })
+    const plan = planRemountHistoryRestore({
+      canonicalAvailable: snapshot.canonicalAvailable === true,
+      durableActive,
+    })
+    if (plan.kind === 'reset') {
+      pointerWrites.push(null)
+      pointers.threadId = null
+      pointers.sessionId = null
+    }
+    return plan
+  }
+
+  assert.equal(apply(loaded).kind, 'preserve')
+  assert.equal(pointers.threadId, 'keep')
+  assert.equal(pointers.sessionId, 'sess-codex')
+  assert.deepEqual(pointerWrites, [])
+
+  hang = false
+  const recovered = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+  const reloaded = await recovered.load({ protectedThreadIds: ['keep'] })
+  assert.equal(reloaded.canonicalAvailable, true)
+  assert.equal(reloaded.threads[0].id, 'keep')
+  assert.equal(reloaded.threads[0].sessionId, 'sess-codex')
+  assert.equal(reloaded.threads[0].msgs[0].text, 'panel-wide codex turn')
+  const bound = apply(reloaded)
+  assert.equal(bound.kind, 'bind')
+  assert.equal(bound.thread.id, 'keep')
+  assert.deepEqual(pointerWrites, [])
+  store.close()
+  recovered.close()
+})
+
+test('#2201 a positively empty canonical snapshot is still a reset', async () => {
+  const indexedDb = createFakeIndexedDb()
+  const store = new ChatHistoryStore({ storage: createMemoryStorage(), indexedDb })
+  const loaded = await store.load()
+  assert.equal(loaded.canonicalAvailable, true)
+  assert.equal(loaded.threads.length, 0)
+  assert.equal(
+    planRemountHistoryRestore({
+      canonicalAvailable: loaded.canonicalAvailable,
+      durableActive: selectRestoreThread(loaded.threads, loaded.meta, { panelOwned: true }),
+    }).kind,
+    'reset',
+  )
+  store.close()
 })
 // ---------------------------------------------------------------------------
 // mcp#884 — THE INVARIANT, pinned as a gate rather than left to inspection.

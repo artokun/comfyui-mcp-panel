@@ -54,7 +54,7 @@ const LOCAL_SHADOW_MESSAGES = 200;
  * not be the reason the host fails.
  */
 const LOCAL_SHADOW_MAX_BYTES = 1_500_000;
-const IDB_OPEN_TIMEOUT_MS = 2000;
+export const IDB_OPEN_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_TOMBSTONES = 512;
 const DEFAULT_MAX_METADATA_OPS = 512;
 const DEFAULT_MAX_WORKFLOW_VERSIONS = 20;
@@ -905,6 +905,25 @@ export function selectRestoreThread(
   return selectThreadForScope(threads, meta, scopeKey);
 }
 
+/**
+ * Remount restore policy (#2201).
+ *
+ * An unavailable or timed-out canonical IndexedDB read is not proof of an empty
+ * archive. The localStorage shadow is a bounded cache of that archive, so a
+ * miss there plus a miss here looks identical to a real reset — and must not
+ * clear the tab's thread/session pointers or persist a null active pointer.
+ * Only a positively available canonical snapshot may bind or reset.
+ */
+export function planRemountHistoryRestore({ canonicalAvailable, durableActive } = {}) {
+  if (canonicalAvailable !== true) {
+    return { kind: "preserve", retry: true };
+  }
+  if (!durableActive) {
+    return { kind: "reset" };
+  }
+  return { kind: "bind", thread: durableActive };
+}
+
 /** Apply a strict recency cap without evicting conversations that are still
  * bound to a browser tab or durable active-scope pointer. Protected ids are
  * ordered by priority; remaining capacity is filled with the newest threads. */
@@ -1542,16 +1561,36 @@ function openDb(indexedDb) {
   });
 }
 
+/**
+ * Read the canonical snapshot.
+ *
+ * Returns `{ available: false, snapshot: null }` when the database cannot be
+ * reached (open timeout, missing IndexedDB, transaction failure) and
+ * `{ available: true, snapshot }` when the read completed — `snapshot` is
+ * null only when the store is positively empty. The difference is
+ * load-bearing (#2201): treating unreachable as empty lets a trimmed
+ * localStorage shadow look like a real history reset.
+ */
 async function idbRead(indexedDb) {
   const db = await openDb(indexedDb);
-  if (!db) return null;
+  if (!db) return { available: false, snapshot: null };
   try {
     return await new Promise((resolve) => {
-      const tx = db.transaction("snapshots", "readonly");
+      let tx;
+      try {
+        tx = db.transaction("snapshots", "readonly");
+      } catch {
+        resolve({ available: false, snapshot: null });
+        return;
+      }
       const req = tx.objectStore("snapshots").get(CHAT_HISTORY_STATE_KEY);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
+      req.onsuccess = () => resolve({ available: true, snapshot: req.result || null });
+      req.onerror = () => resolve({ available: false, snapshot: null });
+      tx.onerror = () => resolve({ available: false, snapshot: null });
+      tx.onabort = () => resolve({ available: false, snapshot: null });
     });
+  } catch {
+    return { available: false, snapshot: null };
   } finally {
     db.close();
   }
@@ -2319,18 +2358,26 @@ export class ChatHistoryStore {
   }
 
   async load(options = {}) {
-    const indexed = await idbRead(this.indexedDb);
+    const read = await idbRead(this.indexedDb);
+    const indexed = read.available ? read.snapshot : null;
     const local = this.readLocal({ quarantineCheckpoint: indexed != null });
     const merged = mergeUnderCanonicalCheckpoint(indexed, local);
     this._observeSnapshot(merged);
     // Migration is automatic: once loaded, the full merged set is promoted to
     // IndexedDB while a small legacy shadow remains for older panel builds.
-    this.persist(merged.threads, merged.meta, options);
+    // An unavailable canonical read must not enqueue that write — a trimmed
+    // shadow would otherwise become the write intent and look like a reset
+    // (#2201). Retry hydration once the store is reachable again.
+    if (read.available) {
+      this.persist(merged.threads, merged.meta, options);
+    }
+    merged.canonicalAvailable = read.available;
     return merged;
   }
 
   async readCanonical() {
-    const indexed = await idbRead(this.indexedDb);
+    const read = await idbRead(this.indexedDb);
+    const indexed = read.available ? read.snapshot : null;
     const merged = mergeUnderCanonicalCheckpoint(
       indexed,
       this.readLocal({ quarantineCheckpoint: indexed != null }),
