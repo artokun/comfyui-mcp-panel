@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
+  strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
+  `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash
+  cluster. The panel's root font stack names no symbol or emoji face, so those glyphs must
+  resolve by DirectWrite fallback either way; the selector made the emoji font mandatory
+  rather than incidental, and several of the nine render exactly where the crash timeline
+  puts the failures. Worth doing regardless: a warning triangle in a dense sidebar wants
+  text presentation. NOT claimed as the fix for the renderer crash, which is upstream.
+
 ## [0.15.160] - 2026-09-03
 
 ### Fixed
