@@ -354,13 +354,6 @@ export function combineNodeErrorMaps(nodeErrorsMaps) {
   return Object.keys(combined).length ? combined : null;
 }
 
-/** Split a locator into its containing scope and its graph-local id. */
-function splitLocatorScope(id) {
-  const raw = String(id ?? "");
-  const cut = raw.lastIndexOf(":");
-  return cut === -1 ? { scope: "", local: raw } : { scope: raw.slice(0, cut), local: raw.slice(cut + 1) };
-}
-
 /** Read a link record out of a LiteGraph link store (Map in newer builds, object in older). */
 function lookupLink(links, linkId) {
   if (links == null || linkId == null) return null;
@@ -368,51 +361,16 @@ function lookupLink(links, linkId) {
 }
 
 /**
- * The live `{ id, slot }` feeding `inputName` on `node` — the SOURCE side of the link,
- * which is exactly what `extra_info.linked_node` names. `undefined` when the graph
- * cannot answer (no such input, no readable link store); `null` when the input is
- * genuinely unconnected — a real answer, distinct from "cannot tell". `slot` is null
- * when the link record does not carry a readable one.
- */
-function liveInputOrigin(node, inputName) {
-  const inputs = Array.isArray(node?.inputs) ? node.inputs : null;
-  if (!inputs) return undefined;
-  const input = inputs.find((i) => i?.name === inputName);
-  // A slot the live node does not have (renamed by a dynamic pack's position-based
-  // re-slotting, #1873) leaves the error unjudgeable — never falsified by absence.
-  if (!input) return undefined;
-  if (input.link == null) return null;
-  const links = node?.graph?.links;
-  if (links == null) return undefined;
-  const link = lookupLink(links, input.link);
-  if (link == null) return undefined;
-  const originId = link.origin_id ?? link[1];
-  if (originId == null) return undefined;
-  const originSlot = link.origin_slot ?? link[2];
-  return {
-    id: String(originId),
-    slot: Number.isInteger(originSlot) ? originSlot : null,
-    // The source NODE, so the caller can ask whether the prompt would even name it.
-    node: node?.graph?.getNodeById?.(originId) ?? null,
-  };
-}
-
-/**
  * True when this live node is one the prompt compiler would name as a link source.
  *
- * The panel compares a COMPILED artifact (the prompt's `linked_node`) against the RAW
- * graph, and those two disagree wherever the compiler resolves *through* a node. The
- * frontend's serializer states the rule exactly (quoted in frontend-virtual-nodes.js):
+ * The frontend's serializer states the rule exactly (quoted in frontend-virtual-nodes.js):
  *
  *     if (e.isVirtualNode || e.mode === NEVER || e.mode === BYPASS) continue;
  *
  * so a Reroute, a Get/Set bus node, a subgraph container (also `isVirtualNode`), a MUTED
- * node or a BYPASSED one never appears in the prompt — the link is attributed to whatever
- * is upstream of it instead. An input fed through any of those has a `linked_node` that
- * CANNOT equal its immediate `origin_id`, and reading that difference as a repair drops a
- * live error on any graph using a reroute (codex gate round 5).
- *
- * Positive proof only: an unresolvable origin node answers false, i.e. keep the error.
+ * node or a BYPASSED one never appears in the prompt — the type the input actually
+ * receives comes from further upstream, and this node's own output type is not evidence
+ * about it. Positive proof only: an unresolvable node answers false, i.e. keep the error.
  */
 function originIsNamedInPrompt(originNode) {
   if (!originNode || typeof originNode !== "object") return false;
@@ -424,67 +382,92 @@ function originIsNamedInPrompt(originNode) {
 }
 
 /**
- * True when this validation error is a claim about ONE specific link that the live
- * graph falsifies. ComfyUI's `return_type_mismatch` (execution.py `validate_inputs`)
- * carries `extra_info.input_name` and `extra_info.linked_node = [nodeId, outputSlot]`
- * — i.e. "input X is fed by node Y and Y's type is wrong". When X is now fed by a
- * different node, or by nothing, that sentence is no longer true of this graph.
+ * True when the live graph proves a `return_type_mismatch` has been REPAIRED.
  *
- * `linked_node` is `[node_id, slot_index]`, and BOTH halves are part of the claim: the
- * received type is `RETURN_TYPES[slot_index]`, so re-pointing the same input at a
- * DIFFERENT OUTPUT of the SAME node is a complete repair of a type mismatch and one the
- * reporter's own scenario could have taken (codex gate round 2). Comparing the node id
- * alone left that repair reported forever.
+ * ## Why this asks about types and not about the link the error names
  *
- * Only decides on POSITIVE evidence. A missing/odd `extra_info`, an input the live
- * node no longer exposes, an unreadable link store, a slot index neither side states,
- * or a `linked_node` in a different subgraph scope than the errored node (which the
- * live inner graph cannot express as a plain origin id) all return false — kept.
+ * The obvious reading of `extra_info.linked_node` is "the error is about this link; if the
+ * input is fed by something else now, the error is stale". Four review rounds killed that
+ * reading, each for a different reason, and they share one cause: **`linked_node` is a
+ * coordinate in the COMPILED prompt and the panel only has the RAW graph.** The compiler
+ * flattens subgraphs, renames dynamic slots, and resolves through every virtual, muted and
+ * bypassed node, so "the link changed" and "the graph was repaired" are simply different
+ * questions. Worse, the final round showed the reading is not even sound when the link
+ * genuinely did change: moving an input from output 0 to output 1 of the SAME node repairs
+ * nothing when both outputs are `IMAGE`, yet the named link is now different.
+ *
+ * So the question this asks is the one that actually determines the verdict, and it is
+ * entirely local: **does the input's own type now exactly equal the type of the output
+ * feeding it?** If it does, ComfyUI cannot produce this mismatch from this graph — the
+ * repair is proven, whatever route the link took to get there. If it does not, the error
+ * is kept, and that covers every case the earlier reading got wrong for free:
+ *
+ *   - fed by a different node that still produces `IMAGE` — types still disagree → kept;
+ *   - moved to another same-typed output of the same node → kept (the round-6 case);
+ *   - fed through a reroute / bypass whose own output type is not the effective one →
+ *     `originIsNamedInPrompt` refuses to read it → kept;
+ *   - now unconnected → there is no source type to prove anything with → kept. (This also
+ *     retires an earlier judgement call: a disconnected input used to be treated as a
+ *     repair, which reported clean on a graph that may still be broken.)
+ *
+ * EXACT equality only. ComfyUI's own `validate_node_input` understands wildcards and
+ * comma-separated unions, and re-implementing it here would be a second compiler to get
+ * wrong; an identical string is the one case that needs no interpretation. A `*` on either
+ * side, an unreadable type, or a missing slot all answer false — the error is kept.
  */
-function nodeErrorLinkClaimFalsified(node, errorNodeId, error) {
+function nodeErrorMismatchRepaired(node, error) {
   // ONLY `return_type_mismatch`. Exactly two error types in execution.py carry a
-  // `linked_node`, and they file it under DIFFERENT nodes (codex gate round 4):
+  // `linked_node`, and they file it under DIFFERENT nodes:
   //
   //   return_type_mismatch          → `errors.append(error)` — recorded on the node being
-  //                                   validated, so `input_name` IS an input of that node
-  //                                   and `linked_node` is what feeds it. This function's
-  //                                   whole premise.
+  //                                   validated, so `input_name` IS an input of that node.
+  //                                   This function's whole premise.
   //   exception_during_inner_validation
   //                                 → `validated[o_id] = (False, reasons, o_id)` — recorded
-  //                                   on the UPSTREAM node, while `input_name` names an input
-  //                                   of the DOWNSTREAM one and `linked_node` points back at
-  //                                   the errored node itself. Reading it with the premise
-  //                                   above finds a same-named input on the wrong node and
-  //                                   drops a live error.
+  //                                   on the UPSTREAM node, while `input_name` names an
+  //                                   input of the DOWNSTREAM one. Read with the premise
+  //                                   above it finds a same-named input on the wrong node.
   //
   // A whitelist rather than a blocklist, so an error type this panel has never seen — a
   // newer ComfyUI's, or a custom validator's — is never judged by semantics borrowed from
   // a different one.
   if (error?.type !== "return_type_mismatch") return false;
-  const extra = error?.extra_info;
-  if (!extra || typeof extra !== "object") return false;
-  const inputName = extra.input_name;
+  const inputName = error?.extra_info?.input_name;
   if (typeof inputName !== "string" || !inputName) return false;
-  const claimed = Array.isArray(extra.linked_node) ? extra.linked_node[0] : undefined;
-  if (claimed == null) return false;
-  // Compare inside ONE graph: the error's ids are the flattened prompt's, the live
-  // link's origin is local to the node's own (sub)graph. Same scope ⇒ same graph.
-  const here = splitLocatorScope(errorNodeId);
-  const there = splitLocatorScope(claimed);
-  if (there.scope !== here.scope) return false;
-  const live = liveInputOrigin(node, inputName);
-  if (live === undefined) return false;
-  if (live === null) return true; // the input exists and nothing feeds it now
-  // The claim is about the COMPILED prompt. Only compare when the live source is a node
-  // the compiler would actually name — otherwise the difference is indirection through a
-  // reroute / subgraph container / muted / bypassed node, not a repair.
-  if (!originIsNamedInPrompt(live.node)) return false;
-  if (live.id !== there.local) return true;
-  // Same source node: the slot is the remainder of the claim. Judge it only when BOTH
-  // sides state one — an absent slot on either side is unreadable, not a disagreement.
-  const claimedSlot = Array.isArray(extra.linked_node) ? extra.linked_node[1] : undefined;
-  if (!Number.isInteger(claimedSlot) || live.slot === null) return false;
-  return live.slot !== claimedSlot;
+
+  const inputs = Array.isArray(node?.inputs) ? node.inputs : null;
+  if (!inputs) return false;
+  // A slot the live node does not have (renamed by a dynamic pack's position-based
+  // re-slotting, #1873) leaves the error unjudgeable — never repaired by absence.
+  const input = inputs.find((i) => i?.name === inputName);
+  if (!input) return false;
+  const inputType = readableSlotType(input);
+  if (!inputType) return false;
+  if (input.link == null) return false; // nothing feeds it ⇒ no source type ⇒ no proof
+
+  const links = node?.graph?.links;
+  if (links == null) return false;
+  const link = lookupLink(links, input.link);
+  if (link == null) return false;
+  const originId = link.origin_id ?? link[1];
+  if (originId == null) return false;
+  const originSlot = link.origin_slot ?? link[2];
+  if (!Number.isInteger(originSlot)) return false;
+
+  const source = node?.graph?.getNodeById?.(originId) ?? null;
+  if (!originIsNamedInPrompt(source)) return false;
+  const outputType = readableSlotType(source?.outputs?.[originSlot]);
+  if (!outputType) return false;
+
+  return outputType === inputType;
+}
+
+/** A slot's declared type, or "" when it is absent, non-string, or the `*` wildcard. */
+function readableSlotType(slot) {
+  const type = slot?.type;
+  if (typeof type !== "string") return "";
+  const trimmed = type.trim();
+  return !trimmed || trimmed === "*" ? "" : trimmed;
 }
 
 /**
@@ -505,8 +488,10 @@ function nodeErrorLinkClaimFalsified(node, errorNodeId, error) {
  *
  *   1. the live node's class is not the entry's `class_type` — ComfyUI reuses ids across
  *      workflows (#1448, applied to validation errors);
- *   2. per error, `nodeErrorLinkClaimFalsified` above. Sibling errors on the same entry
- *      are untouched; an entry whose errors ALL falsify is removed.
+ *   2. per error, `nodeErrorMismatchRepaired` above — the input the error names now
+ *      receives exactly the type it declares, so this mismatch cannot be produced from
+ *      this graph. Sibling errors on the same entry are untouched; an entry whose errors
+ *      ALL prove repaired is removed.
  *
  * An id that does NOT resolve is left alone — see the note on
  * `classifyContradictedNodeError` for why that is load-bearing rather than lenient.
@@ -633,11 +618,11 @@ function classifyContradictedNodeError(rootGraph, id, entry) {
   }
   const errors = Array.isArray(entry?.errors) ? entry.errors : null;
   if (!errors || !errors.length) return null;
-  const survivors = errors.filter((e) => !nodeErrorLinkClaimFalsified(node, id, e));
+  const survivors = errors.filter((e) => !nodeErrorMismatchRepaired(node, e));
   if (survivors.length === errors.length) return null;
-  const falsified = errors.filter((e) => nodeErrorLinkClaimFalsified(node, id, e));
+  const falsified = errors.filter((e) => nodeErrorMismatchRepaired(node, e));
   const inputs = [...new Set(falsified.map((e) => e?.extra_info?.input_name))].join(", ");
-  const reason = `${inputs} on node ${id} is no longer fed by the node the error names`;
+  const reason = `${inputs} on node ${id} now receives the type it declares`;
   return { reason, entry: survivors.length ? { ...entry, errors: survivors } : null };
 }
 
