@@ -140,6 +140,35 @@ test("#2192: the execution-error store is pruned too, not just app.lastNodeError
   assert.equal(result.stale_node_errors.length, 1);
 });
 
+test("#2192: a disclosure list cut at the cap says so (#809)", async () => {
+  // A silently short list inside the field whose whole job is disclosure would be the
+  // same defect the field exists to close. 60 nodes, all contradicted, cap is 50.
+  const impactSwitches = [];
+  const links = {};
+  for (let i = 0; i < 60; i += 1) {
+    const id = 300 + i;
+    impactSwitches.push({
+      id,
+      type: "ImpactSwitch",
+      inputs: [{ name: "select", type: "INT", link: 1000 + i }],
+    });
+    links[1000 + i] = { id: 1000 + i, origin_id: "251", origin_slot: 0, target_id: id, target_slot: 0 };
+  }
+  const inner = makeGraph({ id: "249", nodes: [{ id: 251, type: "ImpactInt" }, ...impactSwitches], links });
+  const rootGraph = makeGraph({ id: "root", nodes: [{ id: 249, type: "SubgraphNode", subgraph: inner }] });
+  const lastNodeErrors = Object.fromEntries(
+    impactSwitches.map((n) => [`249:${n.id}`, { class_type: "ImpactSwitch", errors: [SELECT_MISMATCH] }]),
+  );
+
+  const result = await runProductionGraphGetErrors({ graph: inner, rootGraph, lastNodeErrors });
+  assert.equal(result.node_errors, null);
+  assert.equal(result.stale_node_errors.length, 50);
+  assert.equal(result.stale_node_errors_truncated, true);
+  // The harness stubs fixedCapNote, so the TEXT is pinned in the wiring test below
+  // (against the shipped source); here the observable facts are the cut and its flag.
+  assert.equal(typeof result.stale_node_errors_truncation_hint, "string");
+});
+
 // ── the classifier: what it drops, and everything it refuses to ────────────────
 
 test("#2192: an entry naming a node that is not on the graph at all is dropped", () => {
@@ -247,4 +276,10 @@ test("#2192 wiring: graph_get_errors prunes the map it reports, not a copy besid
     "the raw union must not be bound as `nodeErrors` anywhere",
   );
   assert.match(src, /stale_node_errors: contradictedNodeErrors\.slice\(0, MAX_STATE_NODES\)/);
+  // The cut must be reported with the REAL total, not the shown count — a hint that
+  // says "50 of 50" is the silent-cut defect wearing a disclosure.
+  assert.match(
+    src,
+    /stale_node_errors_truncation_hint: fixedCapNote\(\s*"dropped stale validation error\(s\)",\s*MAX_STATE_NODES,\s*contradictedNodeErrors\.length,/,
+  );
 });

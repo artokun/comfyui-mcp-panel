@@ -21598,7 +21598,9 @@ const GRAPH_TOOL_EXECUTORS = {
       node_errors: nodeErrors,
       // #2192 — a removal is disclosed, never silent: the caller can see WHICH stale
       // rejection was withheld and on what evidence, instead of wondering whether a
-      // real error went missing between two reads.
+      // real error went missing between two reads. Capped like its sibling lists — and
+      // the cut is stated, because a silently short list inside a list whose whole job
+      // is disclosure would be the same defect this field exists to close (#809).
       ...(contradictedNodeErrors.length
         ? {
             stale_node_errors: contradictedNodeErrors.slice(0, MAX_STATE_NODES),
@@ -21606,6 +21608,17 @@ const GRAPH_TOOL_EXECUTORS = {
               "panel.these_validation_errors_from_the_last_queue",
               "These validation errors from the last queue attempt name links the live graph no longer has, so they were dropped. The frontend only replaces that map on the next queue attempt.",
             ),
+            ...(contradictedNodeErrors.length > MAX_STATE_NODES
+              ? {
+                  stale_node_errors_truncated: true,
+                  stale_node_errors_truncation_hint: fixedCapNote(
+                    "dropped stale validation error(s)",
+                    MAX_STATE_NODES,
+                    contradictedNodeErrors.length,
+                    "These were withheld as contradicted, not reported as errors; there is no parameter to page them.",
+                  ),
+                }
+              : {}),
           }
         : {}),
       ...(clean ? { note: tr("panel.no_errors_recorded_since_the_last_execution", "no errors recorded since the last execution start") } : {}),
