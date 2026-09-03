@@ -6,8 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.161] - 2026-09-03
+
 ### Fixed
-- panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194)
+- panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194, #2206)
+
 
 ## [0.15.160] - 2026-09-03
 
