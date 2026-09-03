@@ -165,10 +165,59 @@ test("#2283: logs raw transport retains origin, redirect, and body-size fences",
   );
 });
 
+test("#2511: models inventory operations use only their fixed same-origin /models routes", async () => {
+  const apiURLCalls = [];
+  const apiCalls = [];
+  const bodies = {
+    models: '["checkpoints","loras","diffusion_models"]',
+    "models/checkpoints": '["remote-ckpt.safetensors"]',
+    "models/loras": '["remote-lora.safetensors"]',
+    "models/diffusion_models": '["remote-unet.safetensors"]',
+  };
+  for (const operation of Object.keys(bodies)) {
+    const result = await fetchComfyUIReadForMcp(
+      { operation },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => {
+            apiURLCalls.push(path);
+            return `https://panel.test/comfy/api${path}`;
+          },
+          fileURL: () => { throw new Error("models must not use fileURL"); },
+          fetchApi: async (path, init) => {
+            apiCalls.push({ path, init });
+            return response({ body: bodies[operation] });
+          },
+        },
+        fetchImpl: async () => { throw new Error("models must not use raw fetch"); },
+      },
+    );
+    assert.deepEqual(result, {
+      operation,
+      body: bodies[operation],
+      contentType: "application/json",
+      bytes: new TextEncoder().encode(bodies[operation]).byteLength,
+    });
+  }
+  assert.deepEqual(apiURLCalls, ["/models", "/models/checkpoints", "/models/loras", "/models/diffusion_models"]);
+  assert.deepEqual(apiCalls.map(({ path }) => path), ["/models", "/models/checkpoints", "/models/loras", "/models/diffusion_models"]);
+  for (const { init } of apiCalls) {
+    assert.equal(init.method, "GET");
+    assert.equal(init.cache, "no-store");
+    assert.equal(init.credentials, "include");
+    assert.equal(init.redirect, "manual");
+  }
+});
+
 test("#2283: arbitrary paths, URLs, origins, targets, and operation names are refused before fetch", async () => {
   const invalid = [
     {},
     { operation: "unknown" },
+    { operation: "models/" },
+    { operation: "models/../object_info" },
+    { operation: "models/foo/bar" },
+    { operation: "models/checkpoints?q=1" },
     { operation: "object_info", path: "/admin" },
     { operation: "history", path: "/admin" },
     { operation: "history", url: "https://evil.test" },
