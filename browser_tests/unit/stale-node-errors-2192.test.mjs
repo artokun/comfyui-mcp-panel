@@ -749,7 +749,10 @@ test("#2192 invariant: a demoted entry carries its errors, not just a label", as
   });
   assert.deepEqual(result.stale_node_errors[0].errors, [SELECT_MISMATCH]);
   assert.match(result.stale_node_errors_note, /IN FULL/);
-  assert.match(result.stale_node_errors_note, /nothing is discarded/);
+  // The note must state the limitation rather than promise more than it delivers: the
+  // judgement reads THIS TAB's node defs, and the list is capped with the cut disclosed.
+  assert.match(result.stale_node_errors_note, /THIS TAB loaded/);
+  assert.match(result.stale_node_errors_note, /capped/);
 });
 
 test("#2192 invariant: a class-mismatch demotion carries its errors too", () => {

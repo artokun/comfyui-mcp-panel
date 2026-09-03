@@ -545,13 +545,18 @@ export function pruneContradictedNodeErrors(rootGraph, nodeErrors) {
         ? { class_type: entry.class_type }
         : {}),
       contradicted_by: verdict.reason,
-      // THE ERRORS THEMSELVES, in full. This is what makes the whole mechanism
-      // non-lossy: an entry is never destroyed, only moved out of "errors the graph
-      // has right now" into "recorded at the last queue attempt, and the live graph
-      // disagrees". Every judgement here rests on the FRONTEND's view of the graph,
+      // THE ERRORS THEMSELVES, in full. This is what stops a judgement here from
+      // destroying anything: an entry is not deleted, it is moved out of "errors the
+      // graph has right now" into "recorded at the last queue attempt, and the live
+      // graph disagrees". Every judgement rests on the FRONTEND's view of the graph,
       // and a node def the tab loaded can fall behind the server's (a pack update plus
-      // a reconnect); carrying the payload means the worst case of a wrong judgement is
-      // a mislabelled error the caller can still read in full, never a lost one.
+      // a reconnect); carrying the payload makes the worst case of a wrong judgement a
+      // mislabelled error the caller can still read in full, rather than a lost one.
+      //
+      // Precisely: nothing is dropped SILENTLY. The caller's list of these is capped
+      // like every sibling list in that payload, and a cut is reported with the true
+      // total (`stale_node_errors_truncated` + its hint) — an honest cut, not a
+      // guarantee of unbounded delivery.
       ...(verdict.errors?.length ? { errors: verdict.errors } : {}),
     });
   }
