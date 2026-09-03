@@ -188,18 +188,29 @@ export async function composeRunCompletionFrame(
   // over the payload, so hoisting them costs nothing and awaits nothing.
   const audioRefs = (Array.isArray(audio) ? audio : []).filter((m) => m && m.filename);
   const model3dRefs = (Array.isArray(models3d) ? models3d : []).filter((m) => m && m.filename);
+  const videoRefs = (Array.isArray(videos) ? videos : []).filter((v) => {
+    const m = v && typeof v === "object" ? (v.m ?? v) : null;
+    return m && m.filename && m.type === "output";
+  });
   // #2128 — what `buildStillsSegment` is missing when it decides whether a saved
   // output node ran. It only ever sees IMAGES, so a run whose real output is a
-  // `.glb` (or a `.flac`) with `PreviewImage` taps upstream looked identical to a
-  // preview-only run: it told the agent "no saved output node ran … Add a SaveImage
-  // node" while a 16 MB mesh sat in `output/3D/`. All three claims were false, and
-  // the advice cannot work — a SaveImage node cannot persist a `FILE_3D_GLB`.
+  // `.glb` (or a `.flac`, or an MP4 under a custom key) with `PreviewImage` taps
+  // upstream looked identical to a preview-only run: it told the agent "no saved
+  // output node ran … Add a SaveImage node" while the file sat on disk. All three
+  // claims were false, and the advice cannot work — a SaveImage node cannot persist
+  // a `FILE_3D_GLB` or an MP4.
   //
   // Passed as KINDS rather than a bare boolean so the note can name what actually
-  // ran instead of gesturing at "something else".
+  // ran instead of gesturing at "something else". Videos belong here too: a
+  // VHS/NKD save with preview taps is the same false inference from the image set.
   const nonImageOutputKinds = [];
   if (model3dRefs.length) nonImageOutputKinds.push({ kind: "3D model", count: model3dRefs.length });
   if (audioRefs.length) nonImageOutputKinds.push({ kind: "audio", count: audioRefs.length });
+  if (videoRefs.length) nonImageOutputKinds.push({ kind: "video", count: videoRefs.length });
+  const withheldSaved = withheldSavedOutputCount(withheld);
+  if (withheldSaved > 0) {
+    nonImageOutputKinds.push({ kind: "saved file", count: withheldSaved });
+  }
 
   // ── Stills + video segments in PARALLEL ────────────────────────────────
   // #1610 — these used to be sequential: stills metadata (HEAD + Image decode,
@@ -510,6 +521,22 @@ function summariseNonImageOutputs(kinds) {
   if (!parts.length) return null;
   if (parts.length === 1) return parts[0];
   return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+
+/**
+ * How many withheld descriptors are SAVED (`type:"output"`), not preview temps.
+ *
+ * CompareFrames dumps hundreds of `type:"temp"` PNGs; those must not suppress
+ * the genuine preview-only "Add a SaveImage node" advice. A custom save node
+ * that parked a real file under an unrecognised key (#2128 NKDVideoViewer)
+ * reports `type:"output"` and must.
+ */
+function withheldSavedOutputCount(withheld) {
+  if (!withheld || !(withheld.count > 0)) return 0;
+  if (withheld.outputCount > 0) return withheld.outputCount;
+  const types = Array.isArray(withheld.types) ? withheld.types : [];
+  if (types.includes("output") && !types.includes("temp")) return withheld.count;
+  return 0;
 }
 
 /**
