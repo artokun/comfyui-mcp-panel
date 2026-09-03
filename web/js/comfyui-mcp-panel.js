@@ -415,7 +415,7 @@ import {
 } from "./lib/reconnect-tab-channel.js";
 import { describeHttpFailure } from "./lib/http-failure.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
-import { createTodoCollapseState, paintTodoList } from "./lib/todo-tray.js";
+import { TODO_TOGGLE_CLASS, createTodoCollapseState, paintTodoList } from "./lib/todo-tray.js";
 import {
   resolveScope,
   describeScope,
@@ -34295,6 +34295,8 @@ function buildPanel() {
         onToggle: () => {
           todoCollapse.toggle();
           renderTray();
+          // replaceChildren() drops the old button; restore keyboard focus.
+          tray.querySelector(`.${TODO_TOGGLE_CLASS}`)?.focus();
         },
       }));
     }

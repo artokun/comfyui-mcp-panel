@@ -176,6 +176,7 @@ test("#2165 the panel toggle is local UI — renderTray only, no agent turn", ()
   const body = PANEL.slice(start, PANEL.indexOf("},", start));
   assert.match(body, /todoCollapse\.toggle\(\)/);
   assert.match(body, /renderTray\(\)/);
+  assert.match(body, /TODO_TOGGLE_CLASS.*focus/);
   assert.doesNotMatch(body, /persistThreads|reviseThread|sendNowMsg|sendMessage|user_message/);
 });
 
