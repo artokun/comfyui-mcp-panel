@@ -6,12 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
+
 ## [0.15.163] - 2026-09-03
 
 ### Fixed
 - A custom video save node no longer looks like a preview-only run: a `{filename, subfolder, type:"output"}` MP4 under an unrecognised key (NKDVideoViewer's `nkd_video`) is collected as saved output, so panel_run completion names the file instead of saying "no saved output node ran … Add a SaveImage node" while describing the preview taps. CompareFrames temp dumps and a genuinely preview-only run are unchanged (#2128)
 - graph_get_subgraph no longer caps its inner node list at MAX_STATE_NODES, so a large subgraph's ownership envelope stays `truncated:false` with `node_count === nodes.length` and panel_set_widget can dispatch a promoted write instead of treating the listing cap as an incomplete witness (#2057)
-- panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
 
 
 ## [0.15.162] - 2026-09-03
