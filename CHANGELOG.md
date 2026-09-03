@@ -6,9 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.162] - 2026-09-03
+
 ### Fixed
 - After a large custom-node install, adding a node waits for /object_info with an adaptive command-budget cap instead of a fixed 10s fetch, and still refuses if the schema never arrives (#2050)
 - panel_show_media splits a combined `video/<file>` output filename into `/view`'s `subfolder` + basename so a valid history reference no longer 404s (#2193)
+
 
 ## [0.15.161] - 2026-09-03
 
