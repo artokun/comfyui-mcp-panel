@@ -204,7 +204,7 @@ test("#767 WIRING: the fast path is gated on the type ALREADY being registered",
   // which read as agreement with set_widget only by coincidence.
   assert.match(
     body,
-    /await boundedGetNodeDefs\(budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)\)/,
+    /await boundedGetNodeDefs\(budget\.bounded\(wholeFetchMs\)\)/,
     "the whole-schema fallback must still be there, bounded by the command budget",
   );
   assert.match(
@@ -691,12 +691,12 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   // Every step draws from it. Named individually rather than counted, so adding a step
   // cannot silently satisfy a total.
   const wired = [
-    [/await awaitObjectInfoHistorySeed\(budget\.bounded\(OBJECT_INFO_SEED_WAIT_MS\)\)/, "the baseline seed wait"],
+    [/await awaitObjectInfoHistorySeed\(\s*budget\.bounded\(\s*objectInfoFetchBudgetMs\(/, "the baseline seed wait"],
     [
       /fetchSingleNodeInfo\(class_type[\s\S]{0,400}?budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)/,
       "the single-class fast path",
     ],
-    [/await boundedGetNodeDefs\(budget\.bounded\(NODE_DEFS_FETCH_TIMEOUT_MS\)\)/, "the whole-schema fetch"],
+    [/await boundedGetNodeDefs\(budget\.bounded\(wholeFetchMs\)\)/, "the whole-schema fetch"],
     // The fifth wait — the coalescer join — is NOT a row here. #1385: it has two call sites,
     // so a body-wide match is satisfied by whichever one is left. It is pinned per call site
     // below instead.
@@ -709,6 +709,8 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   // …and NO step may still name one of those constants raw. This is what catches a bound
   // added to this path LATER: the failure mode is not that an existing site regresses, it is
   // that the sixth site nobody thought about is written the way the first five used to be.
+  // #2050 — seed wait and the whole dump take an adaptive floor through objectInfoFetchBudgetMs
+  // and THEN `budget.bounded(that)`, so `floorMs: NAME` is still command-capped.
   const stripped = body.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
   for (const name of [
     "OBJECT_INFO_SEED_WAIT_MS",
@@ -717,12 +719,18 @@ test("#1192: graph_add_node's serialized bounds FIT the command budget", () => {
   ]) {
     const total = (stripped.match(new RegExp(name, "g")) ?? []).length;
     const capped = (stripped.match(new RegExp(`budget\\.bounded\\(${name}\\)`, "g")) ?? []).length;
+    const floor = (stripped.match(new RegExp(`floorMs:\\s*${name}`, "g")) ?? []).length;
     assert.equal(
       total,
-      capped,
-      `${name} appears ${total} time(s) in graph_add_node but only ${capped} are capped by the command budget`,
+      capped + floor,
+      `${name} appears ${total} time(s) in graph_add_node but only ${capped + floor} are command-capped (bounded or adaptive floor)`,
     );
   }
+  assert.match(
+    body,
+    /objectInfoFetchBudgetMs\(\{[\s\S]*?floorMs:\s*NODE_DEFS_FETCH_TIMEOUT_MS/,
+    "the whole-schema fetch must size its wait from the remaining command budget, not a nested 10s floor alone",
+  );
 
   // ── THE FIFTH WAIT: EVERY coalescer call, not "one of them somewhere" ─────────
   //
