@@ -2265,6 +2265,19 @@ function abortedRestoreClause(observed = {}) {
       `byte-identical, which is why the content stays unconfirmed rather than applied`
     );
   }
+  const impactSwitchSlotFailure = failures.every((failure) => {
+    const type = String(failure?.type ?? "");
+    const error = String(failure?.error ?? "");
+    return type === "ImpactSwitch" && /find(Input|Output)Slot is not a function/.test(error);
+  });
+  if (impactSwitchSlotFailure) {
+    return (
+      `. AND THE RESTORE DID NOT RUN TO COMPLETION: ${failures.length} ImpactSwitch node(s) ` +
+      `are still at CONSTRUCTION DEFAULTS after a post-load retry — ${named}` +
+      (failures.length > 10 ? `, and ${failures.length - 10} more` : "") +
+      `. Do not re-open to heal them: persist/rebind the path stamp when identity matches`
+    );
+  }
   return (
     `. AND THE RESTORE DID NOT RUN TO COMPLETION: the panel watched this load and ` +
     `${failures.length} node(s) are still at CONSTRUCTION DEFAULTS after a post-load retry — ` +
@@ -2432,6 +2445,35 @@ export function describeOpenRebindOutcome(verdict, observed = {}) {
     // A reply that says two opposite things about one observation is the defect #1623 was
     // reported for, one level down.
     if (compared && observed.contentLoadRanToCompletion === false) {
+      const restoreFailures = Array.isArray(observed.contentRestoreFailures)
+        ? observed.contentRestoreFailures
+        : [];
+      const impactSwitchSlotFailure =
+        restoreFailures.length > 0 &&
+        restoreFailures.every((failure) => {
+          const type = String(failure?.type ?? "");
+          const error = String(failure?.error ?? "");
+          return (
+            type === "ImpactSwitch" &&
+            /find(Input|Output)Slot is not a function/.test(error)
+          );
+        });
+      if (impactSwitchSlotFailure) {
+        // #2194 — identity is proven; another open/restore of these defaulted
+        // ImpactSwitch nodes is the dead end the save-path recovery used to
+        // recommend. Persist/rebind the path stamp when uuid matches; fail
+        // closed if it does not.
+        return (
+          `workflow_open RAN and the canvas IS bound to ${workflow} — identity is proven — but ` +
+          `ImpactSwitch restore left node(s) at CONSTRUCTION DEFAULTS after t.findInputSlot is not ` +
+          `a function.${because} Do NOT re-open this tab to heal it: another restore of those ` +
+          `broken defaulted nodes is the same dead end. Identity is settled, so persist/rebind ` +
+          `extra.comfyui_mcp.workflow_path onto this file without requiring those nodes to ` +
+          `configure cleanly, then save. If the canvas uuid does NOT match this tab, fail closed ` +
+          `— that is a foreign graph and must not overwrite ${workflow}.` +
+          FENCE_NOT_REFRESHED
+        );
+      }
       return (
         `workflow_open RAN and the canvas IS bound to ${workflow} — that much was proven — but the ` +
         `RESTORE ITSELF DID NOT FINISH, so the graph on the canvas is not what was loaded. This is ` +
