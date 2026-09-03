@@ -415,7 +415,7 @@ import {
 } from "./lib/reconnect-tab-channel.js";
 import { describeHttpFailure } from "./lib/http-failure.js";
 import { reconcileCompletedDownloads } from "./lib/download-refresh.js";
-import { todoItemGlyph } from "./lib/plan-glyph.js";
+import { createTodoCollapseState, paintTodoList } from "./lib/todo-tray.js";
 import {
   resolveScope,
   describeScope,
@@ -31559,6 +31559,17 @@ const PANEL_CSS = `
 }
 .cmcp-tray[hidden] { display: none; }
 .cmcp-tray-head { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7385); text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.55; margin-bottom: 0.3rem; }
+.cmcp-todo-toggle {
+  display: flex; align-items: center; gap: 0.35rem; width: 100%;
+  background: transparent; border: none; color: inherit; font: inherit;
+  text-align: inherit; cursor: pointer; padding: 0; user-select: none;
+}
+.cmcp-todo-toggle:focus-visible {
+  outline: 2px solid var(--p-focus-ring-color, #60a5fa);
+  outline-offset: 2px;
+}
+.cmcp-todo.cmcp-todo-collapsed .cmcp-todo-item { display: none; }
+.cmcp-todo.cmcp-todo-collapsed .cmcp-todo-toggle { margin-bottom: 0; }
 .cmcp-todo-item { display: flex; align-items: flex-start; gap: 0.4rem; padding: 0.12rem 0; line-height: 1.3; }
 .cmcp-todo-item .pi { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615); margin-top: 0.1rem; flex: none; }
 .cmcp-todo-item.done { opacity: 0.55; }
@@ -34127,6 +34138,7 @@ function buildPanel() {
   // checklist (download progress rows slot in here later). Hidden until non-empty.
   let todoItems = [];
   let downloadItems = [];
+  const todoCollapse = createTodoCollapseState();
   const tray = document.createElement("div");
   tray.className = "cmcp-tray";
   tray.hidden = true;
@@ -34267,35 +34279,30 @@ function buildPanel() {
     }
 
     if (hasTodo) {
-      const list = document.createElement("div");
-      list.className = "cmcp-todo";
-      const doneN = todoItems.filter((it) => it && it.status === "done").length;
-      const head = document.createElement("div");
-      head.className = "cmcp-tray-head";
-      head.textContent = tr("panel.plan_done_total", "Plan · {done}/{total}", { done: doneN, total: todoItems.length });
-      list.appendChild(head);
-      for (const it of todoItems) {
-        const status = it && it.status === "active" ? "active" : it && it.status === "done" ? "done" : "pending";
-        const row = document.createElement("div");
-        row.className = "cmcp-todo-item " + status;
-        const icon = document.createElement("i");
-        // #492: the "active" step only SPINS while the agent is actually working.
-        // set_todo persists the plan on the thread, so a step left "active" when a
-        // turn ends (or is stopped) would otherwise keep its spinner turning forever
-        // — the box "shows activity when none is happening". Between turns / on idle
-        // the current step is a static filled dot ("you are here"), not motion.
-        icon.className = "pi " + todoItemGlyph(status, agentWorking);
-        const txt = document.createElement("span");
-        txt.textContent = (it && it.text) || "";
-        row.append(icon, txt);
-        list.appendChild(row);
-      }
-      tray.appendChild(list);
+      // #492: the "active" step only SPINS while the agent is actually working.
+      // set_todo persists the plan on the thread, so a step left "active" when a
+      // turn ends (or is stopped) would otherwise keep its spinner turning forever
+      // — the box "shows activity when none is happening". Between turns / on idle
+      // the current step is a static filled dot ("you are here"), not motion.
+      // #2165: the header is a local collapse toggle (re-expandable). It must not
+      // invent an agent turn — empty panel_set_todo still clears the tray.
+      tray.appendChild(paintTodoList({
+        document,
+        items: todoItems,
+        collapsed: todoCollapse.isCollapsed(),
+        agentWorking,
+        tr,
+        onToggle: () => {
+          todoCollapse.toggle();
+          renderTray();
+        },
+      }));
     }
     scrollLog();
   }
   function renderTodo(items, { persist = true } = {}) {
     todoItems = Array.isArray(items) ? items : [];
+    todoCollapse.resetWhenEmpty(todoItems);
     renderTray();
     // Persist the plan ON the active thread so it survives a reload / panel
     // remount (the tray is otherwise rebuilt empty) and follows thread switches.
