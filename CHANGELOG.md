@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- A custom video save node no longer looks like a preview-only run: a `{filename, subfolder, type:"output"}` MP4 under an unrecognised key (NKDVideoViewer's `nkd_video`) is collected as saved output, so panel_run completion names the file instead of saying "no saved output node ran … Add a SaveImage node" while describing the preview taps. CompareFrames temp dumps and a genuinely preview-only run are unchanged (#2128)
+
 ## [0.15.162] - 2026-09-03
 
 ### Fixed
