@@ -20,6 +20,7 @@ import { clearInheritedExecutionPreview } from "../../web/js/lib/execution-previ
 import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
 import { OBJECT_INFO_DEADLINE_MS } from "../../web/js/lib/object-info-oracle.js";
+import { objectInfoFetchBudgetMs } from "../../web/js/lib/object-info-probe-budget.js";
 import { COMBO_REFRESH_NEVER_RAN } from "../../web/js/lib/set-widget.js";
 import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
 import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
@@ -250,6 +251,11 @@ export function addNodeCommandBudgetDeps() {
     safeRemoveNode,
     // #2029 — graph_add_node arms inert control_after_generate combos after graph.add.
     ensureControlAfterGenerateQueueHooks,
+    // #2050 — adaptive whole-schema wait. Harnesses that rebuild graph_add_node must
+    // name these or the resolver reports a false "object_info is unavailable".
+    objectInfoFetchBudgetMs,
+    lastWholeObjectInfoMs: 0,
+    noteWholeObjectInfoDuration: () => {},
   };
 }
 

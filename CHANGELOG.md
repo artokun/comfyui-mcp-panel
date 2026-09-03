@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- After a large custom-node install, adding a node waits for /object_info with an adaptive command-budget cap instead of a fixed 10s fetch, and still refuses if the schema never arrives (#2050)
+
+
 ## [0.15.161] - 2026-09-03
 
 ### Fixed
