@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
+
 ## [0.15.162] - 2026-09-03
 
 ### Fixed
