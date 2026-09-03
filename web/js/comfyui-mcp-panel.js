@@ -865,7 +865,7 @@ import {
   stripMisattachedExecutionPreviews,
 } from "./lib/execution-preview-attach.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
-import { composeShowMediaReply } from "./lib/media-preview.js";
+import { composeShowMediaReply, normalizeComfyViewRef } from "./lib/media-preview.js";
 import { appendImageCacheBust, appendStoryboardCacheBust, createStoryboardIdentity } from "./lib/storyboard-cache-identity.js";
 import {
   bindSourcePlayback,
@@ -9120,12 +9120,15 @@ function normalizeImageList(images) {
 
 /** Build a ComfyUI /view URL for an output image descriptor. */
 function imageViewUrl(img) {
+  // #2193 — ComfyUI /view basename()s `filename` and looks under `subfolder`.
+  // A combined `video/clip.mp4` with empty subfolder 404s at output/clip.mp4.
+  const ref = normalizeComfyViewRef(img, coerceMessageText) || img;
   const qs = new URLSearchParams({
     // Coerce — a structured filename/subfolder must not become "[object Object]"
     // in the media URL (which reaches the agent via imageRefs / notes) (#276).
-    filename: coerceMessageText(img.filename),
-    subfolder: coerceMessageText(img.subfolder),
-    type: coerceMessageText(img.type) || "output",
+    filename: coerceMessageText(ref.filename),
+    subfolder: coerceMessageText(ref.subfolder),
+    type: coerceMessageText(ref.type) || "output",
   }).toString();
   const path = `/view?${qs}`;
   try {
