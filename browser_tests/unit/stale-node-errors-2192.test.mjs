@@ -50,6 +50,7 @@ const SELECT_MISMATCH = {
   extra_info: {
     input_name: "select",
     received_type: "IMAGE",
+    input_config: ["INT", {}],
     linked_node: ["249:265", 0],
   },
 };
@@ -219,7 +220,7 @@ function typeGraph({ outTypes, slot, via = {} }) {
         {
           type: "return_type_mismatch",
           details: "select, received_type(IMAGE) mismatch input_type(INT)",
-          extra_info: { input_name: "select", received_type: "IMAGE", linked_node: [7, 0] },
+          extra_info: { input_name: "select", received_type: "IMAGE", input_config: ["INT", {}], linked_node: [7, 0] },
         },
       ],
     },
@@ -250,7 +251,7 @@ test("#2192 types: a DIFFERENT source node that still emits the wrong type is st
     links: { 900: { id: 900, origin_id: 8, origin_slot: 0, target_id: 9, target_slot: 0 } },
   });
   const nodeErrors = {
-    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [7, 0] } }] },
+    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", input_config: ["INT", {}], linked_node: [7, 0] } }] },
   };
   assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
 });
@@ -286,7 +287,7 @@ test("#2192 types: a `*` wildcard on either side is never exact proof", () => {
       links: { 900: { id: 900, origin_id: 7, origin_slot: 0, target_id: 9, target_slot: 0 } },
     });
     const nodeErrors = {
-      9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [7, 0] } }] },
+      9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", input_config: ["INT", {}], linked_node: [7, 0] } }] },
     };
     assert.deepEqual(
       pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors,
@@ -312,7 +313,7 @@ test("#2192 types: an unreadable slot type or output index keeps the error", () 
       links: { 900: { id: 900, origin_id: 7, origin_slot: slot, target_id: 9, target_slot: 0 } },
     });
     const nodeErrors = {
-      9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [7, 0] } }] },
+      9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", input_config: ["INT", {}], linked_node: [7, 0] } }] },
     };
     assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors, label);
   }
@@ -328,7 +329,7 @@ test("#2192 types: a link with no readable origin_slot keeps the error", () => {
     links: { 900: { id: 900, origin_id: 7, target_id: 9, target_slot: 0 } },
   });
   const nodeErrors = {
-    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [7, 0] } }] },
+    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", input_config: ["INT", {}], linked_node: [7, 0] } }] },
   };
   assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
 });
@@ -359,6 +360,41 @@ test("#2192: sibling errors on the same node survive the one that proved repaire
   assert.deepEqual(nodeErrors["249:252"].errors, [live]);
   assert.equal(nodeErrors["249:252"].class_type, "ImpactSwitch");
   assert.equal(dropped.length, 1);
+});
+
+// ── the frontend's socket types are the FRONTEND's ────────────────────────────
+
+test("#2192 defs: a live socket type the SERVER did not validate against is no proof", () => {
+  // A pack update plus a reconnect moves the server ahead of the node def this tab
+  // loaded. The server validated `select` as STRING; the tab still draws it INT, and an
+  // INT link therefore still fails at the server. `input_config[0]` is the server's own
+  // word on it — execution.py's `info = (input_type, extra_info)` — so a disagreement
+  // means the frontend's view cannot corroborate anything.
+  const { graph, nodeErrors } = typeGraph({ outTypes: ["INT"], slot: 0 });
+  nodeErrors[9].errors[0].extra_info.input_config = ["STRING", {}];
+  assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
+});
+
+test("#2192 defs: an absent or non-string input_config gives nothing to corroborate", () => {
+  // A combo input's `input_type` is the option LIST, not a name — nothing to compare.
+  for (const config of [undefined, null, [], [["a", "b"], {}], ["", {}], [7, {}]]) {
+    const { graph, nodeErrors } = typeGraph({ outTypes: ["INT"], slot: 0 });
+    if (config === undefined) delete nodeErrors[9].errors[0].extra_info.input_config;
+    else nodeErrors[9].errors[0].extra_info.input_config = config;
+    assert.deepEqual(
+      pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors,
+      nodeErrors,
+      `input_config ${JSON.stringify(config)} must not be read as corroboration`,
+    );
+  }
+});
+
+test("#2192 defs: server and frontend agreeing is what makes the type proof usable", () => {
+  // The positive case, stated explicitly so the guard above cannot silently become the
+  // only outcome: server says INT, the tab draws INT, the live source emits INT.
+  const { graph, nodeErrors } = typeGraph({ outTypes: ["INT"], slot: 0 });
+  assert.equal(nodeErrors[9].errors[0].extra_info.input_config[0], "INT");
+  assert.equal(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, null);
 });
 
 // ── the prompt is COMPILED; the graph is not ──────────────────────────────────
@@ -401,7 +437,7 @@ test("#2192 compiled: an unresolvable source node keeps the error", () => {
     links: { 900: { id: 900, origin_id: 8, origin_slot: 0, target_id: 9, target_slot: 0 } },
   });
   const nodeErrors = {
-    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [5, 0] } }] },
+    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", input_config: ["INT", {}], linked_node: [5, 0] } }] },
   };
   assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
 });

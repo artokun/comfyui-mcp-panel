@@ -443,6 +443,19 @@ function nodeErrorMismatchRepaired(node, error) {
   if (!input) return false;
   const inputType = readableSlotType(input);
   if (!inputType) return false;
+  // The socket types read below are the FRONTEND's, from the node def this tab loaded.
+  // A pack update plus a reconnect can move the server ahead of them, and then an
+  // apparently-matching frontend type says nothing about what the server will accept
+  // (codex gate round 7). The error itself carries the server's own word on it:
+  // `extra_info.input_config` is execution.py's `info = (input_type, extra_info)`, so
+  // element 0 is the input type the SERVER validated against. Requiring the live socket
+  // to still agree with it turns "the frontend believes X" into "the frontend and the
+  // server agreed on X at queue time", which is what the proof below needs.
+  //
+  // Absent or non-string (a combo input's `input_type` is the option LIST, not a name)
+  // means there is nothing to corroborate against, so no proof is available — keep.
+  const serverInputType = error.extra_info.input_config?.[0];
+  if (typeof serverInputType !== "string" || serverInputType !== inputType) return false;
   if (input.link == null) return false; // nothing feeds it ⇒ no source type ⇒ no proof
 
   const links = node?.graph?.links;
