@@ -65,6 +65,7 @@ import { sanitizeNodeAuxId } from "../../web/js/lib/aux-id-sanitize.js";
 import { createVerifiedNodeDefCache } from "../../web/js/lib/verified-node-def-cache.js";
 import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
 import { createObjectInfoSnapshot } from "../../web/js/lib/object-info-snapshot.js";
+import { objectInfoFetchBudgetMs } from "../../web/js/lib/object-info-probe-budget.js";
 import { reconcileFreshDynamicWidgets } from "../../web/js/lib/dynamic-widget-reconcile.js";
 import { safeRemoveNode } from "../../web/js/lib/safe-remove-node.js";
 import { ensureControlAfterGenerateQueueHooks } from "../../web/js/lib/control-after-generate.js";
@@ -407,6 +408,9 @@ function realGraphAddNode({
     OBJECT_INFO_SEED_WAIT_MS: 8000,
     ADD_NODE_COMMAND_BUDGET_MS: budgetMs,
     ADD_NODE_POST_REFRESH_RESERVE_MS: reserveMs,
+    objectInfoFetchBudgetMs,
+    lastWholeObjectInfoMs: 0,
+    noteWholeObjectInfoDuration: () => {},
     ...overrides,
   };
 
@@ -1336,11 +1340,12 @@ test("#1192: an ALREADY-registered class takes the fast path and never reaches t
 // ---------------------------------------------------------------------------
 
 test("#1192: a /object_info read that eats the budget leaves the add a bound, not a hang", async () => {
-  // The whole-schema fetch draws `budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS)`. With the
-  // command nearly spent that is a small number, and the add fails closed on the path an
-  // unreadable schema already takes — rather than parking on a 10s bound the command cannot
-  // afford. Both live routes must hang: #2050 asks `/object_info/<Type>` after the whole
-  // dump is silent, and a working per-class route is the success path for that issue.
+  // The whole-schema fetch draws `budget.bounded(wholeFetchMs)` from the remaining command
+  // budget. With the command nearly spent that is a small number, and the add fails closed
+  // on the path an unreadable schema already takes — rather than parking on a 10s bound the
+  // command cannot afford. Both live routes must hang: #2050 asks `/object_info/<Type>`
+  // after the whole dump is silent, and a working per-class route is the success path for
+  // that issue.
   const comfy = makeComfy();
   const built = realGraphAddNode({
     comfy,
@@ -1803,4 +1808,38 @@ test("#2050: graph_add_node asks the per-class route after a silent whole dump",
     /wholeUsable[\s\S]*!isRegisteredNodeType/,
     "the fallback is gated on a silent whole dump AND an unregistered class",
   );
+  assert.match(
+    body,
+    /objectInfoFetchBudgetMs\([\s\S]*?floorMs:\s*NODE_DEFS_FETCH_TIMEOUT_MS/,
+    "the whole dump wait is adaptive, not a nested 10s floor alone",
+  );
+  assert.match(
+    body,
+    /boundedGetNodeDefs\(budget\.bounded\(wholeFetchMs\)\)/,
+    "the adaptive wait is still command-capped",
+  );
+});
+
+test("#2050: a whole dump slower than the 10s floor still adds inside the command budget", async () => {
+  // Per-class hangs so the type-scoped fallback cannot rescue a too-short whole wait.
+  // The old nested 10s floor, injected here as 80ms, would abandon this 250ms dump.
+  const comfy = makeComfy();
+  const built = realGraphAddNode({
+    comfy,
+    budgetMs: 2000,
+    overrides: {
+      NODE_DEFS_FETCH_TIMEOUT_MS: 80,
+      api: {
+        getNodeDefs: async () => {
+          await sleep(250);
+          return backendObjectInfo();
+        },
+        fetchApi: () => new Promise(() => {}),
+      },
+    },
+  });
+  const started = Date.now();
+  const { added } = await built.graph_add_node({ class_type: "NewNode" });
+  assert.equal(added.type, "NewNode");
+  assert.ok(Date.now() - started < 1800, "the dump must be waited out, not abandoned at the 80ms floor");
 });

@@ -4,8 +4,10 @@ import { readFileSync } from "node:fs";
 
 import {
   objectInfoSnapshotProbeDeadline,
+  objectInfoFetchBudgetMs,
   OBJECT_INFO_SNAPSHOT_PROBE_DEADLINE_MS,
   OBJECT_INFO_REMOTE_SNAPSHOT_PROBE_DEADLINE_MS,
+  OBJECT_INFO_FETCH_MARGIN,
 } from "../../web/js/lib/object-info-probe-budget.js";
 
 const PANEL_SRC = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
@@ -48,6 +50,35 @@ test("#1734 treats an unknown origin conservatively without becoming unbounded",
     );
   }
   assert.ok(OBJECT_INFO_REMOTE_SNAPSHOT_PROBE_DEADLINE_MS < 25_000);
+});
+
+test("#2050: a large-install whole-schema wait uses remaining command time, not only the 10s floor", () => {
+  assert.equal(
+    objectInfoFetchBudgetMs({ remainingMs: 25000, floorMs: 10000, ceilingMs: 25000 }),
+    25000,
+    "with no prior duration the first fetch may spend what the command still has",
+  );
+  assert.equal(
+    objectInfoFetchBudgetMs({ remainingMs: 200, floorMs: 10000, ceilingMs: 25000 }),
+    200,
+    "a nearly-spent command still bounds; it does not restore the 10s floor",
+  );
+  assert.equal(
+    objectInfoFetchBudgetMs({ observedMs: 20840, remainingMs: 25000, floorMs: 10000, ceilingMs: 25000 }),
+    25000,
+    "a prior 20.84s dump pads the next wait up to the command ceiling",
+  );
+  assert.ok(OBJECT_INFO_FETCH_MARGIN >= 1);
+  assert.equal(
+    objectInfoFetchBudgetMs({ remainingMs: 0, floorMs: 10000 }),
+    1,
+    "an exhausted budget yields 1ms so withTimeout still bounds",
+  );
+  assert.equal(
+    objectInfoFetchBudgetMs({ remainingMs: -5, floorMs: 10000 }),
+    1,
+    "a negative remainder is fail-closed, never unbounded",
+  );
 });
 
 test("#1734 production wiring selects from the page origin and keeps command bounding", () => {

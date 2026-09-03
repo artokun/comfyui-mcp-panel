@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- After a large custom-node install, adding a node waits for /object_info with an adaptive command-budget cap instead of a fixed 10s fetch, and still refuses if the schema never arrives (#2050)
 - panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194)
 - panel_connect no longer overwrites an unrelated link (#2108). A link id is minted as
   `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
@@ -16,6 +17,11 @@ All notable changes to this project are documented here. This project adheres to
   link now raises the counter above the ids actually present first; it only ever moves
   up, so a well-formed graph is untouched. An API/prompt graph carries no `last_link_id`
   at all, which is one way to arrive in that state.
+
+## [0.15.161] - 2026-09-03
+
+### Fixed
+- panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194, #2206)
 
 ## [0.15.160] - 2026-09-03
 
