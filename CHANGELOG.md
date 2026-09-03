@@ -9,6 +9,12 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
 
+## [0.15.164] - 2026-09-03
+
+### Fixed
+- The agent TODO tray can be collapsed from its Plan header (and re-expanded) so a forgotten panel_set_todo no longer pins up to 9rem of the chat column; empty panel_set_todo still clears it (#2165, #2219)
+
+
 ## [0.15.163] - 2026-09-03
 
 ### Fixed
