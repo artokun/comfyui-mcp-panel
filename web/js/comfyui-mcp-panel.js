@@ -214,7 +214,11 @@ import {
   pruneGroundingIdentities,
   groundedWorkflowPath,
 } from "./lib/workflow-chat-identity.js";
-import { decideWorkflowSaveVerdict, workflowSaveRefusalError } from "./lib/save-path-guard.js";
+import {
+  decideWorkflowSaveVerdict,
+  rebindForeignStampIfIdentityMatches,
+  workflowSaveRefusalError,
+} from "./lib/save-path-guard.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
@@ -373,7 +377,7 @@ import { BACKEND_SWITCH, runBackendSwitch } from "./lib/backend-switch.js";
 import { createSettingsBackendDefault } from "./lib/settings-backend-default.js";
 import { fetchNodeDefsWithRetry, OBJECT_INFO_RETRY_DELAYS_MS } from "./lib/object-info-retry.js";
 import { createObjectInfoCache, CACHE_OUTCOME } from "./lib/object-info-cache.js";
-import { objectInfoSnapshotProbeDeadline } from "./lib/object-info-probe-budget.js";
+import { objectInfoSnapshotProbeDeadline, objectInfoFetchBudgetMs } from "./lib/object-info-probe-budget.js";
 import {
   fetchWholeObjectInfo,
   objectInfoOracleFailureNote,
@@ -861,7 +865,7 @@ import {
   stripMisattachedExecutionPreviews,
 } from "./lib/execution-preview-attach.js";
 import { composeRunCompletionFrame } from "./lib/run-completion-frame.js";
-import { composeShowMediaReply } from "./lib/media-preview.js";
+import { composeShowMediaReply, normalizeComfyViewRef } from "./lib/media-preview.js";
 import { appendImageCacheBust, appendStoryboardCacheBust, createStoryboardIdentity } from "./lib/storyboard-cache-identity.js";
 import {
   bindSourcePlayback,
@@ -1629,6 +1633,13 @@ function monotonicNow() {
 // unit-testable rather than loose module state in this bundle.
 const objectInfoHistory = createObjectInfoHistory();
 const recordObjectInfoTypes = (defs) => objectInfoHistory.recordTypes(defs);
+// #2050 — last successful whole-schema duration on this tab, so the next add can wait
+// that long instead of the warm-install 10s floor. Zero until a fetch actually lands.
+let lastWholeObjectInfoMs = 0;
+function noteWholeObjectInfoDuration(startedAt) {
+  const elapsed = monotonicNow() - startedAt;
+  if (Number.isFinite(elapsed) && elapsed > 0) lastWholeObjectInfoMs = elapsed;
+}
 // ONLY seedObjectInfoHistory() may call this. See the RECORD ONLY note in
 // registerComfyNodeDefs: any observation taken after an unobserved window cannot support
 // the "never backend-defined this session" claim a baseline makes.
@@ -1670,8 +1681,10 @@ function seedObjectInfoHistory() {
           // out — found no snapshot and was refused exactly as before the fix.
           const observedAtEpoch = backendReconnectEpoch;
           const observedAtGeneration = verifiedNodeDefCache.generation();
+          const fetchStartedAt = monotonicNow();
           const defs = await api.getNodeDefs();
           if (defs && typeof defs === "object" && Object.keys(defs).length > 0) {
+            noteWholeObjectInfoDuration(fetchStartedAt);
             const currentEpoch = backendReconnectEpoch;
             const currentGeneration = verifiedNodeDefCache.generation();
             if (currentEpoch !== observedAtEpoch || currentGeneration !== observedAtGeneration) continue;
@@ -3038,7 +3051,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // could never catch the real failure, that set-version.mjs was not run at all,
 // since one script writes them together. That is how 0.15.86..0.15.96 shipped
 // still announcing 0.15.85.
-const PANEL_VERSION = "0.15.159";
+const PANEL_VERSION = "0.15.162";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at
@@ -4695,6 +4708,35 @@ function installSavePathGuard(appRef) {
           // never be looking at different things.
           snapshotIsStale: saveWouldPersistStaleSnapshot(wf, state),
         });
+        // #2194 — leftover nested workflow_path on THIS tab's uuid. Restamp the
+        // snapshot (and the live extra when it carries the same uuid) so save
+        // does not send the caller through panel_open_workflow, whose ImpactSwitch
+        // restore can dead-end. Fail closed when uuid is missing or disagrees.
+        // `typeof` keeps a sliced test installer fail-closed if the helper is not
+        // injected — a throw here would hit the outer catch and ALLOW the write.
+        if (
+          verdict?.allow === false &&
+          verdict.reason === "stamped_path_foreign" &&
+          typeof rebindForeignStampIfIdentityMatches === "function" &&
+          rebindForeignStampIfIdentityMatches({
+            state,
+            destinationPath: wf?.path ?? null,
+            destinationUuid: typeof workflowObjectUuid === "function" ? workflowObjectUuid(wf) || null : null,
+          })
+        ) {
+          try {
+            const destUuid = typeof workflowObjectUuid === "function" ? workflowObjectUuid(wf) || null : null;
+            const liveExtra =
+              appRef?.rootGraph?.extra?.[WORKFLOW_META_NAMESPACE] ??
+              (typeof app !== "undefined" ? app?.rootGraph?.extra?.[WORKFLOW_META_NAMESPACE] : null);
+            if (liveExtra && destUuid && liveExtra[WORKFLOW_UUID_FIELD] === destUuid) {
+              liveExtra[WORKFLOW_PATH_FIELD] = wf.path;
+            }
+          } catch {
+            /* snapshot stamp is what the write serializes */
+          }
+          verdict = { allow: true };
+        }
       } catch {
         verdict = { allow: true }; // a guard that cannot read its evidence must never invent a refusal
       }
@@ -9078,12 +9120,15 @@ function normalizeImageList(images) {
 
 /** Build a ComfyUI /view URL for an output image descriptor. */
 function imageViewUrl(img) {
+  // #2193 — ComfyUI /view basename()s `filename` and looks under `subfolder`.
+  // A combined `video/clip.mp4` with empty subfolder 404s at output/clip.mp4.
+  const ref = normalizeComfyViewRef(img, coerceMessageText) || img;
   const qs = new URLSearchParams({
     // Coerce — a structured filename/subfolder must not become "[object Object]"
     // in the media URL (which reaches the agent via imageRefs / notes) (#276).
-    filename: coerceMessageText(img.filename),
-    subfolder: coerceMessageText(img.subfolder),
-    type: coerceMessageText(img.type) || "output",
+    filename: coerceMessageText(ref.filename),
+    subfolder: coerceMessageText(ref.subfolder),
+    type: coerceMessageText(ref.type) || "output",
   }).toString();
   const path = `/view?${qs}`;
   try {
@@ -15938,7 +15983,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // seeds, so the next call succeeds without a reload.
     // #1192 — capped by the command budget. Standalone this waits 8000ms, which is a third
     // of the whole command spent before the backend has even been asked what it provides.
-    await awaitObjectInfoHistorySeed(budget.bounded(OBJECT_INFO_SEED_WAIT_MS));
+    // #2050 — a large-install seed is the same whole dump the 10s tool cap cannot finish.
+    // Wait up to what this command still has (padded by a prior success), so the seed can
+    // land and the add can consume it instead of starting a competing getNodeDefs.
+    await awaitObjectInfoHistorySeed(
+      budget.bounded(
+        objectInfoFetchBudgetMs({
+          observedMs: lastWholeObjectInfoMs,
+          remainingMs: budget.remaining(),
+          floorMs: OBJECT_INFO_SEED_WAIT_MS,
+          ceilingMs: ADD_NODE_COMMAND_BUDGET_MS,
+        }),
+      ),
+    );
     // Captured from the SAME fresh /object_info the resolvability assert just
     // fetched. The widget guards below scan THIS def — the backend's current
     // truth — not the possibly-stale registered nodeData: frontend-injected
@@ -16063,15 +16120,20 @@ const GRAPH_TOOL_EXECUTORS = {
           epoch: backendReconnectEpoch,
         };
         addNodeObservedAtEpoch = issued.epoch;
-        // #1192 — allowed 10,000 ms here, capped by the caller's remaining budget.
-        // #1418 — what this comment used to claim about the OTHER path was never true: it
-        // said `graph_set_widget`'s oracle "allows 10,000 ms" and that both were capped, but
-        // that oracle is fetchWholeObjectInfo at OBJECT_INFO_DEADLINE_MS (20,000 ms), and
-        // nothing capped it until #1418 gave it the same budget.bounded(...) treatment. The
-        // two paths genuinely agree now. The earlier sentence is left corrected rather than
-        // deleted because it did real harm twice: a reassurance-shaped claim concealed the
-        // very next occurrence of the defect it described (#1413's note, then this one).
-        const whole = await boundedGetNodeDefs(budget.bounded(NODE_DEFS_FETCH_TIMEOUT_MS));
+        // #1192 — capped by the caller's remaining budget.
+        // #2050 — that remainder IS the bound on a large install, not a nested 10s floor:
+        // a 21s `/object_info` completes inside the 25s command and is abandoned at 10s
+        // otherwise. A prior success pads the next wait; a never-arriving schema still
+        // fails closed at whatever this command has left.
+        const wholeFetchMs = objectInfoFetchBudgetMs({
+          observedMs: lastWholeObjectInfoMs,
+          remainingMs: budget.remaining(),
+          floorMs: NODE_DEFS_FETCH_TIMEOUT_MS,
+          ceilingMs: ADD_NODE_COMMAND_BUDGET_MS,
+        });
+        const fetchStartedAt = monotonicNow();
+        const whole = await boundedGetNodeDefs(budget.bounded(wholeFetchMs));
+        if (whole && whole !== NODE_DEFS_NO_ANSWER) noteWholeObjectInfoDuration(fetchStartedAt);
         if (!schemaProbeIsCurrent(issued)) {
           // A response issued on the previous cache generation or backend connection is no
           // answer for this command. In particular, do not let it become a whole-schema

@@ -9,6 +9,27 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
 
+## [0.15.162] - 2026-09-03
+
+### Fixed
+- After a large custom-node install, adding a node waits for /object_info with an adaptive command-budget cap instead of a fixed 10s fetch, and still refuses if the schema never arrives (#2050)
+- panel_show_media splits a combined `video/<file>` output filename into `/view`'s `subfolder` + basename so a valid history reference no longer 404s (#2193)
+
+
+## [0.15.161] - 2026-09-03
+
+### Fixed
+- panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194, #2206)
+
+## [0.15.160] - 2026-09-03
+
+### Fixed
+- fetch_comfyui_read now admits the closed `models` and `models/<folder>` inventory operations so list_local_models can relay a reachable remote ComfyUI through the live panel instead of dying on the diagnostics-only allowlist (comfyui-mcp#2511)
+
+- admit models inventory through fetch_comfyui_read (#2198)
+- panel_get_errors stops reporting validation errors the live graph disagrees with (#2195)
+
+
 ## [0.15.159] - 2026-09-02
 
 ### Fixed

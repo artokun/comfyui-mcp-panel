@@ -1456,6 +1456,8 @@ function buildShippedSeed({
      let seeded = false;
      const recordObjectInfoTypes = (defs) => { recorded.push(defs); return defs; };
      const markObjectInfoHistorySeeded = () => { seeded = true; return true; };
+     const monotonicNow = () => 0;
+     const noteWholeObjectInfoDuration = () => {};
      ${body}
      return {
        run: () => seedObjectInfoHistory(),
