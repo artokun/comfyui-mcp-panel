@@ -228,6 +228,7 @@ import {
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
+  pruneContradictedNodeErrorMaps,
   graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
@@ -12509,6 +12510,23 @@ async function validationBanner() {
   } catch {
     bannerStalePlaceholders = [];
   }
+  // #2192 — the SAME correlation graph_get_errors now runs, for the same reason and
+  // with more at stake: this banner asserts the user "is seeing these RIGHT NOW", so a
+  // rejection whose link has since been repaired makes the panel state something about
+  // the user's screen that is not true. `app.lastNodeErrors` is only replaced on the
+  // NEXT queue attempt, so nothing about repairing the graph clears it.
+  //
+  // Placed after the binding guard above, on the root graph that guard just proved is
+  // still the one this read started against — correlating against a graph that changed
+  // mid-read is how a live error would get dropped. Pruning HERE (not at the top, where
+  // nodeErrors is read) also puts the corrected map inside `missing.any`'s clean check
+  // and inside `sig`, so repairing the link both stops the banner and counts as a change
+  // — matching what the missing-asset entries in that signature already do.
+  try {
+    nodeErrors = pruneContradictedNodeErrorMaps(postProbeRootGraph, [nodeErrors]).nodeErrors;
+  } catch {
+    /* a banner must never throw; an unpruned map is the safe direction */
+  }
   missing.any = !!(
     missing.models.length ||
     missing.media.length ||
@@ -21375,7 +21393,19 @@ const GRAPH_TOOL_EXECUTORS = {
     // These are independent live stores. The app map can be an empty object
     // after a reset while the execution store still retains the actual rejected
     // prompt, so never let nullish selection make an empty app map mask it.
-    const nodeErrors = combineNodeErrorMaps([comfy?.lastNodeErrors ?? null, storeNodeErrors]);
+    // #2192 — that union is a snapshot of the LAST queue rejection and the frontend
+    // only replaces it on the NEXT one, so a repaired link keeps being reported. Drop
+    // the entries the LIVE graph contradicts before anything downstream reads them —
+    // the per-node join, `clean`, the red-outline adjudication and the payload all
+    // have to agree, and the contradiction the reporter saw (`errored_count: 0` beside
+    // a populated `node_errors`) is exactly what happens when they do not.
+    // Each map is adjudicated on its own and the survivors are unioned — never the other
+    // way round. Merging first lets the LAST map's `class_type` govern the FIRST map's
+    // errors, and a stale store entry then drops a live app error with it (codex gate P1).
+    const { nodeErrors, dropped: contradictedNodeErrors } = pruneContradictedNodeErrorMaps(
+      rootGraph,
+      [comfy?.lastNodeErrors ?? null, storeNodeErrors],
+    );
     if (nodeErrors) {
       for (const [id, entry] of Object.entries(nodeErrors)) {
         for (const e of entry?.errors ?? []) {
@@ -21586,6 +21616,31 @@ const GRAPH_TOOL_EXECUTORS = {
       // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
       last_execution_error: boundExecFailurePayload(execFailureDetail),
       node_errors: nodeErrors,
+      // #2192 — a removal is disclosed, never silent: the caller can see WHICH stale
+      // rejection was withheld and on what evidence, instead of wondering whether a
+      // real error went missing between two reads. Capped like its sibling lists — and
+      // the cut is stated, because a silently short list inside a list whose whole job
+      // is disclosure would be the same defect this field exists to close (#809).
+      ...(contradictedNodeErrors.length
+        ? {
+            stale_node_errors: contradictedNodeErrors.slice(0, MAX_STATE_NODES),
+            stale_node_errors_note: tr(
+              "panel.these_validation_errors_from_the_last_queue",
+              "Recorded at the LAST queue attempt; the live graph disagrees with each, so they are reported here rather than in node_errors (the frontend only replaces that map on the next queue attempt). Every entry carries its errors IN FULL plus the evidence in contradicted_by, so for the conservative reading treat these as still live. This judgement reads the node definitions THIS TAB loaded, which a server-side pack update can get ahead of; the list itself is capped, and a cut is always reported with the true total.",
+            ),
+            ...(contradictedNodeErrors.length > MAX_STATE_NODES
+              ? {
+                  stale_node_errors_truncated: true,
+                  stale_node_errors_truncation_hint: fixedCapNote(
+                    "dropped stale validation error(s)",
+                    MAX_STATE_NODES,
+                    contradictedNodeErrors.length,
+                    "These were withheld as contradicted, not reported as errors; there is no parameter to page them.",
+                  ),
+                }
+              : {}),
+          }
+        : {}),
       ...(clean ? { note: tr("panel.no_errors_recorded_since_the_last_execution", "no errors recorded since the last execution start") } : {}),
     };
   },
