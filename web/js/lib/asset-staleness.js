@@ -545,6 +545,14 @@ export function pruneContradictedNodeErrors(rootGraph, nodeErrors) {
         ? { class_type: entry.class_type }
         : {}),
       contradicted_by: verdict.reason,
+      // THE ERRORS THEMSELVES, in full. This is what makes the whole mechanism
+      // non-lossy: an entry is never destroyed, only moved out of "errors the graph
+      // has right now" into "recorded at the last queue attempt, and the live graph
+      // disagrees". Every judgement here rests on the FRONTEND's view of the graph,
+      // and a node def the tab loaded can fall behind the server's (a pack update plus
+      // a reconnect); carrying the payload means the worst case of a wrong judgement is
+      // a mislabelled error the caller can still read in full, never a lost one.
+      ...(verdict.errors?.length ? { errors: verdict.errors } : {}),
     });
   }
   return { nodeErrors: Object.keys(kept).length ? kept : null, dropped };
@@ -627,6 +635,7 @@ function classifyContradictedNodeError(rootGraph, id, entry) {
     return {
       reason: `node ${id} is a ${liveTypes[0]} now, not the ${claimedType} this error is about`,
       entry: null,
+      errors: Array.isArray(entry?.errors) ? entry.errors : [],
     };
   }
   const errors = Array.isArray(entry?.errors) ? entry.errors : null;
@@ -636,7 +645,7 @@ function classifyContradictedNodeError(rootGraph, id, entry) {
   const falsified = errors.filter((e) => nodeErrorMismatchRepaired(node, e));
   const inputs = [...new Set(falsified.map((e) => e?.extra_info?.input_name))].join(", ");
   const reason = `${inputs} on node ${id} now receives the type it declares`;
-  return { reason, entry: survivors.length ? { ...entry, errors: survivors } : null };
+  return { reason, entry: survivors.length ? { ...entry, errors: survivors } : null, errors: falsified };
 }
 
 /**

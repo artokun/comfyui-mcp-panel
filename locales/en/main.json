@@ -896,7 +896,7 @@
       "then_click_connect_above": "…then click Connect above.",
       "then_start_the_agent_on_this_machine": "Start the agent (on this machine)",
       "these_are_panel_shortcuts_for_what_the": "these are panel shortcuts; for what the agent itself can do, see the docs: {url}",
-      "these_validation_errors_from_the_last_queue": "These validation errors from the last queue attempt name links the live graph no longer has, so they were dropped. The frontend only replaces that map on the next queue attempt.",
+      "these_validation_errors_from_the_last_queue": "Recorded at the LAST queue attempt; the live graph disagrees with each, so they are reported here rather than in node_errors (the frontend only replaces that map on the next queue attempt). Every entry carries its errors IN FULL plus the evidence in contradicted_by — nothing is discarded, so for the conservative reading treat these as still live.",
       "thinking": "Thinking…",
       "thinking_tokens": "Thinking… ({tokens} tokens)",
       "this_affects_every_workflow_and_open_comfyui": "This affects every workflow and open ComfyUI tab. It cannot be undone. Your workflows and their stable identities will not be deleted.",

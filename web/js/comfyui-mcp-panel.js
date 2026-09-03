@@ -21626,7 +21626,7 @@ const GRAPH_TOOL_EXECUTORS = {
             stale_node_errors: contradictedNodeErrors.slice(0, MAX_STATE_NODES),
             stale_node_errors_note: tr(
               "panel.these_validation_errors_from_the_last_queue",
-              "These validation errors from the last queue attempt name links the live graph no longer has, so they were dropped. The frontend only replaces that map on the next queue attempt.",
+              "Recorded at the LAST queue attempt; the live graph disagrees with each, so they are reported here rather than in node_errors (the frontend only replaces that map on the next queue attempt). Every entry carries its errors IN FULL plus the evidence in contradicted_by — nothing is discarded, so for the conservative reading treat these as still live.",
             ),
             ...(contradictedNodeErrors.length > MAX_STATE_NODES
               ? {

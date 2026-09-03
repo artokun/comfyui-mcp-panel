@@ -671,6 +671,73 @@ test("#2192: the banner still fires for the STILL-BROKEN wire", async () => {
   assert.match(banner, /received_type\(IMAGE\) mismatch input_type\(INT\)/);
 });
 
+// ── THE INVARIANT: nothing is ever discarded ─────────────────────────────────
+//
+// Every judgement in this module reads the FRONTEND's view of the graph, and a node def
+// the tab loaded can fall behind the server's (a pack update plus a reconnect). Review
+// found that on the input side and again on the source side, and the source side has no
+// corroborator inside the error to close it with. So the mechanism is built not to need
+// one: a demoted entry keeps its errors IN FULL under `stale_node_errors`, which makes
+// the worst case of a wrong judgement a mislabelled error the caller can still read —
+// never a lost one.
+
+test("#2192 invariant: every input error survives somewhere in the payload", async () => {
+  const { rootGraph, inner } = reporterGraphs();
+  const foreign = { class_type: "LoadImage", errors: [{ message: "from another workflow" }] };
+  const live = { class_type: "ImpactSwitch", errors: [{ type: "value_not_in_list", message: "still live" }] };
+  const lastNodeErrors = {
+    "249:252": { class_type: "ImpactSwitch", errors: [SELECT_MISMATCH] }, // proved repaired
+    7: foreign, // class mismatch — but node 7 is not on this graph, so it is untouched
+    "249:251": live,
+  };
+
+  const result = await runProductionGraphGetErrors({ graph: inner, rootGraph, lastNodeErrors });
+
+  const seen = new Set();
+  for (const entry of Object.values(result.node_errors ?? {})) {
+    for (const e of entry.errors ?? []) seen.add(e);
+  }
+  for (const record of result.stale_node_errors ?? []) {
+    for (const e of record.errors ?? []) seen.add(e);
+  }
+  for (const [id, entry] of Object.entries(lastNodeErrors)) {
+    for (const e of entry.errors) {
+      assert.ok(seen.has(e), `error on ${id} vanished from the payload entirely`);
+    }
+  }
+});
+
+test("#2192 invariant: a demoted entry carries its errors, not just a label", async () => {
+  const { rootGraph, inner } = reporterGraphs();
+  const result = await runProductionGraphGetErrors({
+    graph: inner,
+    rootGraph,
+    lastNodeErrors: { "249:252": { class_type: "ImpactSwitch", errors: [SELECT_MISMATCH] } },
+  });
+  assert.deepEqual(result.stale_node_errors[0].errors, [SELECT_MISMATCH]);
+  assert.match(result.stale_node_errors_note, /IN FULL/);
+  assert.match(result.stale_node_errors_note, /nothing is discarded/);
+});
+
+test("#2192 invariant: a class-mismatch demotion carries its errors too", () => {
+  const { rootGraph } = reporterGraphs();
+  const errors = [{ message: "boom" }, { message: "bang" }];
+  const { dropped } = pruneContradictedNodeErrors(rootGraph, {
+    "249:252": { class_type: "LoadImage", errors },
+  });
+  assert.deepEqual(dropped[0].errors, errors);
+});
+
+test("#2192 invariant: only the FALSIFIED half of a mixed entry is demoted", () => {
+  const { rootGraph } = reporterGraphs();
+  const live = { type: "value_not_in_list", message: "ckpt not in list" };
+  const { nodeErrors, dropped } = pruneContradictedNodeErrors(rootGraph, {
+    "249:252": { class_type: "ImpactSwitch", errors: [SELECT_MISMATCH, live] },
+  });
+  assert.deepEqual(nodeErrors["249:252"].errors, [live], "the live one stays in node_errors");
+  assert.deepEqual(dropped[0].errors, [SELECT_MISMATCH], "the repaired one moves, and moves whole");
+});
+
 // ── wiring: the shipped monolith must actually call it ────────────────────────
 
 test("#2192 wiring: both consumers prune, and neither merges before it prunes", () => {
