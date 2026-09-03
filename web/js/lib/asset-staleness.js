@@ -484,6 +484,47 @@ export function pruneContradictedNodeErrors(rootGraph, nodeErrors) {
 }
 
 /**
+ * Adjudicate each INDEPENDENT validation map on its own, then union the survivors.
+ *
+ * Order matters, and getting it backwards loses live errors (codex gate P1, reproduced).
+ * `combineNodeErrorMaps` merges same-id entries with `{...previous, ...entry}`, so the
+ * LAST map's `class_type` governs the merged entry while its `errors` array holds BOTH
+ * maps' errors. Pruning after that merge let one source's label decide the other
+ * source's fate: with a live `{2:{class_type:"Current",errors:[…]}}` in `app.lastNodeErrors`
+ * and a retained `{2:{class_type:"OldWorkflowType",errors:[…]}}` in the execution store,
+ * the class-type check saw a type the live node does not have and dropped the whole
+ * entry — `node_errors: null`, `errored_count: 0`, with a real error suppressed.
+ *
+ * Pruning FIRST keeps every entry paired with the `class_type` its own source recorded,
+ * which is the only label that says anything about its own errors. A stale store entry is
+ * then dropped alone and the live app entry survives untouched.
+ *
+ * `dropped` is deduplicated on (node id, reason): the same stale entry retained by both
+ * stores is one withheld fact, not two. A node can legitimately appear in BOTH the
+ * returned map and `dropped` — one of its recorded errors was contradicted and another
+ * was not — which is reported rather than hidden.
+ */
+export function pruneContradictedNodeErrorMaps(rootGraph, nodeErrorsMaps) {
+  const maps = Array.isArray(nodeErrorsMaps) ? nodeErrorsMaps : [nodeErrorsMaps];
+  const pruned = [];
+  const dropped = [];
+  const seen = new Set();
+  for (const map of maps) {
+    const result = pruneContradictedNodeErrors(rootGraph, map);
+    pruned.push(result.nodeErrors);
+    for (const record of result.dropped) {
+      // JSON-encoded pair, not a delimiter join: both halves are free-form strings and
+      // any separator character could occur inside one of them.
+      const key = JSON.stringify([record.node_id, record.contradicted_by]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      dropped.push(record);
+    }
+  }
+  return { nodeErrors: combineNodeErrorMaps(pruned), dropped };
+}
+
+/**
  * Null when the entry must be reported as-is; otherwise `{ reason, entry }` where
  * `entry` is the surviving remnant (null when the whole entry goes). Split out so the
  * three checks read in falsification order and each one's fail-open path is visible.

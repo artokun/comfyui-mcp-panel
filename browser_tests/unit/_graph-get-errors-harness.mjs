@@ -6,7 +6,7 @@ import {
   combineNodeErrorMaps,
   findNodeByScopedId,
   findVisibleNodeByScopedId,
-  pruneContradictedNodeErrors,
+  pruneContradictedNodeErrorMaps,
 } from "../../web/js/lib/asset-staleness.js";
 import { applyRuntimeExecFailure, boundExecFailurePayload } from "../../web/js/lib/exec-error-bounds.js";
 import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
@@ -76,7 +76,7 @@ const GRAPH_GET_ERRORS_DEPS = [
   "findNodeByScopedId",
   "getPiniaStore",
   "combineNodeErrorMaps",
-  "pruneContradictedNodeErrors",
+  "pruneContradictedNodeErrorMaps",
   "coerceMessageText",
   "lastExecFailure",
   "applyRuntimeExecFailure",
@@ -160,7 +160,7 @@ export async function runProductionGraphGetErrors({
     // production-path test drives the SHIPPED pruning rather than a stub of it.
     getPiniaStore: () => (storeNodeErrors ? { lastNodeErrors: storeNodeErrors } : null),
     combineNodeErrorMaps,
-    pruneContradictedNodeErrors,
+    pruneContradictedNodeErrorMaps,
     coerceMessageText: (value) => String(value ?? ""),
     lastExecFailure,
     applyRuntimeExecFailure,

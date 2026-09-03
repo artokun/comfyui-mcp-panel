@@ -7,7 +7,7 @@
 // function body, run with injected dependencies, so a test observes what SHIPS rather
 // than a re-implementation of it.
 import { PANEL_SRC } from "./_panel-constants.mjs";
-import { pruneContradictedNodeErrors } from "../../web/js/lib/asset-staleness.js";
+import { pruneContradictedNodeErrorMaps } from "../../web/js/lib/asset-staleness.js";
 
 function extractFunctionBody(source, signature) {
   const start = source.indexOf(signature);
@@ -64,7 +64,7 @@ const VALIDATION_BANNER_DEPS = [
   "isRegisteredNodeType",
   "LiteGraph",
   "coerceMessageText",
-  "pruneContradictedNodeErrors",
+  "pruneContradictedNodeErrorMaps",
 ];
 
 const makeValidationBanner = new Function(
@@ -106,7 +106,7 @@ export async function runProductionValidationBanner({
     isRegisteredNodeType: () => false,
     LiteGraph: {},
     coerceMessageText: (value) => String(value ?? ""),
-    pruneContradictedNodeErrors,
+    pruneContradictedNodeErrorMaps,
   };
   const banner = makeValidationBanner(...VALIDATION_BANNER_DEPS.map((name) => deps[name]));
   return banner();

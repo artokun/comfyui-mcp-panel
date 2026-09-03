@@ -26,7 +26,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { pruneContradictedNodeErrors } from "../../web/js/lib/asset-staleness.js";
+import {
+  pruneContradictedNodeErrors,
+  pruneContradictedNodeErrorMaps,
+} from "../../web/js/lib/asset-staleness.js";
 import { runProductionGraphGetErrors } from "./_graph-get-errors-harness.mjs";
 import { runProductionValidationBanner } from "./_validation-banner-harness.mjs";
 
@@ -170,6 +173,65 @@ test("#2192: a disclosure list cut at the cap says so (#809)", async () => {
   assert.equal(typeof result.stale_node_errors_truncation_hint, "string");
 });
 
+// ── codex gate P1: one map's label must never decide the other map's fate ────
+
+test("#2192 P1: a stale STORE entry does not take the live APP error down with it", async () => {
+  // combineNodeErrorMaps merges same-id entries with {...previous, ...entry}, so the
+  // LAST map's class_type governs an entry whose errors came from BOTH. Pruning after
+  // that merge let a retained foreign label drop a live error: node_errors null,
+  // errored_count 0, real error suppressed. Reproduced against the shipped executor
+  // before the fix; adjudicating each map on its own is what makes it survive.
+  const node = { id: 2, type: "Current", inputs: [] };
+  const graph = makeGraph({ id: "root", nodes: [node] });
+  const live = { type: "value_not_in_list", message: "ckpt not in list", extra_info: { input_name: "ckpt_name" } };
+
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastNodeErrors: { 2: { class_type: "Current", errors: [live] } },
+    storeNodeErrors: { 2: { class_type: "OldWorkflowType", errors: [{ message: "stale from another workflow" }] } },
+  });
+
+  assert.deepEqual(result.node_errors?.[2]?.errors, [live], "the live app error must survive");
+  assert.equal(result.node_errors[2].class_type, "Current", "and keep its OWN source's label");
+  assert.equal(result.errored_count, 1, "and still count as an error on the graph");
+  assert.equal(result.note, undefined, "a graph with a live validation error is not clean");
+  // The foreign entry IS withheld, and says why.
+  assert.equal(result.stale_node_errors.length, 1);
+  assert.match(result.stale_node_errors[0].contradicted_by, /not the OldWorkflowType/);
+});
+
+test("#2192 P1: the same stale entry in BOTH stores is one withheld fact, not two", () => {
+  const node = { id: 2, type: "Current", inputs: [] };
+  const graph = makeGraph({ id: "root", nodes: [node] });
+  const foreign = { class_type: "OldWorkflowType", errors: [{ message: "stale" }] };
+  const { nodeErrors, dropped } = pruneContradictedNodeErrorMaps(graph, [{ 2: foreign }, { 2: foreign }]);
+  assert.equal(nodeErrors, null);
+  assert.equal(dropped.length, 1, "deduplicated on (node id, reason)");
+});
+
+test("#2192 P1: the composer keeps combineNodeErrorMaps' union of two LIVE sources", () => {
+  // The reason that union exists (#579): ComfyUI can clear the app map while the store
+  // still holds the rejection. Pruning per-map must not cost that.
+  const node = { id: 2, type: "Current", inputs: [] };
+  const graph = makeGraph({ id: "root", nodes: [node] });
+  const a = { message: "from the app map" };
+  const b = { message: "from the execution store" };
+  const { nodeErrors } = pruneContradictedNodeErrorMaps(graph, [
+    { 2: { class_type: "Current", errors: [a] } },
+    { 2: { class_type: "Current", errors: [b] } },
+  ]);
+  assert.deepEqual(nodeErrors[2].errors, [a, b]);
+});
+
+test("#2192 P1: a non-array argument is still accepted as a single map", () => {
+  const node = { id: 2, type: "Current", inputs: [] };
+  const graph = makeGraph({ id: "root", nodes: [node] });
+  const map = { 2: { class_type: "Current", errors: [{ message: "live" }] } };
+  assert.deepEqual(pruneContradictedNodeErrorMaps(graph, map).nodeErrors, map);
+  assert.equal(pruneContradictedNodeErrorMaps(graph, null).nodeErrors, null);
+});
+
 // ── the OTHER consumer: the turn-start banner ──────────────────────────────
 //
 // `validationBanner` reads the same map and injects it into the agent's turn asserting
@@ -309,31 +371,46 @@ test("#2192: null / non-object maps pass through unchanged", () => {
 
 // ── wiring: the shipped monolith must actually call it ─────────────────────────
 
-test("#2192 wiring: graph_get_errors prunes the map it reports, not a copy beside it", () => {
+test("#2192 wiring: both consumers prune, and neither merges before it prunes", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  assert.match(src, /pruneContradictedNodeErrors,/, "imported from asset-staleness.js");
-  // One binding: the pruned map is what the per-node join, `clean` and the payload read.
-  // A second `const nodeErrors =` from the raw union would silently un-ship the fix.
-  const bindings = src.match(/const \{ nodeErrors, dropped: contradictedNodeErrors \} = pruneContradictedNodeErrors\(/g);
-  assert.equal(bindings?.length, 1);
-  assert.equal(
-    (src.match(/const nodeErrors = combineNodeErrorMaps\(/g) ?? []).length,
-    0,
-    "the raw union must not be bound as `nodeErrors` anywhere",
-  );
-  assert.match(src, /stale_node_errors: contradictedNodeErrors\.slice\(0, MAX_STATE_NODES\)/);
+  assert.match(src, /pruneContradictedNodeErrorMaps,/, "imported from asset-staleness.js");
+
   // BOTH consumers of the map, not just the one the issue names. A green helper test
   // proves nothing about a call path that never calls it.
   assert.equal(
-    (src.match(/pruneContradictedNodeErrors\(/g) ?? []).length,
+    (src.match(/pruneContradictedNodeErrorMaps\(/g) ?? []).length,
     2,
     "graph_get_errors AND validationBanner must each prune",
   );
+
+  // THE ORDERING INVARIANT (codex gate P1). `combineNodeErrorMaps` merges same-id entries
+  // with {...previous, ...entry}, so merging FIRST lets the last map's class_type govern
+  // the first map's errors and a stale store entry drops a live app error. The panel must
+  // therefore never invoke the union itself — the composer owns that order.
+  assert.equal(
+    (src.match(/combineNodeErrorMaps\(/g) ?? []).length,
+    0,
+    "the panel must not union the maps itself; pruneContradictedNodeErrorMaps does it after pruning",
+  );
+  assert.equal(
+    (src.match(/pruneContradictedNodeErrors\(/g) ?? []).length,
+    0,
+    "the single-map prune is the composer's internal; a direct call here would invite the merge-first order back",
+  );
+
+  // One binding: the pruned map is what the per-node join, `clean` and the payload read.
+  assert.equal(
+    (src.match(/const \{ nodeErrors, dropped: contradictedNodeErrors \} = pruneContradictedNodeErrorMaps\(/g) ?? [])
+      .length,
+    1,
+  );
   assert.match(
     src,
-    /nodeErrors = pruneContradictedNodeErrors\(postProbeRootGraph, nodeErrors\)\.nodeErrors;/,
+    /nodeErrors = pruneContradictedNodeErrorMaps\(postProbeRootGraph, \[nodeErrors\]\)\.nodeErrors;/,
     "the banner must prune against the root graph its own binding guard just cleared",
   );
+
+  assert.match(src, /stale_node_errors: contradictedNodeErrors\.slice\(0, MAX_STATE_NODES\)/);
   // The cut must be reported with the REAL total, not the shown count — a hint that
   // says "50 of 50" is the silent-cut defect wearing a disclosure.
   assert.match(

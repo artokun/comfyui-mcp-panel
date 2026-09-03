@@ -228,7 +228,7 @@ import {
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
-  pruneContradictedNodeErrors,
+  pruneContradictedNodeErrorMaps,
   graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
@@ -12523,7 +12523,7 @@ async function validationBanner() {
   // and inside `sig`, so repairing the link both stops the banner and counts as a change
   // — matching what the missing-asset entries in that signature already do.
   try {
-    nodeErrors = pruneContradictedNodeErrors(postProbeRootGraph, nodeErrors).nodeErrors;
+    nodeErrors = pruneContradictedNodeErrorMaps(postProbeRootGraph, [nodeErrors]).nodeErrors;
   } catch {
     /* a banner must never throw; an unpruned map is the safe direction */
   }
@@ -21399,9 +21399,12 @@ const GRAPH_TOOL_EXECUTORS = {
     // the per-node join, `clean`, the red-outline adjudication and the payload all
     // have to agree, and the contradiction the reporter saw (`errored_count: 0` beside
     // a populated `node_errors`) is exactly what happens when they do not.
-    const { nodeErrors, dropped: contradictedNodeErrors } = pruneContradictedNodeErrors(
+    // Each map is adjudicated on its own and the survivors are unioned — never the other
+    // way round. Merging first lets the LAST map's `class_type` govern the FIRST map's
+    // errors, and a stale store entry then drops a live app error with it (codex gate P1).
+    const { nodeErrors, dropped: contradictedNodeErrors } = pruneContradictedNodeErrorMaps(
       rootGraph,
-      combineNodeErrorMaps([comfy?.lastNodeErrors ?? null, storeNodeErrors]),
+      [comfy?.lastNodeErrors ?? null, storeNodeErrors],
     );
     if (nodeErrors) {
       for (const [id, entry] of Object.entries(nodeErrors)) {
