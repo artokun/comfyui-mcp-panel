@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- After a large custom-node install, adding a node waits for /object_info with an adaptive command-budget cap instead of a fixed 10s fetch, and still refuses if the schema never arrives (#2050)
 - panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194)
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
@@ -18,6 +19,11 @@ All notable changes to this project are documented here. This project adheres to
   isModified reading, because ComfyUI derives that flag from user-input captures and a
   false is not evidence of safety (panel#882). The save/tracker deadlock itself is
   unchanged and panel#2139 stays open.
+
+## [0.15.161] - 2026-09-03
+
+### Fixed
+- panel_save_workflow restamps a leftover nested `extra.comfyui_mcp.workflow_path` when the canvas uuid already matches the tab, and ImpactSwitch `findInputSlot` restore failures no longer dead-end that rebind behind an unrestorable open (#2194, #2206)
 
 ## [0.15.160] - 2026-09-03
 
