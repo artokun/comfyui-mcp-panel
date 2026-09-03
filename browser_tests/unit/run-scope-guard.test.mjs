@@ -1727,6 +1727,35 @@ test("#2203 unscoped interceptor recovers a thrown /prompt from /queue", async (
   assert.equal(spy.calls.filter((c) => isPromptPostCall(c.route, c.options)).length, 1);
 });
 
+test("#2203 a receipt RECOVERED after a malformed 200 is not still counted as missing", () => {
+  // The increment used to be banked by `onMissingPromptId` BEFORE recovery ran and
+  // was never taken back, so a response whose id was successfully recovered from
+  // the queue still carried uncertainCount > 0 and reported `queued_unknown`
+  // instead of accepted (review of #2215).
+  const queued = [];
+  const server = async (route, options) => {
+    const path = typeof route === "string" ? route.split("?")[0] : "";
+    if (!isPromptPostCall(route, options)) {
+      if (path.endsWith("/queue")) return jsonResponse(200, { queue_running: queued, queue_pending: [] });
+      return jsonResponse(200, {});
+    }
+    const body = JSON.parse(options.body);
+    queued.push([1, "recovered-after-malformed", body.prompt, body.extra_data ?? {}, []]);
+    // A 200 that carries NO prompt_id: accepted by ComfyUI, unreadable as a receipt.
+    return jsonResponse(200, {});
+  };
+  const ids = [];
+  const intercepted = createRunFetchInterceptor({
+    recoverDelayMs: 0,
+    origFetchApi: server,
+    onPromptId: (p) => ids.push(p),
+  });
+  return intercepted(...promptPost({ prompt: {} })).then(() => {
+    assert.deepEqual(ids, ["recovered-after-malformed"], "the queue row IS the receipt");
+    assert.equal(intercepted.state.missingPromptIds, 0, "a recovered receipt is not missing");
+  });
+});
+
 test("#556 r6: an attributed post with a MALFORMED response (200 without prompt_id, or non-200 without a rejection body) is a dispatch FAILURE", async () => {
   for (const bad of [jsonResponse(200, {}), jsonResponse(500, {}), jsonResponse(200, { prompt_id: null })]) {
     const spy = makeServer(async () => bad);
