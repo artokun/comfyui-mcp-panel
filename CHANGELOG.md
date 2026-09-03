@@ -10,6 +10,12 @@ All notable changes to this project are documented here. This project adheres to
 - Preserve the panel-wide Codex conversation across a workflow remount when the canonical IndexedDB history read times out or is otherwise unavailable; only a confirmed empty archive may clear the transcript and session (#2201)
 - the canonical chat-history read is decided by the IndexedDB TRANSACTION rather than the request, so a get that succeeds before its transaction aborts is no longer treated as authoritative; and a delayed hydration retry no longer reselects the mount-time thread over a chat the user picked while the store was recovering (#2201)
 
+## [0.15.164] - 2026-09-03
+
+### Fixed
+- The agent TODO tray can be collapsed from its Plan header (and re-expanded) so a forgotten panel_set_todo no longer pins up to 9rem of the chat column; empty panel_set_todo still clears it (#2165, #2219)
+
+
 ## [0.15.163] - 2026-09-03
 
 ### Fixed
