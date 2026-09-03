@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
+
 ## [0.15.162] - 2026-09-03
 
 ### Fixed
