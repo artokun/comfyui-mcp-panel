@@ -2166,7 +2166,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
             toast(
               tr(
                 "civitai_ui.sign_in_timed_out",
-                "CivitAI sign-in did not complete. If the popup showed a 403, ComfyUI's cross-site protection blocked the redirect back — it rejects that request without logging anything. Use a CivitAI API token in Settings instead (see panel#2044).",
+                "CivitAI sign-in did not complete. If the popup showed a 403, ComfyUI's cross-site protection blocked the redirect back — it rejects that request without logging anything. Use a CivitAI API token instead — the panel's “Set CivitAI token…” setting stores it (see panel#2044).",
               ),
             );
           }
