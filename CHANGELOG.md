@@ -9,6 +9,12 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - an oversized A2UI card scrolls inside its own surface instead of consuming the chat viewport, and a `ui_dismiss` that carries no `card_id` now survives a reload or rebind by resolving only the still-unresolved cards in the displayed thread (#2183)
 
+## [0.15.164] - 2026-09-03
+
+### Fixed
+- The agent TODO tray can be collapsed from its Plan header (and re-expanded) so a forgotten panel_set_todo no longer pins up to 9rem of the chat column; empty panel_set_todo still clears it (#2165, #2219)
+
+
 ## [0.15.163] - 2026-09-03
 
 ### Fixed
