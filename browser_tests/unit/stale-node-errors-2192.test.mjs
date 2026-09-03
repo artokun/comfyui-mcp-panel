@@ -232,6 +232,95 @@ test("#2192 P1: a non-array argument is still accepted as a single map", () => {
   assert.equal(pruneContradictedNodeErrorMaps(graph, null).nodeErrors, null);
 });
 
+// ── codex gate round 2: the two halves of the claim, and the right type field ──
+
+test("#2192 r2: class_type is matched against comfyClass, not just node.type", async () => {
+  // The frontend's prompt compiler writes `class_type: e.comfyClass`, and registration
+  // sets type and comfyClass from different sources (`registerNodeType(n.id, i)` vs
+  // `i.comfyClass = t.name`). Comparing against `type` alone dropped live errors.
+  const node = { id: 2, type: "b2f0…-subgraph-uuid", comfyClass: "LoadImage", inputs: [] };
+  const graph = makeGraph({ id: "root", nodes: [node] });
+  const live = { type: "value_not_in_list", message: "image not in list" };
+
+  const result = await runProductionGraphGetErrors({
+    graph,
+    rootGraph: graph,
+    lastNodeErrors: { 2: { class_type: "LoadImage", errors: [live] } },
+  });
+  assert.deepEqual(result.node_errors?.[2]?.errors, [live], "comfyClass agrees — nothing to drop");
+  assert.equal(result.errored_count, 1);
+  assert.equal(result.stale_node_errors, undefined);
+});
+
+test("#2192 r2: a class that matches NEITHER field is still dropped", () => {
+  const node = { id: 2, type: "SomeType", comfyClass: "LoadImage", inputs: [] };
+  const graph = makeGraph({ id: "root", nodes: [node] });
+  const { nodeErrors, dropped } = pruneContradictedNodeErrors(graph, {
+    2: { class_type: "KSampler", errors: [{ message: "from another workflow" }] },
+  });
+  assert.equal(nodeErrors, null);
+  assert.match(dropped[0].contradicted_by, /not the KSampler/);
+});
+
+test("#2192 r2: re-pointing the input at a different OUTPUT SLOT of the same node is a repair", () => {
+  // linked_node is [node_id, slot_index] and received_type is RETURN_TYPES[slot_index],
+  // so moving from output 0 (IMAGE) to output 1 (INT) fixes the mismatch without the
+  // source node changing at all. Comparing the id alone reported it forever.
+  const target = { id: 9, type: "ImpactSwitch", comfyClass: "ImpactSwitch", inputs: [{ name: "select", type: "INT", link: 900 }] };
+  const graph = makeGraph({
+    id: "root",
+    nodes: [{ id: 7, type: "MultiOut" }, target],
+    links: { 900: { id: 900, origin_id: 7, origin_slot: 1, target_id: 9, target_slot: 0 } },
+  });
+  const err = {
+    type: "return_type_mismatch",
+    details: "select, received_type(IMAGE) mismatch input_type(INT)",
+    extra_info: { input_name: "select", received_type: "IMAGE", linked_node: [7, 0] },
+  };
+  const { nodeErrors, dropped } = pruneContradictedNodeErrors(graph, {
+    9: { class_type: "ImpactSwitch", errors: [err] },
+  });
+  assert.equal(nodeErrors, null, "the slot the error names no longer feeds this input");
+  assert.equal(dropped.length, 1);
+});
+
+test("#2192 r2: the SAME node AND slot is still a live error", () => {
+  const target = { id: 9, type: "ImpactSwitch", comfyClass: "ImpactSwitch", inputs: [{ name: "select", type: "INT", link: 900 }] };
+  const graph = makeGraph({
+    id: "root",
+    nodes: [{ id: 7, type: "MultiOut" }, target],
+    links: { 900: { id: 900, origin_id: 7, origin_slot: 0, target_id: 9, target_slot: 0 } },
+  });
+  const nodeErrors = {
+    9: {
+      class_type: "ImpactSwitch",
+      errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [7, 0] } }],
+    },
+  };
+  assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
+});
+
+test("#2192 r2: a slot neither side states is unreadable, not a disagreement", () => {
+  const target = { id: 9, type: "ImpactSwitch", inputs: [{ name: "select", type: "INT", link: 900 }] };
+  // Live link carries no readable origin_slot.
+  const graph = makeGraph({
+    id: "root",
+    nodes: [{ id: 7, type: "MultiOut" }, target],
+    links: { 900: { id: 900, origin_id: 7, target_id: 9, target_slot: 0 } },
+  });
+  const withSlot = { 9: { errors: [{ extra_info: { input_name: "select", linked_node: [7, 3] } }] } };
+  assert.deepEqual(pruneContradictedNodeErrors(graph, withSlot).nodeErrors, withSlot, "no live slot → keep");
+
+  // …and the mirror: a live slot with no claimed one.
+  const graph2 = makeGraph({
+    id: "root",
+    nodes: [{ id: 7, type: "MultiOut" }, { id: 9, type: "ImpactSwitch", inputs: [{ name: "select", link: 900 }] }],
+    links: { 900: { id: 900, origin_id: 7, origin_slot: 2, target_id: 9, target_slot: 0 } },
+  });
+  const noSlot = { 9: { errors: [{ extra_info: { input_name: "select", linked_node: [7] } }] } };
+  assert.deepEqual(pruneContradictedNodeErrors(graph2, noSlot).nodeErrors, noSlot, "no claimed slot → keep");
+});
+
 // ── the OTHER consumer: the turn-start banner ──────────────────────────────
 //
 // `validationBanner` reads the same map and injects it into the agent's turn asserting

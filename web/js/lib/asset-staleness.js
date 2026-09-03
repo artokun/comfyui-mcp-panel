@@ -367,11 +367,13 @@ function lookupLink(links, linkId) {
 }
 
 /**
- * The live source id feeding `inputName` on `node`, or `undefined` when the graph
- * cannot answer (no such input, no readable link store). `null` means the input is
- * genuinely unconnected — a real answer, distinct from "cannot tell".
+ * The live `{ id, slot }` feeding `inputName` on `node` — the SOURCE side of the link,
+ * which is exactly what `extra_info.linked_node` names. `undefined` when the graph
+ * cannot answer (no such input, no readable link store); `null` when the input is
+ * genuinely unconnected — a real answer, distinct from "cannot tell". `slot` is null
+ * when the link record does not carry a readable one.
  */
-function liveInputOriginId(node, inputName) {
+function liveInputOrigin(node, inputName) {
   const inputs = Array.isArray(node?.inputs) ? node.inputs : null;
   if (!inputs) return undefined;
   const input = inputs.find((i) => i?.name === inputName);
@@ -384,7 +386,9 @@ function liveInputOriginId(node, inputName) {
   const link = lookupLink(links, input.link);
   if (link == null) return undefined;
   const originId = link.origin_id ?? link[1];
-  return originId == null ? undefined : String(originId);
+  if (originId == null) return undefined;
+  const originSlot = link.origin_slot ?? link[2];
+  return { id: String(originId), slot: Number.isInteger(originSlot) ? originSlot : null };
 }
 
 /**
@@ -394,10 +398,16 @@ function liveInputOriginId(node, inputName) {
  * — i.e. "input X is fed by node Y and Y's type is wrong". When X is now fed by a
  * different node, or by nothing, that sentence is no longer true of this graph.
  *
+ * `linked_node` is `[node_id, slot_index]`, and BOTH halves are part of the claim: the
+ * received type is `RETURN_TYPES[slot_index]`, so re-pointing the same input at a
+ * DIFFERENT OUTPUT of the SAME node is a complete repair of a type mismatch and one the
+ * reporter's own scenario could have taken (codex gate round 2). Comparing the node id
+ * alone left that repair reported forever.
+ *
  * Only decides on POSITIVE evidence. A missing/odd `extra_info`, an input the live
- * node no longer exposes, an unreadable link store, or a `linked_node` in a different
- * subgraph scope than the errored node (which the live inner graph cannot express as
- * a plain origin id) all return false — the error is kept.
+ * node no longer exposes, an unreadable link store, a slot index neither side states,
+ * or a `linked_node` in a different subgraph scope than the errored node (which the
+ * live inner graph cannot express as a plain origin id) all return false — kept.
  */
 function nodeErrorLinkClaimFalsified(node, errorNodeId, error) {
   const extra = error?.extra_info;
@@ -411,9 +421,15 @@ function nodeErrorLinkClaimFalsified(node, errorNodeId, error) {
   const here = splitLocatorScope(errorNodeId);
   const there = splitLocatorScope(claimed);
   if (there.scope !== here.scope) return false;
-  const liveOrigin = liveInputOriginId(node, inputName);
-  if (liveOrigin === undefined) return false;
-  return liveOrigin !== there.local;
+  const live = liveInputOrigin(node, inputName);
+  if (live === undefined) return false;
+  if (live === null) return true; // the input exists and nothing feeds it now
+  if (live.id !== there.local) return true;
+  // Same source node: the slot is the remainder of the claim. Judge it only when BOTH
+  // sides state one — an absent slot on either side is unreadable, not a disagreement.
+  const claimedSlot = Array.isArray(extra.linked_node) ? extra.linked_node[1] : undefined;
+  if (!Number.isInteger(claimedSlot) || live.slot === null) return false;
+  return live.slot !== claimedSlot;
 }
 
 /**
@@ -535,10 +551,19 @@ function classifyContradictedNodeError(rootGraph, id, entry) {
   if (node == null) {
     return { reason: `no node ${id} is on the active graph`, entry: null };
   }
+  // `class_type` comes from `node.comfyClass`, NOT `node.type` — the frontend's prompt
+  // compiler writes `class_type: e.comfyClass` (verified in the 1.49.6 bundle), and the
+  // two have genuinely different sources at registration: `registerNodeType(n.id, i)`
+  // sets the type while `i.comfyClass = t.name` sets the class. Comparing against `type`
+  // alone dropped live errors on any node where they diverge (codex gate round 2).
+  // Matching EITHER counts as agreement, which is the fail-open direction.
   const claimedType = typeof entry?.class_type === "string" ? entry.class_type : "";
-  const liveType = typeof node?.type === "string" ? node.type : "";
-  if (claimedType && liveType && claimedType !== liveType) {
-    return { reason: `node ${id} is a ${liveType} now, not the ${claimedType} this error is about`, entry: null };
+  const liveTypes = [node?.comfyClass, node?.type].filter((t) => typeof t === "string" && t);
+  if (claimedType && liveTypes.length && !liveTypes.includes(claimedType)) {
+    return {
+      reason: `node ${id} is a ${liveTypes[0]} now, not the ${claimedType} this error is about`,
+      entry: null,
+    };
   }
   const errors = Array.isArray(entry?.errors) ? entry.errors : null;
   if (!errors || !errors.length) return null;
