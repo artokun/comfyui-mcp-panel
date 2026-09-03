@@ -16,7 +16,13 @@ import {
   describeOrphanDynamicWidgets,
   isDynamicWidgetMissingError,
   installGraphToPromptDynamicReconcile,
+  wrapGraphDynamicComboSetters,
 } from "../../web/js/lib/dynamic-widget-reconcile.js";
+import {
+  installGraphToPromptSnapshotBarrier,
+  queuePromptWithGraphToPromptSnapshot,
+  reserveGraphToPromptSnapshot,
+} from "../../web/js/lib/run-prompt-snapshot.js";
 
 const DYNAMIC = "COMFY_DYNAMICCOMBO_V3";
 
@@ -505,4 +511,193 @@ test("#1931: the serializer wrap is idempotent", () => {
   assert.equal(app.graphToPrompt, wrapped);
   assert.equal(installGraphToPromptDynamicReconcile({}), false);
   assert.equal(installGraphToPromptDynamicReconcile(null), false);
+});
+
+/**
+ * #2033 — after restart/reconnect a loaded SaveVideo can sit as plain widgets until
+ * the first graphToPrompt installs native DynamicCombo accessors. The wrap used to
+ * seal only BEFORE that first serialize, so queue-time snapshot restore assigned
+ * through the unwrapped setter, replaced `format.codec`, then wrote the captured
+ * (now detached) child and threw the bare error.
+ */
+function makeReconnectSaveVideo() {
+  const def = nestedFormatDef({ hiddenCodec: false });
+  const store = new Map();
+  const node = { id: 92, type: "SaveVideo", constructor: { nodeData: def }, widgets: [], inputs: [] };
+  const widgetIdFor = (name) => `graph:${node.id}:${name}`;
+
+  function addPlain(name, value) {
+    const widget = { type: "combo", name, options: {}, onRemove() {} };
+    let fallback = value;
+    Object.defineProperty(widget, "widgetId", {
+      configurable: true,
+      get: () => widgetIdFor(widget.name),
+    });
+    Object.defineProperty(widget, "value", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return store.get(widgetIdFor(widget.name))?.value ?? fallback;
+      },
+      set(next) {
+        const state = store.get(widgetIdFor(widget.name));
+        if (state) state.value = next;
+        fallback = next;
+      },
+    });
+    store.set(widgetIdFor(name), { value });
+    node.widgets.push(widget);
+    return widget;
+  }
+
+  addPlain("filename_prefix", "video/ComfyUI");
+  addPlain("format", "auto");
+  addPlain("format.codec", "auto");
+  node.inputs.push({ name: "format", type: DYNAMIC, link: null });
+  node.inputs.push({ name: "format.codec", type: DYNAMIC, link: null });
+
+  function addChild(name, value) {
+    const existing = node.widgets.find((widget) => widget.name === name);
+    if (existing) return existing;
+    return addPlain(name, value);
+  }
+
+  function installDynamicCombo(widget, spec) {
+    const optionsByKey = new Map((spec[1]?.options ?? []).map((option) => [option.key, option.inputs]));
+    let closureValue = widget.value;
+    const isInGroup = (candidate) => candidate.name.startsWith(`${widget.name}.`);
+    const updateWidgets = (next) => {
+      for (let index = node.inputs.length - 1; index >= 0; index--) {
+        if (isInGroup(node.inputs[index])) node.inputs.splice(index, 1);
+      }
+      for (let index = node.widgets.length - 1; index >= 0; index--) {
+        const candidate = node.widgets[index];
+        if (!isInGroup(candidate)) continue;
+        candidate.onRemove?.();
+        if (candidate.widgetId) store.delete(candidate.widgetId);
+        node.widgets.splice(index, 1);
+      }
+      const inputs = optionsByKey.get(next);
+      if (!inputs) return;
+      const insertAt = node.widgets.findIndex((candidate) => candidate === widget) + 1;
+      if (insertAt === 0) throw new Error("Dynamic widget doesn't exist on node");
+      const widgetMark = node.widgets.length;
+      for (const group of ["required", "optional"]) {
+        for (const [childName, childSpec] of Object.entries(inputs[group] ?? {})) {
+          const fullName = `${widget.name}.${childName}`;
+          const isDynamic = Array.isArray(childSpec) && childSpec[0] === DYNAMIC;
+          const child = addChild(
+            fullName,
+            isDynamic ? childSpec[1]?.options?.[0]?.key : (childSpec?.[1]?.default ?? "auto"),
+          );
+          node.inputs.push({ name: fullName, type: isDynamic ? DYNAMIC : childSpec[0], link: null });
+          if (isDynamic) installDynamicCombo(child, childSpec);
+        }
+      }
+      const created = node.widgets.splice(widgetMark);
+      node.widgets.splice(insertAt, 0, ...created);
+    };
+    Object.defineProperty(widget, "value", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return store.get(widget.widgetId)?.value ?? closureValue;
+      },
+      set(next) {
+        const state = store.get(widget.widgetId);
+        if (state) state.value = next;
+        closureValue = next;
+        updateWidgets(next);
+      },
+    });
+    widget.value = closureValue;
+  }
+
+  function installNativeSetters() {
+    const formatSpec = def.input.required.format;
+    const format = node.widgets.find((widget) => widget.name === "format");
+    installDynamicCombo(format, formatSpec);
+  }
+
+  return { node, graph: { _nodes: [node] }, installNativeSetters };
+}
+
+function capturedWidgets(node) {
+  return (node.widgets ?? []).slice();
+}
+
+test("#2033: first serialize that installs DynamicCombo setters still seals them afterwards", async () => {
+  const { node, graph, installNativeSetters } = makeReconnectSaveVideo();
+  const app = {
+    graph,
+    rootGraph: graph,
+    graphToPrompt() {
+      installNativeSetters();
+      return { output: { 92: { class_type: "SaveVideo" } } };
+    },
+  };
+  installGraphToPromptDynamicReconcile(app);
+  await app.graphToPrompt();
+
+  const format = node.widgets.find((widget) => widget.name === "format");
+  const codec = node.widgets.find((widget) => widget.name === "format.codec");
+  assert.ok(format && codec, "native install must materialise format.codec");
+  assert.doesNotThrow(() => {
+    format.value = format.value;
+  });
+  assert.doesNotThrow(() => {
+    codec.value = codec.value;
+  }, "queue-style same-value restore must not hit a detached format.codec");
+  assert.equal(node.widgets.some((widget) => widget.name === "format.codec"), true);
+});
+
+test("#2033: an unsealed native parent assign still detaches the captured child", () => {
+  const { node, installNativeSetters } = makeReconnectSaveVideo();
+  installNativeSetters();
+  const format = node.widgets.find((widget) => widget.name === "format");
+  const codec = node.widgets.find((widget) => widget.name === "format.codec");
+  format.value = format.value;
+  assert.throws(() => {
+    codec.value = codec.value;
+  }, /Dynamic widget doesn't exist on node/);
+});
+
+test("#2033: sealing after the native install makes the same restore safe", () => {
+  const { node, graph, installNativeSetters } = makeReconnectSaveVideo();
+  installNativeSetters();
+  wrapGraphDynamicComboSetters(graph);
+  const format = node.widgets.find((widget) => widget.name === "format");
+  const codec = node.widgets.find((widget) => widget.name === "format.codec");
+  format.value = format.value;
+  assert.doesNotThrow(() => {
+    codec.value = codec.value;
+  });
+  assert.equal(codec.value, "auto");
+});
+
+test("#2033: queue-time snapshot restore does not throw after first serialize installs setters", async () => {
+  const { node, graph, installNativeSetters } = makeReconnectSaveVideo();
+  const queueItems = [];
+  const app = {
+    graph,
+    rootGraph: graph,
+    queueItems,
+    graphToPrompt() {
+      installNativeSetters();
+      return { output: { 92: { class_type: "SaveVideo" } } };
+    },
+    queuePrompt() {
+      queueItems.push({ number: 1 });
+      return Promise.resolve({ node_errors: {} });
+    },
+  };
+  installGraphToPromptDynamicReconcile(app);
+  installGraphToPromptSnapshotBarrier(app);
+  const prompt = await app.graphToPrompt();
+  const captured = capturedWidgets(node);
+  assert.ok(captured.some((widget) => widget.name === "format.codec"));
+  const entry = reserveGraphToPromptSnapshot(app, prompt, graph);
+  await queuePromptWithGraphToPromptSnapshot(app, entry, () => app.queuePrompt());
+  assert.doesNotThrow(() => queueItems.pop());
+  assert.equal(node.widgets.some((widget) => widget.name === "format.codec"), true);
 });

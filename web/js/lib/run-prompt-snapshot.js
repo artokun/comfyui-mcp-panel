@@ -1,3 +1,4 @@
+import { isDynamicWidgetMissingError, wrapGraphDynamicComboSetters } from "./dynamic-widget-reconcile.js";
 
 // #1854 — the intrinsic captured ONCE at module load. Invoking through a
 // per-call property lookup on the function object would read an overrideable
@@ -87,7 +88,14 @@ function captureLiveState(records) {
 
 function restoreState(records, key) {
   for (const record of records ?? []) {
-    record.widget.value = copyStoredValue(record[key]);
+    try {
+      record.widget.value = copyStoredValue(record[key]);
+    } catch (error) {
+      // #2033 — restoring a captured DynamicCombo parent rebuilds dotted children
+      // and leaves the captured child widget detached. The live replacement already
+      // carries the restored option; rethrow anything that is not that throw.
+      if (!isDynamicWidgetMissingError(error)) throw error;
+    }
   }
 }
 
@@ -135,6 +143,11 @@ function prepareEntry(state, entry) {
     return;
   }
   entry.liveState = live;
+  try {
+    wrapGraphDynamicComboSetters(state.app?.rootGraph ?? state.app?.graph);
+  } catch {
+    // Sealing is best-effort; restore still has to run.
+  }
   restoreState(entry.graphState.records, "snapshot");
 }
 

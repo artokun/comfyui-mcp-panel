@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
+
 ## [0.15.159] - 2026-09-02
 
 ### Fixed
