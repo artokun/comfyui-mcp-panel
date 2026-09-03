@@ -410,6 +410,25 @@ function liveInputOrigin(node, inputName) {
  * live inner graph cannot express as a plain origin id) all return false — kept.
  */
 function nodeErrorLinkClaimFalsified(node, errorNodeId, error) {
+  // ONLY `return_type_mismatch`. Exactly two error types in execution.py carry a
+  // `linked_node`, and they file it under DIFFERENT nodes (codex gate round 4):
+  //
+  //   return_type_mismatch          → `errors.append(error)` — recorded on the node being
+  //                                   validated, so `input_name` IS an input of that node
+  //                                   and `linked_node` is what feeds it. This function's
+  //                                   whole premise.
+  //   exception_during_inner_validation
+  //                                 → `validated[o_id] = (False, reasons, o_id)` — recorded
+  //                                   on the UPSTREAM node, while `input_name` names an input
+  //                                   of the DOWNSTREAM one and `linked_node` points back at
+  //                                   the errored node itself. Reading it with the premise
+  //                                   above finds a same-named input on the wrong node and
+  //                                   drops a live error.
+  //
+  // A whitelist rather than a blocklist, so an error type this panel has never seen — a
+  // newer ComfyUI's, or a custom validator's — is never judged by semantics borrowed from
+  // a different one.
+  if (error?.type !== "return_type_mismatch") return false;
   const extra = error?.extra_info;
   if (!extra || typeof extra !== "object") return false;
   const inputName = extra.input_name;

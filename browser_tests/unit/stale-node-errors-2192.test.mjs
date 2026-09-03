@@ -308,7 +308,9 @@ test("#2192 r2: a slot neither side states is unreadable, not a disagreement", (
     nodes: [{ id: 7, type: "MultiOut" }, target],
     links: { 900: { id: 900, origin_id: 7, target_id: 9, target_slot: 0 } },
   });
-  const withSlot = { 9: { errors: [{ extra_info: { input_name: "select", linked_node: [7, 3] } }] } };
+  const withSlot = {
+    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [7, 3] } }] },
+  };
   assert.deepEqual(pruneContradictedNodeErrors(graph, withSlot).nodeErrors, withSlot, "no live slot → keep");
 
   // …and the mirror: a live slot with no claimed one.
@@ -317,8 +319,64 @@ test("#2192 r2: a slot neither side states is unreadable, not a disagreement", (
     nodes: [{ id: 7, type: "MultiOut" }, { id: 9, type: "ImpactSwitch", inputs: [{ name: "select", link: 900 }] }],
     links: { 900: { id: 900, origin_id: 7, origin_slot: 2, target_id: 9, target_slot: 0 } },
   });
-  const noSlot = { 9: { errors: [{ extra_info: { input_name: "select", linked_node: [7] } }] } };
+  const noSlot = {
+    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [7] } }] },
+  };
   assert.deepEqual(pruneContradictedNodeErrors(graph2, noSlot).nodeErrors, noSlot, "no claimed slot → keep");
+});
+
+// ── codex gate round 4: only ONE error type files its linked_node this way ────
+
+test("#2192 r4: exception_during_inner_validation is never judged by the link check", async () => {
+  // execution.py files this one under the UPSTREAM node — `validated[o_id] = (False,
+  // reasons, o_id)` — while `input_name` names an input of the DOWNSTREAM node and
+  // `linked_node` points back at the errored node itself. Read with return_type_mismatch's
+  // premise it finds a same-named input on the wrong node and drops a live error.
+  const node1 = { id: 1, type: "Upstream", comfyClass: "Upstream", inputs: [{ name: "x", type: "IMAGE", link: null }] };
+  const graph = makeGraph({ id: "root", nodes: [node1, { id: 2, type: "Downstream" }] });
+  const nodeErrors = {
+    1: {
+      class_type: "Upstream",
+      errors: [
+        {
+          type: "exception_during_inner_validation",
+          message: "Exception when validating inner node",
+          extra_info: { input_name: "x", linked_node: [2, 0] },
+        },
+      ],
+    },
+  };
+
+  const result = await runProductionGraphGetErrors({ graph, rootGraph: graph, lastNodeErrors: nodeErrors });
+  assert.deepEqual(result.node_errors, nodeErrors, "a live inner-validation exception must survive");
+  assert.equal(result.errored_count, 1);
+  assert.equal(result.note, undefined);
+});
+
+test("#2192 r4: an unknown error type carrying linked_node is never judged either", () => {
+  // Whitelist, not blocklist: a newer ComfyUI's error type, or a custom validator's, must
+  // not be read with semantics borrowed from return_type_mismatch.
+  const target = { id: 9, type: "Sw", comfyClass: "Sw", inputs: [{ name: "select", link: 900 }] };
+  const graph = makeGraph({
+    id: "root",
+    nodes: [{ id: 7, type: "A" }, { id: 8, type: "B" }, target],
+    links: { 900: { id: 900, origin_id: 8, origin_slot: 0, target_id: 9, target_slot: 0 } },
+  });
+  const nodeErrors = {
+    9: { class_type: "Sw", errors: [{ type: "some_future_error", extra_info: { input_name: "select", linked_node: [7, 0] } }] },
+  };
+  assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
+});
+
+test("#2192 r4: an error with NO type is not judged", () => {
+  const target = { id: 9, type: "Sw", inputs: [{ name: "select", link: 900 }] };
+  const graph = makeGraph({
+    id: "root",
+    nodes: [{ id: 7, type: "A" }, { id: 8, type: "B" }, target],
+    links: { 900: { id: 900, origin_id: 8, origin_slot: 0, target_id: 9, target_slot: 0 } },
+  });
+  const nodeErrors = { 9: { errors: [{ extra_info: { input_name: "select", linked_node: [7, 0] } }] } };
+  assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
 });
 
 // ── the OTHER consumer: the turn-start banner ──────────────────────────────
