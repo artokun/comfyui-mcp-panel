@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_connect no longer overwrites an unrelated link (#2108). A link id is minted as
+  `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
+  whose counter sits below an id it already holds had a bystander's record silently
+  overwritten, reading as "that wire moved onto the new link". Every path that mints a
+  link now raises the counter above the ids actually present first; it only ever moves
+  up, so a well-formed graph is untouched. An API/prompt graph carries no `last_link_id`
+  at all, which is one way to arrive in that state.
+
 ## [0.15.159] - 2026-09-02
 
 ### Fixed

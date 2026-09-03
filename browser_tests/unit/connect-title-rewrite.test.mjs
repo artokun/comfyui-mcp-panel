@@ -30,6 +30,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { ensureLinkIdHeadroom } from "../../web/js/lib/link-id-headroom.js";
 
 import {
   isLinkPersisted,
@@ -160,6 +161,7 @@ function autoMatchSlots(origin, target, from_output, to_input) {
  */
 function buildConnect(graph, titleDeps = {}) {
   const deps = {
+    ensureLinkIdHeadroom,
     getGraphCtx: () => ({ graph, canvas: {}, app: {}, rootGraph: graph, LG: {} }),
     resolveNode,
     resolveSlot,
@@ -484,6 +486,7 @@ function buildAddNode({ renameOnCreate = null } = {}) {
   };
 
   const deps = {
+    ensureLinkIdHeadroom,
     captureGraphMutationContext: () => context,
     revalidateGraphMutationContext: () => context,
     getGraphCtx: () => context,

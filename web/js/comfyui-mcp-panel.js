@@ -613,6 +613,7 @@ import {
   unresolvedWildcardPairReason,
   isWildcardSlotType,
 } from "./lib/connect-match.js";
+import { ensureLinkIdHeadroom } from "./lib/link-id-headroom.js";
 import {
   snapshotInputSlotLinks,
   snapshotInputSlotNames,
@@ -10586,6 +10587,13 @@ function promoteWidgetByLink(subgraphNode, sourceNode, sourceWidget) {
   if (!subgraph || typeof subgraph.addInput !== "function") {
     throw new Error("link-only promotion unavailable on this frontend (missing subgraph.addInput)");
   }
+  // #2108 — this function also mints a link, in the SUBGRAPH's own store rather
+  // than the parent's. Its counter is raised by the CALLER, not here: the
+  // promote-widget tests slice this function out of the bundle and rebuild it
+  // with `new Function`, where a module-scope import is not in scope, so a call
+  // here fails as `ensureLinkIdHeadroom is not defined`. Guarding at the call
+  // site keeps the guard unconditional in production instead of making it
+  // optional to satisfy a harness.
 
   const source = { sourceNodeId: String(sourceNode.id), sourceWidgetName: sourceWidget.name };
   if (findPromotedHostInput(subgraphNode, source)) return { changed: false };
@@ -17133,6 +17141,12 @@ const GRAPH_TOOL_EXECUTORS = {
 
   graph_connect({ from_node_id, from_output, to_node_id, to_input, auto_match }) {
     const { graph } = getGraphCtx();
+    // #2108 — a link id is minted as `lastLinkId + 1` and stored with
+    // `_links.set(id, link)`, which REPLACES. A counter sitting below an id the
+    // graph already holds therefore overwrites a bystander's record, and the
+    // wire reads as having moved onto this connection. Raise the counter first;
+    // it only ever moves up, so a well-formed graph is untouched.
+    ensureLinkIdHeadroom(graph);
 
     // Rail tolerance: when an endpoint is a subgraph boundary rail (by real id
     // -10/-20 or alias "input"/"output"/..), route to the EXISTING-slot I/O
@@ -24823,6 +24837,12 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_expose_subgraph_output({ from_node_id, from_output, name }) {
     const { graph, canvas } = getGraphCtx();
     const subgraph = graph;
+    // #2108 — a link id is minted as `lastLinkId + 1` and stored with
+    // `_links.set(id, link)`, which REPLACES. A counter sitting below an id the
+    // graph already holds therefore overwrites a bystander's record, and the
+    // wire reads as having moved onto this connection. Raise the counter first;
+    // it only ever moves up, so a well-formed graph is untouched.
+    ensureLinkIdHeadroom(graph);
     if (typeof subgraph.addOutput !== "function" || !subgraph.outputNode) {
       throw new Error(
         "graph_expose_subgraph_output must be run INSIDE a subgraph (no subgraph.addOutput on the active graph)",
@@ -24927,6 +24947,12 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_expose_subgraph_input({ to_node_id, to_input, name }) {
     const { graph, canvas } = getGraphCtx();
     const subgraph = graph;
+    // #2108 — a link id is minted as `lastLinkId + 1` and stored with
+    // `_links.set(id, link)`, which REPLACES. A counter sitting below an id the
+    // graph already holds therefore overwrites a bystander's record, and the
+    // wire reads as having moved onto this connection. Raise the counter first;
+    // it only ever moves up, so a well-formed graph is untouched.
+    ensureLinkIdHeadroom(graph);
     if (typeof subgraph.addInput !== "function" || !subgraph.inputNode) {
       throw new Error(
         "graph_expose_subgraph_input must be run INSIDE a subgraph (no subgraph.addInput on the active graph)",
@@ -27123,6 +27149,11 @@ const GRAPH_TOOL_EXECUTORS = {
         try {
           let changed = false;
           for (const p of parents) {
+            // #2108 — promoteWidgetByLink allocates a link in p.subgraph's own
+            // store, which keeps its own counter and can be stale independently
+            // of the parent's. Raised here rather than inside that function: see
+            // the note there.
+            if (!demote) ensureLinkIdHeadroom(p?.subgraph);
             const result = demote ? demoteWidgetByLink(p, source) : promoteWidgetByLink(p, node, w);
             changed = changed || result.changed;
           }

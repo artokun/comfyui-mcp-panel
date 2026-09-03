@@ -31,6 +31,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { ensureLinkIdHeadroom } from "../../web/js/lib/link-id-headroom.js";
 
 import {
   isLinkPersisted,
@@ -114,6 +115,7 @@ const uniqueSubgraphInputName = (_g, base) => base;
 
 function buildConnect(graph, overrides = {}) {
   const deps = {
+    ensureLinkIdHeadroom,
     getGraphCtx: () => ({ graph, canvas: {}, app: {}, rootGraph: graph, LG: {} }),
     resolveNode,
     resolveSlot,

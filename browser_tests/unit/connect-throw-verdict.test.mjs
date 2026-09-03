@@ -31,6 +31,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { ensureLinkIdHeadroom } from "../../web/js/lib/link-id-headroom.js";
 
 import {
   isLinkPersisted,
@@ -154,6 +155,7 @@ function buildExecutors(graph, canvas = {}) {
     "loopbackRefusalReason",
     "unresolvedWildcardPairReason",
     "isWildcardSlotType",
+    "ensureLinkIdHeadroom",
     "uniqueSubgraphOutputName",
     "uniqueSubgraphInputName",
     "isLinkPersisted",
@@ -204,6 +206,7 @@ return GRAPH_TOOL_EXECUTORS;`,
     loopbackRefusalReason,
     unresolvedWildcardPairReason,
     isWildcardSlotType,
+    ensureLinkIdHeadroom,
     uniqueSubgraphOutputName,
     uniqueSubgraphInputName,
     isLinkPersisted,
