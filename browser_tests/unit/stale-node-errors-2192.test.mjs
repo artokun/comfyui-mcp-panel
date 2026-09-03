@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 
 import { pruneContradictedNodeErrors } from "../../web/js/lib/asset-staleness.js";
 import { runProductionGraphGetErrors } from "./_graph-get-errors-harness.mjs";
+import { runProductionValidationBanner } from "./_validation-banner-harness.mjs";
 
 const PANEL_JS = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 
@@ -169,6 +170,51 @@ test("#2192: a disclosure list cut at the cap says so (#809)", async () => {
   assert.equal(typeof result.stale_node_errors_truncation_hint, "string");
 });
 
+// ── the OTHER consumer: the turn-start banner ──────────────────────────────
+//
+// `validationBanner` reads the same map and injects it into the agent's turn asserting
+// the user "is seeing these RIGHT NOW". A fix that corrected only panel_get_errors would
+// leave the stale claim on the louder surface.
+
+test("#2192: the turn-start banner does not claim the repaired link is on screen", async () => {
+  const { rootGraph } = reporterGraphs();
+  const banner = await runProductionValidationBanner({
+    rootGraph,
+    lastNodeErrors: { "249:252": { class_type: "ImpactSwitch", errors: [SELECT_MISMATCH] } },
+  });
+  assert.equal(banner, "", "a repaired graph injects nothing");
+});
+
+test("#2192: the banner still fires for the STILL-BROKEN wire", async () => {
+  const { rootGraph } = reporterGraphs({ originId: "265" });
+  const banner = await runProductionValidationBanner({
+    rootGraph,
+    lastNodeErrors: { "249:252": { class_type: "ImpactSwitch", errors: [SELECT_MISMATCH] } },
+  });
+  assert.match(banner, /GRAPH VALIDATION ERRORS/);
+  assert.match(banner, /received_type\(IMAGE\) mismatch input_type\(INT\)/);
+});
+
+test("#2192: NO root graph is not evidence — the banner reports every error unchanged", async () => {
+  // validationBanner's `getGraphCtx()` probe is try/catch-wrapped and yields null when
+  // the binding is unresolvable. Reading that as "none of these nodes exist" would drop
+  // the whole map on a real code path; absence of evidence is not disproof.
+  const banner = await runProductionValidationBanner({
+    rootGraph: null,
+    lastNodeErrors: { 5: { class_type: "KSampler", errors: [{ message: "boom" }] } },
+  });
+  assert.match(banner, /node 5 \(KSampler\): boom/);
+});
+
+test("#2192: pruneContradictedNodeErrors fails open on a nullish graph", () => {
+  const nodeErrors = { 5: { class_type: "KSampler", errors: [SELECT_MISMATCH] } };
+  for (const graph of [null, undefined, 0, ""]) {
+    const out = pruneContradictedNodeErrors(graph, nodeErrors);
+    assert.deepEqual(out.nodeErrors, nodeErrors, `nullish graph ${String(graph)} must not drop anything`);
+    assert.equal(out.dropped.length, 0);
+  }
+});
+
 // ── the classifier: what it drops, and everything it refuses to ────────────────
 
 test("#2192: an entry naming a node that is not on the graph at all is dropped", () => {
@@ -276,6 +322,18 @@ test("#2192 wiring: graph_get_errors prunes the map it reports, not a copy besid
     "the raw union must not be bound as `nodeErrors` anywhere",
   );
   assert.match(src, /stale_node_errors: contradictedNodeErrors\.slice\(0, MAX_STATE_NODES\)/);
+  // BOTH consumers of the map, not just the one the issue names. A green helper test
+  // proves nothing about a call path that never calls it.
+  assert.equal(
+    (src.match(/pruneContradictedNodeErrors\(/g) ?? []).length,
+    2,
+    "graph_get_errors AND validationBanner must each prune",
+  );
+  assert.match(
+    src,
+    /nodeErrors = pruneContradictedNodeErrors\(postProbeRootGraph, nodeErrors\)\.nodeErrors;/,
+    "the banner must prune against the root graph its own binding guard just cleared",
+  );
   // The cut must be reported with the REAL total, not the shown count — a hint that
   // says "50 of 50" is the silent-cut defect wearing a disclosure.
   assert.match(

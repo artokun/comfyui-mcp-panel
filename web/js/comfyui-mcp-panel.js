@@ -12510,6 +12510,23 @@ async function validationBanner() {
   } catch {
     bannerStalePlaceholders = [];
   }
+  // #2192 — the SAME correlation graph_get_errors now runs, for the same reason and
+  // with more at stake: this banner asserts the user "is seeing these RIGHT NOW", so a
+  // rejection whose link has since been repaired makes the panel state something about
+  // the user's screen that is not true. `app.lastNodeErrors` is only replaced on the
+  // NEXT queue attempt, so nothing about repairing the graph clears it.
+  //
+  // Placed after the binding guard above, on the root graph that guard just proved is
+  // still the one this read started against — correlating against a graph that changed
+  // mid-read is how a live error would get dropped. Pruning HERE (not at the top, where
+  // nodeErrors is read) also puts the corrected map inside `missing.any`'s clean check
+  // and inside `sig`, so repairing the link both stops the banner and counts as a change
+  // — matching what the missing-asset entries in that signature already do.
+  try {
+    nodeErrors = pruneContradictedNodeErrors(postProbeRootGraph, nodeErrors).nodeErrors;
+  } catch {
+    /* a banner must never throw; an unpruned map is the safe direction */
+  }
   missing.any = !!(
     missing.models.length ||
     missing.media.length ||

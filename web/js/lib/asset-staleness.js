@@ -453,6 +453,12 @@ export function pruneContradictedNodeErrors(rootGraph, nodeErrors) {
   if (!nodeErrors || typeof nodeErrors !== "object" || Array.isArray(nodeErrors)) {
     return { nodeErrors: nodeErrors ?? null, dropped };
   }
+  // NO graph is not evidence about any node — it is the absence of evidence, and check
+  // (1) would read it as "none of these nodes exist" and drop the entire map. Callers
+  // reach here with a null root legitimately: validationBanner's `getGraphCtx()` probe
+  // is wrapped in try/catch and yields null when the binding is unresolvable. Caught by
+  // running the shipped banner rather than by reading it.
+  if (!rootGraph) return { nodeErrors, dropped };
   const kept = {};
   for (const [id, entry] of Object.entries(nodeErrors)) {
     let verdict = null;
