@@ -562,6 +562,34 @@ test("panel#1283 a refusal on an ABORTED restore names what aborted it", () => {
   assert.match(msg, /carries NO fence refresh/, "the recovery #702 added must still ride along");
 });
 
+test("#2194 ImpactSwitch findInputSlot defaults do not dead-end the rebind path", () => {
+  const msg = describeOpenRebindOutcome(
+    resolveOpenRebindVerdict({
+      instanceStillTarget: true,
+      markerMatches: true,
+      identityMatches: true,
+      contentMatches: false,
+    }),
+    {
+      targetLabel: "Ultimate Illustrious SDXL Detailer.json",
+      contentComparable: true,
+      contentSurfaces: ["nodes"],
+      contentNodeDifference: differing(["properties", "widgets_values", "widgets_values_named"]),
+      contentLoadRanToCompletion: false,
+      contentRestoreFailures: [
+        { id: 436, type: "ImpactSwitch", error: "t.findInputSlot is not a function" },
+      ],
+    },
+  );
+  assert.match(msg, /identity is proven/);
+  assert.match(msg, /ImpactSwitch/);
+  assert.match(msg, /CONSTRUCTION DEFAULTS/);
+  assert.match(msg, /persist\/rebind/);
+  assert.match(msg, /fail closed/);
+  assert.doesNotMatch(msg, /Do NOT save from here/);
+  assert.doesNotMatch(msg, /then open again/);
+});
+
 test("panel#1283 an aborted restore whose difference is only COSMETIC still refuses, and says so", () => {
   // The dangerous combination: `pos` moved (cosmetic) AND a node threw. #1623's reassurance
   // would have fired — "you are on the right workflow and there is no missing work to redo" —
