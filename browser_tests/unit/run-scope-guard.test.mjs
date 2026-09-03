@@ -1668,7 +1668,7 @@ test("#556 r6: an attributed post whose fetch THROWS is a dispatch FAILURE — n
   assert.match(guard.state.failed, /connection reset/);
   // #2203 — empty well-formed queue+history after the throw is a confirmed miss.
   assert.match(guard.state.failed, /NOT found in the ComfyUI/);
-  assert.match(guard.state.failed, /safe to retry/);
+  assert.match(guard.state.failed, /retry can still duplicate it/);
   assert.equal(guard.state.indeterminate, 0);
   assert.equal(captured, null, "no prompt_id claimed");
 });
@@ -2593,7 +2593,12 @@ test("#630 gate r7 P0-3: a SUCCESSFUL cancel still keeps the sentinel — removi
   }
 });
 
-test("#2203 the confirmed-miss message names a safe retry, not an unknown queue", () => {
+test("#2203 the confirmed-miss message states the BOUND, not a safe retry", () => {
+  // A bounded sequence of empty reads cannot prove a request will not be accepted
+  // AFTER the last one -- ComfyUI may still be processing it. The old wording said
+  // "safe to retry", which is a promise this evidence cannot make; it now names the
+  // miss, says plainly that the observation is bounded, and leaves the caller to
+  // check the queue when a duplicate would be expensive (review of #2215).
   const msg = scopeDispatchAbsentError({
     toNodeId: 20,
     detail: "the /prompt request itself threw (Failed to fetch)",
@@ -2602,7 +2607,9 @@ test("#2203 the confirmed-miss message names a safe retry, not an unknown queue"
   });
   assert.match(msg, /Failed to fetch/);
   assert.match(msg, /NOT found in the ComfyUI/);
-  assert.match(msg, /safe to retry/);
+  assert.match(msg, /BOUNDED observation/);
+  assert.match(msg, /retry can still duplicate it/);
+  assert.doesNotMatch(msg, /is safe to retry/);
   assert.doesNotMatch(msg, /CANNOT be determined from here/);
   assert.match(msg, /no full-graph dispatch occurred/);
 });
@@ -3831,7 +3838,7 @@ test("#556 r6 integration: batch=1 whose /prompt fetch THROWS ⇒ 'failed' outco
     assert.equal(result.verified, 0);
     assert.match(result.error, /connection reset/);
     assert.match(result.error, /NOT found in the ComfyUI/, "#2203: empty queue/history after the throw is a confirmed miss");
-    assert.match(result.error, /safe to retry/);
+    assert.match(result.error, /retry can still duplicate it/);
     assert.deepEqual(ids, [], "no prompt_id claimed");
     assert.notEqual(apiTarget.fetchApi, prev, "batch unaccounted ⇒ sentinel stays (the frontend may keep looping)");
     // A late CORRUPTED post of this run is still refused by the sentinel.

@@ -192,7 +192,15 @@ export function matchDispatchPromptIds({ queueJson, historyJson, dispatchId, que
 
   if (byId.length === 1) return { status: "recovered", promptId: byId[0], source: "dispatch_id" };
   if (byId.length > 1) return { status: "unknown", reason: "multiple_dispatch_id_matches" };
-  if (byMark.length === 1) return { status: "recovered", promptId: byMark[0], source: "queue_mark" };
+  // The queue mark is NOT a per-dispatch receipt. Every prompt in a batch shares
+  // it, and the counter restarts on page reload while ComfyUI's history persists --
+  // so a single match can name an earlier batch item or a row from a previous
+  // session, reporting a stale prompt_id AND counting this failed post as observed.
+  // A unique match is still worth reporting as corroboration, but it cannot be a
+  // receipt, so it stays unknown until the marker is unique per request.
+  if (byMark.length === 1) {
+    return { status: "unknown", reason: "queue_mark_is_not_a_receipt", markMatch: byMark[0] };
+  }
   if (byMark.length > 1) return { status: "unknown", reason: "multiple_queue_mark_matches" };
   if (queueOk && historyOk) return { status: "absent" };
   return { status: "unknown", reason: "unreadable_queue_or_history" };
@@ -202,6 +210,13 @@ async function readJson(fetchApi, route) {
   try {
     const res = await fetchApi(route);
     if (!res) return undefined;
+    // A FAILED endpoint is not evidence of an empty one. A 500 /history whose body
+    // happens to be JSON (`{error: ...}`) used to read as a valid, empty history
+    // map -- which, with an empty queue, produced "absent" and authorized a retry
+    // on the strength of the server being broken. Only a 2xx counts; anything else
+    // leaves the verdict unknown.
+    if (typeof res.ok === "boolean" && !res.ok) return undefined;
+    if (typeof res.status === "number" && (res.status < 200 || res.status >= 300)) return undefined;
     if (typeof res.json === "function") return await res.json();
     // Test doubles (and some frontend wrappers) only expose clone().json(),
     // matching classifyRunResponse's read of the /prompt body.

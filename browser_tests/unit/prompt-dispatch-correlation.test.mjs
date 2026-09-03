@@ -88,14 +88,35 @@ test("#2203 matchDispatchPromptIds recovers a unique history entry by dispatch i
   assert.equal(found.source, "dispatch_id");
 });
 
-test("#2203 matchDispatchPromptIds falls back to a unique non-zero queue mark", () => {
+test("#2203 a unique queue mark is corroboration, NOT a receipt", () => {
+  // The mark is shared by every prompt in a batch, and the counter restarts on a
+  // page reload while ComfyUI history persists. So a single match can name an
+  // earlier batch item, or a row from a previous session -- reporting a stale
+  // prompt_id AND counting this failed post as observed. It is reported as a
+  // match for the humans, but the VERDICT stays unknown until the marker is
+  // unique per request (review of #2215).
   const found = matchDispatchPromptIds({
     queueJson: { queue_running: [], queue_pending: [[1073741822, "mark-id", {}, {}, []]] },
     historyJson: {},
     dispatchId: "cmcp-d-missing",
     queueMark: 1073741822,
   });
-  assert.deepEqual(found, { status: "recovered", promptId: "mark-id", source: "queue_mark" });
+  assert.equal(found.status, "unknown");
+  assert.equal(found.reason, "queue_mark_is_not_a_receipt");
+  assert.equal(found.markMatch, "mark-id");
+});
+
+test("#2203 a FAILED queue/history read is not evidence of an empty one", () => {
+  // A 500 whose body happens to be JSON used to read as a valid, empty map --
+  // which with an empty queue produced "absent" and authorized a retry on the
+  // strength of the server being broken (review of #2215).
+  const found = matchDispatchPromptIds({
+    queueJson: undefined,
+    historyJson: {},
+    dispatchId: "cmcp-d-missing",
+    queueMark: 1073741822,
+  });
+  assert.equal(found.status, "unknown");
 });
 
 test("#2203 matchDispatchPromptIds never treats number 0 as a unique mark", () => {

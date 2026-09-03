@@ -1582,8 +1582,11 @@ export function scopeDispatchAbsentError({ toNodeId, detail, verified, batch }) 
     `run-to-node scope for node ${toNodeId}: a verified-scoped /prompt request ` +
     `FAILED to complete — ${detail}. ${verified} of ${batch} batch prompts were ` +
     `confirmed queued before the failure. This one was NOT found in the ComfyUI ` +
-    `queue or history after the request left, so it is treated as not queued and ` +
-    `is safe to retry. What IS certain: the request carried the run-to-node scope, ` +
+    `queue or history in the reads that followed. That is the strongest evidence ` +
+    `available without a server-side receipt, but it is a BOUNDED observation: a ` +
+    `request ComfyUI is still processing could appear after those reads, so a ` +
+    `retry can still duplicate it. Check the queue first if the render is ` +
+    `expensive. What IS certain: the request carried the run-to-node scope, ` +
     `so no full-graph dispatch occurred (#2203).`
   );
 }
@@ -1761,6 +1764,7 @@ export function createRunFetchInterceptor({
         if (res) {
           let captured = false;
           let rejected = false;
+          let missingReceipt = false;
           await captureRunResponse(res, {
             onRejection: (r) => {
               rejected = true;
@@ -1771,9 +1775,20 @@ export function createRunFetchInterceptor({
               onPromptId?.(p);
             },
             onAcceptedNodeErrors,
-            onMissingPromptId: () => state.missingPromptIds++,
+            // Do NOT bank the increment here: recovery has not run yet. A receipt
+            // that is missing from the RESPONSE but recovered from the queue is an
+            // acceptance, and leaving the count raised reported it as
+            // `queued_unknown` instead. The unscoped branch below already ordered
+            // this correctly; this one did not.
+            onMissingPromptId: () => {
+              missingReceipt = true;
+            },
           });
-          if (!captured && !rejected) await recoverLostReceipt();
+          if (!captured && !rejected) {
+            const recovered = await recoverLostReceipt();
+            if (recovered) missingReceipt = false;
+          }
+          if (missingReceipt) state.missingPromptIds++;
         } else {
           const recovered = await recoverLostReceipt();
           if (!recovered) state.missingPromptIds++;
