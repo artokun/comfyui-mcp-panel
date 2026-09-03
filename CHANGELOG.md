@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- fetch_comfyui_read now admits the closed `models` and `models/<folder>` inventory operations so list_local_models can relay a reachable remote ComfyUI through the live panel instead of dying on the diagnostics-only allowlist (comfyui-mcp#2511)
+
 ## [0.15.159] - 2026-09-02
 
 ### Fixed
