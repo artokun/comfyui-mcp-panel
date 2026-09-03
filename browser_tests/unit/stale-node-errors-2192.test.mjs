@@ -379,6 +379,74 @@ test("#2192 r4: an error with NO type is not judged", () => {
   assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
 });
 
+// ── codex gate round 5: the prompt is COMPILED; the graph is not ─────────────
+//
+// The serializer skips `isVirtualNode || mode === NEVER || mode === BYPASS` and attributes
+// the link to whatever is upstream, so an input fed through any of those has a
+// `linked_node` that CANNOT equal its immediate origin_id. Reading that as a repair drops
+// live errors on any graph with a reroute in it.
+
+/** target.select fed by `via` (id 7), which is upstream-fed by the real source 5. */
+function indirectionGraph(via) {
+  const target = { id: 9, type: "Sw", comfyClass: "Sw", inputs: [{ name: "select", link: 900 }] };
+  return {
+    graph: makeGraph({
+      id: "root",
+      nodes: [{ id: 5, type: "RealSource" }, via, target],
+      links: { 900: { id: 900, origin_id: 7, origin_slot: 0, target_id: 9, target_slot: 0 } },
+    }),
+    nodeErrors: {
+      9: {
+        class_type: "Sw",
+        errors: [
+          {
+            type: "return_type_mismatch",
+            details: "select, received_type(IMAGE) mismatch input_type(INT)",
+            extra_info: { input_name: "select", linked_node: [5, 0] },
+          },
+        ],
+      },
+    },
+  };
+}
+
+for (const [label, via] of [
+  ["a BYPASSED node (mode 4)", { id: 7, type: "Passthrough", mode: 4 }],
+  ["a MUTED node (mode 2)", { id: 7, type: "Passthrough", mode: 2 }],
+  ["a virtual Reroute", { id: 7, type: "Reroute", isVirtualNode: true }],
+  ["a subgraph container", { id: 7, type: "SubgraphNode", isVirtualNode: true, subgraph: {} }],
+]) {
+  test(`#2192 r5: an error whose source is reached through ${label} is NOT dropped`, async () => {
+    const { graph, nodeErrors } = indirectionGraph(via);
+    const result = await runProductionGraphGetErrors({ graph, rootGraph: graph, lastNodeErrors: nodeErrors });
+    assert.deepEqual(result.node_errors, nodeErrors, "the compiler resolves through it — this is not a repair");
+    assert.equal(result.errored_count, 1);
+    assert.equal(result.note, undefined);
+  });
+}
+
+test("#2192 r5: an unresolvable source node keeps the error", () => {
+  const target = { id: 9, type: "Sw", inputs: [{ name: "select", link: 900 }] };
+  const graph = makeGraph({
+    id: "root",
+    nodes: [target], // node 8 is referenced by the link but absent from the graph
+    links: { 900: { id: 900, origin_id: 8, origin_slot: 0, target_id: 9, target_slot: 0 } },
+  });
+  const nodeErrors = {
+    9: { errors: [{ type: "return_type_mismatch", extra_info: { input_name: "select", linked_node: [5, 0] } }] },
+  };
+  assert.deepEqual(pruneContradictedNodeErrors(graph, nodeErrors).nodeErrors, nodeErrors);
+});
+
+test("#2192 r5: an ORDINARY source node is still judged — the fix survives the guard", () => {
+  // mode 0 and mode-absent are both ordinary; the reporter's repair is exactly this shape.
+  for (const mode of [0, undefined]) {
+    const { graph, nodeErrors } = indirectionGraph({ id: 7, type: "RealPassthrough", mode });
+    const out = pruneContradictedNodeErrors(graph, nodeErrors);
+    assert.equal(out.nodeErrors, null, `mode ${String(mode)} is a real source, so [5,0] is falsified`);
+  }
+});
+
 // ── the OTHER consumer: the turn-start banner ──────────────────────────────
 //
 // `validationBanner` reads the same map and injects it into the agent's turn asserting

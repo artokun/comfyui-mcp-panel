@@ -13,6 +13,7 @@
  */
 
 import { authoritativeComboValues, parseAnnotatedFilepath } from "./input-asset.js";
+import { isFrontendVirtualNode } from "./frontend-virtual-nodes.js";
 
 // mcp#1940 — `authoritativeComboValues` moved to the LEAF module input-asset.js so
 // `serverDeclaresEmptyComboOptions` (which lives there) can share the one canonical
@@ -388,7 +389,38 @@ function liveInputOrigin(node, inputName) {
   const originId = link.origin_id ?? link[1];
   if (originId == null) return undefined;
   const originSlot = link.origin_slot ?? link[2];
-  return { id: String(originId), slot: Number.isInteger(originSlot) ? originSlot : null };
+  return {
+    id: String(originId),
+    slot: Number.isInteger(originSlot) ? originSlot : null,
+    // The source NODE, so the caller can ask whether the prompt would even name it.
+    node: node?.graph?.getNodeById?.(originId) ?? null,
+  };
+}
+
+/**
+ * True when this live node is one the prompt compiler would name as a link source.
+ *
+ * The panel compares a COMPILED artifact (the prompt's `linked_node`) against the RAW
+ * graph, and those two disagree wherever the compiler resolves *through* a node. The
+ * frontend's serializer states the rule exactly (quoted in frontend-virtual-nodes.js):
+ *
+ *     if (e.isVirtualNode || e.mode === NEVER || e.mode === BYPASS) continue;
+ *
+ * so a Reroute, a Get/Set bus node, a subgraph container (also `isVirtualNode`), a MUTED
+ * node or a BYPASSED one never appears in the prompt — the link is attributed to whatever
+ * is upstream of it instead. An input fed through any of those has a `linked_node` that
+ * CANNOT equal its immediate `origin_id`, and reading that difference as a repair drops a
+ * live error on any graph using a reroute (codex gate round 5).
+ *
+ * Positive proof only: an unresolvable origin node answers false, i.e. keep the error.
+ */
+function originIsNamedInPrompt(originNode) {
+  if (!originNode || typeof originNode !== "object") return false;
+  if (isFrontendVirtualNode(originNode)) return false;
+  const mode = originNode.mode;
+  // 2 = NEVER (mute), 4 = BYPASS. `undefined`/0 is an ordinary always-execute node.
+  if (mode === 2 || mode === 4) return false;
+  return true;
 }
 
 /**
@@ -443,6 +475,10 @@ function nodeErrorLinkClaimFalsified(node, errorNodeId, error) {
   const live = liveInputOrigin(node, inputName);
   if (live === undefined) return false;
   if (live === null) return true; // the input exists and nothing feeds it now
+  // The claim is about the COMPILED prompt. Only compare when the live source is a node
+  // the compiler would actually name — otherwise the difference is indirection through a
+  // reroute / subgraph container / muted / bypassed node, not a repair.
+  if (!originIsNamedInPrompt(live.node)) return false;
   if (live.id !== there.local) return true;
   // Same source node: the slot is the remainder of the claim. Judge it only when BOTH
   // sides state one — an absent slot on either side is unreadable, not a disagreement.
