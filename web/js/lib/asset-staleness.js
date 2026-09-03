@@ -353,6 +353,156 @@ export function combineNodeErrorMaps(nodeErrorsMaps) {
   return Object.keys(combined).length ? combined : null;
 }
 
+/** Split a locator into its containing scope and its graph-local id. */
+function splitLocatorScope(id) {
+  const raw = String(id ?? "");
+  const cut = raw.lastIndexOf(":");
+  return cut === -1 ? { scope: "", local: raw } : { scope: raw.slice(0, cut), local: raw.slice(cut + 1) };
+}
+
+/** Read a link record out of a LiteGraph link store (Map in newer builds, object in older). */
+function lookupLink(links, linkId) {
+  if (links == null || linkId == null) return null;
+  return typeof links.get === "function" ? links.get(linkId) ?? null : links[linkId] ?? null;
+}
+
+/**
+ * The live source id feeding `inputName` on `node`, or `undefined` when the graph
+ * cannot answer (no such input, no readable link store). `null` means the input is
+ * genuinely unconnected — a real answer, distinct from "cannot tell".
+ */
+function liveInputOriginId(node, inputName) {
+  const inputs = Array.isArray(node?.inputs) ? node.inputs : null;
+  if (!inputs) return undefined;
+  const input = inputs.find((i) => i?.name === inputName);
+  // A slot the live node does not have (renamed by a dynamic pack's position-based
+  // re-slotting, #1873) leaves the error unjudgeable — never falsified by absence.
+  if (!input) return undefined;
+  if (input.link == null) return null;
+  const links = node?.graph?.links;
+  if (links == null) return undefined;
+  const link = lookupLink(links, input.link);
+  if (link == null) return undefined;
+  const originId = link.origin_id ?? link[1];
+  return originId == null ? undefined : String(originId);
+}
+
+/**
+ * True when this validation error is a claim about ONE specific link that the live
+ * graph falsifies. ComfyUI's `return_type_mismatch` (execution.py `validate_inputs`)
+ * carries `extra_info.input_name` and `extra_info.linked_node = [nodeId, outputSlot]`
+ * — i.e. "input X is fed by node Y and Y's type is wrong". When X is now fed by a
+ * different node, or by nothing, that sentence is no longer true of this graph.
+ *
+ * Only decides on POSITIVE evidence. A missing/odd `extra_info`, an input the live
+ * node no longer exposes, an unreadable link store, or a `linked_node` in a different
+ * subgraph scope than the errored node (which the live inner graph cannot express as
+ * a plain origin id) all return false — the error is kept.
+ */
+function nodeErrorLinkClaimFalsified(node, errorNodeId, error) {
+  const extra = error?.extra_info;
+  if (!extra || typeof extra !== "object") return false;
+  const inputName = extra.input_name;
+  if (typeof inputName !== "string" || !inputName) return false;
+  const claimed = Array.isArray(extra.linked_node) ? extra.linked_node[0] : undefined;
+  if (claimed == null) return false;
+  // Compare inside ONE graph: the error's ids are the flattened prompt's, the live
+  // link's origin is local to the node's own (sub)graph. Same scope ⇒ same graph.
+  const here = splitLocatorScope(errorNodeId);
+  const there = splitLocatorScope(claimed);
+  if (there.scope !== here.scope) return false;
+  const liveOrigin = liveInputOriginId(node, inputName);
+  if (liveOrigin === undefined) return false;
+  return liveOrigin !== there.local;
+}
+
+/**
+ * Drop validation-map entries that the LIVE graph CONTRADICTS (#2192).
+ *
+ * `node_errors` is the raw union of `app.lastNodeErrors` and the execution-error
+ * store — a snapshot of the LAST queue rejection, which the frontend only replaces on
+ * the NEXT queue attempt. Every other source `graph_get_errors` reports is correlated
+ * against the live graph before it ships: missing assets through `isStaleAssetCandidate`
+ * (still-referenced + active-graph scope, #316), the runtime failure by node id AND
+ * class type (#1448) with scoped-locator resolution (#1685). The validation map never
+ * was, so a `return_type_mismatch` naming a link the user has since repaired is echoed
+ * verbatim forever. It does not even reach the per-node join, because its key is a
+ * SCOPED locator ("249:252") that never string-equals a visible node's own id — which
+ * is how `errored_count: 0` came to ship beside a populated, contradicting `node_errors`.
+ *
+ * Three checks, each needing POSITIVE evidence from the live graph:
+ *
+ *   1. the entry's RECOGNIZED locator resolves to no node in `rootGraph` — these stores
+ *      are not cleared on a workflow-tab switch, so it is another tab's node or a
+ *      deleted one (the #316 scope check, applied to validation errors);
+ *   2. it resolves, but the live node's type differs from the entry's `class_type` —
+ *      ComfyUI reuses ids across workflows (#1448, applied to validation errors);
+ *   3. per error, `nodeErrorLinkClaimFalsified` above. Sibling errors on the same entry
+ *      are untouched; an entry whose errors ALL falsify is removed.
+ *
+ * Nothing here expires an entry by age, by a save, or by a re-read — only by
+ * contradiction. Every unexpected shape, unresolvable locator or unreadable link fails
+ * OPEN (keeps the error), so a genuine rejection is never swallowed.
+ *
+ * Returns `{ nodeErrors, dropped }`. `nodeErrors` is null when nothing survives, so the
+ * caller's `clean` verdict and its note are computed on the CORRECTED map; `dropped`
+ * carries one record per removed entry for in-band disclosure.
+ */
+export function pruneContradictedNodeErrors(rootGraph, nodeErrors) {
+  const dropped = [];
+  if (!nodeErrors || typeof nodeErrors !== "object" || Array.isArray(nodeErrors)) {
+    return { nodeErrors: nodeErrors ?? null, dropped };
+  }
+  const kept = {};
+  for (const [id, entry] of Object.entries(nodeErrors)) {
+    let verdict = null;
+    try {
+      verdict = classifyContradictedNodeError(rootGraph, id, entry);
+    } catch {
+      verdict = null; // any throw ⇒ report the entry verbatim
+    }
+    if (!verdict) {
+      kept[id] = entry;
+      continue;
+    }
+    if (verdict.entry) kept[id] = verdict.entry;
+    dropped.push({
+      node_id: id,
+      ...(typeof entry?.class_type === "string" && entry.class_type
+        ? { class_type: entry.class_type }
+        : {}),
+      contradicted_by: verdict.reason,
+    });
+  }
+  return { nodeErrors: Object.keys(kept).length ? kept : null, dropped };
+}
+
+/**
+ * Null when the entry must be reported as-is; otherwise `{ reason, entry }` where
+ * `entry` is the surviving remnant (null when the whole entry goes). Split out so the
+ * three checks read in falsification order and each one's fail-open path is visible.
+ */
+function classifyContradictedNodeError(rootGraph, id, entry) {
+  if (locatorIsRecognized(id) === false) return null;
+  const node = findNodeByScopedId(rootGraph, id);
+  if (node == null) {
+    return { reason: `no node ${id} is on the active graph`, entry: null };
+  }
+  const claimedType = typeof entry?.class_type === "string" ? entry.class_type : "";
+  const liveType = typeof node?.type === "string" ? node.type : "";
+  if (claimedType && liveType && claimedType !== liveType) {
+    return { reason: `node ${id} is a ${liveType} now, not the ${claimedType} this error is about`, entry: null };
+  }
+  const errors = Array.isArray(entry?.errors) ? entry.errors : null;
+  if (!errors || !errors.length) return null;
+  const survivors = errors.filter((e) => !nodeErrorLinkClaimFalsified(node, id, e));
+  if (survivors.length === errors.length) return null;
+  const falsified = errors.filter((e) => nodeErrorLinkClaimFalsified(node, id, e));
+  const inputs = [...new Set(falsified.map((e) => e?.extra_info?.input_name))].join(", ");
+  const reason = `${inputs} on node ${id} is no longer fed by the node the error names`;
+  return { reason, entry: survivors.length ? { ...entry, errors: survivors } : null };
+}
+
 /**
  * Return visual LiteGraph red outlines that have no current source-confirmed
  * explanation. A saved workflow can retain `has_errors` from an older run even

@@ -228,6 +228,7 @@ import {
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
+  pruneContradictedNodeErrors,
   graphErrorsFindingCounts,
   graphErrorsResultIsClean,
   nodeRedFlagIsStale,
@@ -21375,7 +21376,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // These are independent live stores. The app map can be an empty object
     // after a reset while the execution store still retains the actual rejected
     // prompt, so never let nullish selection make an empty app map mask it.
-    const nodeErrors = combineNodeErrorMaps([comfy?.lastNodeErrors ?? null, storeNodeErrors]);
+    // #2192 — that union is a snapshot of the LAST queue rejection and the frontend
+    // only replaces it on the NEXT one, so a repaired link keeps being reported. Drop
+    // the entries the LIVE graph contradicts before anything downstream reads them —
+    // the per-node join, `clean`, the red-outline adjudication and the payload all
+    // have to agree, and the contradiction the reporter saw (`errored_count: 0` beside
+    // a populated `node_errors`) is exactly what happens when they do not.
+    const { nodeErrors, dropped: contradictedNodeErrors } = pruneContradictedNodeErrors(
+      rootGraph,
+      combineNodeErrorMaps([comfy?.lastNodeErrors ?? null, storeNodeErrors]),
+    );
     if (nodeErrors) {
       for (const [id, entry] of Object.entries(nodeErrors)) {
         for (const e of entry?.errors ?? []) {
@@ -21586,6 +21596,18 @@ const GRAPH_TOOL_EXECUTORS = {
       // current_inputs/current_outputs and huge traceback lines (41k+ tokens).
       last_execution_error: boundExecFailurePayload(execFailureDetail),
       node_errors: nodeErrors,
+      // #2192 — a removal is disclosed, never silent: the caller can see WHICH stale
+      // rejection was withheld and on what evidence, instead of wondering whether a
+      // real error went missing between two reads.
+      ...(contradictedNodeErrors.length
+        ? {
+            stale_node_errors: contradictedNodeErrors.slice(0, MAX_STATE_NODES),
+            stale_node_errors_note: tr(
+              "panel.these_validation_errors_from_the_last_queue",
+              "These validation errors from the last queue attempt name links the live graph no longer has, so they were dropped. The frontend only replaces that map on the next queue attempt.",
+            ),
+          }
+        : {}),
       ...(clean ? { note: tr("panel.no_errors_recorded_since_the_last_execution", "no errors recorded since the last execution start") } : {}),
     };
   },
