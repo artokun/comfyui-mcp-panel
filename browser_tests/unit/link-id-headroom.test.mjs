@@ -151,8 +151,25 @@ test("#2108 all four minting paths raise the counter", () => {
   // promoteWidgetByLink with `new Function`, where a module import is not in
   // scope. The import carries no paren, so this counts CALL sites only.
   const bundle = readFileSync(PANEL_JS, "utf8");
-  assert.equal((bundle.match(/ensureLinkIdHeadroom\(/g) ?? []).length, 4);
+  // AT LEAST four, not exactly four. An equality here fails the moment someone
+  // adds a FIFTH minting path and correctly guards it -- punishing the right
+  // behaviour -- while still passing if a guard moves off a real path onto an
+  // unrelated one, because the total is unchanged. A count is not an identity
+  // check, so each path is asserted in its OWN region below.
+  assert.ok((bundle.match(/ensureLinkIdHeadroom\(/g) ?? []).length >= 4);
   assert.ok(bundle.includes("ensureLinkIdHeadroom(p?.subgraph);"));
+
+  // The two expose paths allocate in the parent graph and are textually identical
+  // (`ensureLinkIdHeadroom(graph);`), so they can only be told apart by WHERE they
+  // sit. Each must carry a guard inside its own method body.
+  for (const method of ["graph_expose_subgraph_output({", "graph_expose_subgraph_input({"]) {
+    const at = bundle.indexOf(method);
+    assert.ok(at > -1, `${method} not found`);
+    const guard = bundle.indexOf("ensureLinkIdHeadroom(graph);", at);
+    assert.ok(guard > -1, `${method} has no headroom guard after it`);
+    // Inside THIS method, not merely somewhere later in the file.
+    assert.ok(guard - at < 2000, `${method}'s nearest guard is too far to be its own`);
+  }
 });
 
 test("#2108 the counter is raised BEFORE graph_connect touches the graph", () => {
