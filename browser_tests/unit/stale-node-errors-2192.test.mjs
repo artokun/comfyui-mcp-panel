@@ -368,13 +368,28 @@ test("#2192: pruneContradictedNodeErrors fails open on a nullish graph", () => {
 
 // ── the classifier: what it drops, and everything it refuses to ────────────────
 
-test("#2192: an entry naming a node that is not on the graph at all is dropped", () => {
+test("#2192: an entry naming a node that does not resolve is KEPT, not dropped", () => {
+  // Absence of a node is absence of evidence. Two separate review P1s came from reading
+  // "does not resolve" as "does not exist": a null root graph (a real validationBanner
+  // state) and a momentarily EMPTY graph (ComfyUI clears and repopulates `_nodes` while
+  // loading) both make every id unresolvable while the errors are perfectly live.
   const { rootGraph } = reporterGraphs();
-  const { nodeErrors, dropped } = pruneContradictedNodeErrors(rootGraph, {
-    777: { class_type: "KSampler", errors: [{ message: "boom" }] },
-  });
-  assert.equal(nodeErrors, null);
-  assert.match(dropped[0].contradicted_by, /no node 777 is on the active graph/);
+  const nodeErrors = { 777: { class_type: "KSampler", errors: [{ message: "boom" }] } };
+  const out = pruneContradictedNodeErrors(rootGraph, nodeErrors);
+  assert.deepEqual(out.nodeErrors, nodeErrors);
+  assert.equal(out.dropped.length, 0);
+});
+
+test("#2192: a momentarily EMPTY graph drops nothing (the mid-load state)", async () => {
+  const empty = makeGraph({ id: "root", nodes: [] });
+  const nodeErrors = { 5: { class_type: "KSampler", errors: [{ message: "ckpt not in list" }] } };
+
+  const result = await runProductionGraphGetErrors({ graph: empty, rootGraph: empty, lastNodeErrors: nodeErrors });
+  assert.deepEqual(result.node_errors, nodeErrors, "a load in flight is not a repaired graph");
+  assert.equal(result.stale_node_errors, undefined);
+
+  const banner = await runProductionValidationBanner({ rootGraph: empty, lastNodeErrors: nodeErrors });
+  assert.match(banner, /GRAPH VALIDATION ERRORS/, "the banner must not go silent mid-load");
 });
 
 test("#2192: an id ComfyUI reused for a different class is dropped (#1448, for validation)", () => {

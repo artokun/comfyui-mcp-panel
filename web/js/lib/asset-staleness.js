@@ -446,15 +446,15 @@ function nodeErrorLinkClaimFalsified(node, errorNodeId, error) {
  * SCOPED locator ("249:252") that never string-equals a visible node's own id — which
  * is how `errored_count: 0` came to ship beside a populated, contradicting `node_errors`.
  *
- * Three checks, each needing POSITIVE evidence from the live graph:
+ * TWO checks, both requiring a RESOLVED live node and POSITIVE contradicting evidence:
  *
- *   1. the entry's RECOGNIZED locator resolves to no node in `rootGraph` — these stores
- *      are not cleared on a workflow-tab switch, so it is another tab's node or a
- *      deleted one (the #316 scope check, applied to validation errors);
- *   2. it resolves, but the live node's type differs from the entry's `class_type` —
- *      ComfyUI reuses ids across workflows (#1448, applied to validation errors);
- *   3. per error, `nodeErrorLinkClaimFalsified` above. Sibling errors on the same entry
+ *   1. the live node's class is not the entry's `class_type` — ComfyUI reuses ids across
+ *      workflows (#1448, applied to validation errors);
+ *   2. per error, `nodeErrorLinkClaimFalsified` above. Sibling errors on the same entry
  *      are untouched; an entry whose errors ALL falsify is removed.
+ *
+ * An id that does NOT resolve is left alone — see the note on
+ * `classifyContradictedNodeError` for why that is load-bearing rather than lenient.
  *
  * Nothing here expires an entry by age, by a save, or by a re-read — only by
  * contradiction. Every unexpected shape, unresolvable locator or unreadable link fails
@@ -469,11 +469,9 @@ export function pruneContradictedNodeErrors(rootGraph, nodeErrors) {
   if (!nodeErrors || typeof nodeErrors !== "object" || Array.isArray(nodeErrors)) {
     return { nodeErrors: nodeErrors ?? null, dropped };
   }
-  // NO graph is not evidence about any node — it is the absence of evidence, and check
-  // (1) would read it as "none of these nodes exist" and drop the entire map. Callers
-  // reach here with a null root legitimately: validationBanner's `getGraphCtx()` probe
-  // is wrapped in try/catch and yields null when the binding is unresolvable. Caught by
-  // running the shipped banner rather than by reading it.
+  // Redundant since neither remaining check can fire without a resolved node, and kept
+  // deliberately: it states at the entry point that no graph means no verdict, so a
+  // future check that reads absence cannot be added without meeting this line first.
   if (!rootGraph) return { nodeErrors, dropped };
   const kept = {};
   for (const [id, entry] of Object.entries(nodeErrors)) {
@@ -542,15 +540,28 @@ export function pruneContradictedNodeErrorMaps(rootGraph, nodeErrorsMaps) {
 
 /**
  * Null when the entry must be reported as-is; otherwise `{ reason, entry }` where
- * `entry` is the surviving remnant (null when the whole entry goes). Split out so the
- * three checks read in falsification order and each one's fail-open path is visible.
+ * `entry` is the surviving remnant (null when the whole entry goes). Split out so both
+ * checks read in falsification order and each one's fail-open path is visible.
+ *
+ * NOTE ON WHAT IS DELIBERATELY *NOT* CHECKED. An earlier revision also dropped an entry
+ * whose recognized locator resolved to NO node, on the #316 reasoning that these stores
+ * survive a workflow-tab switch. That check produced two separate P1s in review, both the
+ * same mistake: a node that does not resolve is not a node that does not EXIST. It fails
+ * to resolve when the root graph is null (validationBanner's `getGraphCtx()` probe is
+ * try/catch-wrapped and yields null by design), and equally when the graph is momentarily
+ * EMPTY — ComfyUI clears and repopulates `_nodes` while loading a workflow, so a real
+ * rejection would be dropped and the banner would go silent mid-load.
+ *
+ * The check is gone rather than hardened, because no amount of hardening changes its
+ * shape: it is the only one that reads ABSENCE as evidence, and it was never what this
+ * issue needed — a stale cross-tab entry is over-reporting, which is the safe direction
+ * and the pre-existing behaviour. Both surviving checks require a RESOLVED live node and
+ * positive contradicting data, so an unresolvable id now simply leaves its entry alone.
  */
 function classifyContradictedNodeError(rootGraph, id, entry) {
-  if (locatorIsRecognized(id) === false) return null;
   const node = findNodeByScopedId(rootGraph, id);
-  if (node == null) {
-    return { reason: `no node ${id} is on the active graph`, entry: null };
-  }
+  // Absence of a node is absence of evidence — never a verdict. See the note above.
+  if (node == null) return null;
   // `class_type` comes from `node.comfyClass`, NOT `node.type` — the frontend's prompt
   // compiler writes `class_type: e.comfyClass` (verified in the 1.49.6 bundle), and the
   // two have genuinely different sources at registration: `registerNodeType(n.id, i)`
