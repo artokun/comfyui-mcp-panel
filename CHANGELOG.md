@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_run recovers the ComfyUI prompt_id after a post-dispatch `/prompt` fetch failure by reconciling a client-generated dispatch id against queue/history, and treats a confirmed miss as safe to retry (#2203)
+
 ## [0.15.162] - 2026-09-03
 
 ### Fixed

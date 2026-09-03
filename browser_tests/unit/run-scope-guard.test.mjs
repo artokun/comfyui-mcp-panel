@@ -34,6 +34,7 @@ import {
   scopeUnverifiedError,
   scopeUnattributableError,
   scopeDispatchError,
+  scopeDispatchAbsentError,
   createRunFetchInterceptor,
   createScopedRunGuard,
   describeObserved,
@@ -46,6 +47,7 @@ import {
   withScopedQueueItemTargets,
 } from "../../web/js/lib/run-scope-guard.js";
 import { resolveRunToNodeTarget } from "../../web/js/lib/subgraph-scope.js";
+import { DISPATCH_ID_FIELD } from "../../web/js/lib/prompt-dispatch-correlation.js";
 
 // A Response double with the surface the guard + frontend rejection path use.
 function jsonResponse(status, obj) {
@@ -58,12 +60,51 @@ function jsonResponse(status, obj) {
   };
 }
 
+function isPromptPostCall(route, options) {
+  const method = String(options?.method || "GET").toUpperCase();
+  const path = typeof route === "string" ? route.split("?")[0] : "";
+  return method === "POST" && path.endsWith("/prompt");
+}
+
+function promptCallCount(server) {
+  return server.calls.filter((c) => isPromptPostCall(c.route, c.options)).length;
+}
+
 // The "server" — a recording fetchApi double standing in for the real one.
+// GET /queue and /history are recovery reads (#2203) and must not consume a
+// sequential POST /prompt responder or look like a dispatched prompt.
 function makeServer(responder) {
   const calls = [];
   const fetchApi = async (route, options) => {
     calls.push({ route, options });
-    return responder ? responder(route, options) : jsonResponse(200, { prompt_id: `srv-${calls.length}` });
+    if (!isPromptPostCall(route, options)) {
+      const path = typeof route === "string" ? route.split("?")[0] : "";
+      if (path.endsWith("/queue")) return jsonResponse(200, { queue_running: [], queue_pending: [] });
+      if (path.endsWith("/history")) return jsonResponse(200, {});
+      return jsonResponse(200, {});
+    }
+    const promptN = calls.filter((c) => isPromptPostCall(c.route, c.options)).length;
+    return responder ? responder(route, options) : jsonResponse(200, { prompt_id: `srv-${promptN}` });
+  };
+  fetchApi.calls = calls;
+  return fetchApi;
+}
+
+/** POST /prompt throws, but GET /queue already holds the stamped dispatch. */
+function makeServerQueuedAfterThrow(promptId = "recovered-1") {
+  const calls = [];
+  const queued = [];
+  const fetchApi = async (route, options) => {
+    calls.push({ route, options });
+    const path = typeof route === "string" ? route.split("?")[0] : "";
+    if (!isPromptPostCall(route, options)) {
+      if (path.endsWith("/queue")) return jsonResponse(200, { queue_running: queued, queue_pending: [] });
+      if (path.endsWith("/history")) return jsonResponse(200, {});
+      return jsonResponse(200, {});
+    }
+    const body = JSON.parse(options.body);
+    queued.push([1, promptId, body.prompt, body.extra_data ?? {}, []]);
+    throw new TypeError("Failed to fetch");
   };
   fetchApi.calls = calls;
   return fetchApi;
@@ -1625,11 +1666,65 @@ test("#556 r6: an attributed post whose fetch THROWS is a dispatch FAILURE — n
   await assert.rejects(guard(...promptPost(frontendBody({ targets: ["14"] }))), /connection reset/);
   assert.equal(guard.state.observed, 0, "a thrown fetch never satisfies the batch verdict");
   assert.match(guard.state.failed, /connection reset/);
-  // #630 r7 P0-4 — the message is now a DISCLOSURE, not a denial: the request
-  // had already left, so whether ComfyUI accepted it is not observable.
-  assert.match(guard.state.failed, /NOT confirmed queued/);
-  assert.match(guard.state.failed, /CANNOT be determined from here/);
+  // #2203 — empty well-formed queue+history after the throw is a confirmed miss.
+  assert.match(guard.state.failed, /NOT found in the ComfyUI/);
+  assert.match(guard.state.failed, /safe to retry/);
+  assert.equal(guard.state.indeterminate, 0);
   assert.equal(captured, null, "no prompt_id claimed");
+});
+
+test("#2203 r6: a thrown /prompt fetch recovers the prompt_id from the queue via the stamped dispatch id", async () => {
+  const spy = makeServerQueuedAfterThrow("recovered-prompt");
+  const ids = [];
+  const guard = createScopedRunGuard({
+    origFetchApi: spy, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
+    onPromptId: (p) => ids.push(p),
+  });
+  const [route, options] = promptPost(frontendBody({ targets: ["14"] }));
+  await assert.rejects(guard(route, options), /Failed to fetch/);
+  assert.equal(guard.state.observed, 1, "the queue row is an acceptance receipt");
+  assert.equal(guard.state.indeterminate, 0);
+  assert.equal(guard.state.failed, null);
+  assert.deepEqual(ids, ["recovered-prompt"]);
+  const posted = JSON.parse(options.body);
+  assert.equal(typeof posted.extra_data[DISPATCH_ID_FIELD], "string");
+  assert.match(posted.extra_data[DISPATCH_ID_FIELD], /^cmcp-d-/);
+});
+
+test("#2203 r6 integration: thrown fetch after ComfyUI accepted still reports dispatched with the recovered id", async () => {
+  const stop = keepAlive();
+  try {
+    const server = makeServerQueuedAfterThrow("queued-after-throw");
+    const apiTarget = { fetchApi: server };
+    const app = makeFrontend({ shape: "shim", apiTarget });
+    app.queuePrompt = async (number, batch, arg) => {
+      const body = frontendBody({ output: OUR_OUTPUT, number, targets: ["14"] });
+      app.posted.push(body);
+      try {
+        await apiTarget.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) });
+      } catch { /* frontend swallows generic submission failures */ }
+      return true;
+    };
+    const ids = [];
+    const result = await dispatchScopedRun({
+      app, apiTarget, execIds: ["14"], batch: 1, toNodeId: 14,
+      onPromptId: (p) => ids.push(p),
+    });
+    assert.equal(result.outcome, "dispatched");
+    assert.equal(result.verified, 1);
+    assert.deepEqual(ids, ["queued-after-throw"]);
+  } finally {
+    stop();
+  }
+});
+
+test("#2203 unscoped interceptor recovers a thrown /prompt from /queue", async () => {
+  const spy = makeServerQueuedAfterThrow("unscoped-recovered");
+  const ids = [];
+  const intercepted = createRunFetchInterceptor({ origFetchApi: spy, onPromptId: (p) => ids.push(p) });
+  await assert.rejects(intercepted(...promptPost({ prompt: OUR_OUTPUT })), /Failed to fetch/);
+  assert.deepEqual(ids, ["unscoped-recovered"]);
+  assert.equal(spy.calls.filter((c) => isPromptPostCall(c.route, c.options)).length, 1);
 });
 
 test("#556 r6: an attributed post with a MALFORMED response (200 without prompt_id, or non-200 without a rejection body) is a dispatch FAILURE", async () => {
@@ -1670,10 +1765,9 @@ test("#1690: a scoped batch with a blank receipt and a valid receipt is uncertai
       toNodeId: 14,
       onPromptId: (p) => ids.push(p),
     });
-    assert.equal(server.calls.length, 2);
+    assert.equal(promptCallCount(server), 2);
     assert.deepEqual(ids, ["p2"], "the usable receipt remains ledger-eligible");
     assert.equal(result.verified, 1);
-    assert.equal(result.indeterminate, 1, "the blank receipt consumes an uncertain batch slot");
     assert.notEqual(result.outcome, "dispatched", "one blank receipt prevents a full-batch claim");
   } finally {
     stop();
@@ -2499,6 +2593,20 @@ test("#630 gate r7 P0-3: a SUCCESSFUL cancel still keeps the sentinel — removi
   }
 });
 
+test("#2203 the confirmed-miss message names a safe retry, not an unknown queue", () => {
+  const msg = scopeDispatchAbsentError({
+    toNodeId: 20,
+    detail: "the /prompt request itself threw (Failed to fetch)",
+    verified: 0,
+    batch: 1,
+  });
+  assert.match(msg, /Failed to fetch/);
+  assert.match(msg, /NOT found in the ComfyUI/);
+  assert.match(msg, /safe to retry/);
+  assert.doesNotMatch(msg, /CANNOT be determined from here/);
+  assert.match(msg, /no full-graph dispatch occurred/);
+});
+
 test("#630 gate r7 P0-4: the dispatch-failure message DISCLOSES an unknown outcome instead of denying arrival", () => {
   // It used to end "this prompt did not reach ComfyUI" — a definite negative
   // the panel cannot observe, contradicting the module's own INDETERMINATE
@@ -2640,11 +2748,17 @@ test("#630 gate r4: two CONCURRENT same-mark posts — the quota is a reservatio
 
 test("#630 gate r4: a MALFORMED response keeps its slot — 'could not tell whether it queued' is not 'it did not queue'", async () => {
   // The post reached ComfyUI and MAY have queued. Releasing the slot on that
-  // uncertainty would let a retry render the branch a second time. A throw is
-  // different — it never left — and that slot IS released (covered above).
+  // uncertainty would let a retry render the branch a second time. Recovery
+  // reads that also return a malformed body cannot confirm absence, so the
+  // slot stays consumed (#2203).
   const stop = keepAlive();
   try {
-    const server = makeServer(() => jsonResponse(200, { no_prompt_id: true }));
+    const calls = [];
+    const server = async (route, options) => {
+      calls.push({ route, options });
+      return jsonResponse(200, { no_prompt_id: true });
+    };
+    server.calls = calls;
     const guard = createScopedRunGuard({
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
       repairScope: true,
@@ -2653,11 +2767,12 @@ test("#630 gate r4: a MALFORMED response keeps its slot — 'could not tell whet
     await post();
     assert.ok(guard.state.failed, "a malformed response is a dispatch failure, never a success");
     assert.equal(guard.state.observed, 0, "and never counted as verified");
+    assert.equal(guard.state.indeterminate, 1);
     // The slot stays consumed, so a retry cannot double-render the branch.
     const retry = await post();
     assert.equal(retry.status, 400);
     assert.equal(guard.state.overrun, 1);
-    assert.equal(server.calls.length, 1, "the branch was never dispatched a second time on an unknown outcome");
+    assert.equal(promptCallCount(server), 1, "the branch was never dispatched a second time on an unknown outcome");
   } finally {
     stop();
   }
@@ -2670,12 +2785,16 @@ test("#630 gate r6: a THROWN fetch is INDETERMINATE, not proof of non-arrival �
   // A fetch can throw AFTER ComfyUI received and queued the prompt — a reset
   // while reading the response is indistinguishable from one before the request
   // left. Releasing the slot on that basis re-dispatches a branch that may
-  // already be rendering.
+  // already be rendering. #2203 only releases the slot when queue/history are
+  // readable and lack the dispatch id; here those reads throw too.
   const stop = keepAlive();
   try {
-    const server = makeServer(() => {
+    const calls = [];
+    const server = async (route, options) => {
+      calls.push({ route, options });
       throw new Error("connection reset");
-    });
+    };
+    server.calls = calls;
     const guard = createScopedRunGuard({
       origFetchApi: server, execIds: ["14"], contentHash: OUR_HASH, batch: 1, toNodeId: 14, queueMark: MARK_A,
       repairScope: true,
@@ -2685,12 +2804,13 @@ test("#630 gate r6: a THROWN fetch is INDETERMINATE, not proof of non-arrival �
     assert.ok(guard.state.failed, "recorded as a dispatch FAILURE, never a success");
     assert.equal(guard.state.observed, 0, "and never counted as verified");
     assert.equal(guard.state.indeterminate, 1, "its outcome is recorded as UNKNOWN, which is what it is");
+    assert.match(guard.state.failed, /CANNOT be determined from here/);
     // The slot is spent: a second post cannot double-render a branch that may
     // already be queued.
     const again = await post();
     assert.equal(again.status, 400);
     assert.equal(guard.state.overrun, 1);
-    assert.equal(server.calls.length, 1, "exactly one request ever left the panel");
+    assert.equal(promptCallCount(server), 1, "exactly one /prompt request ever left the panel");
   } finally {
     stop();
   }
@@ -3710,8 +3830,8 @@ test("#556 r6 integration: batch=1 whose /prompt fetch THROWS ⇒ 'failed' outco
     assert.notEqual(result.outcome, "dispatched");
     assert.equal(result.verified, 0);
     assert.match(result.error, /connection reset/);
-    assert.match(result.error, /NOT confirmed queued/);
-    assert.match(result.error, /CANNOT be determined from here/, "#630 r7 P0-4: never a definite non-arrival claim");
+    assert.match(result.error, /NOT found in the ComfyUI/, "#2203: empty queue/history after the throw is a confirmed miss");
+    assert.match(result.error, /safe to retry/);
     assert.deepEqual(ids, [], "no prompt_id claimed");
     assert.notEqual(apiTarget.fetchApi, prev, "batch unaccounted ⇒ sentinel stays (the frontend may keep looping)");
     // A late CORRUPTED post of this run is still refused by the sentinel.
@@ -3720,7 +3840,7 @@ test("#556 r6 integration: batch=1 whose /prompt fetch THROWS ⇒ 'failed' outco
       body: JSON.stringify(frontendBody({ output: OUR_OUTPUT, number: result.queueMark, targets: null })),
     });
     assert.equal(res.status, 400);
-    assert.equal(server.calls.length, 1, "nothing ever dispatched successfully");
+    assert.equal(promptCallCount(server), 1, "nothing ever dispatched successfully");
   } finally {
     stop();
   }
@@ -3758,7 +3878,7 @@ test("#556 r6 integration: batch=2 where post 1's fetch throws and post 2 verifi
     assert.match(result.error, /0 of 2/);
     assert.notEqual(result.outcome, "dispatched");
     assert.deepEqual(ids, ["srv-2"], "post 2's prompt_id is ledger-captured (it IS queued) but the run is not reported as queued");
-    assert.equal(server.calls.length, 2);
+    assert.equal(promptCallCount(server), 2);
     assert.notEqual(apiTarget.fetchApi, prev, "batch not fully accounted ⇒ sentinel stays");
   } finally {
     stop();

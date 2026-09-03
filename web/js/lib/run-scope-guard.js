@@ -34,6 +34,13 @@ import { controlAfterGenerateEntries } from "./control-after-generate.js";
 import { withTimeout } from "./bounded-step.js";
 import { scrubSecretShapedText } from "./http-failure.js";
 import { installQueuePromptScopeAdapter } from "./queue-prompt-scope-adapter.js";
+// #2203 — a thrown /prompt fetch can still have been accepted. Stamp a client
+// dispatch id onto extra_data and reconcile it against /queue + /history.
+import {
+  mintDispatchId,
+  recoverPromptIdAfterDispatch,
+  stampPromptDispatchOptions,
+} from "./prompt-dispatch-correlation.js";
 
 // #1854 — the intrinsic captured ONCE at module load. Invoking through a
 // per-call property lookup on the function object would read an overrideable
@@ -1567,6 +1574,21 @@ export function scopeDispatchError({ toNodeId, detail, verified, batch }) {
 }
 
 /**
+ * #2203 — the dispatch-failure sibling that DID reconcile: queue/history had
+ * no row for this request's dispatch id, so a retry will not double-render.
+ */
+export function scopeDispatchAbsentError({ toNodeId, detail, verified, batch }) {
+  return (
+    `run-to-node scope for node ${toNodeId}: a verified-scoped /prompt request ` +
+    `FAILED to complete — ${detail}. ${verified} of ${batch} batch prompts were ` +
+    `confirmed queued before the failure. This one was NOT found in the ComfyUI ` +
+    `queue or history after the request left, so it is treated as not queued and ` +
+    `is safe to retry. What IS certain: the request carried the run-to-node scope, ` +
+    `so no full-graph dispatch occurred (#2203).`
+  );
+}
+
+/**
  * #1504 — node_errors on an ACCEPTED (200) reply are dropped outputs, not a refusal.
  *
  * ComfyUI's `validate_prompt` validates each output independently and keeps the ones
@@ -1701,25 +1723,60 @@ export function createRunFetchInterceptor({
     } catch {
       isPost = false;
     }
+    let dispatchId = null;
+    let forwardOptions = options;
     if (isPost) {
       state.posted++;
       state.inFlight++;
+      dispatchId = mintDispatchId();
+      try {
+        forwardOptions = stampPromptDispatchOptions(options, dispatchId);
+      } catch {
+        forwardOptions = options;
+      }
     }
+    const recoverLostReceipt = async () => {
+      if (!dispatchId) return false;
+      const recovered = await recoverPromptIdAfterDispatch({
+        fetchApi: origFetchApi,
+        dispatchId,
+      });
+      if (recovered.status !== "recovered") return false;
+      try {
+        onPromptId?.(recovered.promptId);
+      } catch {
+        /* capture must not hide the original fetch outcome */
+      }
+      return true;
+    };
     try {
-      const res = await origFetchApi(route, options);
+      const res = await origFetchApi(route, forwardOptions);
       if (isPost) {
         if (res) {
+          let captured = false;
+          let rejected = false;
           await captureRunResponse(res, {
-            onRejection,
-            onPromptId,
+            onRejection: (r) => {
+              rejected = true;
+              onRejection?.(r);
+            },
+            onPromptId: (p) => {
+              captured = true;
+              onPromptId?.(p);
+            },
             onAcceptedNodeErrors,
             onMissingPromptId: () => state.missingPromptIds++,
           });
+          if (!captured && !rejected) await recoverLostReceipt();
         } else {
-          state.missingPromptIds++;
+          const recovered = await recoverLostReceipt();
+          if (!recovered) state.missingPromptIds++;
         }
       }
       return res;
+    } catch (err) {
+      if (isPost) await recoverLostReceipt();
+      throw err;
     } finally {
       if (isPost) state.inFlight--;
     }
@@ -1902,6 +1959,27 @@ export function createScopedRunGuard({
       // overrun. The reservation is taken here, synchronously, before the await,
       // so a second concurrent post sees the slot already taken.
       state.inFlight++;
+      const dispatchId = mintDispatchId();
+      try {
+        forwardOptions = stampPromptDispatchOptions(forwardOptions, dispatchId);
+      } catch {
+        /* unstamped: recovery then falls back to this run's unique queue mark */
+      }
+      const recoverLostReceipt = async () =>
+        recoverPromptIdAfterDispatch({
+          fetchApi: origFetchApi,
+          dispatchId,
+          queueMark,
+        });
+      const applyRecovered = (recovered) => {
+        if (recovered?.status !== "recovered") return false;
+        try {
+          onPromptId?.(recovered.promptId);
+        } catch {
+          /* capture must not hide the original fetch outcome */
+        }
+        return true;
+      };
       let res;
       try {
         res = await origFetchApi(route, forwardOptions);
@@ -1917,17 +1995,37 @@ export function createScopedRunGuard({
           // Record BEFORE the post, so a retry that throws is still disclosed as having
           // been attempted rather than vanishing into the dispatch-failure message.
           state.prunedRetry = { namedNode: retry.namedNode, removed: retry.removed };
-          res = await origFetchApi(route, { ...forwardOptions, body: retry.text });
+          const retryOptions = stampPromptDispatchOptions(
+            { ...forwardOptions, body: retry.text },
+            dispatchId,
+          );
+          res = await origFetchApi(route, retryOptions);
         }
       } catch (err) {
-        // INDETERMINATE, not "never arrived" (codex gate r6). A fetch can throw
-        // after ComfyUI already received and queued the prompt — a reset while
-        // reading the response looks identical to one before the request left.
-        // Treating the throw as proof of non-arrival is this cluster's defect
-        // class exactly, and acting on it re-dispatches a branch that may
-        // already be rendering. So the slot stays CONSUMED and the outcome is
-        // recorded as unknown, which is what it is.
+        // INDETERMINATE, not "never arrived" (codex gate r6) — unless #2203
+        // reconciles the stamped dispatch id against queue/history. A unique
+        // match is an acceptance receipt; a well-formed miss is safe to retry;
+        // anything else stays unknown, because a throw after ComfyUI queued is
+        // indistinguishable from one before the request left.
+        const recovered = await recoverLostReceipt();
         state.inFlight--;
+        if (applyRecovered(recovered)) {
+          state.observed++;
+          notify();
+          throw err;
+        }
+        if (recovered.status === "absent") {
+          if (state.failed == null) {
+            state.failed = scopeDispatchAbsentError({
+              toNodeId,
+              detail: `the /prompt request itself threw (${String(err?.message ?? err)})`,
+              verified: state.observed,
+              batch: maxBatch,
+            });
+          }
+          notify();
+          throw err;
+        }
         state.indeterminate++;
         if (state.failed == null) {
           state.failed = scopeDispatchError({
@@ -1949,21 +2047,36 @@ export function createScopedRunGuard({
       // definite outcome. A malformed response keeps the slot consumed on
       // purpose: the post reached ComfyUI and MAY have queued, and re-forwarding
       // on that uncertainty is how a branch gets rendered twice. "Could not
-      // determine whether it queued" is not "determined it did not".
+      // determine whether it queued" is not "determined it did not" — unless
+      // queue/history then produces a unique dispatch-id match (#2203).
       state.inFlight--;
       if (verdict === "accepted") {
         state.observed++;
       } else if (verdict === "rejected") {
         state.rejected++;
       } else {
-        state.indeterminate++;
-        if (state.failed == null) {
-          state.failed = scopeDispatchError({
-            toNodeId,
-            detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
-            verified: state.observed,
-            batch: maxBatch,
-          });
+        const recovered = await recoverLostReceipt();
+        if (applyRecovered(recovered)) {
+          state.observed++;
+        } else if (recovered.status === "absent") {
+          if (state.failed == null) {
+            state.failed = scopeDispatchAbsentError({
+              toNodeId,
+              detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
+              verified: state.observed,
+              batch: maxBatch,
+            });
+          }
+        } else {
+          state.indeterminate++;
+          if (state.failed == null) {
+            state.failed = scopeDispatchError({
+              toNodeId,
+              detail: `the /prompt response was malformed (HTTP ${res?.status ?? "?"}, no prompt_id and no rejection body)`,
+              verified: state.observed,
+              batch: maxBatch,
+            });
+          }
         }
       }
       notify();

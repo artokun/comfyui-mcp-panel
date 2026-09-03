@@ -359,11 +359,30 @@ function jsonResponse(status, obj) {
   };
 }
 
+function isPromptPostCall(route, options) {
+  const method = String(options?.method || "GET").toUpperCase();
+  const path = typeof route === "string" ? route.split("?")[0] : "";
+  return method === "POST" && path.endsWith("/prompt");
+}
+
+function promptCallCount(server) {
+  return (server.calls ?? []).filter((c) => isPromptPostCall(c.route, c.options)).length;
+}
+
+function recoveryRead(route) {
+  const path = typeof route === "string" ? route.split("?")[0] : "";
+  if (path.endsWith("/queue")) return jsonResponse(200, { queue_running: [], queue_pending: [] });
+  if (path.endsWith("/history")) return jsonResponse(200, {});
+  return jsonResponse(200, {});
+}
+
 function makeServer() {
   const calls = [];
   const fetchApi = async (route, options) => {
     calls.push({ route, options, at: Date.now() });
-    return jsonResponse(200, { prompt_id: `srv-${calls.length}` });
+    if (!isPromptPostCall(route, options)) return recoveryRead(route);
+    const promptN = calls.filter((c) => isPromptPostCall(c.route, c.options)).length;
+    return jsonResponse(200, { prompt_id: `srv-${promptN}` });
   };
   fetchApi.calls = calls;
   return fetchApi;
@@ -373,6 +392,7 @@ function makeServerWithoutPromptId() {
   const calls = [];
   const fetchApi = async (route, options) => {
     calls.push({ route, options, at: Date.now() });
+    if (!isPromptPostCall(route, options)) return recoveryRead(route);
     return jsonResponse(200, {});
   };
   fetchApi.calls = calls;
@@ -381,9 +401,12 @@ function makeServerWithoutPromptId() {
 
 function makeServerSequence(bodies) {
   const calls = [];
+  let promptIndex = 0;
   const fetchApi = async (route, options) => {
     calls.push({ route, options, at: Date.now() });
-    const entry = bodies[Math.min(calls.length - 1, bodies.length - 1)];
+    if (!isPromptPostCall(route, options)) return recoveryRead(route);
+    const entry = bodies[Math.min(promptIndex, bodies.length - 1)];
+    promptIndex++;
     const described = entry && typeof entry === "object" && Object.hasOwn(entry, "status");
     return jsonResponse(described ? entry.status : 200, described ? entry.body : entry);
   };
@@ -2550,7 +2573,7 @@ test("#1690 production path: a full run without a prompt_id is outcome-unknown, 
     const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
     const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
     const res = await built.graph_run({});
-    assert.equal(apiTarget.fetchApi.calls.length, 1, "the production queue path made one /prompt request");
+    assert.equal(promptCallCount(apiTarget.fetchApi), 1, "the production queue path made one /prompt request");
     assert.equal(res.queued_unknown, true);
     assert.notEqual(res.queued, true, "a queue acknowledgement without a receipt must not claim success");
     assert.equal(res.prompt_id, undefined);
@@ -2569,7 +2592,7 @@ test("#1690 production path: a blank plus valid batch receipt is outcome-unknown
     const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
     const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
     const res = await built.graph_run({ batch_count: 2 });
-    assert.equal(apiTarget.fetchApi.calls.length, 2, "the production batch path made both /prompt requests");
+    assert.equal(promptCallCount(apiTarget.fetchApi), 2, "the production batch path made both /prompt requests");
     assert.equal(res.queued_unknown, true);
     assert.notEqual(res.queued, true, "one unusable receipt taints the whole batch acknowledgement");
     assert.equal(res.prompt_id, "p2", "the valid receipt remains available for correlation");
@@ -2615,7 +2638,7 @@ test("#1690 production path: a definitive refusal beats another batch item's mis
     const app = makeUnscopedFrontend({ apiTarget, mode: "late" });
     const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
     const res = await built.graph_run({ batch_count: 2 });
-    assert.equal(apiTarget.fetchApi.calls.length, 2, "the production batch path observed both /prompt responses");
+    assert.equal(promptCallCount(apiTarget.fetchApi), 2, "the production batch path observed both /prompt responses");
     assert.equal(res.queued, false, "a definitive refusal remains a refusal for the whole acknowledgement");
     assert.equal(res.queued_unknown, undefined);
     assert.match(String(res.error), /definitive refusal|prompt_outputs_failed_validation/i);
@@ -2728,8 +2751,9 @@ test("#1845 CALL SITE: a full run whose POST /prompt THREW is outcome-unknown, n
     // REACHABILITY, not plausibility: the run really did get to the queue call and the
     // POST really did leave, so this reply is the production path's answer to the
     // reported input — not a pre-flight refusal wearing the right shape.
-    assert.equal(apiTarget.fetchApi.calls.length, 1, "the production queue path attempted one /prompt request");
-    assert.equal(apiTarget.fetchApi.calls[0].route, "/prompt");
+    const promptCalls = apiTarget.fetchApi.calls.filter((c) => String(c.route || "").split("?")[0].endsWith("/prompt"));
+    assert.equal(promptCalls.length, 1, "the production queue path attempted one /prompt request");
+    assert.equal(promptCalls[0].route, "/prompt");
     assert.notDeepEqual(
       res,
       { queued: true, batch_count: 1 },
@@ -2796,7 +2820,8 @@ test("#1845 CONTROL: a batch that queued SOME prompts before the surface died ke
     app.lastNodeErrors = {};
     const built = realGraphRun({ app, apiTarget, budgetMs: 15000, serializeMs: 8000 });
     const res = await built.graph_run({ batch_count: 2 });
-    assert.equal(calls.length, 2, "the batch attempted both /prompt requests");
+    const promptCalls = calls.filter((c) => String(c.route || "").split("?")[0].endsWith("/prompt"));
+    assert.equal(promptCalls.length, 2, "the batch attempted both /prompt requests");
     assert.deepEqual(res, { queued: true, batch_count: 2, prompt_id: "srv-1" });
   } finally {
     stop();
