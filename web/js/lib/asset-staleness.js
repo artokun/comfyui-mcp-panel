@@ -583,7 +583,7 @@ export function pruneContradictedNodeErrorMaps(rootGraph, nodeErrorsMaps) {
   const maps = Array.isArray(nodeErrorsMaps) ? nodeErrorsMaps : [nodeErrorsMaps];
   const pruned = [];
   const dropped = [];
-  const seen = new Set();
+  const seen = new Map();
   for (const map of maps) {
     const result = pruneContradictedNodeErrors(rootGraph, map);
     pruned.push(result.nodeErrors);
@@ -591,9 +591,22 @@ export function pruneContradictedNodeErrorMaps(rootGraph, nodeErrorsMaps) {
       // JSON-encoded pair, not a delimiter join: both halves are free-form strings and
       // any separator character could occur inside one of them.
       const key = JSON.stringify([record.node_id, record.contradicted_by]);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      dropped.push(record);
+      const existing = seen.get(key);
+      if (!existing) {
+        seen.set(key, record);
+        dropped.push(record);
+        continue;
+      }
+      // Same node and same reason — one withheld FACT — but the two stores can hold
+      // DIFFERENT errors that reduce to it. Skipping the second record here would
+      // discard them, breaking the non-loss guarantee inside the very step meant to
+      // tidy the list (codex gate round 9). Union instead, by identity, exactly as
+      // `combineNodeErrorMaps` does: a duplicate is noise, a dropped error is a defect.
+      const merged = Array.isArray(existing.errors) ? [...existing.errors] : [];
+      for (const error of record.errors ?? []) {
+        if (!merged.includes(error)) merged.push(error);
+      }
+      if (merged.length) existing.errors = merged;
     }
   }
   return { nodeErrors: combineNodeErrorMaps(pruned), dropped };

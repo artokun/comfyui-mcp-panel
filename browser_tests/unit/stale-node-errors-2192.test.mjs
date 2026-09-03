@@ -691,7 +691,19 @@ test("#2192 invariant: every input error survives somewhere in the payload", asy
     "249:251": live,
   };
 
-  const result = await runProductionGraphGetErrors({ graph: inner, rootGraph, lastNodeErrors });
+  // The execution store holds a DISTINCT error object that reduces to the SAME reason as
+  // the app map's, so this walk covers the dedupe path too — which is precisely where the
+  // first version of this invariant leaked (it passed the same object through both maps
+  // and so could not tell merging from skipping).
+  const alsoRepaired = { ...SELECT_MISMATCH, message: "same reason, a different object" };
+  const storeNodeErrors = { "249:252": { class_type: "ImpactSwitch", errors: [alsoRepaired] } };
+
+  const result = await runProductionGraphGetErrors({
+    graph: inner,
+    rootGraph,
+    lastNodeErrors,
+    storeNodeErrors,
+  });
 
   const seen = new Set();
   for (const entry of Object.values(result.node_errors ?? {})) {
@@ -700,11 +712,32 @@ test("#2192 invariant: every input error survives somewhere in the payload", asy
   for (const record of result.stale_node_errors ?? []) {
     for (const e of record.errors ?? []) seen.add(e);
   }
-  for (const [id, entry] of Object.entries(lastNodeErrors)) {
-    for (const e of entry.errors) {
-      assert.ok(seen.has(e), `error on ${id} vanished from the payload entirely`);
+  for (const source of [lastNodeErrors, storeNodeErrors]) {
+    for (const [id, entry] of Object.entries(source)) {
+      for (const e of entry.errors) {
+        assert.ok(seen.has(e), `error on ${id} vanished from the payload entirely`);
+      }
     }
   }
+});
+
+test("#2192 invariant: dedupe must MERGE the two stores' errors, never drop one", () => {
+  // The dedupe key is (node id, reason), and two stores can hold DIFFERENT errors that
+  // reduce to the same reason. Skipping the second record discards its errors — the
+  // non-loss invariant broken by the very step meant to tidy it. The earlier invariant
+  // test passed the same object twice and could not see this.
+  const node = { id: 2, type: "Current", comfyClass: "Current", inputs: [] };
+  const graph = makeGraph({ id: "root", nodes: [node] });
+  const fromApp = { message: "recorded by app.lastNodeErrors" };
+  const fromStore = { message: "recorded by the execution-error store" };
+
+  const { dropped } = pruneContradictedNodeErrorMaps(graph, [
+    { 2: { class_type: "OldWorkflowType", errors: [fromApp] } },
+    { 2: { class_type: "OldWorkflowType", errors: [fromStore] } },
+  ]);
+
+  assert.equal(dropped.length, 1, "still one withheld fact");
+  assert.deepEqual(dropped[0].errors, [fromApp, fromStore], "carrying BOTH stores' errors");
 });
 
 test("#2192 invariant: a demoted entry carries its errors, not just a label", async () => {
