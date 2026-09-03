@@ -7,10 +7,16 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-- A custom video save node no longer looks like a preview-only run: a `{filename, subfolder, type:"output"}` MP4 under an unrecognised key (NKDVideoViewer's `nkd_video`) is collected as saved output, so panel_run completion names the file instead of saying "no saved output node ran … Add a SaveImage node" while describing the preview taps. CompareFrames temp dumps and a genuinely preview-only run are unchanged (#2128)
-- graph_get_subgraph no longer caps its inner node list at MAX_STATE_NODES, so a large subgraph's ownership envelope stays `truncated:false` with `node_count === nodes.length` and panel_set_widget can dispatch a promoted write instead of treating the listing cap as an incomplete witness (#2057)
 - Preserve the panel-wide Codex conversation across a workflow remount when the canonical IndexedDB history read times out or is otherwise unavailable; only a confirmed empty archive may clear the transcript and session (#2201)
 - the canonical chat-history read is decided by the IndexedDB TRANSACTION rather than the request, so a get that succeeds before its transaction aborts is no longer treated as authoritative; and a delayed hydration retry no longer reselects the mount-time thread over a chat the user picked while the store was recovering (#2201)
+
+## [0.15.163] - 2026-09-03
+
+### Fixed
+- A custom video save node no longer looks like a preview-only run: a `{filename, subfolder, type:"output"}` MP4 under an unrecognised key (NKDVideoViewer's `nkd_video`) is collected as saved output, so panel_run completion names the file instead of saying "no saved output node ran … Add a SaveImage node" while describing the preview taps. CompareFrames temp dumps and a genuinely preview-only run are unchanged (#2128)
+- graph_get_subgraph no longer caps its inner node list at MAX_STATE_NODES, so a large subgraph's ownership envelope stays `truncated:false` with `node_count === nodes.length` and panel_set_widget can dispatch a promoted write instead of treating the listing cap as an incomplete witness (#2057)
+
+
 ## [0.15.162] - 2026-09-03
 
 ### Fixed
