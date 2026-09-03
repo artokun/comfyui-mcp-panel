@@ -160,12 +160,14 @@ test("#968 WIRED: the observer runs before the refusal, and the note reaches it"
   // 3. The refusal a caller actually sees is given the line.
   assert.match(src, /movedNote: activeWorkflowMoves\.describeLast\(\),/);
 
-  // 4. The pure helper's own call site is UNCHANGED — #1019 pins its three-argument shape,
-  //    and it is rebuilt with `new Function`, where a module global does not exist.
+  // 4. The pure helper receives every input as an ARGUMENT — #1019's point, because
+  //    the function is rebuilt with `new Function` where a module global does not
+  //    exist. #2139 added a fourth field (activeIsModified), so this asserts the
+  //    property rather than the arity: the count was never what mattered.
   assert.match(
     src,
-    /workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, activeIsUnsaved \}\)/,
-    "the fence helper still calls it with exactly three arguments",
+    /workflowInstanceMismatchMessage\(\{\s*commandUuid,\s*activeUuid,\s*activeIsUnsaved,\s*activeIsModified\s*\}\)/,
+    "the fence helper passes every input as an argument",
   );
 });
 
@@ -176,7 +178,7 @@ test("#968 WIRED: the message stays PURE and single-line", () => {
   // an earlier attempt broke 13 tests without touching their subject.
   assert.match(
     src,
-    /function workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null \} = \{\}\) \{/,
+    /function workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, activeIsUnsaved = null, activeIsModified = null, movedNote = null \} = \{\}\) \{/,
   );
   // And it reads only its parameters: a module global here is unreachable under `new Function`.
   // Extracted with the brace-balanced reader below rather than a hand-rolled slice — the

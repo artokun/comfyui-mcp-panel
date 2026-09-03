@@ -120,10 +120,17 @@ test("#1019 an UNSTAMPED command still reports that, whatever the tab", () => {
 });
 
 test("#1019 source guard: the fact is READ, not assumed, and an unreadable read stays null", () => {
+  // #2139 added a second read (activeIsModified) in the same try, so the single-line
+  // assignment this used to quote is now inside a block. What it GUARDS is unchanged
+  // and is what these still assert: unknown by default, positively read, and an
+  // unreadable tab proving nothing.
   const src = readFileSync(PANEL_JS, "utf8");
   const fn = namedFunctionSource(src, "assertActiveWorkflowCommandTarget");
   assert.match(fn, /let activeIsUnsaved = null;/, "unknown by default");
-  assert.match(fn, /if \(active\) activeIsUnsaved = !savedWorkflowPath\(active\);/, "positively read");
+  assert.match(fn, /activeIsUnsaved = !savedWorkflowPath\(active\);/, "positively read");
   assert.match(fn, /} catch \{\r?\n\s*activeIsUnsaved = null;/, "an unreadable tab proves nothing");
-  assert.match(fn, /workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, activeIsUnsaved \}\)/);
+  assert.match(
+    fn,
+    /workflowInstanceMismatchMessage\(\{\s*commandUuid,\s*activeUuid,\s*activeIsUnsaved,\s*activeIsModified\s*\}\)/,
+  );
 });

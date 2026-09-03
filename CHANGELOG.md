@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
+  work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
+  saved tab carrying unsaved drift that is the one recovery that loses it, which is the
+  deadlock the report describes: save already refused as behind the canvas, mutations
+  fenced off, and the suggested escape destructive. The existing panel#1019 note asks
+  whether the tab CAN be re-opened; this asks what it COSTS. Warns only on a positive
+  isModified reading, because ComfyUI derives that flag from user-input captures and a
+  false is not evidence of safety (panel#882). The save/tracker deadlock itself is
+  unchanged and panel#2139 stays open.
+
 ## [0.15.160] - 2026-09-03
 
 ### Fixed

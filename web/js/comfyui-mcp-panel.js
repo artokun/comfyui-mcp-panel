@@ -5081,7 +5081,7 @@ function noteWorkflowIdentityDrift() {
 // and #750/#1019 rebuild it in isolation with `new Function`, where a module global does not
 // exist. One line on purpose (see above). Appended, never substituted — the refusal's own
 // reasoning survives; the note only says WHY the active workflow is not what was expected.
-function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null } = {}) {
+function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, activeIsModified = null, movedNote = null } = {}) {
   const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const expected = str(commandUuid);
   const live = str(activeUuid);
@@ -5115,6 +5115,29 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
         `still works normally. panel_list_workflows is exempt from this fence and ` +
         `republishes the active identity if you need it first (#1019).`
       : "") +
+    // #2139 — the OTHER cost of following this advice, which #1019 does not cover.
+    // That guard asks whether the active tab CAN be re-opened (an unsaved tab has no
+    // path). This asks what re-opening it COSTS: a SAVED tab with unsaved drift
+    // re-opens fine and discards the drift on the way. The reporter had exactly that
+    // — unsaved rewiring on a saved workflow, save already refused by the
+    // tracker-behind guard — and called panel_open_workflow a forbidden recovery,
+    // because it is the one move that loses the work.
+    //
+    // POSITIVE evidence only. `isModified === true` is the same reading used
+    // elsewhere in this file, and its own #882 note records why the negative is
+    // worthless: ComfyUI derives the flag from USER INPUT captures, so a value a
+    // NODE wrote leaves the tab reading clean while the canvas already differs. So
+    // true warns; false and undefined stay silent rather than implying it is safe.
+    //
+    // Deliberately does NOT capture first. #882's helper exists for callers about to
+    // DISCARD a canvas and must read a fresh flag; this is an error message, and a
+    // mutation inside one is a new failure surface on a path that is already failing.
+    (activeIsModified === true
+      ? ` And note the ACTIVE tab has UNSAVED changes: panel_open_workflow re-reads it ` +
+        `from disk, so those changes are discarded. Save first, or re-target instead — ` +
+        `if the save is itself refused as behind the canvas, that is panel#2139 and ` +
+        `re-opening is the one recovery that loses the work.`
+      : "") +
     ` If NO panel tab is connected, neither will help and the connection is the thing ` +
     `to fix — panel_graph_outline reports connectivity directly.`
   );
@@ -5142,13 +5165,26 @@ function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
     // Read defensively: an unreadable path is not evidence either way, and the message
     // then keeps its existing wording rather than claiming something about the tab.
     let activeIsUnsaved = null;
+    // #2139 — read-only, and only the POSITIVE reading counts. `isModified` is
+    // ComfyUI's own flag; #882 records that it is derived from USER INPUT captures,
+    // so a value a NODE wrote leaves it false while the canvas already differs.
+    // `true` is therefore evidence of drift and `false` is evidence of nothing —
+    // which is the right shape for a warning, and the reason this does not capture
+    // first the way a caller about to DISCARD the canvas must.
+    let activeIsModified = null;
     try {
       const active = activeWorkflowRef();
-      if (active) activeIsUnsaved = !savedWorkflowPath(active);
+      if (active) {
+        activeIsUnsaved = !savedWorkflowPath(active);
+        activeIsModified = active.isModified === true ? true : null;
+      }
     } catch {
       activeIsUnsaved = null;
+      activeIsModified = null;
     }
-    throw new Error(workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved }));
+    throw new Error(
+      workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved, activeIsModified }),
+    );
   }
 }
 
