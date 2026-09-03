@@ -214,7 +214,11 @@ import {
   pruneGroundingIdentities,
   groundedWorkflowPath,
 } from "./lib/workflow-chat-identity.js";
-import { decideWorkflowSaveVerdict, workflowSaveRefusalError } from "./lib/save-path-guard.js";
+import {
+  decideWorkflowSaveVerdict,
+  rebindForeignStampIfIdentityMatches,
+  workflowSaveRefusalError,
+} from "./lib/save-path-guard.js";
 import { validateA2UISpec, renderA2UICard, renderA2UIInert, renderA2UIFailCard, A2UI_CSS } from "./cmcp-a2ui.js";
 import { openSidePanel } from "./cmcp-sidepanel-ui.js";
 import {
@@ -4696,6 +4700,35 @@ function installSavePathGuard(appRef) {
           // never be looking at different things.
           snapshotIsStale: saveWouldPersistStaleSnapshot(wf, state),
         });
+        // #2194 — leftover nested workflow_path on THIS tab's uuid. Restamp the
+        // snapshot (and the live extra when it carries the same uuid) so save
+        // does not send the caller through panel_open_workflow, whose ImpactSwitch
+        // restore can dead-end. Fail closed when uuid is missing or disagrees.
+        // `typeof` keeps a sliced test installer fail-closed if the helper is not
+        // injected — a throw here would hit the outer catch and ALLOW the write.
+        if (
+          verdict?.allow === false &&
+          verdict.reason === "stamped_path_foreign" &&
+          typeof rebindForeignStampIfIdentityMatches === "function" &&
+          rebindForeignStampIfIdentityMatches({
+            state,
+            destinationPath: wf?.path ?? null,
+            destinationUuid: typeof workflowObjectUuid === "function" ? workflowObjectUuid(wf) || null : null,
+          })
+        ) {
+          try {
+            const destUuid = typeof workflowObjectUuid === "function" ? workflowObjectUuid(wf) || null : null;
+            const liveExtra =
+              appRef?.rootGraph?.extra?.[WORKFLOW_META_NAMESPACE] ??
+              (typeof app !== "undefined" ? app?.rootGraph?.extra?.[WORKFLOW_META_NAMESPACE] : null);
+            if (liveExtra && destUuid && liveExtra[WORKFLOW_UUID_FIELD] === destUuid) {
+              liveExtra[WORKFLOW_PATH_FIELD] = wf.path;
+            }
+          } catch {
+            /* snapshot stamp is what the write serializes */
+          }
+          verdict = { allow: true };
+        }
       } catch {
         verdict = { allow: true }; // a guard that cannot read its evidence must never invent a refusal
       }

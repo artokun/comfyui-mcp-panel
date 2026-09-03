@@ -142,6 +142,33 @@ export function decideWorkflowSaveVerdict({
 }
 
 /**
+ * #2194 — restamp a leftover nested `workflow_path` when graph identity is THIS
+ * tab's, so save does not require `panel_open_workflow` (whose restore can leave
+ * ImpactSwitch nodes at construction defaults).
+ *
+ * Fail closed unless both uuids are non-empty strings and equal: a missing or
+ * disagreeing identity is the #1667 foreign-canvas case and must not overwrite.
+ *
+ * Mutates `state.extra.comfyui_mcp.workflow_path` only. Returns true when the
+ * stamp now names the destination.
+ */
+export function rebindForeignStampIfIdentityMatches({
+  state,
+  destinationPath,
+  destinationUuid,
+} = {}) {
+  if (typeof destinationUuid !== "string" || !destinationUuid) return false;
+  if (typeof destinationPath !== "string" || !destinationPath) return false;
+  const extra = state?.extra?.comfyui_mcp;
+  const stampedUuid = extra?.workflow_uuid;
+  if (typeof stampedUuid !== "string" || !stampedUuid) return false;
+  if (stampedUuid !== destinationUuid) return false;
+  if (!extra || typeof extra !== "object" || Array.isArray(extra)) return false;
+  extra.workflow_path = destinationPath;
+  return true;
+}
+
+/**
  * The refusal a blocked save throws. States what was compared, what was NOT written,
  * both readings of the evidence (stale canvas vs deliberate copy), and the recovery.
  * Deliberately does not claim which reading is true — the panel cannot tell them apart;
@@ -178,8 +205,11 @@ export function workflowSaveRefusalError(verdict) {
       `belong to it — this is the #1667 stale-canvas data-loss guard, and NOTHING was written. ` +
       `Either this tab's canvas is stale (mounted from another workflow — reload the file from ` +
       `disk before losing it), or you deliberately built this content under a copied identity. ` +
-      `If the canvas really is what you want in "${dest}", re-bind the tab first — open the ` +
-      `workflow via panel_open_workflow so its identity is re-verified against the file — then ` +
-      `save again.`,
+      `If the canvas uuid already matches this tab, persist by restamping extra.comfyui_mcp.workflow_path ` +
+      `to "${dest}" — that rebind does not require a clean restore of ImpactSwitch nodes that throw ` +
+      `findInputSlot and stay at construction defaults. Do NOT open-then-restore as the only path: ` +
+      `panel_open_workflow can report identity match, leave those nodes unrestored, and then forbid ` +
+      `save (panel#2194). If the canvas uuid does NOT match this tab, fail closed — that is a ` +
+      `foreign graph and must not overwrite "${dest}".`,
   );
 }
