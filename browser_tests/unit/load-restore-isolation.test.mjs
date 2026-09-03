@@ -17,6 +17,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  applySerializedNodeState,
   installNodeConfigureIsolation,
   loadRestoreCompleted,
   loadGraphDataWithCompletionProof,
@@ -787,6 +788,82 @@ test("#1668 skips the retry when the workflow changes during the settle wait", a
   assert.deepEqual(result.failed, [
     { id: 122, type: "ImpactSwitch", error: "active workflow changed during restore retry", retry: "workflow-switched" },
   ]);
+});
+
+test("#2194 applies serialized ImpactSwitch state when retry configure still throws findInputSlot", async () => {
+  const info = {
+    id: 436,
+    type: "ImpactSwitch",
+    pos: [120, 80],
+    size: [210, 90],
+    mode: 0,
+    flags: { collapsed: false },
+    properties: { ue_properties: { version: 2 } },
+    widgets_values: ["saved-select", "saved-other"],
+    widgets_values_named: { select: "saved-select" },
+  };
+  const node = {
+    id: 436,
+    type: "ImpactSwitch",
+    pos: [10, 10],
+    size: [200, 100],
+    mode: 0,
+    flags: {},
+    properties: {},
+    inputs: [{ name: "select", link: 901, widget: { name: "select" } }],
+    outputs: [],
+    widgets: [
+      { name: "select", value: 1, callback() { throw new TypeError("t.findInputSlot is not a function"); } },
+      { name: "other", value: "construction" },
+    ],
+    serialize() {
+      return {
+        id: this.id,
+        type: this.type,
+        pos: this.pos,
+        size: this.size,
+        mode: this.mode,
+        flags: this.flags,
+        properties: this.properties,
+        widgets_values: this.widgets.map((widget) => widget.value),
+        widgets_values_named: this.widgets_values_named,
+      };
+    },
+    configure() {
+      throw new TypeError("t.findInputSlot is not a function");
+    },
+  };
+  const result = await retryNodeRestores(
+    { getNodeById: () => node },
+    [{
+      id: 436,
+      type: "ImpactSwitch",
+      error: "t.findInputSlot is not a function",
+      linkDisconnectCrash: true,
+      linkDisconnectEvidence: true,
+      info,
+    }],
+  );
+  assert.deepEqual(result.restored, [{ id: 436, type: "ImpactSwitch" }]);
+  assert.deepEqual(result.failed, []);
+  assert.equal(result.recovered[0].id, 436);
+  assert.equal(node.widgets[0].value, "saved-select");
+  assert.deepEqual(node.pos, [120, 80]);
+  assert.equal(node.properties.ue_properties.version, 2);
+});
+
+test("#2194 applySerializedNodeState does not fire ImpactSwitch widget callbacks", () => {
+  let callbackCalls = 0;
+  const node = {
+    widgets: [{ name: "select", value: 1, callback() { callbackCalls += 1; } }],
+  };
+  assert.equal(
+    applySerializedNodeState(node, { widgets_values: ["saved-select"] }),
+    true,
+  );
+  assert.equal(node.widgets[0].value, "saved-select");
+  assert.equal(callbackCalls, 0);
+  assert.equal(typeof node.widgets[0].callback, "function");
 });
 
 test("#1668 cannot upgrade an unrelated initial failure from a link-shaped retry", async () => {
