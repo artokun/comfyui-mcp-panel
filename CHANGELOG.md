@@ -6,9 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.169] - 2026-09-04
+
 ### Fixed
-- graph_set_widget acknowledges a long CLIPTextEncode / multiline text write as soon as the live editor holds the value, instead of waiting on a backgrounded-tab rAF flush until the 90s relay times out (#2233)
-- Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234)
+- graph_set_widget acknowledges a long CLIPTextEncode / multiline text write as soon as the live editor holds the value, instead of waiting on a backgrounded-tab rAF flush until the 90s relay times out (#2233, #2236)
+- Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234, #2235)
+
 
 ## [0.15.168] - 2026-09-04
 
