@@ -6,9 +6,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
-- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222)
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
   strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
   `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash
@@ -24,6 +22,12 @@ All notable changes to this project are documented here. This project adheres to
   code; the eleven translations have the selector stripped byte-wise, leaving wording
   untouched.
 - the emoji-presentation removal now covers every shipped web/js file rather than the main bundle alone (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
+
+## [0.15.165] - 2026-09-04
+
+### Fixed
+- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222, #2223)
+
 
 ## [0.15.164] - 2026-09-03
 
