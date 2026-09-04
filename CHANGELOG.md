@@ -7,11 +7,16 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-
-- After a delivered panel_open_workflow, the switch fence no longer latches panel_list_workflows / panel_set_workflow_target({mode:"current"}) / panel_graph_outline for minutes while a later settle or safe-repaint is still pending. workflow_list stays the recovery probe; leftover previous-tab graph is still refused (#2249, #1215)
 - the A2UI card cap now actually bounds the card to a fraction of the chat log (#2183). Its log-relative term was full-height, and .cmcp-log is shorter than the viewport — header, toolbar and composer take the rest — so whenever the log fell under 70vh that term was the smallest and won: at a 900px viewport and a 500px log it allowed 468px, 94% of the log. A card could still consume the chat area, which is what this rule exists to prevent. All three terms now express the same fraction. Found by the Copilot review on the PR
 - the no-card_id dismiss sweep is now DRIVEN by tests, not matched as source text (#2183). Its selection - a2ui only, unresolved only - decides how much a destructive recovery destroys: it sets `resolved` on records, touches the history store, removes DOM nodes and persists, and it runs during the reload/rebind window. Every assertion about it matched the TEXT of `onUiDismiss`, and no browser spec exercises `ui_dismiss` either, so a reorder or rename that kept the text passed while the behaviour went unchecked. The selection moved to a pure `lib/a2ui-sweep.js` and is exercised directly: already-resolved records are left alone, non-a2ui records are never swept, `resolved` is compared to TRUE rather than truthy (a timestamp must not read as dismissed), and a missing thread or a null hole sweeps nothing instead of throwing.
 - an oversized A2UI card scrolls inside its own surface instead of consuming the chat viewport, and a `ui_dismiss` that carries no `card_id` now survives a reload or rebind by resolving only the still-unresolved cards in the displayed thread (#2183)
+
+## [0.15.174] - 2026-09-04
+
+### Fixed
+
+- After a delivered panel_open_workflow, the switch fence no longer latches panel_list_workflows / panel_set_workflow_target({mode:"current"}) / panel_graph_outline for minutes while a later settle or safe-repaint is still pending. workflow_list stays the recovery probe; leftover previous-tab graph is still refused (#2249, #2250, #1215)
+
 
 ## [0.15.173] - 2026-09-04
 
