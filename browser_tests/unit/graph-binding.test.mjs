@@ -21,6 +21,7 @@ import {
   activeWorkflowProvenEmpty,
   graphEmptyBindingUnproven,
   graphReadDesynced,
+  graphRootUnprovenAgainstActiveState,
   missingNodeStateReportsNodes,
   graphRootMidPopulation,
   graphRootMismatchesActiveWorkflow,
@@ -505,6 +506,140 @@ test("graphReadDesynced: FALSE — descended into an empty subgraph (legitimatel
 test("graphReadDesynced: defensive — missing args never throw, default to not-desynced", () => {
   assert.equal(graphReadDesynced(), false);
   assert.equal(graphReadDesynced({}), false);
+});
+
+// ── #1215: nonempty previous canvas + no comparable active state ─────────────
+
+test("#1215: a nonempty live canvas with no comparable active state is unproven", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({}),
+    }),
+    true,
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({ changeTracker: { activeState: { nodes: "bad" } } }),
+    }),
+    true,
+    "malformed nodes is the same as missing — that is the safe-repaint shape",
+  );
+});
+
+test("#1215: a comparable current state is the shape guard's job, not this one", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({ changeTracker: { activeState: state(5) } }),
+    }),
+    false,
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({ changeTracker: { activeState: state(0) } }),
+    }),
+    false,
+    "well-formed empty nodes must stay a shape mismatch (blank tab vs leftover canvas)",
+  );
+});
+
+test("#1215: empty live, no workflow service, and subgraph scope fail OPEN", () => {
+  assert.equal(graphRootUnprovenAgainstActiveState({ liveNodeCount: 0, activeWorkflow: wf({}) }), false);
+  assert.equal(graphRootUnprovenAgainstActiveState({ liveNodeCount: 118, activeWorkflow: null }), false);
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      inSubgraph: true,
+      activeWorkflow: wf({}),
+    }),
+    false,
+  );
+  assert.equal(graphRootUnprovenAgainstActiveState(), false);
+});
+
+test("#1215: outline/query refuse the previous canvas after a switch that could not repaint", () => {
+  const rootGraph = { _nodes: state(118).nodes };
+  const activeWorkflow = wf({});
+  for (const cmd of ["graph_outline", "graph_query"]) {
+    const verdict = resolveGraphBindingVerdict({
+      graph: rootGraph,
+      rootGraph,
+      activeWorkflow,
+      activeWorkflowUuid: "remove-bg-tab",
+      liveNodeCount: 118,
+      ...graphCommandBindingBar(cmd),
+    });
+    assert.equal(verdict?.reason, "root-state-unreadable", cmd);
+    assert.equal(verdict.live, 118);
+    assert.equal(verdict.expected, null);
+  }
+});
+
+test("#1215: a TARGET uuid on the leftover canvas is not ownership proof", () => {
+  const rootGraph = {
+    _nodes: state(118).nodes,
+    extra: { comfyui_mcp: { workflow_uuid: "remove-bg-tab" } },
+  };
+  const verdict = resolveGraphBindingVerdict({
+    graph: rootGraph,
+    rootGraph,
+    activeWorkflow: wf({}),
+    activeWorkflowUuid: "remove-bg-tab",
+    liveNodeCount: 118,
+    rootUuidMismatch: false,
+    ...graphCommandBindingBar("graph_outline"),
+  });
+  assert.equal(
+    verdict?.reason,
+    "root-state-unreadable",
+    "a stale/shared TARGET tag on the outgoing canvas (#1639) must not license the read",
+  );
+});
+
+test("#1215: already-current untagged canvas with matching state still admits (#2038)", () => {
+  const nodes = state(3).nodes;
+  const rootGraph = { _nodes: nodes, extra: {} };
+  const verdict = resolveGraphBindingVerdict({
+    graph: rootGraph,
+    rootGraph,
+    activeWorkflow: wf({ isModified: false, changeTracker: { activeState: { nodes, links: [], groups: [] } } }),
+    activeWorkflowUuid: "already-current",
+    liveNodeCount: 3,
+    ...graphCommandBindingBar("graph_outline"),
+    includeBaselineReadGuard: true,
+  });
+  assert.equal(verdict, null);
+});
+
+test("#1215: the refusal names the live count and says set_workflow_target is not a remedy", () => {
+  const msg = graphBindingRefusalMessage({ reason: "root-state-unreadable", live: 118, expected: null });
+  assert.match(msg, /^\[root-state-unreadable\]/);
+  assert.match(msg, /118 node\(s\)/);
+  assert.match(msg, /NOT applied/);
+  assert.match(msg, /previous workflow/);
+  assert.match(msg, /panel_open_workflow/);
+  assert.match(msg, /panel_load_workflow/);
+  assert.match(msg, /panel_set_workflow_target is NOT a remedy/);
+  assert.doesNotMatch(msg, /reports 0 node\(s\)/);
+});
+
+test("#1215: graph_outline and graph_query re-assert the binding bar in their executors", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  for (const cmd of ["graph_outline", "graph_query"]) {
+    const at = src.indexOf(`${cmd}({`);
+    assert.notEqual(at, -1, `${cmd} executor must remain`);
+    const slice = src.slice(at, at + 2200);
+    assert.match(slice, /assertGraphBoundToActiveWorkflow/, `${cmd} must re-assert before serving nodes`);
+    assert.match(
+      slice,
+      new RegExp(`graphCommandBindingBar\\("${cmd}"\\)`),
+      `${cmd} must keep the classified-read bar`,
+    );
+    assert.match(slice, /includeBaselineReadGuard: true/, `${cmd} must keep the #389 baseline guard on`);
+  }
 });
 
 test("missingNodeStateReportsNodes: only positive, shaped missing-node state is evidence", () => {
@@ -3638,8 +3773,8 @@ test("#618: a descended SUBGRAPH is exempt — an entered subgraph legitimately 
   assert.equal(verdict, null);
 });
 
-test("#618: no current-state evidence fails OPEN — an absent/malformed tracker read proves nothing", () => {
-  for (const wf of [midPopWorkflow(31, { withState: false }), null, undefined]) {
+test("#618: no current-state evidence does not manufacture a mid-population verdict", () => {
+  for (const wf of [null, undefined]) {
     const verdict = resolveGraphBindingVerdict({
       graph: midPopRoot(8),
       rootGraph: midPopRoot(8),
@@ -3647,8 +3782,21 @@ test("#618: no current-state evidence fails OPEN — an absent/malformed tracker
       liveNodeCount: 8,
       postReconnectWindow: true,
     });
-    assert.equal(verdict, null, "unreadable current state must never manufacture a mid-population verdict");
+    assert.equal(verdict, null, "no workflow service stays legacy-available");
   }
+  const missingState = resolveGraphBindingVerdict({
+    graph: midPopRoot(8),
+    rootGraph: midPopRoot(8),
+    activeWorkflow: midPopWorkflow(31, { withState: false }),
+    liveNodeCount: 8,
+    postReconnectWindow: true,
+  });
+  assert.equal(
+    missingState?.reason,
+    "root-state-unreadable",
+    "a present workflow with no current state is the #1215 leftover-canvas refuse, not mid-population",
+  );
+  assert.notEqual(missingState?.reason, "root-mid-population");
 });
 
 test("#618: equal or AHEAD live counts do not fire — only a canvas BEHIND the workflow's own state is mid-restore evidence", () => {

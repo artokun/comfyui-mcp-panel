@@ -15086,6 +15086,13 @@ const GRAPH_TOOL_EXECUTORS = {
   // graph_get_state stays registered for BACK-COMPAT with older orchestrators.
   graph_query({ types, title, where, ids, upstream_of, downstream_of, depth, fields, group_by, limit, max_chars, widget_max_chars }) {
     const { graph, rootGraph } = getGraphCtx();
+    // #1215 — same executor re-assert as graph_outline. Dispatch already runs the
+    // classified-read bar; this keeps the #389 baseline guard on so a tab switch
+    // that left the previous canvas mounted cannot be queried as the new workflow.
+    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
+      ...graphCommandBindingBar("graph_query"),
+      includeBaselineReadGuard: true,
+    });
     // #429: resync cached node rects to live geometry before the `groups` block
     // recomputes geometric membership (summarizeGroup), so it never reports stale ids.
     syncGraphNodeAreas(graph);

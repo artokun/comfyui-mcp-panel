@@ -24,10 +24,12 @@ import {
   POINTER_WATCH_UNAVAILABLE_NOTICE,
 } from "../../web/js/lib/live-canvas-capture-gate.js";
 import {
+  graphCommandBindingBar,
   graphRootMatchesState,
   graphRootStructureExtendsActiveWorkflow,
   graphRootWorkflowUuidMatches,
   graphRootWorkflowUuidMismatches,
+  resolveGraphBindingVerdict,
 } from "../../web/js/lib/graph-binding.js";
 import {
   classifyOpenSwitchFailure,
@@ -1784,6 +1786,139 @@ test("#1215 production workflow_open refuses when the load leaves the previous t
   );
   assert.equal(root._nodes[0].widgets_values[0], "previous-value", "the leftover canvas is still SOURCE");
   assert.equal(panel.guard(), null, "the refused open still releases its reload guard");
+});
+
+test("#1215 production workflow_open that cannot repaint does not let outline/query serve the previous canvas", async () => {
+  const sourceUuid = "krea-118-0000-4000-8000-00000000000a";
+  const targetUuid = "remove-bg-0000-4000-8000-00000000000b";
+  const previousNodes = Array.from({ length: 118 }, (_, i) => ({ id: i + 1, type: "KSampler" }));
+  const root = {
+    _nodes: previousNodes.map((node) => ({ ...node })),
+    extra: {},
+  };
+  const previous = {
+    path: "workflows/image_krea.json",
+    changeTracker: { activeState: { nodes: previousNodes, links: [], groups: [] } },
+  };
+  const target = {
+    path: "workflows/remove_bg_workflow.json",
+    filename: "remove_bg_workflow.json",
+    isModified: false,
+  };
+  let active = previous;
+  const subscribers = [];
+  const workflowStore = {
+    $subscribe: (subscriber) => {
+      subscribers.push(subscriber);
+      return () => {
+        const index = subscribers.indexOf(subscriber);
+        if (index >= 0) subscribers.splice(index, 1);
+      };
+    },
+  };
+  const app = {
+    rootGraph: root,
+    graph: root,
+    canvas: { graph: root },
+    loadGraphData: async () => {
+      throw new Error("a target with no complete state must not reach loadGraphData");
+    },
+    extensionManager: {
+      workflow: {
+        openWorkflows: [target],
+        workflows: [],
+        getWorkflowByPath: () => target,
+        openWorkflow: async () => {
+          active = target;
+        },
+      },
+    },
+  };
+  const panel = productionExecutor("workflow_open", {
+    backendReconnectEpoch: 4,
+    activeWorkflowResyncEpoch: 4,
+    postReconnectBindingProofEpoch: 4,
+    app,
+    document: workflowPiniaDocument(workflowStore),
+    activeWorkflowRef: () => active,
+    sameWorkflowObject: (a, b) => a === b,
+    workflowTabId: (workflow) => `wf:${workflow.path}`,
+    WORKFLOW_META_NAMESPACE: "comfyui_mcp",
+    WORKFLOW_UUID_FIELD: "workflow_uuid",
+    WORKFLOW_PATH_FIELD: "workflow_path",
+    OPEN_PROOF_FIELD: "open_proof",
+    workflowObjectUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowStableUuid: (workflow) => (workflow === previous ? sourceUuid : targetUuid),
+    workflowOwnsRootUuidTag: () => false,
+    workflowUuidOwner: () => null,
+    getWorkflowTitle: () => "remove_bg_workflow",
+    waitForReconnectHandshakeBeforeOpen: async () => {},
+    comfyBackendIsDown: () => false,
+    postReconnectBindingSettleWindow: () => false,
+    nodeDefRefreshInFlight: null,
+    flushSourceCanvasBeforeSwitch: async () => {},
+    claimActiveWorkflowMove: () => {},
+    acquireCanvasInteractionLock: () => null,
+    releaseCanvasInteractionLock: () => {},
+    MOVE_CAUSES: { OPEN_EXECUTOR: "workflow_open" },
+    settleOpenedWorkflowTarget: async () => ({ target, loaded: false }),
+    workflowRecordMatchesSelector: () => true,
+    installNodeConfigureIsolation: () => ({ failures: [], restore: () => {} }),
+    installGraphConfigureWatch: () => ({ restore: () => {} }),
+    loadRestoreCompleted: () => true,
+    retryNodeRestores: async () => ({ restored: [], failed: [], recovered: [] }),
+    liteGraphGlobal: () => null,
+    getGraphCtx: () => ({ graph: root, rootGraph: root }),
+    decideLiveCanvasCapture: decideLiveCanvasCapture,
+    applySavedNodePresentation: () => {},
+    applySavedSubgraphHostWidgets: () => {},
+    decideOpenStaleness: () => ({ stale: false, reload: false }),
+    describeRepaintSourceBinding: () => "unknown",
+    graphRootCarriesOpenProof: () => false,
+    graphRootReproducesStateContent: () => ({ proven: false, presentationOnly: false, normalizedOnly: false }),
+    graphRootStructureExtendsActiveWorkflow,
+    describeGraphStateDifference: () => ({ comparable: true, surfaces: ["nodes"], accountedSurfaces: [], nodeDifference: null }),
+    openContentDifferenceIsDefinitionsOnly: () => false,
+    resolveOpenRebindVerdict: () => ({ status: "unproven" }),
+    describeOpenRebindOutcome: () => "could not prove rebound",
+    OPEN_REBIND_STATUS: { PROVEN: "proven", CONTENT_UNVERIFIED: "content-unverified", UNPROVEN: "unproven" },
+    GRAPH_TOOL_EXECUTORS: { graph_outline: () => ({ node_count: 118 }) },
+    settleOpenedWorkflowReadable,
+    settleOwnedOpenedWorkflowActive,
+    noteOpenAttempt: () => ({ seq: 1 }),
+    backendSocketReplyFields: () => ({}),
+    activeWorkflowUuidForOpenReply: () => targetUuid,
+    describeOpenActiveBinding: () => ({ active_matches_target: true }),
+    canvasFileDivergenceNote: () => null,
+    failOpenRebindUnknown: (error) => error,
+    coerceMessageText: (value) => String(value),
+  });
+
+  await assert.rejects(
+    panel.method({ path: "remove_bg_workflow.json", rid: "safe-repaint-previous-canvas" }),
+    /safe repaint/,
+    "the open must refuse rather than paint TARGET's fence over SOURCE's canvas",
+  );
+  assert.equal(active, target, "the pointer has already moved, as in the recurrence");
+  assert.equal(root._nodes.length, 118, "the live canvas is still the previous graph");
+  assert.equal(panel.guard(), null);
+
+  for (const cmd of ["graph_outline", "graph_query"]) {
+    const verdict = resolveGraphBindingVerdict({
+      graph: root,
+      rootGraph: root,
+      activeWorkflow: target,
+      activeWorkflowUuid: targetUuid,
+      liveNodeCount: root._nodes.length,
+      ...graphCommandBindingBar(cmd),
+      includeBaselineReadGuard: true,
+    });
+    assert.equal(
+      verdict?.reason,
+      "root-state-unreadable",
+      `${cmd} must refuse after set_workflow_target current — the fence names TARGET, the canvas is still SOURCE`,
+    );
+  }
 });
 
 test("#1639 production workflow_open remembers a switch-away-and-back during an awaited open step", async () => {
