@@ -119,7 +119,7 @@ function resolveSameOriginUrl(api, path, expectedOrigin = pageOrigin()) {
   const transportPath = useFileUrl ? LOGS_TRANSPORT_PATH : path;
   let rawUrl;
   try {
-    rawUrl = resolver(transportPath);
+    rawUrl = resolver.call(api, transportPath);
   } catch (error) {
     throw readError(
       "api_unavailable",
