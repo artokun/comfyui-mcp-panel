@@ -5132,6 +5132,30 @@ function noteWorkflowIdentityDrift() {
 // and #750/#1019 rebuild it in isolation with `new Function`, where a module global does not
 // exist. One line on purpose (see above). Appended, never substituted — the refusal's own
 // reasoning survives; the note only says WHY the active workflow is not what was expected.
+/**
+ * #2139 — the active tab's save/modify state, as EVIDENCE rather than a guarantee.
+ *
+ * `isModified` is set by ComfyUI's ChangeTracker, which does not observe every
+ * programmatic edit, so `true` is evidence of drift and `false` is evidence of
+ * nothing. Both callers of `workflowInstanceMismatchMessage` need the same
+ * reading, and the primary dispatch fence was passing neither — its refusal is
+ * the one a caller actually sees for an ordinary instance mismatch, so the
+ * discard warning never fired on the path it was written for. One probe, both
+ * sites, so they cannot drift apart.
+ */
+function activeWorkflowSaveState() {
+  try {
+    const active = activeWorkflowRef();
+    if (!active) return { activeIsUnsaved: null, activeIsModified: null };
+    return {
+      activeIsUnsaved: !savedWorkflowPath(active),
+      activeIsModified: active.isModified === true ? true : null,
+    };
+  } catch {
+    return { activeIsUnsaved: null, activeIsModified: null };
+  }
+}
+
 function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, activeIsModified = null, movedNote = null } = {}) {
   const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const expected = str(commandUuid);
@@ -5238,26 +5262,16 @@ function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
     // "Since the new workflow is unsaved, panel_open_workflow cannot recover it."
     // Read defensively: an unreadable path is not evidence either way, and the message
     // then keeps its existing wording rather than claiming something about the tab.
-    let activeIsUnsaved = null;
     // #2139 — read-only, and only the POSITIVE reading counts. `isModified` is
     // ComfyUI's own flag; #882 records that it is derived from USER INPUT captures,
     // so a value a NODE wrote leaves it false while the canvas already differs.
     // `true` is therefore evidence of drift and `false` is evidence of nothing —
     // which is the right shape for a warning, and the reason this does not capture
-    // first the way a caller about to DISCARD the canvas must.
-    let activeIsModified = null;
-    try {
-      const active = activeWorkflowRef();
-      if (active) {
-        activeIsUnsaved = !savedWorkflowPath(active);
-        activeIsModified = active.isModified === true ? true : null;
-      }
-    } catch {
-      activeIsUnsaved = null;
-      activeIsModified = null;
-    }
+    // first the way a caller about to DISCARD the canvas must. Both readings come
+    // from `activeWorkflowSaveState()` so this fence and the dispatch fence cannot
+    // disagree about the same tab.
     throw new Error(
-      workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved, activeIsModified }),
+      workflowInstanceMismatchMessage({ commandUuid, activeUuid, ...activeWorkflowSaveState() }),
     );
   }
 }
@@ -29645,6 +29659,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                   workflowInstanceMismatchMessage({
                     commandUuid: dispatchCommandUuid,
                     activeUuid: dispatchActiveUuid,
+                    // #2139 — this fence is the refusal an ordinary instance mismatch
+                    // produces, so it must carry the same discard warning as the
+                    // write-boundary assertion below. It passed neither flag, which
+                    // left the warning unreachable on the primary path.
+                    ...activeWorkflowSaveState(),
                     // #968 — what last moved the active workflow, if anything did. This is the
                     // refusal a caller actually sees when a binding has gone stale.
                     movedNote: activeWorkflowMoves.describeLast(),

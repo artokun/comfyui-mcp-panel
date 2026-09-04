@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- the re-open discard warning now reaches the refusal callers actually hit (#2139). It was wired only into the secondary write-boundary assertion; the PRIMARY dispatch fence called the same message builder with commandUuid/activeUuid/movedNote only, so activeIsModified defaulted to null and an ordinary workflow-instance mismatch never showed the warning — the fence whose own comment calls it "the refusal a caller actually sees". Both sites now read through one shared activeWorkflowSaveState() probe so they cannot disagree about the same tab. Found by the Copilot review on the PR
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
   saved tab carrying unsaved drift that is the one recovery that loses it, which is the

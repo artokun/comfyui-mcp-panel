@@ -166,8 +166,24 @@ test("#968 WIRED: the observer runs before the refusal, and the note reaches it"
   //    property rather than the arity: the count was never what mattered.
   assert.match(
     src,
-    /workflowInstanceMismatchMessage\(\{\s*commandUuid,\s*activeUuid,\s*activeIsUnsaved,\s*activeIsModified\s*\}\)/,
+    /workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, \.\.\.activeWorkflowSaveState\(\) \}\)/,
     "the fence helper passes every input as an argument",
+  );
+  // ...and the PRIMARY dispatch fence carries the same reading. It used to pass only
+  // commandUuid/activeUuid/movedNote, so activeIsModified defaulted to null and #2139's
+  // discard warning was unreachable on the refusal an ordinary mismatch produces.
+  // Anchor on the CALL, not on "commandUuid: dispatchCommandUuid" — that string also
+  // appears in the commandTargetsActiveWorkflow guard a few lines above, and slicing
+  // from the first hit looks at the wrong block.
+  const primary = src
+    .split(/(?<!function )workflowInstanceMismatchMessage\(\{/)
+    .slice(1)
+    .find((c) => c.slice(0, 400).includes("dispatchCommandUuid"));
+  assert.ok(primary, "the dispatch fence still builds a mismatch message");
+  assert.match(
+    primary.slice(0, 700),
+    /\.\.\.activeWorkflowSaveState\(\)/,
+    "the dispatch fence must carry the save-state reading too",
   );
 });
 

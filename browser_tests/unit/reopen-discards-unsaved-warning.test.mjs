@@ -89,7 +89,9 @@ test("#2139 the reading is POSITIVE-only and takes no capture", () => {
   // A capture inside an error message is a mutation on a path that is already
   // failing. #882's capture helper exists for callers about to DISCARD a canvas;
   // this is not one.
-  const at = SRC.indexOf("let activeIsModified = null;");
+  // The read now lives in the SHARED probe, because the primary dispatch fence
+  // needed the same reading and was passing neither flag — see the wiring test below.
+  const at = SRC.indexOf("function activeWorkflowSaveState()");
   assert.ok(at > -1, "the read moved — re-point this test");
   const block = SRC.slice(at, at + 900);
   assert.match(block, /active\.isModified === true \? true : null/);
