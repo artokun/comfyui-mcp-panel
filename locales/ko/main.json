@@ -287,10 +287,10 @@
       "action_rewind_the_canvas": "캔버스 되감기",
       "action_roll_back_the_canvas": "캔버스 롤백",
       "canvas_not_restored_no_snapshot": "캔버스가 복원되지 않았습니다 — 사용할 수 있는 그래프 스냅샷이 없어, 되돌리려던 편집 내용이 그대로 남아 있습니다.",
-      "could_not_action_nothing_was_loaded": "⚠️ {action}을(를) 할 수 없습니다 — 아무것도 로드되지 않아 그래프 편집이 적용되지 않았으며, 다시 시도해도 안전합니다. {reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ {action}이(가) 실행되었는지 확인할 수 없습니다 — 패널이 인식하지 못하는 결과를 받았으니, 다른 작업을 하기 전에 캔버스를 확인하세요.",
+      "could_not_action_nothing_was_loaded": "⚠ {action}을(를) 할 수 없습니다 — 아무것도 로드되지 않아 그래프 편집이 적용되지 않았으며, 다시 시도해도 안전합니다. {reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ {action}이(가) 실행되었는지 확인할 수 없습니다 — 패널이 인식하지 못하는 결과를 받았으니, 다른 작업을 하기 전에 캔버스를 확인하세요.",
       "no_reason_was_reported": "이유가 보고되지 않았습니다.",
-      "the_action_ran_but_unconfirmed": "⚠️ {action}은(는) 실행되었지만 패널이 결과를 확인하지 못했습니다. 캔버스가 변경되었을 수 있으니 다른 작업을 하기 전에 확인하세요. {reason}"
+      "the_action_ran_but_unconfirmed": "⚠ {action}은(는) 실행되었지만 패널이 결과를 확인하지 못했습니다. 캔버스가 변경되었을 수 있으니 다른 작업을 하기 전에 확인하세요. {reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager에 연결할 수 없습니다 (내장 Manager가 켜져 있나요?)"
@@ -338,7 +338,7 @@
       "auto_arranged_nodes_other": "노드 {count}개 자동 정렬",
       "auto_let_the_agent_pick": "자동 (에이전트가 선택)",
       "auto_restart_failed": "자동 재시작 실패: {error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ 베타 — 앱이 빠르게 바뀌고 있어 업데이트 사이에 동작이 깨질 수 있습니다. 위 토글을 켜고, 사용하는 플랫폼용으로 설치한 다음, 패널 헤더의 QR 버튼으로 페어링하세요.",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ 베타 — 앱이 빠르게 바뀌고 있어 업데이트 사이에 동작이 깨질 수 있습니다. 위 토글을 켜고, 사용하는 플랫폼용으로 설치한 다음, 패널 헤더의 QR 버튼으로 페어링하세요.",
       "blind": "가림",
       "blocked_a_chat_from_another_workflow_open": "다른 워크플로우의 대화가 차단되었습니다. 이어서 진행하려면 \"{workflow}\"를 먼저 여세요.",
       "bridge_url": "브리지 URL",
@@ -810,7 +810,7 @@
       "the_canvas_was_not_reverted_no_graph": "캔버스는 되돌려지지 않았습니다 — 해당 턴의 그래프 스냅숏이 없습니다(최근 25개까지만 보관되고 이후에는 삭제됩니다). 메시지는 입력창으로 돌아왔지만 캔버스에는 그 턴의 편집이 그대로 남아 있습니다.",
       "the_connection_that_asked_this_dropped_so": "이 {what}을(를) 요청한 연결이 끊겨서, 여기서 답해도 에이전트에 전달되지 않습니다.",
       "the_old_session_could_not_be_invalidated": "이전 세션을 확실히 무효화하지 못했습니다. 복원되는 것을 막기 위해 재연결을 일시 중지했습니다.",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ 오케스트레이터가 가림 모드 변경을 확인하지 않았습니다 — v0.42.0 이전 버전일 수 있으며, 그 경우 가림은 패널 자체의 이미지 피드만 막고 에이전트의 이미지 도구는 막지 않습니다. 완전히 적용하려면 comfyui-mcp를 업데이트하세요.",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ 오케스트레이터가 가림 모드 변경을 확인하지 않았습니다 — v0.42.0 이전 버전일 수 있으며, 그 경우 가림은 패널 자체의 이미지 피드만 막고 에이전트의 이미지 도구는 막지 않습니다. 완전히 적용하려면 comfyui-mcp를 업데이트하세요.",
       "the_panel_agent_dropped_restarting_it": "패널 에이전트가 끊겼습니다 — 재시작하는 중…",
       "the_panel_agent_isn_t_answering_yet": "패널 에이전트가 아직 응답하지 않습니다 — 다시 연결하는 중…",
       "the_panel_agent_keeps_failing_to_start": "⚠ 패널 에이전트가 계속 시작에 실패합니다. 로그인 상태를 확인한 뒤(`claude`를 한 번 실행, Codex는 `codex login`, Gemini는 `gemini`, 로컬 모델은 `ollama serve`) 연결을 누르세요.",

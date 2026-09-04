@@ -70,6 +70,53 @@ test("panel#2023 nothing REQUESTS emoji presentation, anywhere in web/js", () =>
   assert.deepEqual(offenders, [], `U+FE0F still shipped in: ${offenders.join(", ")}`);
 });
 
+test("panel#2023 the LOCALE CATALOGS request it either, and they are what renders", () => {
+  // The gate above walks every shipped .js and still missed this, because the JS
+  // literal is only the FALLBACK. `tr()` resolves the catalog FIRST:
+  //
+  //     if (loaded) out = catalog[key];
+  //     if (out === undefined) out = fallback;
+  //
+  // So on any normal load the string that reaches the DOM comes from
+  // locales/<lang>/main.json, not from the source line next to it. Five keys carried
+  // the selector in all twelve languages -- three of them in graph-revert, the very
+  // file whose fallbacks were cleaned -- so the render path still asked for the
+  // emoji face while the source read as fixed.
+  //
+  // English is GENERATED (`npm run i18n:build`) from the tr() fallbacks; the other
+  // eleven are translations, and the selector is stripped from them byte-wise so no
+  // translated wording is touched.
+  const offenders = [];
+  const localesDir = join(HERE, "../../locales");
+  for (const lang of readdirSync(localesDir, { withFileTypes: true })) {
+    if (!lang.isDirectory()) continue;
+    for (const f of readdirSync(join(localesDir, lang.name))) {
+      if (!f.endsWith(".json")) continue;
+      const rel = `${lang.name}/${f}`;
+      const n = [...readFileSync(join(localesDir, lang.name, f), "utf8")].filter((c) => c === "️").length;
+      if (n > 0) offenders.push(`${rel} (${n})`);
+    }
+  }
+  assert.deepEqual(offenders, [], `U+FE0F still shipped in catalogs: ${offenders.join(", ")}`);
+});
+
+test("panel#2023 the catalog really does win over the fallback", () => {
+  // The reason the test above has to exist. If tr() ever preferred the fallback,
+  // cleaning the .js alone WOULD be sufficient and this gate could relax; pin the
+  // resolution order so that stays a deliberate decision rather than a silent drift.
+  const i18n = readFileSync(join(WEB_JS, "lib/i18n.js"), "utf8");
+  const at = i18n.indexOf("export function tr(");
+  assert.ok(at > -1);
+  const body = i18n.slice(at, at + 900);
+  // Anchor on the SINGULAR branch. tr() has a plural branch above it whose own
+  // `out === undefined` sits earlier in the function, so an unanchored search
+  // compares two different clauses and reports the order backwards.
+  const cat = body.indexOf("out = catalog[key];");
+  const fb = body.indexOf("out === undefined", cat);
+  assert.ok(cat > -1, "tr()'s singular catalog lookup not found");
+  assert.ok(fb > cat, "tr() must consult the catalog before falling back");
+});
+
 test("panel#2023 the warning glyph itself is still there", () => {
   // The selector goes; the glyph stays. Dropping the warning sign would be a
   // different change, and a worse one — these are the lines that tell a user a run

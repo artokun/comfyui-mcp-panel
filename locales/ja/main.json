@@ -287,10 +287,10 @@
       "action_rewind_the_canvas": "キャンバスの巻き戻し",
       "action_roll_back_the_canvas": "キャンバスのロールバック",
       "canvas_not_restored_no_snapshot": "キャンバスは復元されていません — これに対応するグラフのスナップショットがないため、取り消そうとした編集がそのまま残っています。",
-      "could_not_action_nothing_was_loaded": "⚠️ {action}を実行できませんでした — 何も読み込まれなかったためグラフへの編集は適用されておらず、やり直しても安全です。{reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ {action}が行われたかどうか判別できませんでした — パネルが認識できない結果を受け取ったため、次の操作に進む前にキャンバスを確認してください。",
+      "could_not_action_nothing_was_loaded": "⚠ {action}を実行できませんでした — 何も読み込まれなかったためグラフへの編集は適用されておらず、やり直しても安全です。{reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ {action}が行われたかどうか判別できませんでした — パネルが認識できない結果を受け取ったため、次の操作に進む前にキャンバスを確認してください。",
       "no_reason_was_reported": "理由は報告されていません。",
-      "the_action_ran_but_unconfirmed": "⚠️ {action}は実行されましたが、パネルは結果を確認できませんでした。キャンバスが変わっている可能性があるため、次の操作に進む前に確認してください。{reason}"
+      "the_action_ran_but_unconfirmed": "⚠ {action}は実行されましたが、パネルは結果を確認できませんでした。キャンバスが変わっている可能性があるため、次の操作に進む前に確認してください。{reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager に接続できません（内蔵 Manager は有効になっていますか？）"
@@ -338,7 +338,7 @@
       "auto_arranged_nodes_other": "ノード {count} 個を自動整列しました",
       "auto_let_the_agent_pick": "自動（エージェントに任せる）",
       "auto_restart_failed": "自動再起動に失敗しました: {error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ ベータ — アプリの変化が速く、更新のあいだに動かなくなることがあります。上のトグルをオンにして、お使いのプラットフォーム向けをインストールし、パネルヘッダーの QR ボタンでペアリングしてください。",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ ベータ — アプリの変化が速く、更新のあいだに動かなくなることがあります。上のトグルをオンにして、お使いのプラットフォーム向けをインストールし、パネルヘッダーの QR ボタンでペアリングしてください。",
       "blind": "ブラインド",
       "blocked_a_chat_from_another_workflow_open": "別のワークフローのチャットをブロックしました。再開するには先に「{workflow}」を開いてください。",
       "bridge_url": "ブリッジ URL",
@@ -810,7 +810,7 @@
       "the_canvas_was_not_reverted_no_graph": "キャンバスは戻していません — そのターンのグラフスナップショットがありません（直近 25 件だけ保持され、それより古いものは破棄されます）。メッセージはコンポーザーに戻しましたが、キャンバスにはそのターンの編集が残っています。",
       "the_connection_that_asked_this_dropped_so": "この{what}を送った接続が切断されたため、ここで回答してもエージェントには届きません。",
       "the_old_session_could_not_be_invalidated": "古いセッションを確実に無効化できませんでした。復元してしまうのを避けるため、再接続を一時停止しています。",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ オーケストレーターがブラインド設定の変更を確認しませんでした — v0.42.0 より前の可能性があります。そのバージョンではブラインドはパネル自身の画像フィードしか制御せず、エージェントの画像ツールは制御されません。完全に適用するには comfyui-mcp を更新してください。",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ オーケストレーターがブラインド設定の変更を確認しませんでした — v0.42.0 より前の可能性があります。そのバージョンではブラインドはパネル自身の画像フィードしか制御せず、エージェントの画像ツールは制御されません。完全に適用するには comfyui-mcp を更新してください。",
       "the_panel_agent_dropped_restarting_it": "パネルのエージェントが切断されました — 再起動しています…",
       "the_panel_agent_isn_t_answering_yet": "パネルのエージェントがまだ応答しません — 接続し直しています…",
       "the_panel_agent_keeps_failing_to_start": "⚠ パネルのエージェントが起動に失敗し続けています。サインインできているか確認してから（`claude` を一度実行、Codex なら `codex login`、Gemini なら `gemini`、ローカルモデルなら `ollama serve`）、「接続」をクリックしてください。",
