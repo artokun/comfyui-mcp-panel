@@ -46,8 +46,16 @@ test("#2183 keeps record identity on live and inert card roots", () => {
 test("#2183 no-card_id dismissal resolves only the displayed thread and persists it", () => {
   const dismiss = blockAfter(panelSrc, "onUiDismiss(msg) {");
   assert.match(dismiss, /dismissAllLiveA2uiCards\(liveA2uiCards/);
-  assert.match(dismiss, /for \(const rec of thread\?\.msgs \|\| \[\]\)/);
-  assert.match(dismiss, /rec\?\.kind !== "a2ui" \|\| rec\.resolved === true/);
+  // Still the DISPLAYED thread, which is the scope claim worth keeping here — the
+  // sweep must not reach other threads. `unresolvedA2UICards` handles the null/empty
+  // cases the old `|| []` covered, and those are driven in a2ui-sweep-selection.
+  assert.match(dismiss, /for \(const rec of unresolvedA2UICards\(thread\?\.msgs\)\)/);
+  // The selection itself moved to `lib/a2ui-sweep.js` and is DRIVEN in
+  // a2ui-sweep-selection.test.mjs — a2ui-only, unresolved-only, `resolved === true`
+  // rather than truthy, and the empty/null-hole cases. What is worth pinning HERE is
+  // only that the handler still delegates to that vetted selection rather than
+  // re-deriving one inline, which is how the two would drift apart.
+  assert.match(dismiss, /unresolvedA2UICards\(thread\?\.msgs\)/);
   assert.match(dismiss, /rec\.resolved = true/);
   assert.match(dismiss, /historyStore\.touchMessage\(rec\)/);
   assert.match(dismiss, /persistThreads\(\)/);

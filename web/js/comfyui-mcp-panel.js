@@ -78,6 +78,7 @@ import {
   settleVramOccupancyAfterFree,
 } from "./lib/vram-occupancy.js";
 import { nodeInstanceIdentity } from "./lib/node-identity.js";
+import { unresolvedA2UICards } from "./lib/a2ui-sweep.js";
 import { describeVoiceError } from "./lib/voice-error.js";
 import { voiceRecognitionLang } from "./lib/voice-language.js";
 import { isEmbeddedDesktopShell, voiceInputSupport } from "./lib/voice-support.js";
@@ -40803,8 +40804,7 @@ function buildPanel() {
       const fallbackCardIds = [];
       let fallbackDismissed = 0;
       try {
-        for (const rec of thread?.msgs || []) {
-          if (rec?.kind !== "a2ui" || rec.resolved === true) continue;
+        for (const rec of unresolvedA2UICards(thread?.msgs)) {
           rec.resolved = true;
           historyStore.touchMessage(rec);
           fallbackDismissed += 1;

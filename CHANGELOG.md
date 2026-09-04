@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- the no-card_id dismiss sweep is now DRIVEN by tests, not matched as source text (#2183). Its selection - a2ui only, unresolved only - decides how much a destructive recovery destroys: it sets `resolved` on records, touches the history store, removes DOM nodes and persists, and it runs during the reload/rebind window. Every assertion about it matched the TEXT of `onUiDismiss`, and no browser spec exercises `ui_dismiss` either, so a reorder or rename that kept the text passed while the behaviour went unchecked. The selection moved to a pure `lib/a2ui-sweep.js` and is exercised directly: already-resolved records are left alone, non-a2ui records are never swept, `resolved` is compared to TRUE rather than truthy (a timestamp must not read as dismissed), and a missing thread or a null hole sweeps nothing instead of throwing.
 - an oversized A2UI card scrolls inside its own surface instead of consuming the chat viewport, and a `ui_dismiss` that carries no `card_id` now survives a reload or rebind by resolving only the still-unresolved cards in the displayed thread (#2183)
 
 ## [0.15.171] - 2026-09-04
