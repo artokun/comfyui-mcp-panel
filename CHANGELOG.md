@@ -23,6 +23,12 @@ All notable changes to this project are documented here. This project adheres to
   untouched.
 - the emoji-presentation removal now covers every shipped web/js file rather than the main bundle alone (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
 
+## [0.15.167] - 2026-09-04
+
+### Fixed
+- fetch_comfyui_read keeps the Comfy API object as `this` when calling apiURL/fileURL, so frontend helpers that read `this.api_base` still resolve after restart instead of throwing "Cannot read properties of undefined (reading 'api_base')" (#2228, #2229)
+
+
 ## [0.15.166] - 2026-09-04
 
 ### Fixed
