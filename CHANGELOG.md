@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234)
+
 ## [0.15.168] - 2026-09-04
 
 ### Fixed
