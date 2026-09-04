@@ -6,9 +6,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
-- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222)
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
   whose counter sits below an id it already holds had a bystander's record silently
@@ -19,6 +17,12 @@ All notable changes to this project are documented here. This project adheres to
   repair on every success path instead of doing it silently: raising the counter protects
   the next connect and cannot undo the collisions already made, so a graph that needed it
   may already have wires that moved, and the reply now says so (#2196).
+
+## [0.15.165] - 2026-09-04
+
+### Fixed
+- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222, #2223)
+
 
 ## [0.15.164] - 2026-09-03
 
