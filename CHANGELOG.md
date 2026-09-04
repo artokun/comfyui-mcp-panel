@@ -6,9 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+
 ### Fixed
-- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215)
 - panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
+## [0.15.170] - 2026-09-04
+
+### Fixed
+- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215, #2238)
+
 
 ## [0.15.169] - 2026-09-04
 
