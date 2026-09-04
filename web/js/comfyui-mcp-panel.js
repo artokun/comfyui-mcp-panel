@@ -24574,7 +24574,13 @@ const GRAPH_TOOL_EXECUTORS = {
                 ? {
                     stale_hint:
                       "Could not verify whether the on-disk file still matches this tab (disk read unavailable or slower than its deadline), AND this tab has unsaved edits. Treat the canvas as possibly stale, but do NOT reach for panel_load_workflow first: it loads the on-disk version over the canvas and those unsaved edits are discarded. Save first, then re-read if you still need to.",
-                    conflict: true,
+                    // NOT `conflict: true`. A conflict is "the file changed on disk
+                    // AND this tab has unsaved edits" — and on this arm staleness is
+                    // explicitly UNVERIFIED, so only the second half is known. Claiming
+                    // one would assert the very thing the sentence above admits it could
+                    // not check, which is the same overclaim the positive-evidence rule
+                    // in #2204 exists to prevent. The hint says what is at risk; it does
+                    // not need a flag saying what was not established.
                   }
                 : {
                     stale_hint:

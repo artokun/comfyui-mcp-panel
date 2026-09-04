@@ -1428,6 +1428,23 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
 // Scoped to the branch region and comment-stripped on purpose: the fix ships with a long
 // explanatory comment naming these very identifiers, and an unscoped `assert.match` over
 // the handler body would pass on the comment alone.
+test("#2139 the unknown arm does not CLAIM a conflict it could not verify", () => {
+  // A conflict is "the file changed on disk AND this tab has unsaved edits". On this
+  // arm the disk read failed, so only the second half is known — asserting `conflict`
+  // would claim exactly what the hint admits it could not check. The agent reads that
+  // key as established fact, so an unverified `true` is worse than an absent field.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = stripComments(handlerBody(src, "async workflow_open({"));
+  const at = body.indexOf('staleInfo.stale === "unknown"');
+  assert.notEqual(at, -1, "the unknown arm must still exist");
+  const region = body.slice(at, at + 2200);
+  assert.match(region, /dirtyNow \|\| wasDirty/, "the arm must still branch on dirtiness");
+  assert.doesNotMatch(
+    region,
+    /conflict:\s*true/,
+    "unknown staleness must not assert a conflict; the CONFLICT arm above owns that claim",
+  );
+});
 test("#2139 the unknown-staleness arm does not tell a DIRTY tab to load over its edits", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const body = stripComments(handlerBody(src, "async workflow_open({"));
