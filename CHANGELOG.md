@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181)
 - pin the property the sign-in timeout silently depends on (#2044). `++tries` sits after `await refreshAuth()`, so if that call ever propagated a rejection the interval callback would abort before the counter moved, the count would never reach 120, and the new give-up branch would never fire - restoring the exact silence this fixes, under the server-down/network-error case that is one of the likelier reasons a sign-in does not complete. It is safe only because `refreshAuth` swallows its own fetch failure and records signed-out; that is now asserted at the site that depends on it, so a refactor letting it throw fails a test instead of quietly un-fixing the timeout.
 - CivitAI sign-in now says when it did not complete (panel#2044). The poll gave up after
   four minutes in silence while the popup showed a bare browser 403 that ComfyUI never
