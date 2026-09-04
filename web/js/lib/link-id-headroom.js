@@ -66,9 +66,25 @@ export function collectLinkIds(links) {
  * reachable only through the record, and allocating past the store's key alone
  * would still collide with it.
  */
+/**
+ * The link store, from EITHER shape. `_links` is the modern private Map; older
+ * LiteGraph builds expose the plain object/array as `links`, and the rest of the
+ * panel already reads both (`disconnect-verify.js`, `connect-verify.js`).
+ *
+ * Reading only `_links` made this helper return null on those builds, so the
+ * stale counter was never repaired and #2108's overwrite survived the fix
+ * entirely — silently, because "no links" and "no store" produced the same
+ * answer.
+ */
+function linkStore(graph) {
+  const modern = graph?._links;
+  if (modern) return modern;
+  return graph?.links ?? null;
+}
+
 export function highestLinkId(graph) {
-  const ids = collectLinkIds(graph?._links);
-  const links = graph?._links;
+  const links = linkStore(graph);
+  const ids = collectLinkIds(links);
   if (links && typeof links.values === "function") {
     for (const link of links.values()) {
       const n = Number(link?.id);

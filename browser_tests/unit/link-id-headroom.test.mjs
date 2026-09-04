@@ -315,3 +315,50 @@ test("#2196 the promotion loop accumulates repairs and surfaces them once", () =
     "the promotion reply stopped surfacing collected repairs",
   );
 });
+
+// #2108 — EXECUTION, not source text. The wiring tests above read the bundle; they
+// prove the call exists, not that a stale counter stops overwriting a live link.
+// These drive the real helper against both store shapes and assert the outcome.
+describe_legacy();
+function describe_legacy() {
+  /** A graph on an OLDER LiteGraph: the plain record lives on `links`, not `_links`. */
+  function makeLegacyGraph(lastLinkId, links) {
+    return {
+      state: { lastLinkId },
+      links,
+      get last_link_id() {
+        return this.state.lastLinkId;
+      },
+      set last_link_id(v) {
+        this.state.lastLinkId = v;
+      },
+    };
+  }
+
+  test("#2108 a LEGACY `links` store is read, so the counter is still repaired", () => {
+    // Reading only `_links` returned null here, so `adjusted` was false and the very
+    // next allocation re-used id 4 and overwrote the existing link.
+    const graph = makeLegacyGraph(1, { 4: { id: 4 } });
+    const res = ensureLinkIdHeadroom(graph);
+    assert.equal(res.adjusted, true, "the legacy store must be read");
+    assert.equal(res.to, 4);
+    assert.equal(graph.last_link_id, 4);
+  });
+
+  test("#2108 the repair actually prevents the collision it exists for", () => {
+    // Allocate the way the frontend does — ++counter — and prove the id it yields is
+    // free. Without the repair this returns 2, which already exists.
+    const links = { 4: { id: 4 } };
+    const graph = makeLegacyGraph(1, links);
+    ensureLinkIdHeadroom(graph);
+    const minted = ++graph.state.lastLinkId;
+    assert.equal(minted, 5);
+    assert.ok(!(minted in links), "the minted id must not already be in the store");
+  });
+
+  test("#2108 the modern `_links` Map still wins when both are present", () => {
+    const graph = makeGraph(1, asMap([7]));
+    graph.links = { 99: { id: 99 } };
+    assert.equal(ensureLinkIdHeadroom(graph).to, 7, "the modern store is authoritative");
+  });
+}
