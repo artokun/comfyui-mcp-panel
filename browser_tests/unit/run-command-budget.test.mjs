@@ -72,7 +72,11 @@ import {
   scopedBatchDriveNote,
   rgthreeFixedSeedNote,
 } from "../../web/js/lib/scoped-batch-seed.js";
-import { collectVirtualSourceFeeds, virtualSourceNote } from "../../web/js/lib/virtual-source-promotion.js";
+import {
+  collectVirtualSourceFeeds,
+  installGraphToPromptVirtualSourceApply,
+  virtualSourceNote,
+} from "../../web/js/lib/virtual-source-promotion.js";
 import { collectDisabledAncestorOutputs, disabledOutputsNote } from "../../web/js/lib/muted-subgraph-outputs.js";
 import { prunedRetryNote } from "../../web/js/lib/partial-run-prune.js";
 import {
@@ -745,6 +749,7 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
     installGraphToPromptNullSafety,
     installGraphToPromptSnapshotBarrier,
     installGraphToPromptDynamicReconcile,
+    installGraphToPromptVirtualSourceApply,
     queuePromptWithGraphToPromptSnapshot,
     reserveGraphToPromptSnapshot,
     releaseGraphToPromptSnapshot,

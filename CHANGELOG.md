@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181)
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
   strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
   `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash
