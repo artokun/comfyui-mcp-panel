@@ -6,12 +6,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
-- panel_run recovers the ComfyUI prompt_id after a post-dispatch `/prompt` fetch failure by reconciling a client-generated dispatch id against queue/history, and treats a confirmed miss as safe to retry (#2203)
-- the post-dispatch receipt recovery no longer treats a shared queue mark as a per-request receipt, no longer reads a FAILED /queue or /history response as an empty one, no longer loses an acceptance whose id was recovered after a malformed 200, and states plainly that a confirmed miss is a bounded observation rather than promising a retry is safe (#2203)
-- Preserve the panel-wide Codex conversation across a workflow remount when the canonical IndexedDB history read times out or is otherwise unavailable; only a confirmed empty archive may clear the transcript and session (#2201)
-- the canonical chat-history read is decided by the IndexedDB TRANSACTION rather than the request, so a get that succeeds before its transaction aborts is no longer treated as authoritative; and a delayed hydration retry no longer reselects the mount-time thread over a chat the user picked while the store was recovering (#2201)
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
   whose counter sits below an id it already holds had a bystander's record silently
@@ -32,6 +27,16 @@ All notable changes to this project are documented here. This project adheres to
   it. Inlined rather than shared, because those handlers are rebuilt by
   `new Function` harnesses that inject dependencies by name — a module-scope helper
   throws ReferenceError there, which the connect-throw-verdict suite caught.
+
+## [0.15.171] - 2026-09-04
+
+### Fixed
+- panel_run recovers the ComfyUI prompt_id after a post-dispatch `/prompt` fetch failure by reconciling a client-generated dispatch id against queue/history, and treats a confirmed miss as safe to retry (#2203, #2215)
+- the post-dispatch receipt recovery no longer treats a shared queue mark as a per-request receipt, no longer reads a FAILED /queue or /history response as an empty one, no longer loses an acceptance whose id was recovered after a malformed 200, and states plainly that a confirmed miss is a bounded observation rather than promising a retry is safe (#2203, #2215)
+- Preserve the panel-wide Codex conversation across a workflow remount when the canonical IndexedDB history read times out or is otherwise unavailable; only a confirmed empty archive may clear the transcript and session (#2201, #2214)
+- the canonical chat-history read is decided by the IndexedDB TRANSACTION rather than the request, so a get that succeeds before its transaction aborts is no longer treated as authoritative; and a delayed hydration retry no longer reselects the mount-time thread over a chat the user picked while the store was recovering (#2201, #2214)
+
+
 ## [0.15.170] - 2026-09-04
 
 ### Fixed
