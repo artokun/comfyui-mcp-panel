@@ -6,16 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
+- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215)
 - panel_run recovers the ComfyUI prompt_id after a post-dispatch `/prompt` fetch failure by reconciling a client-generated dispatch id against queue/history, and treats a confirmed miss as safe to retry (#2203)
 - the post-dispatch receipt recovery no longer treats a shared queue mark as a per-request receipt, no longer reads a FAILED /queue or /history response as an empty one, no longer loses an acceptance whose id was recovered after a malformed 200, and states plainly that a confirmed miss is a bounded observation rather than promising a retry is safe (#2203)
+
 ## [0.15.169] - 2026-09-04
 
 ### Fixed
 - graph_set_widget acknowledges a long CLIPTextEncode / multiline text write as soon as the live editor holds the value, instead of waiting on a backgrounded-tab rAF flush until the 90s relay times out (#2233, #2236)
 - Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234, #2235)
-
 
 ## [0.15.168] - 2026-09-04
 

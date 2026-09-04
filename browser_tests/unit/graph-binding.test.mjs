@@ -21,6 +21,7 @@ import {
   activeWorkflowProvenEmpty,
   graphEmptyBindingUnproven,
   graphReadDesynced,
+  graphRootUnprovenAgainstActiveState,
   missingNodeStateReportsNodes,
   graphRootMidPopulation,
   graphRootMismatchesActiveWorkflow,
@@ -288,6 +289,7 @@ function buildDirtyStaleRouteHarness({
     "app",
     "WORKFLOW_META_NAMESPACE",
     "WORKFLOW_UUID_FIELD",
+    "switchRepaintUnproven",
     `${fenceSource}\nreturn assertGraphBoundToActiveWorkflow;`,
   )(
     () => workflowA,
@@ -313,6 +315,7 @@ function buildDirtyStaleRouteHarness({
     { graph: rootB, extensionManager: { workflow: { openWorkflows } } },
     "comfyui_mcp",
     "workflow_uuid",
+    false,
   );
   return { src, workflowA, rawB, proxyB, rootB, objectUuids, stableUuid, assertBound };
 }
@@ -505,6 +508,216 @@ test("graphReadDesynced: FALSE — descended into an empty subgraph (legitimatel
 test("graphReadDesynced: defensive — missing args never throw, default to not-desynced", () => {
   assert.equal(graphReadDesynced(), false);
   assert.equal(graphReadDesynced({}), false);
+});
+
+// ── #1215: leftover previous canvas after a switch that could not repaint ────
+
+test("#1215: missing current state alone is NOT leftover evidence", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({}),
+    }),
+    false,
+    "graph_query fixtures and a first observation fail OPEN",
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({ changeTracker: { activeState: { nodes: "bad" } } }),
+    }),
+    false,
+    "malformed nodes without switch proof stays available",
+  );
+});
+
+test("#1215: a failed switch repaint with no comparable active state is leftover", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({}),
+      switchRepaintUnproven: true,
+    }),
+    true,
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({ changeTracker: { activeState: { nodes: "bad" } } }),
+      switchRepaintUnproven: true,
+    }),
+    true,
+    "malformed nodes is the same as missing — that is the safe-repaint shape",
+  );
+});
+
+test("#1215: a comparable current state is the shape guard's job, not this one", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({ changeTracker: { activeState: state(5) } }),
+    }),
+    false,
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({ changeTracker: { activeState: state(0) } }),
+    }),
+    false,
+    "well-formed empty nodes must stay a shape mismatch (blank tab vs leftover canvas)",
+  );
+});
+
+test("#1215: empty live, no workflow service, and subgraph scope fail OPEN", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({ liveNodeCount: 0, activeWorkflow: wf({}), switchRepaintUnproven: true }),
+    false,
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({ liveNodeCount: 118, activeWorkflow: null, switchRepaintUnproven: true }),
+    false,
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      inSubgraph: true,
+      activeWorkflow: wf({}),
+      switchRepaintUnproven: true,
+    }),
+    false,
+  );
+  assert.equal(graphRootUnprovenAgainstActiveState(), false);
+});
+
+test("#1215: a previous open tab whose state matches the live root is leftover", () => {
+  const nodes = state(118).nodes.map((node) => ({ ...node, type: "KSampler" }));
+  const rootGraph = {
+    _nodes: nodes,
+    serialize: () => ({ nodes, links: [], groups: [] }),
+  };
+  const previous = wf({ changeTracker: { activeState: { nodes, links: [], groups: [] } } });
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 118,
+      activeWorkflow: wf({}),
+      rootGraph,
+      others: [previous],
+    }),
+    true,
+  );
+});
+
+test("#1215: outline/query refuse the previous canvas after a switch that could not repaint", () => {
+  const rootGraph = { _nodes: state(118).nodes };
+  const activeWorkflow = wf({});
+  for (const cmd of ["graph_outline", "graph_query"]) {
+    const verdict = resolveGraphBindingVerdict({
+      graph: rootGraph,
+      rootGraph,
+      activeWorkflow,
+      activeWorkflowUuid: "remove-bg-tab",
+      liveNodeCount: 118,
+      switchRepaintUnproven: true,
+      ...graphCommandBindingBar(cmd),
+    });
+    assert.equal(verdict?.reason, "root-state-unreadable", cmd);
+    assert.equal(verdict.live, 118);
+    assert.equal(verdict.expected, null);
+  }
+  assert.equal(
+    resolveGraphBindingVerdict({
+      graph: rootGraph,
+      rootGraph,
+      activeWorkflow,
+      activeWorkflowUuid: "remove-bg-tab",
+      liveNodeCount: 118,
+      ...graphCommandBindingBar("graph_query"),
+    }),
+    null,
+    "without leftover switch proof, graph_query fixtures stay available",
+  );
+});
+
+test("#1215: a TARGET uuid on the leftover canvas is not ownership proof", () => {
+  const rootGraph = {
+    _nodes: state(118).nodes,
+    extra: { comfyui_mcp: { workflow_uuid: "remove-bg-tab" } },
+  };
+  const verdict = resolveGraphBindingVerdict({
+    graph: rootGraph,
+    rootGraph,
+    activeWorkflow: wf({}),
+    activeWorkflowUuid: "remove-bg-tab",
+    liveNodeCount: 118,
+    rootUuidMismatch: false,
+    switchRepaintUnproven: true,
+    ...graphCommandBindingBar("graph_outline"),
+  });
+  assert.equal(
+    verdict?.reason,
+    "root-state-unreadable",
+    "a stale/shared TARGET tag on the outgoing canvas (#1639) must not license the read",
+  );
+});
+
+test("#1215: already-current untagged canvas with matching state still admits (#2038)", () => {
+  const nodes = state(3).nodes;
+  const rootGraph = { _nodes: nodes, extra: {} };
+  const verdict = resolveGraphBindingVerdict({
+    graph: rootGraph,
+    rootGraph,
+    activeWorkflow: wf({ isModified: false, changeTracker: { activeState: { nodes, links: [], groups: [] } } }),
+    activeWorkflowUuid: "already-current",
+    liveNodeCount: 3,
+    ...graphCommandBindingBar("graph_outline"),
+    includeBaselineReadGuard: true,
+  });
+  assert.equal(verdict, null);
+});
+
+test("#1215: the refusal names the live count and says set_workflow_target is not a remedy", () => {
+  const msg = graphBindingRefusalMessage({ reason: "root-state-unreadable", live: 118, expected: null });
+  assert.match(msg, /^\[root-state-unreadable\]/);
+  assert.match(msg, /118 node\(s\)/);
+  assert.match(msg, /NOT applied/);
+  assert.match(msg, /previous workflow/);
+  assert.match(msg, /panel_open_workflow/);
+  assert.match(msg, /panel_load_workflow/);
+  assert.match(msg, /panel_set_workflow_target is NOT a remedy/);
+  assert.doesNotMatch(msg, /reports 0 node\(s\)/);
+});
+
+test("#1215: graph_outline re-asserts the binding bar; graph_query stays dispatch-fenced", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const outlineAt = src.indexOf("graph_outline({");
+  assert.notEqual(outlineAt, -1);
+  const outline = src.slice(outlineAt, outlineAt + 2200);
+  assert.match(outline, /assertGraphBoundToActiveWorkflow/, "outline re-asserts before serving nodes");
+  assert.match(outline, /graphCommandBindingBar\("graph_outline"\)/);
+  assert.match(outline, /includeBaselineReadGuard: true/);
+  const queryAt = src.indexOf("graph_query({");
+  assert.notEqual(queryAt, -1);
+  const query = src.slice(queryAt, queryAt + 800);
+  assert.doesNotMatch(
+    query,
+    /assertGraphBoundToActiveWorkflow/,
+    "extracted graph_query budget tests re-run this method without the canvas fence",
+  );
+  assert.match(
+    src,
+    /assertGraphBoundToActiveWorkflow\(graph, rootGraph, graphCommandBindingBar\(msg\.cmd\)\)/,
+    "dispatch still fences graph_query through the classified-read bar",
+  );
+  const fence = src.slice(
+    src.indexOf("function assertGraphBoundToActiveWorkflow("),
+    src.indexOf("function tryHealStaleRootWorkflowIdentity("),
+  );
+  assert.match(
+    fence,
+    /typeof switchRepaintUnproven !== "undefined"/,
+    "extracted #1477/#1233 fences must not throw on an unbound leftover flag",
+  );
 });
 
 test("missingNodeStateReportsNodes: only positive, shaped missing-node state is evidence", () => {
@@ -3648,6 +3861,7 @@ test("#618: no current-state evidence fails OPEN — an absent/malformed tracker
       postReconnectWindow: true,
     });
     assert.equal(verdict, null, "unreadable current state must never manufacture a mid-population verdict");
+    assert.notEqual(verdict?.reason, "root-state-unreadable", "missing state without leftover switch proof stays available");
   }
 });
 
