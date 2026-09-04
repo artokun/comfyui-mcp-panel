@@ -7,7 +7,6 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181)
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
   whose counter sits below an id it already holds had a bystander's record silently
@@ -40,6 +39,12 @@ All notable changes to this project are documented here. This project adheres to
   it. Inlined rather than shared, because those handlers are rebuilt by
   `new Function` harnesses that inject dependencies by name — a module-scope helper
   throws ReferenceError there, which the connect-throw-verdict suite caught.
+
+## [0.15.172] - 2026-09-04
+
+### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181, #2243)
+
 
 ## [0.15.171] - 2026-09-04
 
