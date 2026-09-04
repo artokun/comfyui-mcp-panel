@@ -23,6 +23,12 @@ All notable changes to this project are documented here. This project adheres to
   untouched.
 - the emoji-presentation removal now covers every shipped web/js file rather than the main bundle alone (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
 
+## [0.15.173] - 2026-09-04
+
+### Fixed
+- panel_get_errors no longer reports a clean graph when missing models are still named on a promoted native-subgraph host rail: the load-time store blames the inner locator, and the inner widget may hold an on-disk fallback while the host still names the absent file. The live combo scan now also walks nested subgraphs from the bound root, so inner loaders are judged even when the user is looking at the root canvas (#984, #2245)
+
+
 ## [0.15.172] - 2026-09-04
 
 ### Fixed
