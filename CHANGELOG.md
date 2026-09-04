@@ -6,8 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+
 ### Fixed
-- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215)
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
   strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
   `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash
@@ -23,6 +23,11 @@ All notable changes to this project are documented here. This project adheres to
   code; the eleven translations have the selector stripped byte-wise, leaving wording
   untouched.
 - the emoji-presentation removal now covers every shipped web/js file rather than the main bundle alone (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
+## [0.15.170] - 2026-09-04
+
+### Fixed
+- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215, #2238)
+
 
 ## [0.15.169] - 2026-09-04
 
