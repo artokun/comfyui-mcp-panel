@@ -18,6 +18,12 @@ All notable changes to this project are documented here. This project adheres to
   generated `locales/en/main.json`, so flattening the conditional in the source
   fallback — from which that catalog is generated, and which renders whenever the
   catalog is not loaded — left it green while the two silently diverged.
+- the sign-in timeout notice names the token setting by REFERENCE, not by copying its
+  English label (#2044). The label is translated in every locale and this toast is not,
+  so a French reader was told to find "Set CivitAI token…" while their menu read
+  "Définir le jeton CivitAI…" — the one actionable sentence in a message about a
+  sign-in that cannot succeed was the part they could not act on. It now interpolates
+  tr("panel.set_civitai_token"), so the quoted text is whatever the running UI shows.
 ## [0.15.169] - 2026-09-04
 
 ### Fixed

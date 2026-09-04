@@ -85,3 +85,56 @@ test("#2044 the SOURCE fallback carries the same conditional, and matches the ca
     "catalog and fallback have diverged — re-run `npm run i18n:build`",
   );
 });
+
+// The remedy names a SETTING, and that setting's label is translated in every
+// locale while this toast is not — so quoting the English label told a French
+// reader to look for "Set CivitAI token…" while their menu said "Définir le jeton
+// CivitAI…". The one actionable sentence in a message about a sign-in that cannot
+// succeed was the part they could not act on.
+//
+// Referenced, not copied: the quoted text is whatever the running UI shows, in any
+// locale, and cannot drift if the label is reworded.
+test("panel#2044 the timeout toast REFERENCES the setting label, never copies it", () => {
+  const src = readFileSync(
+    new URL("../../web/js/cmcp-civitai-ui.js", import.meta.url),
+    "utf8",
+  );
+  const at = src.indexOf("civitai_ui.sign_in_timed_out");
+  assert.ok(at > 0, "the timeout toast is gone");
+  const region = src.slice(at, at + 900);
+  assert.ok(region.includes("{setting}"), "the toast stopped interpolating the label");
+  assert.ok(
+    region.includes('tr("panel.set_civitai_token"'),
+    "the toast stopped resolving the label through tr()",
+  );
+  // The literal English label must not be re-embedded in the message itself.
+  const message = region.slice(0, region.indexOf("{ setting:"));
+  assert.equal(
+    message.includes("Set CivitAI token"),
+    false,
+    "the English label is hard-coded in the message again",
+  );
+});
+
+// The catalog is what non-English users resolve through, so the placeholder has to
+// survive `npm run i18n:build` — a fallback fixed in source but not regenerated
+// would leave every locale on the old hard-coded string.
+test("panel#2044 the generated en catalog carries the placeholder", () => {
+  const cat = JSON.parse(
+    readFileSync(new URL("../../locales/en/main.json", import.meta.url), "utf8"),
+  );
+  const find = (o) => {
+    for (const [k, v] of Object.entries(o)) {
+      if (k === "sign_in_timed_out" && typeof v === "string") return v;
+      if (v && typeof v === "object") {
+        const hit = find(v);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+  const entry = find(cat);
+  assert.ok(entry, "sign_in_timed_out missing from the en catalog");
+  assert.ok(entry.includes("{setting}"), "catalog entry lost the placeholder");
+  assert.equal(entry.includes("Set CivitAI token"), false, "catalog re-embedded the label");
+});
