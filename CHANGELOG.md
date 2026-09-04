@@ -8,6 +8,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
+  strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
+  `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash
+  cluster. The panel's root font stack names no symbol or emoji face, so those glyphs must
+  resolve by DirectWrite fallback either way; the selector made the emoji font mandatory
+  rather than incidental, and several of the nine render exactly where the crash timeline
+  puts the failures. Worth doing regardless: a warning triangle in a dense sidebar wants
+  text presentation. NOT claimed as the fix for the renderer crash, which is upstream.
 - the emoji-presentation removal now covers every shipped web/js file rather than the main bundle alone (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
 
 ## [0.15.164] - 2026-09-03
