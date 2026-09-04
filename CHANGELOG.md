@@ -6,10 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
+
+## [0.15.168] - 2026-09-04
 
 ### Fixed
-- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057)
-- panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
+- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057, #2231)
+
 
 ## [0.15.167] - 2026-09-04
 
