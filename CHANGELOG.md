@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181)
+
 ## [0.15.171] - 2026-09-04
 
 ### Fixed
