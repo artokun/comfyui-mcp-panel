@@ -459,6 +459,54 @@ export async function filterServerConfirmedInputSubfolderCandidates(
 }
 
 /**
+ * The live upload-combo inventory a def publishes for `widgetName` on `type`:
+ * `{ values, config }` when the input is an upload combo with a readable option
+ * list, otherwise null. Used to judge a just-uploaded filename against the same
+ * connected-ComfyUI listing `upload_image` verifies (`/object_info/<Type>`), not
+ * the page-load widget snapshot (#2222).
+ */
+export function uploadComboInventoryOf(defsByType, type, widgetName) {
+  try {
+    if (!defsByType || !type || !widgetName) return null;
+    const input = defsByType[type]?.input;
+    if (!input) return null;
+    const spec =
+      (input.required && input.required[widgetName]) ??
+      (input.optional && input.optional[widgetName]);
+    if (!Array.isArray(spec)) return null;
+    const config = uploadConfigOf(spec[1]);
+    if (!config) return null;
+    const values = authoritativeComboValues(spec);
+    if (!Array.isArray(values)) return null;
+    return { values, config };
+  } catch {
+    return null;
+  }
+}
+
+/** Exact membership only — the upload tool's returned relative filename, not a lookalike. */
+export function inventoryHasExactValue(inventory, value) {
+  return Array.isArray(inventory) && inventory.includes(value);
+}
+
+/**
+ * Replace a combo widget's option list with a live server inventory. Unlike
+ * `addComboOption`, this MAY replace a function-valued source: after an upload the
+ * live `/object_info/<Type>` list is the authority, and a stale callback would keep
+ * rejecting a filename the server already enumerates (#2222).
+ */
+export function applyComboInventory(widget, inventory) {
+  try {
+    if (!widget || !Array.isArray(inventory)) return false;
+    if (!widget.options || typeof widget.options !== "object") widget.options = {};
+    widget.options.values = inventory.slice();
+    return Array.isArray(widget.options.values);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Add `value` to a combo widget's option list in place (so a following revalidation
  * accepts it) WITHOUT clobbering a dynamic function-valued option source. Returns
  * true if the option list now contains the value. Defensive; no-op on a bad widget.
