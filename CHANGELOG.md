@@ -8,6 +8,8 @@ All notable changes to this project are documented here. This project adheres to
 
 
 ### Fixed
+- panel_run recovers the ComfyUI prompt_id after a post-dispatch `/prompt` fetch failure by reconciling a client-generated dispatch id against queue/history, and treats a confirmed miss as safe to retry (#2203)
+- the post-dispatch receipt recovery no longer treats a shared queue mark as a per-request receipt, no longer reads a FAILED /queue or /history response as an empty one, no longer loses an acceptance whose id was recovered after a malformed 200, and states plainly that a confirmed miss is a bounded observation rather than promising a retry is safe (#2203)
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
   whose counter sits below an id it already holds had a bystander's record silently
