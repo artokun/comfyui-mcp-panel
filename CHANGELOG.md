@@ -16,6 +16,13 @@ All notable changes to this project are documented here. This project adheres to
   isModified reading, because ComfyUI derives that flag from user-input captures and a
   false is not evidence of safety (panel#882). The save/tracker deadlock itself is
   unchanged and panel#2139 stays open.
+  A SECOND blind spot is now recorded on the check: read out of the shipped
+  `changeTracker.ts`, `isModified` is written only by `updateModified()`, reached only
+  from `captureCanvasState()`, which returns early while a change transaction is open —
+  so inside a STRANDED transaction the flag is frozen at the last successful capture.
+  That is the same state in which save is refused as behind the canvas, so drift made
+  entirely inside the stranded transaction leaves this warning silent on the deadlock
+  its own sentence names.
 - the stale-snapshot save refusal no longer promises that a still-open transaction clears by itself or that nudging the canvas fixes it (measured: it does not, and each nudge widens the gap), and it now warns against falling back to ComfyUI's own Save, which persists the same tracker snapshot silently (#2139)
 
 ## [0.15.165] - 2026-09-04
