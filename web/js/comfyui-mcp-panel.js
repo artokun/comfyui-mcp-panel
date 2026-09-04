@@ -40742,6 +40742,20 @@ function buildPanel() {
         dismissed: cards.dismissed + fallbackDismissed,
         card_ids: [...new Set([...cards.card_ids, ...fallbackCardIds])],
         media_unloaded: media.unloaded,
+        // The fallback sweeps EVERY unresolved card in the displayed thread,
+        // because a dismissal that carries no card_id cannot say which one it
+        // meant. Merging its count into `dismissed` alone would let a caller who
+        // named one card read "dismissed: 3" with nothing saying why, so the sweep
+        // reports itself separately.
+        ...(fallbackDismissed
+          ? {
+              recovered_without_card_id: fallbackDismissed,
+              recovered_note:
+                `${fallbackDismissed} card(s) were resolved by the no-card_id recovery, which ` +
+                `clears every unresolved card in the thread on screen — it cannot tell which one ` +
+                `the dismissal meant.`,
+            }
+          : {}),
       };
     },
     // Orchestrator pushed live download progress → render rows in the tray.

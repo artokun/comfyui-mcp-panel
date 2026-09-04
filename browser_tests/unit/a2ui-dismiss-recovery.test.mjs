@@ -55,3 +55,16 @@ test("#2183 no-card_id dismissal resolves only the displayed thread and persists
   assert.match(dismiss, /setChatSurfaceForCards\(\)/);
   assert.match(dismiss, /card_ids: \[\.\.\.new Set\(/);
 });
+
+test("#2183 the no-card_id sweep REPORTS itself, because it clears more than one card", () => {
+  // The fallback resolves EVERY unresolved card in the displayed thread — it
+  // cannot tell which one a dismissal with no card_id meant. Folding that into
+  // `dismissed` alone would let a caller who named one card read "dismissed: 3"
+  // with nothing saying why, so the sweep is reported on its own key.
+  const at = panelSrc.indexOf("recovered_without_card_id");
+  assert.ok(at > -1, "the sweep must report itself separately from `dismissed`");
+  // Only when it actually ran: a normal dismissal must not grow a new key.
+  const spread = panelSrc.lastIndexOf("...(fallbackDismissed", at);
+  assert.ok(spread > -1 && at - spread < 400, "the key must be conditional on the sweep firing");
+  assert.ok(panelSrc.includes("clears every unresolved card in the thread on screen"));
+});
