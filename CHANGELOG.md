@@ -6,7 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+
 ### Fixed
+- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057)
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
   saved tab carrying unsaved drift that is the one recovery that loses it, which is the

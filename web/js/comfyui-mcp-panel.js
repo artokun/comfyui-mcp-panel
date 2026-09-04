@@ -421,6 +421,7 @@ import {
   resolveScope,
   describeScope,
   findSubgraphOwner,
+  resolvePromotedContainerForRead,
   isSubgraphInRoot,
   resolveRailNode,
   railKindFor,
@@ -15966,8 +15967,16 @@ const GRAPH_TOOL_EXECUTORS = {
   },
 
   graph_get_subgraph({ node_id }) {
-    const { graph } = getGraphCtx();
-    const node = resolveNode(graph, node_id);
+    const { graph, rootGraph } = getGraphCtx();
+    // #2057 — after enter_subgraph the HOST wrapper is not in the viewed
+    // graph. MCP's promoted-write probe treats that missing-id throw as
+    // "could not determine whether the addressed node is a promoted
+    // container" and never dispatches graph_set_widget. Classify the live
+    // owner / unique root host first; fall through to resolveNode so an
+    // ordinary miss still uses the existing missing-id diagnosis.
+    const node =
+      resolvePromotedContainerForRead(graph, rootGraph ?? graph, node_id) ??
+      resolveNode(graph, node_id);
     // #1941 — MCP's promoted-write probe treats anything other than this exact
     // "is not a subgraph" line as indeterminate and refuses the write. A root
     // node is not a promoted container: only a live inner graph (nodes list or
