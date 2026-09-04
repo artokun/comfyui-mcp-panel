@@ -3059,7 +3059,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // could never catch the real failure, that set-version.mjs was not run at all,
 // since one script writes them together. That is how 0.15.86..0.15.96 shipped
 // still announcing 0.15.85.
-const PANEL_VERSION = "0.15.169";
+const PANEL_VERSION = "0.15.170";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at
