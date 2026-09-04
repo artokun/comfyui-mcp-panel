@@ -2161,14 +2161,27 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
             // from CivitAI with a 403 on the one branch that logs nothing, and it is
             // installed by default whenever `--enable-cors-header` is absent.
             //
-            // The remedy named is the one that works today and needs no flag: the
-            // panel already accepts a CivitAI API token server-side.
+            // panel#2044 — the remedy must be one that actually signs the BROWSER in.
+            // An earlier revision pointed at the CivitAI API token setting. That token
+            // is stored for the agent's own download tools; `py/civitai_proxy.py`
+            // authenticates the browser solely from its OAuth token file and never
+            // reads `CIVITAI_API_TOKEN` — the name appears in that module only inside
+            // a docstring. The advice named a setting that cannot fix what just failed.
+            //
+            // What does fix it is the flag whose ABSENCE causes the 403:
+            // `create_origin_only_middleware` is installed whenever
+            // `--enable-cors-header` is missing, and that middleware is what rejects
+            // the cross-site redirect back from CivitAI.
+            //
+            // It is also the only explanation the user gets after a four-minute wait,
+            // so it does not ride the 3.5s toast default.
             toast(
               tr(
                 "civitai_ui.sign_in_timed_out",
-                "CivitAI sign-in did not complete. If the popup showed a 403, ComfyUI's cross-site protection blocked the redirect back — it rejects that request without logging anything. Use a CivitAI API token instead — the panel's “{setting}” setting stores it (see panel#2044).",
+                "CivitAI sign-in did not complete. If the popup showed a 403, ComfyUI's cross-site protection blocked the redirect back — it rejects that request without logging anything. Start ComfyUI with --enable-cors-header to allow it (see panel#2044). The panel's “{setting}” setting will NOT help here: that token is used by the agent's download tools, and browser sign-in uses a separate OAuth token.",
                 { setting: tr("panel.set_civitai_token", "Set CivitAI token…") },
               ),
+              { ms: 20000 },
             );
           }
         }

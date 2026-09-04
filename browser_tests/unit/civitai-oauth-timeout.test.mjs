@@ -39,13 +39,36 @@ test("#2044 the sign-in poll has an else branch at all", () => {
   assert.ok(branch.includes("civitai_ui.sign_in_timed_out"));
 });
 
-test("#2044 the message names the remedy that works today", () => {
+test("#2044 the message names a remedy that can actually sign the BROWSER in", () => {
   const en = JSON.parse(readFileSync(EN, "utf8"));
   const msg = en?.comfyuiMcpPanel?.civitai_ui?.sign_in_timed_out;
   assert.equal(typeof msg, "string", "the key must be in the generated English catalog");
-  // The panel already accepts a CivitAI API token server-side, and that path needs
-  // no flag and no registration change — so it is the one to point at.
-  assert.match(msg, /API token/i);
+  // An earlier revision pointed at the CivitAI API token setting and this test
+  // asserted that wording. It is the wrong remedy: `py/civitai_proxy.py`
+  // authenticates the browser solely from its OAuth token file and never reads
+  // CIVITAI_API_TOKEN — the name occurs in that module only inside a docstring.
+  // The token is for the agent's download tools.
+  //
+  // The 403 comes from `create_origin_only_middleware`, which ComfyUI installs
+  // whenever --enable-cors-header is absent, so THAT is what unblocks the redirect.
+  assert.match(msg, /--enable-cors-header/);
+  // ...and the message must say plainly that the token setting is not the fix, so
+  // a reader who remembers the old advice is not sent back to it.
+  assert.match(msg, /setting will NOT help/i);
+});
+
+test("#2044 the only explanation after a four-minute wait outlives the toast default", () => {
+  // `toast(msg, { ms = 3500 })`. A ~60-word diagnostic delivered at the end of a
+  // four-minute wait, then removed after 3.5 seconds, is the failure this message
+  // exists to prevent, one layer up.
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/cmcp-civitai-ui.js", import.meta.url)),
+    "utf8",
+  );
+  const i = src.indexOf("civitai_ui.sign_in_timed_out");
+  assert.ok(i > 0, "the timeout message is still emitted here");
+  const call = src.slice(i, i + 900);
+  assert.match(call, /\{ ms: \d{5,} \}/, "the timeout toast must set an explicit, long lifetime");
 });
 
 test("#2044 the message does not CLAIM a 403 it never saw", () => {
