@@ -459,6 +459,7 @@ import {
   inputAssetViewQuery,
   inputPathsUseWindowsSeparators,
   probeInputAssetPresence as probeAssetOnServer,
+  uploadComboInventoryOf,
 } from "./lib/input-asset.js";
 import {
   GET_ERRORS_TOTAL_BUDGET_MS,
@@ -18965,6 +18966,30 @@ const GRAPH_TOOL_EXECUTORS = {
         } catch {
           return false;
         }
+      },
+      // #2222 — LoadImage/LoadVideo combo membership after upload_image. The
+      // authorization payload (and api.getNodeDefs) can predate the upload, so
+      // refreshCombos would copy a stale 462-item list and reject the exact
+      // filename the upload tool just verified. Drop that cache and re-read
+      // `/object_info/<Type>` from the connected ComfyUI — the same inventory
+      // INPUT_TYPES uses — then require an exact match before accepting.
+      fetchUploadComboInventory: async ({ type, widgetName }) => {
+        if (!type || !widgetName) return null;
+        objectInfoCache.invalidate();
+        const scopedEpoch = backendReconnectEpoch;
+        const scopedGeneration = verifiedNodeDefCache.generation();
+        const scoped = await fetchTypeScopedObjectInfo([type], {
+          fetchApi: typeof api?.fetchApi === "function" ? (route, init) => api.fetchApi(route, init) : null,
+          deadlineMs: budget.bounded(),
+        });
+        if (
+          scopedEpoch !== backendReconnectEpoch ||
+          scopedGeneration !== verifiedNodeDefCache.generation() ||
+          comfyBackendIsDown()
+        ) {
+          return null;
+        }
+        return uploadComboInventoryOf(scoped.defs, type, widgetName);
       },
       // #2025 — the remaining command budget bounds the write+ack. On timeout after
       // delivery, awaitSetWidgetAck readbacks the live widget instead of hanging

@@ -13,6 +13,9 @@ import {
   filterServerConfirmedInputSubfolderCandidates,
   inputPathsUseWindowsSeparators,
   addComboOption,
+  applyComboInventory,
+  uploadComboInventoryOf,
+  inventoryHasExactValue,
   inputAssetViewQuery,
   probeInputAssetPresence,
 } from "../../web/js/lib/input-asset.js";
@@ -419,6 +422,31 @@ test("addComboOption refuses to clobber a dynamic FUNCTION option source", () =>
   const w = { options: { values: fn } };
   assert.equal(addComboOption(w, "x.png"), false);
   assert.equal(w.options.values, fn, "function source left untouched");
+});
+
+test("#2222 uploadComboInventoryOf reads V1 LoadImage/LoadVideo upload lists", () => {
+  const defs = {
+    LoadImage: { input: { required: { image: [["old.png", "new.png"], { image_upload: true }] } } },
+    LoadVideo: { input: { required: { file: [["clip.mp4"], { video_upload: true }] } } },
+    CheckpointLoaderSimple: { input: { required: { ckpt_name: [["sd.safetensors"], {}] } } },
+  };
+  const images = uploadComboInventoryOf(defs, "LoadImage", "image");
+  assert.deepEqual(images.values, ["old.png", "new.png"]);
+  assert.equal(images.config.image_upload, true);
+  assert.equal(inventoryHasExactValue(images.values, "new.png"), true);
+  assert.equal(inventoryHasExactValue(images.values, "missing.png"), false);
+  assert.ok(uploadComboInventoryOf(defs, "LoadVideo", "file"));
+  assert.equal(uploadComboInventoryOf(defs, "CheckpointLoaderSimple", "ckpt_name"), null);
+});
+
+test("#2222 applyComboInventory replaces a stale list, including a function source", () => {
+  const w = { options: { values: ["old.png"] } };
+  assert.equal(applyComboInventory(w, ["old.png", "fresh.png"]), true);
+  assert.deepEqual(w.options.values, ["old.png", "fresh.png"]);
+  const fn = () => ["old.png"];
+  const dyn = { options: { values: fn } };
+  assert.equal(applyComboInventory(dyn, ["fresh.png"]), true);
+  assert.deepEqual(dyn.options.values, ["fresh.png"]);
 });
 
 function filenameParamOf(qs) {
