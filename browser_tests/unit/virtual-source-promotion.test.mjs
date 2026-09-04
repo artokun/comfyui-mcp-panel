@@ -430,6 +430,56 @@ test("#1181 Krea2-like compiled prompt carries promoted width/height and the lin
   assert.equal(prompt.output["78:15"].inputs.clip[0], "1", "tensor links are left alone");
 });
 
+test("#1181 GetNode primitive bus compiles through SetNode, never the Constant key", () => {
+  const latent = {
+    id: 4,
+    type: "EmptyLatentImage",
+    widgets: [{ name: "width", value: 512 }],
+    inputs: [{ name: "width", type: "INT", link: 1, widget: { name: "width" } }],
+  };
+  const inner = {
+    _nodes: [latent],
+    inputNode: { id: -10 },
+    links: [{ id: 1, origin_id: -10, origin_slot: 0, target_id: 4, target_slot: 0, type: "INT" }],
+  };
+  const source = primitive(1, 1280);
+  const setNode = {
+    id: 2,
+    type: "SetNode",
+    isVirtualNode: true,
+    widgets: [{ name: "Constant", value: "width" }],
+    inputs: [{ name: "*", link: 8 }],
+  };
+  const getNode = {
+    id: 3,
+    type: "GetNode",
+    isVirtualNode: true,
+    inputs: [],
+    outputs: [{ name: "INT", type: "INT" }],
+    widgets: [{ name: "Constant", value: "width" }],
+  };
+  const host = {
+    id: 10,
+    subgraph: inner,
+    widgets: [{ name: "width", value: 512 }],
+    inputs: [{ name: "width", type: "INT", link: 7, widget: { name: "width" } }],
+  };
+  const g = graphOf(
+    [source, setNode, getNode, host],
+    {
+      8: { origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 },
+      7: { origin_id: 3, origin_slot: 0, target_id: 10, target_slot: 0 },
+    },
+  );
+  for (const node of g._nodes) node.graph = g;
+  assert.equal(linkedSourcePayload(getNode, g), 1280);
+  const prompt = { output: { "10:4": { class_type: "EmptyLatentImage", inputs: { width: 512 } } } };
+  applyLinkedSubgraphValuesToPrompt(g, prompt);
+  assert.equal(prompt.output["10:4"].inputs.width, 1280);
+  assert.equal(getNode.widgets[0].value, "width");
+  assert.equal(latent.widgets[0].value, 512, "live inner widget is untouched");
+});
+
 test("#1181 PrimitiveNode coverage is not weakened: it is still a non-serializing source", () => {
   assert.equal(isNonSerializingValueSource(primitive(85, "a lantern")), true);
   const g = primitiveFeed();

@@ -295,6 +295,8 @@ export function linkedSourcePayload(node, graph = node?.graph, seen = new Set())
   nextSeen.add(node);
   if (node.subgraph) return undefined;
   if (node.type === "GetNode") {
+    const outType = node.outputs?.[0]?.type;
+    if (typeof outType === "string" && outType && !PRIMITIVE_OUTPUT_TYPES.has(outType)) return undefined;
     try {
       if (typeof node.getInputLink === "function") {
         const link = node.getInputLink(0);
