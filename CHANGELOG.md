@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- the fetch_comfyui_read allowlist rejection now has its wording pinned by a test. comfyui-mcp
+  matches `/operation must be one of/i` on that message to fall back to reading the model list from
+  `object_info` when `models/<category>` is unavailable (comfyui-mcp#2511); rewording it silently
+  disabled that recovery, with no error raised in either repo. A reword now fails here instead.
 ## [0.15.170] - 2026-09-04
 
 ### Fixed
