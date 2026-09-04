@@ -19,6 +19,23 @@ const READ_OPERATIONS = new Map([
 const LOGS_TRANSPORT_PATH = "/internal/logs/raw";
 // Same closed folder grammar MCP uses for `models/<folder>` (comfyui-mcp#2511).
 const MODELS_FOLDER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// LOAD-BEARING WORDING, not just a message (comfyui-mcp#2511 / #2793).
+//
+// comfyui-mcp matches this sentence to decide that the panel cannot serve
+// `models/<category>` and that it should fall back to reading the model list out
+// of `object_info` instead:
+//
+//     return /operation must be one of/i.test(parts.join(NEWLINE));
+//
+// The only structured signal on the wire is `invalid_input`, which this file also
+// uses for "operation is required" — too coarse to tell the two apart — so the
+// prose is what carries the distinction. Reword the phrase 'operation must be one
+// of' and that recovery stops firing SILENTLY: list_local_models simply returns
+// nothing useful again, with no error on either side.
+//
+// A test pins the substring so a reword fails HERE, loudly, rather than in another
+// repo at runtime. If this needs to change, add a distinct error code (e.g.
+// `unsupported_operation`) first and let mcp match that instead.
 const ALLOWED_OPERATION_NOTE =
   "operation must be one of history, system_stats, logs, object_info, workflow_templates, models, or models/<folder>";
 

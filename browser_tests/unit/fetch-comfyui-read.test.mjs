@@ -493,3 +493,33 @@ test("#2283: the command remains on the authenticated rid executor/reply path", 
   assert.equal(commandIsCanvasIndependent("fetch_comfyui_read"), true);
   assert.equal(commandIsCanvasTargetless("fetch_comfyui_read"), true);
 });
+
+// The allowlist rejection's WORDING is load-bearing across the repo boundary
+// (comfyui-mcp#2511 / #2793). comfyui-mcp matches `/operation must be one of/i` on
+// this message to decide the panel cannot serve `models/<category>` and to fall back
+// to reading the model list out of `object_info`.
+//
+// The only structured signal available is `invalid_input`, which this module also
+// uses for "operation is required" — too coarse to distinguish — so the sentence
+// carries the distinction. Reword it and that recovery stops firing SILENTLY:
+// list_local_models goes back to returning nothing useful, with no error raised on
+// either side to notice.
+//
+// This pins the substring so the reword fails HERE, in the repo doing the rewording,
+// instead of at runtime in another one. If the phrase genuinely must change, add a
+// distinct error code first (e.g. `unsupported_operation`) and let mcp match that.
+test("panel: the allowlist rejection keeps the phrase comfyui-mcp matches on", () => {
+  let thrown = null;
+  try {
+    validateFetchComfyUIReadArgs({ operation: "not_a_real_operation" });
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown, "an unknown operation should be rejected");
+  const text = String(thrown.message ?? thrown.reason ?? thrown);
+  assert.match(
+    text,
+    /operation must be one of/i,
+    "comfyui-mcp keys its models/<category> fallback on this exact phrase",
+  );
+});
