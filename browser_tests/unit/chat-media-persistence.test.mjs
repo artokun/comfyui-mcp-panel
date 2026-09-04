@@ -38,6 +38,10 @@ function createFakeIndexedDb(initialState = null) {
             queueMicrotask(() => {
               request.result = state == null ? undefined : structuredClone(state);
               request.onsuccess?.();
+              // A real readonly transaction COMPLETES once its requests finish;
+              // this double only did so for writes, so a reader that (correctly)
+              // waits for the transaction rather than the request hung here.
+              queueMicrotask(() => tx.oncomplete?.());
             });
             return request;
           },

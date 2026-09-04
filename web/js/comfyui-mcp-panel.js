@@ -183,6 +183,7 @@ import {
   isThreadInScope,
   mergeHistorySnapshots,
   panelScopeKeyForBackend,
+  planRemountHistoryRestore,
   resolvePanelPointer,
   retainBoundedThreads,
   selectPanelThread,
@@ -46387,19 +46388,18 @@ function buildPanel() {
 
   // Merge the canonical IndexedDB snapshot in the background and promote any
   // legacy records before making the final, settings-aware binding.
-  const historyRestoreReady = (async () => {
-    try {
-      const loaded = await historyStore.load({ protectedThreadIds: [reloadThreadId].filter(Boolean) });
+  // #2201 — a remount (workflow switch) must not treat an unavailable canonical
+  // read as an empty archive. Bumped in destroy() so an in-flight retry cannot
+  // bind into a replacement panel.
+  let historyRestoreGeneration = 0;
+  const applyHydratedHistory = (loaded, canonicalAvailable) => {
+    if (canonicalAvailable && loaded) {
       const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, loaded);
       historyMeta = merged.meta;
       threads = capHistoryThreads(merged.threads, reloadThreadId);
       applyWorkflowAliasesFromHistory();
       persistThreads();
-    } catch {
-      // localStorage shadow remains usable when IndexedDB is unavailable.
     }
-
-    await settingsHydrated;
     const panelOwned = historyScopeFollowsPanel();
     const scopeKey = currentHistoryScopeKey();
     const durableActive = selectRestoreThread(threads, historyMeta, {
@@ -46407,8 +46407,9 @@ function buildPanel() {
       scopeKey,
       preferredThreadId: reloadThreadId,
     });
-
-    if (!durableActive) {
+    const plan = planRemountHistoryRestore({ canonicalAvailable, durableActive });
+    if (plan.kind === "preserve") return plan;
+    if (plan.kind === "reset") {
       thread = null;
       ssSet(CURRENT_THREAD_KEY, null);
       ssSet(SESSION_KEY, null);
@@ -46417,13 +46418,17 @@ function buildPanel() {
       renderTodo([]);
       persistThreads();
       refreshContextRingForScope(); // #381: restore this scope's fill post-hydration (blank if none)
-      return;
+      return plan;
     }
 
     // For the exact conversation already owned by this tab, sessionStorage is
     // authoritative even when empty. The stored id is only a full-restart fallback.
+    // The LIVE pointer, falling back to the mount-time capture. On the initial
+    // hydration these are the same value; on a DELAYED one they are not, and using
+    // the capture would revert a session that rotated while the retry waited.
+    const liveSessionId = ssGet(SESSION_KEY);
     const storedSessionId = durableActive.id === reloadThreadId
-      ? reloadSessionId
+      ? (liveSessionId ?? reloadSessionId)
       : (durableActive.sessionId || null);
     const boundSessionId = resumableSessionId({
       ...durableActive,
@@ -46440,6 +46445,53 @@ function buildPanel() {
     if (foreignSession) armVisibleTranscriptReplay();
     persistThreads();
     refreshContextRingForScope(); // #381: restore this scope's fill post-hydration
+    return plan;
+  };
+  const retryCanonicalHydration = async (generation) => {
+    let delay = 250;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (generation !== historyRestoreGeneration) return;
+      try {
+        const loaded = await historyStore.load({
+          protectedThreadIds: [reloadThreadId].filter(Boolean),
+        });
+        if (generation !== historyRestoreGeneration) return;
+        if (loaded.canonicalAvailable !== true) {
+          delay = Math.min(2000, Math.round(delay * 1.5));
+          continue;
+        }
+        await settingsHydrated;
+        if (generation !== historyRestoreGeneration) return;
+        // The generation only moves on destroy(), so it cannot see a user who
+        // selected or created a chat while IndexedDB was recovering. Applying then
+        // would reselect the MOUNT-time thread, repaint its transcript over the one
+        // they are reading, and can fence an in-flight reply. The pointer is the
+        // evidence the generation is not: if it moved, this result is stale and the
+        // user's own choice wins.
+        if (ssGet(CURRENT_THREAD_KEY) !== reloadThreadId) return;
+        applyHydratedHistory(loaded, true);
+        return;
+      } catch {
+        delay = Math.min(2000, Math.round(delay * 1.5));
+      }
+    }
+  };
+  const historyRestoreReady = (async () => {
+    let loaded = null;
+    let canonicalAvailable = false;
+    try {
+      loaded = await historyStore.load({ protectedThreadIds: [reloadThreadId].filter(Boolean) });
+      canonicalAvailable = loaded.canonicalAvailable === true;
+    } catch {
+      // IndexedDB threw rather than reporting unavailable — same preserve path.
+    }
+
+    await settingsHydrated;
+    const plan = applyHydratedHistory(loaded, canonicalAvailable);
+    if (plan.kind === "preserve") {
+      void retryCanonicalHydration(historyRestoreGeneration);
+    }
   })();
 
   // ---- Settings dialog → live panel hooks ----
@@ -46635,6 +46687,7 @@ function buildPanel() {
     },
     setChatSurface: cmcpSetChatSurface, // A2UI seam: widen/restore the chat surface
     destroy() {
+      historyRestoreGeneration += 1;
       launcherStartGeneration += 1;
       clearCopiedWidgetState();
       try {
