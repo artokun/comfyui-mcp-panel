@@ -508,6 +508,31 @@ test("#2283: the command remains on the authenticated rid executor/reply path", 
 // This pins the substring so the reword fails HERE, in the repo doing the rewording,
 // instead of at runtime in another one. If the phrase genuinely must change, add a
 // distinct error code first (e.g. `unsupported_operation`) and let mcp match that.
+// ...and the reword is only HALF the way this contract breaks. The test above runs
+// under one locale, so it catches a rewording and cannot catch a TRANSLATION: wrap
+// the note in `tr()` and it still passes, because `tr` resolves the `en` catalog
+// that `i18n:build` GENERATES from this very string. Users on the other 11 catalogs
+// would get a translated message, comfyui-mcp's /operation must be one of/i would
+// miss, and the models/<category> fallback would stop firing - invisibly, from the
+// English side that every test and every developer runs on.
+//
+// The comment above defends against a human doing this deliberately. It is no
+// defence against a sweep that wraps user-facing strings without reading them,
+// which is how this repo's i18n coverage grew. A NEGATIVE source assertion is the
+// right instrument here: it fails in English, at the moment the string becomes
+// translatable, before any locale is built.
+test("panel: the phrase stays UNtranslated, or the cross-repo grep dies silently", () => {
+  const lib = readFileSync(
+    new URL("../../web/js/lib/fetch-comfyui-read.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(lib, /operation must be one of/i, "the note must still live in this module");
+  assert.doesNotMatch(
+    lib,
+    /(^|[^\w$.])tr\s*\(/m,
+    "fetch-comfyui-read.js must stay translation-free: comfyui-mcp greps its wording across the repo boundary",
+  );
+});
 test("panel: the allowlist rejection keeps the phrase comfyui-mcp matches on", () => {
   let thrown = null;
   try {
