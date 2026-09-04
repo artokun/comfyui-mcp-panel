@@ -6,8 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
+- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215)
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
   saved tab carrying unsaved drift that is the one recovery that loses it, which is the
@@ -25,12 +25,12 @@ All notable changes to this project are documented here. This project adheres to
   entirely inside the stranded transaction leaves this warning silent on the deadlock
   its own sentence names.
 - the stale-snapshot save refusal no longer promises that a still-open transaction clears by itself or that nudging the canvas fixes it (measured: it does not, and each nudge widens the gap), and it now warns against falling back to ComfyUI's own Save, which persists the same tracker snapshot silently (#2139)
+
 ## [0.15.169] - 2026-09-04
 
 ### Fixed
 - graph_set_widget acknowledges a long CLIPTextEncode / multiline text write as soon as the live editor holds the value, instead of waiting on a backgrounded-tab rAF flush until the 90s relay times out (#2233, #2236)
 - Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234, #2235)
-
 
 ## [0.15.168] - 2026-09-04
 
