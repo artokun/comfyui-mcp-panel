@@ -8,6 +8,8 @@ All notable changes to this project are documented here. This project adheres to
 
 
 ### Fixed
+- panel_run recovers the ComfyUI prompt_id after a post-dispatch `/prompt` fetch failure by reconciling a client-generated dispatch id against queue/history, and treats a confirmed miss as safe to retry (#2203)
+- the post-dispatch receipt recovery no longer treats a shared queue mark as a per-request receipt, no longer reads a FAILED /queue or /history response as an empty one, no longer loses an acceptance whose id was recovered after a malformed 200, and states plainly that a confirmed miss is a bounded observation rather than promising a retry is safe (#2203)
 - an oversized A2UI card scrolls inside its own surface instead of consuming the chat viewport, and a `ui_dismiss` that carries no `card_id` now survives a reload or rebind by resolving only the still-unresolved cards in the displayed thread (#2183)
 ## [0.15.170] - 2026-09-04
 
