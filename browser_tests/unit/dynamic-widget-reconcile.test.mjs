@@ -22,6 +22,7 @@ import {
   installGraphToPromptSnapshotBarrier,
   queuePromptWithGraphToPromptSnapshot,
   reserveGraphToPromptSnapshot,
+  restoreState,
 } from "../../web/js/lib/run-prompt-snapshot.js";
 
 const DYNAMIC = "COMFY_DYNAMICCOMBO_V3";
@@ -700,4 +701,46 @@ test("#2033: queue-time snapshot restore does not throw after first serialize in
   await queuePromptWithGraphToPromptSnapshot(app, entry, () => app.queuePrompt());
   assert.doesNotThrow(() => queueItems.pop());
   assert.equal(node.widgets.some((widget) => widget.name === "format.codec"), true);
+});
+
+// #2033 — the restore catch is narrow ON PURPOSE: it swallows the detached-child throw
+// and rethrows everything else. Both directions are pinned HERE rather than through the
+// queue path, because `restoreState` runs after the barrier test's assertions complete
+// (measured with a call counter: the counter is still unset at the end of that test's
+// body, even after a tick). A test written against the queue path therefore observes the
+// restore only by accident, which is why a blanket-swallow mutation previously left all
+// 8,344 panel tests green. `restoreState` is pure over its records, so calling it directly
+// reaches the catch with no plumbing.
+function widgetThatThrows(error) {
+  return {
+    name: "format.codec",
+    get value() {
+      return "h264";
+    },
+    set value(_next) {
+      throw error;
+    },
+  };
+}
+
+test("#2033: restoreState SWALLOWS the detached-child throw", () => {
+  const widget = widgetThatThrows(new Error("Dynamic widget doesn't exist on node"));
+  assert.doesNotThrow(() => restoreState([{ widget, snapshot: "h264" }], "snapshot"));
+});
+
+test("#2033: restoreState RETHROWS anything that is not that throw", () => {
+  // The whole safety of the catch is this direction. Without it the condition can be
+  // widened to a catch-all and nothing fails.
+  const widget = widgetThatThrows(new Error("boom: unrelated restore failure"));
+  assert.throws(
+    () => restoreState([{ widget, snapshot: "h264" }], "snapshot"),
+    /boom: unrelated restore failure/,
+  );
+});
+
+test("#2033: a non-Error rejection is still classified, not blindly swallowed", () => {
+  // isDynamicWidgetMissingError stringifies non-Errors; a bare string that does not
+  // match must still propagate.
+  const widget = widgetThatThrows("plain string failure");
+  assert.throws(() => restoreState([{ widget, snapshot: "h264" }], "snapshot"));
 });
