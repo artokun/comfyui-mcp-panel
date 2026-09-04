@@ -472,5 +472,13 @@ export async function withPreservedPromotedInstanceWidgets(rootGraph, subgraph, 
     } catch {
       /* #2001 — a restore throw must not turn a landed inner mutation into a missing reply */
     }
+    try {
+      // #2057 — inner add/rewire recreates host inputs without `_subgraphSlot`.
+      // Rebind unique IO slots so graph_get_subgraph still publishes a complete
+      // promoted-terminal witness for HOST rails (MiniMax value / value_2).
+      rebindLoadedPromotedMappings(rootGraph);
+    } catch {
+      /* a rebind throw must not turn a landed inner mutation into a missing reply */
+    }
   }
 }
