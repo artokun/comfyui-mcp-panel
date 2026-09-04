@@ -7,8 +7,13 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181)
 - the unknown-staleness reply no longer tells a tab with UNSAVED edits to load the on-disk copy over them (#2139). `panel_load_workflow` replaces the canvas, so that advice discards unsaved work. Every other arm of `workflow_open`'s staleness chain consults the dirty flags first, but the `stale: "unknown"` arm issued the recommendation unconditionally - and that is the arm reached when the disk read was "unavailable or slower than its deadline", so the one path admitting it verified nothing was also the one instructing an overwrite. It now names the loss when the tab is dirty and keeps the plain re-read advice when it is not. Positive evidence only: a tab reporting no unsaved edits is not called clean, because a programmatic edit leaves `isModified` unset.
+
+## [0.15.172] - 2026-09-04
+
+### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181, #2243)
+
 
 ## [0.15.171] - 2026-09-04
 
