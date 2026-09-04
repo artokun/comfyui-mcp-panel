@@ -6,8 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
+- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215)
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
   whose counter sits below an id it already holds had a bystander's record silently
@@ -28,12 +28,12 @@ All notable changes to this project are documented here. This project adheres to
   it. Inlined rather than shared, because those handlers are rebuilt by
   `new Function` harnesses that inject dependencies by name — a module-scope helper
   throws ReferenceError there, which the connect-throw-verdict suite caught.
+
 ## [0.15.169] - 2026-09-04
 
 ### Fixed
 - graph_set_widget acknowledges a long CLIPTextEncode / multiline text write as soon as the live editor holds the value, instead of waiting on a backgrounded-tab rAF flush until the 90s relay times out (#2233, #2236)
 - Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234, #2235)
-
 
 ## [0.15.168] - 2026-09-04
 
