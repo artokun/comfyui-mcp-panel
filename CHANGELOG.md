@@ -7,6 +7,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+
+- After a delivered panel_open_workflow, the switch fence no longer latches panel_list_workflows / panel_set_workflow_target({mode:"current"}) / panel_graph_outline for minutes while a later settle or safe-repaint is still pending. workflow_list stays the recovery probe; leftover previous-tab graph is still refused (#2249, #1215)
 - the link-id repair now reads the LEGACY link store too, so it applies on older LiteGraph builds (#2108). highestLinkId read only `_links`, the modern private Map; older builds expose the plain record as `links`, which the rest of the panel already handles (disconnect-verify, connect-verify). On those builds the helper returned null, so `adjusted` was false and the stale counter was never raised — the overwrite this fix exists to prevent survived it, silently, because "no links" and "no store" gave the same answer. Adds execution tests that mint an id after the repair and assert it is free, rather than only reading the bundle for call sites. Found by the Copilot review on the PR
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph

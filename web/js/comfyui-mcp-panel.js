@@ -823,6 +823,10 @@ import {
   createSingleFlight,
 } from "./lib/open-outcome.js";
 import {
+  frontendActiveMatchesAppliedOpen,
+  switchFenceRefusesCommand,
+} from "./lib/switch-fence.js";
+import {
   classifyUndeliveredReply,
   describeUndeliveredReply,
   createLostReplyJournal,
@@ -1394,6 +1398,13 @@ function activeWorkflowReloadGuard() {
 /** Journal one open attempt and return its receipt. `applied:false` (with the error) is
  *  recorded too — a genuine negative is as load-bearing as a positive here. */
 function noteOpenAttempt({ cmd, rid, requested, resolved, applied, error }) {
+  // #2249 — a delivered switch journals applied as soon as the frontend names
+  // TARGET, so a later settle hang cannot withhold the receipt. The success
+  // path journals the same rid again; keep one applied record per command.
+  if (applied === true && rid) {
+    const latest = latestOpenReceipt(openReceipts);
+    if (latest && latest.rid === rid && latest.applied === true) return latest;
+  }
   const receipt = makeOpenReceipt({
     seq: ++openReceiptSeq,
     cmd,
@@ -23076,6 +23087,31 @@ const GRAPH_TOOL_EXECUTORS = {
           endWorkflowReloadStep(reloadGuardToken);
         }
         if (openSettled.target && openSettled.target !== target) target = openSettled.target;
+        // #2249 — the switch is delivered once the frontend already names TARGET.
+        // Journal applied NOW so a later settle/repaint hang cannot withhold the
+        // receipt from workflow_list, and mark leftover-canvas so graph_outline
+        // still refuses the previous tab (#1215). The token stays owned for this
+        // open's remaining steps; dispatch unlatches via switchFenceRefusesCommand.
+        try {
+          const activeAfterSwitch = activeWorkflowRef();
+          if (sameWorkflowObject(activeAfterSwitch, target) === true) {
+            pointerMovedThisOpen = !sameWorkflowObject(activeBefore, target);
+            if (pointerMovedThisOpen) switchRepaintUnproven = true;
+            noteOpenAttempt({
+              cmd: "workflow_open",
+              rid,
+              requested: path,
+              resolved: {
+                path: target.path,
+                filename: target.filename,
+                routing_key: workflowTabId(target),
+              },
+              applied: true,
+            });
+          }
+        } catch {
+          /* switch observation is best-effort — a missed early receipt keeps the fence */
+        }
       // We deliberately do NOT auto-reload the canvas from disk here: switching to an
       // already-open tab must not silently discard the user's in-memory graph, and a
       // re-read could race a concurrent canvas edit and clobber it. Instead the staleness
@@ -29612,7 +29648,26 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // (nothing applied, safe to retry) rather than queue: refusing cannot reorder
             // or double-apply, and the section lasts a fraction of a second.
             const reloadGuard = activeWorkflowReloadGuard();
-            if (reloadGuard) {
+            const appliedOpenReceipt = latestOpenReceipt(openReceipts);
+            let switchFenceActive = null;
+            try {
+              switchFenceActive = activeWorkflowRef();
+            // unknown-ok:
+            } catch {
+              switchFenceActive = null;
+            }
+            if (
+              switchFenceRefusesCommand({
+                cmd: msg.cmd,
+                guard: reloadGuard,
+                openReceiptApplied: appliedOpenReceipt?.applied === true,
+                frontendActiveMatchesAppliedOpen: frontendActiveMatchesAppliedOpen({
+                  receipt: appliedOpenReceipt,
+                  activePath: typeof switchFenceActive?.path === "string" ? switchFenceActive.path : null,
+                  activeRoutingKey: switchFenceActive ? workflowTabId(switchFenceActive) : null,
+                }),
+              })
+            ) {
               throw new Error(
                 `the panel is switching/refreshing "${reloadGuard.key}" right now, so "${msg.cmd}" ` +
                   `was NOT applied — nothing changed. Retry in a moment.`,
