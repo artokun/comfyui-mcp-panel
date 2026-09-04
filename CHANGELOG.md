@@ -6,8 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.166] - 2026-09-04
+
 ### Fixed
-- After panel_open_workflow reopens a modified subgraph, promoted width/height/seed host rails rebind onto the unique inner input-rail slots and graph_get_subgraph publishes a complete promoted-terminal witness, so panel_set_widget can write those widgets instead of refusing an unresolved mapping. panel_refresh_nodes runs the same rebind. A stale properties.proxyWidgets pair from the file is not a veto once the live parent rail is authenticated (#2225)
+- After panel_open_workflow reopens a modified subgraph, promoted width/height/seed host rails rebind onto the unique inner input-rail slots and graph_get_subgraph publishes a complete promoted-terminal witness, so panel_set_widget can write those widgets instead of refusing an unresolved mapping. panel_refresh_nodes runs the same rebind. A stale properties.proxyWidgets pair from the file is not a veto once the live parent rail is authenticated (#2225, #2226)
+
 
 ## [0.15.165] - 2026-09-04
 
