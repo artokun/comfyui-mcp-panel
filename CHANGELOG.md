@@ -10,6 +10,12 @@ All notable changes to this project are documented here. This project adheres to
 - the unknown-staleness reply does not claim a CONFLICT it could not verify (#2139). A conflict is "the file changed on disk AND this tab has unsaved edits"; on that arm the disk read failed, so only the second half is known. The dirty branch now warns about what is at risk without asserting the half that was never established - the same positive-evidence rule the #2204 warning follows.
 - the unknown-staleness reply no longer tells a tab with UNSAVED edits to load the on-disk copy over them (#2139). `panel_load_workflow` replaces the canvas, so that advice discards unsaved work. Every other arm of `workflow_open`'s staleness chain consults the dirty flags first, but the `stale: "unknown"` arm issued the recommendation unconditionally - and that is the arm reached when the disk read was "unavailable or slower than its deadline", so the one path admitting it verified nothing was also the one instructing an overwrite. It now names the loss when the tab is dirty and keeps the plain re-read advice when it is not. Positive evidence only: a tab reporting no unsaved edits is not called clean, because a programmatic edit leaves `isModified` unset.
 
+## [0.15.173] - 2026-09-04
+
+### Fixed
+- panel_get_errors no longer reports a clean graph when missing models are still named on a promoted native-subgraph host rail: the load-time store blames the inner locator, and the inner widget may hold an on-disk fallback while the host still names the absent file. The live combo scan now also walks nested subgraphs from the bound root, so inner loaders are judged even when the user is looking at the root canvas (#984, #2245)
+
+
 ## [0.15.172] - 2026-09-04
 
 ### Fixed
