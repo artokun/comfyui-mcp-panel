@@ -417,18 +417,19 @@ export function commandIsCanvasIndependent(cmd) {
  *  `workflow_list`, which DOES observe the canvas (it reports which tab is active)
  *  and so cannot honestly join that set, but which targets none.
  *
- *  Both guards this feeds exist to stop an operation landing on the WRONG workflow —
- *  the uuid fence (#570) and the pinned-target guard (#349/#186). `workflow_list`
- *  lands on nothing: it mutates no graph, selects no target (it enumerates every open
- *  tab), and returns tab metadata rather than graph content.
+ *  The guards this feeds exist to stop an operation landing on the WRONG workflow —
+ *  the uuid fence (#570), the pinned-target guard (#349/#186), and the switch/reload
+ *  token (#442/#2249). `workflow_list` lands on nothing: it mutates no graph, selects
+ *  no target (it enumerates every open tab), and returns tab metadata rather than
+ *  graph content.
  *
  *  It is also the ONLY probe the recovery path has. `rebindWorkflowFence()` re-derives
- *  a session's target from `workflow_list`'s active record, so gating it behind either
- *  guard makes the repair require the thing it repairs to be already-correct. That
- *  circularity is what made #932/#607/#688 permanent: every command refused, and the
- *  refusal text advertising a recovery that was itself refused for the same reason.
- *  Both guards must consult THIS predicate, or the wedge simply moves to whichever one
- *  was left behind. */
+ *  a session's target from `workflow_list`'s active record, so gating it behind any of
+ *  those guards makes the repair require the thing it repairs to be already-correct.
+ *  That circularity is what made #932/#607/#688/#2249 permanent: every command refused,
+ *  and the refusal text advertising a recovery that was itself refused for the same
+ *  reason. Every one of those guards must consult THIS predicate, or the wedge simply
+ *  moves to whichever one was left behind. */
 export function commandIsCanvasTargetless(cmd) {
   return commandIsCanvasIndependent(cmd) || cmd === 'workflow_list';
 }
