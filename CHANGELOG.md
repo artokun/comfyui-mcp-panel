@@ -6,7 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+
 ### Fixed
+- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222)
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
   strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
   `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash

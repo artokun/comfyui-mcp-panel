@@ -53,6 +53,9 @@ import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
 import {
   uploadInputConfig,
   uploadInputAccepts,
+  uploadConfigOf,
+  inventoryHasExactValue,
+  applyComboInventory,
   addComboOption,
   serverDeclaresEmptyComboOptions,
   serverDeclaresRemoteComboOptions,
@@ -495,6 +498,13 @@ async function runSetWidgetBody(
     assertTargetStillCurrent,
     refreshCombos,
     confirmServerAsset,
+    // #2222 — live connected-ComfyUI upload-file inventory for LoadImage/LoadVideo
+    // (and any other upload combo). `upload_image` verifies the stored filename
+    // against a fresh `/object_info/<Type>` listing; panel_set_widget used to
+    // revalidate against the page-load widget snapshot (or a burst-cached whole
+    // map that predates the upload). This hook MUST bypass that cache and return
+    // `{ values, config }` from the same inventory, or null when it cannot.
+    fetchUploadComboInventory,
     // #1223 × #1126 — WHERE the schema `getFreshObjectInfo` answered with actually came
     // from. Read as a FUNCTION, at the moment of decision, because the answer is only known
     // AFTER the oracle has run.
@@ -1613,9 +1623,7 @@ async function runSetWidgetBody(
     // of THIS input's upload kind (e.g. an image extension for an image_upload combo),
     // never a stray `.txt` the LoadImage combo would never list.
     if (!uploadInputAccepts(cfg, value)) return false;
-    const uploadWidget = (resolvedTargetNode?.widgets ?? []).find(
-      (w) => w?.name === (writeTargetWidgetName ?? widgetName),
-    );
+    const uploadWidget = findUploadWidget();
     if (!uploadWidget) return false;
     let exists = false;
     try {
@@ -1628,6 +1636,47 @@ async function runSetWidgetBody(
     // not add an option to the captured widget after that switch (#718).
     assertTargetStillCurrentNow();
     return addComboOption(uploadWidget, value);
+  };
+
+  const uploadWidgetName = () => writeTargetWidgetName ?? widgetName;
+  const uploadDefInputName = () => concreteWidgetName ?? writeTargetWidgetName ?? widgetName;
+  const findUploadWidget = () =>
+    (resolvedTargetNode?.widgets ?? []).find((w) => w?.name === uploadWidgetName());
+
+  // #2222: a TOP-LEVEL upload the live connected inventory already lists, but the
+  // widget (and the burst-cached whole /object_info used by refreshCombos) does not.
+  // `upload_image` verifies against that inventory; rejecting here without asking it
+  // is the split-brain the issue reports. Exact filename match only.
+  const tryLiveUploadInventory = async () => {
+    if (typeof fetchUploadComboInventory !== "function") return false;
+    const type = authTarget?.type;
+    const defName = uploadDefInputName();
+    if (!type || !defName) return false;
+    // A readable NON-upload spec (ckpt_name, sampler_name, …) must not spend a
+    // live inventory fetch. Snapshot-only maps have no input spec, so they fall
+    // through and ask — LoadImage after upload_image is that case.
+    const knownSpec =
+      (freshDefs?.[type]?.input?.required && freshDefs[type].input.required[defName]) ??
+      (freshDefs?.[type]?.input?.optional && freshDefs[type].input.optional[defName]);
+    if (Array.isArray(knownSpec) && !uploadConfigOf(knownSpec[1])) return false;
+    let inventory = null;
+    try {
+      inventory = await fetchUploadComboInventory({
+        type,
+        widgetName: defName,
+        value,
+      });
+    } catch {
+      return false;
+    }
+    const values = inventory?.values;
+    const cfg = uploadConfigOf(inventory?.config) ?? uploadInputConfig(freshDefs ?? undefined, type, defName);
+    if (!cfg || !uploadInputAccepts(cfg, value)) return false;
+    if (!inventoryHasExactValue(values, value)) return false;
+    const uploadWidget = findUploadWidget();
+    if (!uploadWidget) return false;
+    assertTargetStillCurrentNow();
+    return applyComboInventory(uploadWidget, values);
   };
 
   try {
@@ -1703,6 +1752,22 @@ async function runSetWidgetBody(
         // Still a combo miss after the refresh — keep the freshest reason and try the
         // upload-asset fallback below.
         latest = retryErr;
+      }
+    }
+
+    // #2222: live input-file inventory from the connected ComfyUI (same listing
+    // upload_image consults). Applied BEFORE the /view existence probe so a
+    // top-level filename the server already enumerates is not rejected against
+    // a stale 462-item widget snapshot.
+    if (await tryLiveUploadInventory()) {
+      try {
+        return await succeedWrite({}, { refreshed: true });
+      } catch (invErr) {
+        if (!(invErr instanceof WidgetWriteError)) throw invErr;
+        if (!invErr.combo) {
+          throw refusalFrame(invErr, " after refreshing the upload-file inventory");
+        }
+        latest = invErr;
       }
     }
 
