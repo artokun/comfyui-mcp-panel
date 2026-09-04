@@ -10,6 +10,12 @@ All notable changes to this project are documented here. This project adheres to
 - Preserve the panel-wide Codex conversation across a workflow remount when the canonical IndexedDB history read times out or is otherwise unavailable; only a confirmed empty archive may clear the transcript and session (#2201)
 - the canonical chat-history read is decided by the IndexedDB TRANSACTION rather than the request, so a get that succeeds before its transaction aborts is no longer treated as authoritative; and a delayed hydration retry no longer reselects the mount-time thread over a chat the user picked while the store was recovering (#2201)
 
+## [0.15.167] - 2026-09-04
+
+### Fixed
+- fetch_comfyui_read keeps the Comfy API object as `this` when calling apiURL/fileURL, so frontend helpers that read `this.api_base` still resolve after restart instead of throwing "Cannot read properties of undefined (reading 'api_base')" (#2228, #2229)
+
+
 ## [0.15.166] - 2026-09-04
 
 ### Fixed
