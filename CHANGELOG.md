@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_run copies promoted subgraph rails and linked primitive values into the compiled prompt so a Krea2-style width/height and external prompt execute instead of stored inner defaults; GetNode/SetNode bus relays are no longer reported as dropped value sources (#1181)
+
 ## [0.15.171] - 2026-09-04
 
 ### Fixed

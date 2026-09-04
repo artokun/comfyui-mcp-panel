@@ -27,6 +27,9 @@ import {
   collectVirtualSourceFeeds,
   virtualSourceNote,
   virtualSourceTag,
+  linkedSourcePayload,
+  applyLinkedSubgraphValuesToPrompt,
+  installGraphToPromptVirtualSourceApply,
 } from "../../web/js/lib/virtual-source-promotion.js";
 
 // ---- fixtures ---------------------------------------------------------------
@@ -93,6 +96,40 @@ test("#1181 a virtual node with a CONNECTED input can relay a real value — not
 
 test("#1181 a bare virtual node with nothing to forward IS flagged", () => {
   assert.equal(isNonSerializingValueSource({ id: 2, isVirtualNode: true, inputs: [] }), true);
+});
+
+test("#1181 GetNode is a bus relay graphToPrompt resolves, not a dropped value source", () => {
+  // Krea2 wires Get_VAE / Get_CLIP into the subgraph. Clause 2 used to flag any
+  // virtual node with no connected input, so panel_run claimed GetNode was the
+  // non-source PrimitiveNode is. The widget is the bus NAME, not a payload.
+  assert.equal(
+    isNonSerializingValueSource({
+      id: 59,
+      type: "GetNode",
+      isVirtualNode: true,
+      inputs: [],
+      widgets: [{ name: "value", value: "VAE" }],
+    }),
+    false,
+  );
+  assert.equal(
+    isNonSerializingValueSource({
+      id: 32,
+      type: "SetNode",
+      isVirtualNode: true,
+      inputs: [{ name: "VAE", link: 1 }],
+    }),
+    false,
+  );
+  assert.equal(
+    linkedSourcePayload({
+      id: 59,
+      type: "GetNode",
+      isVirtualNode: true,
+      widgets: [{ name: "value", value: "VAE" }],
+    }),
+    undefined,
+  );
 });
 
 test("#1181 malformed/missing nodes fail safe: not a source, never a throw", () => {
@@ -210,9 +247,9 @@ test("#1181 the queue-time note names the source and says the STORED value execu
   assert.match(note, /PrimitiveNode #85/);
   assert.match(note, /subgraph #10/);
   assert.match(note, /"text"/);
-  assert.match(note, /STORED/i, "says the inner stored value is what executes");
-  assert.match(note, /does NOT reach the prompt|dropped from the prompt/i);
-  // The remedy the reporter verified: a BACKEND primitive carries the value.
+  assert.match(note, /STORED/i, "names the inner stored fallback ComfyUI would serialize");
+  assert.match(note, /DROPS that source|dropped from the prompt/i);
+  assert.match(note, /compiles the linked/i, "says panel_run compiles the linked value into the prompt");
   assert.match(note, /backend/i);
 });
 
@@ -226,7 +263,8 @@ test("#1181 no findings, no note", () => {
 test("#1181 the outline/compact tag says the link value is NOT what executes", () => {
   const tag = virtualSourceTag({ node_id: 85, output_slot: 0 });
   assert.match(tag, /#85\.0/);
-  assert.match(tag, /NOT what executes|not serialized|stored value/i);
+  assert.match(tag, /not serialized/i);
+  assert.match(tag, /compiles the linked value into the prompt/i);
   assert.equal(virtualSourceTag(null), "");
 });
 
@@ -273,4 +311,185 @@ test("#1181 the promoted-write refusal names the real repairs when the outer fee
   assert.match(src, /does NOT cross the subgraph boundary/, "the corrected refusal says what happens");
   // The generic #366 refusal must still exist for real-source / nested-promotion cases.
   assert.match(src, /parent rail widget could not be identified/, "the generic refusal is kept");
+});
+
+// ---- compiled-prompt apply (Krea2 recurrence) --------------------------------
+
+function krea2LikeGraph() {
+  const latent = {
+    id: 76,
+    type: "EmptyLatentImage",
+    widgets: [
+      { name: "width", value: 1920 },
+      { name: "height", value: 1080 },
+      { name: "batch_size", value: 1 },
+    ],
+    inputs: [],
+  };
+  const encode = {
+    id: 15,
+    type: "CLIPTextEncode",
+    widgets: [{ name: "text", value: "" }],
+    inputs: [
+      { name: "clip", type: "CLIP", link: 42 },
+      { name: "text", type: "STRING", link: 83, widget: { name: "text" } },
+    ],
+  };
+  const anySwitch = {
+    id: 72,
+    type: "Any Switch (rgthree)",
+    isVirtualNode: true,
+    widgets: [],
+    inputs: [
+      { name: "any_01", type: "*", link: 97 },
+      { name: "any_02", type: "*", link: null },
+    ],
+    outputs: [{ name: "*", type: "*", links: [83] }],
+  };
+  const inner = {
+    _nodes: [latent, encode, anySwitch],
+    inputNode: { id: -10 },
+    links: [
+      { id: 97, origin_id: -10, origin_slot: 4, target_id: 72, target_slot: 0, type: "*" },
+      { id: 83, origin_id: 72, origin_slot: 0, target_id: 15, target_slot: 1, type: "STRING" },
+      { id: 42, origin_id: -10, origin_slot: 1, target_id: 15, target_slot: 0, type: "CLIP" },
+    ],
+  };
+  const promptNode = {
+    id: 143,
+    type: "PrimitiveStringMultiline",
+    constructor: { nodeData: {} },
+    outputs: [{ name: "STRING", type: "STRING", links: [153] }],
+    widgets: [{ name: "value", value: "a lantern at dusk" }],
+  };
+  const getVae = {
+    id: 59,
+    type: "GetNode",
+    isVirtualNode: true,
+    inputs: [],
+    outputs: [{ name: "VAE", type: "VAE", links: [84] }],
+    widgets: [{ name: "value", value: "VAE" }],
+  };
+  const host = {
+    id: 78,
+    type: "21ffbd86-8db8-4fab-954b-2cd8ab0662da",
+    subgraph: inner,
+    properties: { proxyWidgets: [["76", "width"], ["76", "height"]] },
+    widgets: [
+      { name: "width", value: 1024 },
+      { name: "height", value: 768 },
+    ],
+    inputs: [
+      { name: "vae", type: "VAE", link: 84 },
+      { name: "clip", type: "CLIP", link: 85 },
+      { name: "model", type: "MODEL", link: 156 },
+      { name: "positive", type: "CONDITIONING", link: 238 },
+      { name: "any_01", type: "STRING", link: 153 },
+      { name: "any_02", type: "STRING", link: null },
+    ],
+  };
+  const g = graphOf(
+    [getVae, promptNode, host],
+    {
+      84: { origin_id: 59, origin_slot: 0 },
+      153: { origin_id: 143, origin_slot: 0 },
+    },
+  );
+  host.graph = g;
+  return g;
+}
+
+function staleKrea2Prompt() {
+  return {
+    output: {
+      "78:76": {
+        class_type: "EmptyLatentImage",
+        inputs: { width: 1920, height: 1080, batch_size: 1 },
+      },
+      "78:15": {
+        class_type: "CLIPTextEncode",
+        inputs: { clip: ["1", 0], text: "" },
+      },
+    },
+  };
+}
+
+test("#1181 GetNode feeding a subgraph is not a virtual-source feed", () => {
+  const found = collectVirtualSourceFeeds(krea2LikeGraph());
+  assert.equal(found.some((f) => f.origin_type === "GetNode"), false);
+});
+
+test("#1181 Krea2-like compiled prompt carries promoted width/height and the linked prompt", () => {
+  const g = krea2LikeGraph();
+  const prompt = staleKrea2Prompt();
+  const n = applyLinkedSubgraphValuesToPrompt(g, prompt);
+  assert.ok(n >= 3, `expected width, height, and text patches, got ${n}`);
+  assert.equal(prompt.output["78:76"].inputs.width, 1024);
+  assert.equal(prompt.output["78:76"].inputs.height, 768);
+  assert.equal(prompt.output["78:15"].inputs.text, "a lantern at dusk");
+  assert.equal(prompt.output["78:15"].inputs.clip[0], "1", "tensor links are left alone");
+});
+
+test("#1181 PrimitiveNode coverage is not weakened: it is still a non-serializing source", () => {
+  assert.equal(isNonSerializingValueSource(primitive(85, "a lantern")), true);
+  const g = primitiveFeed();
+  const prompt = {
+    output: {
+      "10:3": { class_type: "CLIPTextEncode", inputs: { text: "OLD stored text" } },
+    },
+  };
+  // primitiveFeed's container has no inner CLIPTextEncode — pin the detector still fires.
+  const found = collectVirtualSourceFeeds(g);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].origin_type, "PrimitiveNode");
+  applyLinkedSubgraphValuesToPrompt(g, prompt);
+});
+
+test("#1181 PrimitiveNode linked into a subgraph STRING input is copied onto the inner prompt node", () => {
+  const innerNode = {
+    id: 3,
+    type: "CLIPTextEncode",
+    widgets: [{ name: "text", value: "OLD stored text" }],
+    inputs: [{ name: "text", type: "STRING", link: 1, widget: { name: "text" } }],
+  };
+  const innerGraph = {
+    _nodes: [innerNode],
+    inputNode: { id: -10 },
+    links: [{ id: 1, origin_id: -10, origin_slot: 0, target_id: 3, target_slot: 0, type: "STRING" }],
+  };
+  const host = container(10);
+  host.subgraph = innerGraph;
+  host.inputs = [{ name: "text", type: "STRING", link: 7, _widget: { name: "text" } }];
+  const g = graphOf([primitive(85, "a lantern at dusk"), host], { 7: { origin_id: 85, origin_slot: 0 } });
+  host.graph = g;
+  const prompt = {
+    output: { "10:3": { class_type: "CLIPTextEncode", inputs: { text: "OLD stored text" } } },
+  };
+  applyLinkedSubgraphValuesToPrompt(g, prompt);
+  assert.equal(prompt.output["10:3"].inputs.text, "a lantern at dusk");
+});
+
+test("#1181 graphToPrompt wrap patches the compiled prompt and does not mutate live inner widgets", async () => {
+  const g = krea2LikeGraph();
+  const inner = g._nodes[2].subgraph._nodes[0];
+  const app = {
+    graph: g,
+    graphToPrompt: () => staleKrea2Prompt(),
+  };
+  assert.equal(installGraphToPromptVirtualSourceApply(app), true);
+  assert.equal(installGraphToPromptVirtualSourceApply(app), true, "idempotent");
+  const prompt = await app.graphToPrompt();
+  assert.equal(prompt.output["78:76"].inputs.width, 1024);
+  assert.equal(prompt.output["78:15"].inputs.text, "a lantern at dusk");
+  assert.equal(inner.widgets[0].value, 1920, "live inner stored value is untouched");
+});
+
+test("#1181 graph_run installs the virtual-source prompt apply before the snapshot barrier", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const apply = src.indexOf("installGraphToPromptVirtualSourceApply(app)");
+  const snapshot = src.indexOf("installGraphToPromptSnapshotBarrier(app)");
+  const preflight = src.indexOf("const preflightBuild = await withTimeout(");
+  assert.ok(apply > 0, "graph_run must install the virtual-source prompt apply");
+  assert.ok(snapshot > apply, "snapshot barrier stays outermost");
+  assert.ok(preflight > snapshot, "apply is installed before pre-flight serialize");
 });
