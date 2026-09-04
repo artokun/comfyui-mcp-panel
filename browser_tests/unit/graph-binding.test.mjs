@@ -709,6 +709,15 @@ test("#1215: graph_outline re-asserts the binding bar; graph_query stays dispatc
     /assertGraphBoundToActiveWorkflow\(graph, rootGraph, graphCommandBindingBar\(msg\.cmd\)\)/,
     "dispatch still fences graph_query through the classified-read bar",
   );
+  const fence = src.slice(
+    src.indexOf("function assertGraphBoundToActiveWorkflow("),
+    src.indexOf("function tryHealStaleRootWorkflowIdentity("),
+  );
+  assert.match(
+    fence,
+    /typeof switchRepaintUnproven !== "undefined"/,
+    "extracted #1477/#1233 fences must not throw on an unbound leftover flag",
+  );
 });
 
 test("missingNodeStateReportsNodes: only positive, shaped missing-node state is evidence", () => {

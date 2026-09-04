@@ -10049,6 +10049,10 @@ function assertGraphBoundToActiveWorkflow(
   } catch {
     others = null;
   }
+  // typeof so extracted fence harnesses (#1477/#1233) that do not bind this
+  // module-level flag still run: an undeclared identifier is not leftover proof.
+  const leftoverSwitch =
+    typeof switchRepaintUnproven !== "undefined" && switchRepaintUnproven === true;
   const verdict = resolveGraphBindingVerdict({
     graph,
     rootGraph,
@@ -10063,7 +10067,7 @@ function assertGraphBoundToActiveWorkflow(
     graphLoading,
     missingNodeState,
     others,
-    switchRepaintUnproven,
+    switchRepaintUnproven: leftoverSwitch,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }
