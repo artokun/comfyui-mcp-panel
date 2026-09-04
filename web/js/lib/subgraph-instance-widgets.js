@@ -266,6 +266,122 @@ function savedDefinitionsById(savedGraph) {
   return byId;
 }
 
+function subgraphInputSlots(subgraph) {
+  if (Array.isArray(subgraph?.inputs) && subgraph.inputs.length) return subgraph.inputs;
+  if (Array.isArray(subgraph?.inputNode?.slots) && subgraph.inputNode.slots.length) {
+    return subgraph.inputNode.slots;
+  }
+  return [];
+}
+
+function aliasKey(value) {
+  return typeof value === "string" && value.length > 0 ? value.toLowerCase() : null;
+}
+
+function slotAliasKeys(slot) {
+  const keys = [];
+  const name = aliasKey(slot?.name);
+  const label = aliasKey(slot?.label);
+  if (name) keys.push(name);
+  if (label && label !== name) keys.push(label);
+  return keys;
+}
+
+function uniqueSlotForAliases(slots, aliases) {
+  const wanted = new Set();
+  for (const alias of aliases) {
+    const key = aliasKey(alias);
+    if (key) wanted.add(key);
+  }
+  if (!wanted.size) return null;
+  const hits = [];
+  for (const slot of slots) {
+    if (!slot) continue;
+    if (slotAliasKeys(slot).some((key) => wanted.has(key))) hits.push(slot);
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+function liveHostWidgets(host) {
+  try {
+    return Array.isArray(host?.widgets) ? host.widgets : [];
+  } catch {
+    return [];
+  }
+}
+
+function bindSlotIfMissing(target, slot, result) {
+  if (!target || !slot) {
+    result.skipped += 1;
+    return;
+  }
+  if (target._subgraphSlot) {
+    result.skipped += 1;
+    return;
+  }
+  target._subgraphSlot = slot;
+  result.rebound += 1;
+}
+
+function rebindOneLoadedHost(host, result) {
+  const slots = subgraphInputSlots(host?.subgraph);
+  if (!slots.length) return;
+  const inputs = Array.isArray(host.inputs) ? host.inputs : [];
+  for (const input of inputs) {
+    bindSlotIfMissing(
+      input,
+      uniqueSlotForAliases(slots, [
+        input?.name,
+        input?.label,
+        input?.widget?.name,
+        input?.widget?.label,
+        input?._widget?.name,
+        input?._widget?.label,
+      ]),
+      result,
+    );
+  }
+  for (const widget of liveHostWidgets(host)) {
+    bindSlotIfMissing(widget, uniqueSlotForAliases(slots, [widget?.name, widget?.label]), result);
+  }
+}
+
+/**
+ * #2225 — after workflow_open / graph_load of a modified subgraph, host rails
+ * exist (outline lists width/height/seed) while `_subgraphSlot` is still
+ * unbound. Rebind each host input/widget onto the unique same-named subgraph
+ * input-rail slot so graph_get_subgraph can publish a complete promoted-terminal
+ * witness. Name match is unique or skipped; an existing slot is left alone.
+ *
+ * @returns {{ rebound: number, skipped: number }}
+ */
+export function rebindLoadedPromotedMappings(rootGraph) {
+  const result = { rebound: 0, skipped: 0 };
+  if (!rootGraph) return result;
+  const stack = [rootGraph];
+  const seen = new Set();
+  let walks = 0;
+  while (stack.length) {
+    if (++walks > MAX_SUBGRAPH_WALKS) break;
+    const graph = stack.pop();
+    if (!graph || seen.has(graph)) continue;
+    seen.add(graph);
+    let nodes;
+    try {
+      nodes = graph._nodes ?? graph.nodes;
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(nodes)) continue;
+    for (const node of nodes) {
+      if (!node?.subgraph) continue;
+      rebindOneLoadedHost(node, result);
+      stack.push(node.subgraph);
+    }
+  }
+  return result;
+}
+
 /**
  * #874 remaining load path — `panel_load_workflow` / `graph_load` of a saved
  * subgraph host.
@@ -287,6 +403,7 @@ function savedDefinitionsById(savedGraph) {
 export function applySavedSubgraphHostWidgets(liveRoot, savedGraph) {
   const result = { restored: 0, skipped: 0 };
   if (!liveRoot || !savedGraph || typeof savedGraph !== "object") return result;
+  rebindLoadedPromotedMappings(liveRoot);
   const defs = savedDefinitionsById(savedGraph);
 
   const applyInGraph = (liveGraph, savedNodes) => {
