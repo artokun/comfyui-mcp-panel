@@ -50,6 +50,44 @@ import {
 // enrich the note; a stall cannot beat the grace.
 export const STILLS_METADATA_TIMEOUT_MS = 1000;
 
+// #2234 — overlapping compose() calls for the SAME video record (a 20 s sweep
+// that re-enters while the first sample is still encoding) must share one
+// pipeline, not mint a second identity. WeakMap so a finished record does not
+// keep the promise alive; the durable reuse lives on the record itself.
+const inFlightStoryboards = new WeakMap();
+
+function reusedStoryboardSegment(v) {
+  if (!v || typeof v !== "object") return null;
+  const ref = v.storyboardRef;
+  const note = v.storyboardNote;
+  if (!ref || typeof note !== "string" || !note) return null;
+  const segment = { ref, note };
+  if (typeof v.storyboardNoteWhenBlind === "string" && v.storyboardNoteWhenBlind) {
+    segment.noteWhenBlind = v.storyboardNoteWhenBlind;
+  }
+  return segment;
+}
+
+function ensureStoryboardIdentity(v) {
+  if (!v || typeof v !== "object") return createStoryboardIdentity();
+  if (typeof v.storyboardIdentity !== "string" || !v.storyboardIdentity) {
+    v.storyboardIdentity = createStoryboardIdentity();
+  }
+  return v.storyboardIdentity;
+}
+
+function persistStoryboardSegment(v, storyboardIdentity, segment) {
+  if (!v || typeof v !== "object") return;
+  if (typeof storyboardIdentity === "string" && storyboardIdentity) {
+    v.storyboardIdentity = storyboardIdentity;
+  }
+  if (segment?.ref) v.storyboardRef = segment.ref;
+  if (typeof segment?.note === "string" && segment.note) v.storyboardNote = segment.note;
+  if (typeof segment?.noteWhenBlind === "string" && segment.noteWhenBlind) {
+    v.storyboardNoteWhenBlind = segment.noteWhenBlind;
+  }
+}
+
 /**
  * Build and send the single consolidated completion frame for one finished
  * prompt. Resolves to the frame that was sent (for tests), or null when the
@@ -765,6 +803,16 @@ async function buildVideoSegment(v, deps) {
   if (!videoStoryboardEnabled) {
     return { ref: null, note: noteOnly("storyboard preview is turned off in panel settings") };
   }
+  // #2234 — a refused retry of THIS finished record must not sample or upload
+  // again. The artifact cannot change; a fresh identity would only mint another
+  // temp filename. A genuinely new completion is a different `v` (and usually a
+  // different prompt id), so #1718 / #1834 cache-busting is unchanged.
+  const reused = reusedStoryboardSegment(v);
+  if (reused) return reused;
+  if (v && typeof v === "object") {
+    const inFlight = inFlightStoryboards.get(v);
+    if (inFlight) return inFlight;
+  }
   // The storyboard pipeline (sample → upload → HEAD) contains at least one
   // UNBOUNDED step (uploadBlobToInput does a fetch with no timeout). Bound the
   // whole pipeline: on timeout, degrade to the note-only fallback so a stalled
@@ -791,7 +839,13 @@ async function buildVideoSegment(v, deps) {
       // Give the source fetch and every derived artifact one attempt identity so
       // neither the browser nor ComfyUI's filename-based temp ref can return the
       // previous run's pixels.
-      const storyboardIdentity = v?.storyboardIdentity || createStoryboardIdentity();
+      //
+      // #2234 — write that identity back onto THIS record immediately, before
+      // any await. A refused retry of the same finished run (or a sweep that
+      // overlaps this produce) must reuse it; minting here would fill temp/
+      // with unique storyboard_*.png names. A new completion still mints,
+      // because it is a different record.
+      const storyboardIdentity = ensureStoryboardIdentity(v);
       const sourceUrl =
         v?.videoUrl || appendStoryboardCacheBust(imageViewUrl(m), storyboardIdentity);
       // The video's own byte size is wanted only for the note's metadata line.
@@ -948,14 +1002,23 @@ async function buildVideoSegment(v, deps) {
         `Blind mode is ON, so the storyboard was NOT sent to you (it is shown to the user). ` +
         `Do not comment on motion, sharpness, or visual quality — acknowledge completion and the metadata below only.` +
         metaSuffix(sizeStr, frames);
-      return { ref, note, noteWhenBlind };
+      const segment = { ref, note, noteWhenBlind };
+      persistStoryboardSegment(v, storyboardIdentity, segment);
+      return segment;
     } catch (err) {
       warn("[cmcp] storyboard pipeline failed:", err);
       return { ref: null, note: noteOnly("its storyboard preview failed to build") };
     }
   };
+  const work = produce();
+  if (v && typeof v === "object") {
+    inFlightStoryboards.set(v, work);
+    void work.finally(() => {
+      if (inFlightStoryboards.get(v) === work) inFlightStoryboards.delete(v);
+    });
+  }
   return withTimeout(
-    produce(),
+    work,
     videoStoryboardTimeoutMs,
     () => {
       warn("[cmcp] storyboard: timed out for", m?.filename);
