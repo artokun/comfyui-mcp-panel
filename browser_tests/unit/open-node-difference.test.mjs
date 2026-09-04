@@ -375,6 +375,11 @@ test("the pin guard also skips the recovery probe, or the wedge just moves", () 
     /pinnedPath\.trim\(\) && !commandIsCanvasTargetless\(msg\.cmd\)/,
     "both guards must consult the same predicate",
   );
+  assert.match(
+    PANEL,
+    /switchFenceRefusesCommand\(/,
+    "#2249 — the switch token must consult the same targetless exemption, or the wedge moves there",
+  );
 });
 
 test("an ordinary graph read stays fenced — the exemption is not a hole", () => {
