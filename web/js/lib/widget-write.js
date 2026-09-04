@@ -2062,16 +2062,23 @@ function resolveWidgetOnlyLoadedPromotion(subgraphNode, widgetName) {
   const subgraph = subgraphNode?.subgraph;
   const wanted = String(widgetName).toLowerCase();
   const widgets = Array.isArray(subgraphNode?.widgets) ? subgraphNode.widgets : [];
-  const hostHits = widgets.filter(
-    (widget) => widget && typeof widget.name === "string" && widget.name.toLowerCase() === wanted,
-  );
+  const hostHits = widgets.filter((widget) => {
+    if (!widget) return false;
+    const name = typeof widget.name === "string" ? widget.name.toLowerCase() : "";
+    const label = typeof widget.label === "string" ? widget.label.toLowerCase() : "";
+    return name === wanted || label === wanted;
+  });
   if (hostHits.length !== 1) return { promoted: false };
-  const source = uniqueRailBackedInnerWidget(subgraph, widgetName);
+  const hostWidget = hostHits[0];
+  const slot = uniqueSlotMatchingAliases(subgraph, [widgetName, hostWidget.name, hostWidget.label]);
+  const fromSlot = slot ? sourcesFromInputRailSlot(subgraph, slot) : [];
+  const source =
+    fromSlot.length === 1 ? fromSlot[0] : uniqueRailBackedInnerWidget(subgraph, widgetName);
   if (!source) return { promoted: false };
   const innerNode = subgraphNodeById(subgraph, source.sourceNodeId);
   const innerWidget = (innerNode?.widgets ?? []).find((widget) => widget?.name === source.sourceWidgetName);
   if (!innerNode || !innerWidget) return { promoted: false };
-  const input = { name: hostHits[0].name, _widget: hostHits[0], widget: hostHits[0] };
+  const input = { name: hostWidget.name, _widget: hostWidget, widget: hostWidget };
   const parentWidgets = liveHostPromotedWidgets(subgraphNode, input, innerWidget);
   const parentWidget = parentWidgets[0] ?? null;
   if (!parentWidget) return { promoted: false };

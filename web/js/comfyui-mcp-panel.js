@@ -307,6 +307,7 @@ import {
 import {
   withPreservedPromotedInstanceWidgets,
   applySavedSubgraphHostWidgets,
+  rebindLoadedPromotedMappings,
 } from "./lib/subgraph-instance-widgets.js";
 import {
   snapshotExternalLinks,
@@ -3053,7 +3054,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // could never catch the real failure, that set-version.mjs was not run at all,
 // since one script writes them together. That is how 0.15.86..0.15.96 shipped
 // still announcing 0.15.85.
-const PANEL_VERSION = "0.15.165";
+const PANEL_VERSION = "0.15.166";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at
@@ -10389,6 +10390,35 @@ function promotedHostAliasRecords(subgraphNode) {
       for (const value of promotedInputAliases(widget, widget._subgraphSlot)) add(value, null, null);
     }
   }
+  // #2225 — after a modified-definition reopen, host rails exist on
+  // node.widgets while `_subgraphSlot` is still unbound. A unique subgraph
+  // input-rail slot of the same name is that promotion.
+  const ioSlots = Array.isArray(subgraphNode?.subgraph?.inputs) && subgraphNode.subgraph.inputs.length
+    ? subgraphNode.subgraph.inputs
+    : Array.isArray(subgraphNode?.subgraph?.inputNode?.slots)
+      ? subgraphNode.subgraph.inputNode.slots
+      : [];
+  if (ioSlots.length) {
+    const slotKeys = new Map();
+    for (const slot of ioSlots) {
+      for (const raw of [slot?.name, slot?.label]) {
+        if (typeof raw !== "string" || raw.length === 0) continue;
+        const key = raw.toLowerCase();
+        slotKeys.set(key, slotKeys.has(key) ? null : slot);
+      }
+    }
+    for (const widget of projectedWidgets) {
+      const aliases = [widget?.name, widget?.label].filter(
+        (value) => typeof value === "string" && value.length > 0,
+      );
+      if (!aliases.length) continue;
+      const unique = aliases
+        .map((alias) => slotKeys.get(alias.toLowerCase()))
+        .filter((slot, index, all) => slot && all.indexOf(slot) === index);
+      if (unique.length !== 1) continue;
+      for (const value of aliases) add(value, null, null);
+    }
+  }
 
   const rawProxyWidgets = subgraphNode?.properties?.proxyWidgets;
   if (rawProxyWidgets === undefined) return records;
@@ -10559,19 +10589,10 @@ function promotedTerminalWitnesses(subgraphNode) {
       });
       continue;
     }
-    if (
-      record.relation &&
-      (String(resolution.target.node?.id) !== String(record.relation.nodeId) ||
-        resolution.target.widget?.name !== record.relation.widgetName)
-    ) {
-      entries.push({
-        widget,
-        immediate_node_id: resolution.target.node?.id,
-        immediate_widget: resolution.target.widget?.name,
-        error: "the live _subgraphSlot target disagreed with properties.proxyWidgets",
-      });
-      continue;
-    }
+    // After a modified-definition load, proxyWidgets can still name the FILE's
+    // inner id/widget while the live input-rail already points at the Primitive
+    // `value` terminal. The live parent-rail-authenticated resolution is the
+    // mapping graph_set_widget writes; a stale serialized pair is not a veto.
     entries.push({
       widget,
       parent_rail: {
@@ -14212,6 +14233,13 @@ const GRAPH_TOOL_EXECUTORS = {
       };
     }
     const refreshed = verdict === true || (verdict != null && typeof verdict === "object" && verdict.refreshed === true);
+    if (refreshed) {
+      try {
+        rebindLoadedPromotedMappings(app?.graph);
+      } catch {
+        /* mapping rebind is best-effort; the witness still recomputes on the next read */
+      }
+    }
     // #981: the stale-placeholder disclosure has to survive BOTH paths. The producer
     // runs the scan whatever the verdict says — a refresh that failed at the combo phase
     // can still leave placeholders behind — but only this branch dropped it, because
