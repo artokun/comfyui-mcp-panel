@@ -18,6 +18,12 @@ All notable changes to this project are documented here. This project adheres to
   the next connect and cannot undo the collisions already made, so a graph that needed it
   may already have wires that moved, and the reply now says so (#2196).
 
+## [0.15.167] - 2026-09-04
+
+### Fixed
+- fetch_comfyui_read keeps the Comfy API object as `this` when calling apiURL/fileURL, so frontend helpers that read `this.api_base` still resolve after restart instead of throwing "Cannot read properties of undefined (reading 'api_base')" (#2228, #2229)
+
+
 ## [0.15.166] - 2026-09-04
 
 ### Fixed
