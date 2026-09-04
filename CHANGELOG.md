@@ -6,7 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+
 ### Fixed
+- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222)
 - CivitAI sign-in now says when it did not complete (panel#2044). The poll gave up after
   four minutes in silence while the popup showed a bare browser 403 that ComfyUI never
   logged, so the user got no statement that sign-in had failed. The message offers the
