@@ -17,6 +17,16 @@ All notable changes to this project are documented here. This project adheres to
   repair on every success path instead of doing it silently: raising the counter protects
   the next connect and cannot undo the collisions already made, so a graph that needed it
   may already have wires that moved, and the reply now says so (#2196).
+- the counter repair is disclosed from EVERY caller, not only panel_connect (#2196).
+  panel_expose_subgraph_output/_input and the widget-promotion path repaired the
+  counter silently. They take the same graph, and the counter only moves up, so
+  whichever ran first consumed the condition: repair silently there and the next
+  panel_connect saw nothing to report, losing the disclosure for good on a graph
+  whose earlier connects may already have overwritten an unrelated link. All three
+  now surface it, joined with any landed-after-throw warning rather than replacing
+  it. Inlined rather than shared, because those handlers are rebuilt by
+  `new Function` harnesses that inject dependencies by name — a module-scope helper
+  throws ReferenceError there, which the connect-throw-verdict suite caught.
 
 ## [0.15.168] - 2026-09-04
 

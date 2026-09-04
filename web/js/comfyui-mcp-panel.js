@@ -24975,7 +24975,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // graph already holds therefore overwrites a bystander's record, and the
     // wire reads as having moved onto this connection. Raise the counter first;
     // it only ever moves up, so a well-formed graph is untouched.
-    ensureLinkIdHeadroom(graph);
+    const headroom = ensureLinkIdHeadroom(graph);
     if (typeof subgraph.addOutput !== "function" || !subgraph.outputNode) {
       throw new Error(
         "graph_expose_subgraph_output must be run INSIDE a subgraph (no subgraph.addOutput on the active graph)",
@@ -25072,7 +25072,25 @@ const GRAPH_TOOL_EXECUTORS = {
         on_host_subgraph_node: true,
         from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
       },
-      ...(exposeConnectErr ? { warning: landedAfterThrowWarning(exposeConnectErr) } : {}),
+      // #2196 — a counter repair is DISCLOSED here too, not only from graph_connect.
+      // These sites take the SAME graph, and the counter only moves up, so whichever
+      // runs first CONSUMES the condition: repair silently here and the next connect
+      // sees `adjusted: false` and says nothing, losing the disclosure for good on a
+      // graph whose earlier connects may already have overwritten a bystander.
+      // #2196 — BOTH warnings, not either/or. Inlined rather than a shared helper:
+      // these handlers are rebuilt by `new Function` harnesses that inject deps by
+      // NAME, so a module-scope function is not in scope here (ReferenceError at
+      // runtime, which is what the connect-throw-verdict suite caught).
+      ...(headroom?.warning || exposeConnectErr
+        ? {
+            warning: [
+              headroom?.warning,
+              exposeConnectErr ? landedAfterThrowWarning(exposeConnectErr) : "",
+            ]
+              .filter(Boolean)
+              .join(" "),
+          }
+        : {}),
     };
   },
 
@@ -25085,7 +25103,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // graph already holds therefore overwrites a bystander's record, and the
     // wire reads as having moved onto this connection. Raise the counter first;
     // it only ever moves up, so a well-formed graph is untouched.
-    ensureLinkIdHeadroom(graph);
+    const headroom = ensureLinkIdHeadroom(graph);
     if (typeof subgraph.addInput !== "function" || !subgraph.inputNode) {
       throw new Error(
         "graph_expose_subgraph_input must be run INSIDE a subgraph (no subgraph.addInput on the active graph)",
@@ -25173,7 +25191,25 @@ const GRAPH_TOOL_EXECUTORS = {
         on_host_subgraph_node: true,
         to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
       },
-      ...(exposeConnectErr ? { warning: landedAfterThrowWarning(exposeConnectErr) } : {}),
+      // #2196 — a counter repair is DISCLOSED here too, not only from graph_connect.
+      // These sites take the SAME graph, and the counter only moves up, so whichever
+      // runs first CONSUMES the condition: repair silently here and the next connect
+      // sees `adjusted: false` and says nothing, losing the disclosure for good on a
+      // graph whose earlier connects may already have overwritten a bystander.
+      // #2196 — BOTH warnings, not either/or. Inlined rather than a shared helper:
+      // these handlers are rebuilt by `new Function` harnesses that inject deps by
+      // NAME, so a module-scope function is not in scope here (ReferenceError at
+      // runtime, which is what the connect-throw-verdict suite caught).
+      ...(headroom?.warning || exposeConnectErr
+        ? {
+            warning: [
+              headroom?.warning,
+              exposeConnectErr ? landedAfterThrowWarning(exposeConnectErr) : "",
+            ]
+              .filter(Boolean)
+              .join(" "),
+          }
+        : {}),
     };
   },
 
@@ -27266,6 +27302,8 @@ const GRAPH_TOOL_EXECUTORS = {
     const source = { sourceNodeId: String(node.id), sourceWidgetName: w.name };
     const action = demote ? "demote" : "promote";
     let strategy = "link-only";
+      // #2196 -- link-counter repairs made while promoting, surfaced on the reply.
+      const headroomWarnings = [];
     graph.beforeChange?.();
     try {
       // Preview widgets ($$canvas-image-preview) have no connectable input slot,
@@ -27286,7 +27324,14 @@ const GRAPH_TOOL_EXECUTORS = {
             // store, which keeps its own counter and can be stale independently
             // of the parent's. Raised here rather than inside that function: see
             // the note there.
-            if (!demote) ensureLinkIdHeadroom(p?.subgraph);
+            // #2196 -- collected, not dropped. A silent repair here CONSUMES the condition
+            // for this subgraph: the counter only moves up, so a later connect INSIDE it
+            // reports `adjusted: false` and the user never learns that earlier connects
+            // there may already have overwritten an unrelated link.
+            if (!demote) {
+              const h = ensureLinkIdHeadroom(p?.subgraph);
+              if (h?.warning) headroomWarnings.push(h.warning);
+            }
             const result = demote ? demoteWidgetByLink(p, source) : promoteWidgetByLink(p, node, w);
             changed = changed || result.changed;
           }
@@ -27328,6 +27373,7 @@ const GRAPH_TOOL_EXECUTORS = {
       from_node: node.id,
       on_subgraph_nodes: parents.map((p) => p.id),
       strategy,
+      ...(headroomWarnings.length ? { warning: headroomWarnings.join(" ") } : {}),
     };
   },
 

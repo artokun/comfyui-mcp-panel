@@ -256,3 +256,23 @@ test("#2196 EVERY graph_connect success exit carries the disclosure", () => {
     "graph_connect no longer folds headroomWarning into its warning composition",
   );
 });
+test("#2196 both subgraph expose twins put the repair on their reply", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  // INLINED on purpose: these handlers are rebuilt by `new Function` harnesses that
+  // inject dependencies BY NAME, so a shared module-scope helper is not in scope and
+  // throws ReferenceError the moment the line runs. A first attempt did exactly that
+  // and connect-throw-verdict caught it, which is why this pins the inline shape.
+  const spreads = src.split("...(headroom?.warning || exposeConnectErr").length - 1;
+  assert.equal(spreads, 2, "expected both expose twins to surface the repair");
+  assert.equal(
+    src.includes("warningField("),
+    false,
+    "a shared helper is not reachable inside the new Function harnesses",
+  );
+  // The join must keep BOTH warnings, never replace one with the other.
+  // The join must keep BOTH warnings, never replace one with the other.
+  assert.ok(
+    src.includes("landedAfterThrowWarning(exposeConnectErr)"),
+    "the expose twins dropped the landed-after-throw warning",
+  );
+});
