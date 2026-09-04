@@ -310,6 +310,104 @@ test("#984 source guard: the live combo scan walks nested subgraphs from the bou
   );
 });
 
+test("#984 recurrence: a stale HOST-rail combo must not combo-clear a still-missing promoted file", () => {
+  // get_errors sets trustCombo after refreshComboOptionsFromDefs. That sweep keys
+  // off node.type, so a virtual GraphNode host is never rebuilt and its rail
+  // options.values can still list the absent MiniMaxH3 path. Combo-clearing from
+  // that list is how missing_models went empty while the turn-start scan named it.
+  const inner = {
+    id: 88,
+    widgets: [
+      {
+        name: "vae_name",
+        value: "exists-on-disk.safetensors",
+        options: { values: ["exists-on-disk.safetensors"] },
+      },
+    ],
+  };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const host = {
+    id: 1512,
+    subgraph: sub,
+    widgets: [
+      {
+        name: "vae_name",
+        value: "MiniMaxH3/vae.safetensors",
+        options: { values: ["MiniMaxH3/vae.safetensors", "exists-on-disk.safetensors"] },
+      },
+    ],
+  };
+  const root = rootWithSubgraphs([host], [sub]);
+  const candidate = { nodeId: 1512, name: "MiniMaxH3/vae.safetensors", widgetName: "vae_name" };
+  assert.equal(
+    assetCandidateResolvesLive(root, candidate.nodeId, candidate.name, candidate.widgetName),
+    false,
+    "a host-rail combo is not /object_info of the inner loader",
+  );
+  assert.equal(
+    isStaleAssetCandidate(root, candidate, { trustCombo: true }),
+    false,
+    "trustCombo after get_errors' refresh must not drop a genuine promoted miss",
+  );
+});
+
+test("#984 recurrence: an empty HOST-rail combo is not proof the file exists", () => {
+  const inner = { id: 88, widgets: [{ name: "vae_name", value: "exists-on-disk.safetensors", options: { values: [] } }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const host = {
+    id: 1512,
+    subgraph: sub,
+    widgets: [{ name: "vae_name", value: "MiniMaxH3/vae.safetensors", options: { values: [] } }],
+  };
+  const root = rootWithSubgraphs([host], [sub]);
+  const candidate = { nodeId: 1512, name: "MiniMaxH3/vae.safetensors", widgetName: "vae_name" };
+  assert.equal(assetCandidateResolvesLive(root, candidate.nodeId, candidate.name, candidate.widgetName), false);
+  assert.equal(isStaleAssetCandidate(root, candidate, { trustCombo: true }), false);
+});
+
+test("#984 recurrence: locator + trustCombo still reports when only the HOST rail names the miss", () => {
+  const inner = {
+    id: 88,
+    widgets: [
+      {
+        name: "vae_name",
+        value: "exists-on-disk.safetensors",
+        options: { values: ["exists-on-disk.safetensors"] },
+      },
+    ],
+  };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const host = {
+    id: 1512,
+    subgraph: sub,
+    widgets: [{ name: "vae_name", value: "MiniMaxH3/vae.safetensors" }],
+  };
+  const root = rootWithSubgraphs([host], [sub]);
+  const candidate = {
+    nodeId: `${SG_UUID}:88`,
+    name: "MiniMaxH3/vae.safetensors",
+    widgetName: "vae_name",
+  };
+  assert.equal(isStaleAssetCandidate(root, candidate, { trustCombo: true }), false);
+});
+
+test("#984 recurrence: the two halves naming the same promoted miss count once and are not clean", () => {
+  const file = "MiniMaxH3/vae.safetensors";
+  const result = {
+    errored_count: 0,
+    node_errors: null,
+    last_execution_error: null,
+    missing_models: [{ node_id: 1512, file, widget: "vae_name" }],
+    unavailable_widget_values: [
+      { id: 1512, type: "VAELoader", widget: "vae_name", value: file, kind: "missing_asset" },
+    ],
+  };
+  assert.equal(graphErrorsResultIsClean(result), false);
+  const counts = graphErrorsFindingCounts(result);
+  assert.equal(counts.missingAssets, 1);
+  assert.equal(counts.unavailable, 0, "same (node, widget, file) is one finding, not two");
+});
+
 test("assetCandidateStillReferenced: true while a widget still holds the file", () => {
   const node = { id: 5, widgets: [{ name: "lora_name", value: "old.safetensors" }] };
   assert.equal(

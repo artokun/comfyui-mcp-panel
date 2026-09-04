@@ -185,6 +185,81 @@ function parseClassCombos(body, className) {
  * no `inputs` array, an unconnected input, a malformed entry — yields nothing, so the
  * widget stays judged. Skipping is the only thing this can do, and only on evidence.
  */
+/**
+ * Promoted native-subgraph HOST rails are `isVirtualNode` and absent from
+ * /object_info, so the live scan used to skip the whole wrapper. The inner
+ * loader that owns the combo is usually converted-to-input (link-driven) and
+ * skipped too — leaving MiniMaxH3 paths on host 1512 with no live finding
+ * (#984 recurrence). Map each host rail onto its inner class via proxyWidgets
+ * (or a unique inner widget of the same name) so the scan can fetch THAT
+ * class's /object_info and judge the host value.
+ *
+ * Unresolvable rails yield nothing: the load-time store still has to keep the
+ * candidate, and inventing a class would be a false positive.
+ */
+export function promotedComboScanTargets(node) {
+  const out = [];
+  try {
+    if (!node?.subgraph || !Array.isArray(node.widgets) || !node.widgets.length) return out;
+    const inners = node.subgraph._nodes ?? [];
+    const byId = new Map();
+    for (const inner of inners) {
+      if (inner?.id != null) byId.set(String(inner.id), inner);
+    }
+    const pairs = Array.isArray(node.properties?.proxyWidgets) ? node.properties.proxyWidgets : [];
+    const innerForWidget = (widgetName) => {
+      for (const pair of pairs) {
+        if (!Array.isArray(pair) || pair.length < 2) continue;
+        if (String(pair[1]) !== widgetName) continue;
+        const hit = byId.get(String(pair[0]));
+        if (hit) return hit;
+      }
+      const matches = inners.filter((inner) =>
+        (inner?.widgets ?? []).some((w) => w?.name === widgetName),
+      );
+      return matches.length === 1 ? matches[0] : null;
+    };
+    for (const widget of node.widgets) {
+      const widgetName = typeof widget?.name === "string" ? widget.name : null;
+      if (!widgetName) continue;
+      const inner = innerForWidget(widgetName);
+      const className =
+        typeof inner?.type === "string"
+          ? inner.type
+          : typeof inner?.comfyClass === "string"
+            ? inner.comfyClass
+            : null;
+      if (!inner || !className || isFrontendVirtualNode(inner)) continue;
+      out.push({ widget, widgetName, className, inner });
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
+/**
+ * Virtual subgraph hosts contribute synthetic scan nodes typed as the INNER
+ * loader so /object_info is the real combo, while `id` stays the host (the
+ * visible rail). Original nodes are kept: a non-promoted virtual node still
+ * skips later, and an inner loader is still judged on its own widgets.
+ */
+export function expandPromotedHostScanNodes(nodes) {
+  if (!Array.isArray(nodes)) return nodes;
+  const extra = [];
+  for (const node of nodes) {
+    if (!isFrontendVirtualNode(node) || !node.subgraph) continue;
+    for (const t of promotedComboScanTargets(node)) {
+      extra.push({
+        id: node.id,
+        type: t.className,
+        widgets: [{ name: t.widgetName, value: t.widget?.value }],
+      });
+    }
+  }
+  return extra.length ? [...nodes, ...extra] : nodes;
+}
+
 export function linkDrivenWidgetNames(node) {
   const names = new Set();
   try {
@@ -309,6 +384,7 @@ export async function scanComboAvailability(
   if (!Array.isArray(nodes) || typeof fetchClassInfo !== "function") {
     return { unavailable, unknown };
   }
+  nodes = expandPromotedHostScanNodes(nodes);
   // get_errors shares ONE budget across every elective server wait it makes, and
   // overrunning it is not a slow answer — it is a "did not reply" that strands the
   // agent with NO error surface at all (#589). That is strictly worse than the

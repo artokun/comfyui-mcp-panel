@@ -26,6 +26,8 @@ import {
   optionsLookLikeFiles,
   comboAvailabilityNote,
   linkDrivenWidgetNames,
+  promotedComboScanTargets,
+  expandPromotedHostScanNodes,
 } from "../../web/js/lib/live-combo-availability.js";
 import { SINGLE_NODE_INFO_OUTCOME } from "../../web/js/lib/single-node-def.js";
 
@@ -714,4 +716,75 @@ test("#1634 Windows: a genuinely different nested model is still reported", asyn
 test("#1634 Windows separator equivalence never collapses string vs number", () => {
   assert.equal(comboOffers([10], "10", { backslashIsSeparator: true }), false);
   assert.equal(comboOffers(["10"], 10, { backslashIsSeparator: true }), false);
+});
+
+const VAE = classBody("VAELoader", {
+  vae_name: [["exists-on-disk.safetensors"], {}],
+});
+
+function promotedHost(file = "MiniMaxH3/vae.safetensors") {
+  const inner = {
+    id: 88,
+    type: "VAELoader",
+    widgets: [{ name: "vae_name", value: "exists-on-disk.safetensors" }],
+    inputs: [{ name: "vae_name", link: 1, widget: { name: "vae_name" } }],
+  };
+  const host = {
+    id: 1512,
+    type: "MiniMaxH3",
+    isVirtualNode: true,
+    subgraph: { _nodes: [inner] },
+    properties: { proxyWidgets: [["88", "vae_name"]] },
+    widgets: [{ name: "vae_name", value: file }],
+  };
+  return { host, inner };
+}
+
+test("#984 recurrence: a virtual subgraph HOST still reports a promoted missing model", async () => {
+  const { host, inner } = promotedHost();
+  const r = await scanComboAvailability([host, inner], async (cls) =>
+    cls === "VAELoader" ? VAE : {},
+  );
+  assert.equal(r.unavailable.length, 1, "the host rail names a file the inner combo does not offer");
+  assert.equal(r.unavailable[0].id, 1512);
+  assert.equal(r.unavailable[0].type, "VAELoader");
+  assert.equal(r.unavailable[0].widget, "vae_name");
+  assert.equal(r.unavailable[0].value, "MiniMaxH3/vae.safetensors");
+  assert.equal(r.unavailable[0].kind, "missing_asset");
+});
+
+test("#984 recurrence: a promoted host rail whose value IS offered is not reported", async () => {
+  const { host, inner } = promotedHost("exists-on-disk.safetensors");
+  const r = await scanComboAvailability([host, inner], async (cls) =>
+    cls === "VAELoader" ? VAE : {},
+  );
+  assert.deepEqual(r.unavailable, []);
+});
+
+test("#984 recurrence: an inner link-driven leftover is still skipped (host rail is the live value)", async () => {
+  const { host, inner } = promotedHost();
+  inner.widgets[0].value = "MiniMaxH3/stale-inner-leftover.safetensors";
+  const r = await scanComboAvailability([host, inner], async (cls) =>
+    cls === "VAELoader" ? VAE : {},
+  );
+  assert.equal(r.unavailable.length, 1);
+  assert.equal(r.unavailable[0].value, "MiniMaxH3/vae.safetensors", "judge the host rail, not the inner leftover");
+});
+
+test("#984 promotedComboScanTargets maps proxyWidgets onto the inner class", () => {
+  const { host, inner } = promotedHost();
+  assert.deepEqual(
+    promotedComboScanTargets(host).map((t) => ({ name: t.widgetName, type: t.className, inner: t.inner })),
+    [{ name: "vae_name", type: "VAELoader", inner }],
+  );
+  assert.deepEqual(promotedComboScanTargets({ isVirtualNode: true, widgets: [] }), []);
+});
+
+test("#984 expandPromotedHostScanNodes synthesises an inner-typed host-id node", () => {
+  const { host } = promotedHost();
+  const expanded = expandPromotedHostScanNodes([host]);
+  assert.equal(expanded.length, 2);
+  assert.equal(expanded[1].id, 1512);
+  assert.equal(expanded[1].type, "VAELoader");
+  assert.equal(expanded[1].widgets[0].value, "MiniMaxH3/vae.safetensors");
 });

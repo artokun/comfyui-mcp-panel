@@ -240,11 +240,24 @@ export function assetCandidateStillReferenced(rootGraph, nodeId, file) {
  * `[input]`-annotated one (its stripped bare name) may be combo-cleared: both
  * resolve against the very input root the combo enumerates.
  */
+/**
+ * Combo lists on a native-subgraph HOST are not /object_info of the inner loader
+ * (#984 recurrence). `refreshComboOptionsFromDefs` keys off `node.type`, so a
+ * virtual GraphNode's promoted rails keep whatever they had at load — including
+ * the absent MiniMaxH3 path, or an empty list. Neither is proof the file exists.
+ * Only an inner node that currently holds the filename may combo-clear it.
+ */
+function comboAuthorityNodes(node, file) {
+  if (!node) return [];
+  if (!node.subgraph) return [node];
+  return (node.subgraph._nodes ?? []).filter((n) => widgetsHoldFile(n, file));
+}
+
 export function assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName) {
   try {
     if (nodeId == null || !file) return false;
     const node = findNodeByScopedId(rootGraph, nodeId);
-    if (!node || !Array.isArray(node.widgets)) return false;
+    if (!node) return false;
     // Annotation classification comes FIRST (codex P1): a value that parses as
     // [output]/[temp]-annotated resolves as its STRIPPED name in the output/temp
     // root via folder_paths.annotated_filepath. A combo entry that literally
@@ -264,24 +277,31 @@ export function assetCandidateResolvesLive(rootGraph, nodeId, file, widgetName) 
     // input root the combo enumerates — and the RAW annotated string is NOT
     // checked: a literal `foo.png [input]` combo entry is a weird filename, not
     // proof that `foo.png` exists.
-    const comboHasFile = (w) => {
-      if (!w) return false;
+    const comboHasFile = (n, w) => {
+      if (!w || !n) return false;
       const raw = w.options?.values;
-      const list = typeof raw === "function" ? raw(w, node) : raw;
+      const list = typeof raw === "function" ? raw(w, n) : raw;
       return Array.isArray(list) && list.includes(parsed.name);
     };
-    const named = widgetName
-      ? node.widgets.find((x) => x?.name === widgetName)
-      : node.widgets.find((x) => Array.isArray(x?.options?.values));
-    if (comboHasFile(named)) return true;
-    // Widget-shift repair (#569): the blamed widget's own combo can never hold
-    // the file, so also consult the widgets whose CURRENT value literally carries
-    // it — exactly the widgets assetCandidateStillReferenced's node-wide scan
-    // keeps this candidate alive for. A widget still referencing a genuinely
-    // missing file is NOT offered by its fresh combo, so it still flags.
-    for (const w of node.widgets) {
-      if (w === named) continue;
-      if (w?.value === file && comboHasFile(w)) return true;
+    const nodeResolves = (n) => {
+      if (!n || !Array.isArray(n.widgets)) return false;
+      const named = widgetName
+        ? n.widgets.find((x) => x?.name === widgetName)
+        : n.widgets.find((x) => Array.isArray(x?.options?.values));
+      if (comboHasFile(n, named)) return true;
+      // Widget-shift repair (#569): the blamed widget's own combo can never hold
+      // the file, so also consult the widgets whose CURRENT value literally carries
+      // it — exactly the widgets assetCandidateStillReferenced's node-wide scan
+      // keeps this candidate alive for. A widget still referencing a genuinely
+      // missing file is NOT offered by its fresh combo, so it still flags.
+      for (const w of n.widgets) {
+        if (w === named) continue;
+        if (w?.value === file && comboHasFile(n, w)) return true;
+      }
+      return false;
+    };
+    for (const n of comboAuthorityNodes(node, file)) {
+      if (nodeResolves(n)) return true;
     }
     return false;
   } catch {
