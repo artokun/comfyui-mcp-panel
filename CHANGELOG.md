@@ -23,6 +23,12 @@ All notable changes to this project are documented here. This project adheres to
   untouched.
 - the emoji-presentation removal now covers every shipped web/js file rather than the main bundle alone (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
 
+## [0.15.166] - 2026-09-04
+
+### Fixed
+- After panel_open_workflow reopens a modified subgraph, promoted width/height/seed host rails rebind onto the unique inner input-rail slots and graph_get_subgraph publishes a complete promoted-terminal witness, so panel_set_widget can write those widgets instead of refusing an unresolved mapping. panel_refresh_nodes runs the same rebind. A stale properties.proxyWidgets pair from the file is not a veto once the live parent rail is authenticated (#2225, #2226)
+
+
 ## [0.15.165] - 2026-09-04
 
 ### Fixed
