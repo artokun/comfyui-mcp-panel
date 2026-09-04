@@ -2255,8 +2255,13 @@ function isLiveCustomTextWidget(widget) {
   }
 }
 
-function customTextHolds(widget, coerced) {
-  if (widgetHoldsValue(widget, coerced)) return true;
+/**
+ * #2233 — true when the widget's live textarea / contenteditable already holds
+ * `coerced`. Distinct from `.value`: a Vue getter can lag while the editor
+ * that query_graph reads is already committed.
+ */
+export function liveTextEditorHolds(widget, coerced) {
+  if (typeof coerced !== "string" || !widget || typeof widget !== "object") return false;
   const el = liveTextEditorElement(widget);
   if (!el) return false;
   try {
@@ -2264,6 +2269,11 @@ function customTextHolds(widget, coerced) {
   } catch {
     return false;
   }
+}
+
+function customTextHolds(widget, coerced) {
+  if (widgetHoldsValue(widget, coerced)) return true;
+  return liveTextEditorHolds(widget, coerced);
 }
 
 /** When a string write did not stick on `.value`, copy it into the live editor. */

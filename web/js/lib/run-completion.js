@@ -134,9 +134,16 @@ export function createRunCompletionTracker({
   // replay this exact executed batch before falling back to /history. This
   // matters when a remote proxy permits the panel websocket but rejects the
   // separate history request: the panel already has the temp reference and
-  // must not throw it away with the failed send. SaveImage/video recovery keeps
-  // its existing /history behavior.
-  const liveReplays = new Map(); // key -> onFlush payload containing type:"temp"
+  // must not throw it away with the failed send.
+  //
+  // #2234 — VIDEO batches are retained for the same reason, plus a second one:
+  // each compose mints a storyboard identity and uploads a unique temp PNG.
+  // Rebuilding the batch from /history every sweep would mint a new identity
+  // and write another pair of files even though the source video has not
+  // changed. Replaying the same video records lets produce() reuse the
+  // identity and skip the re-upload. SaveImage (output stills) recovery still
+  // uses /history: those refs do not spawn derived temp files.
+  const liveReplays = new Map(); // key -> onFlush payload (temp images and/or videos)
   const active = new Set(); // keys ComfyUI currently reports as running
   const starts = new Map(); // key -> start timestamp
   // Keys whose start came from a real lifecycle signal, not a fallback (#986).
@@ -286,7 +293,17 @@ export function createRunCompletionTracker({
     return records.find((record) => record.routeId === route && record.sessionId === session) ?? null;
   }
 
+  function retainReplayBatch(k, payload) {
+    if (k === NO_PROMPT_KEY || !payload || typeof payload !== "object") return;
+    const images = payload.images;
+    const videos = payload.videos;
+    const hasTempImage = Array.isArray(images) && images.some((image) => image?.type === "temp");
+    const hasVideo = Array.isArray(videos) && videos.length > 0;
+    if (hasTempImage || hasVideo) liveReplays.set(k, payload);
+  }
+
   function flushWithCompletionRecords(k, payload) {
+    retainReplayBatch(k, payload);
     const records = completionRecords(k);
     if (!records.length) {
       onFlush(payload);
@@ -817,12 +834,6 @@ export function createRunCompletionTracker({
     markTerminal(k);
     markDispatched(k);
     if (!hasCompletionKey) markDelivered(k);
-    if (
-      k !== NO_PROMPT_KEY &&
-      payload.images.some((image) => image?.type === "temp")
-    ) {
-      liveReplays.set(k, payload);
-    }
     flushWithCompletionRecords(k, payload);
   }
 
