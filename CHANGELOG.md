@@ -6,9 +6,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
-- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057)
 - CivitAI sign-in now says when it did not complete (panel#2044). The poll gave up after
   four minutes in silence while the popup showed a bare browser 403 that ComfyUI never
   logged, so the user got no statement that sign-in had failed. The message offers the
@@ -19,6 +17,12 @@ All notable changes to this project are documented here. This project adheres to
   generated `locales/en/main.json`, so flattening the conditional in the source
   fallback — from which that catalog is generated, and which renders whenever the
   catalog is not loaded — left it green while the two silently diverged.
+
+## [0.15.168] - 2026-09-04
+
+### Fixed
+- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057, #2231)
+
 
 ## [0.15.167] - 2026-09-04
 
