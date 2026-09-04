@@ -25,6 +25,12 @@ All notable changes to this project are documented here. This project adheres to
   its own sentence names.
 - the stale-snapshot save refusal no longer promises that a still-open transaction clears by itself or that nudging the canvas fixes it (measured: it does not, and each nudge widens the gap), and it now warns against falling back to ComfyUI's own Save, which persists the same tracker snapshot silently (#2139)
 
+## [0.15.167] - 2026-09-04
+
+### Fixed
+- fetch_comfyui_read keeps the Comfy API object as `this` when calling apiURL/fileURL, so frontend helpers that read `this.api_base` still resolve after restart instead of throwing "Cannot read properties of undefined (reading 'api_base')" (#2228, #2229)
+
+
 ## [0.15.166] - 2026-09-04
 
 ### Fixed

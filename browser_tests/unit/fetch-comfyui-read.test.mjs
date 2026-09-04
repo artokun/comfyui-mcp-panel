@@ -132,6 +132,58 @@ test("#2196/#2283: the allowed operations use only their fixed same-origin route
   }
 });
 
+test("#2228: apiURL and fileURL keep the Comfy API object as this when they read this.api_base", async () => {
+  function apiURL(path) {
+    return `${this.api_base}${path}`;
+  }
+  function fileURL(path) {
+    return `${this.api_base}${path}`;
+  }
+  const api = {
+    api_base: "https://panel.test/comfy/api",
+    apiURL,
+    fileURL,
+    fetchApi: async () => response({ body: '{"prompt-1":{"status":{"status_str":"success"}}}' }),
+  };
+
+  const history = await fetchComfyUIReadForMcp(
+    { operation: "history" },
+    { expectedOrigin: "https://panel.test", api },
+  );
+  assert.equal(history.operation, "history");
+  assert.equal(history.body, '{"prompt-1":{"status":{"status_str":"success"}}}');
+
+  const logs = await fetchComfyUIReadForMcp(
+    { operation: "logs" },
+    {
+      expectedOrigin: "https://panel.test",
+      api: { ...api, api_base: "https://panel.test/comfy" },
+      fetchImpl: async (url) => {
+        assert.equal(url, "https://panel.test/comfy/internal/logs/raw");
+        return response({ body: "ERROR: render failed\n", url });
+      },
+    },
+  );
+  assert.equal(logs.operation, "logs");
+  assert.equal(logs.body, "ERROR: render failed\n");
+
+  await rejection(
+    fetchComfyUIReadForMcp(
+      { operation: "system_stats" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          api_base: "https://evil.test/api",
+          apiURL,
+          fetchApi: async () => { throw new Error("must not fetch"); },
+        },
+        fetchImpl: async () => { throw new Error("must not fetch"); },
+      },
+    ),
+    "invalid_origin",
+  );
+});
+
 test("#2283: logs raw transport retains origin, redirect, and body-size fences", async () => {
   const options = {
     expectedOrigin: "https://panel.test",
