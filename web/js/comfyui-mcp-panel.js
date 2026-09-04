@@ -3061,7 +3061,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // could never catch the real failure, that set-version.mjs was not run at all,
 // since one script writes them together. That is how 0.15.86..0.15.96 shipped
 // still announcing 0.15.85.
-const PANEL_VERSION = "0.15.172";
+const PANEL_VERSION = "0.15.173";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at
@@ -21327,7 +21327,12 @@ const GRAPH_TOOL_EXECUTORS = {
       includeBaselineReadGuard: true,
       missingNodeState,
     });
-    const scanNodes = preScanGraph._nodes ?? [];
+    // Visible graph plus every nested subgraph. A promoted host is virtual and
+    // skipped by the scan; its inner loaders are the ones that name the files,
+    // and they are not in `preScanGraph._nodes` while the user is at root
+    // (#984 recurrence: MiniMaxH3 assets on host 1512). collectAllGraphs walks
+    // from the bound ROOT so an open-subgraph view still sees sibling hosts.
+    const scanNodes = collectAllGraphs(preScanRootGraph).flatMap((g) => g?._nodes ?? []);
     // #745 — ask the SERVER about the widget values actually on the canvas now before
     // the optional load-time missing-asset refresh. Per-class /object_info is small,
     // deduped and independently authoritative; giving it first use of the shared
