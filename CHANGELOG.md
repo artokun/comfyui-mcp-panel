@@ -6,16 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
+- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215)
 - Preserve the panel-wide Codex conversation across a workflow remount when the canonical IndexedDB history read times out or is otherwise unavailable; only a confirmed empty archive may clear the transcript and session (#2201)
 - the canonical chat-history read is decided by the IndexedDB TRANSACTION rather than the request, so a get that succeeds before its transaction aborts is no longer treated as authoritative; and a delayed hydration retry no longer reselects the mount-time thread over a chat the user picked while the store was recovering (#2201)
+
 ## [0.15.169] - 2026-09-04
 
 ### Fixed
 - graph_set_widget acknowledges a long CLIPTextEncode / multiline text write as soon as the live editor holds the value, instead of waiting on a backgrounded-tab rAF flush until the 90s relay times out (#2233, #2236)
 - Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234, #2235)
-
 
 ## [0.15.168] - 2026-09-04
 

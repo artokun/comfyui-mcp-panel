@@ -1298,6 +1298,10 @@ let workflowBindingGeneration = 0;
 function nextWorkflowBindingGeneration() {
   return ++workflowBindingGeneration;
 }
+// #1215 — last workflow_open moved the active pointer and could not prove the
+// canvas rebound. Reads must not serve the leftover previous graph under the
+// new fence. Cleared only by a proven open; panel_set_workflow_target does not.
+let switchRepaintUnproven = false;
 // Defensive ceiling: a guard can only ever be cleared by workflow_open's finally, so if
 // some pathological path ever failed to run it, an un-expiring guard would wedge every
 // command in the tab. Age it out instead — but ONLY while no step of the section is in
@@ -10037,6 +10041,19 @@ function assertGraphBoundToActiveWorkflow(
   // available response was a blind reload/re-open retry loop. Every caller runs
   // this BEFORE doing any work, which is what makes its "was NOT applied" claim
   // true rather than a fabrication.
+  let others = null;
+  try {
+    const open = app?.extensionManager?.workflow?.openWorkflows;
+    if (Array.isArray(open)) {
+      others = open.filter((w) => w && !sameWorkflowObject(w, activeWorkflow));
+    }
+  } catch {
+    others = null;
+  }
+  // typeof so extracted fence harnesses (#1477/#1233) that do not bind this
+  // module-level flag still run: an undeclared identifier is not leftover proof.
+  const leftoverSwitch =
+    typeof switchRepaintUnproven !== "undefined" && switchRepaintUnproven === true;
   const verdict = resolveGraphBindingVerdict({
     graph,
     rootGraph,
@@ -10050,6 +10067,8 @@ function assertGraphBoundToActiveWorkflow(
     postReconnectWindow: postReconnectSettleWindow(),
     graphLoading,
     missingNodeState,
+    others,
+    switchRepaintUnproven: leftoverSwitch,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }
@@ -15089,6 +15108,8 @@ const GRAPH_TOOL_EXECUTORS = {
     const { graph, rootGraph } = getGraphCtx();
     // #429: resync cached node rects to live geometry before the `groups` block
     // recomputes geometric membership (summarizeGroup), so it never reports stale ids.
+    // Binding is asserted at dispatch (`graphCommandBindingBar(msg.cmd)`), not here:
+    // extracted graph_query budget tests re-run this method without the canvas fence.
     syncGraphNodeAreas(graph);
     const nodes = graph._nodes ?? [];
     const byId = new Map(nodes.map((n) => [String(n.id), n]));
@@ -24221,6 +24242,10 @@ const GRAPH_TOOL_EXECUTORS = {
       });
     }
     if (rebindFailed) {
+      // #1215 — the pointer may already name TARGET while the canvas is still
+      // SOURCE. Remember that so a later graph_outline / graph_query cannot
+      // treat the leftover canvas as the new workflow after set_workflow_target.
+      if (pointerMovedThisOpen) switchRepaintUnproven = true;
       // #1089 follow-up — the foreign-source finding rides the FAILURE too.
       //
       // It was only on the success reply, and that dropped it on the combination that
@@ -24248,6 +24273,7 @@ const GRAPH_TOOL_EXECUTORS = {
       }
       throw failOpenRebindUnknown(rebindFailed);
     }
+    switchRepaintUnproven = false;
     // A first open loads the named file, and an explicit stale reload re-read it from
     // disk; either operation re-establishes graph provenance for a workflow previously
     // replaced by graph_load. Merely switching to an already-open in-memory tab does not.
