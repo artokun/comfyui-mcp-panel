@@ -6,11 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-
 ### Fixed
-- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057)
 - Preserve the panel-wide Codex conversation across a workflow remount when the canonical IndexedDB history read times out or is otherwise unavailable; only a confirmed empty archive may clear the transcript and session (#2201)
 - the canonical chat-history read is decided by the IndexedDB TRANSACTION rather than the request, so a get that succeeds before its transaction aborts is no longer treated as authoritative; and a delayed hydration retry no longer reselects the mount-time thread over a chat the user picked while the store was recovering (#2201)
+
+## [0.15.168] - 2026-09-04
+
+### Fixed
+- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057, #2231)
+
 
 ## [0.15.167] - 2026-09-04
 
