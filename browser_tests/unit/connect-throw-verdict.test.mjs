@@ -291,6 +291,17 @@ function mkGraph({ subgraph = false } = {}) {
   const store = mkLinkStore();
   const graph = {
     lastLinkId: 0,
+    // Mirrors the real LGraph, where `last_link_id` is a DEPRECATED accessor pair
+    // over the state counter (`get/set last_link_id` -> `state.lastLinkId`, read out
+    // of the shipped frontend). Without it the fixture models a graph carrying NO
+    // counter at all -- the API-workflow shape #2108 is about -- so every connect
+    // through this harness looked like one that needed a link-id repair.
+    get last_link_id() {
+      return this.lastLinkId;
+    },
+    set last_link_id(v) {
+      this.lastLinkId = v;
+    },
     _links: store.map,
     links: store.proxy,
     nodes: [],

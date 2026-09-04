@@ -116,7 +116,13 @@ export function ensureLinkIdHeadroom(graph) {
   // swallows the assignment must not be reported as repaired.
   const after = Number(graph.last_link_id);
   if (!Number.isFinite(after) || after < highest) return { adjusted: false };
-  return { adjusted: true, from: known, to: highest };
+  // The sentence rides ALONG with the result rather than being a second import.
+  // graph_connect is rebuilt by six `new Function` harnesses that inject deps by
+  // name, and a module import is not in scope inside them (the same constraint the
+  // promotion call site is already commented for). One symbol keeps every existing
+  // harness working and cannot be forgotten by the next one.
+  const result = { adjusted: true, from: known, to: highest };
+  return { ...result, warning: linkCounterRepairWarning(result) };
 }
 
 /**

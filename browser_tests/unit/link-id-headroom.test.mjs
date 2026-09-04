@@ -81,7 +81,12 @@ test("highestLinkId reads the record's own id, not only the store key", () => {
 test("a stale counter is raised above every id the graph holds", () => {
   // The reported state: an id exists that the counter has not reached.
   const graph = makeGraph(0, asMap([1, 2, 3]));
-  assert.deepEqual(ensureLinkIdHeadroom(graph), { adjusted: true, from: 0, to: 3 });
+  const { warning, ...moved } = ensureLinkIdHeadroom(graph);
+  assert.deepEqual(moved, { adjusted: true, from: 0, to: 3 });
+  // #2196 — the sentence travels ON the result, because graph_connect is rebuilt by
+  // `new Function` harnesses where a second module import is not in scope.
+  assert.equal(warning, linkCounterRepairWarning(moved));
+  assert.ok(warning.length > 0);
   assert.equal(graph.last_link_id, 3);
 });
 
@@ -103,7 +108,9 @@ test("a counter that is absent entirely is repaired", () => {
   // An API/prompt graph carries no last_link_id at all, and panel#2011 made that
   // shape loadable — so this is a reachable state, not a hypothetical.
   const graph = { _links: asMap([5, 6]) };
-  assert.deepEqual(ensureLinkIdHeadroom(graph), { adjusted: true, from: null, to: 6 });
+  const { warning, ...moved } = ensureLinkIdHeadroom(graph);
+  assert.deepEqual(moved, { adjusted: true, from: null, to: 6 });
+  assert.match(warning, /was not set/);
   assert.equal(graph.last_link_id, 6);
 });
 
@@ -141,11 +148,7 @@ test("it is idempotent — a second call changes nothing", () => {
 // loads.
 test("#2108 the bundle imports the helper", () => {
   const bundle = readFileSync(PANEL_JS, "utf8");
-  assert.ok(
-    bundle.includes(
-      'import { ensureLinkIdHeadroom, linkCounterRepairWarning } from "./lib/link-id-headroom.js";',
-    ),
-  );
+  assert.ok(bundle.includes('import { ensureLinkIdHeadroom } from "./lib/link-id-headroom.js";'));
 });
 
 test("#2108 all four minting paths raise the counter", () => {
@@ -238,5 +241,18 @@ test("#2196 EVERY graph_connect success exit carries the disclosure", () => {
   // No exit may still hand-roll the join: that is the shape that silently omits
   // the new sentence.
   assert.equal((region.match(/warning: \[/g) ?? []).length, 0);
-  assert.ok(region.includes("const headroomWarning = linkCounterRepairWarning(headroom);"));
+  assert.ok(region.includes('const headroomWarning = headroom.warning ?? "";'));
+
+  // The composition itself. All four exits route through `withHeadroom`, so if it
+  // stops appending the sentence they go quiet TOGETHER and every other assertion
+  // in this file still passes -- the riders are all still there, the helper still
+  // returns the right string, and nothing reaches the user. Pinned as source
+  // because the bundle is a browser module this suite cannot import, the same
+  // reason the #2108 call-site checks above are source-shape assertions.
+  assert.ok(
+    region.includes(
+      'const withHeadroom = (...sentences) => [...sentences, headroomWarning].filter(Boolean).join(" ");',
+    ),
+    "graph_connect no longer folds headroomWarning into its warning composition",
+  );
 });

@@ -617,7 +617,7 @@ import {
   unresolvedWildcardPairReason,
   isWildcardSlotType,
 } from "./lib/connect-match.js";
-import { ensureLinkIdHeadroom, linkCounterRepairWarning } from "./lib/link-id-headroom.js";
+import { ensureLinkIdHeadroom } from "./lib/link-id-headroom.js";
 import {
   snapshotInputSlotLinks,
   snapshotInputSlotNames,
@@ -17208,7 +17208,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // graph that needed raising had been minting colliding ids all along. Every
     // success exit below carries the sentence, so no path can drop it.
     const headroom = ensureLinkIdHeadroom(graph);
-    const headroomWarning = linkCounterRepairWarning(headroom);
+    const headroomWarning = headroom.warning ?? "";
     const headroomRider = headroom.adjusted
       ? { link_counter_repaired: { from: headroom.from, to: headroom.to } }
       : {};
