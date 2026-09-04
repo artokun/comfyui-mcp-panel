@@ -7,7 +7,6 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181)
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
   strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
   `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash
@@ -23,6 +22,12 @@ All notable changes to this project are documented here. This project adheres to
   code; the eleven translations have the selector stripped byte-wise, leaving wording
   untouched.
 - the emoji-presentation removal now covers every shipped web/js file rather than the main bundle alone (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
+
+## [0.15.172] - 2026-09-04
+
+### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181, #2243)
+
 
 ## [0.15.171] - 2026-09-04
 
