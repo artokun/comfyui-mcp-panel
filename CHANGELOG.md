@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+
+### Fixed
+- panel_run no longer refuses forever on a STALE socket flag (#2854). ComfyUI arms comfyBackendSocketDown from a failed _pollQueue during a long GPU-bound render, and `reconnected` never fires because the websocket never left OPEN -- so the flag never cleared. Every other panel_* path asks comfyBackendIsDown(), whose #1325 rule is that flagged-down over an OPEN socket is stale rather than down; the run-dispatch identity read the raw flag instead, so it alone reported "backend socket down" and refused every dispatch while reads, edits and the ComfyUI queue all worked. Fail-closed directions are unchanged: the flag with a non-OPEN or unreadable readyState still refuses
 ## [0.15.173] - 2026-09-04
 
 ### Fixed
