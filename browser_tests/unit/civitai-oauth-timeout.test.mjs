@@ -138,3 +138,31 @@ test("panel#2044 the generated en catalog carries the placeholder", () => {
   assert.ok(entry.includes("{setting}"), "catalog entry lost the placeholder");
   assert.equal(entry.includes("Set CivitAI token"), false, "catalog re-embedded the label");
 });
+
+test("#2044 refreshAuth cannot REJECT, which is what makes the timeout reachable", () => {
+  // Load-bearing in a way neither site states. The poll body is:
+  //
+  //   await refreshAuth();
+  //   if (!isOpen) { ... return; }
+  //   if (state.signedIn || ++tries > 120) { ... }
+  //
+  // `++tries` sits AFTER the await. If refreshAuth ever propagated a rejection the
+  // async interval callback would abort before the counter moved, the count would
+  // never reach 120, and the give-up branch this PR adds would never fire --
+  // restoring the exact silence #2044 is about, under a server-down/network-error
+  // condition that is one of the likelier reasons a sign-in does not complete.
+  //
+  // Safe today only because refreshAuth swallows its own failure and records a
+  // signed-out state. Asserted HERE, at the place that depends on it, so a later
+  // refactor letting it throw fails this test rather than silently un-fixing the
+  // timeout.
+  const at = src.indexOf("async function refreshAuth()");
+  assert.ok(at > -1, "refreshAuth moved or was renamed -- re-point this test");
+  const body = src.slice(at, at + 400);
+  assert.ok(body.includes("await ctx.api.fetchApi("), "the body must still be the fetching one");
+  assert.match(
+    body,
+    /catch\s*\{[^}]*state\.signedIn\s*=\s*false/,
+    "refreshAuth must swallow its fetch failure and record signed-out, or the poll never reaches ++tries",
+  );
+});
