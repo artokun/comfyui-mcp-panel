@@ -8,6 +8,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - CivitAI sign-in now says when it did not complete (panel#2044). The poll gave up after
+  four minutes in silence while the popup showed a bare browser 403 that ComfyUI never
+  logged, so the user got no statement that sign-in had failed. The message offers the
+  known cause conditionally rather than asserting a status this side cannot read, and
+  names the remedy that works today: a CivitAI API token in Settings. The underlying
+  cross-site redirect block is unchanged and panel#2044 stays open for it.
 
 ## [0.15.164] - 2026-09-03
 
