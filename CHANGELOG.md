@@ -7,6 +7,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+
+- After a delivered panel_open_workflow, the switch fence no longer latches panel_list_workflows / panel_set_workflow_target({mode:"current"}) / panel_graph_outline for minutes while a later settle or safe-repaint is still pending. workflow_list stays the recovery probe; leftover previous-tab graph is still refused (#2249, #1215)
 - the re-open discard warning now reaches the refusal callers actually hit (#2139). It was wired only into the secondary write-boundary assertion; the PRIMARY dispatch fence called the same message builder with commandUuid/activeUuid/movedNote only, so activeIsModified defaulted to null and an ordinary workflow-instance mismatch never showed the warning — the fence whose own comment calls it "the refusal a caller actually sees". Both sites now read through one shared activeWorkflowSaveState() probe so they cannot disagree about the same tab. Found by the Copilot review on the PR
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
