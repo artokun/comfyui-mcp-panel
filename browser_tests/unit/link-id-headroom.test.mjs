@@ -256,6 +256,7 @@ test("#2196 EVERY graph_connect success exit carries the disclosure", () => {
     "graph_connect no longer folds headroomWarning into its warning composition",
   );
 });
+
 test("#2196 both subgraph expose twins put the repair on their reply", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   // INLINED on purpose: these handlers are rebuilt by `new Function` harnesses that
@@ -270,9 +271,47 @@ test("#2196 both subgraph expose twins put the repair on their reply", () => {
     "a shared helper is not reachable inside the new Function harnesses",
   );
   // The join must keep BOTH warnings, never replace one with the other.
-  // The join must keep BOTH warnings, never replace one with the other.
+  // COUNTED, not merely present: landedAfterThrowWarning(exposeConnectErr) also
+  // appears in the graph_connect region, so an includes() check survives the twins
+  // dropping it entirely. A mutation proved that — it passed until this counted.
+  const joined = src.split(
+    'exposeConnectErr ? landedAfterThrowWarning(exposeConnectErr) : ""'
+  ).length - 1;
+  assert.equal(joined, 2, "an expose twin stopped joining the landed-after-throw warning");
+});
+
+// #2196 — the DISCLOSURE must survive at EVERY call site, not just graph_connect.
+//
+// This is the exact defect these pin: three of the four sites captured nothing.
+// The two expose twins take the SAME graph graph_connect does, and the counter only
+// ever moves UP, so whichever runs first CONSUMES the condition — repair silently in
+// panel_expose_subgraph_input and the next panel_connect gets `adjusted: false` and
+// says nothing, on a graph whose earlier connects may already have overwritten a
+// bystander. The disclosure was not merely missing there; it was lost for good.
+//
+// Structural, because the failure is "a caller dropped the return value" — no amount
+// of exercising ensureLinkIdHeadroom itself can surface that.
+test("#2196 no ensureLinkIdHeadroom call site DISCARDS the repair", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const calls = src
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.includes("ensureLinkIdHeadroom(") && !l.startsWith("//") && !l.startsWith("*"))
+    .filter((l) => !l.startsWith("import") && !l.includes("} from"));
+  assert.ok(calls.length >= 4, `expected the known call sites, found ${calls.length}`);
+  const discarded = calls.filter((l) => !l.includes("= ensureLinkIdHeadroom("));
+  assert.deepEqual(discarded, [], "a call site dropped the return value, so it cannot disclose");
+});
+
+test("#2196 the promotion loop accumulates repairs and surfaces them once", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  assert.ok(src.includes("const headroomWarnings = [];"), "no accumulator");
   assert.ok(
-    src.includes("landedAfterThrowWarning(exposeConnectErr)"),
-    "the expose twins dropped the landed-after-throw warning",
+    src.includes("if (h?.warning) headroomWarnings.push(h.warning);"),
+    "the promotion loop stopped collecting repairs",
+  );
+  assert.ok(
+    src.includes('headroomWarnings.length ? { warning: headroomWarnings.join(" ") }'),
+    "the promotion reply stopped surfacing collected repairs",
   );
 });
