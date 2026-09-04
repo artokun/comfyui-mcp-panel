@@ -6,8 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-### Fixed
 
+### Fixed
+- panel_run recovers the ComfyUI prompt_id after a post-dispatch `/prompt` fetch failure by reconciling a client-generated dispatch id against queue/history, and treats a confirmed miss as safe to retry (#2203)
+- the post-dispatch receipt recovery no longer treats a shared queue mark as a per-request receipt, no longer reads a FAILED /queue or /history response as an empty one, no longer loses an acceptance whose id was recovered after a malformed 200, and states plainly that a confirmed miss is a bounded observation rather than promising a retry is safe (#2203)
 - the fetch_comfyui_read allowlist rejection now has its wording pinned by a test. comfyui-mcp
   matches `/operation must be one of/i` on that message to fall back to reading the model list from
   `object_info` when `models/<category>` is unavailable (comfyui-mcp#2511); rewording it silently
