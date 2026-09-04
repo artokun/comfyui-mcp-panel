@@ -6,7 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+
 ### Fixed
+- After entering a MiniMax H3 subgraph and replacing inner loaders, graph_get_subgraph still classifies the HOST wrapper and publishes a complete promoted-terminal witness for `value` / `value_2`, so panel_set_widget can dispatch instead of treating the in-subgraph lookup as an unclassifiable container (#2057)
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
   whose counter sits below an id it already holds had a bystander's record silently

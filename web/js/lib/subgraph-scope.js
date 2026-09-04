@@ -32,6 +32,8 @@
 // closed. resolveScope needs exactly that bar before it may repaint a canvas
 // away, so it borrows the proof rather than inventing a weaker one.
 import { graphRootProvenEmpty as graphProvenContentFree } from "./graph-binding.js";
+import { isPromotedContainer } from "./graph-read.js";
+import { canonicalNodeId, resolveLiveNode } from "./node-id.js";
 
 export const SUBGRAPH_INPUT_RAIL_ID = -10;
 export const SUBGRAPH_OUTPUT_RAIL_ID = -20;
@@ -126,6 +128,57 @@ export function findSubgraphOwner(rootGraph, subgraph) {
     }
   }
   return null;
+}
+
+/** Hard cap on graphs visited while classifying a promoted container from a
+ *  nested view. A `node.subgraph` getter that yields a new object each time
+ *  would otherwise walk forever on graph_get_subgraph's read path (#2057). */
+const MAX_PROMOTED_CONTAINER_WALKS = 10000;
+
+function nodeIdMatches(node, nodeId) {
+  if (node?.id == null || nodeId == null) return false;
+  return canonicalNodeId(node.id) === canonicalNodeId(nodeId);
+}
+
+/**
+ * #2057 — `graph_get_subgraph` is MCP's promoted-container classifier. Writes
+ * resolve against the VIEWED graph, so after `panel_enter_subgraph` the HOST
+ * wrapper is not in `_nodes` and `resolveNode` throws a missing-id line.
+ * MCP treats anything other than "is not a subgraph" as indeterminate and
+ * refuses the promoted write (`value` / `value_2` on MiniMax H3 host 140)
+ * before `graph_set_widget`.
+ *
+ * This read may therefore look at the live owner of the current view, then a
+ * unique matching SubgraphNode reachable from the root. An ordinary node in
+ * the current view is still returned so the caller can throw the definitive
+ * non-container line. Ambiguous same-id hosts are not guessed.
+ *
+ * @returns {object | null}
+ */
+export function resolvePromotedContainerForRead(graph, rootGraph, nodeId) {
+  const local = resolveLiveNode(graph, nodeId);
+  if (local) return local;
+  const owner = findSubgraphOwner(rootGraph, graph);
+  if (owner?.node && nodeIdMatches(owner.node, nodeId) && isPromotedContainer(owner.node)) {
+    return owner.node;
+  }
+  if (!rootGraph) return null;
+  const hits = [];
+  const seen = new Set();
+  const stack = [rootGraph];
+  let walks = 0;
+  while (stack.length) {
+    if (++walks > MAX_PROMOTED_CONTAINER_WALKS) break;
+    const next = stack.pop();
+    if (!next || seen.has(next)) continue;
+    seen.add(next);
+    for (const node of next._nodes ?? []) {
+      if (!node) continue;
+      if (node.subgraph) stack.push(node.subgraph);
+      if (nodeIdMatches(node, nodeId) && isPromotedContainer(node)) hits.push(node);
+    }
+  }
+  return hits.length === 1 ? hits[0] : null;
 }
 
 /** Ordered list of subgraph INSTANCE node ids from the root graph down to (but not
