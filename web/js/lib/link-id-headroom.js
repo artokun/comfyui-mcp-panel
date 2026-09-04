@@ -118,3 +118,32 @@ export function ensureLinkIdHeadroom(graph) {
   if (!Number.isFinite(after) || after < highest) return { adjusted: false };
   return { adjusted: true, from: known, to: highest };
 }
+
+/**
+ * The sentence a repair is worth saying out loud, or "" when nothing was adjusted.
+ *
+ * This is the disclosure `ensureLinkIdHeadroom`'s contract promises. It matters
+ * because raising the counter fixes the NEXT connect and can do nothing about the
+ * previous ones: a graph whose counter sat below a live id was already minting
+ * colliding ids, and each of those replaced a bystander's record in `_links`. The
+ * caller is the only one in a position to go back and look, so telling them is the
+ * whole value of having detected it.
+ *
+ * Returns "" unless the counter actually moved, so an ordinary connect's payload
+ * stays byte-identical to before this existed.
+ *
+ * Does no work that can throw: it is called from the RETURN EXPRESSION of a connect
+ * whose wire has already landed, where a throw would report a completed mutation as
+ * a failure.
+ */
+export function linkCounterRepairWarning(headroom) {
+  if (!headroom?.adjusted) return "";
+  const before = Number.isFinite(headroom.from) ? `was ${headroom.from}` : "was not set";
+  return (
+    `This graph's link-id counter ${before} while the graph already held link ` +
+    `${headroom.to}, so it was raised to ${headroom.to} before connecting (#2108). ` +
+    `That prevents the NEXT collision and cannot undo an earlier one: connects made ` +
+    `before this repair may each have overwritten an unrelated link. If a wire you ` +
+    `never touched looks wrong, this is where it came from.`
+  );
+}

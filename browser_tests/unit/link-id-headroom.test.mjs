@@ -28,6 +28,7 @@ import {
   collectLinkIds,
   highestLinkId,
   ensureLinkIdHeadroom,
+  linkCounterRepairWarning,
 } from "../../web/js/lib/link-id-headroom.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -140,7 +141,11 @@ test("it is idempotent — a second call changes nothing", () => {
 // loads.
 test("#2108 the bundle imports the helper", () => {
   const bundle = readFileSync(PANEL_JS, "utf8");
-  assert.ok(bundle.includes('import { ensureLinkIdHeadroom } from "./lib/link-id-headroom.js";'));
+  assert.ok(
+    bundle.includes(
+      'import { ensureLinkIdHeadroom, linkCounterRepairWarning } from "./lib/link-id-headroom.js";',
+    ),
+  );
 });
 
 test("#2108 all four minting paths raise the counter", () => {
@@ -181,4 +186,57 @@ test("#2108 the counter is raised BEFORE graph_connect touches the graph", () =>
   const mutate = bundle.indexOf('["connect"](', at);
   assert.ok(guard > -1);
   assert.ok(guard < mutate, "the headroom guard must precede the first connect mutation");
+});
+
+// #2196 — the repair is disclosed rather than silent.
+//
+// `ensureLinkIdHeadroom` documents that it "returns what happened so a caller can
+// disclose it", because raising the counter protects the NEXT connect and can do
+// nothing about the ones already made: a graph that needed raising had been
+// minting colliding ids all along, each one replacing a bystander in `_links`.
+// Every call site discarded that return, so the contract had no implementations
+// and the user whose graph was already damaged was told nothing.
+
+test("#2196 no sentence when the counter did not move", () => {
+  // The ordinary connect. Emitting anything here would put a warning on every
+  // well-formed graph, which is how a disclosure stops being read.
+  assert.equal(linkCounterRepairWarning({ adjusted: false }), "");
+  assert.equal(linkCounterRepairWarning(undefined), "");
+  assert.equal(linkCounterRepairWarning(null), "");
+});
+
+test("#2196 the sentence names both counters and does not claim a full repair", () => {
+  const w = linkCounterRepairWarning({ adjusted: true, from: 2, to: 9 });
+  assert.match(w, /was 2/);
+  assert.match(w, /9/);
+  // The honesty requirement: it must not read as "your graph is fixed".
+  assert.match(w, /cannot undo an earlier one/);
+  assert.match(w, /#2108/);
+});
+
+test("#2196 an absent counter is described, not printed as NaN", () => {
+  // `from` is null when last_link_id was missing or non-numeric — the API-workflow
+  // case that panel#2011 made loadable, which is how #2108's reporter got here.
+  const w = linkCounterRepairWarning({ adjusted: true, from: null, to: 4 });
+  assert.match(w, /was not set/);
+  assert.ok(!w.includes("NaN"), w);
+  assert.ok(!w.includes("null"), w);
+});
+
+test("#2196 EVERY graph_connect success exit carries the disclosure", () => {
+  // The wiring, not the helper. graph_connect has four success exits (two rail
+  // branches, the landed-after-throw path, and the clean path) and each builds its
+  // own `warning`. A disclosure added to one of them is a disclosure the other
+  // three drop, so this pins the count inside graph_connect's own region.
+  const bundle = readFileSync(PANEL_JS, "utf8");
+  const at = bundle.indexOf("graph_connect({ from_node_id");
+  const end = bundle.indexOf("graph_disconnect({", at);
+  assert.ok(at > -1 && end > at);
+  const region = bundle.slice(at, end);
+
+  assert.equal((region.match(/\.\.\.headroomRider,/g) ?? []).length, 4);
+  // No exit may still hand-roll the join: that is the shape that silently omits
+  // the new sentence.
+  assert.equal((region.match(/warning: \[/g) ?? []).length, 0);
+  assert.ok(region.includes("const headroomWarning = linkCounterRepairWarning(headroom);"));
 });

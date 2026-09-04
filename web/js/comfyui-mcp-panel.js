@@ -617,7 +617,7 @@ import {
   unresolvedWildcardPairReason,
   isWildcardSlotType,
 } from "./lib/connect-match.js";
-import { ensureLinkIdHeadroom } from "./lib/link-id-headroom.js";
+import { ensureLinkIdHeadroom, linkCounterRepairWarning } from "./lib/link-id-headroom.js";
 import {
   snapshotInputSlotLinks,
   snapshotInputSlotNames,
@@ -17203,7 +17203,16 @@ const GRAPH_TOOL_EXECUTORS = {
     // graph already holds therefore overwrites a bystander's record, and the
     // wire reads as having moved onto this connection. Raise the counter first;
     // it only ever moves up, so a well-formed graph is untouched.
-    ensureLinkIdHeadroom(graph);
+    // #2196 — the repair is DISCLOSED, not silent. Raising the counter protects the
+    // connect about to happen; it says nothing about the ones already made, and a
+    // graph that needed raising had been minting colliding ids all along. Every
+    // success exit below carries the sentence, so no path can drop it.
+    const headroom = ensureLinkIdHeadroom(graph);
+    const headroomWarning = linkCounterRepairWarning(headroom);
+    const headroomRider = headroom.adjusted
+      ? { link_counter_repaired: { from: headroom.from, to: headroom.to } }
+      : {};
+    const withHeadroom = (...sentences) => [...sentences, headroomWarning].filter(Boolean).join(" ");
 
     // Rail tolerance: when an endpoint is a subgraph boundary rail (by real id
     // -10/-20 or alias "input"/"output"/..), route to the EXISTING-slot I/O
@@ -17285,7 +17294,10 @@ const GRAPH_TOOL_EXECUTORS = {
           from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
           to: { subgraph_output: existing.name },
         },
-        ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+        ...headroomRider,
+        ...(railConnectErr || headroomWarning
+          ? { warning: withHeadroom(railConnectErr ? landedAfterThrowWarning(railConnectErr) : "") }
+          : {}),
       };
     }
 
@@ -17354,7 +17366,10 @@ const GRAPH_TOOL_EXECUTORS = {
           from: { subgraph_input: existing.name },
           to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
         },
-        ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+        ...headroomRider,
+        ...(railConnectErr || headroomWarning
+          ? { warning: withHeadroom(railConnectErr ? landedAfterThrowWarning(railConnectErr) : "") }
+          : {}),
       };
     }
 
@@ -17597,7 +17612,8 @@ const GRAPH_TOOL_EXECUTORS = {
         // disclosure at least as much as the clean one.
         ...(slotRewrites.length ? { slots_rewritten: slotRewrites } : {}),
         ...(landedCollateral.length ? { collateral_changes: landedCollateral } : {}),
-        warning: [
+        ...headroomRider,
+        warning: withHeadroom(
           landedAfterThrowWarning(
             connectErr,
             landed.inputIndex !== inIdx
@@ -17609,9 +17625,7 @@ const GRAPH_TOOL_EXECUTORS = {
           titleRewriteWarning(titleRewrites),
           slotRewriteWarning(slotRewrites),
           landedCollateral.length ? connectCollateralWarning(landedCollateral) : "",
-        ]
-          .filter(Boolean)
-          .join(" "),
+        ),
       };
     }
     if (!link) {
@@ -17715,17 +17729,17 @@ const GRAPH_TOOL_EXECUTORS = {
       // #2380 — what moved on nodes this command never named. A third rider on the
       // same key, for the same reason the first two share it.
       ...(collateral.length ? { collateral_changes: collateral } : {}),
-      // All three riders share the single `warning` key, so none can drop the
+      // #2196 — a fourth rider, on the same key for the same reason.
+      ...headroomRider,
+      // All four riders share the single `warning` key, so none can drop the
       // others' sentence when one connect does more than one at once.
-      ...(titleRewrites.length || slotRewrites.length || collateral.length
+      ...(titleRewrites.length || slotRewrites.length || collateral.length || headroomWarning
         ? {
-            warning: [
+            warning: withHeadroom(
               collateral.length ? connectCollateralWarning(collateral) : "",
               titleRewriteWarning(titleRewrites),
               slotRewriteWarning(slotRewrites),
-            ]
-              .filter(Boolean)
-              .join(" "),
+            ),
           }
         : {}),
     };
