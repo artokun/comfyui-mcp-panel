@@ -2688,11 +2688,11 @@ test('#2201 planRemountHistoryRestore preserves until canonical is positively av
   const thread = { id: 'keep', sessionId: 'sess-codex', msgs: [{ id: 'm1', role: 'user', text: 'hi' }] }
   assert.deepEqual(
     planRemountHistoryRestore({ canonicalAvailable: false, durableActive: thread }),
-    { kind: 'preserve', retry: true },
+    { kind: 'preserve' },
   )
   assert.deepEqual(
     planRemountHistoryRestore({ canonicalAvailable: undefined, durableActive: null }),
-    { kind: 'preserve', retry: true },
+    { kind: 'preserve' },
   )
   assert.deepEqual(
     planRemountHistoryRestore({ canonicalAvailable: true, durableActive: null }),

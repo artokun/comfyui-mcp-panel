@@ -916,7 +916,10 @@ export function selectRestoreThread(
  */
 export function planRemountHistoryRestore({ canonicalAvailable, durableActive } = {}) {
   if (canonicalAvailable !== true) {
-    return { kind: "preserve", retry: true };
+    // No `retry` flag: the caller branches on `kind === "preserve"` and starts the
+    // retry from that. A second field saying the same thing was read by nobody,
+    // and a verdict carrying data no consumer reads is how the two drift apart.
+    return { kind: "preserve" };
   }
   if (!durableActive) {
     return { kind: "reset" };
