@@ -6,8 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+
 ### Fixed
-- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215)
 - CivitAI sign-in now says when it did not complete (panel#2044). The poll gave up after
   four minutes in silence while the popup showed a bare browser 403 that ComfyUI never
   logged, so the user got no statement that sign-in had failed. The message offers the
@@ -24,6 +24,11 @@ All notable changes to this project are documented here. This project adheres to
   "Définir le jeton CivitAI…" — the one actionable sentence in a message about a
   sign-in that cannot succeed was the part they could not act on. It now interpolates
   tr("panel.set_civitai_token"), so the quoted text is whatever the running UI shows.
+## [0.15.170] - 2026-09-04
+
+### Fixed
+- After panel_open_workflow switches tabs but cannot repaint, panel_graph_outline / panel_query_graph refuse instead of serving the previous tab's graph under the new workflow's fence — panel_set_workflow_target is not a remedy (#1215, #2238)
+
 
 ## [0.15.169] - 2026-09-04
 
