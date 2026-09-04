@@ -33,6 +33,7 @@ import {
   resolveEnclosingPromotedWrite,
   followPromotionToConcrete,
   collectPromotionIntermediates,
+  liveTextEditorHolds,
 } from "./widget-write.js";
 import { reconcileUnknownWidgetNames } from "./asset-staleness.js";
 import {
@@ -218,9 +219,15 @@ export function readLiveWidgetValue(node, widgetName, occurrence = null) {
   try {
     const live = liveWidgetAt(node, widgetName, occurrence);
     if (!live) return { found: false, value: undefined };
+    let value;
+    try {
+      value = live.value;
+    } catch {
+      value = undefined;
+    }
     // `widget` is returned so the caller can attribute the read to the row it came from by
     // IDENTITY (#2143) rather than re-deriving it from the ordinal it asked for.
-    return { found: true, value: live.value, widget: live };
+    return { found: true, value, widget: live };
   } catch {
     return { found: false, value: undefined };
   }
@@ -292,10 +299,13 @@ export async function awaitSetWidgetAck(writePromise, {
     if (settled?.ok) noteLateSuccess(honestWidgetAck(settled.result));
   }, () => {});
   const live = readLiveWidgetValue(node, widget, occurrence);
+  // #2233 — a live multiline editor is what query_graph reads. A lagging Vue
+  // `.value` getter must not turn an already-committed text write into a hang.
+  const editorHolds = liveTextEditorHolds(live.widget, requested);
   const verified = widgetWriteTimeoutReadback({
     requested,
-    actual: live.value,
-    found: live.found,
+    actual: editorHolds ? requested : live.value,
+    found: live.found || editorHolds,
     node_id: node?.id,
     widget,
     // #2143 — this receipt stands in for the write's own reply, so it must carry the same
@@ -1441,7 +1451,18 @@ async function runSetWidgetBody(
     return { ...set, widget_occurrence: next };
   };
 
+  function liveTextEditorRetainsWrite(set) {
+    if (typeof value !== "string") return false;
+    const written = writtenWidgets.get(set);
+    return !!(written?.valueWidget && liveTextEditorHolds(written.valueWidget, value));
+  }
+
   async function retainVerifiedWrite(set, rewrite) {
+    // #2233 — a live textarea that already holds the committed string is the
+    // receipt. Waiting on rAF after that is how a backgrounded tab lost the
+    // graph_set_widget ack while query_graph already showed the write. A
+    // just-added primitive with no editor still takes the #1922 flush.
+    if (liveTextEditorRetainsWrite(set)) return withLiveOccurrence(set);
     await flushFrontendWidgets();
     assertNotAbandoned();
     assertTargetStillCurrentNow();

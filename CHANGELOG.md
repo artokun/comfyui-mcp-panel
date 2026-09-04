@@ -7,6 +7,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- graph_set_widget acknowledges a long CLIPTextEncode / multiline text write as soon as the live editor holds the value, instead of waiting on a backgrounded-tab rAF flush until the 90s relay times out (#2233)
+- Refused completion retries of a finished video reuse the composed storyboard identity and skip re-upload, so a down bridge cannot fill ComfyUI/temp with unique `storyboard_*.png` / `poster_*.png` copies every sweep (#2234)
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
   saved tab carrying unsaved drift that is the one recovery that loses it, which is the
