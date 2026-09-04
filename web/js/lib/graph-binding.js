@@ -88,6 +88,52 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
 }
 
 /**
+ * #1215 recurrence — after a tab switch the ACTIVE pointer (and the session
+ * fence) can already name the new workflow while the live root is still the
+ * PREVIOUS tab's graph. That is the inverse of `graphReadDesynced`: the canvas
+ * is nonempty, not empty.
+ *
+ * Missing current state alone is NOT leftover evidence. Extracted graph_query
+ * fixtures, a first observation, and #618's unreadable tracker all look like
+ * "live nodes + no activeState" and must fail OPEN. Refuse only when that
+ * unreadable active state is paired with switch/open leftover proof:
+ *   - `switchRepaintUnproven`: this session's last open moved the pointer and
+ *     could not prove the canvas rebound (the safe-repaint failure);
+ *   - or another still-open workflow's current state AGREES with the live
+ *     root, so the mounted graph is that previous tab's, not the named one.
+ *
+ * A well-formed empty `nodes: []` is the shape guard's job. A TARGET uuid on
+ * the leftover canvas is not an exception (#1639). `panel_set_workflow_target`
+ * does not clear this — it re-points the session, it does not rebind the canvas.
+ */
+export function graphRootUnprovenAgainstActiveState({
+  liveNodeCount,
+  activeWorkflow,
+  rootGraph = null,
+  others = null,
+  switchRepaintUnproven = false,
+  inSubgraph = false,
+} = {}) {
+  if (inSubgraph) return false;
+  if (!activeWorkflow) return false;
+  if (!(Number(liveNodeCount) > 0)) return false;
+  if (activeWorkflowCurrentState(activeWorkflow) != null) return false;
+  if (switchRepaintUnproven === true) return true;
+  if (!rootGraph || !Array.isArray(others)) return false;
+  for (const other of others) {
+    if (!other) continue;
+    try {
+      const otherState = activeWorkflowCurrentState(other);
+      if (otherState == null) continue;
+      if (graphRootAgreesWithActiveState(rootGraph, otherState)) return true;
+    } catch {
+      // An unreadable twin is not leftover proof.
+    }
+  }
+  return false;
+}
+
+/**
  * True when ComfyUI's load-time missing-node store positively reports missing
  * nodes. The store is independent from both LiteGraph's live graph and the
  * workflow ChangeTracker, so it is useful evidence specifically in the
@@ -3076,6 +3122,8 @@ export function resolveGraphBindingVerdict({
   postReconnectWindow = false,
   graphLoading = false,
   missingNodeState = null,
+  others = null,
+  switchRepaintUnproven = false,
 } = {}) {
   const nodeCount = Number.isFinite(Number(liveNodeCount))
     ? Number(liveNodeCount)
@@ -3170,6 +3218,24 @@ export function resolveGraphBindingVerdict({
       ...(reason === "root-shape-mismatch" ? { structureMatches: structureMatches === true } : {}),
     };
   }
+  // #1215 — leftover previous canvas after a switch that could not repaint.
+  // Missing current state alone is not enough (graph_query fixtures, #618).
+  if (
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: nodeCount,
+      activeWorkflow,
+      rootGraph,
+      others,
+      switchRepaintUnproven,
+      inSubgraph,
+    })
+  ) {
+    return {
+      reason: "root-state-unreadable",
+      expected: null,
+      live: nodeCount,
+    };
+  }
   if (missingNodeStateReportsNodes(missingNodeState) && !inSubgraph && nodeCount === 0) {
     return {
       reason: "empty-graph-missing-nodes",
@@ -3216,6 +3282,19 @@ export function graphBindingRefusalMessage(verdict) {
       `reconnect, or a failed open, and node_count 0 could be a FALSE-EMPTY reading, so this ` +
       `command was NOT applied as authoritative. Retry in a moment once the tab settles; if it ` +
       `persists, re-open the workflow tab (panel_open_workflow) or reload the panel.`
+    );
+  }
+  if (verdict.reason === "root-state-unreadable") {
+    const live = Number(verdict.live);
+    const liveText = Number.isFinite(live) ? `${live} node(s)` : "nodes";
+    return (
+      `[root-state-unreadable] The live canvas shows ${liveText}, but the active workflow has no ` +
+      `comparable serialized state, so this command was NOT applied as authoritative. After a tab ` +
+      `switch the canvas can still be the previous workflow while the active pointer and session ` +
+      `fence already name the new one. Re-open the active workflow tab (panel_open_workflow) or ` +
+      `load it from disk (panel_load_workflow). That REPLACES the canvas. Re-targeting with ` +
+      `panel_set_workflow_target is NOT a remedy for this — it re-points the session, it does ` +
+      `not rebind the canvas.`
     );
   }
   if (verdict.reason === "empty-graph-missing-nodes") {
