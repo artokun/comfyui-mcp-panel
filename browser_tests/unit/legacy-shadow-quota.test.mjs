@@ -118,7 +118,13 @@ function createFakeIndexedDb({ failWrites = false, missingLegacyStore = false } 
           return req;
         },
       });
-      if (mode !== "readwrite") settle();
+      // Deferred by the same two-microtask drain the requests use. Settling a
+      // readonly transaction SYNCHRONOUSLY here completed it before its own
+      // get handler ran, which is backwards from real IDB (complete fires after
+      // the request handlers) and made a reader that takes its result from the
+      // transaction see the pre-request default. `settle` is idempotent, so a
+      // transaction that issues no request at all still completes.
+      if (mode !== "readwrite") queueMicrotask(() => queueMicrotask(settle));
       return tx;
     },
   };
