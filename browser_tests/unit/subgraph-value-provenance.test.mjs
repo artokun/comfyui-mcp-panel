@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isPromotedContainer } from "../../web/js/lib/graph-read.js";
+import { resolvePromotedContainerForRead } from "../../web/js/lib/subgraph-scope.js";
 import { graphViewIdentityFor } from "../../web/js/lib/graph-view-identity.js";
 import { subgraphValueProvenance } from "../../web/js/lib/subgraph-value-provenance.js";
 import { redactWidgetValue, REDACTED_WIDGET_VALUE } from "../../web/js/lib/widget-secret-redaction.js";
@@ -96,11 +97,13 @@ test("WIRING: production graph_get_subgraph gives MCP a definitive non-promoted 
     "getGraphCtx",
     "resolveNode",
     "isPromotedContainer",
+    "resolvePromotedContainerForRead",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph: {} }),
     (_graph, id) => ({ id, type: "OrdinaryNode" }),
     isPromotedContainer,
+    resolvePromotedContainerForRead,
   );
 
   assert.throws(
@@ -146,6 +149,7 @@ test("WIRING: production graph_get_subgraph publishes the terminal nested-promot
     "summarizeNode",
     "promotedTerminalWitnesses",
     "isPromotedContainer",
+    "resolvePromotedContainerForRead",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph }),
@@ -159,6 +163,7 @@ test("WIRING: production graph_get_subgraph publishes the terminal nested-promot
     (node) => ({ id: node.id, type: node.type }),
     () => [terminal],
     isPromotedContainer,
+    resolvePromotedContainerForRead,
   );
 
   const out = getSubgraph({ node_id: 78 });
@@ -186,6 +191,7 @@ test("WIRING: production graph_get_subgraph publishes an explicit empty witness 
     "summarizeNode",
     "promotedTerminalWitnesses",
     "isPromotedContainer",
+    "resolvePromotedContainerForRead",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph: {} }),
@@ -199,6 +205,7 @@ test("WIRING: production graph_get_subgraph publishes an explicit empty witness 
     (node) => ({ id: node.id, type: node.type }),
     () => [],
     isPromotedContainer,
+    resolvePromotedContainerForRead,
   );
 
   assert.deepEqual(getSubgraph({ node_id: 78 }).promoted_terminals, []);
@@ -514,6 +521,7 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     "summarizeNode",
     "promotedTerminalWitnesses",
     "isPromotedContainer",
+    "resolvePromotedContainerForRead",
     `return ({${method}}).graph_get_subgraph;`,
   )(
     () => ({ graph }),
@@ -527,6 +535,7 @@ test("WIRING: production graph_get_subgraph redacts instance provenance", async 
     (node) => ({ id: node.id, mode: node.mode, inputs: node.inputs, outputs: node.outputs }),
     () => [],
     isPromotedContainer,
+    resolvePromotedContainerForRead,
   );
 
   const out = getSubgraph({ node_id: 173 });
