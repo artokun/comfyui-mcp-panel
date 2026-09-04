@@ -25741,6 +25741,20 @@ const GRAPH_TOOL_EXECUTORS = {
     const rawClipboard = getEffectiveClipboard(storage);
     const layout = getVerifiedLayout(rawClipboard) ?? parseClipboardLayout(rawClipboard);
     let auxIdSanitizedCount = 0;
+    // #2108 — paste ALLOCATES link ids, so it needs the same headroom as connect.
+    // Read out of the installed frontend's own sources: `LGraphCanvas` holds no
+    // `lastLinkId`/`addLink`/`new LLink` — `pasteFromClipboard` delegates to
+    // `_deserializeItems`, and the links it lands are minted by `LGraphNode`'s
+    // connect path with the shared idiom
+    // `toLinkId(Number(graph.state.lastLinkId) + 1)` into a `_links.set` that
+    // REPLACES. Both halves of a paste allocate: the internal wires among the
+    // copied nodes (this handler's own note promises they are preserved) and,
+    // with connect_inputs, the reconnection to existing nodes.
+    //
+    // So a counter sitting below an id the graph already holds makes a paste
+    // overwrite a bystander exactly as a connect did. Raising is idempotent and
+    // only ever moves the counter up, so a well-formed graph is untouched.
+    const headroom = ensureLinkIdHeadroom(graph);
     graph.beforeChange?.();
     try {
       withInMemoryClipboard(storage, () => canvas.pasteFromClipboard(options));
@@ -25824,6 +25838,12 @@ const GRAPH_TOOL_EXECUTORS = {
       note:
         "Internal wires among the copied nodes are preserved. connect_inputs:false (default) drops only external feeds; pass true to also reconnect those.",
       ...(auxIdSanitizedCount ? { aux_id_sanitized: auxIdSanitizedCount } : {}),
+      // #2196 — DISCLOSED, not silent. Raising protects the paste about to
+      // happen; it says nothing about connects already made, and a graph that
+      // needed raising had been minting colliding ids all along.
+      ...(headroom.adjusted
+        ? { link_counter_repaired: { from: headroom.from, to: headroom.to } }
+        : {}),
     };
     if (groupsNow.length) {
       result.groups = groupsNow.map((g) => summarizeGroup(graph, g));
@@ -25833,6 +25853,11 @@ const GRAPH_TOOL_EXECUTORS = {
       result.dropped_nodes = dropped;
       result.dropped_types = dropped_types;
       result.warning = formatDroppedWarning(dropped);
+    }
+    // Appended rather than assigned: a drop warning and a counter repair are
+    // independent, and the caller needs both.
+    if (headroom.warning) {
+      result.warning = [result.warning, headroom.warning].filter(Boolean).join(" ");
     }
     return result;
   },

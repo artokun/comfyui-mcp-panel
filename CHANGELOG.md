@@ -17,6 +17,18 @@ All notable changes to this project are documented here. This project adheres to
   repair on every success path instead of doing it silently: raising the counter protects
   the next connect and cannot undo the collisions already made, so a graph that needed it
   may already have wires that moved, and the reply now says so (#2196).
+- panel_paste_nodes raises the counter too — it was the one allocating path still
+  unguarded (#2108, #2196). Read out of the installed frontend'''s own sources:
+  `LGraphCanvas` holds no `lastLinkId`/`addLink`/`new LLink`, so
+  `pasteFromClipboard` delegates to `_deserializeItems`, and the links it lands are
+  minted by `LGraphNode`'''s connect path with the same
+  `toLinkId(Number(graph.state.lastLinkId) + 1)` into a replacing `_links.set`. Both
+  halves of a paste allocate: the internal wires among the copied nodes (which the
+  handler'''s own note promises are preserved) and, with connect_inputs, the
+  reconnection to existing nodes. Copy-paste is a routine first move on exactly the
+  API/prompt graph that arrives with no `last_link_id`, so this was reachable by the
+  same route as the reported connect. The repair rides on the paste result and is
+  appended to any dropped-nodes warning rather than replacing it.
 - the counter repair is disclosed from EVERY caller, not only panel_connect (#2196).
   panel_expose_subgraph_output/_input and the widget-promotion path repaired the
   counter silently. They take the same graph, and the counter only moves up, so
