@@ -364,3 +364,16 @@ test("#874 graph_load and the disk-reload open path both re-apply saved host wid
     "workflow_open's on-disk reload must re-apply the FILE after loadGraphData",
   );
 });
+
+test("#2225 applySavedSubgraphHostWidgets rebinds promoted slots before restoring values", () => {
+  const applySrc = readFileSync(new URL("../../web/js/lib/subgraph-instance-widgets.js", import.meta.url), "utf8");
+  const start = applySrc.indexOf("export function applySavedSubgraphHostWidgets");
+  const end = applySrc.indexOf("\nexport async function withPreservedPromotedInstanceWidgets", start);
+  assert.ok(start >= 0 && end > start);
+  const body = applySrc.slice(start, end);
+  assert.match(body, /rebindLoadedPromotedMappings\(liveRoot\)/);
+  assert.ok(
+    body.indexOf("rebindLoadedPromotedMappings(liveRoot)") < body.indexOf("savedHostWidgetMap"),
+    "slot rebind must run before file values are written onto the rails",
+  );
+});
