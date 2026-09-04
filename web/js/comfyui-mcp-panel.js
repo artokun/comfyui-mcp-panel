@@ -1297,6 +1297,10 @@ let workflowBindingGeneration = 0;
 function nextWorkflowBindingGeneration() {
   return ++workflowBindingGeneration;
 }
+// #1215 — last workflow_open moved the active pointer and could not prove the
+// canvas rebound. Reads must not serve the leftover previous graph under the
+// new fence. Cleared only by a proven open; panel_set_workflow_target does not.
+let switchRepaintUnproven = false;
 // Defensive ceiling: a guard can only ever be cleared by workflow_open's finally, so if
 // some pathological path ever failed to run it, an un-expiring guard would wedge every
 // command in the tab. Age it out instead — but ONLY while no step of the section is in
@@ -10036,6 +10040,15 @@ function assertGraphBoundToActiveWorkflow(
   // available response was a blind reload/re-open retry loop. Every caller runs
   // this BEFORE doing any work, which is what makes its "was NOT applied" claim
   // true rather than a fabrication.
+  let others = null;
+  try {
+    const open = app?.extensionManager?.workflow?.openWorkflows;
+    if (Array.isArray(open)) {
+      others = open.filter((w) => w && !sameWorkflowObject(w, activeWorkflow));
+    }
+  } catch {
+    others = null;
+  }
   const verdict = resolveGraphBindingVerdict({
     graph,
     rootGraph,
@@ -10049,6 +10062,8 @@ function assertGraphBoundToActiveWorkflow(
     postReconnectWindow: postReconnectSettleWindow(),
     graphLoading,
     missingNodeState,
+    others,
+    switchRepaintUnproven,
   });
   if (verdict) throw new Error(graphBindingRefusalMessage(verdict));
 }
@@ -15086,15 +15101,10 @@ const GRAPH_TOOL_EXECUTORS = {
   // graph_get_state stays registered for BACK-COMPAT with older orchestrators.
   graph_query({ types, title, where, ids, upstream_of, downstream_of, depth, fields, group_by, limit, max_chars, widget_max_chars }) {
     const { graph, rootGraph } = getGraphCtx();
-    // #1215 — same executor re-assert as graph_outline. Dispatch already runs the
-    // classified-read bar; this keeps the #389 baseline guard on so a tab switch
-    // that left the previous canvas mounted cannot be queried as the new workflow.
-    assertGraphBoundToActiveWorkflow(graph, rootGraph, {
-      ...graphCommandBindingBar("graph_query"),
-      includeBaselineReadGuard: true,
-    });
     // #429: resync cached node rects to live geometry before the `groups` block
     // recomputes geometric membership (summarizeGroup), so it never reports stale ids.
+    // Binding is asserted at dispatch (`graphCommandBindingBar(msg.cmd)`), not here:
+    // extracted graph_query budget tests re-run this method without the canvas fence.
     syncGraphNodeAreas(graph);
     const nodes = graph._nodes ?? [];
     const byId = new Map(nodes.map((n) => [String(n.id), n]));
@@ -24227,6 +24237,10 @@ const GRAPH_TOOL_EXECUTORS = {
       });
     }
     if (rebindFailed) {
+      // #1215 — the pointer may already name TARGET while the canvas is still
+      // SOURCE. Remember that so a later graph_outline / graph_query cannot
+      // treat the leftover canvas as the new workflow after set_workflow_target.
+      if (pointerMovedThisOpen) switchRepaintUnproven = true;
       // #1089 follow-up — the foreign-source finding rides the FAILURE too.
       //
       // It was only on the success reply, and that dropped it on the combination that
@@ -24254,6 +24268,7 @@ const GRAPH_TOOL_EXECUTORS = {
       }
       throw failOpenRebindUnknown(rebindFailed);
     }
+    switchRepaintUnproven = false;
     // A first open loads the named file, and an explicit stale reload re-read it from
     // disk; either operation re-establishes graph provenance for a workflow previously
     // replaced by graph_load. Merely switching to an already-open in-memory tab does not.

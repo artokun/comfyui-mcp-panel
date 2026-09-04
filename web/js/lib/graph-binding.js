@@ -93,35 +93,44 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
  * PREVIOUS tab's graph. That is the inverse of `graphReadDesynced`: the canvas
  * is nonempty, not empty.
  *
- * Every older predicate fail-opens on the reported shape (open returned the
- * "safe repaint" error because the target had no `activeState.nodes`, then
- * `panel_set_workflow_target({mode:"current"})` rebound the fence and
- * `panel_graph_outline` served the prior graph):
- *   - `graphReadDesynced` only fires when the live root is EMPTY;
- *   - `graphRootMismatchesActiveWorkflow` returns false when `nodes` is
- *     missing (`!Array.isArray(expected)`);
- *   - uuid mismatch needs a tag on the live root, which an untagged previous
- *     canvas does not carry. A TARGET tag is not an exception either: after a
- *     switch the outgoing canvas can still hold a stale/shared stamp (#1639).
+ * Missing current state alone is NOT leftover evidence. Extracted graph_query
+ * fixtures, a first observation, and #618's unreadable tracker all look like
+ * "live nodes + no activeState" and must fail OPEN. Refuse only when that
+ * unreadable active state is paired with switch/open leftover proof:
+ *   - `switchRepaintUnproven`: this session's last open moved the pointer and
+ *     could not prove the canvas rebound (the safe-repaint failure);
+ *   - or another still-open workflow's current state AGREES with the live
+ *     root, so the mounted graph is that previous tab's, not the named one.
  *
- * Fail-closed only when ALL of:
- *   - ROOT scope;
- *   - an active workflow object is present (no service → legacy availability);
- *   - the live root observably has nodes;
- *   - that workflow's CURRENT serialized state is absent/malformed.
- * A well-formed empty `nodes: []` is the shape guard's job (blank tab vs a
- * leftover canvas). `panel_set_workflow_target` does not clear this — it
- * re-points the session, it does not rebind the canvas.
+ * A well-formed empty `nodes: []` is the shape guard's job. A TARGET uuid on
+ * the leftover canvas is not an exception (#1639). `panel_set_workflow_target`
+ * does not clear this — it re-points the session, it does not rebind the canvas.
  */
 export function graphRootUnprovenAgainstActiveState({
   liveNodeCount,
   activeWorkflow,
+  rootGraph = null,
+  others = null,
+  switchRepaintUnproven = false,
   inSubgraph = false,
 } = {}) {
   if (inSubgraph) return false;
   if (!activeWorkflow) return false;
   if (!(Number(liveNodeCount) > 0)) return false;
-  return activeWorkflowCurrentState(activeWorkflow) == null;
+  if (activeWorkflowCurrentState(activeWorkflow) != null) return false;
+  if (switchRepaintUnproven === true) return true;
+  if (!rootGraph || !Array.isArray(others)) return false;
+  for (const other of others) {
+    if (!other) continue;
+    try {
+      const otherState = activeWorkflowCurrentState(other);
+      if (otherState == null) continue;
+      if (graphRootAgreesWithActiveState(rootGraph, otherState)) return true;
+    } catch {
+      // An unreadable twin is not leftover proof.
+    }
+  }
+  return false;
 }
 
 /**
@@ -3113,6 +3122,8 @@ export function resolveGraphBindingVerdict({
   postReconnectWindow = false,
   graphLoading = false,
   missingNodeState = null,
+  others = null,
+  switchRepaintUnproven = false,
 } = {}) {
   const nodeCount = Number.isFinite(Number(liveNodeCount))
     ? Number(liveNodeCount)
@@ -3207,11 +3218,18 @@ export function resolveGraphBindingVerdict({
       ...(reason === "root-shape-mismatch" ? { structureMatches: structureMatches === true } : {}),
     };
   }
-  // #1215 — live canvas has nodes, active workflow has nothing to compare.
-  // Not gated on includeBaselineReadGuard: a classified read at dispatch is
-  // how panel_graph_outline / panel_query_graph silently served the previous
-  // tab after an open that could not repaint.
-  if (graphRootUnprovenAgainstActiveState({ liveNodeCount: nodeCount, activeWorkflow, inSubgraph })) {
+  // #1215 — leftover previous canvas after a switch that could not repaint.
+  // Missing current state alone is not enough (graph_query fixtures, #618).
+  if (
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: nodeCount,
+      activeWorkflow,
+      rootGraph,
+      others,
+      switchRepaintUnproven,
+      inSubgraph,
+    })
+  ) {
     return {
       reason: "root-state-unreadable",
       expected: null,

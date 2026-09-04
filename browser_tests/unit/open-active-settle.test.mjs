@@ -1825,7 +1825,7 @@ test("#1215 production workflow_open that cannot repaint does not let outline/qu
     },
     extensionManager: {
       workflow: {
-        openWorkflows: [target],
+        openWorkflows: [previous, target],
         workflows: [],
         getWorkflowByPath: () => target,
         openWorkflow: async () => {
@@ -1910,6 +1910,8 @@ test("#1215 production workflow_open that cannot repaint does not let outline/qu
       activeWorkflow: target,
       activeWorkflowUuid: targetUuid,
       liveNodeCount: root._nodes.length,
+      others: [previous],
+      switchRepaintUnproven: true,
       ...graphCommandBindingBar(cmd),
       includeBaselineReadGuard: true,
     });
