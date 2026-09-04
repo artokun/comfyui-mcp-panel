@@ -54,6 +54,32 @@ function storeCleanupAlias(dynamicRoot, widgetId, index) {
   };
 }
 
+/**
+ * #2033 vs the relocation replay — does this root still carry rows that only the
+ * NATIVE rebuild can remove?
+ *
+ * `reconcileFreshDynamicWidgets` renames an orphan to `<root>.__cmcp_stale_N` and
+ * pushes a `<root>.__cmcp_store_cleanup_N` alias, then replays the root so
+ * LiteGraph's own setter deletes both. That replay is a SAME-VALUE write
+ * (`const v = widget.value; widget.value = v;`), which is exactly what the #2033
+ * short-circuit swallows — and it swallows it precisely when the root is healthy
+ * (`preserved.size` nonzero), i.e. the common case. The stale row and its store
+ * alias then stay attached.
+ *
+ * So the short-circuit must stand down while cleanup is pending. Once the replay
+ * has removed these rows the predicate is false again and #2033's protection
+ * returns, which is why this asks about the CURRENT widget list rather than
+ * latching a flag.
+ */
+function hasPendingCleanupRows(node, dynamicRoot) {
+  const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+  const stale = `${dynamicRoot}.__cmcp_stale_`;
+  const cleanup = `${dynamicRoot}.__cmcp_store_cleanup_`;
+  return widgets.some(
+    (w) => typeof w?.name === "string" && (w.name.startsWith(stale) || w.name.startsWith(cleanup)),
+  );
+}
+
 function isDynamicComboSpec(spec) {
   return Array.isArray(spec) && spec[0] === DYNAMIC_COMBO_V3;
 }
@@ -253,7 +279,10 @@ function wrapDynamicComboSetter(node, widget) {
     // queue-time snapshot restore still holding the captured child throws
     // `Dynamic widget doesn't exist on node`. A stripped root (preserved empty)
     // still needs the rebuild — that is the #2140 rescue.
-    if (previous === next && preserved.size) return;
+    // ...unless this root still carries relocation/cleanup rows. Those are removed
+    // ONLY by the native rebuild, and the reconcile replay that triggers it is a
+    // same-value write — so short-circuiting here left the residue attached.
+    if (previous === next && preserved.size && !hasPendingCleanupRows(node, widget.name)) return;
     origSet.call(this, next);
     if (previous === next) restorePrefixedValues(node, preserved);
   };

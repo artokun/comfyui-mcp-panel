@@ -6,6 +6,8 @@
 // reconcileGraphDynamicWidgets. These tests fail on the duplicate/orphan set
 // and pass on the shipped nested set.
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -744,3 +746,27 @@ test("#2033: a non-Error rejection is still classified, not blindly swallowed", 
   const widget = widgetThatThrows("plain string failure");
   assert.throws(() => restoreState([{ widget, snapshot: "h264" }], "snapshot"));
 });
+
+// #2033 vs the relocation replay. The reconcile renames an orphan to
+// `<root>.__cmcp_stale_N`, pushes a `<root>.__cmcp_store_cleanup_N` alias, and
+// replays the root so LiteGraph's own setter deletes both. That replay is a
+// SAME-VALUE write, which is exactly what #2033's short-circuit swallows -- and it
+// swallows it when the root is HEALTHY (preserved children present), i.e. the
+// common case, leaving the residue attached.
+test("#2033/#2140 the same-value short-circuit yields while cleanup rows are pending", () => {
+  const src = readFileSync(
+    fileURLToPath(new URL("../../web/js/lib/dynamic-widget-reconcile.js", import.meta.url)),
+    "utf8",
+  );
+  // The guard consults the CURRENT widget list, so it stops applying once the
+  // replay has removed the rows and #2033's protection comes back.
+  assert.match(src, /function hasPendingCleanupRows\(node, dynamicRoot\)/);
+  assert.match(src, /__cmcp_stale_/);
+  assert.match(src, /__cmcp_store_cleanup_/);
+  // The regression: an unconditional return on a healthy root.
+  assert.match(
+    src,
+    /previous === next && preserved\.size && !hasPendingCleanupRows\(node, widget\.name\)/,
+  );
+  assert.doesNotMatch(src, /if \(previous === next && preserved\.size\) return;/);
+});
