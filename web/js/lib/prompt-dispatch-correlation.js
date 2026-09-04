@@ -196,10 +196,16 @@ export function matchDispatchPromptIds({ queueJson, historyJson, dispatchId, que
   // it, and the counter restarts on page reload while ComfyUI's history persists --
   // so a single match can name an earlier batch item or a row from a previous
   // session, reporting a stale prompt_id AND counting this failed post as observed.
-  // A unique match is still worth reporting as corroboration, but it cannot be a
-  // receipt, so it stays unknown until the marker is unique per request.
+  // It stays UNKNOWN until the marker is unique per request.
+  //
+  // An earlier version of this returned the matched prompt_id alongside, on the
+  // grounds that it was "worth reporting as corroboration". Nothing reported it:
+  // both callers do `if (status !== "recovered") return false` and drop the rest,
+  // so the field was carried to no one. Data nobody reads is the same defect as a
+  // verdict nobody renders — if a human ever needs the corroborating id, it should
+  // arrive with a consumer that shows it.
   if (byMark.length === 1) {
-    return { status: "unknown", reason: "queue_mark_is_not_a_receipt", markMatch: byMark[0] };
+    return { status: "unknown", reason: "queue_mark_is_not_a_receipt" };
   }
   if (byMark.length > 1) return { status: "unknown", reason: "multiple_queue_mark_matches" };
   if (queueOk && historyOk) return { status: "absent" };

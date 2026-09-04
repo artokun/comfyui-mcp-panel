@@ -103,7 +103,9 @@ test("#2203 a unique queue mark is corroboration, NOT a receipt", () => {
   });
   assert.equal(found.status, "unknown");
   assert.equal(found.reason, "queue_mark_is_not_a_receipt");
-  assert.equal(found.markMatch, "mark-id");
+  // No `markMatch` field: it was carried to no consumer. See the note in
+  // matchDispatchPromptIds — data nobody reads is a verdict nobody renders.
+  assert.equal(found.markMatch, undefined);
 });
 
 test("#2203 a FAILED queue/history read is not evidence of an empty one", () => {
