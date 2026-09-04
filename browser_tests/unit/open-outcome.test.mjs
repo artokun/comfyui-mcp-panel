@@ -726,6 +726,7 @@ test("#442 codex R9: the switch+reload holds a critical section that REFUSES con
   assert.notEqual(guardAt, -1, "the command dispatcher must consult the section");
   assert.ok(guardAt < execAt, "…BEFORE running the executor");
   const refusal = src.slice(guardAt, execAt);
+  assert.match(refusal, /switchFenceRefusesCommand\(/);
   assert.match(refusal, /was NOT applied — nothing changed\. Retry in a moment\./);
   // A stuck guard must age out rather than wedge the tab forever.
   assert.match(src, /Date\.now\(\) - workflowReloadGuard\.since > WORKFLOW_RELOAD_GUARD_MAX_MS/);
