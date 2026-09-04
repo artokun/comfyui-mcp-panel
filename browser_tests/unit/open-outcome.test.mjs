@@ -1416,3 +1416,51 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
     assert.equal(replyUuid(workflow, workflow), null, `mapped ${workflow.path} must not publish a noncanonical UUID`);
   }
 });
+
+// #2139 — the `stale: "unknown"` arm recommended `panel_load_workflow` UNCONDITIONALLY.
+// That call loads the on-disk copy OVER the canvas, so on a tab with unsaved edits it
+// discards them. Every other arm of this chain consults the dirty flags first (the
+// CONFLICT arm says so outright; the arm after it is the proven-clean `else`) — this one
+// alone did not, and it is the arm that fires when the disk read was "unavailable or
+// slower than its deadline", which is transient and common. The one path that admits it
+// verified nothing was the one giving an unconditional instruction to overwrite.
+//
+// Scoped to the branch region and comment-stripped on purpose: the fix ships with a long
+// explanatory comment naming these very identifiers, and an unscoped `assert.match` over
+// the handler body would pass on the comment alone.
+test("#2139 the unknown-staleness arm does not tell a DIRTY tab to load over its edits", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = stripComments(handlerBody(src, "async workflow_open({"));
+  const at = body.indexOf('staleInfo.stale === "unknown"');
+  assert.notEqual(at, -1, "the unknown arm must still exist");
+  // Bound the region at the end of the ternary chain so this cannot pass on the
+  // CONFLICT arm above it, which has always been dirty-aware.
+  const region = body.slice(at, at + 2200);
+
+  assert.match(
+    region,
+    /dirtyNow \|\| wasDirty/,
+    "the unknown arm must consult the dirty flags before recommending a disk load",
+  );
+
+  const dirtyArm = region.slice(region.indexOf("dirtyNow || wasDirty"));
+  const cut = dirtyArm.indexOf("Could not verify", dirtyArm.indexOf("Could not verify") + 1);
+  const warned = cut === -1 ? dirtyArm : dirtyArm.slice(0, cut);
+  assert.match(
+    warned,
+    /unsaved edits/,
+    "the dirty arm must SAY the tab has unsaved edits",
+  );
+  assert.match(
+    warned,
+    /discarded|do NOT reach for panel_load_workflow/,
+    "the dirty arm must name the loss, not just mention staleness",
+  );
+
+  // ...and the clean arm must still give the original, useful advice.
+  assert.match(
+    region,
+    /call panel_load_workflow to be sure you have the on-disk version/,
+    "a tab with no unsaved edits still gets the plain re-read recommendation",
+  );
+});
