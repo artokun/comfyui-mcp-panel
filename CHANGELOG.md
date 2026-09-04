@@ -25,6 +25,12 @@ All notable changes to this project are documented here. This project adheres to
   its own sentence names.
 - the stale-snapshot save refusal no longer promises that a still-open transaction clears by itself or that nudging the canvas fixes it (measured: it does not, and each nudge widens the gap), and it now warns against falling back to ComfyUI's own Save, which persists the same tracker snapshot silently (#2139)
 
+## [0.15.173] - 2026-09-04
+
+### Fixed
+- panel_get_errors no longer reports a clean graph when missing models are still named on a promoted native-subgraph host rail: the load-time store blames the inner locator, and the inner widget may hold an on-disk fallback while the host still names the absent file. The live combo scan now also walks nested subgraphs from the bound root, so inner loaders are judged even when the user is looking at the root canvas (#984, #2245)
+
+
 ## [0.15.172] - 2026-09-04
 
 ### Fixed
