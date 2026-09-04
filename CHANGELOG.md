@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_get_errors no longer reports a clean graph when missing models are still named on a promoted native-subgraph host rail: the load-time store blames the inner locator, and the inner widget may hold an on-disk fallback while the host still names the absent file. The live combo scan now also walks nested subgraphs from the bound root, so inner loaders are judged even when the user is looking at the root canvas (#984)
+
 ## [0.15.172] - 2026-09-04
 
 ### Fixed
