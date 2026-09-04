@@ -20,6 +20,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { isPromotedContainer } from "../../web/js/lib/graph-read.js";
+import { resolveLiveNode } from "../../web/js/lib/node-id.js";
+import { resolvePromotedContainerForRead } from "../../web/js/lib/subgraph-scope.js";
 
 const PANEL_SRC = readFileSync(
   new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
@@ -53,6 +55,7 @@ function loadGetSubgraph() {
       "summarizeNode",
       "promotedTerminalWitnesses",
       "isPromotedContainer",
+      "resolvePromotedContainerForRead",
       `return ({${method}}).graph_get_subgraph;`,
     )(
       () => ({ graph: {} }),
@@ -66,6 +69,7 @@ function loadGetSubgraph() {
       (inner) => ({ id: inner.id, type: inner.type }),
       () => [],
       isPromotedContainer,
+      resolvePromotedContainerForRead,
     );
 }
 
@@ -265,4 +269,82 @@ test("#2057 graph_get_subgraph does not cap the inner list used as an ownership 
     "asserting truncated:true is a promoted-write veto even when promoted_terminals is complete",
   );
   assert.match(src, /truncated:\s*false/, "complete ownership envelopes emit truncated:false");
+  assert.match(
+    src,
+    /resolvePromotedContainerForRead\(graph, rootGraph \?\? graph, node_id\)/,
+    "MCP's classifier must find the HOST while the canvas is inside it",
+  );
+});
+
+test("#2057 resolvePromotedContainerForRead finds the host while viewing its inner graph", () => {
+  const inner = { _nodes: [{ id: 139, type: "PrimitiveBoolean" }] };
+  const host = { id: 140, type: "SubgraphNode", subgraph: inner };
+  const root = { _nodes: [host] };
+  assert.equal(resolveLiveNode(inner, 140), null);
+  assert.equal(resolvePromotedContainerForRead(inner, root, 140), host);
+  assert.equal(resolvePromotedContainerForRead(inner, root, "140"), host);
+});
+
+test("#2057 graph_get_subgraph classifies the host from inside instead of a missing-id throw", () => {
+  const innerNode = { id: 139, type: "PrimitiveBoolean" };
+  const inner = { _nodes: [innerNode] };
+  const host = { id: 140, type: "SubgraphNode", title: "Image to Video (MiniMax H3)", subgraph: inner };
+  const root = { _nodes: [host] };
+  const start = PANEL_SRC.indexOf("graph_get_subgraph({ node_id }) {");
+  const end = PANEL_SRC.indexOf("async graph_add_node(", start);
+  const method = PANEL_SRC.slice(start, end).replace(/,\s*$/, "");
+  const getSubgraph = new Function(
+    "getGraphCtx",
+    "resolveNode",
+    "describeActiveGraph",
+    "subgraphValueProvenance",
+    "redactWidgetValue",
+    "graphViewIdentityFor",
+    "MAX_STATE_NODES",
+    "fixedCapNote",
+    "summarizeNode",
+    "promotedTerminalWitnesses",
+    "isPromotedContainer",
+    "resolvePromotedContainerForRead",
+    `return ({${method}}).graph_get_subgraph;`,
+  )(
+    () => ({ graph: inner, rootGraph: root }),
+    (graph, nodeId) => {
+      const found = resolveLiveNode(graph, nodeId);
+      if (!found) throw new Error(`No node with id ${nodeId} in the current graph`);
+      return found;
+    },
+    () => ({ scope: "subgraph", owner_node_id: 140, graph_identity: "graph:inner" }),
+    () => ({}),
+    () => ({}),
+    () => "graph:inner",
+    50,
+    () => "truncation note",
+    (n) => ({ id: n.id, type: n.type }),
+    () => [],
+    isPromotedContainer,
+    resolvePromotedContainerForRead,
+  );
+  const out = getSubgraph({ node_id: 140 });
+  assert.equal(out.subgraph_of.node_id, 140);
+  assert.equal(out.truncated, false);
+  assert.equal(out.node_count, 1);
+  assert.equal(out.nodes[0].id, 139);
+});
+
+test("#2057 an inner ordinary node still throws the definitive non-container line", () => {
+  const innerNode = { id: 139, type: "PrimitiveBoolean" };
+  const inner = { _nodes: [innerNode] };
+  const host = { id: 140, type: "SubgraphNode", subgraph: inner };
+  const root = { _nodes: [host] };
+  assert.equal(resolvePromotedContainerForRead(inner, root, 139), innerNode);
+  const getSubgraph = loadGetSubgraph()(innerNode);
+  assert.throws(
+    () => getSubgraph({ node_id: 139 }),
+    (err) => {
+      assert.match(String(err.message), /Node 139 \(PrimitiveBoolean\) is not a subgraph/);
+      assert.match(asOrchestratorError(err), DEFINITIVE_NON_SUBGRAPH_RE);
+      return true;
+    },
+  );
 });
