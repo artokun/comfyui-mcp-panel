@@ -7,6 +7,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+
+- After a delivered panel_open_workflow, the switch fence no longer latches panel_list_workflows / panel_set_workflow_target({mode:"current"}) / panel_graph_outline for minutes while a later settle or safe-repaint is still pending. workflow_list stays the recovery probe; leftover previous-tab graph is still refused (#2249, #1215)
 - the cross-repo contract comment now quotes comfyui-mcp accurately (#2511). It wrote `parts.join(NEWLINE)`; the real matcher is `parts.join("
 ")` and NEWLINE is not a symbol that exists there. A misquoted contract is worse than an unquoted one — anyone verifying it greps for something absent and concludes the contract moved. Found by the Copilot review on the PR
 - the fetch_comfyui_read allowlist rejection now has its wording pinned by a test. comfyui-mcp
