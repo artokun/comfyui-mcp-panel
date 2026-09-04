@@ -32,7 +32,11 @@ test("#2183 bounds A2UI cards and gives oversized content its own scroll surface
   assert.ok(ruleStart >= 0, "the live A2UI card rule must exist");
   const ruleEnd = a2uiSrc.indexOf("}", ruleStart);
   const rule = a2uiSrc.slice(ruleStart, ruleEnd + 1);
-  assert.match(rule, /max-height:\s*min\(70vh,\s*42rem,\s*calc\(100%\s*-\s*2rem\)\)/);
+  // All three terms cap the card to the same FRACTION. calc(100% - 2rem) did not:
+  // the log is shorter than the viewport, so that term won whenever the log was
+  // under 70vh and allowed ~94% of it -- the outcome this rule exists to prevent.
+  assert.match(rule, /max-height:\s*min\(70vh,\s*42rem,\s*calc\(70%\s*-\s*2rem\)\)/);
+  assert.doesNotMatch(rule, /calc\(100%\s*-\s*2rem\)/);
   assert.match(rule, /overflow-y:\s*auto/);
 });
 
