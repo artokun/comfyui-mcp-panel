@@ -6,10 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- an oversized A2UI card scrolls inside its own surface instead of consuming the chat viewport, and a `ui_dismiss` that carries no `card_id` now survives a reload or rebind by resolving only the still-unresolved cards in the displayed thread (#2183)
+
+## [0.15.165] - 2026-09-04
 
 ### Fixed
-- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222)
-- an oversized A2UI card scrolls inside its own surface instead of consuming the chat viewport, and a `ui_dismiss` that carries no `card_id` now survives a reload or rebind by resolving only the still-unresolved cards in the displayed thread (#2183)
+- panel_set_widget refreshes LoadImage/LoadVideo combo choices from the connected ComfyUI `/object_info/<Type>` input-file inventory after a combo miss, invalidates the cached whole-map list, and accepts only the exact uploaded relative filename — so a file `upload_image` just verified is not rejected against a stale page-load dropdown (#2222, #2223)
+
 
 ## [0.15.164] - 2026-09-03
 
