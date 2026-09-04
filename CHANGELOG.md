@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181)
 - the snapshot-restore catch is now pinned in BOTH directions (#2033). It swallows the detached-child throw and rethrows everything else, and that narrowness was untested: replacing the condition with a blanket swallow left all 8,344 panel tests green. The catch is not reachable through the queue path while a test is asserting — instrumented with a call counter, `restoreState` has still not run at the end of the barrier test's body, even after a tick — so a test written against that path observes the restore only by accident. `restoreState` is now exported as a test seam and driven directly: it is pure over its records, so both the swallow and the rethrow are reached with no queue plumbing. A blanket-swallow mutation now kills two tests.
 - panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
 
