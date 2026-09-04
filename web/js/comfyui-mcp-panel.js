@@ -21299,7 +21299,12 @@ const GRAPH_TOOL_EXECUTORS = {
       includeBaselineReadGuard: true,
       missingNodeState,
     });
-    const scanNodes = preScanGraph._nodes ?? [];
+    // Visible graph plus every nested subgraph. A promoted host is virtual and
+    // skipped by the scan; its inner loaders are the ones that name the files,
+    // and they are not in `preScanGraph._nodes` while the user is at root
+    // (#984 recurrence: MiniMaxH3 assets on host 1512). collectAllGraphs walks
+    // from the bound ROOT so an open-subgraph view still sees sibling hosts.
+    const scanNodes = collectAllGraphs(preScanRootGraph).flatMap((g) => g?._nodes ?? []);
     // #745 — ask the SERVER about the widget values actually on the canvas now before
     // the optional load-time missing-asset refresh. Per-class /object_info is small,
     // deduped and independently authoritative; giving it first use of the shared

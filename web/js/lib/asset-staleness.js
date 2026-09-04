@@ -165,17 +165,49 @@ export function locatorIsRecognized(scopedId) {
   return parts.length === 2 && UUID_RE.test(first) && parts[1] !== "";
 }
 
+function widgetsHoldFile(node, file) {
+  return Array.isArray(node?.widgets) && node.widgets.some((w) => w?.value === file);
+}
+
+/** True when `node` is reachable from `graph`, including nested subgraphs. */
+function graphContainsNode(graph, node, _seen = new WeakSet()) {
+  if (!graph || !node || _seen.has(graph)) return false;
+  _seen.add(graph);
+  for (const n of graph._nodes ?? graph.nodes ?? []) {
+    if (n === node) return true;
+    if (n?.subgraph && graphContainsNode(n.subgraph, node, _seen)) return true;
+  }
+  return false;
+}
+
 /**
  * Keep a candidate only if some widget on the node STILL literally holds that
  * filename. Fails OPEN (returns true / "still referenced") on any unexpected
  * shape, so the worst case is over-reporting and a real miss is never swallowed.
+ *
+ * Promoted native-subgraph rails are AUTHORITATIVE (#366/#1181): the inner
+ * widget may hold an on-disk fallback (or empty) while the HOST still names
+ * the missing file. The load-time store blames the inner locator, and treating
+ * "inner no longer holds the filename" as a user fix is how panel_get_errors
+ * reported clean while the turn-start scan still named four MiniMaxH3 paths
+ * promoted through host 1512 (#984 recurrence). A host/inner counterpart that
+ * still holds the file keeps the candidate.
  */
 export function assetCandidateStillReferenced(rootGraph, nodeId, file) {
   try {
     if (nodeId == null || !file) return true;
     const node = findNodeByScopedId(rootGraph, nodeId);
-    if (!node || !Array.isArray(node.widgets) || !node.widgets.length) return true;
-    return node.widgets.some((w) => w?.value === file);
+    if (!node) return true;
+    if (widgetsHoldFile(node, file)) return true;
+    for (const g of collectAllGraphs(rootGraph)) {
+      for (const n of g._nodes ?? []) {
+        if (n === node || !widgetsHoldFile(n, file)) continue;
+        if (n.subgraph && graphContainsNode(n.subgraph, node)) return true;
+        if (node.subgraph && graphContainsNode(node.subgraph, n)) return true;
+      }
+    }
+    if (Array.isArray(node.widgets) && node.widgets.length) return false;
+    return true;
   } catch {
     return true;
   }
