@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_run compiles promoted host-rail width/height and linked PrimitiveNode/GetNode primitive values into the flattened subgraph prompt so inner stored fallbacks do not execute; GetNode/SetNode tensor buses are not reported as dropped value sources (#1181)
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
   saved tab carrying unsaved drift that is the one recovery that loses it, which is the

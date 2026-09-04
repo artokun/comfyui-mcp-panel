@@ -277,6 +277,7 @@ import {
 } from "./lib/muted-subgraph-outputs.js";
 import {
   collectVirtualSourceFeeds,
+  installGraphToPromptVirtualSourceApply,
   virtualFedInputs,
   virtualSourceNote,
   virtualSourceTag,
@@ -20305,6 +20306,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // and the deferred queue-loop serialize see the same nested set. Installed before
     // the snapshot barrier so a cancelled queue item still throws synchronously.
     installGraphToPromptDynamicReconcile(app);
+    // #1181 recurrence — copy promoted rails and linked primitive payloads into
+    // the compiled prompt (Krea2 width/height + external prompt). After reconcile,
+    // before the snapshot barrier so cancel still throws synchronously.
+    installGraphToPromptVirtualSourceApply(app);
     installGraphToPromptSnapshotBarrier(app);
     try {
       // Inspect the SERIALIZED prompt, not the canvas. graphToPrompt has already
@@ -21267,12 +21272,11 @@ const GRAPH_TOOL_EXECUTORS = {
     // execution disagreed, reused cached conditioning and all). Measured on ComfyUI
     // 0.32.0 / frontend 1.48.7.
     //
-    // Same posture as #985 above: the panel does not build this prompt and cannot
-    // carry the value across the boundary, but it can stop queueing in silence.
-    // Reported at QUEUE time so an agent can interrupt rather than learn it from
-    // the render. Scoped runs are NOT exempt — unlike #985 this is not about
-    // execution roots: a dropped source feeds nothing no matter how the run is
-    // scoped. The note states the read-from-graph caveat itself.
+    // The serializer wrap copies those payloads into the compiled prompt. This
+    // scan still names leftover PrimitiveNode feeds at QUEUE time so an agent
+    // can interrupt (GetNode/SetNode bus relays are not feeds). Scoped runs are
+    // NOT exempt — unlike #985 this is not about execution roots. The note
+    // states the read-from-graph caveat itself.
     try {
       const virtualFeeds = collectVirtualSourceFeeds(rootGraph);
       if (virtualFeeds.length) {
