@@ -1460,6 +1460,26 @@ test("#2139 the unknown-staleness arm does not tell a DIRTY tab to load over its
     "the unknown arm must consult the dirty flags before recommending a disk load",
   );
 
+  // The condition must not be NEGATED. `!(dirtyNow || wasDirty)` still contains the
+  // substring the regex above looks for, and the slice below still reads the FIRST
+  // message object — so the arms could be swapped and every assertion here would
+  // still pass while dirty tabs received the clean-tab advice.
+  assert.doesNotMatch(
+    region,
+    /!\s*\(\s*dirtyNow \|\| wasDirty/,
+    "the dirty arm must be the TRUE branch, not the negation",
+  );
+  // ...and pin the MAPPING, not just the presence of both strings: the true branch
+  // carries the has-unsaved-edits text and the false branch the reports-none text.
+  const ternary = region.slice(region.indexOf("dirtyNow || wasDirty"));
+  const qAt = ternary.indexOf("?");
+  const colonAt = ternary.indexOf(": {", qAt);
+  assert.ok(qAt > -1 && colonAt > qAt, "the unknown arm is still a ternary");
+  const trueBranch = ternary.slice(qAt, colonAt);
+  const falseBranch = ternary.slice(colonAt, colonAt + 1200);
+  assert.match(trueBranch, /AND this tab has unsaved edits/, "TRUE branch = the dirty tab");
+  assert.match(falseBranch, /reports no unsaved edits/, "FALSE branch = the quiet tab");
+
   const dirtyArm = region.slice(region.indexOf("dirtyNow || wasDirty"));
   const cut = dirtyArm.indexOf("Could not verify", dirtyArm.indexOf("Could not verify") + 1);
   const warned = cut === -1 ? dirtyArm : dirtyArm.slice(0, cut);
@@ -1472,6 +1492,22 @@ test("#2139 the unknown-staleness arm does not tell a DIRTY tab to load over its
     warned,
     /discarded|do NOT reach for panel_load_workflow/,
     "the dirty arm must name the loss, not just mention staleness",
+  );
+  // The REMEDY must not be able to cause the loss this hint warns about.
+  // classifyInPlaceOverwrite returns "skip" for a tab already isPersisted === true,
+  // so an ordinary save of a persisted tab overwrites in place WITHOUT reading disk
+  // -- and this whole branch exists because the disk contents could not be
+  // established. An unqualified "save first" here can therefore clobber the very
+  // change the sentence says might exist.
+  assert.match(
+    region,
+    /NEW path/,
+    "both arms must send the caller to a new path, not an in-place overwrite",
+  );
+  assert.doesNotMatch(
+    region,
+    /Save first, then re-read/,
+    "the in-place instruction must not come back",
   );
 
   // ...and the clean arm must still give the original, useful advice.
