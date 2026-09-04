@@ -9,6 +9,12 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
 
+## [0.15.167] - 2026-09-04
+
+### Fixed
+- fetch_comfyui_read keeps the Comfy API object as `this` when calling apiURL/fileURL, so frontend helpers that read `this.api_base` still resolve after restart instead of throwing "Cannot read properties of undefined (reading 'api_base')" (#2228, #2229)
+
+
 ## [0.15.166] - 2026-09-04
 
 ### Fixed
