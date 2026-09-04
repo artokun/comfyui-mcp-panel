@@ -220,6 +220,96 @@ test("isStaleAssetCandidate: a genuinely-missing subgraph asset STILL reports (U
   );
 });
 
+test("#984 recurrence: a promoted HOST rail that still names the missing file keeps the inner locator candidate", () => {
+  // Inner widget holds an on-disk fallback (the compiled-prompt fallback #1181
+  // exists to ignore). Host 1512's promoted rail still names the absent MiniMaxH3
+  // asset. The load-time store blames the inner locator. Dropping that candidate
+  // is how get_errors reported clean while the turn-start scan still named the file.
+  const inner = { id: 88, widgets: [{ name: "ckpt_name", value: "exists-on-disk.safetensors" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const host = {
+    id: 1512,
+    subgraph: sub,
+    widgets: [
+      { name: "vae_name", value: "MiniMaxH3/vae.safetensors" },
+      { name: "clip_name", value: "MiniMaxH3/clip.safetensors" },
+    ],
+  };
+  const root = rootWithSubgraphs([host], [sub]);
+  const candidate = {
+    nodeId: `${SG_UUID}:88`,
+    name: "MiniMaxH3/vae.safetensors",
+    widgetName: "ckpt_name",
+  };
+  assert.equal(
+    assetCandidateStillReferenced(root, candidate.nodeId, candidate.name),
+    true,
+    "the host rail still names the missing file",
+  );
+  assert.equal(
+    isStaleAssetCandidate(root, candidate),
+    false,
+    "must not report clean: the promoted rail still references the miss",
+  );
+  assert.equal(
+    graphErrorsResultIsClean({
+      missing_models: [{ node_id: candidate.nodeId, file: candidate.name, kind: "missing_model" }],
+    }),
+    false,
+  );
+});
+
+test("#984 recurrence control: once the HOST rail also leaves the missing file, the inner locator IS stale", () => {
+  const inner = { id: 88, widgets: [{ name: "ckpt_name", value: "exists-on-disk.safetensors" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const host = {
+    id: 1512,
+    subgraph: sub,
+    widgets: [{ name: "vae_name", value: "installed.safetensors" }],
+  };
+  const root = rootWithSubgraphs([host], [sub]);
+  assert.equal(
+    isStaleAssetCandidate(root, {
+      nodeId: `${SG_UUID}:88`,
+      name: "MiniMaxH3/vae.safetensors",
+      widgetName: "ckpt_name",
+    }),
+    true,
+    "neither inner nor host still names the file → a real set_widget fix",
+  );
+});
+
+test("#984 recurrence: a HOST-id candidate still reports when the inner loader holds the missing file", () => {
+  const inner = { id: 88, widgets: [{ name: "ckpt_name", value: "MiniMaxH3/t5.safetensors" }] };
+  const sub = subgraphOf(SG_UUID, [inner]);
+  const host = {
+    id: 1512,
+    subgraph: sub,
+    widgets: [{ name: "ckpt_name", value: "exists-on-disk.safetensors" }],
+  };
+  const root = rootWithSubgraphs([host], [sub]);
+  assert.equal(
+    isStaleAssetCandidate(root, {
+      nodeId: 1512,
+      name: "MiniMaxH3/t5.safetensors",
+      widgetName: "ckpt_name",
+    }),
+    false,
+  );
+});
+
+test("#984 source guard: the live combo scan walks nested subgraphs from the bound root", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const at = src.indexOf("async graph_get_errors()");
+  assert.ok(at > 0, "graph_get_errors must still be recognisable");
+  const body = src.slice(at, at + 12000);
+  assert.match(
+    body,
+    /scanNodes = collectAllGraphs\(preScanRootGraph\)\.flatMap\(\(g\) => g\?\._nodes \?\? \[\]\)/,
+    "live scan must include inner loaders, not only the visible graph",
+  );
+});
+
 test("assetCandidateStillReferenced: true while a widget still holds the file", () => {
   const node = { id: 5, widgets: [{ name: "lora_name", value: "old.safetensors" }] };
   assert.equal(
