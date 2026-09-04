@@ -13,6 +13,10 @@ All notable changes to this project are documented here. This project adheres to
   known cause conditionally rather than asserting a status this side cannot read, and
   names the remedy that works today: a CivitAI API token in Settings. The underlying
   cross-site redirect block is unchanged and panel#2044 stays open for it.
+  The honesty guard now covers BOTH copies of the sentence: the check read only the
+  generated `locales/en/main.json`, so flattening the conditional in the source
+  fallback — from which that catalog is generated, and which renders whenever the
+  catalog is not loaded — left it green while the two silently diverged.
 
 ## [0.15.165] - 2026-09-04
 

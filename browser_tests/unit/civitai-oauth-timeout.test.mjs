@@ -61,3 +61,27 @@ test("#2044 the message does not CLAIM a 403 it never saw", () => {
     "nothing before the conditional may state the cause as fact",
   );
 });
+
+test("#2044 the SOURCE fallback carries the same conditional, and matches the catalog", () => {
+  // The test above reads locales/en/main.json. That is the string that normally
+  // renders -- `tr()` resolves the catalog first -- but it is GENERATED from the
+  // fallback literal in the source by `npm run i18n:build`, and the fallback is what
+  // renders whenever the catalog is not loaded. So flattening the conditional in the
+  // source alone leaves that test green while the generated catalog silently drifts
+  // out of date, and the un-catalogued path states as fact a 403 this code never saw.
+  //
+  // This is the panel#2210 shape exactly: a check that reads one of the two copies.
+  const at = src.indexOf("CivitAI sign-in did not complete");
+  assert.ok(at > -1, "the fallback literal moved — re-point this test");
+  const fallback = src.slice(at, src.indexOf('",', at));
+  assert.ok(
+    /if the popup showed a 403/i.test(fallback),
+    "the source fallback must offer the cause conditionally too",
+  );
+  const en = JSON.parse(readFileSync(EN, "utf8"));
+  assert.equal(
+    en.comfyuiMcpPanel.civitai_ui.sign_in_timed_out,
+    fallback,
+    "catalog and fallback have diverged — re-run `npm run i18n:build`",
+  );
+});
