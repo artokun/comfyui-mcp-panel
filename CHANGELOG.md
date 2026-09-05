@@ -7,14 +7,18 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-
-- panel_run refuses a stale live browser bundle with a Ctrl+Shift+R hard-refresh requirement instead of silently dropping dispatch; unverified scoped pending items are still removed fail-closed (#2252)
 - the cross-repo contract comment now quotes comfyui-mcp accurately (#2511). It wrote `parts.join(NEWLINE)`; the real matcher is `parts.join("
 ")` and NEWLINE is not a symbol that exists there. A misquoted contract is worse than an unquoted one — anyone verifying it greps for something absent and concludes the contract moved. Found by the Copilot review on the PR
 - the fetch_comfyui_read allowlist rejection now has its wording pinned by a test. comfyui-mcp
   matches `/operation must be one of/i` on that message to fall back to reading the model list from
   `object_info` when `models/<category>` is unavailable (comfyui-mcp#2511); rewording it silently
   disabled that recovery, with no error raised in either repo. A reword now fails here instead.
+
+## [0.15.175] - 2026-09-05
+
+### Fixed
+
+- panel_run refuses a stale live browser bundle with a Ctrl+Shift+R hard-refresh requirement instead of silently dropping dispatch; unverified scoped pending items are still removed fail-closed (#2252, #2253)
 
 
 ## [0.15.174] - 2026-09-04
