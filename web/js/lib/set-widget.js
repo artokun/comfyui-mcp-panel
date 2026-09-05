@@ -48,6 +48,7 @@ import {
 import { controlAfterGenerateWarning, controlEntryForWidget } from "./control-after-generate.js";
 import { isTypeScopedObjectInfo } from "./scoped-object-info.js";
 import { isPromotedContainer, linkDrivenWidgets, drivenTag } from "./graph-read.js";
+import { wrapGraphDynamicComboSetters } from "./dynamic-widget-reconcile.js";
 import { refreshDynamicInputsAfterWrite } from "./dynamic-inputs-refresh.js";
 import { refreshCustomGeneratedWidgetsAfterWrite } from "./custom-generated-widgets-refresh.js";
 import { REFRESH_JOIN_ABANDONED } from "./refresh-coalesce.js";
@@ -610,6 +611,19 @@ async function runSetWidgetBody(
   const assertNotAbandoned = () => {
     if (ackState?.abandoned) throw widgetWriteOutcomeUnknownError();
   };
+  // #2031 recurrence: graphToPrompt wrap is too late. Vue/widget-store flush
+  // after panel_set_widget re-assigns the DynamicCombo parent, rebuilds dotted
+  // children from spec defaults, then panel_query_graph reads the default
+  // while the receipt still says applied:true. Wrap before the write so a
+  // same-value parent assign restores the live children.
+  const preserveDynamicComboChildren = () => {
+    try {
+      wrapGraphDynamicComboSetters(node?.graph ?? { _nodes: [node] });
+    } catch {
+      /* a hostile node must not block the write */
+    }
+  };
+  preserveDynamicComboChildren();
   if (clear !== undefined && clear !== true && clear !== false) {
     throw new Error("panel_set_widget clear must be a boolean");
   }
@@ -1200,6 +1214,7 @@ async function runSetWidgetBody(
         out: writeOut,
         ...extra,
       });
+      preserveDynamicComboChildren();
       // #1282 — REFRESH DYNAMIC INPUT SLOTS after the write, on the node the write
       // landed on, inside the SAME synchronous stretch (no await since the fence, so
       // the press cannot interleave with a workflow switch or another command frame).
