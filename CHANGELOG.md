@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- fetch_image no longer sends `/view` through ComfyUI `api.fetchApi`, which prefixes `/api` so local media became `/api/view` and failed with `Failed to fetch` after headless ECONNREFUSED. `/view` uses origin-validated `fileURL` + same-origin fetch (and `Comfy-User` when the API object has a user). History / system_stats keep `fetchApi` so cloud auth headers and 401 remint stay intact (comfyui-mcp#2884)
+
 ## [0.15.177] - 2026-09-05
 
 ### Fixed
