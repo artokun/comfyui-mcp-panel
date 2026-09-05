@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
   strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
   `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash

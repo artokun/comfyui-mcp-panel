@@ -154,12 +154,12 @@ function childValue(node, name) {
   return node.widgets.find((widget) => widget.name === name)?.value;
 }
 
-test("#2031 unfixed shape: FLOAT child write is accepted and readable, then lost at serialize", async () => {
+test("#2031 unfixed shape: a direct FLOAT child assign is readable, then lost at native serialize", () => {
   const { node, nativeGraphToPrompt } = makeUpscalerNode();
   assert.equal(childValue(node, "mode.scale"), 2);
 
-  const result = await runSetWidget(node, "mode.scale", 1.5, widgetOpts());
-  assert.equal(result.set.value, 1.5);
+  const child = node.widgets.find((widget) => widget.name === "mode.scale");
+  child.value = 1.5;
   assert.equal(childValue(node, "mode.scale"), 1.5, "query-style readback confirms the write");
 
   const queued = nativeGraphToPrompt();
@@ -167,6 +167,22 @@ test("#2031 unfixed shape: FLOAT child write is accepted and readable, then lost
     queued.output[186].inputs["mode.scale"],
     2,
     "native serialize rebuilds the combo from spec defaults and drops the FLOAT write",
+  );
+});
+
+test("#2031 a same-value parent flush after set_widget keeps the FLOAT child without waiting for graphToPrompt", async () => {
+  const { node } = makeUpscalerNode();
+
+  const result = await runSetWidget(node, "mode.scale", 1.5, widgetOpts());
+  assert.equal(result.set.value, 1.5);
+  assert.equal(childValue(node, "mode.scale"), 1.5);
+
+  const root = node.widgets.find((widget) => widget.name === "mode");
+  root.value = root.value;
+  assert.equal(
+    childValue(node, "mode.scale"),
+    1.5,
+    "Vue/widget-store flush after set must not revert the child before query_graph",
   );
 });
 
