@@ -173,11 +173,15 @@ test("#2252 a version mismatch is queued:false stale_bundle with a Ctrl+Shift+R 
 test("#2252 SHIPPED refuseStaleBundleRun maps the installed-pack probe onto a run refusal", async () => {
   const refreshBody = extractFunction("async function refuseStaleBundleRefresh(");
   const runBody = extractFunction("async function refuseStaleBundleRun(");
+  assert.doesNotMatch(
+    runBody,
+    /describeStaleBundleRun/,
+    "the root must map the refresh verdict itself — a static new export breaks mixed cache",
+  );
   const factory = new Function(
     "api",
     "PANEL_VERSION",
     "describeStaleBundleRefresh",
-    "describeStaleBundleRun",
     `${refreshBody}; ${runBody}; return refuseStaleBundleRun;`,
   );
   let versionRoute = 0;
@@ -192,7 +196,6 @@ test("#2252 SHIPPED refuseStaleBundleRun maps the installed-pack probe onto a ru
     },
     "0.15.173",
     describeStaleBundleRefresh,
-    describeStaleBundleRun,
   )();
   assert.equal(versionRoute, 1);
   assert.equal(stale.queued, false);
@@ -207,7 +210,6 @@ test("#2252 SHIPPED refuseStaleBundleRun maps the installed-pack probe onto a ru
     { fetchApi: async () => ({ ok: true, json: async () => ({ version: "0.15.174" }) }) },
     "0.15.174",
     describeStaleBundleRefresh,
-    describeStaleBundleRun,
   )();
   assert.equal(current, null, "equal versions fail open into the run");
 
@@ -215,9 +217,18 @@ test("#2252 SHIPPED refuseStaleBundleRun maps the installed-pack probe onto a ru
     { fetchApi: async () => ({ ok: false }) },
     "0.15.173",
     describeStaleBundleRefresh,
-    describeStaleBundleRun,
   )();
   assert.equal(unknown, null, "an unreadable probe must not invent stale_bundle");
+});
+
+test("#2252 mixed-cache: a fresh root still links against an older node-def-refresh.js", () => {
+  const named = SRC.match(/import \{([^}]+)\} from "\.\/lib\/node-def-refresh\.js";/);
+  assert.ok(named, "node-def-refresh named import not found");
+  assert.doesNotMatch(
+    named[1],
+    /describeStaleBundleRun/,
+    "must not statically import a new child export the cached module may lack",
+  );
 });
 
 // ---------------------------------------------------------------------------

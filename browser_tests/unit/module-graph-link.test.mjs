@@ -37,6 +37,8 @@ import { sealProvenRootBinding } from "../../web/js/lib/graph-binding.js";
 import { composeShowMediaReply } from "../../web/js/lib/media-preview.js";
 import { composeRunCompletionFrame } from "../../web/js/lib/run-completion-frame.js";
 import { describeNodeDefRefresh, describeStaleBundleRefresh, describeStaleBundleRun } from "../../web/js/lib/node-def-refresh.js";
+// describeStaleBundleRun is a lib export for tests; the panel maps the refresh
+// verdict in-root so a mixed cache (new panel.js + old node-def-refresh.js) still links.
 import { confirmCanvasNavigation } from "../../web/js/lib/canvas-navigation.js";
 import {
   watchPostReconnectSettle,

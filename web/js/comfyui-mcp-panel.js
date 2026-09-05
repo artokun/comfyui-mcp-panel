@@ -342,7 +342,6 @@ import {
   NODE_DEF_REFRESH_REASONS,
   describeNodeDefRefresh,
   describeStaleBundleRefresh,
-  describeStaleBundleRun,
   describeRefreshGraphLoss,
   restoredLiveNodesNote,
 } from "./lib/node-def-refresh.js";
@@ -1813,11 +1812,29 @@ async function refuseStaleBundleRefresh() {
 /**
  * #2252 — same installed-pack probe as refuseStaleBundleRefresh, mapped onto a
  * panel_run refusal. A stale tab must not reach queuePrompt or dispatchScopedRun.
+ *
+ * Map the refresh verdict in this root module. A static import of
+ * describeStaleBundleRun would fail ESM linking if a fresh root met a cached
+ * older node-def-refresh.js that does not export it — the mixed-cache state
+ * this gate exists to handle.
  */
 async function refuseStaleBundleRun() {
   const stale = await refuseStaleBundleRefresh();
   if (!stale) return null;
-  return describeStaleBundleRun({ running: stale.running, installed: stale.installed });
+  const running = stale.running;
+  const installed = stale.installed;
+  const remedy =
+    `This tab is running panel ${running} while the installed pack is ${installed}. ` +
+    `Hard-refresh this tab (Ctrl+Shift+R) to load panel ${installed} before panel_run. ` +
+    `Nothing was queued.`;
+  return {
+    queued: false,
+    reason: stale.reason,
+    running,
+    installed,
+    remedy,
+    error: remedy,
+  };
 }
 
 async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
