@@ -41720,7 +41720,20 @@ function buildPanel() {
       const transportState = backendSocketTransportState({
         socketReadyState: comfyBackendSocketReadyState(),
       });
-      backendSocketState = comfyBackendSocketDown === true ? "down" : transportState;
+      // #2854 — the STICKY flag alone is not a down socket. #1325 established that
+      // `flaggedDown + readyState OPEN` is a stale or busy-poll signal: ComfyUI arms the
+      // flag from a failed `_pollQueue` during a long GPU-bound render, and `reconnected`
+      // never fires because the websocket never left OPEN, so the flag never clears.
+      // `comfyBackendIsDown()` applies that rule and every other panel_* path already
+      // uses it -- which is why reads and mutations kept working while panel_run alone
+      // refused for an hour. Reading the raw flag here re-introduced the exact hazard
+      // the helper exists to prevent.
+      //
+      // Strictness is unchanged in the directions that matter: flaggedDown with a
+      // non-OPEN or UNREADABLE readyState still yields "down" (fail closed, #646), and
+      // when the flag is clear this still defers to backendSocketTransportState, which
+      // refuses to call an absent readyState available.
+      backendSocketState = comfyBackendIsDown() ? "down" : transportState;
     } catch {}
     return {
       routeId,
