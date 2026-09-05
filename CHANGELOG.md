@@ -7,14 +7,18 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-
-- After an already-open panel_open_workflow applies last_open, panel_graph_outline / panel_query_graph refuse a leftover previous-tab or archived canvas when the live graph is smaller than the named file — failed switch repaint and another open tab matching the live root stay fail-closed; fixtures without leftover proof stay available (#1215)
 - the cross-repo contract comment now quotes comfyui-mcp accurately (#2511). It wrote `parts.join(NEWLINE)`; the real matcher is `parts.join("
 ")` and NEWLINE is not a symbol that exists there. A misquoted contract is worse than an unquoted one — anyone verifying it greps for something absent and concludes the contract moved. Found by the Copilot review on the PR
 - the fetch_comfyui_read allowlist rejection now has its wording pinned by a test. comfyui-mcp
   matches `/operation must be one of/i` on that message to fall back to reading the model list from
   `object_info` when `models/<category>` is unavailable (comfyui-mcp#2511); rewording it silently
   disabled that recovery, with no error raised in either repo. A reword now fails here instead.
+
+## [0.15.176] - 2026-09-05
+
+### Fixed
+
+- After an already-open panel_open_workflow applies last_open, panel_graph_outline / panel_query_graph refuse a leftover previous-tab or archived canvas when the live graph is smaller than the named file — failed switch repaint and another open tab matching the live root stay fail-closed; fixtures without leftover proof stay available (#1215, #2255)
 
 
 ## [0.15.175] - 2026-09-05
