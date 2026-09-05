@@ -69,6 +69,7 @@ import {
 // that export is renamed or dropped, the completion frame and every video preview stop
 // linking — and neither has a syntax error to catch it.
 import { withTimeout } from "../../web/js/lib/bounded-step.js";
+import { applyGraphNodeMode } from "../../web/js/lib/set-node-mode.js";
 
 test("panel ↔ bundle-version.js module edge links (#584/#611)", () => {
   assert.equal(typeof resolveBundleStaleness, "function");
@@ -133,6 +134,10 @@ test("panel ↔ disconnect-verify.js module edge links (#668)", () => {
   assert.equal(typeof snapshotGraphState, "function");
   assert.equal(typeof describeInputLink, "function");
   assert.equal(typeof verifyDisconnect, "function");
+});
+
+test("panel ↔ set-node-mode.js module edge links (#2262)", () => {
+  assert.equal(typeof applyGraphNodeMode, "function");
 });
 
 test("panel ↔ settle-open-active.js tmp: reconnect edges link (#2022)", () => {

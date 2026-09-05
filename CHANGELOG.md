@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_set_node_mode on an rgthree Mute / Bypass Repeater (and a node that repeater owns) now stamps the repeater and its live targets together and refuses unless a fresh read of those modes matches, so a bypass receipt cannot disagree with panel_graph_outline still showing mute (#2262)
+
 ## [0.15.178] - 2026-09-05
 
 ### Fixed
