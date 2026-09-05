@@ -1809,6 +1809,34 @@ async function refuseStaleBundleRefresh() {
   }
 }
 
+/**
+ * #2252 — same installed-pack probe as refuseStaleBundleRefresh, mapped onto a
+ * panel_run refusal. A stale tab must not reach queuePrompt or dispatchScopedRun.
+ *
+ * Map the refresh verdict in this root module. A static import of
+ * describeStaleBundleRun would fail ESM linking if a fresh root met a cached
+ * older node-def-refresh.js that does not export it — the mixed-cache state
+ * this gate exists to handle.
+ */
+async function refuseStaleBundleRun() {
+  const stale = await refuseStaleBundleRefresh();
+  if (!stale) return null;
+  const running = stale.running;
+  const installed = stale.installed;
+  const remedy =
+    `This tab is running panel ${running} while the installed pack is ${installed}. ` +
+    `Hard-refresh this tab (Ctrl+Shift+R) to load panel ${installed} before panel_run. ` +
+    `Nothing was queued.`;
+  return {
+    queued: false,
+    reason: stale.reason,
+    running,
+    installed,
+    remedy,
+    error: remedy,
+  };
+}
+
 async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
   // Trust the live combos for suppressing missing-asset candidates ONLY once they have
   // ACTUALLY BEEN REBUILT from an authoritative payload this run obtained. Two things can
@@ -20103,6 +20131,13 @@ const GRAPH_TOOL_EXECUTORS = {
         targetId,
       });
     };
+    // #2252 — a stale live bundle must not accept a run. 0.15.173 vs installed
+    // 0.15.174 silently dropped dispatch (queued_unknown, no prompt_id, ComfyUI
+    // never logged got prompt). Refuse with a hard-refresh requirement BEFORE
+    // the panel_run hold, prompt construction, queuePrompt, or scoped dispatch.
+    // An unreadable version probe fails open (same rule as #2027).
+    const staleBundle = await refuseStaleBundleRun();
+    if (staleBundle) return staleBundle;
     // Mark the dispatch before queuePrompt can produce a fast execution_success.
     // The tracker holds that completion until the delayed /prompt response gives
     // it a prompt-scoped key, then replays the exact batch keyed.
