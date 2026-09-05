@@ -87,6 +87,24 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
   return activeWorkflowNodeCount(activeWorkflow) > 0;
 }
 
+function workflowLoadedFileNodeCount(activeWorkflow) {
+  try {
+    const raw = activeWorkflow?.originalContent;
+    if (typeof raw !== "string" || !raw) return 0;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed?.nodes) ? parsed.nodes.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function leftoverArchivedCanvasAgainstOpenFile({ liveNodeCount, activeWorkflow }) {
+  if (activeWorkflow?.isModified === true) return false;
+  const fileCount = workflowLoadedFileNodeCount(activeWorkflow);
+  if (!(fileCount > 0)) return false;
+  return Number(liveNodeCount) < fileCount;
+}
+
 /**
  * #1215 recurrence — after a tab switch the ACTIVE pointer (and the session
  * fence) can already name the new workflow while the live root is still the
@@ -95,12 +113,19 @@ export function graphReadDesynced({ liveNodeCount, activeWorkflow, inSubgraph = 
  *
  * Missing current state alone is NOT leftover evidence. Extracted graph_query
  * fixtures, a first observation, and #618's unreadable tracker all look like
- * "live nodes + no activeState" and must fail OPEN. Refuse only when that
- * unreadable active state is paired with switch/open leftover proof:
+ * "live nodes + no activeState" and must fail OPEN. Refuse when last-open
+ * leftover proof is present:
  *   - `switchRepaintUnproven`: this session's last open moved the pointer and
- *     could not prove the canvas rebound (the safe-repaint failure);
- *   - or another still-open workflow's current state AGREES with the live
- *     root, so the mounted graph is that previous tab's, not the named one.
+ *     could not prove the canvas rebound (the safe-repaint failure). A TARGET
+ *     tracker that still serializes is not an exception — that is the poisoned
+ *     already-open tab;
+ *   - another still-open workflow's current state AGREES with the live root
+ *     while THIS tab has no comparable current state, so the mounted graph is
+ *     that previous tab's, not the named one;
+ *   - or a CLEAN already-open tab whose loaded file (`originalContent`) is
+ *     LARGER than the live canvas: the tracker can agree with a leftover
+ *     4-node archive while last-open names the 69-node file. Dirty tabs fail
+ *     OPEN (a user can delete nodes). Missing/unreadable file bytes fail OPEN.
  *
  * A well-formed empty `nodes: []` is the shape guard's job. A TARGET uuid on
  * the leftover canvas is not an exception (#1639). `panel_set_workflow_target`
@@ -117,8 +142,9 @@ export function graphRootUnprovenAgainstActiveState({
   if (inSubgraph) return false;
   if (!activeWorkflow) return false;
   if (!(Number(liveNodeCount) > 0)) return false;
-  if (activeWorkflowCurrentState(activeWorkflow) != null) return false;
   if (switchRepaintUnproven === true) return true;
+  if (leftoverArchivedCanvasAgainstOpenFile({ liveNodeCount, activeWorkflow })) return true;
+  if (activeWorkflowCurrentState(activeWorkflow) != null) return false;
   if (!rootGraph || !Array.isArray(others)) return false;
   for (const other of others) {
     if (!other) continue;
