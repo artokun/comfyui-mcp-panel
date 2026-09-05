@@ -1,3 +1,4 @@
+import { isDynamicWidgetMissingError, wrapGraphDynamicComboSetters } from "./dynamic-widget-reconcile.js";
 
 // #1854 — the intrinsic captured ONCE at module load. Invoking through a
 // per-call property lookup on the function object would read an overrideable
@@ -85,9 +86,31 @@ function captureLiveState(records) {
   return live;
 }
 
-function restoreState(records, key) {
+/**
+ * Write each captured value back onto its widget.
+ *
+ * EXPORTED as a test seam (#2033). The catch below is narrow on purpose, and that
+ * narrowness was unpinned: replacing the condition with a blanket swallow left the
+ * whole panel suite green. It is not reachable through the queue path while a test
+ * is asserting — measured with a call counter, `restoreState` has still not run at
+ * the end of the barrier test's body, even after a tick — so a test written against
+ * that path pins the catch only by accident. This function is pure over its
+ * `{widget, snapshot|value}` records and needs no queue plumbing, so driving it
+ * directly is what actually reaches the catch, in both directions.
+ *
+ * @param {Array<{widget: {value: unknown}}> | null | undefined} records
+ * @param {"snapshot" | "value"} key
+ */
+export function restoreState(records, key) {
   for (const record of records ?? []) {
-    record.widget.value = copyStoredValue(record[key]);
+    try {
+      record.widget.value = copyStoredValue(record[key]);
+    } catch (error) {
+      // #2033 — restoring a captured DynamicCombo parent rebuilds dotted children
+      // and leaves the captured child widget detached. The live replacement already
+      // carries the restored option; rethrow anything that is not that throw.
+      if (!isDynamicWidgetMissingError(error)) throw error;
+    }
   }
 }
 
@@ -135,6 +158,11 @@ function prepareEntry(state, entry) {
     return;
   }
   entry.liveState = live;
+  try {
+    wrapGraphDynamicComboSetters(state.app?.rootGraph ?? state.app?.graph);
+  } catch {
+    // Sealing is best-effort; restore still has to run.
+  }
   restoreState(entry.graphState.records, "snapshot");
 }
 

@@ -54,6 +54,32 @@ function storeCleanupAlias(dynamicRoot, widgetId, index) {
   };
 }
 
+/**
+ * #2033 vs the relocation replay — does this root still carry rows that only the
+ * NATIVE rebuild can remove?
+ *
+ * `reconcileFreshDynamicWidgets` renames an orphan to `<root>.__cmcp_stale_N` and
+ * pushes a `<root>.__cmcp_store_cleanup_N` alias, then replays the root so
+ * LiteGraph's own setter deletes both. That replay is a SAME-VALUE write
+ * (`const v = widget.value; widget.value = v;`), which is exactly what the #2033
+ * short-circuit swallows — and it swallows it precisely when the root is healthy
+ * (`preserved.size` nonzero), i.e. the common case. The stale row and its store
+ * alias then stay attached.
+ *
+ * So the short-circuit must stand down while cleanup is pending. Once the replay
+ * has removed these rows the predicate is false again and #2033's protection
+ * returns, which is why this asks about the CURRENT widget list rather than
+ * latching a flag.
+ */
+function hasPendingCleanupRows(node, dynamicRoot) {
+  const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+  const stale = `${dynamicRoot}.__cmcp_stale_`;
+  const cleanup = `${dynamicRoot}.__cmcp_store_cleanup_`;
+  return widgets.some(
+    (w) => typeof w?.name === "string" && (w.name.startsWith(stale) || w.name.startsWith(cleanup)),
+  );
+}
+
 function isDynamicComboSpec(spec) {
   return Array.isArray(spec) && spec[0] === DYNAMIC_COMBO_V3;
 }
@@ -226,37 +252,53 @@ function valueDescriptor(widget) {
  * so a confirmed `mode.scale` write is rebuilt from `default: 2` after
  * panel_query_graph already showed 1.5.
  *
- * Wrap the setter so a SAME-VALUE assignment restores the live children.
- * Changing the selected option still rebuilds from the new option's spec.
+ * Wrap the setter so a SAME-VALUE assignment keeps live children (no rebuild)
+ * and a stripped root still rebuilds. Changing the selected option still
+ * rebuilds from the new option's spec.
  */
 function wrapDynamicComboSetter(node, widget) {
-  if (!widget || widget[DYNAMIC_COMBO_PRESERVE_CHILDREN]) return;
+  if (!widget) return;
   const desc = valueDescriptor(widget);
   if (!desc || typeof desc.set !== "function") return;
+  // Mark the SETTER, not the widget. After reconnect the first serialize can
+  // replace a store-backed accessor with native DynamicCombo `updateWidgets`;
+  // a widget-level flag would skip resealing that new setter (#2033).
+  if (desc.set[DYNAMIC_COMBO_PRESERVE_CHILDREN]) return;
   const origSet = desc.set;
   const origGet = typeof desc.get === "function" ? desc.get : null;
+  const set = function preserveDynamicComboChildren(next) {
+    let previous;
+    try {
+      previous = origGet ? origGet.call(this) : undefined;
+    } catch {
+      previous = undefined;
+    }
+    const preserved = capturePrefixedValues(node, widget.name);
+    // #2033 — a same-value write whose dotted children are already live must not
+    // run the native rebuild. That rebuild replaces the child widgets, so a later
+    // queue-time snapshot restore still holding the captured child throws
+    // `Dynamic widget doesn't exist on node`. A stripped root (preserved empty)
+    // still needs the rebuild — that is the #2140 rescue.
+    // ...unless this root still carries relocation/cleanup rows. Those are removed
+    // ONLY by the native rebuild, and the reconcile replay that triggers it is a
+    // same-value write — so short-circuiting here left the residue attached.
+    if (previous === next && preserved.size && !hasPendingCleanupRows(node, widget.name)) return;
+    origSet.call(this, next);
+    if (previous === next) restorePrefixedValues(node, preserved);
+  };
+  set[DYNAMIC_COMBO_PRESERVE_CHILDREN] = true;
   Object.defineProperty(widget, "value", {
     configurable: true,
     enumerable: desc.enumerable !== false,
     get() {
       return origGet ? origGet.call(this) : undefined;
     },
-    set(next) {
-      let previous;
-      try {
-        previous = origGet ? origGet.call(this) : undefined;
-      } catch {
-        previous = undefined;
-      }
-      const preserved = capturePrefixedValues(node, widget.name);
-      origSet.call(this, next);
-      if (previous === next) restorePrefixedValues(node, preserved);
-    },
+    set,
   });
-  widget[DYNAMIC_COMBO_PRESERVE_CHILDREN] = true;
 }
 
-function wrapGraphDynamicComboSetters(graph) {
+/** Seal live DynamicCombo value setters across `graph` and nested subgraphs. */
+export function wrapGraphDynamicComboSetters(graph) {
   for (const node of graphNodes(graph)) {
     try {
       const required = nodeDef(node)?.input?.required;
@@ -840,6 +882,17 @@ function prepareLiveDynamicWidgets(graph) {
   }
 }
 
+function sealLiveDynamicComboSetters(graph) {
+  try {
+    // #2033 — native graphToPrompt can INSTALL DynamicCombo accessors on the first
+    // serialize after reconnect. Wrapping only before that call leaves those new
+    // setters unsealed, and queue-time snapshot restore then detaches children.
+    wrapGraphDynamicComboSetters(graph);
+  } catch {
+    // Best-effort: a hostile node must not block serialization.
+  }
+}
+
 function retryLiveDynamicWidgets(graph) {
   try {
     resyncLivePrimitiveWidgets(graph);
@@ -881,12 +934,16 @@ export function installGraphToPromptDynamicReconcile(app) {
         const retried = orig(graph, ...rest);
         if (retried && typeof retried.then === "function") {
           return Promise.resolve(retried).then(
-            (value) => value,
+            (value) => {
+              sealLiveDynamicComboSetters(target);
+              return value;
+            },
             (retryError) => {
               throw namedDynamicWidgetError(retryError, target);
             },
           );
         }
+        sealLiveDynamicComboSetters(target);
         return retried;
       } catch (retryError) {
         throw namedDynamicWidgetError(retryError, target);
@@ -895,8 +952,12 @@ export function installGraphToPromptDynamicReconcile(app) {
     try {
       const result = orig(graph, ...rest);
       if (result && typeof result.then === "function") {
-        return Promise.resolve(result).then((value) => value, retry);
+        return Promise.resolve(result).then((value) => {
+          sealLiveDynamicComboSetters(target);
+          return value;
+        }, retry);
       }
+      sealLiveDynamicComboSetters(target);
       return result;
     } catch (error) {
       return retry(error);
