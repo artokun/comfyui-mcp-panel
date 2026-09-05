@@ -20,6 +20,14 @@
 //          unresolvedWildcardPairReason replaces the computed
 //          "no input accepts type *" tail and tells the caller to land a
 //          concrete typed producer first.
+//   #2266 — to_input "ref_image_0" on MiniMaxH3ReferenceToVideo is the
+//          Autogrow DISPLAY alias of the dotted slot "ref_images.ref_image_0".
+//          A name-miss used to fall through to type-name matching, find zero
+//          slots typed "ref_image_0", and throw "no input accepts type IMAGE"
+//          while the listing already showed the IMAGE slot. Resolve a unique
+//          display alias (label / localized_name / dotted suffix) BEFORE the
+//          type-name pass; an ambiguous alias is refused with the internal
+//          names rather than guessed.
 
 export const SLOT_RANK_EXACT = 2;
 export const SLOT_RANK_WILD = 1;
@@ -130,8 +138,12 @@ function asIndexToken(ref) {
 export function slotDiagnostic(origin, target, requested = {}) {
   const refLabel = (ref) =>
     ref == null ? "auto" : typeof ref === "string" ? `"${ref}"` : String(ref);
+  const formatSlotName = (slot) => {
+    const alias = slotDisplayAlias(slot);
+    return alias ? `"${slot?.name ?? ""}" as "${alias}"` : `"${slot?.name ?? ""}"`;
+  };
   const outs = (origin.outputs ?? [])
-    .map((o, i) => `[${i}] "${o?.name ?? ""}" (${renderSlotType(o?.type)})`)
+    .map((o, i) => `[${i}] ${formatSlotName(o)} (${renderSlotType(o?.type)})`)
     .join(", ");
   const ins = (target.inputs ?? [])
     .map((inp, i) => {
@@ -139,7 +151,7 @@ export function slotDiagnostic(origin, target, requested = {}) {
         ? `${baseSlotType(inp?.type)}/widget`
         : renderSlotType(inp?.type);
       const connected = inp?.link != null ? " [connected]" : "";
-      return `[${i}] "${inp?.name ?? ""}" (${typeStr})${connected}`;
+      return `[${i}] ${formatSlotName(inp)} (${typeStr})${connected}`;
     })
     .join(", ");
 
@@ -240,11 +252,87 @@ export function unresolvedWildcardPairReason(origin, target, outIdx, inIdx) {
   );
 }
 
+/** Distinct display alias a slot carries, or null.
+ *  Order: `label`, then `localized_name`, then the suffix after the last `.`
+ *  on a dotted Autogrow name (`ref_images.ref_image_0` → `ref_image_0`).
+ *  A token identical to the programmatic name is not an alias. */
+export function slotDisplayAlias(slot) {
+  const name = typeof slot?.name === "string" ? slot.name.trim() : "";
+  const candidates = [slot?.label, slot?.localized_name];
+  if (name.includes(".")) candidates.push(name.slice(name.lastIndexOf(".") + 1));
+  for (const raw of candidates) {
+    if (typeof raw !== "string") continue;
+    const token = raw.trim();
+    if (token && token !== name) return token;
+  }
+  return null;
+}
+
+/** Lowercased distinct aliases a slot can be addressed by (not including `name`). */
+function slotAliasTokens(slot) {
+  const tokens = [];
+  const seen = new Set();
+  const add = (raw) => {
+    if (typeof raw !== "string") return;
+    const token = raw.trim().toLowerCase();
+    if (!token || seen.has(token)) return;
+    seen.add(token);
+    tokens.push(token);
+  };
+  const name = typeof slot?.name === "string" ? slot.name.trim() : "";
+  add(slot?.label);
+  add(slot?.localized_name);
+  if (name.includes(".")) add(name.slice(name.lastIndexOf(".") + 1));
+  // The programmatic name is already handled by the exact-name pass; drop it
+  // so a redundant `label === name` cannot double-count this slot as an alias.
+  const nameLower = name.toLowerCase();
+  return tokens.filter((t) => t !== nameLower);
+}
+
+/** Resolve `ref` against unique display aliases. Returns { index },
+ *  { error: "ambiguous", names } when several slots share it, or null when
+ *  none do. Called only after an exact NAME miss. */
+function resolveDisplayAliasSlot(slots, ref) {
+  if (ref == null || typeof ref === "number") return null;
+  const want = String(ref).trim().toLowerCase();
+  if (!want) return null;
+  const list = slots ?? [];
+  const hits = [];
+  list.forEach((s, i) => {
+    if (slotAliasTokens(s).includes(want)) hits.push(i);
+  });
+  if (hits.length === 1) return { index: hits[0] };
+  if (hits.length > 1) {
+    const names = hits.map((i) => list[i]?.name).filter(Boolean);
+    return { error: "ambiguous", names };
+  }
+  return null;
+}
+
+function unresolvedNameReason(slots, ref, side) {
+  const list = slots ?? [];
+  const names = list.map((s) => s?.name).filter(Boolean);
+  const aliasHints = [];
+  for (const s of list) {
+    const alias = slotDisplayAlias(s);
+    if (alias && s?.name) aliasHints.push(`"${alias}" → ${s.name}`);
+  }
+  return (
+    `No ${side} named "${ref}"` +
+    (aliasHints.length ? `; display aliases: ${aliasHints.join(", ")}` : "") +
+    `. Use a slot name or index` +
+    (names.length ? ` (available: ${names.join(", ")})` : "") +
+    "."
+  );
+}
+
 /** Resolve one explicit slot ref to an index, or null when omitted (auto).
  *  A bare integer token (real number OR numeric string such as "0") is an INDEX
  *  and is range-checked; any other string is a case-insensitive/trimmed NAME
- *  lookup with NO silent fallback. Returns
- *  { index } | { error: "range"|"name" } | null (omitted). */
+ *  lookup with NO silent fallback. A unique display alias (label /
+ *  localized_name / Autogrow dotted suffix) is accepted after a name miss and
+ *  the numeric-string index fallback (#2266). Returns
+ *  { index } | { error: "range"|"name"|"ambiguous", names? } | null (omitted). */
 export function resolveExplicitSlot(slots, ref) {
   if (ref == null) return null;
   const list = slots ?? [];
@@ -268,6 +356,10 @@ export function resolveExplicitSlot(slots, ref) {
     if (idxToken < 0 || idxToken >= list.length) return { error: "range" };
     return { index: idxToken };
   }
+  // #2266: unique display alias AFTER name and numeric-index, BEFORE the type-name
+  // pass in autoMatchSlots, so "ref_image_0" is not read as a TYPE.
+  const byAlias = resolveDisplayAliasSlot(list, ref);
+  if (byAlias) return byAlias;
   return { error: "name" };
 }
 
@@ -324,7 +416,17 @@ export function typeMatchedIndices(slots, ref) {
 function resolveTypeRef(slots, ref, origin, target, requested, side) {
   const ti = typeMatchedIndices(slots, ref);
   if (ti.length === 1) return { index: ti[0] };
-  if (ti.length === 0) throw new Error(slotDiagnostic(origin, target, requested));
+  if (ti.length === 0) {
+    // #2266 — a leftover NAME miss is not a type incompatibility. The computed
+    // "no input accepts type IMAGE" tail is what made `to_input:"ref_image_0"`
+    // look like the IMAGE autogrow slot was missing when it was listed.
+    throw new Error(
+      slotDiagnostic(origin, target, {
+        ...requested,
+        reason: unresolvedNameReason(slots, ref, side),
+      }),
+    );
+  }
   const names = ti.map((i) => slots[i]?.name).filter(Boolean);
   const reason =
     `ambiguous: ${ti.length} ${renderSlotType(slots[ti[0]]?.type)} ${side}s` +
@@ -348,6 +450,20 @@ export function autoMatchSlots(origin, target, fromRef, toRef) {
     throw new Error(`output slot index ${fromRef} out of range (node has ${outputs.length})`);
   if (inp?.error === "range")
     throw new Error(`input slot index ${toRef} out of range (node has ${inputs.length})`);
+  if (out?.error === "ambiguous") {
+    const names = out.names ?? [];
+    const reason =
+      `ambiguous: ${names.length} outputs share display alias "${fromRef}"` +
+      `${names.length ? ` (${names.join(", ")})` : ""} — name one by slot name or index`;
+    throw new Error(slotDiagnostic(origin, target, { ...requested, reason }));
+  }
+  if (inp?.error === "ambiguous") {
+    const names = inp.names ?? [];
+    const reason =
+      `ambiguous: ${names.length} inputs share display alias "${toRef}"` +
+      `${names.length ? ` (${names.join(", ")})` : ""} — name one by slot name or index`;
+    throw new Error(slotDiagnostic(origin, target, { ...requested, reason }));
+  }
 
   // #406: a string ref that matched no slot NAME may instead name a slot's TYPE —
   // the caller addressed the port by its displayed type ("IMAGE") rather than its

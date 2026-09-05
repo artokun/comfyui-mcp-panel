@@ -26,6 +26,7 @@ import {
   isTypeCompatible,
   isWildcardSlotType,
   slotDiagnostic,
+  slotDisplayAlias,
   loopbackRefusalReason,
   unresolvedWildcardPairReason,
 } from "../../web/js/lib/connect-match.js";
@@ -507,4 +508,123 @@ test("#2028: with the reason override the diagnostic KEEPS the slot listing but 
   assert.doesNotMatch(msg, /No input on node 790 accepts type/);
   assert.match(msg, /unresolved wildcard-to-wildcard/);
   assert.match(msg, /INTConstant/);
+});
+
+// ---- #2266: Autogrow display-label alias resolves before type matching ------
+//
+// Reported: panel_connect IMAGE → MiniMaxH3ReferenceToVideo with
+// to_input "ref_image_0" (the canvas display label) was refused with
+// "No input on node N accepts type IMAGE" while the listing showed
+// [n] "ref_images.ref_image_0" (IMAGE). The full internal name worked.
+// A name-miss fell through to type-name matching, found zero slots typed
+// "ref_image_0", and blamed the origin IMAGE type. Unique display aliases
+// (label / localized_name / dotted suffix) now resolve first.
+
+function loadImageNode() {
+  return { id: 7, type: "LoadImage", outputs: [{ name: "IMAGE", type: "IMAGE" }] };
+}
+
+function miniMaxH3RefNode(extra = {}) {
+  return {
+    id: 12,
+    type: "MiniMaxH3ReferenceToVideo",
+    inputs: [
+      { name: "clip", type: "CLIP", link: null },
+      { name: "prompt", type: "STRING", link: null },
+      { name: "ref_images.ref_image_0", type: "IMAGE", link: null, ...extra },
+      { name: "ref_images.ref_image_1", type: "IMAGE", link: null },
+      { name: "ref_videos.ref_video_0", type: "IMAGE", link: null },
+    ],
+  };
+}
+
+test("#2266: slotDisplayAlias prefers label, then localized_name, then dotted suffix", () => {
+  assert.equal(
+    slotDisplayAlias({ name: "ref_images.ref_image_0", label: "first ref" }),
+    "first ref",
+  );
+  assert.equal(
+    slotDisplayAlias({ name: "ref_images.ref_image_0", localized_name: "ref_image_0" }),
+    "ref_image_0",
+  );
+  assert.equal(slotDisplayAlias({ name: "ref_images.ref_image_0" }), "ref_image_0");
+  assert.equal(slotDisplayAlias({ name: "prompt" }), null);
+  assert.equal(slotDisplayAlias({ name: "seed", label: "seed" }), null);
+});
+
+test("#2266: resolveExplicitSlot matches the Autogrow dotted suffix as a unique alias", () => {
+  const inputs = miniMaxH3RefNode().inputs;
+  assert.deepEqual(resolveExplicitSlot(inputs, "ref_image_0"), { index: 2 });
+  assert.deepEqual(resolveExplicitSlot(inputs, "ref_images.ref_image_0"), { index: 2 });
+  assert.deepEqual(resolveExplicitSlot(inputs, "ref_video_0"), { index: 4 });
+});
+
+test("#2266: a slot.label unique on the node is an address", () => {
+  const inputs = miniMaxH3RefNode({ label: "hero" }).inputs;
+  assert.deepEqual(resolveExplicitSlot(inputs, "hero"), { index: 2 });
+});
+
+test("#2266: localized_name unique on the node is an address", () => {
+  const inputs = miniMaxH3RefNode({ localized_name: "picture 1" }).inputs;
+  assert.deepEqual(resolveExplicitSlot(inputs, "picture 1"), { index: 2 });
+});
+
+test("#2266: the reported call (IMAGE → to_input ref_image_0) now connects", () => {
+  const m = autoMatchSlots(loadImageNode(), miniMaxH3RefNode(), "IMAGE", "ref_image_0");
+  assert.equal(m.outIdx, 0);
+  assert.equal(m.inIdx, 2);
+  assert.deepEqual(m.autoMatched, []);
+});
+
+test("#2266: the full dotted internal name still connects", () => {
+  const m = autoMatchSlots(loadImageNode(), miniMaxH3RefNode(), "IMAGE", "ref_images.ref_image_0");
+  assert.equal(m.inIdx, 2);
+});
+
+test("#2266: an exact NAME still outranks a sibling's display alias of the same token", () => {
+  const target = {
+    id: 2,
+    inputs: [
+      { name: "ref_image_0", type: "MASK", link: null },
+      { name: "ref_images.ref_image_0", type: "IMAGE", link: null },
+    ],
+  };
+  assert.deepEqual(resolveExplicitSlot(target.inputs, "ref_image_0"), { index: 0 });
+});
+
+test("#2266: two slots sharing a display alias are refused, not guessed", () => {
+  const origin = loadImageNode();
+  const target = {
+    id: 2,
+    type: "T",
+    inputs: [
+      { name: "a.foo", type: "IMAGE", link: null },
+      { name: "b.foo", type: "IMAGE", link: null },
+    ],
+  };
+  assert.throws(
+    () => autoMatchSlots(origin, target, "IMAGE", "foo"),
+    /ambiguous.*display alias "foo".*a\.foo.*b\.foo/is,
+  );
+});
+
+test("#2266: a leftover name miss no longer claims the IMAGE slot is missing", () => {
+  assert.throws(
+    () => autoMatchSlots(loadImageNode(), miniMaxH3RefNode(), "IMAGE", "ref_image_99"),
+    (err) => {
+      const msg = String(err?.message ?? err);
+      assert.match(msg, /No input named "ref_image_99"/);
+      assert.match(msg, /ref_images\.ref_image_0/);
+      assert.doesNotMatch(msg, /No input on node 12 accepts type IMAGE/);
+      return true;
+    },
+  );
+});
+
+test("#2266: slotDiagnostic lists the Autogrow display alias next to the internal name", () => {
+  const msg = slotDiagnostic(loadImageNode(), miniMaxH3RefNode(), {
+    from_output: "IMAGE",
+    to_input: "ref_image_99",
+  });
+  assert.match(msg, /"ref_images\.ref_image_0" as "ref_image_0"/);
 });
