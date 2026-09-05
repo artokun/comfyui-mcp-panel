@@ -99,6 +99,7 @@ import {
   compareRunDispatchIdentity,
   downgradeUnstableRunResult,
 } from "../../web/js/lib/run-dispatch-identity.js";
+import { describeStaleBundleRun } from "../../web/js/lib/node-def-refresh.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -709,7 +710,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef, runDispatchIdentityRef, resolveRunToNodeTargetRef }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef, runDispatchIdentityRef, resolveRunToNodeTargetRef, refuseStaleBundleRun }) {
   const seen = { dispatchArgs: null };
   const localRunToken = Symbol("test local graph run");
   const deps = {
@@ -795,6 +796,8 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
         targetId,
       })),
     panelRunOwnerRef: panelRunOwnerRef ?? { current: {} },
+    // #2252 — fail-open default so budget/dispatch tests still exercise a current bundle.
+    refuseStaleBundleRun: refuseStaleBundleRun ?? (async () => null),
   };
   const names = Object.keys(deps);
   const factory = new Function(
@@ -2964,6 +2967,116 @@ test("#1861: a scoped batch with repeating controls attaches the note to partial
 
     // Verify the note mentions the control widget we added
     assert.match(String(res.repeating_controls_note), /randomize/, "note should mention the randomize mode");
+  } finally {
+    stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #2252 — a stale live bundle must refuse panel_run BEFORE dispatch.
+// Unfixed: graph_run accepted the request and dispatch returned queued_unknown
+// with no prompt_id; ComfyUI never logged got prompt. Fixed: hard-refresh
+// refusal, no queuePrompt, no dispatchScopedRun, no pending item.
+// ---------------------------------------------------------------------------
+
+function stale173vs174() {
+  return describeStaleBundleRun({ running: "0.15.173", installed: "0.15.174" });
+}
+
+test("#2252 UNFIXED silent drop: without the stale-bundle gate, scoped graph_run still reaches dispatch", async () => {
+  const gateAt = runMatch[0].indexOf("refuseStaleBundleRun");
+  const dispatchAt = runMatch[0].indexOf("dispatchScopedRun");
+  const beginAt = runMatch[0].indexOf("beginPanelRun");
+  assert.notEqual(dispatchAt, -1, "shipped graph_run still dispatches scoped runs");
+  assert.notEqual(beginAt, -1, "shipped graph_run still marks beginPanelRun");
+  // Characterise the defect: if the gate is missing, dispatch is reachable while stale.
+  // The SHIPPED body must place the probe before either effect.
+  assert.notEqual(gateAt, -1, "unfixed graph_run accepted a stale tab and dropped dispatch silently");
+  assert.ok(gateAt < dispatchAt, "stale-bundle refusal must run before dispatchScopedRun");
+  assert.ok(gateAt < beginAt, "stale-bundle refusal must run before beginPanelRun");
+});
+
+test("#2252 SHIPPED: stale 0.15.173 vs installed 0.15.174 refuses scoped and full panel_run before dispatch", async () => {
+  const stop = keepAlive();
+  try {
+    const stale = stale173vs174();
+    let dispatched = 0;
+    let begun = 0;
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, drainMs: 5 });
+    app.graph = { _nodes: [] };
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 2000,
+      serializeMs: 500,
+      dispatch: () => {
+        dispatched += 1;
+        return {
+          outcome: "unverified",
+          queueMark: 1,
+          verified: 0,
+          error: "frontend deferred or silently dropped the request",
+        };
+      },
+      runCompletionRef: {
+        beginPanelRun() {
+          begun += 1;
+          return Symbol("run");
+        },
+        endPanelRun() {},
+        onQueued() {},
+      },
+      refuseStaleBundleRun: async () => stale,
+    });
+
+    const scoped = await built.graph_run({ to_node_id: 9 });
+    assert.equal(scoped.queued, false, "a stale tab must not claim a queue");
+    assert.equal(scoped.queued_unknown, undefined, "must not report the silent-drop queued_unknown shape");
+    assert.equal(scoped.reason, "stale_bundle");
+    assert.equal(scoped.running, "0.15.173");
+    assert.equal(scoped.installed, "0.15.174");
+    assert.match(scoped.error, /Ctrl\+Shift\+R/);
+    assert.match(scoped.remedy, /Hard-refresh/);
+    assert.equal(dispatched, 0, "dispatchScopedRun must not run on a stale bundle");
+    assert.equal(begun, 0, "beginPanelRun must not arm on a stale bundle");
+    assert.equal(promptCallCount(apiTarget.fetchApi), 0, "nothing may POST /prompt");
+    assert.equal(app.queueItems.length, 0, "no pending queue item may be created");
+
+    const full = await built.graph_run({});
+    assert.equal(full.queued, false);
+    assert.equal(full.queued_unknown, undefined);
+    assert.equal(full.reason, "stale_bundle");
+    assert.equal(dispatched, 0);
+    assert.equal(begun, 0);
+    assert.equal(promptCallCount(apiTarget.fetchApi), 0);
+    assert.equal(app.queueItems.length, 0);
+  } finally {
+    stop();
+  }
+});
+
+test("#2252 SHIPPED: a current / unknown probe still reaches dispatch (fail-open)", async () => {
+  const stop = keepAlive();
+  try {
+    const apiTarget = { fetchApi: makeServer() };
+    const app = makeBusyDroppingFrontend({ apiTarget, drainMs: 5 });
+    app.graph = { _nodes: [] };
+    let dispatched = 0;
+    const built = realGraphRun({
+      app,
+      apiTarget,
+      budgetMs: 2000,
+      serializeMs: 500,
+      dispatch: () => {
+        dispatched += 1;
+        return { outcome: "dispatched", verified: 1, promptIds: ["p1"], queueMark: 1 };
+      },
+      refuseStaleBundleRun: async () => null,
+    });
+    const res = await built.graph_run({ to_node_id: 9 });
+    assert.equal(dispatched, 1, "a readable current/unknown probe must not block a run");
+    assert.notEqual(res.reason, "stale_bundle");
   } finally {
     stop();
   }
