@@ -7,6 +7,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+
+- panel_run refuses a stale live browser bundle with a Ctrl+Shift+R hard-refresh requirement instead of silently dropping dispatch; unverified scoped pending items are still removed fail-closed (#2252)
 - the link-id repair now reads the LEGACY link store too, so it applies on older LiteGraph builds (#2108). highestLinkId read only `_links`, the modern private Map; older builds expose the plain record as `links`, which the rest of the panel already handles (disconnect-verify, connect-verify). On those builds the helper returned null, so `adjusted` was false and the stale counter was never raised — the overwrite this fix exists to prevent survived it, silently, because "no links" and "no store" gave the same answer. Adds execution tests that mint an id after the repair and assert it is free, rather than only reading the bundle for call sites. Found by the Copilot review on the PR
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
@@ -40,6 +42,7 @@ All notable changes to this project are documented here. This project adheres to
   it. Inlined rather than shared, because those handlers are rebuilt by
   `new Function` harnesses that inject dependencies by name — a module-scope helper
   throws ReferenceError there, which the connect-throw-verdict suite caught.
+
 
 ## [0.15.174] - 2026-09-04
 
