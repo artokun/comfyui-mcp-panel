@@ -124,12 +124,15 @@ function pageOrigin() {
 }
 
 function resolveSameOriginUrl(api, path, expectedOrigin = pageOrigin()) {
-  if (typeof api?.apiURL !== "function") {
-    throw fetchImageError("api_unavailable", "fetch_image requires the panel API URL helper");
+  // ComfyUI's apiURL / fetchApi prefix /api. /view is not in that namespace —
+  // the same hole as /internal/logs/raw (see comfy-log.js). fileURL keeps the
+  // frontend base path without the API wrapper.
+  if (typeof api?.fileURL !== "function") {
+    throw fetchImageError("api_unavailable", "fetch_image requires the panel file URL helper");
   }
   let rawUrl;
   try {
-    rawUrl = api.apiURL(path);
+    rawUrl = api.fileURL.call(api, path);
   } catch (error) {
     throw fetchImageError("api_unavailable", `fetch_image could not resolve the /view URL: ${error?.message ?? error}`);
   }
@@ -301,9 +304,9 @@ function bytesToBase64(bytes) {
  * Fetch a ComfyUI file reference for MCP get_image.
  *
  * `args` may be the bridge command frame (transport fields are ignored after
- * validation) or a direct file reference in unit tests. The panel API helper
- * remains the preferred transport so its normal base-path and credentials
- * behavior is preserved; the raw fetch fallback is only for minimal hosts.
+ * validation) or a direct file reference in unit tests. Transport is
+ * origin-validated `fileURL` + same-origin fetch. `api.fetchApi` is never used:
+ * it prefixes `/api`, so `/view` becomes `/api/view`.
  */
 export async function fetchImageForMcp(
   args,
@@ -336,12 +339,8 @@ export async function fetchImageForMcp(
   try {
     let response;
     try {
-      if (typeof api?.fetchApi === "function") {
-        response = await Promise.race([api.fetchApi(path, request), timeout.timeoutPromise]);
-      } else {
-        if (typeof fetchImpl !== "function") throw fetchImageError("api_unavailable", "fetch_image has no fetch transport");
-        response = await Promise.race([fetchImpl(url, request), timeout.timeoutPromise]);
-      }
+      if (typeof fetchImpl !== "function") throw fetchImageError("api_unavailable", "fetch_image has no fetch transport");
+      response = await Promise.race([fetchImpl(url, request), timeout.timeoutPromise]);
     } catch (error) {
       if (error === timeout.timeoutError || timeout.controller.signal.aborted) throw timeout.timeoutError;
       if (error?.code) throw error;

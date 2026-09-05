@@ -55,12 +55,12 @@ async function rejection(promise, code) {
   });
 }
 
-test("#2149: valid refs use the API/base-path URL and return bounded media bytes", async () => {
+test("#2149: valid refs use the file/base-path URL and return bounded media bytes", async () => {
   const calls = [];
   const result = await fetchImageForMcp(
     { filename: "cat.png", subfolder: "renders", type: "output" },
     {
-      api: { apiURL: (path) => `/comfy${path}` },
+      api: { fileURL: (path) => `/comfy${path}` },
       fetchImpl: async (url, init) => {
         calls.push({ url, init });
         return response({ bytes: [0, 1, 2, 255] });
@@ -78,25 +78,61 @@ test("#2149: valid refs use the API/base-path URL and return bounded media bytes
   assert.ok(calls[0].init.signal instanceof AbortSignal);
 });
 
-test("#2149: the normal panel API helper receives the same relative route and credentials", async () => {
-  const calls = [];
-  const result = await fetchImageForMcp(
-    { filename: "cat.png" },
-    {
-      api: {
-        apiURL: (path) => `/base${path}`,
-        fetchApi: async (path, init) => {
-          calls.push({ path, init });
-          return response({ bytes: [137, 80, 78, 71] });
+test("#2884: apiURL/fetchApi without fileURL cannot be used as a /view transport", async () => {
+  await rejection(
+    fetchImageForMcp(
+      { filename: "clip.mp4" },
+      {
+        expectedOrigin: "https://panel.test",
+        api: {
+          apiURL: (path) => `https://panel.test/api${path}`,
+          fetchApi: async () => { throw new Error("Failed to fetch"); },
         },
+        fetchImpl: async () => { throw new Error("must not fetch"); },
+      },
+    ),
+    "api_unavailable",
+  );
+});
+
+test("#2884: a production-like fetchApi that prefixes /api is not used for /view", async () => {
+  const fetchApiCalls = [];
+  const fetchCalls = [];
+  const origin = "https://panel.test";
+  function apiURL(path) {
+    return `${origin}${this.api_base}/api${path}`;
+  }
+  function fileURL(path) {
+    return `${origin}${this.api_base}${path}`;
+  }
+  const result = await fetchImageForMcp(
+    { filename: "clip.mp4", type: "output" },
+    {
+      expectedOrigin: origin,
+      api: {
+        api_base: "/comfy",
+        apiURL,
+        fileURL,
+        fetchApi: async (path, init) => {
+          fetchApiCalls.push({ path, init });
+          throw new Error("Failed to fetch");
+        },
+      },
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url, init });
+        return response({ mime: "video/mp4", bytes: [0, 0, 0, 1], url });
       },
     },
   );
 
   assert.equal(result.ok, true);
-  assert.equal(calls[0].path, "/view?filename=cat.png&subfolder=&type=output");
-  assert.equal(calls[0].init.credentials, "include");
-  assert.equal(calls[0].init.redirect, "manual");
+  assert.equal(result.mimeType, "video/mp4");
+  assert.equal(fetchApiCalls.length, 0);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].url, `${origin}/comfy/view?filename=clip.mp4&subfolder=&type=output`);
+  assert.equal(fetchCalls[0].url.includes("/api/view"), false);
+  assert.equal(fetchCalls[0].init.credentials, "include");
+  assert.equal(fetchCalls[0].init.redirect, "manual");
 });
 
 test("#2149: file refs reject separators, traversal, invalid subfolders, types, URLs, and extra fields", async () => {
@@ -122,7 +158,7 @@ test("#2149: file refs reject separators, traversal, invalid subfolders, types, 
     assert.throws(() => validateFetchImageRef(ref), { code: "invalid_input" }, JSON.stringify(ref));
     await rejection(
       fetchImageForMcp(ref, {
-        api: { apiURL: (path) => path },
+        api: { fileURL: (path) => path },
         fetchImpl: async () => { throw new Error("must not fetch"); },
       }),
       "invalid_input",
@@ -135,7 +171,7 @@ test("#2149: an absolute API URL must remain same-origin", async () => {
     fetchImageForMcp(
       { filename: "cat.png" },
       {
-        api: { apiURL: () => "https://evil.test/view?filename=cat.png" },
+        api: { fileURL: () => "https://evil.test/view?filename=cat.png" },
         expectedOrigin: "https://panel.test",
         fetchImpl: async () => { throw new Error("must not fetch"); },
       },
@@ -150,7 +186,7 @@ test("#2149: HTTP failures preserve status classification", async () => {
     await fetchImageForMcp(
       { filename: "missing.png" },
       {
-        api: { apiURL: (path) => path },
+        api: { fileURL: (path) => path },
         fetchImpl: async () => response({ status: 404, mime: "text/html", body: false }),
       },
     );
@@ -164,7 +200,7 @@ test("#2149: HTTP failures preserve status classification", async () => {
 
 test("#2149: redirects and cross-origin final response URLs are typed refusals", async () => {
   const options = {
-    api: { apiURL: (path) => path },
+    api: { fileURL: (path) => path },
     expectedOrigin: "https://panel.test",
   };
 
@@ -195,7 +231,7 @@ test("#2149: a same-origin final response URL remains valid", async () => {
   const result = await fetchImageForMcp(
     { filename: "same-origin.png" },
     {
-      api: { apiURL: (path) => `https://panel.test/base${path}` },
+      api: { fileURL: (path) => `https://panel.test/base${path}` },
       expectedOrigin: "https://panel.test",
       fetchImpl: async (url, init) => {
         assert.equal(init.redirect, "manual");
@@ -211,7 +247,7 @@ test("#2149: non-media MIME types are refused", async () => {
     fetchImageForMcp(
       { filename: "not-an-image.txt" },
       {
-        api: { apiURL: (path) => path },
+        api: { fileURL: (path) => path },
         fetchImpl: async () => response({ mime: "text/plain", bytes: [1] }),
       },
     ),
@@ -224,7 +260,7 @@ test("#2149: Content-Length and streamed bytes cannot exceed the configured cap"
     fetchImageForMcp(
       { filename: "large.png" },
       {
-        api: { apiURL: (path) => path },
+        api: { fileURL: (path) => path },
         maxBytes: 4,
         fetchImpl: async () => response({ contentLength: 5, bytes: [1, 2, 3, 4, 5] }),
       },
@@ -236,7 +272,7 @@ test("#2149: Content-Length and streamed bytes cannot exceed the configured cap"
     fetchImageForMcp(
       { filename: "chunked.png" },
       {
-        api: { apiURL: (path) => path },
+        api: { fileURL: (path) => path },
         maxBytes: 4,
         fetchImpl: async () => response({ bytes: [1, 2, 3, 4, 5] }),
       },
@@ -251,7 +287,7 @@ test("#2149: the fetch and body read have an abort timeout", async () => {
     fetchImageForMcp(
       { filename: "hung.png" },
       {
-        api: { apiURL: (path) => path },
+        api: { fileURL: (path) => path },
         timeoutMs: 10,
         fetchImpl: async (_url, init) => {
           signal = init.signal;

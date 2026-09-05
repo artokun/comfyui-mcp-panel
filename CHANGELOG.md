@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- fetch_image and fetch_comfyui_read no longer send `/view` or `/system_stats` through ComfyUI `api.fetchApi`, which prefixes `/api` and was failing the connected-panel media/health relay with `Failed to fetch`. `/view` uses origin-validated `fileURL` (the real media route); API reads use `apiURL` + same-origin fetch, matching the logs transport (comfyui-mcp#2884)
+
 ## [0.15.177] - 2026-09-05
 
 ### Fixed

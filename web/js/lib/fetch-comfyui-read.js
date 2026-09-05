@@ -305,18 +305,15 @@ export async function fetchComfyUIReadForMcp(
   try {
     let response;
     try {
-      // ComfyUI's internal logs route is not under the API wrapper's /api
-      // namespace. Keep history/system_stats on fetchApi (which preserves the
-      // frontend's base-path behavior), but send logs through the already
-      // origin-validated absolute URL.
-      if (operation !== "logs" && typeof api?.fetchApi === "function") {
-        response = await Promise.race([api.fetchApi(path, request), timeout.timeoutPromise]);
-      } else {
-        if (typeof fetchImpl !== "function") {
-          throw readError("api_unavailable", "fetch_comfyui_read has no fetch transport");
-        }
-        response = await Promise.race([fetchImpl(url, request), timeout.timeoutPromise]);
+      // Never use api.fetchApi. It prefixes /api (correct for history /
+      // system_stats via apiURL, wrong for logs via fileURL) and bypasses the
+      // origin-validated URL. Production fetchApi + redirect:"manual" has
+      // failed with "Failed to fetch" (comfyui-mcp#2884). Logs already used
+      // same-origin fetch; the other reads now share that transport.
+      if (typeof fetchImpl !== "function") {
+        throw readError("api_unavailable", "fetch_comfyui_read has no fetch transport");
       }
+      response = await Promise.race([fetchImpl(url, request), timeout.timeoutPromise]);
     } catch (error) {
       if (error === timeout.timeoutError || timeout.controller.signal.aborted) throw timeout.timeoutError;
       if (error?.code) throw error;

@@ -121,15 +121,61 @@ test("#2196/#2283: the allowed operations use only their fixed same-origin route
 
   assert.deepEqual(apiURLCalls, ["/history", "/system_stats", "/object_info", "/workflow_templates"]);
   assert.deepEqual(fileURLCalls, ["/internal/logs/raw"]);
-  assert.deepEqual(apiCalls.map(({ path }) => path), ["/history", "/system_stats", "/object_info", "/workflow_templates"]);
-  assert.deepEqual(rawCalls.map(({ url }) => url), ["https://panel.test/comfy/internal/logs/raw"]);
-  for (const { init } of [...apiCalls, ...rawCalls]) {
+  assert.deepEqual(apiCalls, []);
+  assert.deepEqual(rawCalls.map(({ url }) => url), [
+    "https://panel.test/comfy/api/history",
+    "https://panel.test/comfy/api/system_stats",
+    "https://panel.test/comfy/internal/logs/raw",
+    "https://panel.test/comfy/api/object_info",
+    "https://panel.test/comfy/api/workflow_templates",
+  ]);
+  for (const { init } of rawCalls) {
     assert.equal(init.method, "GET");
     assert.equal(init.cache, "no-store");
     assert.equal(init.credentials, "include");
     assert.equal(init.redirect, "manual");
     assert.ok(init.signal instanceof AbortSignal);
   }
+});
+
+test("#2884: a production-like fetchApi that prefixes /api is not used for /system_stats", async () => {
+  const fetchApiCalls = [];
+  const fetchCalls = [];
+  const origin = "https://panel.test";
+  const body = '{"system":{"os":"windows"},"devices":[]}';
+  function apiURL(path) {
+    return `${origin}${this.api_base}/api${path}`;
+  }
+  function fileURL(path) {
+    return `${origin}${this.api_base}${path}`;
+  }
+  const result = await fetchComfyUIReadForMcp(
+    { operation: "system_stats" },
+    {
+      expectedOrigin: origin,
+      api: {
+        api_base: "/comfy",
+        apiURL,
+        fileURL,
+        fetchApi: async (path, init) => {
+          fetchApiCalls.push({ path, init });
+          throw new Error("Failed to fetch");
+        },
+      },
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url, init });
+        return response({ body, url });
+      },
+    },
+  );
+
+  assert.equal(result.operation, "system_stats");
+  assert.equal(result.body, body);
+  assert.equal(fetchApiCalls.length, 0);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].url, `${origin}/comfy/api/system_stats`);
+  assert.equal(fetchCalls[0].init.credentials, "include");
+  assert.equal(fetchCalls[0].init.redirect, "manual");
 });
 
 test("#2228: apiURL and fileURL keep the Comfy API object as this when they read this.api_base", async () => {
@@ -143,12 +189,19 @@ test("#2228: apiURL and fileURL keep the Comfy API object as this when they read
     api_base: "https://panel.test/comfy/api",
     apiURL,
     fileURL,
-    fetchApi: async () => response({ body: '{"prompt-1":{"status":{"status_str":"success"}}}' }),
+    fetchApi: async () => { throw new Error("must not use fetchApi"); },
   };
 
   const history = await fetchComfyUIReadForMcp(
     { operation: "history" },
-    { expectedOrigin: "https://panel.test", api },
+    {
+      expectedOrigin: "https://panel.test",
+      api,
+      fetchImpl: async (url) => {
+        assert.equal(url, "https://panel.test/comfy/api/history");
+        return response({ body: '{"prompt-1":{"status":{"status_str":"success"}}}', url });
+      },
+    },
   );
   assert.equal(history.operation, "history");
   assert.equal(history.body, '{"prompt-1":{"status":{"status_str":"success"}}}');
@@ -219,7 +272,8 @@ test("#2283: logs raw transport retains origin, redirect, and body-size fences",
 
 test("#2511: models inventory operations use only their fixed same-origin /models routes", async () => {
   const apiURLCalls = [];
-  const apiCalls = [];
+  const fetchApiCalls = [];
+  const rawCalls = [];
   const bodies = {
     models: '["checkpoints","loras","diffusion_models"]',
     "models/checkpoints": '["remote-ckpt.safetensors"]',
@@ -238,11 +292,14 @@ test("#2511: models inventory operations use only their fixed same-origin /model
           },
           fileURL: () => { throw new Error("models must not use fileURL"); },
           fetchApi: async (path, init) => {
-            apiCalls.push({ path, init });
-            return response({ body: bodies[operation] });
+            fetchApiCalls.push({ path, init });
+            throw new Error("Failed to fetch");
           },
         },
-        fetchImpl: async () => { throw new Error("models must not use raw fetch"); },
+        fetchImpl: async (url, init) => {
+          rawCalls.push({ url, init });
+          return response({ body: bodies[operation], url });
+        },
       },
     );
     assert.deepEqual(result, {
@@ -253,8 +310,14 @@ test("#2511: models inventory operations use only their fixed same-origin /model
     });
   }
   assert.deepEqual(apiURLCalls, ["/models", "/models/checkpoints", "/models/loras", "/models/diffusion_models"]);
-  assert.deepEqual(apiCalls.map(({ path }) => path), ["/models", "/models/checkpoints", "/models/loras", "/models/diffusion_models"]);
-  for (const { init } of apiCalls) {
+  assert.deepEqual(fetchApiCalls, []);
+  assert.deepEqual(rawCalls.map(({ url }) => url), [
+    "https://panel.test/comfy/api/models",
+    "https://panel.test/comfy/api/models/checkpoints",
+    "https://panel.test/comfy/api/models/loras",
+    "https://panel.test/comfy/api/models/diffusion_models",
+  ]);
+  for (const { init } of rawCalls) {
     assert.equal(init.method, "GET");
     assert.equal(init.cache, "no-store");
     assert.equal(init.credentials, "include");
@@ -363,10 +426,11 @@ test("#2283: object_info uses its documented large/slow route budget while other
       expectedOrigin: "https://panel.test",
       api: {
         apiURL: (path) => path,
-        fetchApi: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 20_841));
-          return response({ body, contentLength: body.length, stream: false });
-        },
+        fetchApi: async () => { throw new Error("must not use fetchApi"); },
+      },
+      fetchImpl: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20_841));
+        return response({ body, contentLength: body.length, stream: false });
       },
     },
   );
@@ -380,8 +444,9 @@ test("#2283: object_info uses its documented large/slow route budget while other
         expectedOrigin: "https://panel.test",
         api: {
           apiURL: (path) => path,
-          fetchApi: async () => response({ body, contentLength: body.length, stream: false }),
+          fetchApi: async () => { throw new Error("must not use fetchApi"); },
         },
+        fetchImpl: async () => response({ body, contentLength: body.length, stream: false }),
       },
     ),
     "too_large",
@@ -415,27 +480,28 @@ test("#2283: the production dispatcher and helper carry a >20.84s, >25MB object_
       {
         api: {
           apiURL: (path) => path,
-          fetchApi: async (_path, init) => {
-            seenRequest = init;
-            await new Promise((resolve, reject) => {
-              let settled = false;
-              let producerTimer;
-              let onAbort;
-              const finish = (error) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(producerTimer);
-                init.signal.removeEventListener("abort", onAbort);
-                if (error) reject(error);
-                else resolve();
-              };
-              onAbort = () => finish(Object.assign(new Error("producer aborted"), { name: "AbortError" }));
-              producerTimer = setTimeout(() => finish(), productionDelayMs);
-              init.signal.addEventListener("abort", onAbort, { once: true });
-              if (init.signal.aborted) onAbort();
-            });
-            return response({ body, contentLength: body.length, stream: false });
-          },
+          fetchApi: async () => { throw new Error("must not use fetchApi"); },
+        },
+        fetchImpl: async (_url, init) => {
+          seenRequest = init;
+          await new Promise((resolve, reject) => {
+            let settled = false;
+            let producerTimer;
+            let onAbort;
+            const finish = (error) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(producerTimer);
+              init.signal.removeEventListener("abort", onAbort);
+              if (error) reject(error);
+              else resolve();
+            };
+            onAbort = () => finish(Object.assign(new Error("producer aborted"), { name: "AbortError" }));
+            producerTimer = setTimeout(() => finish(), productionDelayMs);
+            init.signal.addEventListener("abort", onAbort, { once: true });
+            if (init.signal.aborted) onAbort();
+          });
+          return response({ body, contentLength: body.length, stream: false });
         },
       },
     );
@@ -458,8 +524,9 @@ test("#2283: object_info still refuses an oversize body and a timeout", async ()
         expectedOrigin: "https://panel.test",
         api: {
           apiURL: (path) => path,
-          fetchApi: async () => response({ body: oversize, contentLength: oversize.length, stream: false }),
+          fetchApi: async () => { throw new Error("must not use fetchApi"); },
         },
+        fetchImpl: async () => response({ body: oversize, contentLength: oversize.length, stream: false }),
       },
     ),
     "too_large",
@@ -473,8 +540,9 @@ test("#2283: object_info still refuses an oversize body and a timeout", async ()
         expectedOrigin: "https://panel.test",
         api: {
           apiURL: (path) => path,
-          fetchApi: () => new Promise((resolve) => setTimeout(() => resolve(response()), 25)),
+          fetchApi: () => { throw new Error("must not use fetchApi"); },
         },
+        fetchImpl: () => new Promise((resolve) => setTimeout(() => resolve(response()), 25)),
       },
     ),
     "timeout",
