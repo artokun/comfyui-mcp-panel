@@ -7,11 +7,15 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-
-- panel_run refuses a stale live browser bundle with a Ctrl+Shift+R hard-refresh requirement instead of silently dropping dispatch; unverified scoped pending items are still removed fail-closed (#2252)
 - the unknown-staleness hint no longer recommends a save that can destroy the change it warns about (#2139). Both arms said "save first"; classifyInPlaceOverwrite returns "skip" for a tab already isPersisted, so an ordinary save of a persisted tab overwrites in place WITHOUT reading disk — and this branch exists precisely because the on-disk contents could not be established, so the advice could clobber an external edit. Both arms now point at a NEW path, which keeps both versions. The arm test also pinned only the presence of both strings, so a negated condition would have swapped dirty and clean advice undetected; it now pins the mapping. Found by the Copilot review on the PR
 - the unknown-staleness reply does not claim a CONFLICT it could not verify (#2139). A conflict is "the file changed on disk AND this tab has unsaved edits"; on that arm the disk read failed, so only the second half is known. The dirty branch now warns about what is at risk without asserting the half that was never established - the same positive-evidence rule the #2204 warning follows.
 - the unknown-staleness reply no longer tells a tab with UNSAVED edits to load the on-disk copy over them (#2139). `panel_load_workflow` replaces the canvas, so that advice discards unsaved work. Every other arm of `workflow_open`'s staleness chain consults the dirty flags first, but the `stale: "unknown"` arm issued the recommendation unconditionally - and that is the arm reached when the disk read was "unavailable or slower than its deadline", so the one path admitting it verified nothing was also the one instructing an overwrite. It now names the loss when the tab is dirty and keeps the plain re-read advice when it is not. Positive evidence only: a tab reporting no unsaved edits is not called clean, because a programmatic edit leaves `isModified` unset.
+
+## [0.15.175] - 2026-09-05
+
+### Fixed
+
+- panel_run refuses a stale live browser bundle with a Ctrl+Shift+R hard-refresh requirement instead of silently dropping dispatch; unverified scoped pending items are still removed fail-closed (#2252, #2253)
 
 
 ## [0.15.174] - 2026-09-04
