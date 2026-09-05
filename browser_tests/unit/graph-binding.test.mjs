@@ -676,6 +676,104 @@ test("#1215: already-current untagged canvas with matching state still admits (#
   assert.equal(verdict, null);
 });
 
+test("#1215: a failed switch repaint is leftover even when the TARGET tracker still serializes", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 4,
+      activeWorkflow: wf({ changeTracker: { activeState: state(4) } }),
+      switchRepaintUnproven: true,
+    }),
+    true,
+    "poisoned already-open state matching the leftover canvas is not ownership proof",
+  );
+});
+
+test("#1215: a clean already-open file larger than the live canvas is leftover archive", () => {
+  const live = state(4);
+  const file = state(69);
+  const rootGraph = {
+    _nodes: live.nodes,
+    serialize: () => ({ nodes: live.nodes, links: [], groups: [] }),
+  };
+  const activeWorkflow = wf({
+    isModified: false,
+    path: "workflows/3d_pixal3d_trellis2_image_to_model.json",
+    originalContent: JSON.stringify({ ...file, links: [], groups: [] }),
+    changeTracker: { activeState: { ...live, links: [], groups: [] } },
+  });
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 4,
+      activeWorkflow,
+      rootGraph,
+    }),
+    true,
+    "last-open named the 69-node file while the canvas still holds a 4-node archive",
+  );
+  for (const cmd of ["graph_outline", "graph_query"]) {
+    const verdict = resolveGraphBindingVerdict({
+      graph: rootGraph,
+      rootGraph,
+      activeWorkflow,
+      activeWorkflowUuid: "already-open-trellis2",
+      liveNodeCount: 4,
+      ...graphCommandBindingBar(cmd),
+      includeBaselineReadGuard: true,
+    });
+    assert.equal(verdict?.reason, "root-state-unreadable", cmd);
+    assert.equal(verdict.live, 4);
+  }
+});
+
+test("#1215: a dirty tab smaller than its file is not leftover (user deletions fail OPEN)", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 4,
+      activeWorkflow: wf({
+        isModified: true,
+        originalContent: JSON.stringify(state(69)),
+        changeTracker: { activeState: state(4) },
+      }),
+    }),
+    false,
+  );
+});
+
+test("#1215: missing or unreadable originalContent is not leftover (fixtures fail OPEN)", () => {
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 4,
+      activeWorkflow: wf({ isModified: false, changeTracker: { activeState: state(4) } }),
+    }),
+    false,
+    "no file bytes",
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 4,
+      activeWorkflow: wf({
+        isModified: false,
+        originalContent: "{not-json",
+        changeTracker: { activeState: state(4) },
+      }),
+    }),
+    false,
+    "unreadable file bytes",
+  );
+  assert.equal(
+    graphRootUnprovenAgainstActiveState({
+      liveNodeCount: 69,
+      activeWorkflow: wf({
+        isModified: false,
+        originalContent: JSON.stringify(state(69)),
+        changeTracker: { activeState: state(69) },
+      }),
+    }),
+    false,
+    "live canvas matches the already-open file",
+  );
+});
+
 test("#1215: the refusal names the live count and says set_workflow_target is not a remedy", () => {
   const msg = graphBindingRefusalMessage({ reason: "root-state-unreadable", live: 118, expected: null });
   assert.match(msg, /^\[root-state-unreadable\]/);
