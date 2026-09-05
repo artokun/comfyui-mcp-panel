@@ -1202,6 +1202,9 @@ async function runSetWidgetBody(
     // shared write path is not on offer, and pretending otherwise is what cost a round.
     const prepared = typeof prepareWriteTarget === "function" ? prepareWriteTarget() : null;
     try {
+      // After the object-info await, wrap the LIVE combo again so a Vue remount
+      // during the fetch cannot leave the parent setter unwrapped for this write.
+      preserveDynamicComboChildren();
       const set = applyWidgetWrite(node, widgetName, value, {
         resolveSource,
         canvas,
