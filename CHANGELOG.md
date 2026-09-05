@@ -9,6 +9,24 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
 - Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
+- the CivitAI sign-in timeout no longer recommends a setting that cannot sign the browser in (#2044). It pointed at the CivitAI API token setting; `py/civitai_proxy.py` authenticates the browser solely from its OAuth token file and never reads CIVITAI_API_TOKEN — the name occurs there only inside a docstring — so the advice named a remedy for a different subsystem. The message now names --enable-cors-header, whose absence installs the origin-only middleware that produces the 403, and says the token setting will not help. It also no longer rides the 3.5s toast default: it is the only explanation the user gets after a four-minute wait
+- pin the property the sign-in timeout silently depends on (#2044). `++tries` sits after `await refreshAuth()`, so if that call ever propagated a rejection the interval callback would abort before the counter moved, the count would never reach 120, and the new give-up branch would never fire - restoring the exact silence this fixes, under the server-down/network-error case that is one of the likelier reasons a sign-in does not complete. It is safe only because `refreshAuth` swallows its own fetch failure and records signed-out; that is now asserted at the site that depends on it, so a refactor letting it throw fails a test instead of quietly un-fixing the timeout.
+- CivitAI sign-in now says when it did not complete (panel#2044). The poll gave up after
+  four minutes in silence while the popup showed a bare browser 403 that ComfyUI never
+  logged, so the user got no statement that sign-in had failed. The message offers the
+  known cause conditionally rather than asserting a status this side cannot read, and
+  names the remedy that works today: a CivitAI API token in Settings. The underlying
+  cross-site redirect block is unchanged and panel#2044 stays open for it.
+  The honesty guard now covers BOTH copies of the sentence: the check read only the
+  generated `locales/en/main.json`, so flattening the conditional in the source
+  fallback — from which that catalog is generated, and which renders whenever the
+  catalog is not loaded — left it green while the two silently diverged.
+- the sign-in timeout notice names the token setting by REFERENCE, not by copying its
+  English label (#2044). The label is translated in every locale and this toast is not,
+  so a French reader was told to find "Set CivitAI token…" while their menu read
+  "Définir le jeton CivitAI…" — the one actionable sentence in a message about a
+  sign-in that cannot succeed was the part they could not act on. It now interpolates
+  tr("panel.set_civitai_token"), so the quoted text is whatever the running UI shows.
 
 ## [0.15.176] - 2026-09-05
 
