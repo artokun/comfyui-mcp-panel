@@ -763,6 +763,28 @@ test("#2265: a generic enum combo refusal lists the live options so a stale gues
   assert.equal(node.widgets[0].value, "cuda", "must not mutate on reject");
 });
 
+test("#2265: a mixed None/disabled/path combo still omits option values", () => {
+  const mixed = ["None", "disabled", "client/model.safetensors"];
+  const node = {
+    id: 4,
+    type: "OptionalLoader",
+    widgets: [{ name: "model", options: { values: mixed }, value: mixed[0] }],
+  };
+
+  let refusal;
+  try {
+    applyWidgetWrite(node, "model", "missing.safetensors", HOOKS);
+  } catch (err) {
+    refusal = err;
+  }
+
+  assert.ok(refusal instanceof WidgetWriteError);
+  assert.match(refusal.message, /holds 3 options/);
+  assert.match(refusal.message, /intentionally omitted/);
+  assert.equal(refusal.message.includes("client/model.safetensors"), false);
+  assert.equal(/Valid options:/.test(refusal.message), false);
+});
+
 test("#2265: a checkpoint combo still omits option values (path/model-file redaction)", () => {
   const ckptOptions = ["private-project/v1.safetensors", "private-project/v2.ckpt"];
   const node = {

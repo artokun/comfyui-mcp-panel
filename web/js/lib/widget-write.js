@@ -9,7 +9,7 @@ import {
   boundPropertyState,
   boundPropertyUnverifiedNote,
 } from "./widget-bound-property.js";
-import { optionsLookLikeFiles } from "./live-combo-availability.js";
+import { optionsIncludeFileLike } from "./live-combo-availability.js";
 
 // #976: captured at module load so invoking a widget's callback cannot read any
 // property off the callback itself (a poisoned `.call` getter or a Proxy trap would
@@ -227,9 +227,10 @@ export function comboOptions(widget) {
  * #2547 omitted every option value because a LoadImage/checkpoint list can name
  * private files. That rule was applied to EVERY combo, so a 3-value `device`
  * enum refused "auto" while naming the count and none of the choices. Redact
- * only when the live list looks like files on disk (same majority-extension
- * rule as `optionsLookLikeFiles`); generic enums (device/precision/sampler)
- * list the values so a stale guess can be corrected.
+ * only when ANY live option looks like a file (`optionsIncludeFileLike`);
+ * generic enums (device/precision/sampler) list the values so a stale guess
+ * can be corrected. Majority `optionsLookLikeFiles` is the missing-asset
+ * classifier, not a privacy gate — mixed None/disabled/path lists still leak.
  */
 function describeOffListCombo(name, value, options) {
   const count = options.length;
@@ -238,7 +239,7 @@ function describeOffListCombo(name, value, options) {
     `"${name}". Its option list WAS read successfully and holds ${count} ` +
     `option${count === 1 ? "" : "s"}, none of them this value — so this is a ` +
     `rejected VALUE, not an unreadable list. `;
-  if (optionsLookLikeFiles(options)) {
+  if (optionsIncludeFileLike(options)) {
     return (
       head +
       `The valid option values are intentionally omitted from this diagnostic because ` +
