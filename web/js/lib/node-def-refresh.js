@@ -80,6 +80,35 @@ export function describeStaleBundleRefresh({ running, installed } = {}) {
   };
 }
 
+/**
+ * #2252 — refuse panel_run when the running browser bundle is STALE.
+ *
+ * A one-patch live/installed mismatch (0.15.173 vs 0.15.174) accepted the run
+ * and then silently dropped dispatch: queued_unknown, no prompt_id, ComfyUI
+ * never logged got prompt. Fail-closed here, before queuePrompt / scoped
+ * dispatch, so the caller gets a hard-refresh requirement instead of an idle
+ * queue. Fail-open on an unreadable probe — same rule as describeStaleBundleRefresh.
+ *
+ * @returns {null|{queued:false, reason:string, running:string, installed:string, remedy:string, error:string}}
+ */
+export function describeStaleBundleRun({ running, installed } = {}) {
+  if (resolveBundleStaleness({ running, installed }) !== "stale") return null;
+  const run = String(running).trim();
+  const inst = String(installed).trim();
+  const remedy =
+    `This tab is running panel ${run} while the installed pack is ${inst}. ` +
+    `Hard-refresh this tab (Ctrl+Shift+R) to load panel ${inst} before panel_run. ` +
+    `Nothing was queued.`;
+  return {
+    queued: false,
+    reason: NODE_DEF_REFRESH_REASONS.STALE_BUNDLE,
+    running: run,
+    installed: inst,
+    remedy,
+    error: remedy,
+  };
+}
+
 function detailSuffix(thrown) {
   const text = String(thrown?.message ?? thrown ?? "").trim();
   return text ? `(${text})` : "";
