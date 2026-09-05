@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
+- Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
 - panel_run no longer refuses forever on a STALE socket flag (#2854). ComfyUI arms comfyBackendSocketDown from a failed _pollQueue during a long GPU-bound render, and `reconnected` never fires because the websocket never left OPEN -- so the flag never cleared. Every other panel_* path asks comfyBackendIsDown(), whose #1325 rule is that flagged-down over an OPEN socket is stale rather than down; the run-dispatch identity read the raw flag instead, so it alone reported "backend socket down" and refused every dispatch while reads, edits and the ComfyUI queue all worked. Fail-closed directions are unchanged: the flag with a non-OPEN or unreadable readyState still refuses
 
 ## [0.15.176] - 2026-09-05
