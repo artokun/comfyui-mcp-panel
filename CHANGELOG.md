@@ -9,6 +9,24 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
 - Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
+- the re-open discard warning now reaches the refusal callers actually hit (#2139). It was wired only into the secondary write-boundary assertion; the PRIMARY dispatch fence called the same message builder with commandUuid/activeUuid/movedNote only, so activeIsModified defaulted to null and an ordinary workflow-instance mismatch never showed the warning — the fence whose own comment calls it "the refusal a caller actually sees". Both sites now read through one shared activeWorkflowSaveState() probe so they cannot disagree about the same tab. Found by the Copilot review on the PR
+- the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
+  work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
+  saved tab carrying unsaved drift that is the one recovery that loses it, which is the
+  deadlock the report describes: save already refused as behind the canvas, mutations
+  fenced off, and the suggested escape destructive. The existing panel#1019 note asks
+  whether the tab CAN be re-opened; this asks what it COSTS. Warns only on a positive
+  isModified reading, because ComfyUI derives that flag from user-input captures and a
+  false is not evidence of safety (panel#882). The save/tracker deadlock itself is
+  unchanged and panel#2139 stays open.
+  A SECOND blind spot is now recorded on the check: read out of the shipped
+  `changeTracker.ts`, `isModified` is written only by `updateModified()`, reached only
+  from `captureCanvasState()`, which returns early while a change transaction is open —
+  so inside a STRANDED transaction the flag is frozen at the last successful capture.
+  That is the same state in which save is refused as behind the canvas, so drift made
+  entirely inside the stranded transaction leaves this warning silent on the deadlock
+  its own sentence names.
+- the stale-snapshot save refusal no longer promises that a still-open transaction clears by itself or that nudging the canvas fixes it (measured: it does not, and each nudge widens the gap), and it now warns against falling back to ComfyUI's own Save, which persists the same tracker snapshot silently (#2139)
 
 ## [0.15.176] - 2026-09-05
 

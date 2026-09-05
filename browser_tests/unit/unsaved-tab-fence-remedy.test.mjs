@@ -120,10 +120,32 @@ test("#1019 an UNSTAMPED command still reports that, whatever the tab", () => {
 });
 
 test("#1019 source guard: the fact is READ, not assumed, and an unreadable read stays null", () => {
+  // #2139 added a second read (activeIsModified) in the same try, so the single-line
+  // assignment this used to quote is now inside a block. What it GUARDS is unchanged
+  // and is what these still assert: unknown by default, positively read, and an
+  // unreadable tab proving nothing.
   const src = readFileSync(PANEL_JS, "utf8");
-  const fn = namedFunctionSource(src, "assertActiveWorkflowCommandTarget");
-  assert.match(fn, /let activeIsUnsaved = null;/, "unknown by default");
-  assert.match(fn, /if \(active\) activeIsUnsaved = !savedWorkflowPath\(active\);/, "positively read");
-  assert.match(fn, /} catch \{\r?\n\s*activeIsUnsaved = null;/, "an unreadable tab proves nothing");
-  assert.match(fn, /workflowInstanceMismatchMessage\(\{ commandUuid, activeUuid, activeIsUnsaved \}\)/);
+  // The read moved into the shared `activeWorkflowSaveState()` probe so the primary
+  // dispatch fence gets the same reading; what it GUARDS is unchanged.
+  const fn = namedFunctionSource(src, "activeWorkflowSaveState");
+  assert.match(fn, /activeIsUnsaved: null, activeIsModified: null/, "unknown by default");
+  assert.match(fn, /activeIsUnsaved: !savedWorkflowPath/, "positively read");
+  assert.match(fn, /\} catch \{/, "an unreadable tab proves nothing");
+  // WIRING, which is the part that was broken: BOTH call sites must carry the
+  // reading. The primary dispatch fence passed only commandUuid/activeUuid/movedNote,
+  // so activeIsModified defaulted to null and the discard warning was unreachable on
+  // the refusal an ordinary instance mismatch actually produces.
+  // Split yields the DEFINITION as well as the calls, so drop it explicitly rather
+  // than adjusting the expected number and hiding a real third call site.
+  const calls = src
+    .split(/(?<!function )workflowInstanceMismatchMessage\(\{/)
+    .slice(1);
+  assert.equal(calls.length, 2, "two CALL sites — re-point this test if that changes");
+  for (const call of calls) {
+    assert.match(
+      call.slice(0, 600),
+      /activeWorkflowSaveState\(\)/,
+      "every mismatch message must carry the shared save-state reading",
+    );
+  }
 });

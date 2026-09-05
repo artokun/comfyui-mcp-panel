@@ -389,6 +389,38 @@ test("#1563 THE REPORTED CASE: a stale snapshot is refused before it can be writ
   assert.match(workflowSaveRefusalError(verdict).message, /NOTHING was written/);
 });
 
+test("#2139 the stale-snapshot advice does not promise a stranded transaction clears itself", () => {
+  // Both shipped recovery steps are wrong for ONE of the four causes this message
+  // names, and it is the cause the reporter actually hit. Measured on a live rig:
+  // a stranded transaction never reaches depth 0 on its own, and a nudge opens and
+  // closes its OWN pair, so the depth returns to 1 and each nudge WIDENS the gap.
+  const msg = workflowSaveRefusalError({
+    allow: false,
+    reason: SAVE_PATH_GUARD_REASON.STALE_SNAPSHOT,
+    destinationPath: "workflows/big.json",
+  }).message;
+  assert.doesNotMatch(msg, /clears by itself/);
+  assert.match(msg, /NEITHER STEP CAN CLEAR IT/);
+  assert.match(msg, /widens the gap/);
+});
+
+test("#2139 the advice does not send the user to ComfyUI's own Save, which writes the SAME snapshot", () => {
+  // Read out of the shipped frontend source rather than assumed:
+  // ComfyWorkflow.save() does `this.content = JSON.stringify(this.activeState)`,
+  // i.e. it persists the tracker SNAPSHOT, and prepareForSave -> captureCanvasState
+  // is suppressed inside a transaction. So upstream would write exactly the stale
+  // state refused here, and silently. Falling back to it is data loss, not recovery.
+  const msg = workflowSaveRefusalError({
+    allow: false,
+    reason: SAVE_PATH_GUARD_REASON.STALE_SNAPSHOT,
+    destinationPath: "workflows/big.json",
+  }).message;
+  assert.match(msg, /Do NOT fall back to ComfyUI's own Save/);
+  assert.match(msg, /activeState/);
+  // And it must say where the work actually still lives.
+  assert.match(msg, /live in the\s+GRAPH|GRAPH:/);
+});
+
 test("#1563 a FIRST save is refused too — lost work reported as success is the same defect", () => {
   // Not gated on `destinationPersisted`: no existing file is destroyed, but the user is
   // still told a canvas reached disk when part of it did not.

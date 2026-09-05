@@ -5171,7 +5171,31 @@ function noteWorkflowIdentityDrift() {
 // and #750/#1019 rebuild it in isolation with `new Function`, where a module global does not
 // exist. One line on purpose (see above). Appended, never substituted — the refusal's own
 // reasoning survives; the note only says WHY the active workflow is not what was expected.
-function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null } = {}) {
+/**
+ * #2139 — the active tab's save/modify state, as EVIDENCE rather than a guarantee.
+ *
+ * `isModified` is set by ComfyUI's ChangeTracker, which does not observe every
+ * programmatic edit, so `true` is evidence of drift and `false` is evidence of
+ * nothing. Both callers of `workflowInstanceMismatchMessage` need the same
+ * reading, and the primary dispatch fence was passing neither — its refusal is
+ * the one a caller actually sees for an ordinary instance mismatch, so the
+ * discard warning never fired on the path it was written for. One probe, both
+ * sites, so they cannot drift apart.
+ */
+function activeWorkflowSaveState() {
+  try {
+    const active = activeWorkflowRef();
+    if (!active) return { activeIsUnsaved: null, activeIsModified: null };
+    return {
+      activeIsUnsaved: !savedWorkflowPath(active),
+      activeIsModified: active.isModified === true ? true : null,
+    };
+  } catch {
+    return { activeIsUnsaved: null, activeIsModified: null };
+  }
+}
+
+function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, activeIsModified = null, movedNote = null } = {}) {
   const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const expected = str(commandUuid);
   const live = str(activeUuid);
@@ -5205,6 +5229,52 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
         `still works normally. panel_list_workflows is exempt from this fence and ` +
         `republishes the active identity if you need it first (#1019).`
       : "") +
+    // #2139 — the OTHER cost of following this advice, which #1019 does not cover.
+    // That guard asks whether the active tab CAN be re-opened (an unsaved tab has no
+    // path). This asks what re-opening it COSTS: a SAVED tab with unsaved drift
+    // re-opens fine and discards the drift on the way. The reporter had exactly that
+    // — unsaved rewiring on a saved workflow, save already refused by the
+    // tracker-behind guard — and called panel_open_workflow a forbidden recovery,
+    // because it is the one move that loses the work.
+    //
+    // POSITIVE evidence only. `isModified === true` is the same reading used
+    // elsewhere in this file, and its own #882 note records why the negative is
+    // worthless: ComfyUI derives the flag from USER INPUT captures, so a value a
+    // NODE wrote leaves the tab reading clean while the canvas already differs. So
+    // true warns; false and undefined stay silent rather than implying it is safe.
+    //
+    // A SECOND blind spot, and it lands on this issue's own deadlock. Read out of
+    // the shipped frontend (`changeTracker.ts`): `workflow.isModified` is written
+    // only by `updateModified()`, which is reached only from `captureCanvasState()`
+    // — and that returns EARLY while a change transaction is open:
+    //
+    //     captureCanvasState:
+    //       const isInsideChangeTransaction = this.changeCount > 0
+    //       if (!app.graph || isInsideChangeTransaction || …) return
+    //       …
+    //       this.updateModified(previousState)
+    //
+    // (Braces omitted on purpose: the unit test extracts this function by counting
+    // braces over the raw source and does not skip comments, so an unbalanced one
+    // inside a comment makes the whole function unextractable.)
+    //
+    // So inside a STRANDED transaction the flag is frozen at whatever the last
+    // successful capture left. That is precisely the state in which save is refused
+    // as behind the canvas: if the drift happened entirely inside the stranded
+    // transaction, `isModified` is still the pre-drift value and this warning stays
+    // silent on the very case the sentence below names. Sessions that made balanced
+    // edits earlier read true and do warn, which is the common shape — but silence
+    // here is not evidence the tab is clean, and never was.
+    //
+    // Deliberately does NOT capture first. #882's helper exists for callers about to
+    // DISCARD a canvas and must read a fresh flag; this is an error message, and a
+    // mutation inside one is a new failure surface on a path that is already failing.
+    (activeIsModified === true
+      ? ` And note the ACTIVE tab has UNSAVED changes: panel_open_workflow re-reads it ` +
+        `from disk, so those changes are discarded. Save first, or re-target instead — ` +
+        `if the save is itself refused as behind the canvas, that is panel#2139 and ` +
+        `re-opening is the one recovery that loses the work.`
+      : "") +
     ` If NO panel tab is connected, neither will help and the connection is the thing ` +
     `to fix — panel_graph_outline reports connectivity directly.`
   );
@@ -5231,14 +5301,17 @@ function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
     // "Since the new workflow is unsaved, panel_open_workflow cannot recover it."
     // Read defensively: an unreadable path is not evidence either way, and the message
     // then keeps its existing wording rather than claiming something about the tab.
-    let activeIsUnsaved = null;
-    try {
-      const active = activeWorkflowRef();
-      if (active) activeIsUnsaved = !savedWorkflowPath(active);
-    } catch {
-      activeIsUnsaved = null;
-    }
-    throw new Error(workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved }));
+    // #2139 — read-only, and only the POSITIVE reading counts. `isModified` is
+    // ComfyUI's own flag; #882 records that it is derived from USER INPUT captures,
+    // so a value a NODE wrote leaves it false while the canvas already differs.
+    // `true` is therefore evidence of drift and `false` is evidence of nothing —
+    // which is the right shape for a warning, and the reason this does not capture
+    // first the way a caller about to DISCARD the canvas must. Both readings come
+    // from `activeWorkflowSaveState()` so this fence and the dispatch fence cannot
+    // disagree about the same tab.
+    throw new Error(
+      workflowInstanceMismatchMessage({ commandUuid, activeUuid, ...activeWorkflowSaveState() }),
+    );
   }
 }
 
@@ -29720,6 +29793,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                   workflowInstanceMismatchMessage({
                     commandUuid: dispatchCommandUuid,
                     activeUuid: dispatchActiveUuid,
+                    // #2139 — this fence is the refusal an ordinary instance mismatch
+                    // produces, so it must carry the same discard warning as the
+                    // write-boundary assertion below. It passed neither flag, which
+                    // left the warning unreachable on the primary path.
+                    ...activeWorkflowSaveState(),
                     // #968 — what last moved the active workflow, if anything did. This is the
                     // refusal a caller actually sees when a binding has gone stale.
                     movedNote: activeWorkflowMoves.describeLast(),
