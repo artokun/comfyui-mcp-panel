@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
+- A failed Save-As restore now passes `{ workflow }` to the canvas fence, so cleanup can repaint the source instead of always returning false and leaving the next graph read on a partial canvas (#2257)
 
 ## [0.15.176] - 2026-09-05
 

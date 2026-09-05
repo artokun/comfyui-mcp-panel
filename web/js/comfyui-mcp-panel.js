@@ -7937,7 +7937,11 @@ async function programmaticSave(name) {
       // The adapter restores the record before calling this hook. Repaint only when
       // that record is still the active instance; a concurrent tab switch must not
       // load the source graph over the user's other canvas.
-      if (!canvasFence(workflow)) return false;
+      // canvasFence takes `{ workflow }` — passing the record itself always
+      // destructures `workflow.workflow` (undefined) and returns false, so
+      // every failed Save-As then reported "source canvas restore returned false"
+      // and left the next graph read on a partial canvas (#2257).
+      if (!canvasFence({ workflow })) return false;
       return repaintSaveAsCanvas(workflow, workflow.path, {
         canvasFence: (current, phase) => canvasFence({ workflow: current, phase }),
       });
