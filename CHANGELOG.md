@@ -7,6 +7,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+
+- panel_run refuses a stale live browser bundle with a Ctrl+Shift+R hard-refresh requirement instead of silently dropping dispatch; unverified scoped pending items are still removed fail-closed (#2252)
 - the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
   strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
   `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash
@@ -22,6 +24,7 @@ All notable changes to this project are documented here. This project adheres to
   code; the eleven translations have the selector stripped byte-wise, leaving wording
   untouched.
 - the VARIATION SELECTOR removal now covers every shipped web/js file rather than the main bundle alone. This drops U+FE0F only, which affects text-default glyphs such as the U+26A0 warning sign; it does NOT remove the panel emoji-font dependency, since 44 emoji-presentation-default characters remain in web/js and 16 more in each of the 12 shipped locale catalogues (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
+
 
 ## [0.15.174] - 2026-09-04
 
