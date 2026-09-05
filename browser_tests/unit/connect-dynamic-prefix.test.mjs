@@ -31,6 +31,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { ensureLinkIdHeadroom } from "../../web/js/lib/link-id-headroom.js";
 
 import {
   isLinkPersisted,
@@ -114,6 +115,7 @@ const uniqueSubgraphInputName = (_g, base) => base;
 
 function buildConnect(graph, overrides = {}) {
   const deps = {
+    ensureLinkIdHeadroom,
     getGraphCtx: () => ({ graph, canvas: {}, app: {}, rootGraph: graph, LG: {} }),
     resolveNode,
     resolveSlot,
@@ -199,6 +201,17 @@ function mkGraph() {
   const nodes = [];
   const graph = {
     lastLinkId: 0,
+    // Mirrors the real LGraph, where `last_link_id` is a DEPRECATED accessor pair
+    // over the state counter (`get/set last_link_id` -> `state.lastLinkId`, read out
+    // of the shipped frontend). Without it the fixture models a graph carrying NO
+    // counter at all -- the API-workflow shape #2108 is about -- so every connect
+    // through this harness looked like one that needed a link-id repair.
+    get last_link_id() {
+      return this.lastLinkId;
+    },
+    set last_link_id(v) {
+      this.lastLinkId = v;
+    },
     _links: store.map,
     links: store.proxy,
     nodes,
@@ -251,6 +264,11 @@ function seedPreexistingLinks(graph, targetId) {
       target_slot: targetSlot,
     });
   }
+  // ComfyUI MINTED these ids, so the graph this fixture models has a counter past
+  // them. Left at 0 it would model the #2108 collision state -- a graph that still
+  // needs a link-id repair -- which is not what these #2008 slot-naming tests are
+  // about, and which now (correctly) carries a repair disclosure.
+  graph.lastLinkId = Math.max(graph.lastLinkId, ...rows.map(([id]) => id));
 }
 
 function familyEnd(inputs, family) {

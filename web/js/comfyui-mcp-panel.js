@@ -622,6 +622,7 @@ import {
   unresolvedWildcardPairReason,
   isWildcardSlotType,
 } from "./lib/connect-match.js";
+import { ensureLinkIdHeadroom } from "./lib/link-id-headroom.js";
 import {
   snapshotInputSlotLinks,
   snapshotInputSlotNames,
@@ -10736,6 +10737,13 @@ function promoteWidgetByLink(subgraphNode, sourceNode, sourceWidget) {
   if (!subgraph || typeof subgraph.addInput !== "function") {
     throw new Error("link-only promotion unavailable on this frontend (missing subgraph.addInput)");
   }
+  // #2108 — this function also mints a link, in the SUBGRAPH's own store rather
+  // than the parent's. Its counter is raised by the CALLER, not here: the
+  // promote-widget tests slice this function out of the bundle and rebuild it
+  // with `new Function`, where a module-scope import is not in scope, so a call
+  // here fails as `ensureLinkIdHeadroom is not defined`. Guarding at the call
+  // site keeps the guard unconditional in production instead of making it
+  // optional to satisfy a harness.
 
   const source = { sourceNodeId: String(sourceNode.id), sourceWidgetName: sourceWidget.name };
   if (findPromotedHostInput(subgraphNode, source)) return { changed: false };
@@ -17334,6 +17342,21 @@ const GRAPH_TOOL_EXECUTORS = {
 
   graph_connect({ from_node_id, from_output, to_node_id, to_input, auto_match }) {
     const { graph } = getGraphCtx();
+    // #2108 — a link id is minted as `lastLinkId + 1` and stored with
+    // `_links.set(id, link)`, which REPLACES. A counter sitting below an id the
+    // graph already holds therefore overwrites a bystander's record, and the
+    // wire reads as having moved onto this connection. Raise the counter first;
+    // it only ever moves up, so a well-formed graph is untouched.
+    // #2196 — the repair is DISCLOSED, not silent. Raising the counter protects the
+    // connect about to happen; it says nothing about the ones already made, and a
+    // graph that needed raising had been minting colliding ids all along. Every
+    // success exit below carries the sentence, so no path can drop it.
+    const headroom = ensureLinkIdHeadroom(graph);
+    const headroomWarning = headroom.warning ?? "";
+    const headroomRider = headroom.adjusted
+      ? { link_counter_repaired: { from: headroom.from, to: headroom.to } }
+      : {};
+    const withHeadroom = (...sentences) => [...sentences, headroomWarning].filter(Boolean).join(" ");
 
     // Rail tolerance: when an endpoint is a subgraph boundary rail (by real id
     // -10/-20 or alias "input"/"output"/..), route to the EXISTING-slot I/O
@@ -17415,7 +17438,10 @@ const GRAPH_TOOL_EXECUTORS = {
           from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
           to: { subgraph_output: existing.name },
         },
-        ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+        ...headroomRider,
+        ...(railConnectErr || headroomWarning
+          ? { warning: withHeadroom(railConnectErr ? landedAfterThrowWarning(railConnectErr) : "") }
+          : {}),
       };
     }
 
@@ -17484,7 +17510,10 @@ const GRAPH_TOOL_EXECUTORS = {
           from: { subgraph_input: existing.name },
           to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
         },
-        ...(railConnectErr ? { warning: landedAfterThrowWarning(railConnectErr) } : {}),
+        ...headroomRider,
+        ...(railConnectErr || headroomWarning
+          ? { warning: withHeadroom(railConnectErr ? landedAfterThrowWarning(railConnectErr) : "") }
+          : {}),
       };
     }
 
@@ -17727,7 +17756,8 @@ const GRAPH_TOOL_EXECUTORS = {
         // disclosure at least as much as the clean one.
         ...(slotRewrites.length ? { slots_rewritten: slotRewrites } : {}),
         ...(landedCollateral.length ? { collateral_changes: landedCollateral } : {}),
-        warning: [
+        ...headroomRider,
+        warning: withHeadroom(
           landedAfterThrowWarning(
             connectErr,
             landed.inputIndex !== inIdx
@@ -17739,9 +17769,7 @@ const GRAPH_TOOL_EXECUTORS = {
           titleRewriteWarning(titleRewrites),
           slotRewriteWarning(slotRewrites),
           landedCollateral.length ? connectCollateralWarning(landedCollateral) : "",
-        ]
-          .filter(Boolean)
-          .join(" "),
+        ),
       };
     }
     if (!link) {
@@ -17845,17 +17873,17 @@ const GRAPH_TOOL_EXECUTORS = {
       // #2380 — what moved on nodes this command never named. A third rider on the
       // same key, for the same reason the first two share it.
       ...(collateral.length ? { collateral_changes: collateral } : {}),
-      // All three riders share the single `warning` key, so none can drop the
+      // #2196 — a fourth rider, on the same key for the same reason.
+      ...headroomRider,
+      // All four riders share the single `warning` key, so none can drop the
       // others' sentence when one connect does more than one at once.
-      ...(titleRewrites.length || slotRewrites.length || collateral.length
+      ...(titleRewrites.length || slotRewrites.length || collateral.length || headroomWarning
         ? {
-            warning: [
+            warning: withHeadroom(
               collateral.length ? connectCollateralWarning(collateral) : "",
               titleRewriteWarning(titleRewrites),
               slotRewriteWarning(slotRewrites),
-            ]
-              .filter(Boolean)
-              .join(" "),
+            ),
           }
         : {}),
     };
@@ -25093,6 +25121,12 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_expose_subgraph_output({ from_node_id, from_output, name }) {
     const { graph, canvas } = getGraphCtx();
     const subgraph = graph;
+    // #2108 — a link id is minted as `lastLinkId + 1` and stored with
+    // `_links.set(id, link)`, which REPLACES. A counter sitting below an id the
+    // graph already holds therefore overwrites a bystander's record, and the
+    // wire reads as having moved onto this connection. Raise the counter first;
+    // it only ever moves up, so a well-formed graph is untouched.
+    const headroom = ensureLinkIdHeadroom(graph);
     if (typeof subgraph.addOutput !== "function" || !subgraph.outputNode) {
       throw new Error(
         "graph_expose_subgraph_output must be run INSIDE a subgraph (no subgraph.addOutput on the active graph)",
@@ -25189,7 +25223,25 @@ const GRAPH_TOOL_EXECUTORS = {
         on_host_subgraph_node: true,
         from: { node_id: node.id, output: outputSlot?.name ?? outIdx },
       },
-      ...(exposeConnectErr ? { warning: landedAfterThrowWarning(exposeConnectErr) } : {}),
+      // #2196 — a counter repair is DISCLOSED here too, not only from graph_connect.
+      // These sites take the SAME graph, and the counter only moves up, so whichever
+      // runs first CONSUMES the condition: repair silently here and the next connect
+      // sees `adjusted: false` and says nothing, losing the disclosure for good on a
+      // graph whose earlier connects may already have overwritten a bystander.
+      // #2196 — BOTH warnings, not either/or. Inlined rather than a shared helper:
+      // these handlers are rebuilt by `new Function` harnesses that inject deps by
+      // NAME, so a module-scope function is not in scope here (ReferenceError at
+      // runtime, which is what the connect-throw-verdict suite caught).
+      ...(headroom?.warning || exposeConnectErr
+        ? {
+            warning: [
+              headroom?.warning,
+              exposeConnectErr ? landedAfterThrowWarning(exposeConnectErr) : "",
+            ]
+              .filter(Boolean)
+              .join(" "),
+          }
+        : {}),
     };
   },
 
@@ -25197,6 +25249,12 @@ const GRAPH_TOOL_EXECUTORS = {
   graph_expose_subgraph_input({ to_node_id, to_input, name }) {
     const { graph, canvas } = getGraphCtx();
     const subgraph = graph;
+    // #2108 — a link id is minted as `lastLinkId + 1` and stored with
+    // `_links.set(id, link)`, which REPLACES. A counter sitting below an id the
+    // graph already holds therefore overwrites a bystander's record, and the
+    // wire reads as having moved onto this connection. Raise the counter first;
+    // it only ever moves up, so a well-formed graph is untouched.
+    const headroom = ensureLinkIdHeadroom(graph);
     if (typeof subgraph.addInput !== "function" || !subgraph.inputNode) {
       throw new Error(
         "graph_expose_subgraph_input must be run INSIDE a subgraph (no subgraph.addInput on the active graph)",
@@ -25284,7 +25342,25 @@ const GRAPH_TOOL_EXECUTORS = {
         on_host_subgraph_node: true,
         to: { node_id: node.id, input: inputSlot?.name ?? inIdx },
       },
-      ...(exposeConnectErr ? { warning: landedAfterThrowWarning(exposeConnectErr) } : {}),
+      // #2196 — a counter repair is DISCLOSED here too, not only from graph_connect.
+      // These sites take the SAME graph, and the counter only moves up, so whichever
+      // runs first CONSUMES the condition: repair silently here and the next connect
+      // sees `adjusted: false` and says nothing, losing the disclosure for good on a
+      // graph whose earlier connects may already have overwritten a bystander.
+      // #2196 — BOTH warnings, not either/or. Inlined rather than a shared helper:
+      // these handlers are rebuilt by `new Function` harnesses that inject deps by
+      // NAME, so a module-scope function is not in scope here (ReferenceError at
+      // runtime, which is what the connect-throw-verdict suite caught).
+      ...(headroom?.warning || exposeConnectErr
+        ? {
+            warning: [
+              headroom?.warning,
+              exposeConnectErr ? landedAfterThrowWarning(exposeConnectErr) : "",
+            ]
+              .filter(Boolean)
+              .join(" "),
+          }
+        : {}),
     };
   },
 
@@ -25789,6 +25865,20 @@ const GRAPH_TOOL_EXECUTORS = {
     const rawClipboard = getEffectiveClipboard(storage);
     const layout = getVerifiedLayout(rawClipboard) ?? parseClipboardLayout(rawClipboard);
     let auxIdSanitizedCount = 0;
+    // #2108 — paste ALLOCATES link ids, so it needs the same headroom as connect.
+    // Read out of the installed frontend's own sources: `LGraphCanvas` holds no
+    // `lastLinkId`/`addLink`/`new LLink` — `pasteFromClipboard` delegates to
+    // `_deserializeItems`, and the links it lands are minted by `LGraphNode`'s
+    // connect path with the shared idiom
+    // `toLinkId(Number(graph.state.lastLinkId) + 1)` into a `_links.set` that
+    // REPLACES. Both halves of a paste allocate: the internal wires among the
+    // copied nodes (this handler's own note promises they are preserved) and,
+    // with connect_inputs, the reconnection to existing nodes.
+    //
+    // So a counter sitting below an id the graph already holds makes a paste
+    // overwrite a bystander exactly as a connect did. Raising is idempotent and
+    // only ever moves the counter up, so a well-formed graph is untouched.
+    const headroom = ensureLinkIdHeadroom(graph);
     graph.beforeChange?.();
     try {
       withInMemoryClipboard(storage, () => canvas.pasteFromClipboard(options));
@@ -25872,6 +25962,12 @@ const GRAPH_TOOL_EXECUTORS = {
       note:
         "Internal wires among the copied nodes are preserved. connect_inputs:false (default) drops only external feeds; pass true to also reconnect those.",
       ...(auxIdSanitizedCount ? { aux_id_sanitized: auxIdSanitizedCount } : {}),
+      // #2196 — DISCLOSED, not silent. Raising protects the paste about to
+      // happen; it says nothing about connects already made, and a graph that
+      // needed raising had been minting colliding ids all along.
+      ...(headroom.adjusted
+        ? { link_counter_repaired: { from: headroom.from, to: headroom.to } }
+        : {}),
     };
     if (groupsNow.length) {
       result.groups = groupsNow.map((g) => summarizeGroup(graph, g));
@@ -25881,6 +25977,11 @@ const GRAPH_TOOL_EXECUTORS = {
       result.dropped_nodes = dropped;
       result.dropped_types = dropped_types;
       result.warning = formatDroppedWarning(dropped);
+    }
+    // Appended rather than assigned: a drop warning and a counter repair are
+    // independent, and the caller needs both.
+    if (headroom.warning) {
+      result.warning = [result.warning, headroom.warning].filter(Boolean).join(" ");
     }
     return result;
   },
@@ -27377,6 +27478,8 @@ const GRAPH_TOOL_EXECUTORS = {
     const source = { sourceNodeId: String(node.id), sourceWidgetName: w.name };
     const action = demote ? "demote" : "promote";
     let strategy = "link-only";
+      // #2196 -- link-counter repairs made while promoting, surfaced on the reply.
+      const headroomWarnings = [];
     graph.beforeChange?.();
     try {
       // Preview widgets ($$canvas-image-preview) have no connectable input slot,
@@ -27393,6 +27496,18 @@ const GRAPH_TOOL_EXECUTORS = {
         try {
           let changed = false;
           for (const p of parents) {
+            // #2108 — promoteWidgetByLink allocates a link in p.subgraph's own
+            // store, which keeps its own counter and can be stale independently
+            // of the parent's. Raised here rather than inside that function: see
+            // the note there.
+            // #2196 -- collected, not dropped. A silent repair here CONSUMES the condition
+            // for this subgraph: the counter only moves up, so a later connect INSIDE it
+            // reports `adjusted: false` and the user never learns that earlier connects
+            // there may already have overwritten an unrelated link.
+            if (!demote) {
+              const h = ensureLinkIdHeadroom(p?.subgraph);
+              if (h?.warning) headroomWarnings.push(h.warning);
+            }
             const result = demote ? demoteWidgetByLink(p, source) : promoteWidgetByLink(p, node, w);
             changed = changed || result.changed;
           }
@@ -27434,6 +27549,7 @@ const GRAPH_TOOL_EXECUTORS = {
       from_node: node.id,
       on_subgraph_nodes: parents.map((p) => p.id),
       strategy,
+      ...(headroomWarnings.length ? { warning: headroomWarnings.join(" ") } : {}),
     };
   },
 

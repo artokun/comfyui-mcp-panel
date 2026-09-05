@@ -9,6 +9,39 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
 - Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
+- the link-id repair now reads the LEGACY link store too, so it applies on older LiteGraph builds (#2108). highestLinkId read only `_links`, the modern private Map; older builds expose the plain record as `links`, which the rest of the panel already handles (disconnect-verify, connect-verify). On those builds the helper returned null, so `adjusted` was false and the stale counter was never raised — the overwrite this fix exists to prevent survived it, silently, because "no links" and "no store" gave the same answer. Adds execution tests that mint an id after the repair and assert it is free, rather than only reading the bundle for call sites. Found by the Copilot review on the PR
+- panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
+  as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
+  whose counter sits below an id it already holds had a bystander's record silently
+  overwritten, reading as "that wire moved onto the new link". Every path that mints a
+  link now raises the counter above the ids actually present first; it only ever moves
+  up, so a well-formed graph is untouched. An API/prompt graph carries no `last_link_id`
+  at all, which is one way to arrive in that state. panel_connect also DISCLOSES the
+  repair on every success path instead of doing it silently: raising the counter protects
+  the next connect and cannot undo the collisions already made, so a graph that needed it
+  may already have wires that moved, and the reply now says so (#2196).
+- panel_paste_nodes raises the counter too — it was the one allocating path still
+  unguarded (#2108, #2196). Read out of the installed frontend'''s own sources:
+  `LGraphCanvas` holds no `lastLinkId`/`addLink`/`new LLink`, so
+  `pasteFromClipboard` delegates to `_deserializeItems`, and the links it lands are
+  minted by `LGraphNode`'''s connect path with the same
+  `toLinkId(Number(graph.state.lastLinkId) + 1)` into a replacing `_links.set`. Both
+  halves of a paste allocate: the internal wires among the copied nodes (which the
+  handler'''s own note promises are preserved) and, with connect_inputs, the
+  reconnection to existing nodes. Copy-paste is a routine first move on exactly the
+  API/prompt graph that arrives with no `last_link_id`, so this was reachable by the
+  same route as the reported connect. The repair rides on the paste result and is
+  appended to any dropped-nodes warning rather than replacing it.
+- the counter repair is disclosed from EVERY caller, not only panel_connect (#2196).
+  panel_expose_subgraph_output/_input and the widget-promotion path repaired the
+  counter silently. They take the same graph, and the counter only moves up, so
+  whichever ran first consumed the condition: repair silently there and the next
+  panel_connect saw nothing to report, losing the disclosure for good on a graph
+  whose earlier connects may already have overwritten an unrelated link. All three
+  now surface it, joined with any landed-after-throw warning rather than replacing
+  it. Inlined rather than shared, because those handlers are rebuilt by
+  `new Function` harnesses that inject dependencies by name — a module-scope helper
+  throws ReferenceError there, which the connect-throw-verdict suite caught.
 
 ## [0.15.176] - 2026-09-05
 
