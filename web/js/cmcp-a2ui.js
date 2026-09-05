@@ -260,7 +260,15 @@ export const A2UI_CSS = `
 }
 .cmcp-a2ui { border: 1px solid var(--p-content-border-color, #3f3f46); border-left: 3px solid var(--p-primary-color, #3a7bd5);
   border-radius: 8px; padding: 0.6rem 0.7rem; margin: 0.35rem 0; background: var(--p-content-background, #1f1f23);
-  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); position: relative; }
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9846); position: relative;
+  /* All three terms cap the card to the SAME fraction. The log-relative term used
+     to be a full-height one, and that was not equivalent: .cmcp-log is shorter than
+     the viewport (header, toolbar and composer take the rest), so whenever the log
+     is under 70vh that term was the smallest and won -- at a 900px viewport and a
+     500px log it allowed 468px, i.e. 94% of the log. A card could still consume the
+     chat area, which is the thing this rule exists to prevent. The guard test
+     asserts the old value is absent, so do not name it here. */
+  max-height: min(70vh, 42rem, calc(70% - 2rem)); overflow-y: auto; }
 .cmcp-a2ui.resolved { opacity: 0.85; }
 .cmcp-a2ui-title { font-weight: 600; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8862); text-transform: uppercase; letter-spacing: 0.05em;
   opacity: 0.7; margin-bottom: 0.4rem; padding-right: 1.2rem; }
