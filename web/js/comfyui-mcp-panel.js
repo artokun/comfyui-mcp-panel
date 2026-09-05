@@ -342,6 +342,7 @@ import {
   NODE_DEF_REFRESH_REASONS,
   describeNodeDefRefresh,
   describeStaleBundleRefresh,
+  describeStaleBundleRun,
   describeRefreshGraphLoss,
   restoredLiveNodesNote,
 } from "./lib/node-def-refresh.js";
@@ -1807,6 +1808,16 @@ async function refuseStaleBundleRefresh() {
   } catch {
     return null;
   }
+}
+
+/**
+ * #2252 — same installed-pack probe as refuseStaleBundleRefresh, mapped onto a
+ * panel_run refusal. A stale tab must not reach queuePrompt or dispatchScopedRun.
+ */
+async function refuseStaleBundleRun() {
+  const stale = await refuseStaleBundleRefresh();
+  if (!stale) return null;
+  return describeStaleBundleRun({ running: stale.running, installed: stale.installed });
 }
 
 async function registerComfyNodeDefs(preloadedDefs, runOpts, runControl) {
@@ -20103,6 +20114,13 @@ const GRAPH_TOOL_EXECUTORS = {
         targetId,
       });
     };
+    // #2252 — a stale live bundle must not accept a run. 0.15.173 vs installed
+    // 0.15.174 silently dropped dispatch (queued_unknown, no prompt_id, ComfyUI
+    // never logged got prompt). Refuse with a hard-refresh requirement BEFORE
+    // the panel_run hold, prompt construction, queuePrompt, or scoped dispatch.
+    // An unreadable version probe fails open (same rule as #2027).
+    const staleBundle = await refuseStaleBundleRun();
+    if (staleBundle) return staleBundle;
     // Mark the dispatch before queuePrompt can produce a fast execution_success.
     // The tracker holds that completion until the delayed /prompt response gives
     // it a prompt-scoped key, then replays the exact batch keyed.

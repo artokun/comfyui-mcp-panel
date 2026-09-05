@@ -99,6 +99,7 @@ import {
   compareRunDispatchIdentity,
   downgradeUnstableRunResult,
 } from "../../web/js/lib/run-dispatch-identity.js";
+import { describeStaleBundleRun } from "../../web/js/lib/node-def-refresh.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -709,7 +710,7 @@ test("#1565 P0: a run abandoned at its bound still FENCES its own late post, wit
  * technique add-node-command-budget.test.mjs uses) so the wiring can be exercised in
  * milliseconds; the shipped VALUES are pinned separately below.
  */
-function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef, runDispatchIdentityRef, resolveRunToNodeTargetRef }) {
+function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runCompletionRef, armRunReconcileSweepRef, runReceiptSender, runReceiptRouteRef, runReceiptSessionRef, panelRunOwnerRef, runDispatchIdentityRef, resolveRunToNodeTargetRef, refuseStaleBundleRun }) {
   const seen = { dispatchArgs: null };
   const localRunToken = Symbol("test local graph run");
   const deps = {
@@ -795,6 +796,8 @@ function realGraphRun({ app, apiTarget, budgetMs, serializeMs, dispatch, runComp
         targetId,
       })),
     panelRunOwnerRef: panelRunOwnerRef ?? { current: {} },
+    // #2252 — fail-open default so budget/dispatch tests still exercise a current bundle.
+    refuseStaleBundleRun: refuseStaleBundleRun ?? (async () => null),
   };
   const names = Object.keys(deps);
   const factory = new Function(
