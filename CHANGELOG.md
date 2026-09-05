@@ -7,9 +7,13 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-
-- After an already-open panel_open_workflow applies last_open, panel_graph_outline / panel_query_graph refuse a leftover previous-tab or archived canvas when the live graph is smaller than the named file — failed switch repaint and another open tab matching the live root stay fail-closed; fixtures without leftover proof stay available (#1215)
 - panel_run no longer refuses forever on a STALE socket flag (#2854). ComfyUI arms comfyBackendSocketDown from a failed _pollQueue during a long GPU-bound render, and `reconnected` never fires because the websocket never left OPEN -- so the flag never cleared. Every other panel_* path asks comfyBackendIsDown(), whose #1325 rule is that flagged-down over an OPEN socket is stale rather than down; the run-dispatch identity read the raw flag instead, so it alone reported "backend socket down" and refused every dispatch while reads, edits and the ComfyUI queue all worked. Fail-closed directions are unchanged: the flag with a non-OPEN or unreadable readyState still refuses
+
+## [0.15.176] - 2026-09-05
+
+### Fixed
+
+- After an already-open panel_open_workflow applies last_open, panel_graph_outline / panel_query_graph refuse a leftover previous-tab or archived canvas when the live graph is smaller than the named file — failed switch repaint and another open tab matching the live root stay fail-closed; fixtures without leftover proof stay available (#1215, #2255)
 
 
 ## [0.15.175] - 2026-09-05
