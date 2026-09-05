@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
+- Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
 - the link-id repair now reads the LEGACY link store too, so it applies on older LiteGraph builds (#2108). highestLinkId read only `_links`, the modern private Map; older builds expose the plain record as `links`, which the rest of the panel already handles (disconnect-verify, connect-verify). On those builds the helper returned null, so `adjusted` was false and the stale counter was never raised — the overwrite this fix exists to prevent survived it, silently, because "no links" and "no store" gave the same answer. Adds execution tests that mint an id after the repair and assert it is free, rather than only reading the bundle for call sites. Found by the Copilot review on the PR
 - panel_connect no longer overwrites an unrelated link (#2108, #2196). A link id is minted
   as `lastLinkId + 1` and stored with `_links.set(id, link)`, which replaces — so a graph
