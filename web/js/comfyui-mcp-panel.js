@@ -314,6 +314,7 @@ import {
 import {
   snapshotExternalLinks,
   verifyExternalLinks,
+  reseatExternalLinksByIdentity,
 } from "./lib/unpack-link-verify.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { isGenericManagerUpdateError, readUpdateTraceback } from "./lib/manager-update-traceback.js";
@@ -25603,6 +25604,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // expected link by NAME against the live link table; if any cannot be proven
     // present, roll back and refuse with exactly what would have been lost rather
     // than report a success over a graph that would render wrong.
+    //
+    // comfyui-mcp#2887 — #1665 only counted surviving wires. After a MiniMax-style
+    // autogrow rebuild, litegraph can still attach those wires to the WRONG named
+    // child (`IMAGE` on `ref_videos.ref_video_0`). Reseat by the snapshotted
+    // boundary identity (namespace + child + type) before verifying; a slot that
+    // is not unique is left for the refusal below rather than guessed.
+    const reseated = reseatExternalLinksByIdentity(graph, externalLinks);
     const linkCheck = verifyExternalLinks(graph, externalLinks);
     if (linkCheck.dropped.length) {
       let rolledBack = false;
@@ -25619,8 +25627,9 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error(
         `unpack_subgraph refused: the unpack did not restore ${linkCheck.dropped.length} ` +
           `external link(s):\n${lost}\n` +
-          `These are links litegraph's unpackSubgraph rewires by slot index and silently loses ` +
-          `when the target is a widget-converted or dynamic input (comfyui-mcp#1665). ` +
+          `These are links litegraph's unpackSubgraph rewires by slot index: it can DROP them ` +
+          `on widget-converted/dynamic targets (#1665) or RESTORE them onto the wrong named ` +
+          `child after a dynamic-input rebuild (#2887). ` +
           (rolledBack
             ? `The workflow was reloaded from its pre-unpack snapshot, so the subgraph and all ` +
               `its links are intact — nothing was lost. Unpack in the ComfyUI canvas and re-add ` +
@@ -25644,8 +25653,9 @@ const GRAPH_TOOL_EXECUTORS = {
         // pre-unpack state could not even be read (pre-existing corruption the unpack
         // did not cause, disclosed rather than silently inherited).
         ...(externalLinks.links.length
-          ? { external_links_verified: linkCheck.restored }
+          ? { external_links_verified: linkCheck.restored, external_links_identity_ok: true }
           : {}),
+        ...(reseated ? { external_links_reseated: reseated } : {}),
         ...(linkCheck.unverifiable.length ? { external_links_unverifiable: linkCheck.unverifiable } : {}),
         // #979 — disclose what was carried inward. An unpack cannot be undone from
         // this result, so a caller checking values afterwards needs to know which

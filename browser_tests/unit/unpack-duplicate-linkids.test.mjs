@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import {
   snapshotExternalLinks,
   verifyExternalLinks,
+  reseatExternalLinksByIdentity,
 } from "../../web/js/lib/unpack-link-verify.js";
 import {
   materializePromotedValues,
@@ -175,6 +176,7 @@ function buildUnpack(graph, { app, canvas, rootGraph, methodSrc = unpackSrc } = 
     "resolveLoadGraphArgs",
     "snapshotExternalLinks",
     "verifyExternalLinks",
+    "reseatExternalLinksByIdentity",
     "materializedValuesNote",
     `return ({
 ${methodSrc}
@@ -199,6 +201,7 @@ ${methodSrc}
     resolveLoadGraphArgs,
     snapshotExternalLinks,
     verifyExternalLinks,
+    reseatExternalLinksByIdentity,
     materializedValuesNote,
   );
 }
@@ -306,4 +309,8 @@ test("#1938 the shipped method still owns the dedupe, before snapshot and unpack
   assert.ok(dedupeAt < snapshotAt, "dedupe must precede the snapshot");
   assert.ok(dedupeAt < unpackAt, "dedupe must precede the unpack");
   assert.match(unpackSrc, /graph\.unpackSubgraph\(node[\s\S]{0,400}?\} catch \(err\)/);
+  const reseatAt = unpackSrc.indexOf("reseatExternalLinksByIdentity(graph, externalLinks)");
+  const verifyAt = unpackSrc.indexOf("verifyExternalLinks(graph, externalLinks)");
+  assert.ok(reseatAt > unpackAt, "identity reseat must follow unpack");
+  assert.ok(verifyAt > reseatAt, "identity verify must follow reseat");
 });

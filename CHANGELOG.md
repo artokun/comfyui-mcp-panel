@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_unpack_subgraph reseats and verifies restored links by boundary-slot identity (dynamic namespace + child name + type) instead of trusting LiteGraph's post-rebuild slot indices, and rolls back if that identity is not unique. An IMAGE feed landing on MiniMaxH3ReferenceToVideo `ref_videos` after unpack is a refusal, not a silent graph (comfyui-mcp#2887)
 - panel_set_widget combo refusals list the live options for generic enums (device/precision) instead of applying the private filename/path redaction to every combo (#2265)
 
 ## [0.15.178] - 2026-09-05

@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import {
   snapshotExternalLinks,
   verifyExternalLinks,
+  reseatExternalLinksByIdentity,
 } from "../../web/js/lib/unpack-link-verify.js";
 
 const mkLink = (id, origin_id, origin_slot, target_id, target_slot) => ({
@@ -68,12 +69,16 @@ test("#1665 snapshot names external endpoints on BOTH sides of the wrapper", () 
   assert.equal(snap.unverifiable.length, 0);
   assert.equal(snap.links.length, 2);
   const inbound = snap.links.find((l) => l.kind === "in");
-  assert.deepEqual(inbound.source, { node_id: 131, slot: 0, name: "INT" });
+  assert.deepEqual(inbound.source, { node_id: 131, slot: 0, name: "INT", type: null });
+  assert.deepEqual(inbound.interior, []);
+  assert.equal(inbound.identity_unresolved, false);
   assert.equal(inbound.rail, "int_in");
   assert.equal(inbound.consumers, 1);
   assert.equal(inbound.baseline, 1);
   const outbound = snap.links.find((l) => l.kind === "out");
-  assert.deepEqual(outbound.target, { node_id: 136, slot: 2, name: "length" });
+  assert.deepEqual(outbound.target, { node_id: 136, slot: 2, name: "length", type: null });
+  assert.equal(outbound.producer, null);
+  assert.equal(outbound.identity_unresolved, false);
   assert.equal(outbound.rail, "int_out");
 });
 
@@ -243,3 +248,143 @@ test("#1665 object-keyed link tables (older LiteGraph) verify the same", () => {
   assert.equal(res.restored, 1);
   assert.deepEqual(res.dropped, []);
 });
+
+const inputT = (name, link, type) => ({ name, link, type });
+const outputT = (name, links, type) => ({ name, links, type });
+
+/** Reporter's MiniMaxH3 shape: dotted autogrow children plus shared INT rails. */
+function minimaxUnpackFixture() {
+  const load = { id: 10, outputs: [outputT("IMAGE", [50], "IMAGE")], inputs: [] };
+  const res = { id: 11, outputs: [outputT("INT", [51], "INT")], inputs: [] };
+  const inner = {
+    id: 136,
+    inputs: [
+      inputT("prompt", null, "STRING"),
+      inputT("ref_images.ref_image_0", 900, "IMAGE"),
+      inputT("ref_videos.ref_video_0", null, "VIDEO"),
+      inputT("width", 901, "INT"),
+    ],
+    outputs: [],
+  };
+  const interiorLinks = [mkLink(900, -10, 0, 136, 1), mkLink(901, -10, 1, 136, 3)];
+  const subgraphNode = {
+    id: 6350,
+    inputs: [inputT("ref_images", 50, "IMAGE"), inputT("width", 51, "INT")],
+    outputs: [],
+    subgraph: {
+      inputs: [
+        { name: "ref_images", type: "IMAGE", linkIds: [900] },
+        { name: "width", type: "INT", linkIds: [901] },
+      ],
+      _links: new Map(interiorLinks.map((l) => [l.id, l])),
+      _nodes: [inner],
+      getNodeById(id) {
+        return this._nodes.find((n) => String(n.id) === String(id)) ?? null;
+      },
+    },
+  };
+  return {
+    graph: mkGraph([load, res, subgraphNode], [mkLink(50, 10, 0, 6350, 0), mkLink(51, 11, 0, 6350, 1)]),
+    inner,
+    subgraphNode,
+  };
+}
+
+function scrambledMinimaxGraph(inner) {
+  inner.inputs = [
+    inputT("prompt", null, "STRING"),
+    inputT("ref_images.ref_image_0", null, "IMAGE"),
+    inputT("ref_videos.ref_video_0", 60, "VIDEO"),
+    inputT("width", 61, "INT"),
+  ];
+  return mkGraph(
+    [
+      { id: 10, outputs: [outputT("IMAGE", [60], "IMAGE")], inputs: [] },
+      { id: 11, outputs: [outputT("INT", [61], "INT")], inputs: [] },
+      inner,
+    ],
+    [mkLink(60, 10, 0, 136, 2), mkLink(61, 11, 0, 136, 3)],
+  );
+}
+
+test("#2887 snapshot names interior autogrow children, not just the rail", () => {
+  const { graph, subgraphNode } = minimaxUnpackFixture();
+  const snap = snapshotExternalLinks(graph, subgraphNode);
+  assert.equal(snap.unverifiable.length, 0);
+  const imageIn = snap.links.find((l) => l.rail === "ref_images");
+  assert.deepEqual(imageIn.interior, [{ node_id: 136, name: "ref_images.ref_image_0", type: "IMAGE" }]);
+  assert.equal(imageIn.identity_unresolved, false);
+  const widthIn = snap.links.find((l) => l.rail === "width");
+  assert.deepEqual(widthIn.interior, [{ node_id: 136, name: "width", type: "INT" }]);
+});
+
+test("#2887 a count-matching scramble onto ref_videos is DROPPED, not restored", () => {
+  const { graph, inner, subgraphNode } = minimaxUnpackFixture();
+  const snap = snapshotExternalLinks(graph, subgraphNode);
+  const graph2 = scrambledMinimaxGraph(inner);
+  const res = verifyExternalLinks(graph2, snap);
+  assert.equal(res.restored, 1, "the INT width rail still sits on width");
+  assert.equal(res.dropped.length, 1);
+  assert.match(res.dropped[0], /ref_images\.ref_image_0/);
+  assert.match(res.dropped[0], /10\.IMAGE/);
+});
+
+test("#2887 reseat moves the IMAGE off ref_videos onto the unique named child", () => {
+  const { graph, inner, subgraphNode } = minimaxUnpackFixture();
+  const snap = snapshotExternalLinks(graph, subgraphNode);
+  const graph2 = scrambledMinimaxGraph(inner);
+  const moved = reseatExternalLinksByIdentity(graph2, snap);
+  assert.ok(moved >= 1);
+  assert.equal(inner.inputs[1].link, 60, "ref_images.ref_image_0 holds the IMAGE");
+  assert.equal(inner.inputs[2].link, null, "ref_videos is empty again");
+  const res = verifyExternalLinks(graph2, snap);
+  assert.equal(res.restored, 2);
+  assert.deepEqual(res.dropped, []);
+});
+
+test("#2887 duplicate child names fail closed instead of reseating onto a guess", () => {
+  const { graph, inner, subgraphNode } = minimaxUnpackFixture();
+  const snap = snapshotExternalLinks(graph, subgraphNode);
+  inner.inputs = [
+    inputT("ref_images.ref_image_0", 60, "IMAGE"),
+    inputT("ref_images.ref_image_0", null, "IMAGE"),
+    inputT("ref_videos.ref_video_0", null, "VIDEO"),
+    inputT("width", 61, "INT"),
+  ];
+  const graph2 = mkGraph(
+    [
+      { id: 10, outputs: [outputT("IMAGE", [60], "IMAGE")], inputs: [] },
+      { id: 11, outputs: [outputT("INT", [61], "INT")], inputs: [] },
+      inner,
+    ],
+    [mkLink(60, 10, 0, 136, 0), mkLink(61, 11, 0, 136, 3)],
+  );
+  assert.equal(reseatExternalLinksByIdentity(graph2, snap), 0);
+  const res = verifyExternalLinks(graph2, snap);
+  assert.match(res.dropped.join("\n"), /ref_images\.ref_image_0/);
+});
+
+test("#2887 an unreadable interior store with a live linkId is unresolved identity", () => {
+  const load = { id: 10, outputs: [outputT("IMAGE", [50], "IMAGE")], inputs: [] };
+  const subgraphNode = {
+    id: 6350,
+    inputs: [inputT("ref_images", 50, "IMAGE")],
+    outputs: [],
+    subgraph: {
+      inputs: [{ name: "ref_images", type: "IMAGE", linkIds: [900] }],
+      _links: new Map(),
+      _nodes: [],
+    },
+  };
+  const graph = mkGraph([load, subgraphNode], [mkLink(50, 10, 0, 6350, 0)]);
+  const snap = snapshotExternalLinks(graph, subgraphNode);
+  assert.equal(snap.links[0].identity_unresolved, true);
+  assert.deepEqual(snap.links[0].interior, []);
+  const after = mkGraph(
+    [load, { id: 136, inputs: [inputT("ref_images.ref_image_0", 60, "IMAGE")], outputs: [] }],
+    [mkLink(60, 10, 0, 136, 0)],
+  );
+  const res = verifyExternalLinks(after, snap);
+  assert.equal(res.dropped.length, 1);
+});
+
