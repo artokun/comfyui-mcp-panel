@@ -6,8 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.179] - 2026-09-05
+
 ### Fixed
-- panel_set_widget combo refusals list the live options for generic enums (device/precision) instead of applying the private filename/path redaction to every combo (#2265)
+- panel_set_widget combo refusals list the live options for generic enums (device/precision) instead of applying the private filename/path redaction to every combo (#2265, #2271)
+
 
 ## [0.15.178] - 2026-09-05
 
