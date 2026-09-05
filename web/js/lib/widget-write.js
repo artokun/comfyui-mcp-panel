@@ -9,6 +9,7 @@ import {
   boundPropertyState,
   boundPropertyUnverifiedNote,
 } from "./widget-bound-property.js";
+import { optionsLookLikeFiles } from "./live-combo-availability.js";
 
 // #976: captured at module load so invoking a widget's callback cannot read any
 // property off the callback itself (a poisoned `.call` getter or a Proxy trap would
@@ -218,6 +219,44 @@ export function readComboOptions(widget) {
  */
 export function comboOptions(widget) {
   return readComboOptions(widget).options;
+}
+
+/**
+ * #2265 / #2547 — the diagnostic half of an off-list combo refusal.
+ *
+ * #2547 omitted every option value because a LoadImage/checkpoint list can name
+ * private files. That rule was applied to EVERY combo, so a 3-value `device`
+ * enum refused "auto" while naming the count and none of the choices. Redact
+ * only when the live list looks like files on disk (same majority-extension
+ * rule as `optionsLookLikeFiles`); generic enums (device/precision/sampler)
+ * list the values so a stale guess can be corrected.
+ */
+function describeOffListCombo(name, value, options) {
+  const count = options.length;
+  const head =
+    `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
+    `"${name}". Its option list WAS read successfully and holds ${count} ` +
+    `option${count === 1 ? "" : "s"}, none of them this value — so this is a ` +
+    `rejected VALUE, not an unreadable list. `;
+  if (optionsLookLikeFiles(options)) {
+    return (
+      head +
+      `The valid option values are intentionally omitted from this diagnostic because ` +
+      `combo values may contain private filenames or paths. Choose a value from the ` +
+      `widget's current dropdown (refreshing its options first if needed) and retry.`
+    );
+  }
+  let listed = null;
+  try {
+    listed = options.map((o) => JSON.stringify(o)).join(", ");
+  } catch {
+    // unknown-ok: a hostile option must not replace the off-list refusal
+    listed = null;
+  }
+  if (!listed) {
+    return head + `Choose a value from the widget's current dropdown and retry.`;
+  }
+  return head + `Valid options: ${listed}.`;
 }
 
 /** #1126 — the human-readable half of a `readComboOptions` UNREADABLE outcome. */
@@ -1550,16 +1589,7 @@ export function coerceWidgetValue(
     // installed is caught here instead of failing 40 seconds into a run. The message says
     // which of the two happened, so an agent can tell "your value is wrong" apart from
     // "the panel could not look" and stop treating them as the same failure.
-    throw new WidgetWriteError(
-      `Value ${JSON.stringify(value)} is not a valid option for combo widget ` +
-        `"${name}". Its option list WAS read successfully and holds ${options.length} ` +
-        `option${options.length === 1 ? "" : "s"}, none of them this value — so this is a ` +
-        `rejected VALUE, not an unreadable list. The valid option values are intentionally ` +
-        `omitted from this diagnostic because combo values may contain private filenames ` +
-        `or paths. Choose a value from the widget's current dropdown (refreshing its ` +
-        `options first if needed) and retry.`,
-      { combo: true },
-    );
+    throw new WidgetWriteError(describeOffListCombo(name, value, options), { combo: true });
   }
 
   if (isNumericWidget(widget)) {
