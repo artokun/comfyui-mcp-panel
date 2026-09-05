@@ -6,6 +6,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- panel_set_widget's generated custom-widget refresh no longer throws after a verified write on a migrated node whose serialized state has no `widgets_values`. The rebuild called `onConfigure()` with no arguments, so a pack that reads `info.widgets_values` (UnifiedResizeImageMask after the widget layout drifted from the current definition) reported `generated_widgets_refresh_failed` while the values had already landed. The refresh now serializes the live node, fills `widgets_values` from the live widget list when serialize omitted it, and skips `onConfigure` when those values are still missing (#2264)
+
 ## [0.15.178] - 2026-09-05
 
 ### Fixed
