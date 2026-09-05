@@ -24674,8 +24674,46 @@ const GRAPH_TOOL_EXECUTORS = {
           ? {
               stale: "unknown",
               reloaded: false,
-              stale_hint:
-                "Could not verify whether the on-disk file still matches this tab (disk read unavailable or slower than its deadline). Treat the canvas as possibly stale; call panel_load_workflow to be sure you have the on-disk version.",
+              // #2139 — the advice here is DESTRUCTIVE and was issued unconditionally.
+              // `panel_load_workflow` replaces the canvas with the on-disk copy, so on a
+              // tab with unsaved edits it discards them. Every other arm of this chain
+              // consults `dirtyNow || wasDirty` before recommending it (the CONFLICT arm
+              // above says so outright, and the arm below is the proven-clean `else`);
+              // this one alone did not, and it is the arm that fires when the disk read
+              // was "unavailable or slower than its deadline" — a transient, common
+              // condition, not a rare one. So the one path that admits it verified
+              // nothing was also the one giving an unconditional instruction to
+              // overwrite.
+              //
+              // Positive evidence only, as in #2204: `isModified === true` is evidence
+              // of drift; `false` and `undefined` are evidence of NOTHING (measured — a
+              // programmatic node add and a direct widget write both leave the flag
+              // false). So a silent tab is never called clean here, and the sentence
+              // added is about what the caller stands to lose, not a claim they are safe.
+              //
+              // And the remedy must not be able to cause the loss it is warning about.
+              // `classifyInPlaceOverwrite` returns "skip" for a tab already
+              // `isPersisted === true` (workflow-save.js), so an ordinary save of a
+              // persisted tab overwrites in place WITHOUT reading disk. On THIS branch
+              // the disk contents are precisely what could not be established, so
+              // "save first" could clobber the very change the hint says might exist.
+              // Both arms therefore point at a NEW path, which keeps both versions.
+              ...(dirtyNow || wasDirty
+                ? {
+                    stale_hint:
+                      "Could not verify whether the on-disk file still matches this tab (disk read unavailable or slower than its deadline), AND this tab has unsaved edits. Treat the canvas as possibly stale, but do NOT reach for panel_load_workflow first: it loads the on-disk version over the canvas and those unsaved edits are discarded. Save to a NEW path (Save As / panel_save_workflow with a different filename), which keeps both versions: a plain save of an already-persisted tab overwrites in place WITHOUT comparing to disk, so if the file did change underneath it, that change is gone.",
+                    // NOT `conflict: true`. A conflict is "the file changed on disk
+                    // AND this tab has unsaved edits" — and on this arm staleness is
+                    // explicitly UNVERIFIED, so only the second half is known. Claiming
+                    // one would assert the very thing the sentence above admits it could
+                    // not check, which is the same overclaim the positive-evidence rule
+                    // in #2204 exists to prevent. The hint says what is at risk; it does
+                    // not need a flag saying what was not established.
+                  }
+                : {
+                    stale_hint:
+                      "Could not verify whether the on-disk file still matches this tab (disk read unavailable or slower than its deadline). Treat the canvas as possibly stale; call panel_load_workflow to be sure you have the on-disk version. This tab reports no unsaved edits — though an edit written programmatically can leave that flag unset, so if you are unsure, save to a NEW path first rather than over this one: a plain save of an already-persisted tab overwrites in place WITHOUT comparing to disk.",
+                  }),
             }
           : {}),
       // #1215 — the weaker sibling of foreign_source_state. The repaint source
