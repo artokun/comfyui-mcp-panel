@@ -7,6 +7,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+
+- After an already-open panel_open_workflow applies last_open, panel_graph_outline / panel_query_graph refuse a leftover previous-tab or archived canvas when the live graph is smaller than the named file — failed switch repaint and another open tab matching the live root stay fail-closed; fixtures without leftover proof stay available (#1215)
 - the CivitAI sign-in timeout no longer recommends a setting that cannot sign the browser in (#2044). It pointed at the CivitAI API token setting; `py/civitai_proxy.py` authenticates the browser solely from its OAuth token file and never reads CIVITAI_API_TOKEN — the name occurs there only inside a docstring — so the advice named a remedy for a different subsystem. The message now names --enable-cors-header, whose absence installs the origin-only middleware that produces the 403, and says the token setting will not help. It also no longer rides the 3.5s toast default: it is the only explanation the user gets after a four-minute wait
 - pin the property the sign-in timeout silently depends on (#2044). `++tries` sits after `await refreshAuth()`, so if that call ever propagated a rejection the interval callback would abort before the counter moved, the count would never reach 120, and the new give-up branch would never fire - restoring the exact silence this fixes, under the server-down/network-error case that is one of the likelier reasons a sign-in does not complete. It is safe only because `refreshAuth` swallows its own fetch failure and records signed-out; that is now asserted at the site that depends on it, so a refactor letting it throw fails a test instead of quietly un-fixing the timeout.
 - CivitAI sign-in now says when it did not complete (panel#2044). The poll gave up after
@@ -25,6 +27,7 @@ All notable changes to this project are documented here. This project adheres to
   "Définir le jeton CivitAI…" — the one actionable sentence in a message about a
   sign-in that cannot succeed was the part they could not act on. It now interpolates
   tr("panel.set_civitai_token"), so the quoted text is whatever the running UI shows.
+
 
 ## [0.15.175] - 2026-09-05
 
