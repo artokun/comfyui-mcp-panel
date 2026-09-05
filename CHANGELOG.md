@@ -9,6 +9,12 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
 - Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
+- the cross-repo contract comment now quotes comfyui-mcp accurately (#2511). It wrote `parts.join(NEWLINE)`; the real matcher is `parts.join("
+")` and NEWLINE is not a symbol that exists there. A misquoted contract is worse than an unquoted one — anyone verifying it greps for something absent and concludes the contract moved. Found by the Copilot review on the PR
+- the fetch_comfyui_read allowlist rejection now has its wording pinned by a test. comfyui-mcp
+  matches `/operation must be one of/i` on that message to fall back to reading the model list from
+  `object_info` when `models/<category>` is unavailable (comfyui-mcp#2511); rewording it silently
+  disabled that recovery, with no error raised in either repo. A reword now fails here instead.
 
 ## [0.15.176] - 2026-09-05
 
