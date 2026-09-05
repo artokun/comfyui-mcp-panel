@@ -6,7 +6,9 @@ import {
   combineNodeErrorMaps,
   findNodeByScopedId,
   findVisibleNodeByScopedId,
+  graphGetErrorsLiveScanStale,
   pruneContradictedNodeErrorMaps,
+  recordedMissingTypesOnLiveGraph,
 } from "../../web/js/lib/asset-staleness.js";
 import { applyRuntimeExecFailure, boundExecFailurePayload } from "../../web/js/lib/exec-error-bounds.js";
 import { createObjectInfoCache } from "../../web/js/lib/object-info-cache.js";
@@ -68,8 +70,10 @@ const GRAPH_GET_ERRORS_DEPS = [
   "fetchSingleNodeInfo",
   "probeInputAssetPresence",
   "graphReadBindingChanged",
+  "graphGetErrorsLiveScanStale",
   "collectAllGraphs",
   "adjudicateRecordedMissingNodeTypes",
+  "recordedMissingTypesOnLiveGraph",
   "isRegisteredNodeType",
   "LiteGraph",
   "findVisibleNodeByScopedId",
@@ -124,6 +128,13 @@ export async function runProductionGraphGetErrors({
   objectInfoCache = createObjectInfoCache(),
   objectInfoSnapshot = createObjectInfoSnapshot(),
   verifiedNodeDefCache = createVerifiedNodeDefCache(),
+  collectAllGraphs = (value) => [value],
+  graphReadBindingChanged = () => false,
+  activeWorkflowRef = () => null,
+  graphGetErrorsLiveScanStale: graphGetErrorsLiveScanStaleOverride,
+  recordedMissingTypesOnLiveGraph: recordedMissingTypesOnLiveGraphOverride,
+  adjudicateRecordedMissingNodeTypes = (types) => ({ stillMissing: types, stalePlaceholders: [] }),
+  collectMissingNodeTypeReasons = () => [],
 }) {
   const deps = {
     monotonicNow,
@@ -142,16 +153,20 @@ export async function runProductionGraphGetErrors({
     assertGraphBoundToActiveWorkflow: () => {},
     graphCommandBindingBar: () => ({}),
     collectMissingAssets,
-    activeWorkflowRef: () => null,
+    activeWorkflowRef,
     GET_ERRORS_STEP_CAP_MS: 4000,
     filterServerConfirmedInputSubfolderMedia,
     inputAssetServerUsesWindowsPaths,
     scanComboAvailability: scan,
     fetchSingleNodeInfo,
     probeInputAssetPresence: () => {},
-    graphReadBindingChanged: () => false,
-    collectAllGraphs: (value) => [value],
-    adjudicateRecordedMissingNodeTypes: (types) => ({ stillMissing: types, stalePlaceholders: [] }),
+    graphReadBindingChanged,
+    graphGetErrorsLiveScanStale:
+      graphGetErrorsLiveScanStaleOverride ?? graphGetErrorsLiveScanStale,
+    collectAllGraphs,
+    adjudicateRecordedMissingNodeTypes,
+    recordedMissingTypesOnLiveGraph:
+      recordedMissingTypesOnLiveGraphOverride ?? recordedMissingTypesOnLiveGraph,
     isRegisteredNodeType: () => false,
     LiteGraph: {},
     findVisibleNodeByScopedId,
@@ -176,7 +191,7 @@ export async function runProductionGraphGetErrors({
     uncheckedNodesNote: () => "unchecked",
     stalePlaceholderNote: () => "placeholder",
     boundExecFailurePayload,
-    collectMissingNodeTypeReasons: () => [],
+    collectMissingNodeTypeReasons,
   };
   const executor = makeGraphGetErrors(...GRAPH_GET_ERRORS_DEPS.map((name) => deps[name]));
   return executor();

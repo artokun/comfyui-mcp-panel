@@ -230,6 +230,8 @@ import {
   emptyComboNote,
   refreshComboOptionsFromDefs,
   collectAllGraphs,
+  graphGetErrorsLiveScanStale,
+  recordedMissingTypesOnLiveGraph,
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
@@ -12652,10 +12654,11 @@ async function validationBanner() {
       allNodes,
       (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
     );
-    missing.nodeTypes = adjudicated.stillMissing;
+    missing.nodeTypes = recordedMissingTypesOnLiveGraph(adjudicated.stillMissing, allNodes);
     bannerStalePlaceholders = adjudicated.stalePlaceholders;
     // Same gate as graph_get_errors (panel#1370): an empty recorded list was never
     // narrowed by the adjudication, so its count is an unnamed miss, not a cleared one.
+    // #2263 — drop previous-tab type names the live graph does not carry.
     if (recordedTypes.length && !missing.nodeTypes.length) missing.nodeCount = 0;
   } catch {
     bannerStalePlaceholders = [];
@@ -21537,6 +21540,14 @@ const GRAPH_TOOL_EXECUTORS = {
         afterWorkflow: activeWorkflowRef(),
         beforeRootGraph: preProbeRootGraph,
         afterRootGraph: postProbeRootGraph,
+      }) ||
+      // #2263 — same-object in-place load: instance identity is unchanged but
+      // the scanned node ids are no longer on the bound graph. Refuse rather
+      // than emit the previous workflow's ids as if they were this canvas.
+      graphGetErrorsLiveScanStale({
+        scannedNodes: scanNodes,
+        liveRootGraph: postProbeRootGraph,
+        liveScan,
       })
     ) {
       throw new Error(
@@ -21561,7 +21572,7 @@ const GRAPH_TOOL_EXECUTORS = {
         allNodes,
         (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
       );
-      assets.nodeTypes = adjudicated.stillMissing;
+      assets.nodeTypes = recordedMissingTypesOnLiveGraph(adjudicated.stillMissing, allNodes);
       stalePlaceholders = adjudicated.stalePlaceholders;
       // #1332 drops the count when the adjudication removes every type the client can
       // now construct, so it cannot keep alarming for names that are no longer reported.
@@ -21569,6 +21580,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // empty recorded list means the store named nothing to begin with, and the count is
       // then the only evidence that anything is missing; zeroing it there turns "N
       // missing, names unknown" into "no errors recorded since the last execution start".
+      // #2263 — the same drop when the store still names a PREVIOUS tab's types.
       if (recordedTypes.length && !assets.nodeTypes.length) assets.nodeCount = 0;
     } catch {
       /* unreadable registry → keep the load-time list (fail closed) */

@@ -1091,6 +1091,96 @@ export function collectAllGraphs(rootGraph) {
 }
 
 /**
+ * Node ids reachable from `rootGraph`, including nested subgraphs. Empty when
+ * the graph is unreadable — callers that need fail-closed treat that as "no
+ * live ids", never as "everything is in scope".
+ */
+export function liveGraphNodeIdSet(rootGraph) {
+  const ids = new Set();
+  try {
+    for (const g of collectAllGraphs(rootGraph)) {
+      for (const n of g?._nodes ?? []) {
+        if (n?.id != null) ids.add(String(n.id));
+      }
+    }
+  } catch {
+    /* unreadable graph → empty set */
+  }
+  return ids;
+}
+
+function idsMissingFromLiveSet(ids, liveIds) {
+  if (!liveIds || typeof liveIds.has !== "function") return true;
+  try {
+    for (const id of ids ?? []) {
+      if (id == null) continue;
+      if (!liveIds.has(String(id))) return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * #2263 — true when `panel_get_errors`' live combo scan no longer describes the
+ * bound graph. ComfyUI can load a new workflow into the SAME graph object, so
+ * `graphReadBindingChanged` (instance identity) stays false while `scanNodes`
+ * still names the previous tab's ids (5599 / 5603 after a switch to a 17-node
+ * graph). Returning those ids is the defect; refuse so the caller retries.
+ *
+ * Nested subgraph ids of the CURRENT root stay in-scope (`collectAllGraphs`).
+ * An unreadable live root fails closed (stale).
+ */
+export function graphGetErrorsLiveScanStale({ scannedNodes, liveRootGraph, liveScan } = {}) {
+  if (!liveRootGraph) return true;
+  const liveIds = liveGraphNodeIdSet(liveRootGraph);
+  const scanned = [];
+  try {
+    for (const n of Array.isArray(scannedNodes) ? scannedNodes : []) {
+      if (n?.id != null) scanned.push(n.id);
+    }
+  } catch {
+    return true;
+  }
+  if (idsMissingFromLiveSet(scanned, liveIds)) return true;
+  const findings = [];
+  try {
+    for (const list of [liveScan?.unavailable, liveScan?.unknown]) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
+        if (item?.id != null) findings.push(item.id);
+      }
+    }
+  } catch {
+    return true;
+  }
+  return idsMissingFromLiveSet(findings, liveIds);
+}
+
+/**
+ * #2263 — the missing-node-type Pinia store is a load-time snapshot and is not
+ * cleared on a tab switch (#316's model/media scoping does not cover it). Keep
+ * only types that still appear on the live graph. An empty live type set is not
+ * proof (empty canvas / unreadable nodes) — fail open and keep the record.
+ */
+export function recordedMissingTypesOnLiveGraph(recordedTypes, nodes) {
+  const recorded = Array.isArray(recordedTypes) ? recordedTypes : [];
+  if (!recorded.length) return recorded;
+  const liveTypes = new Set();
+  try {
+    for (const n of Array.isArray(nodes) ? nodes : []) {
+      const t = n?.type ?? n?.comfyClass;
+      if (t != null) liveTypes.add(t);
+    }
+  } catch {
+    return recorded;
+  }
+  if (!liveTypes.size) return recorded;
+  return recorded.filter((t) => liveTypes.has(t));
+}
+
+/**
  * After a node-def refresh, re-apply the fresh definitions to ALREADY-LOADED node
  * instances (finding #3): registerNodesFromDefs mints a NEW class per type, so
  * existing instances keep their old/generic constructor and would otherwise never

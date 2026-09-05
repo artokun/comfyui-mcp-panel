@@ -6,11 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- panel_get_errors no longer reports previous-workflow node ids after a switch: a live combo scan whose ids are gone from the bound graph is refused as an instance mismatch rather than listing leftover ids (5599/5603), and load-time missing node types that do not appear on the live graph are dropped (#2263)
+
 ## [0.15.178] - 2026-09-05
 
 ### Fixed
 - fetch_image no longer sends `/view` through ComfyUI `api.fetchApi`, which prefixes `/api` so local media became `/api/view` and failed with `Failed to fetch` after headless ECONNREFUSED. `/view` uses origin-validated `fileURL` + same-origin fetch (and `Comfy-User` when the API object has a user). History / system_stats keep `fetchApi` so cloud auth headers and 401 remint stay intact (comfyui-mcp#2884, #2261)
-
 
 ## [0.15.177] - 2026-09-05
 
