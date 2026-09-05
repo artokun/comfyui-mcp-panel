@@ -7,11 +7,15 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-
-- After an already-open panel_open_workflow applies last_open, panel_graph_outline / panel_query_graph refuse a leftover previous-tab or archived canvas when the live graph is smaller than the named file — failed switch repaint and another open tab matching the live root stay fail-closed; fixtures without leftover proof stay available (#1215)
 - the same-value short-circuit no longer swallows the relocation replay (#2033/#2140). reconcileFreshDynamicWidgets renames an orphan to `<root>.__cmcp_stale_N`, pushes a store cleanup alias, and replays the root so LiteGraph's own setter deletes both — but that replay is a SAME-VALUE write, which is exactly what the #2033 guard returns on, and it returned precisely when the root was HEALTHY (live dotted children), i.e. the common case. The stale row and its store alias stayed attached. The guard now stands down while a root still carries those rows, and applies again once the replay has removed them. Found by the Copilot review on the PR
 - the snapshot-restore catch is now pinned in BOTH directions (#2033). It swallows the detached-child throw and rethrows everything else, and that narrowness was untested: replacing the condition with a blanket swallow left all 8,344 panel tests green. The catch is not reachable through the queue path while a test is asserting — instrumented with a call counter, `restoreState` has still not run at the end of the barrier test's body, even after a tick — so a test written against that path observes the restore only by accident. `restoreState` is now exported as a test seam and driven directly: it is pure over its records, so both the swallow and the rethrow are reached with no queue plumbing. A blanket-swallow mutation now kills two tests.
 - panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
+
+## [0.15.176] - 2026-09-05
+
+### Fixed
+
+- After an already-open panel_open_workflow applies last_open, panel_graph_outline / panel_query_graph refuse a leftover previous-tab or archived canvas when the live graph is smaller than the named file — failed switch repaint and another open tab matching the live root stay fail-closed; fixtures without leftover proof stay available (#1215, #2255)
 
 
 ## [0.15.175] - 2026-09-05
