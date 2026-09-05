@@ -396,6 +396,7 @@ import {
 } from "./lib/object-info-snapshot.js";
 import { fetchTypeScopedObjectInfo } from "./lib/scoped-object-info.js";
 import { isRgthreeLoraRowCreation, createRgthreeLoraRow } from "./lib/rgthree-lora-row.js";
+import { applyGraphNodeMode } from "./lib/set-node-mode.js";
 import { objectInfoFingerprint, objectInfoUnchanged } from "./lib/object-info-fingerprint.js";
 import { confirmCanvasNavigation } from "./lib/canvas-navigation.js";
 import {
@@ -26842,8 +26843,15 @@ const GRAPH_TOOL_EXECUTORS = {
     const prevNum = typeof node.mode === "number" ? node.mode : 0;
     const previous_mode = NUM_TO_MODE[prevNum] ?? prevNum;
     graph.beforeChange?.();
+    let propagated = [];
     try {
-      node.mode = target;
+      // #2262 — a stock assignment is not enough for rgthree Mute / Bypass Repeater:
+      // the pack stores mode on an accessor and stamps connected inputs (or group
+      // members) in onModeChange. applyGraphNodeMode writes the wrapper, the
+      // owning repeaters, and their targets, then refuses unless every live mode
+      // matches. `node.mode = target` still happens inside that helper.
+      const applied = applyGraphNodeMode(node, target, graph);
+      propagated = applied.propagated;
     } finally {
       graph.afterChange?.();
     }
@@ -26869,6 +26877,7 @@ const GRAPH_TOOL_EXECUTORS = {
       node_id: node.id,
       mode: NUM_TO_MODE[actualNum],
       previous_mode,
+      ...(propagated.length ? { propagated } : {}),
       ...(bypassWarning ? { warning: bypassWarning } : {}),
     };
   },

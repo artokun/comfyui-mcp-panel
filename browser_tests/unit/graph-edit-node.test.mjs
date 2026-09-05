@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { canonicalNodeId, isQualifiedNodeId } from "../../web/js/lib/node-id.js";
 import { writePoint, refreshNodeArea } from "../../web/js/lib/group-geometry.js";
+import { applyGraphNodeMode } from "../../web/js/lib/set-node-mode.js";
 import { fileURLToPath } from "node:url";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
@@ -117,8 +118,9 @@ function realLegacyMode(getGraphCtx, resolveNode, unsafeBypassMappings, normaliz
     "resolveNode",
     "unsafeBypassMappings",
     "normalizeLegacyNodeId",
+    "applyGraphNodeMode",
     `const executors = { ${legacyModeMatch[0]} }; return executors.graph_set_node_mode;`,
-  )(getGraphCtx, resolveNode, unsafeBypassMappings, normalizeLegacyNodeId);
+  )(getGraphCtx, resolveNode, unsafeBypassMappings, normalizeLegacyNodeId, applyGraphNodeMode);
 }
 
 function makeNode(id, { pos = [0, 0], size = [140, 60], collapsible = true } = {}) {

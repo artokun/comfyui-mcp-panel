@@ -34,9 +34,9 @@ function setNodeModeBody() {
 
 test("the mode is READ BACK after the write", () => {
   const body = setNodeModeBody();
-  const write = body.indexOf("node.mode = target;");
+  const write = body.indexOf("applyGraphNodeMode(node, target, graph)");
   const readBack = body.indexOf("const actualNum =");
-  assert.ok(write > -1, "the write must still be there");
+  assert.ok(write > -1, "the write must go through applyGraphNodeMode so repeater targets move");
   assert.ok(readBack > write, "the read-back must come AFTER the write, or it proves nothing");
 });
 
@@ -63,7 +63,7 @@ test("previous_mode is still sampled BEFORE the write", () => {
   // error in the other direction.
   const body = setNodeModeBody();
   const prev = body.indexOf("const previous_mode =");
-  const write = body.indexOf("node.mode = target;");
+  const write = body.indexOf("applyGraphNodeMode(node, target, graph)");
   assert.ok(prev > -1 && write > -1 && prev < write, "previous_mode must be read before the write");
 });
 
