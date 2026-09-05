@@ -739,6 +739,75 @@ test("#2547: an invalid combo refusal keeps the verdict/count but never disclose
   assert.equal(node.widgets[0].value, privateOptions[0], "must not mutate on reject");
 });
 
+test("#2265: a generic enum combo refusal lists the live options so a stale guess can be corrected", () => {
+  const deviceOptions = ["cuda", "cpu", "mps"];
+  const node = {
+    id: 12,
+    type: "MinimaxH3LatentUpscaler3D",
+    widgets: [{ name: "device", options: { values: deviceOptions }, value: "cuda" }],
+  };
+
+  let refusal;
+  try {
+    applyWidgetWrite(node, "device", "auto", HOOKS);
+  } catch (err) {
+    refusal = err;
+  }
+
+  assert.ok(refusal instanceof WidgetWriteError);
+  assert.match(refusal.message, /not a valid option for combo widget "device"/);
+  assert.match(refusal.message, /holds 3 options/);
+  assert.match(refusal.message, /rejected VALUE, not an unreadable list/);
+  assert.match(refusal.message, /Valid options: "cuda", "cpu", "mps"/);
+  assert.equal(/intentionally omitted/.test(refusal.message), false);
+  assert.equal(node.widgets[0].value, "cuda", "must not mutate on reject");
+});
+
+test("#2265: a mixed None/disabled/path combo still omits option values", () => {
+  const mixed = ["None", "disabled", "client/model.safetensors"];
+  const node = {
+    id: 4,
+    type: "OptionalLoader",
+    widgets: [{ name: "model", options: { values: mixed }, value: mixed[0] }],
+  };
+
+  let refusal;
+  try {
+    applyWidgetWrite(node, "model", "missing.safetensors", HOOKS);
+  } catch (err) {
+    refusal = err;
+  }
+
+  assert.ok(refusal instanceof WidgetWriteError);
+  assert.match(refusal.message, /holds 3 options/);
+  assert.match(refusal.message, /intentionally omitted/);
+  assert.equal(refusal.message.includes("client/model.safetensors"), false);
+  assert.equal(/Valid options:/.test(refusal.message), false);
+});
+
+test("#2265: a checkpoint combo still omits option values (path/model-file redaction)", () => {
+  const ckptOptions = ["private-project/v1.safetensors", "private-project/v2.ckpt"];
+  const node = {
+    id: 3,
+    type: "CheckpointLoaderSimple",
+    widgets: [{ name: "ckpt_name", options: { values: ckptOptions }, value: ckptOptions[0] }],
+  };
+
+  let refusal;
+  try {
+    applyWidgetWrite(node, "ckpt_name", "missing.safetensors", HOOKS);
+  } catch (err) {
+    refusal = err;
+  }
+
+  assert.ok(refusal instanceof WidgetWriteError);
+  assert.match(refusal.message, /holds 2 options/);
+  assert.match(refusal.message, /intentionally omitted/);
+  for (const privateValue of ckptOptions) {
+    assert.equal(refusal.message.includes(privateValue), false, `must not disclose ${privateValue}`);
+  }
+});
+
 test("combo: a numeric index is NOT reinterpreted as a dropdown position", () => {
   const node = { id: 1, type: "N", widgets: [{ name: "c", options: { values: ["alpha", "beta", "gamma"] }, value: "alpha" }] };
   assert.throws(() => applyWidgetWrite(node, "c", 1, HOOKS), WidgetWriteError);
