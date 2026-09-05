@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
 - the cross-repo contract comment now quotes comfyui-mcp accurately (#2511). It wrote `parts.join(NEWLINE)`; the real matcher is `parts.join("
 ")` and NEWLINE is not a symbol that exists there. A misquoted contract is worse than an unquoted one — anyone verifying it greps for something absent and concludes the contract moved. Found by the Copilot review on the PR
 - the fetch_comfyui_read allowlist rejection now has its wording pinned by a test. comfyui-mcp
