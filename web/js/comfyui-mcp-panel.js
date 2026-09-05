@@ -17574,8 +17574,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // name; an onConnectionsChange insert that shifts later families must not
     // steal those names' links or report them as rewrites.
     const namedSlotsBefore = captureNamedSlotLinks(target);
+    // Prefer the live programmatic name so an Autogrow display alias
+    // (`ref_image_0`) still feeds #2008 dotted-name reconcile
+    // (`ref_images.ref_image_0`). Raw to_input is only the fallback when the
+    // resolved slot has no name.
     const requestedSlotName =
-      typeof to_input === "string" ? to_input : target.inputs?.[inIdx]?.name ?? null;
+      target.inputs?.[inIdx]?.name ??
+      (typeof to_input === "string" ? to_input : null);
     const inputNamesBefore = snapshotInputSlotNames(graph);
     // #2380 — the whole-graph state, captured BEFORE the wire is made. Every other
     // check on this path is scoped to the two endpoints the command NAMED, so a
