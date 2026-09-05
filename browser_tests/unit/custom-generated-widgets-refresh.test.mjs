@@ -34,6 +34,8 @@
  *   6. A rebuild that THROWS does not fail the verified write; the failure is
  *      disclosed (generated_widgets_refresh_failed).
  *   7. A rebuild that changes nothing is not claimed as a refresh.
+ *   8. #2264 — a migrated node whose serialize() omits widgets_values still
+ *      refreshes: onConfigure receives live widget values, never undefined.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -388,4 +390,110 @@ test("refreshCustomGeneratedWidgetsAfterWrite returns null when there is no patt
     out === null || typeof out.failed === "string",
     "hostile reads degrade to a disclosure, never a throw",
   );
+});
+
+test("#2264 migrated serialize without widgets_values still refreshes; onConfigure sees live values", async () => {
+  const node = makeDenoNode({ count: 1 });
+  node.serialize = function () {
+    return { id: this.id, type: this.type };
+  };
+  let seen = null;
+  const orig = node.onConfigure;
+  node.onConfigure = function (info) {
+    seen = info.widgets_values;
+    return orig.call(this);
+  };
+
+  const res = await runSetWidget(node, "active_loras", 3, {
+    registry: REGISTRY,
+    ...freshOracle,
+    canvas: CANVAS,
+  });
+
+  assert.equal(res.set.value, 3, "the write itself still reports the value that landed");
+  assert.equal("generated_widgets_refresh_failed" in res.set, false);
+  assert.equal(res.set.generated_widgets_refreshed, true);
+  assert.ok(Array.isArray(seen), "onConfigure received widgets_values filled from live widgets");
+  assert.equal(seen[0], 3, "live active_loras is the first serialized value");
+  assert.deepEqual(generatedRowNames(node), [
+    "deno_multi_lora_row_1",
+    "deno_multi_lora_row_2",
+    "deno_multi_lora_row_3",
+  ]);
+});
+
+test("#2264 no serialize() still supplies widgets_values so a pack that reads info.widgets_values does not throw", async () => {
+  const node = makeDenoNode({ count: 1 });
+  const orig = node.onConfigure;
+  node.onConfigure = function (info) {
+    if (info.widgets_values.length < 1) throw new Error("empty widgets_values");
+    return orig.call(this);
+  };
+
+  const res = await runSetWidget(node, "active_loras", 2, {
+    registry: REGISTRY,
+    ...freshOracle,
+    canvas: CANVAS,
+  });
+
+  assert.equal(res.set.value, 2);
+  assert.equal("generated_widgets_refresh_failed" in res.set, false);
+  assert.equal(res.set.generated_widgets_refreshed, true);
+});
+
+test("#2264 missing widgets_values skips onConfigure instead of calling it with undefined", () => {
+  let called = 0;
+  const node = {
+    widgets: [
+      { name: "active_loras", hidden: true, type: "converted-widget", value: 1, options: { serialize: false } },
+      { name: "row_1", type: "custom", options: { serialize: false }, index: 1 },
+    ],
+    serialize() {
+      return { id: 7, type: "UnifiedResizeImageMask" };
+    },
+    onConfigure(info) {
+      called += 1;
+      return info.widgets_values.length;
+    },
+  };
+  const out = refreshCustomGeneratedWidgetsAfterWrite(node);
+  assert.equal(called, 0, "onConfigure is not invoked when widgets_values cannot be produced");
+  assert.equal(out, null);
+});
+
+test("#2264 UnifiedResize-shaped node: migrated serialize does not fail a verified scale_mode write", async () => {
+  const scale = {
+    name: "scale_mode",
+    type: "combo",
+    value: "Multiplier",
+    options: { values: ["Dimensions (W × H)", "Multiplier"] },
+  };
+  const width = { name: "width", type: "number", value: 1024, hidden: true };
+  const display = {
+    name: "resolution_display",
+    type: "custom",
+    options: { serialize: false },
+    value: "Resolution: (pending)",
+  };
+  const node = {
+    id: 9,
+    type: "UnifiedResizeImageMask",
+    widgets: [scale, width, display],
+    serialize() {
+      return { id: this.id, type: this.type };
+    },
+    onConfigure(info) {
+      this._fromValues = info.widgets_values[0];
+    },
+  };
+
+  const res = await runSetWidget(node, "scale_mode", "Dimensions (W × H)", {
+    registry: { UnifiedResizeImageMask: {} },
+    getFreshObjectInfo: async () => ({ UnifiedResizeImageMask: {} }),
+    canvas: CANVAS,
+  });
+
+  assert.equal(res.set.value, "Dimensions (W × H)");
+  assert.equal("generated_widgets_refresh_failed" in res.set, false);
+  assert.equal(node._fromValues, "Dimensions (W × H)");
 });
