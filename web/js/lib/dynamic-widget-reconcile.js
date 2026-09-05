@@ -256,7 +256,7 @@ function wrapDynamicComboSetter(node, widget) {
   widget[DYNAMIC_COMBO_PRESERVE_CHILDREN] = true;
 }
 
-function wrapGraphDynamicComboSetters(graph) {
+export function wrapGraphDynamicComboSetters(graph) {
   for (const node of graphNodes(graph)) {
     try {
       const required = nodeDef(node)?.input?.required;
