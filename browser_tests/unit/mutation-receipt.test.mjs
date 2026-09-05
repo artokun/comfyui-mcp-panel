@@ -248,4 +248,21 @@ test("#2116 wiring: graph_set_widget persists late receipts and retry_of replays
     /lateMutationReceipts\.remember\(msg\.rid, reply\.result/,
   );
   assert.match(PANEL_SRC, /from "\.\/lib\/mutation-receipt\.js"/);
+  assert.match(PANEL_SRC, /msg\.cmd === "graph_create_subgraph"/);
+});
+
+test("#2267 store: a landed subgraph conversion is replayable by request id", () => {
+  const store = createMutationReceiptStore();
+  const fingerprint = commandFingerprint({
+    cmd: "graph_create_subgraph",
+    node_ids: [1, 2, 3],
+  });
+  store.remember(
+    "r-sub",
+    { subgraph: { node_id: 302, from_nodes: [1, 2, 3] } },
+    { cmd: "graph_create_subgraph", fingerprint },
+  );
+  const hit = store.lookup("r-sub", fingerprint);
+  assert.equal(hit.cmd, "graph_create_subgraph");
+  assert.equal(hit.result.subgraph.node_id, 302);
 });

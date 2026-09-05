@@ -549,6 +549,12 @@ import {
   conversionThrowReport,
 } from "./lib/subgraph-conversion-integrity.js";
 import {
+  normalizeCreateSubgraphNodeIds,
+  recoverConvertedSubgraph,
+  recoveredCreateSubgraphResult,
+  unresolvedCreateSubgraphNodesRefusal,
+} from "./lib/subgraph-conversion-recovery.js";
+import {
   classifyWorkflowRefresh,
   knownSelectorSample,
   openWorkflowNotFoundMessage,
@@ -25008,10 +25014,23 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof graph.convertToSubgraph !== "function") {
       throw new Error("convertToSubgraph unavailable on this frontend");
     }
-    const ns = (Array.isArray(node_ids) ? node_ids : [])
-      .map((id) => graph.getNodeById(Number(id)))
-      .filter(Boolean);
-    if (!ns.length) throw new Error("provide node_ids to group into a subgraph");
+    const requested = normalizeCreateSubgraphNodeIds(node_ids);
+    if (!requested.length) throw new Error("provide node_ids to group into a subgraph");
+    const ns = requested.map((id) => graph.getNodeById(id)).filter(Boolean);
+    // #2267 — a lost reply after convertToSubgraph leaves the named nodes inside
+    // the wrapper. Retrying the same ids must return that wrapper, not wrap a
+    // leftover set or report the outcome as unknown.
+    if (ns.length !== requested.length) {
+      const recovered = recoverConvertedSubgraph({ graph, nodeIds: requested });
+      if (recovered) return recoveredCreateSubgraphResult(recovered, requested);
+      throw new Error(
+        unresolvedCreateSubgraphNodesRefusal({
+          what: "panel_create_subgraph",
+          requested,
+          foundIds: ns.map((n) => n.id),
+        }),
+      );
+    }
     // #1463 — selects, refuses a detached selection, and reports a THROW with a
     // mutation verdict instead of the frontend's bare exception.
     const res = convertSelectionToSubgraph({
@@ -28629,8 +28648,9 @@ function awaitDuplicateReply(prior, rid, callerTimeoutMs) {
   ]);
 }
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
-// #2116 — rid-correlated receipts for graph_set_widget mutations that applied
-// after the caller timeout. retry_of reads these instead of executing again.
+// #2116 / #2267 — rid-correlated receipts for mutations that applied after the
+// caller timeout (widget writes and subgraph conversions). retry_of reads these
+// instead of executing again.
 const lateMutationReceipts = createMutationReceiptStore();
 
 // #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
@@ -29967,7 +29987,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // the same rid on a fresh socket learns the true outcome instead of
         // re-executing the command.
         settleRid(reply);
-        if (msg.cmd === "graph_set_widget" && reply?.ok) {
+        if (
+          (msg.cmd === "graph_set_widget" ||
+            msg.cmd === "graph_create_subgraph" ||
+            msg.cmd === "graph_subgraph_group") &&
+          reply?.ok
+        ) {
           lateMutationReceipts.remember(msg.rid, reply.result, {
             cmd: msg.cmd,
             fingerprint,

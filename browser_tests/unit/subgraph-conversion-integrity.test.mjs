@@ -46,6 +46,12 @@ import {
   conversionSnapshot,
   conversionThrowReport,
 } from "../../web/js/lib/subgraph-conversion-integrity.js";
+import {
+  normalizeCreateSubgraphNodeIds,
+  recoverConvertedSubgraph,
+  recoveredCreateSubgraphResult,
+  unresolvedCreateSubgraphNodesRefusal,
+} from "../../web/js/lib/subgraph-conversion-recovery.js";
 
 const src = () =>
   readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
@@ -507,6 +513,10 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
     "assertSubgraphNodeLanded",
     "assertSubgraphConversionSerializable",
     "subgraphConversionAdvisories",
+    "normalizeCreateSubgraphNodeIds",
+    "recoverConvertedSubgraph",
+    "recoveredCreateSubgraphResult",
+    "unresolvedCreateSubgraphNodesRefusal",
     `const executors = { ${body[0]} }; return executors.${name.replace(/^async /, "")};`,
   )(
     () => ({ app: {}, graph, canvas, rootGraph: graph }),
@@ -530,6 +540,10 @@ function realExecutor(name, args, convertToSubgraph, wrapper) {
       `return ${serializable[0]};`,
     )(danglingInputLinks, disconnectedBoundaryInputs, brokenConversionRefusal, brokenConversionWarning),
     new Function(`return ${advisories[0]};`)(),
+    normalizeCreateSubgraphNodeIds,
+    recoverConvertedSubgraph,
+    recoveredCreateSubgraphResult,
+    unresolvedCreateSubgraphNodesRefusal,
   );
 }
 

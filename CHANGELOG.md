@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_connect accepts an Autogrow display-label alias (`ref_image_0` → `ref_images.ref_image_0`) instead of refusing with a false "no input accepts type IMAGE"; the resolved live slot name still feeds #2008 dotted-name reconcile, and an unmatched name reports internal slot names rather than blaming the origin type (#2266)
+- panel_create_subgraph recovers a conversion whose reply was lost: a retry of the same node_ids returns the existing subgraph instead of wrapping leftovers or reporting unknown, a partial leftover set is refused rather than converted, and the landed receipt is replayable via retry_of (#2267)
 
 ## [0.15.179] - 2026-09-05
 
