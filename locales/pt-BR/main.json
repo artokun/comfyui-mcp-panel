@@ -305,10 +305,10 @@
       "action_rewind_the_canvas": "retroceder o canvas",
       "action_roll_back_the_canvas": "reverter o canvas",
       "canvas_not_restored_no_snapshot": "O canvas NÃO foi restaurado — não existe snapshot do grafo disponível para isso, então ele ainda contém as edições que você estava tentando desfazer.",
-      "could_not_action_nothing_was_loaded": "⚠️ Não foi possível {action} — nada foi carregado, então nenhuma edição do grafo foi aplicada e é seguro tentar de novo. {reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ Não deu para saber se a ação ({action}) aconteceu — o painel recebeu um resultado que não reconhece, então confira o canvas antes de fazer qualquer outra coisa.",
+      "could_not_action_nothing_was_loaded": "⚠ Não foi possível {action} — nada foi carregado, então nenhuma edição do grafo foi aplicada e é seguro tentar de novo. {reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ Não deu para saber se a ação ({action}) aconteceu — o painel recebeu um resultado que não reconhece, então confira o canvas antes de fazer qualquer outra coisa.",
       "no_reason_was_reported": "Nenhum motivo foi informado.",
-      "the_action_ran_but_unconfirmed": "⚠️ A ação ({action}) FOI executada, mas o painel não conseguiu confirmar o resultado, então o canvas pode ter mudado — confira antes de fazer qualquer outra coisa. {reason}"
+      "the_action_ran_but_unconfirmed": "⚠ A ação ({action}) FOI executada, mas o painel não conseguiu confirmar o resultado, então o canvas pode ter mudado — confira antes de fazer qualquer outra coisa. {reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager inacessível (o Manager integrado está ativado?)"
@@ -360,7 +360,7 @@
       "auto_arranged_nodes_other": "{count} nós organizados automaticamente",
       "auto_let_the_agent_pick": "Auto (deixe o agente escolher)",
       "auto_restart_failed": "O reinício automático falhou: {error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ Beta — o app muda rápido e as builds podem quebrar entre atualizações. Ative o botão acima, instale para a sua plataforma e pareie com o botão de QR no cabeçalho do painel.",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ Beta — o app muda rápido e as builds podem quebrar entre atualizações. Ative o botão acima, instale para a sua plataforma e pareie com o botão de QR no cabeçalho do painel.",
       "blind": "Cego",
       "blocked_a_chat_from_another_workflow_open": "Bloqueei uma conversa de outro workflow. Abra \"{workflow}\" antes de retomá-la.",
       "bridge_url": "URL da ponte",
@@ -890,7 +890,7 @@
       "the_canvas_was_not_reverted_no_graph": "O canvas NÃO foi revertido — não há snapshot do grafo daquele turno (só os 25 últimos são mantidos, os demais são descartados). A sua mensagem voltou para o campo de mensagem, mas o canvas ainda tem as edições daquele turno.",
       "the_connection_that_asked_this_dropped_so": "A conexão que originou isso ({what}) caiu, então uma resposta aqui não chega mais ao agente.",
       "the_old_session_could_not_be_invalidated": "Não foi possível invalidar a sessão antiga de forma durável; a reconexão está pausada para evitar restaurá-la.",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ O orquestrador não confirmou a mudança do modo Cego — ele pode ser anterior à v0.42.0, onde o Cego só bloqueia o feed de imagens do próprio painel (as ferramentas de imagem do agente NÃO são bloqueadas). Atualize o comfyui-mcp para aplicar por completo.",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ O orquestrador não confirmou a mudança do modo Cego — ele pode ser anterior à v0.42.0, onde o Cego só bloqueia o feed de imagens do próprio painel (as ferramentas de imagem do agente NÃO são bloqueadas). Atualize o comfyui-mcp para aplicar por completo.",
       "the_panel_agent_dropped_restarting_it": "O agente do painel caiu — reiniciando…",
       "the_panel_agent_isn_t_answering_yet": "O agente do painel ainda não está respondendo — reconectando…",
       "the_panel_agent_keeps_failing_to_start": "⚠ O agente do painel continua falhando ao iniciar. Confira se você está logado (rode `claude` uma vez, `codex login` para o Codex, `gemini` para o Gemini, ou `ollama serve` para modelos locais) e clique em Conectar.",

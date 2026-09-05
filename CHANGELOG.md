@@ -9,6 +9,21 @@ All notable changes to this project are documented here. This project adheres to
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
 - Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
+- the panel no longer REQUESTS emoji presentation for its warning glyph (panel#2023). Nine
+  strings carried U+FE0F (VARIATION SELECTOR-16), which pins the glyph to the emoji face —
+  `seguiemj.ttf` on Windows, the file KB5120998 replaced two days before that issue's crash
+  cluster. The panel's root font stack names no symbol or emoji face, so those glyphs must
+  resolve by DirectWrite fallback either way; the selector made the emoji font mandatory
+  rather than incidental, and several of the nine render exactly where the crash timeline
+  puts the failures. Worth doing regardless: a warning triangle in a dense sidebar wants
+  text presentation. NOT claimed as the fix for the renderer crash, which is upstream.
+  The selector is also removed from the LOCALE CATALOGS, which are what actually render:
+  `tr()` reads `catalog[key]` first and treats the source literal as a fallback, so five
+  keys in all twelve languages (60 occurrences, three of them in graph_revert) were still
+  requesting the emoji face while the JS read as fixed. English is regenerated from the
+  code; the eleven translations have the selector stripped byte-wise, leaving wording
+  untouched.
+- the VARIATION SELECTOR removal now covers every shipped web/js file rather than the main bundle alone. This drops U+FE0F only, which affects text-default glyphs such as the U+26A0 warning sign; it does NOT remove the panel emoji-font dependency, since 44 emoji-presentation-default characters remain in web/js and 16 more in each of the 12 shipped locale catalogues (nine more selectors still rendered from web/js/lib), and the chat strip patterns match the current spelling again — dropping the selector from the emitted warnings had silently killed them, so agent-only GRAPH VALIDATION ERRORS / MISSING ASSETS / LAST RUN FAILED blocks were reaching the user (#2023)
 
 ## [0.15.176] - 2026-09-05
 

@@ -305,10 +305,10 @@
       "action_rewind_the_canvas": "rembobinage du canevas",
       "action_roll_back_the_canvas": "restauration du canevas",
       "canvas_not_restored_no_snapshot": "Le canevas n'a PAS été restauré — aucun instantané du graphe n'est disponible pour cela, il contient donc toujours les modifications que vous cherchiez à annuler.",
-      "could_not_action_nothing_was_loaded": "⚠️ Échec de l'action « {action} » — rien n'a été chargé, donc aucune modification du graphe n'a été appliquée et réessayer ne présente aucun risque. {reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ Impossible de déterminer si l'action « {action} » a eu lieu — le panneau a reçu un résultat qu'il ne reconnaît pas ; vérifiez le canevas avant toute autre opération.",
+      "could_not_action_nothing_was_loaded": "⚠ Échec de l'action « {action} » — rien n'a été chargé, donc aucune modification du graphe n'a été appliquée et réessayer ne présente aucun risque. {reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ Impossible de déterminer si l'action « {action} » a eu lieu — le panneau a reçu un résultat qu'il ne reconnaît pas ; vérifiez le canevas avant toute autre opération.",
       "no_reason_was_reported": "Aucune raison n'a été indiquée.",
-      "the_action_ran_but_unconfirmed": "⚠️ L'action « {action} » a bien été EXÉCUTÉE mais le panneau n'a pas pu en confirmer le résultat ; le canevas a peut-être changé — vérifiez-le avant toute autre opération. {reason}"
+      "the_action_ran_but_unconfirmed": "⚠ L'action « {action} » a bien été EXÉCUTÉE mais le panneau n'a pas pu en confirmer le résultat ; le canevas a peut-être changé — vérifiez-le avant toute autre opération. {reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager injoignable (le gestionnaire intégré est-il activé ?)"
@@ -360,7 +360,7 @@
       "auto_arranged_nodes_other": "Réorganisation auto de {count} nœuds",
       "auto_let_the_agent_pick": "Auto (laisser l'agent choisir)",
       "auto_restart_failed": "Échec du redémarrage auto : {error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ Bêta — l'appli évolue vite et les builds peuvent casser d'une mise à jour à l'autre. Activez le commutateur ci-dessus, installez la version de votre plateforme, puis appairez avec le bouton QR de l'en-tête du panneau.",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ Bêta — l'appli évolue vite et les builds peuvent casser d'une mise à jour à l'autre. Activez le commutateur ci-dessus, installez la version de votre plateforme, puis appairez avec le bouton QR de l'en-tête du panneau.",
       "blind": "Aveugle",
       "blocked_a_chat_from_another_workflow_open": "Conversation venant d'un autre workflow bloquée. Ouvrez « {workflow} » avant de la reprendre.",
       "bridge_url": "URL du pont",
@@ -890,7 +890,7 @@
       "the_canvas_was_not_reverted_no_graph": "Le canevas n'a PAS été restauré — aucun instantané du graphe pour ce tour (seuls les 25 derniers sont conservés, puis évincés). Votre message est de retour dans la zone de rédaction, mais le canevas contient toujours les modifications de ce tour.",
       "the_connection_that_asked_this_dropped_so": "La connexion qui a posé cette {what} a été perdue ; une réponse donnée ici ne peut plus atteindre l'agent.",
       "the_old_session_could_not_be_invalidated": "L'ancienne session n'a pas pu être invalidée durablement ; la reconnexion est suspendue pour éviter de la restaurer.",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ L'orchestrateur n'a pas confirmé le changement du mode Aveugle — il est peut-être antérieur à la v0.42.0, où Aveugle ne filtrait que le flux d'images du panneau lui-même (les outils d'image de l'agent ne sont PAS filtrés). Mettez comfyui-mcp à jour pour une application complète.",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ L'orchestrateur n'a pas confirmé le changement du mode Aveugle — il est peut-être antérieur à la v0.42.0, où Aveugle ne filtrait que le flux d'images du panneau lui-même (les outils d'image de l'agent ne sont PAS filtrés). Mettez comfyui-mcp à jour pour une application complète.",
       "the_panel_agent_dropped_restarting_it": "L'agent du panneau s'est déconnecté — redémarrage…",
       "the_panel_agent_isn_t_answering_yet": "L'agent du panneau ne répond pas encore — reconnexion…",
       "the_panel_agent_keeps_failing_to_start": "⚠ L'agent du panneau n'arrive pas à démarrer. Vérifiez que vous êtes bien connecté (lancez `claude` une fois, `codex login` pour Codex, `gemini` pour Gemini, ou `ollama serve` pour les modèles locaux), puis cliquez sur Connecter.",

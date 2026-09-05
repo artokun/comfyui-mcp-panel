@@ -990,7 +990,7 @@ async function buildVideoSegment(v, deps) {
       // variant says so AFFIRMATIVELY (an explicit prohibition is reliable; a
       // merely-absent request is not) — the sheet is still painted for the user
       // above, so only the agent is blind.
-      const header = `📽️ ${sheetHead} of ${videoKind} — `;
+      const header = `📽 ${sheetHead} of ${videoKind} — `;
       const note =
         header +
         `frames run top-left→bottom-right = start→end. ` +

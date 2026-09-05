@@ -7217,7 +7217,7 @@ function panelSettingsList() {
         const note = document.createElement("div");
         note.textContent = tr(
           "panel.beta_the_app_changes_rapidly_and_builds",
-          "⚠️ Beta — the app changes rapidly and builds may break between updates. " +
+          "⚠ Beta — the app changes rapidly and builds may break between updates. " +
             "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.",
         );
         note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);opacity:0.75;line-height:1.35;";
@@ -12732,7 +12732,7 @@ async function validationBanner() {
     const shown = lines.slice(0, MAX);
     const more = lines.length > MAX ? `\n  …and ${lines.length - MAX} more` : "";
     out +=
-      `⚠️ GRAPH VALIDATION ERRORS — ComfyUI rejected the current graph at queue time; ` +
+      `⚠ GRAPH VALIDATION ERRORS — ComfyUI rejected the current graph at queue time; ` +
       `the user is seeing these in the frontend's error panel RIGHT NOW. These are PRE-RUN ` +
       `validation errors (missing models, invalid widget values / value_not_in_list, broken ` +
       `links) — NOT runtime failures:\n  ` +
@@ -12775,7 +12775,7 @@ async function validationBanner() {
       );
     }
     out +=
-      `⚠️ MISSING ASSETS — the user's canvas has RED nodes RIGHT NOW because the workflow ` +
+      `⚠ MISSING ASSETS — the user's canvas has RED nodes RIGHT NOW because the workflow ` +
       `references things this ComfyUI doesn't have. This is detected AT LOAD TIME, so it is ` +
       `already true before anything is queued (ComfyUI's validator hasn't run yet, which is ` +
       `why the raw validation list can be empty while nodes are visibly red):\n  ` +
@@ -12792,7 +12792,7 @@ async function validationBanner() {
     const nodeId = execErr.node_id != null ? coerceMessageText(execErr.node_id) : "?";
     const where = nodeType ? ` in ${nodeType} (node ${nodeId})` : "";
     out +=
-      `⚠️ LAST RUN FAILED${where}: ${msg}\nThis is a RUNTIME error from the most recent ` +
+      `⚠ LAST RUN FAILED${where}: ${msg}\nThis is a RUNTIME error from the most recent ` +
       `execution (distinct from the validation errors above).\n\n`;
   }
   return out;
@@ -35812,7 +35812,7 @@ function buildPanel() {
         appendSystem(
           tr(
             "panel.the_orchestrator_didnt_acknowledge_the_blind_change",
-            "⚠️ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
+            "⚠ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
           ),
         );
       }, 6000);
@@ -42618,7 +42618,7 @@ function buildPanel() {
       sentThisMount: rebootResumeMids.size,
     });
     const repeatPrefix = repeat
-      ? "⚠️ You may have already received this restart notice — an earlier copy was sent but never acknowledged. If you already acted on it, ignore this one and do NOT re-queue anything. "
+      ? "⚠ You may have already received this restart notice — an earlier copy was sent but never acknowledged. If you already acted on it, ignore this one and do NOT re-queue anything. "
       : "";
     // The agent session behind this conversation looks REPLACED rather than
     // resumed, so "continue what you were doing" may be addressed to an instance
@@ -42628,16 +42628,16 @@ function buildPanel() {
     // would strand the ordinary restart.
     const replacedPrefix =
       step?.sessionState === "replaced"
-        ? "⚠️ Your agent session was replaced (not resumed) across this restart, so you may not have the context you had before. Check the ComfyUI queue/history before starting or re-queueing any render. "
+        ? "⚠ Your agent session was replaced (not resumed) across this restart, so you may not have the context you had before. Check the ComfyUI queue/history before starting or re-queueing any render. "
         : step?.sessionState === "unknown"
-          ? "⚠️ I couldn't confirm whether your agent session was resumed or replaced across this restart. Check the ComfyUI queue/history before starting or re-queueing any render. "
+          ? "⚠ I couldn't confirm whether your agent session was resumed or replaced across this restart. Check the ComfyUI queue/history before starting or re-queueing any render. "
           : "";
     const text =
       repeatPrefix +
       replacedPrefix +
       (unconfirmed
       ? `✅ ComfyUI just restarted to load newly-installed custom nodes (now available). ` +
-        `⚠️ A render was already in flight when the restart was triggered${
+        `⚠ A render was already in flight when the restart was triggered${
           owed.length ? ` (prompt ${owed.join(", ")})` : ""
         } and I could NOT confirm whether it finished. Check the ComfyUI queue/history for it BEFORE re-queueing anything — ` +
         `it may still be running, and re-queueing would duplicate it. Then continue what you were doing before the restart.`

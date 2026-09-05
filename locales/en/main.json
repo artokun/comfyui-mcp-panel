@@ -299,10 +299,10 @@
       "action_rewind_the_canvas": "rewind the canvas",
       "action_roll_back_the_canvas": "roll back the canvas",
       "canvas_not_restored_no_snapshot": "The canvas was NOT restored — there is no graph snapshot available for this, so it still holds the edits you were trying to undo.",
-      "could_not_action_nothing_was_loaded": "⚠️ Could not {action} — nothing was loaded, so no graph edits were applied and retrying is safe. {reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ Could not tell whether the {action} happened — the panel got back an outcome it does not recognize, so check the canvas before doing anything else.",
+      "could_not_action_nothing_was_loaded": "⚠ Could not {action} — nothing was loaded, so no graph edits were applied and retrying is safe. {reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ Could not tell whether the {action} happened — the panel got back an outcome it does not recognize, so check the canvas before doing anything else.",
       "no_reason_was_reported": "No reason was reported.",
-      "the_action_ran_but_unconfirmed": "⚠️ The {action} RAN but the panel could not confirm the result, so the canvas may have changed — check it before doing anything else. {reason}"
+      "the_action_ran_but_unconfirmed": "⚠ The {action} RAN but the panel could not confirm the result, so the canvas may have changed — check it before doing anything else. {reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager not reachable (is the built-in Manager enabled?)"
@@ -356,7 +356,7 @@
       "auto_restart_failed": "Auto-restart failed: {error}",
       "autostart_mcp_when_panel_opens": "Autostart MCP when this panel opens",
       "autostart_off_start_mcp_manually": "Autostart is off. Start MCP manually, then click Connect:",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ Beta — the app changes rapidly and builds may break between updates. Enable the toggle above, install for your platform, then pair with the QR button in the panel header.",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ Beta — the app changes rapidly and builds may break between updates. Enable the toggle above, install for your platform, then pair with the QR button in the panel header.",
       "blind": "Blind",
       "blocked_a_chat_from_another_workflow_open": "Blocked a chat from another workflow. Open \"{workflow}\" before resuming it.",
       "bridge_url": "Bridge URL",
@@ -889,7 +889,7 @@
       "the_canvas_was_not_reverted_no_graph": "The canvas was NOT reverted — no graph snapshot for that turn (they are kept for the last 25 and then evicted). Your message is back in the composer, but the canvas still holds that turn's edits.",
       "the_connection_that_asked_this_dropped_so": "The connection that asked this {what} dropped, so an answer here can no longer reach the agent.",
       "the_old_session_could_not_be_invalidated": "The old session could not be invalidated durably; reconnect is paused to avoid restoring it.",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ The orchestrator didn't acknowledge the Blind change — it may predate v0.42.0, where Blind only gates the panel's own image feed (the agent's image tools are NOT gated). Update comfyui-mcp for full enforcement.",
       "the_panel_agent_dropped_restarting_it": "The panel agent dropped — restarting it…",
       "the_panel_agent_isn_t_answering_yet": "The panel agent isn't answering yet — reconnecting…",
       "the_panel_agent_keeps_failing_to_start": "⚠ The panel agent keeps failing to start. Check you're signed in (run `claude` once, `codex login` for Codex, `gemini` for Gemini, or `ollama serve` for local models), then click Connect.",

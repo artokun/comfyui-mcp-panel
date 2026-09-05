@@ -287,10 +287,10 @@
       "action_rewind_the_canvas": "倒回畫布",
       "action_roll_back_the_canvas": "還原畫布",
       "canvas_not_restored_no_snapshot": "畫布並未還原 —— 沒有可用的節點圖快照，所以它仍保留著你想要撤銷的那些修改。",
-      "could_not_action_nothing_was_loaded": "⚠️ 無法{action} —— 沒有載入任何內容，因此並未套用任何節點圖修改，重試是安全的。{reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ 無法判斷{action}是否真的執行了 —— 面板收到了它無法辨識的結果，請先檢查畫布再做其他操作。",
+      "could_not_action_nothing_was_loaded": "⚠ 無法{action} —— 沒有載入任何內容，因此並未套用任何節點圖修改，重試是安全的。{reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ 無法判斷{action}是否真的執行了 —— 面板收到了它無法辨識的結果，請先檢查畫布再做其他操作。",
       "no_reason_was_reported": "沒有回報任何原因。",
-      "the_action_ran_but_unconfirmed": "⚠️ {action}已經執行，但面板無法確認結果，畫布可能已經變動 —— 請先檢查畫布再做其他操作。{reason}"
+      "the_action_ran_but_unconfirmed": "⚠ {action}已經執行，但面板無法確認結果，畫布可能已經變動 —— 請先檢查畫布再做其他操作。{reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "無法連線 ComfyUI-Manager（內建的 Manager 已啟用嗎？）"
@@ -338,7 +338,7 @@
       "auto_arranged_nodes_other": "已自動排列 {count} 個節點",
       "auto_let_the_agent_pick": "自動（讓代理自己挑）",
       "auto_restart_failed": "自動重新啟動失敗：{error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ Beta —— 這個 App 變動得很快，不同版本之間可能無法互通。請先開啟上方的開關，安裝你平台的版本，再用面板標題列的 QR 按鈕配對。",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ Beta —— 這個 App 變動得很快，不同版本之間可能無法互通。請先開啟上方的開關，安裝你平台的版本，再用面板標題列的 QR 按鈕配對。",
       "blind": "遮蔽",
       "blocked_a_chat_from_another_workflow_open": "已擋下一段屬於其他工作流程的聊天。請先開啟「{workflow}」再繼續它。",
       "bridge_url": "橋接網址",
@@ -810,7 +810,7 @@
       "the_canvas_was_not_reverted_no_graph": "畫布「沒有」還原 —— 那一回合沒有節點圖快照（只保留最近 25 個，更舊的會被清掉）。你的訊息回到輸入框了，但畫布仍然留著那一回合的修改。",
       "the_connection_that_asked_this_dropped_so": "提出這個{what}的那條連線已經斷了，所以在這裡回答已經傳不到代理手上。",
       "the_old_session_could_not_be_invalidated": "舊的工作階段無法可靠地作廢；為了避免它被還原回來，已暫停重新連線。",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ 協調器沒有確認「遮蔽」設定的變更 —— 它可能早於 v0.42.0，那個版本的「遮蔽」只擋面板自己的圖片推送（代理的圖片工具「不會」被擋）。請更新 comfyui-mcp 才能完整生效。",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ 協調器沒有確認「遮蔽」設定的變更 —— 它可能早於 v0.42.0，那個版本的「遮蔽」只擋面板自己的圖片推送（代理的圖片工具「不會」被擋）。請更新 comfyui-mcp 才能完整生效。",
       "the_panel_agent_dropped_restarting_it": "面板代理斷線了 —— 正在重新啟動…",
       "the_panel_agent_isn_t_answering_yet": "面板代理還沒有回應 —— 正在重新連線…",
       "the_panel_agent_keeps_failing_to_start": "⚠ 面板代理一直啟動失敗。請確認你已經登入（先執行一次 `claude`，Codex 用 `codex login`，Gemini 用 `gemini`，本機模型用 `ollama serve`），然後按「連線」。",
