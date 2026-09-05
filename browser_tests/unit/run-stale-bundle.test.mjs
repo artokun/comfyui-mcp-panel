@@ -171,25 +171,53 @@ test("#2252 a version mismatch is queued:false stale_bundle with a Ctrl+Shift+R 
 // ---------------------------------------------------------------------------
 
 test("#2252 SHIPPED refuseStaleBundleRun maps the installed-pack probe onto a run refusal", async () => {
-  const body = extractFunction("async function refuseStaleBundleRun(");
+  const refreshBody = extractFunction("async function refuseStaleBundleRefresh(");
+  const runBody = extractFunction("async function refuseStaleBundleRun(");
   const factory = new Function(
-    "refuseStaleBundleRefresh",
+    "api",
+    "PANEL_VERSION",
+    "describeStaleBundleRefresh",
     "describeStaleBundleRun",
-    `${body}; return refuseStaleBundleRun;`,
+    `${refreshBody}; ${runBody}; return refuseStaleBundleRun;`,
   );
+  let versionRoute = 0;
   const stale = await factory(
-    async () => describeStaleBundleRefresh({ running: "0.15.173", installed: "0.15.174" }),
+    {
+      fetchApi: async (route, init) => {
+        versionRoute += 1;
+        assert.equal(route, "/comfyui_mcp_panel/version");
+        assert.equal(init?.cache, "no-store");
+        return { ok: true, json: async () => ({ version: "0.15.174" }) };
+      },
+    },
+    "0.15.173",
+    describeStaleBundleRefresh,
     describeStaleBundleRun,
   )();
+  assert.equal(versionRoute, 1);
   assert.equal(stale.queued, false);
   assert.equal(stale.reason, "stale_bundle");
   assert.equal(stale.running, "0.15.173");
   assert.equal(stale.installed, "0.15.174");
   assert.match(stale.error, /Ctrl\+Shift\+R/);
   assert.match(stale.error, /Nothing was queued/);
+  assert.equal("queued_unknown" in stale, false);
 
-  const current = await factory(async () => null, describeStaleBundleRun)();
-  assert.equal(current, null, "equal/unknown probes fail open into the run");
+  const current = await factory(
+    { fetchApi: async () => ({ ok: true, json: async () => ({ version: "0.15.174" }) }) },
+    "0.15.174",
+    describeStaleBundleRefresh,
+    describeStaleBundleRun,
+  )();
+  assert.equal(current, null, "equal versions fail open into the run");
+
+  const unknown = await factory(
+    { fetchApi: async () => ({ ok: false }) },
+    "0.15.173",
+    describeStaleBundleRefresh,
+    describeStaleBundleRun,
+  )();
+  assert.equal(unknown, null, "an unreadable probe must not invent stale_bundle");
 });
 
 // ---------------------------------------------------------------------------
