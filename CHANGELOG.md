@@ -7,6 +7,8 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+
+- panel_run refuses a stale live browser bundle with a Ctrl+Shift+R hard-refresh requirement instead of silently dropping dispatch; unverified scoped pending items are still removed fail-closed (#2252)
 - the re-open discard warning now reaches the refusal callers actually hit (#2139). It was wired only into the secondary write-boundary assertion; the PRIMARY dispatch fence called the same message builder with commandUuid/activeUuid/movedNote only, so activeIsModified defaulted to null and an ordinary workflow-instance mismatch never showed the warning — the fence whose own comment calls it "the refusal a caller actually sees". Both sites now read through one shared activeWorkflowSaveState() probe so they cannot disagree about the same tab. Found by the Copilot review on the PR
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
@@ -25,6 +27,7 @@ All notable changes to this project are documented here. This project adheres to
   entirely inside the stranded transaction leaves this warning silent on the deadlock
   its own sentence names.
 - the stale-snapshot save refusal no longer promises that a still-open transaction clears by itself or that nudging the canvas fixes it (measured: it does not, and each nudge widens the gap), and it now warns against falling back to ComfyUI's own Save, which persists the same tracker snapshot silently (#2139)
+
 
 ## [0.15.174] - 2026-09-04
 
