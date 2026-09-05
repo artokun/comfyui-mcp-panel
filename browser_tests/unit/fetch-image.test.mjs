@@ -111,6 +111,7 @@ test("#2884: a production-like fetchApi that prefixes /api is not used for /view
       expectedOrigin: origin,
       api: {
         api_base: "/comfy",
+        user: "alice",
         apiURL,
         fileURL,
         fetchApi: async (path, init) => {
@@ -133,6 +134,7 @@ test("#2884: a production-like fetchApi that prefixes /api is not used for /view
   assert.equal(fetchCalls[0].url.includes("/api/view"), false);
   assert.equal(fetchCalls[0].init.credentials, "include");
   assert.equal(fetchCalls[0].init.redirect, "manual");
+  assert.equal(fetchCalls[0].init.headers["Comfy-User"], "alice");
 });
 
 test("#2149: file refs reject separators, traversal, invalid subfolders, types, URLs, and extra fields", async () => {

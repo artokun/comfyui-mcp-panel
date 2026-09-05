@@ -335,6 +335,9 @@ export async function fetchImageForMcp(
     credentials: "include",
     redirect: "manual",
     signal: timeout.controller.signal,
+    ...(typeof api?.user === "string" && api.user
+      ? { headers: { "Comfy-User": api.user } }
+      : {}),
   };
   try {
     let response;

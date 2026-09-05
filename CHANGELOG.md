@@ -7,7 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-- fetch_image and fetch_comfyui_read no longer send `/view` or `/system_stats` through ComfyUI `api.fetchApi`, which prefixes `/api` and was failing the connected-panel media/health relay with `Failed to fetch`. `/view` uses origin-validated `fileURL` (the real media route); API reads use `apiURL` + same-origin fetch, matching the logs transport (comfyui-mcp#2884)
+- fetch_image no longer sends `/view` through ComfyUI `api.fetchApi`, which prefixes `/api` so local media became `/api/view` and failed with `Failed to fetch` after headless ECONNREFUSED. `/view` uses origin-validated `fileURL` + same-origin fetch (and `Comfy-User` when the API object has a user). History / system_stats keep `fetchApi` so cloud auth headers and 401 remint stay intact (comfyui-mcp#2884)
 
 ## [0.15.177] - 2026-09-05
 
