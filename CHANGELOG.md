@@ -8,6 +8,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - panel_set_widget wraps live COMFY_DYNAMICCOMBO_V3 parents before the write so a Vue/widget-store flush cannot rebuild dotted FLOAT children from spec defaults while the receipt still says applied:true; panel_query_graph then sees the value that was written (#2031)
+- Save-As after panel_refresh_nodes proves destination canvas identity before refusing, recaptures the active tracker (and reseals a missing root uuid) so refresh does not invalidate content identity, and a failed copy's source restore actually runs then recaptures so the next graph read is not root-shape-mismatch (#2257)
 - the re-open discard warning now reaches the refusal callers actually hit (#2139). It was wired only into the secondary write-boundary assertion; the PRIMARY dispatch fence called the same message builder with commandUuid/activeUuid/movedNote only, so activeIsModified defaulted to null and an ordinary workflow-instance mismatch never showed the warning — the fence whose own comment calls it "the refusal a caller actually sees". Both sites now read through one shared activeWorkflowSaveState() probe so they cannot disagree about the same tab. Found by the Copilot review on the PR
 - the workflow-instance-mismatch refusal now warns when re-opening would DISCARD unsaved
   work (panel#2139). It recommends panel_open_workflow, which re-reads from disk — for a
