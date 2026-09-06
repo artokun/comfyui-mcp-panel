@@ -67,6 +67,7 @@ import {
   findSlotIndexByName,
   reconcileDynamicPrefixSlots,
 } from "../../web/js/lib/dynamic-slot-reconcile.js";
+import { resolveExplicitSlot } from "../../web/js/lib/connect-match.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8").replace(/\r\n/g, "\n");
@@ -96,9 +97,9 @@ function resolveSlot(slots, ref, kind) {
     if (ref < 0 || ref >= list.length) throw new Error(`no ${kind} slot ${ref}`);
     return ref;
   }
-  const i = list.findIndex((s) => s?.name === ref);
-  if (i === -1) throw new Error(`no ${kind} named ${ref}`);
-  return i;
+  const resolved = resolveExplicitSlot(list, ref);
+  if (Number.isInteger(resolved?.index)) return resolved.index;
+  throw new Error(`no ${kind} named ${ref}`);
 }
 
 const railIntent = () => null;
@@ -371,6 +372,25 @@ test("#2008 dotted-name helper is the Autogrow child shape, not positional packs
   assert.equal(isDynamicPrefixSlotName("input3"), false);
   assert.equal(isDynamicPrefixSlotName("prompt"), false);
   assert.equal(isDynamicPrefixSlotName(null), false);
+});
+
+test("#2266: Autogrow display alias still runs #2008 dotted-name reconcile", () => {
+  const { graph, mm } = minimaxFixture({ mode: "rebuild" });
+  const videoLink = nameLink(mm, "ref_videos.ref_video_0");
+  const audioLink = nameLink(mm, "ref_audios.ref_audio_0");
+  const graph_connect = buildConnect(graph);
+
+  const res = graph_connect({
+    from_node_id: 1,
+    from_output: 0,
+    to_node_id: 136,
+    to_input: "ref_image_4",
+  });
+
+  assert.equal(res.connected.to.input, "ref_images.ref_image_4");
+  assert.ok(nameLink(mm, "ref_images.ref_image_4") != null);
+  assert.equal(nameLink(mm, "ref_videos.ref_video_0"), videoLink, "alias must not skip Autogrow restore");
+  assert.equal(nameLink(mm, "ref_audios.ref_audio_0"), audioLink);
 });
 
 test("#2008 INSERT: connecting to ref_images.ref_image_4 keeps later names and stays silent", () => {
