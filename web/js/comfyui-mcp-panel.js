@@ -3099,7 +3099,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // could never catch the real failure, that set-version.mjs was not run at all,
 // since one script writes them together. That is how 0.15.86..0.15.96 shipped
 // still announcing 0.15.85.
-const PANEL_VERSION = "0.15.176";
+const PANEL_VERSION = "0.15.179";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at
@@ -7727,19 +7727,27 @@ async function repaintSaveAsCanvas(copy, targetPath, { canvasFence } = {}) {
       // active workflow record and this Save-As operation's monotonic generation.
       const ownerChanged = !ownsWorkflow(workflow, "repaint-after");
       if (ownerChanged) return { ok: false, ownerChanged: true };
-      if (restore.completed !== true) return { ok: false, ownerChanged: false };
       const rootGraph = app?.graph;
       const rootMeta = rootGraph?.extra?.[WORKFLOW_META_NAMESPACE];
       const canvasIsRoot = app?.canvas?.graph == null || app.canvas.graph === rootGraph;
-      return {
-        ok:
-          ownsWorkflow(workflow, "repaint-verify") &&
-          sameWorkflowObject(activeWorkflowRef(), workflow) &&
-          canvasIsRoot &&
-          rootMeta?.[WORKFLOW_UUID_FIELD] === targetUuid &&
-          normalizedWorkflowPath(rootMeta?.[WORKFLOW_PATH_FIELD]) === normalizedWorkflowPath(destinationPath),
-        ownerChanged: false,
-      };
+      // keepInstance may restamp extra onto the live object uuid. Verify the
+      // identity that actually landed, not only the pre-load mint (#2257).
+      const attachedUuid =
+        (typeof workflowObjectUuid === "function" ? workflowObjectUuid(workflow) : null) || targetUuid;
+      const destIdentityProven =
+        ownsWorkflow(workflow, "repaint-verify") &&
+        sameWorkflowObject(activeWorkflowRef(), workflow) &&
+        canvasIsRoot &&
+        typeof attachedUuid === "string" &&
+        attachedUuid &&
+        rootMeta?.[WORKFLOW_UUID_FIELD] === attachedUuid &&
+        normalizedWorkflowPath(rootMeta?.[WORKFLOW_PATH_FIELD]) === normalizedWorkflowPath(destinationPath);
+      // Destination identity is the #939 persist gate. A node-configure miss
+      // after panel_refresh_nodes must not hide a canvas that already carries
+      // the copy's uuid and path (#2257).
+      if (destIdentityProven) return { ok: true, ownerChanged: false };
+      if (restore.completed !== true) return { ok: false, ownerChanged: false };
+      return { ok: false, ownerChanged: false };
     } catch {
       // A throw is recoverable only when the awaited load also lost ownership. If
       // the same owner remains active, preserve the existing fail-closed refusal.
@@ -7937,10 +7945,24 @@ async function programmaticSave(name) {
       // The adapter restores the record before calling this hook. Repaint only when
       // that record is still the active instance; a concurrent tab switch must not
       // load the source graph over the user's other canvas.
-      if (!canvasFence(workflow)) return false;
-      return repaintSaveAsCanvas(workflow, workflow.path, {
+      // canvasFence takes `{ workflow }` — passing the record itself always
+      // destructures `workflow.workflow` (undefined) and returns false, so
+      // every failed Save-As then reported "source canvas restore returned false"
+      // and left the next graph read on a partial canvas (#2257).
+      if (!canvasFence({ workflow })) return false;
+      const restored = await repaintSaveAsCanvas(workflow, workflow.path, {
         canvasFence: (current, phase) => canvasFence({ workflow: current, phase }),
       });
+      if (restored !== true) return false;
+      // The restore already proved source identity on the canvas. Recapture the
+      // tracker in the same turn so the next graph read cannot see dest-stamped
+      // extra against a source snapshot as root-shape-mismatch (#2257).
+      try {
+        captureCanvasIntoTracker(workflow);
+      } catch {
+        /* proven restore still stands; recapture is identity bookkeeping */
+      }
+      return true;
     },
     canvasFence,
     operationFence,
@@ -14292,6 +14314,28 @@ const GRAPH_TOOL_EXECUTORS = {
       } catch {
         /* mapping rebind is best-effort; the witness still recomputes on the next read */
       }
+      // Combo reapply mutates live widgets. Recapture the active tracker and
+      // reseal a missing root uuid so the next Save-As / graph read still
+      // sees this workflow's content identity (#2257).
+      try {
+        const wf = typeof activeWorkflowRef === "function" ? activeWorkflowRef() : null;
+        if (wf) {
+          captureCanvasIntoTracker(wf);
+          const uuid =
+            (typeof workflowObjectUuid === "function" && workflowObjectUuid(wf)) ||
+            (typeof workflowStableUuid === "function" && workflowStableUuid(wf, { commit: false })) ||
+            null;
+          if (typeof uuid === "string" && uuid && typeof sealProvenRootBinding === "function") {
+            sealProvenRootBinding({
+              rootGraph: app?.graph,
+              activeWorkflow: wf,
+              activeWorkflowUuid: uuid,
+            });
+          }
+        }
+      } catch {
+        /* identity recapture must never fail a completed node-def refresh */
+      }
     }
     // #981: the stale-placeholder disclosure has to survive BOTH paths. The producer
     // runs the scan whatever the verdict says — a refresh that failed at the combo phase
@@ -17530,8 +17574,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // name; an onConnectionsChange insert that shifts later families must not
     // steal those names' links or report them as rewrites.
     const namedSlotsBefore = captureNamedSlotLinks(target);
+    // Prefer the live programmatic name so an Autogrow display alias
+    // (`ref_image_0`) still feeds #2008 dotted-name reconcile
+    // (`ref_images.ref_image_0`). Raw to_input is only the fallback when the
+    // resolved slot has no name.
     const requestedSlotName =
-      typeof to_input === "string" ? to_input : target.inputs?.[inIdx]?.name ?? null;
+      target.inputs?.[inIdx]?.name ??
+      (typeof to_input === "string" ? to_input : null);
     const inputNamesBefore = snapshotInputSlotNames(graph);
     // #2380 — the whole-graph state, captured BEFORE the wire is made. Every other
     // check on this path is scoped to the two endpoints the command NAMED, so a

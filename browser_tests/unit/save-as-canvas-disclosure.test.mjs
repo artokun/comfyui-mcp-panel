@@ -73,6 +73,21 @@ test("#939 the production adapter repaints before it captures and persists the c
   assert.match(panel, /const canvasFence = \(\{ workflow \} = \{\}\)/);
   assert.match(panel, /saveAsCanvasGeneration/);
   assert.match(panel, /restoreCanvas: async \(\{ workflow \}\)/);
+  assert.match(
+    panel,
+    /if \(!canvasFence\(\{ workflow \}\)\) return false;/,
+    "#2257 restoreCanvas must pass { workflow } — the record itself always fails the fence",
+  );
+  assert.match(
+    panel,
+    /destIdentityProven/,
+    "#2257 must verify destination identity before declaring a Save-As restore failure",
+  );
+  assert.match(
+    panel,
+    /captureCanvasIntoTracker\(workflow\)/,
+    "#2257 source restore must recapture the tracker after a proven canvas restore",
+  );
   assert.match(panel, /\[WORKFLOW_PATH_FIELD\]: destinationPath/);
   assert.match(panel, /loadGraphDataWithCompletionProof\(\{/);
   assert.ok(

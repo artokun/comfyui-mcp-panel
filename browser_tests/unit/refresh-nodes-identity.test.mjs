@@ -246,3 +246,13 @@ test("#2026 production refresh_nodes snapshots identity, gates the route on that
   );
   assert.match(refreshBody, /viewing: boundIdentity/);
 });
+
+test("#2257 production refresh_nodes recaptures the active tracker after a successful refresh", () => {
+  const refreshBody = refreshNodesMatch[0];
+  assert.match(
+    refreshBody,
+    /captureCanvasIntoTracker\(wf\)/,
+    "refresh must recapture content identity so the next Save-As / graph read is not root-shape-mismatch",
+  );
+  assert.match(refreshBody, /sealProvenRootBinding\(/);
+});

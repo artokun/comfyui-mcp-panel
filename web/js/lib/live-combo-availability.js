@@ -79,6 +79,15 @@ export function optionsLookLikeFiles(options) {
   return strings.filter((s) => FILE_LIKE.test(s)).length * 2 >= strings.length;
 }
 
+/** True when any string option looks like a file path. Diagnostics that print
+ *  option values must use this, not majority `optionsLookLikeFiles` — a mixed
+ *  list like `None`/`disabled`/`client/model.safetensors` is not majority-file
+ *  but still contains a private path (#2265 Copilot). */
+export function optionsIncludeFileLike(options) {
+  if (!Array.isArray(options) || options.length === 0) return false;
+  return options.some((o) => typeof o === "string" && FILE_LIKE.test(o));
+}
+
 /**
  * Pull a class's combo inputs out of an /object_info/<class> body.
  *

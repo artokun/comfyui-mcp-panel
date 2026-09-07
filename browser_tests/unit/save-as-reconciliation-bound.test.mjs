@@ -147,3 +147,55 @@ test('#939 a continuously changing active tab gets a bounded neutral canvas befo
     delete globalThis.app
   }
 })
+
+test('#2257 destination identity on the canvas proves Save-As even when load completion is incomplete', async () => {
+  const fn = namedFunctionSource(PANEL, 'repaintSaveAsCanvas')
+  const repaintSaveAsCanvas = new Function(`
+    const MAX_SAVE_AS_CANVAS_RECONCILIATIONS = 3
+    const WORKFLOW_META_NAMESPACE = 'comfyui_mcp'
+    const WORKFLOW_UUID_FIELD = 'workflow_uuid'
+    const WORKFLOW_PATH_FIELD = 'workflow_path'
+    const workflowStableUuid = (workflow) => workflow.uuid
+    const workflowObjectUuid = (workflow) => workflow.uuid
+    const sameWorkflowObject = (a, b) => a === b
+    const normalizedWorkflowPath = (path) => path
+    const activeWorkflowRef = () => globalThis.__cmcp2257Active
+    const liteGraphGlobal = () => null
+    const loadGraphDataWithCompletionProof = async ({ load }) => {
+      await load()
+      return { completed: false }
+    }
+    ${fn}
+    return repaintSaveAsCanvas
+  `)()
+
+  const copy = {
+    path: 'workflows/copy-after-refresh.json',
+    uuid: 'copy-after-refresh',
+    changeTracker: { activeState: { nodes: [{ id: 1, type: 'KSampler' }], extra: {} } }
+  }
+  globalThis.__cmcp2257Active = copy
+  globalThis.app = {
+    graph: { _nodes: copy.changeTracker.activeState.nodes, extra: {} },
+    canvas: null,
+    loadGraphData: async (payload) => {
+      globalThis.app.graph.extra = payload.extra
+      globalThis.app.graph._nodes = payload.nodes ?? []
+    }
+  }
+
+  try {
+    assert.equal(
+      await repaintSaveAsCanvas(copy, copy.path, {
+        canvasFence: (workflow) => globalThis.__cmcp2257Active === workflow
+      }),
+      true,
+      'destination uuid+path on the live root is the persist proof, not configure completion',
+    )
+    assert.equal(globalThis.app.graph.extra.comfyui_mcp.workflow_uuid, copy.uuid)
+    assert.equal(globalThis.app.graph.extra.comfyui_mcp.workflow_path, copy.path)
+  } finally {
+    delete globalThis.__cmcp2257Active
+    delete globalThis.app
+  }
+})
