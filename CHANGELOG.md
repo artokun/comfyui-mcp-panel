@@ -6,9 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.182] - 2026-09-07
+
 ### Fixed
 
 - interactive ask/question cards now retain their URL+epoch correlation across a same-session reconnect, replay the pending answer only to that proven session, and withdraw mismatched cards without painting duplicates (#2218)
+
+- preserve ask cards across same-session reconnect
+
 
 ## [0.15.181] - 2026-09-07
 
