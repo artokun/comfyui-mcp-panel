@@ -1,4 +1,4 @@
-import { isDynamicWidgetMissingError, wrapGraphDynamicComboSetters } from "./dynamic-widget-reconcile.js";
+import { wrapGraphDynamicComboSetters } from "./dynamic-widget-reconcile.js";
 
 // #1854 — the intrinsic captured ONCE at module load. Invoking through a
 // per-call property lookup on the function object would read an overrideable
@@ -55,6 +55,45 @@ function forEachGraph(rootGraph, visit) {
   }
 }
 
+function widgetName(widget) {
+  try {
+    return typeof widget?.name === "string" ? widget.name : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWidget(record) {
+  const node = record?.node;
+  const name = record?.name;
+  if (node && typeof name === "string") {
+    const widgets = node.widgets;
+    if (!Array.isArray(widgets)) {
+      throw new Error(`Cannot restore widget ${name}: node widgets are unavailable`);
+    }
+    const replacement = widgets.find((widget) => widgetName(widget) === name);
+    if (!replacement) {
+      throw new Error(`Cannot restore widget ${name}: no live widget has that name`);
+    }
+    return replacement;
+  }
+  if (!record?.widget) throw new Error("Cannot restore an unnamed widget without its captured object");
+  return record.widget;
+}
+
+function shallowToDeep(records) {
+  return (records ?? [])
+    .map((record, index) => ({ record, index }))
+    .sort((left, right) => {
+      const leftName = left.record?.name;
+      const rightName = right.record?.name;
+      const leftDepth = typeof leftName === "string" ? leftName.split(".").length : 0;
+      const rightDepth = typeof rightName === "string" ? rightName.split(".").length : 0;
+      return leftDepth - rightDepth || left.index - right.index;
+    })
+    .map(({ record }) => record);
+}
+
 function captureWidgetState(rootGraph) {
   const records = [];
   let supported = true;
@@ -69,7 +108,7 @@ function captureWidgetState(rootGraph) {
           supported = false;
           continue;
         }
-        records.push({ widget, snapshot: cloned.value });
+        records.push({ node, name: widgetName(widget), widget, snapshot: cloned.value });
       }
     }
   });
@@ -79,38 +118,30 @@ function captureWidgetState(rootGraph) {
 function captureLiveState(records) {
   const live = [];
   for (const record of records) {
-    const cloned = cloneValue(record.widget.value);
+    const widget = resolveWidget(record);
+    const cloned = cloneValue(widget.value);
     if (!cloned.ok) return null;
-    live.push({ widget: record.widget, value: cloned.value });
+    live.push({ ...record, widget, value: cloned.value });
   }
   return live;
 }
 
 /**
- * Write each captured value back onto its widget.
+ * Write each captured value back onto the live widget with the same node/name.
  *
- * EXPORTED as a test seam (#2033). The catch below is narrow on purpose, and that
- * narrowness was unpinned: replacing the condition with a blanket swallow left the
- * whole panel suite green. It is not reachable through the queue path while a test
- * is asserting — measured with a call counter, `restoreState` has still not run at
- * the end of the barrier test's body, even after a tick — so a test written against
- * that path pins the catch only by accident. This function is pure over its
- * `{widget, snapshot|value}` records and needs no queue plumbing, so driving it
- * directly is what actually reaches the catch, in both directions.
+ * DynamicCombo setters replace dotted child objects when a shallow parent is restored.
+ * Resolve every record immediately before writing, and do so shallow-to-deep, so a
+ * child never receives a write through a detached captured accessor. There is no
+ * message-based suppression here: a missing replacement or an unrelated setter error
+ * must fail closed.
  *
- * @param {Array<{widget: {value: unknown}}> | null | undefined} records
+ * @param {Array<{node?: object, name?: string | null, widget: {value: unknown}}> | null | undefined} records
  * @param {"snapshot" | "value"} key
  */
 export function restoreState(records, key) {
-  for (const record of records ?? []) {
-    try {
-      record.widget.value = copyStoredValue(record[key]);
-    } catch (error) {
-      // #2033 — restoring a captured DynamicCombo parent rebuilds dotted children
-      // and leaves the captured child widget detached. The live replacement already
-      // carries the restored option; rethrow anything that is not that throw.
-      if (!isDynamicWidgetMissingError(error)) throw error;
-    }
+  for (const record of shallowToDeep(records)) {
+    const widget = resolveWidget(record);
+    widget.value = copyStoredValue(record[key]);
   }
 }
 
@@ -174,9 +205,15 @@ function finishEntry(state, entry) {
   // Do not overwrite a value changed while the asynchronous serializer was
   // running. Values still equal to the queue-time state belong to this
   // temporary restore and can safely return to the live graph's prior state.
-  for (const [index, record] of entry.graphState.records.entries()) {
-    if (Object.is(record.widget.value, entry.queueValues?.[index])) {
-      record.widget.value = copyStoredValue(entry.liveState[index].value);
+  const liveRecords = entry.graphState.records.map((record, index) => ({
+    ...record,
+    value: entry.liveState[index]?.value,
+    queueValue: entry.queueValues?.[index],
+  }));
+  for (const record of shallowToDeep(liveRecords)) {
+    const widget = resolveWidget(record);
+    if (Object.is(widget.value, record.queueValue)) {
+      widget.value = copyStoredValue(record.value);
     }
   }
   removeEntryFromState(state, entry);
@@ -388,7 +425,7 @@ export function installGraphToPromptSnapshotBarrier(app) {
       return result;
     }
 
-    entry.queueValues = entry.graphState.records.map((record) => record.widget.value);
+    entry.queueValues = entry.graphState.records.map((record) => resolveWidget(record).value);
     let result;
     try {
       // This is the real ComfyUI serializer, after its beforeQueued and promoted

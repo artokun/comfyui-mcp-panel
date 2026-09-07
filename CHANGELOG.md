@@ -8,9 +8,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - the same-value short-circuit no longer swallows the relocation replay (#2033/#2140). reconcileFreshDynamicWidgets renames an orphan to `<root>.__cmcp_stale_N`, pushes a store cleanup alias, and replays the root so LiteGraph's own setter deletes both — but that replay is a SAME-VALUE write, which is exactly what the #2033 guard returns on, and it returned precisely when the root was HEALTHY (live dotted children), i.e. the common case. The stale row and its store alias stayed attached. The guard now stands down while a root still carries those rows, and applies again once the replay has removed them. Found by the Copilot review on the PR
-- the snapshot-restore catch is now pinned in BOTH directions (#2033). It swallows the detached-child throw and rethrows everything else, and that narrowness was untested: replacing the condition with a blanket swallow left all 8,344 panel tests green. The catch is not reachable through the queue path while a test is asserting — instrumented with a call counter, `restoreState` has still not run at the end of the barrier test's body, even after a tick — so a test written against that path observes the restore only by accident. `restoreState` is now exported as a test seam and driven directly: it is pure over its records, so both the swallow and the rethrow are reached with no queue plumbing. A blanket-swallow mutation now kills two tests.
-- panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is ignored rather than failed closed as a graph error (#2033)
+- snapshot and live-state queue restores now re-resolve widgets by node/name from shallow to deep after DynamicCombo parents replace dotted children; missing replacements and unrelated setter failures remain fail-closed (#2033)
+- panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is resolved to its live replacement (#2033)
 - panel_connect accepts an Autogrow display-label alias (`ref_image_0` → `ref_images.ref_image_0`) instead of refusing with a false "no input accepts type IMAGE"; the resolved live slot name still feeds #2008 dotted-name reconcile, and an unmatched name reports internal slot names rather than blaming the origin type (#2266)
+
+## [0.15.179] - 2026-09-05
+
+### Fixed
 - panel_set_widget combo refusals list the live options for generic enums (device/precision) instead of applying the private filename/path redaction to every combo (#2265, #2271)
 
 ## [0.15.178] - 2026-09-05

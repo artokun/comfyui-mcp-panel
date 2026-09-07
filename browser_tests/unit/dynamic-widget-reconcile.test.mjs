@@ -705,14 +705,49 @@ test("#2033: queue-time snapshot restore does not throw after first serialize in
   assert.equal(node.widgets.some((widget) => widget.name === "format.codec"), true);
 });
 
-// #2033 — the restore catch is narrow ON PURPOSE: it swallows the detached-child throw
-// and rethrows everything else. Both directions are pinned HERE rather than through the
-// queue path, because `restoreState` runs after the barrier test's assertions complete
-// (measured with a call counter: the counter is still unset at the end of that test's
-// body, even after a tick). A test written against the queue path therefore observes the
-// restore only by accident, which is why a blanket-swallow mutation previously left all
-// 8,344 panel tests green. `restoreState` is pure over its records, so calling it directly
-// reaches the catch with no plumbing.
+test("#2033: queue snapshot and live restore re-resolve after a parent replacement", async () => {
+  const { node, graph, installNativeSetters } = makeReconnectSaveVideo();
+  const queueItems = [];
+  let nativeInstalled = false;
+  const app = {
+    graph,
+    rootGraph: graph,
+    queueItems,
+    graphToPrompt() {
+      if (!nativeInstalled) {
+        nativeInstalled = true;
+        installNativeSetters();
+      }
+      return { output: { 92: { class_type: "SaveVideo" } } };
+    },
+    queuePrompt() {
+      queueItems.push({ number: 1 });
+      return Promise.resolve({ node_errors: {} });
+    },
+  };
+  installGraphToPromptDynamicReconcile(app);
+  installGraphToPromptSnapshotBarrier(app);
+  const prompt = await app.graphToPrompt();
+  const entry = reserveGraphToPromptSnapshot(app, prompt, graph);
+
+  const root = node.widgets.find((widget) => widget.name === "format");
+  root.value = "mp4";
+  const liveChild = node.widgets.find((widget) => widget.name === "format.codec");
+  await queuePromptWithGraphToPromptSnapshot(app, entry, () => app.queuePrompt());
+  queueItems.pop();
+  const snapshotChild = node.widgets.find((widget) => widget.name === "format.codec");
+  assert.notEqual(snapshotChild, liveChild, "snapshot restore rebuilt the parent and replaced the live child");
+
+  await app.graphToPrompt(graph);
+  const restoredChild = node.widgets.find((widget) => widget.name === "format.codec");
+  assert.equal(root.value, "mp4");
+  assert.equal(restoredChild.value, "auto");
+  assert.equal(node.widgets.includes(liveChild), false, "live restore also used the current replacement");
+});
+
+// #2033 — restoreState resolves each record against the current node immediately before
+// writing. A DynamicCombo parent can replace every dotted child during that write, so
+// records must be applied shallow-to-deep rather than through captured widget objects.
 function widgetThatThrows(error) {
   return {
     name: "format.codec",
@@ -725,26 +760,57 @@ function widgetThatThrows(error) {
   };
 }
 
-test("#2033: restoreState SWALLOWS the detached-child throw", () => {
-  const widget = widgetThatThrows(new Error("Dynamic widget doesn't exist on node"));
-  assert.doesNotThrow(() => restoreState([{ widget, snapshot: "h264" }], "snapshot"));
-});
+function makeIdentityRestoreFixture() {
+  const node = { widgets: [] };
+  let rootValue = "live-parent";
+  const replacement = { name: "format.codec", value: "replacement-default" };
+  const root = { name: "format" };
+  Object.defineProperty(root, "value", {
+    configurable: true,
+    get: () => rootValue,
+    set: (next) => {
+      rootValue = next;
+      node.widgets = [root, replacement];
+    },
+  });
+  const detached = widgetThatThrows(new Error("Dynamic widget doesn't exist on node"));
+  node.widgets = [root, detached];
+  return { node, root, detached, replacement };
+}
 
-test("#2033: restoreState RETHROWS anything that is not that throw", () => {
-  // The whole safety of the catch is this direction. Without it the condition can be
-  // widened to a catch-all and nothing fails.
-  const widget = widgetThatThrows(new Error("boom: unrelated restore failure"));
+for (const [key, parentValue, childValue] of [
+  ["snapshot", "snapshot-parent", "snapshot-child"],
+  ["value", "live-parent", "live-child"],
+]) {
+  test(`#2033: ${key} restore re-resolves replacement widgets shallow-to-deep`, () => {
+    const { node, root, detached, replacement } = makeIdentityRestoreFixture();
+    const records = [
+      { node, name: "format.codec", widget: detached, [key]: childValue },
+      { node, name: "format", widget: root, [key]: parentValue },
+    ];
+    restoreState(records, key);
+    assert.equal(node.widgets.includes(detached), false);
+    assert.equal(replacement.value, childValue);
+  });
+}
+
+test("#2033: restoreState propagates unrelated setter failures", () => {
+  const error = new Error("boom: unrelated restore failure");
+  const widget = widgetThatThrows(error);
+  const node = { widgets: [widget] };
   assert.throws(
-    () => restoreState([{ widget, snapshot: "h264" }], "snapshot"),
-    /boom: unrelated restore failure/,
+    () => restoreState([{ node, name: widget.name, widget, snapshot: "h264" }], "snapshot"),
+    (actual) => actual === error,
   );
 });
 
-test("#2033: a non-Error rejection is still classified, not blindly swallowed", () => {
-  // isDynamicWidgetMissingError stringifies non-Errors; a bare string that does not
-  // match must still propagate.
-  const widget = widgetThatThrows("plain string failure");
-  assert.throws(() => restoreState([{ widget, snapshot: "h264" }], "snapshot"));
+test("#2033: restoreState propagates missing live replacements", () => {
+  const widget = { name: "format.codec", value: "h264" };
+  const node = { widgets: [] };
+  assert.throws(
+    () => restoreState([{ node, name: widget.name, widget, snapshot: "h264" }], "snapshot"),
+    /no live widget has that name/,
+  );
 });
 
 // #2033 vs the relocation replay. The reconcile renames an orphan to
@@ -753,7 +819,38 @@ test("#2033: a non-Error rejection is still classified, not blindly swallowed", 
 // SAME-VALUE write, which is exactly what #2033's short-circuit swallows -- and it
 // swallows it when the root is HEALTHY (preserved children present), i.e. the
 // common case, leaving the residue attached.
-test("#2033/#2140 the same-value short-circuit yields while cleanup rows are pending", () => {
+test("#2033/#2140 cleanup replay removes stale widgets, inputs, and store aliases", () => {
+  const def = nestedFormatDef();
+  const { node, store } = makeNode({
+    def,
+    extraWidgets: [{ name: "codec", dynamic: true }],
+  });
+  const graph = { _nodes: [node] };
+  wrapGraphDynamicComboSetters(graph);
+  assert.equal(store.has("15:codec"), true);
+
+  const result = reconcileFreshDynamicWidgets(node, def);
+  assert.equal(result.failures.length, 0);
+  assert.ok(result.replayed.includes("format"));
+  assert.equal(node.widgets.some((widget) => /__cmcp_(stale|store_cleanup)_/.test(widget.name)), false);
+  assert.equal(node.inputs.some((input) => /__cmcp_(stale|store_cleanup)_/.test(input.name)), false);
+  assert.equal(store.has("15:codec"), false, "the renamed orphan's original store key is deleted");
+  assert.equal(
+    [...store.keys()].some((key) => key.includes("__cmcp_")),
+    false,
+    "native cleanup deletes the stale widget and re-registration keys",
+  );
+
+  const root = node.widgets.find((widget) => widget.name === "format");
+  const child = node.widgets.find((widget) => widget.name === "format.codec");
+  const rebuildCount = node.dynamicRebuilds.length;
+  const sameValue = root.value;
+  root.value = sameValue;
+  assert.equal(node.widgets.find((widget) => widget.name === "format.codec"), child);
+  assert.equal(node.dynamicRebuilds.length, rebuildCount, "the same-value guard remains active after cleanup");
+});
+
+test("#2033/#2140 the same-value short-circuit yields while cleanup rows are pending", () => {
   const src = readFileSync(
     fileURLToPath(new URL("../../web/js/lib/dynamic-widget-reconcile.js", import.meta.url)),
     "utf8",
