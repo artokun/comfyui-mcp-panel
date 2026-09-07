@@ -4,6 +4,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+  backendSocketIsDown,
+  backendSocketTransportState,
+  WS_OPEN,
+} from "../../web/js/lib/reconnect-recovery.js";
+import {
   captureRunDispatchIdentity,
   compareRunDispatchIdentity,
   downgradeUnstableRunResult,
@@ -162,7 +167,9 @@ test("the production identity provider publishes proof, not a swallowed null UUI
   assert.match(provider, /let routeIdentityProven = false;/);
   assert.match(provider, /routeIdentityProven = typeof routeId === "string"/);
   assert.match(provider, /const transportState = backendSocketTransportState\(/);
-  assert.match(provider, /backendSocketState = comfyBackendSocketDown === true \? "down" : transportState/);
+  // #2854 — must be the COMBINED predicate, not the raw sticky flag.
+  assert.match(provider, /backendSocketState = comfyBackendIsDown\(\) \? "down" : transportState/);
+  assert.doesNotMatch(provider, /backendSocketState = comfyBackendSocketDown === true/);
   assert.match(provider, /backendSocketState,/);
   assert.match(provider, /const probe = probeActiveWorkflow\(\);/);
   assert.match(provider, /const candidate =/);
@@ -193,4 +200,49 @@ test("an unstable scoped receipt keeps queued_prompt_ids while removing queued:t
   assert.deepEqual(result.queued_prompt_ids, ["scoped-1", "scoped-2"]);
   assert.equal(result.prompt_id, "scoped-1");
   assert.deepEqual(result.prompt_ids, ["scoped-1", "scoped-2"]);
+});
+
+// #2854 - panel_run refused every dispatch for an hour while every other panel_*
+// call on the same canvas succeeded and reported backend_socket "up".
+//
+// The provider decides backendSocketState. Driving that decision through the REAL
+// helpers, both ways, separates the fix from the bug: the busted form reads the
+// sticky flag alone; the fixed form asks comfyBackendIsDown(), whose rule is
+// "flaggedDown + OPEN is a stale or busy-poll signal, not a down socket" (#1325).
+const providerState = (decide, flaggedDown, socketReadyState) =>
+  decide(flaggedDown, socketReadyState)
+    ? "down"
+    : backendSocketTransportState({ socketReadyState });
+
+const FIXED = (flaggedDown, socketReadyState) =>
+  backendSocketIsDown({ flaggedDown, socketReadyState });
+const BUSTED = (flaggedDown) => flaggedDown === true;
+
+test("#2854 a stale sticky flag over an OPEN socket does not refuse the dispatch", () => {
+  const state = providerState(FIXED, true, WS_OPEN);
+  assert.equal(state, "available", "flaggedDown + OPEN is stale, not down");
+  const result = compareRunDispatchIdentity(
+    identity({ backendSocketState: state }),
+    identity({ backendSocketState: state }),
+  );
+  assert.equal(result.stable, true);
+  assert.deepEqual(result.changed, []);
+});
+
+test("#2854 the pre-fix decision is what produced the permanent refusal", () => {
+  const state = providerState(BUSTED, true, WS_OPEN);
+  assert.equal(state, "down");
+  const result = compareRunDispatchIdentity(
+    identity({ backendSocketState: state }),
+    identity({ backendSocketState: state }),
+  );
+  assert.equal(result.stable, false);
+  assert.deepEqual(result.changed, ["backend socket down"]);
+});
+
+test("#2854 fail-closed directions are unchanged by the fix", () => {
+  assert.equal(providerState(FIXED, true, 3), "down");
+  assert.equal(providerState(FIXED, true, undefined), "down");
+  assert.equal(providerState(FIXED, false, undefined), "unknown");
+  assert.equal(providerState(FIXED, false, WS_OPEN), "available");
 });
