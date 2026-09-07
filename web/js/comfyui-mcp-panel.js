@@ -20215,10 +20215,10 @@ const GRAPH_TOOL_EXECUTORS = {
     // An unreadable version probe fails open (same rule as #2027).
     const staleBundle = await refuseStaleBundleRun();
     if (staleBundle) return staleBundle;
-    // Mark the dispatch before queuePrompt can produce a fast execution_success.
-    // The tracker holds that completion until the delayed /prompt response gives
-    // it a prompt-scoped key, then replays the exact batch keyed.
-    const dispatchPanelRunToken = dispatchRunCompletion?.beginPanelRun?.() ?? null;
+    // The tracker token is created immediately before queuePrompt below. It is
+    // kept live because the receipt interceptor can answer after the bounded
+    // graph-run wait and must still bind the exact prompt to this dispatch.
+    let dispatchPanelRunToken = null;
     const releaseUnqueuedRunDispatch = () => {
       try {
         dispatchRunCompletion?.endPanelRun?.(dispatchPanelRunToken);
@@ -20724,6 +20724,8 @@ const GRAPH_TOOL_EXECUTORS = {
       releaseUnqueuedRunDispatch();
       throw error;
     }
+    // Mark the dispatch before queuePrompt can produce a fast execution_success.
+    dispatchPanelRunToken = dispatchRunCompletion?.beginPanelRun?.() ?? null;
     if (!partialTargets) {
       // UNSCOPED full run — the historical single-shot path: capture wrap for
       // exactly the duration of the queuePrompt call, then restore.
@@ -20788,6 +20790,7 @@ const GRAPH_TOOL_EXECUTORS = {
         // must survive this command's normal `false` result. Release only when
         // queuePrompt rejected before the item could be processed.
         releaseGraphToPromptSnapshot(app, promptSnapshotReservation);
+        releaseUnqueuedRunDispatch();
         throw error;
       } finally {
         if (origFetchApi) api.fetchApi = prevFetchApi;
@@ -20853,6 +20856,9 @@ const GRAPH_TOOL_EXECUTORS = {
           onPromptId: capturePromptId,
           onAcceptedNodeErrors: captureAcceptedNodeErrors,
         });
+      } catch (error) {
+        releaseUnqueuedRunDispatch();
+        throw error;
       } finally {
         // ALWAYS, on every exit including a throw. A hook left wrapped would keep
         // advancing controls on the user's later single scoped previews.
@@ -20899,6 +20905,9 @@ const GRAPH_TOOL_EXECUTORS = {
         /* keep the unfiltered scan - over-warning is the safe direction here */
       }
     }
+    // A settled dispatch no longer admits lifecycle candidates. The tracker
+    // retains only its bounded delayed-receipt state for any late /prompt id.
+    releaseUnqueuedRunDispatch();
     const readRunDispatchIdentityAfter = () => {
       let targetId = partialTargets?.[0] ?? null;
       if (partialTargets) {

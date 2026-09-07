@@ -213,6 +213,210 @@ test("orphan safety net: outputs with NO start/executing still flush (never stra
   assert.deepEqual(h.flushes[0].images.map((m) => m.filename), ["orphan.png"]);
 });
 
+test("#365: a queued panel run with lost start frames waits for execution_success", () => {
+  const h = makeHarness();
+  const P = "panel-prompt-lost-start";
+  // panel_run has already received ComfyUI's prompt_id, but both
+  // execution_start and executing(node) are absent from this websocket stream.
+  h.tracker.onQueued(P, { routeId: "route", sessionId: "session" });
+  h.tracker.onExecuted(P, imgs([img("early-preview.png", "temp")]));
+  h.tick(1500);
+  h.tracker.onExecutingNull();
+  assert.equal(h.flushes.length, 0, "timer and queue-idle fallbacks cannot finish a panel run");
+
+  h.tracker.onExecuted(P, imgs([img("final-save.png", "output")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.equal(h.flushes.length, 1, "the authoritative success emits one completion");
+  assert.equal(h.flushes[0].promptId, P);
+  assert.deepEqual(
+    h.flushes[0].images.map((m) => m.filename),
+    ["early-preview.png", "final-save.png"],
+    "the completion contains the full prompt batch, not the first preview",
+  );
+});
+
+test("#365: output before the panel prompt receipt stays held during dispatch", () => {
+  const h = makeHarness();
+  const P = "panel-prompt-late-receipt";
+  const dispatchToken = h.tracker.beginPanelRun();
+  // queuePrompt has started, but the /prompt response has not reached the panel
+  // yet. The live output is nevertheless attributable to this panel dispatch.
+  h.tracker.onExecuted(P, imgs([img("early-preview.png", "temp")]));
+  h.tick(1500);
+  h.tracker.onExecutingNull();
+  assert.equal(h.flushes.length, 0, "dispatch hold prevents an early completion before prompt registration");
+
+  h.tracker.onQueued(P, { routeId: "route", sessionId: "session", dispatchToken });
+  h.tracker.onExecuted(P, imgs([img("final-save.png", "output")]));
+  h.tracker.onExecutionSuccess(P);
+  assert.equal(h.flushes.length, 1);
+  assert.deepEqual(
+    h.flushes[0].images.map((m) => m.filename),
+    ["early-preview.png", "final-save.png"],
+    "late prompt registration still produces the complete batch",
+  );
+});
+
+test("#365: production dispatch end keeps late output held until its receipt", async () => {
+  const h = makeHarness();
+  const P = "panel-production-late-receipt";
+  const dispatchToken = h.tracker.beginPanelRun();
+
+  // Production ends the token as soon as its bounded queue dispatch returns.
+  // Lifecycle output can still arrive before the delayed /prompt response.
+  h.tracker.endPanelRun(dispatchToken);
+  const dispatch = h.tracker._panelRunDispatches.get(dispatchToken);
+  assert.equal(dispatch.acceptsCandidates, false, "queue admission closes at production dispatch end");
+  assert.equal(dispatch.acceptsLateCandidates, true, "bounded late lifecycle grace remains active");
+  h.tracker.onExecuted(P, imgs([img("production-early-preview.png", "temp")]));
+  h.tick(1500);
+  assert.equal(h.flushes.length, 0, "ended dispatch still fences its late candidate");
+
+  h.tracker.onQueued(P, { routeId: "route", sessionId: "session", dispatchToken });
+  await Promise.resolve();
+  h.tracker.onExecuted(P, imgs([img("production-final-save.png", "output")]));
+  h.tracker.onExecutionSuccess(P);
+
+  assert.equal(h.flushes.length, 1, "the receipt and terminal success emit one completion");
+  assert.deepEqual(
+    h.flushes[0].images.map((m) => m.filename),
+    ["production-early-preview.png", "production-final-save.png"],
+    "late production output remains in the keyed completion batch",
+  );
+});
+
+test("#365: a keyed panel run survives the next prompt start until its own terminal", () => {
+  const h = makeHarness();
+  const A = "panel-prompt-A";
+  const B = "canvas-prompt-B";
+  h.tracker.onQueued(A, { routeId: "route", sessionId: "session" });
+  h.tracker.onExecuted(A, imgs([img("early-preview.png", "temp")]));
+
+  // B starts before A's execution_success. The sequential fallback must not
+  // turn A's buffered preview into a completion or discard it.
+  h.tracker.onExecutionStart(B);
+  assert.equal(h.flushes.length, 0, "a new prompt start cannot finish keyed panel prompt A");
+
+  h.tracker.onExecuted(B, imgs([img("canvas.png", "output")]));
+  h.tracker.onExecutionSuccess(B);
+  assert.equal(h.flushes.length, 1, "B may finish its own canvas completion");
+  assert.equal(h.flushes[0].promptId, B);
+
+  h.tracker.onExecuted(A, imgs([img("final-save.png", "output")]));
+  h.tracker.onExecutionSuccess(A);
+  assert.equal(h.flushes.length, 2, "A completes only on A's authoritative terminal");
+  assert.equal(h.flushes[1].promptId, A);
+  assert.deepEqual(
+    h.flushes[1].images.map((m) => m.filename),
+    ["early-preview.png", "final-save.png"],
+    "A retains the full batch across B's start",
+  );
+});
+
+test("#365: an unrelated canvas prompt is released from the provisional panel hold", async () => {
+  const h = makeHarness();
+  const dispatchToken = h.tracker.beginPanelRun();
+  const C = "canvas-cross-talk";
+  const A = "panel-prompt-receipt";
+
+  // Before the /prompt response, ownership is unknowable from the lifecycle
+  // frame alone, so C is only a bounded provisional candidate.
+  h.tracker.onExecuted(C, imgs([img("canvas-before-receipt.png", "output")]));
+  h.tracker.onExecutionSuccess(C);
+  assert.equal(h.flushes.length, 0, "the unresolved dispatch window is bounded, not a panel claim");
+
+  // Production registerPromptId supplies the dispatch token and exact panel
+  // identity. C must immediately return to ordinary canvas orphan handling.
+  h.tracker.onQueued(A, {
+    routeId: "route",
+    sessionId: "session",
+    dispatchToken,
+  });
+  await Promise.resolve();
+  assert.equal(h.flushes.length, 1, "the unclaimed canvas output is released");
+  assert.equal(h.flushes[0].promptId, C);
+  assert.equal(h.tracker._panelRunCompletionKeys.has(C), false);
+
+  // Once A is identified, a later canvas output during the remaining dispatch
+  // hold is never added to the panel candidate set at all.
+  const D = "canvas-after-receipt";
+  h.tracker.onExecutionStart(D);
+  h.tracker.onExecuted(D, imgs([img("canvas-after-receipt.png", "output")]));
+  h.tracker.onExecutionSuccess(D);
+  assert.equal(h.flushes.length, 2, "later unrelated canvas output stays ordinary");
+  assert.equal(h.flushes[1].promptId, D);
+  assert.equal(h.tracker._panelRunCompletionKeys.has(D), false);
+});
+
+test("#365: a delayed dispatch receipt still releases unclaimed canvas candidates", async () => {
+  const h = makeHarness();
+  const dispatchToken = h.tracker.beginPanelRun();
+  const C = "canvas-late-cross-talk";
+  const A = "panel-late-receipt";
+
+  h.tick(30_000); // the bounded dispatch hold expires before the /prompt reply
+  // A lifecycle frame can arrive after the bounded hold, but before the delayed
+  // response. It remains provisional until the exact production token arrives.
+  h.tracker.onExecuted(C, imgs([img("canvas-late.png", "output")]));
+  h.tracker.onQueued(A, {
+    routeId: "route",
+    sessionId: "session",
+    dispatchToken,
+  });
+  await Promise.resolve();
+
+  assert.equal(h.flushes.length, 1, "a late exact receipt still releases unrelated canvas work");
+  assert.equal(h.flushes[0].promptId, C);
+  assert.equal(h.tracker._panelRunCompletionKeys.has(C), false);
+});
+
+test("#365: overlapping dispatch receipts do not release another dispatch's live candidates", async () => {
+  const h = makeHarness();
+  const dispatchA = h.tracker.beginPanelRun();
+  const dispatchB = h.tracker.beginPanelRun();
+  const A = "panel-overlap-A";
+  const B = "panel-overlap-B";
+  const C = "canvas-overlap";
+  h.tracker.endPanelRun(dispatchA);
+  h.tracker.endPanelRun(dispatchB);
+
+  // These lifecycle frames arrive after BOTH production dispatches have returned,
+  // while their bounded late-candidate grace is live. The candidate reverse index
+  // must therefore name both tokens.
+  h.tracker.onExecuted(A, imgs([img("panel-a-early.png", "temp")]));
+  h.tracker.onExecuted(B, imgs([img("panel-b-early.png", "temp")]));
+  h.tracker.onExecuted(C, imgs([img("canvas-overlap.png", "output")]));
+  assert.deepEqual(
+    [...h.tracker._panelRunDispatchCandidates.get(B).tokens],
+    [dispatchA, dispatchB],
+    "the live candidate is scoped to every overlapping dispatch that could own it",
+  );
+
+  // Dispatch A's receipt may release only candidates no other dispatch could
+  // have observed. In particular, B must stay buffered until B's receipt.
+  h.tracker.onQueued(A, { routeId: "route", sessionId: "session", dispatchToken: dispatchA });
+  await Promise.resolve();
+  assert.equal(h.flushes.length, 0, "dispatch A's receipt cannot flush dispatch B's candidate");
+  assert.equal(
+    h.tracker._panelRunDispatchCandidates.get(B).tokens.has(dispatchB),
+    true,
+    "dispatch B still fences its candidate after dispatch A resolves",
+  );
+
+  // B's receipt claims B and releases only the genuinely unclaimed canvas C.
+  h.tracker.onQueued(B, { routeId: "route", sessionId: "session", dispatchToken: dispatchB });
+  await Promise.resolve();
+  assert.equal(h.flushes.length, 1);
+  assert.equal(h.flushes[0].promptId, C, "only the unclaimed canvas candidate is released");
+
+  h.tracker.onExecutionSuccess(A);
+  h.tracker.onExecutionSuccess(B);
+  assert.equal(h.flushes.length, 3);
+  assert.equal(h.flushes[1].promptId, A);
+  assert.equal(h.flushes[2].promptId, B);
+  assert.equal(h.tracker._panelRunDispatchCandidates.size, 0, "candidate state drains after both receipts");
+});
+
 test("#269/#468: a completed run reliably fires exactly one completion event (resume trigger)", () => {
   const h = makeHarness();
   const P = "prompt-video";
@@ -335,6 +539,59 @@ function makeFrameDeps(overrides = {}) {
     ...overrides,
   };
   return { deps, frames, painted, uploadCalls };
+}
+
+/** Extract the shipped lifecycle callers so delivery tests do not bypass production wiring. */
+function makeProductionCompletionHandlers(runCompletion) {
+  const panelSrc = readFileSync(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const sourceBetween = (startMarker, endMarker) => {
+    const start = panelSrc.indexOf(startMarker);
+    const end = panelSrc.indexOf(endMarker, start);
+    assert.ok(start >= 0 && end > start, `could not locate ${startMarker}`);
+    return panelSrc.slice(start, end).trim();
+  };
+  return new Function(
+    "imageViewUrl",
+    "isVideoOutput",
+    "isAudioOutput",
+    "paintVideo",
+    "paintAudio",
+    "paintImage",
+    "stripMisattachedExecutionPreviews",
+    "app",
+    "createStoryboardIdentity",
+    "appendStoryboardCacheBust",
+    "appendImageCacheBust",
+    "NO_PROMPT_KEY",
+    "collectNodeOutputMedia",
+    "chatMediaEnabled",
+    "getSetting",
+    "SETTING_CHAT_MEDIA",
+    `return (runCompletion) => [
+      (${sourceBetween("  function onExecuted(ev) {", "  function onExecError(ev)")}),
+      (${sourceBetween("  function onExecutionSuccess(ev) {", "  // Primary render-duration start signal")}),
+    ];`,
+  )(
+    (media) => `view://${media.filename}`,
+    () => false,
+    () => false,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    { graph: {}, nodeOutputs: {}, nodePreviewImages: {} },
+    () => "storyboard",
+    (url) => url,
+    (url) => url,
+    NO_PROMPT_KEY,
+    collectNodeOutputMedia,
+    (v) => v !== false,
+    () => undefined,
+    "comfyui-mcp.chatMedia",
+  )(runCompletion);
 }
 
 test("#1837 a repeat registration REUSES the run's identity — one finished run, one agent turn", () => {
@@ -748,6 +1005,55 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
   assert.equal(pruneCount, 1);
   assert.equal(runCompletion.isSettled(promptId), true);
   assert.equal(runCompletion._delivered.has(promptId), true);
+});
+
+test("#365 production delivery: terminal before receipt emits exactly one keyed frame", async () => {
+  const { deps, frames } = makeFrameDeps();
+  let runCompletion;
+  const productionOnFlush = createRunCompletionFlushHandler({
+    ...deps,
+    markDelivered: (promptId, completionKey) => runCompletion.markDelivered(promptId, completionKey),
+    markUndelivered: (promptId, completionKey) => runCompletion.markUndelivered(promptId, completionKey),
+    pruneRebootMarker: () => {},
+    isAgentMuted: () => false,
+  });
+  runCompletion = createRunCompletionTracker({
+    onFlush: productionOnFlush,
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  const [onExecuted, onExecutionSuccess] = makeProductionCompletionHandlers(runCompletion);
+  const dispatchToken = runCompletion.beginPanelRun();
+  runCompletion.endPanelRun(dispatchToken);
+  const promptId = "panel-terminal-before-receipt";
+
+  // This is the production order: queuePrompt's bounded dispatch has returned,
+  // then the lifecycle reaches terminal before the delayed /prompt response.
+  onExecuted({
+    detail: {
+      prompt_id: promptId,
+      node: "save",
+      output: { images: [{ filename: "terminal-before-receipt.png", type: "output" }] },
+    },
+  });
+  onExecutionSuccess({ detail: { prompt_id: promptId } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(frames.length, 0, "terminal-before-receipt must not send an unkeyed fallback");
+
+  const completionKey = runCompletion.onQueued(promptId, {
+    routeId: "route",
+    sessionId: "session",
+    dispatchToken,
+  });
+  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(frames.length, 1, "the delayed receipt emits one completion frame");
+  assert.equal(frames[0].completion_key, completionKey, "the only frame is keyed");
+  assert.deepEqual(
+    frames[0].images.map((m) => m.filename),
+    ["terminal-before-receipt.png"],
+  );
 });
 
 test("presentation: a still-storyboard fallback (no blob) still yields ONE frame with the note", async () => {
