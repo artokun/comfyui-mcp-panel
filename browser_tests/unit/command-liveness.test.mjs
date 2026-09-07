@@ -288,6 +288,20 @@ test("#2218: an epoch-less sensitive reply is never replayable across a same-URL
     [],
     "an unproven replacement must not even advertise the sensitive outcome",
   );
+
+  const failureJournal = createLostReplyJournal();
+  const failure = failureJournal.record({
+    reply: { rid: "safe-failure", ok: false, error: "question withdrawn" },
+    cmd: "request_secret",
+    at: now - 1000,
+    url: URL_A,
+  });
+  assert.equal(
+    failureJournal.canReplay(failure, { now, targetUrl: URL_A }),
+    false,
+    "even a payload-free sensitive failure needs a proven session",
+  );
+  assert.deepEqual(failureJournal.summaries({ now, targetUrl: URL_A }), []);
 });
 
 test("#694: the journal records the session epoch and summaries filter by it identically", () => {

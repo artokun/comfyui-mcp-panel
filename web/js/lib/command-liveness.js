@@ -165,12 +165,12 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
   const rawSensitiveReplies = new WeakMap();
   const canReplay = (entry, { now, targetUrl, targetEpoch } = {}) => {
     if (!isReplayable(entry, { now, targetUrl, targetEpoch })) return false;
-    // A private answer has no safe legacy mode. URL equality alone cannot prove that an
-    // epoch-less replacement is the same orchestrator session, so every sensitive entry
-    // requires the stronger URL + proven epoch fence even though ordinary replies retain
-    // the pre-epoch compatibility rule.
+    // Interactive outcomes have no safe legacy mode. URL equality alone cannot prove that
+    // an epoch-less replacement is the same orchestrator session, so every sensitive entry
+    // requires the stronger URL + proven epoch fence, including payload-free failures;
+    // ordinary replies retain the pre-epoch compatibility rule.
     return (
-      !rawSensitiveReplies.has(entry) ||
+      !SENSITIVE_RESULT_CMDS.has(entry.cmd) ||
       sameBridgeSession({
         sourceUrl: entry.url,
         sourceEpoch: entry.epoch,
@@ -285,9 +285,9 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
  * session at the same address. The age bound here remains the backstop for a LEGACY
  * orchestrator that sends no epoch (absent on both sides compares equal — URL-only
  * matching, exactly the pre-epoch behaviour), bounding that residual four ways:
- * sensitive results remain redacted in the public journal and raw values are selected only
- * for a proven same-session replay; replay goes ONLY to the exact socket instance that
- * completed a handshake; entries age out here; and the window is
+ * sensitive results remain redacted in the public journal and are delivered only after a
+ * proven same-session replay; replay goes ONLY to the exact socket instance that completed
+ * a handshake; entries age out here; and the window is
  * deliberately tight — a drop, reconnect and handshake take a couple of seconds, so 20s
  * is generous for the case this serves while leaving little room for an orchestrator to
  * restart and re-bind inside it.
