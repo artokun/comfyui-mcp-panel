@@ -10,7 +10,7 @@
 // TWO THINGS THE ISSUE ASKED FOR THAT THE NODE'S OWN CODE SAYS NOT TO DO. I filed that
 // issue and was wrong about both; the source is the authority, not the UI:
 //
-//   "Call the node's own removal path so its bookkeeping runs."  rgthree's 🗑️ Remove is
+//   "Call the node's own removal path so its bookkeeping runs."  rgthree's 🗑 Remove is
 //   `removeArrayItem(this.widgets, widget)` — a plain splice, no hook, no bookkeeping.
 //   There is nothing to call. We use the frontend's own `node.removeWidget()`, passing the
 //   WIDGET OBJECT: LGraphNode's takes one and throws on a miss, and rgthree's override

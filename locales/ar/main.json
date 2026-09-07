@@ -332,10 +332,10 @@
       "action_rewind_the_canvas": "إرجاع لوحة الرسم",
       "action_roll_back_the_canvas": "التراجع بلوحة الرسم",
       "canvas_not_restored_no_snapshot": "لم تُستعَد لوحة الرسم — لا تتوفر لقطة للمخطط في هذه الحالة، لذا ما تزال تحمل التعديلات التي كنت تحاول التراجع عنها.",
-      "could_not_action_nothing_was_loaded": "⚠️ تعذّر {action} — لم يُحمَّل أي شيء، فلم تُطبَّق أي تعديلات على المخطط وإعادة المحاولة آمنة. {reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ تعذّر تحديد ما إذا تم {action} — وصلت اللوحة نتيجة لا تعرفها، لذا تحقّق من لوحة الرسم قبل فعل أي شيء آخر.",
+      "could_not_action_nothing_was_loaded": "⚠ تعذّر {action} — لم يُحمَّل أي شيء، فلم تُطبَّق أي تعديلات على المخطط وإعادة المحاولة آمنة. {reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ تعذّر تحديد ما إذا تم {action} — وصلت اللوحة نتيجة لا تعرفها، لذا تحقّق من لوحة الرسم قبل فعل أي شيء آخر.",
       "no_reason_was_reported": "لم يُذكر أي سبب.",
-      "the_action_ran_but_unconfirmed": "⚠️ جرى {action} فعلًا لكن اللوحة لم تستطع تأكيد النتيجة، لذا قد تكون لوحة الرسم قد تغيّرت — تحقّق منها قبل فعل أي شيء آخر. {reason}"
+      "the_action_ran_but_unconfirmed": "⚠ جرى {action} فعلًا لكن اللوحة لم تستطع تأكيد النتيجة، لذا قد تكون لوحة الرسم قد تغيّرت — تحقّق منها قبل فعل أي شيء آخر. {reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "تعذّر الوصول إلى ComfyUI-Manager (هل المدير المدمج مُفعّل؟)"
@@ -393,7 +393,7 @@
       "auto_arranged_nodes_zero": "رُتّبت {count} عقدة تلقائيًا",
       "auto_let_the_agent_pick": "تلقائي (دع الوكيل يختار)",
       "auto_restart_failed": "فشلت إعادة التشغيل التلقائية: {error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ نسخة تجريبية — يتغيّر التطبيق بسرعة وقد تتعطل النسخ بين التحديثات. فعّل المفتاح أعلاه، وثبّت النسخة الخاصة بمنصّتك، ثم اقترن عبر زر رمز QR في رأس اللوحة.",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ نسخة تجريبية — يتغيّر التطبيق بسرعة وقد تتعطل النسخ بين التحديثات. فعّل المفتاح أعلاه، وثبّت النسخة الخاصة بمنصّتك، ثم اقترن عبر زر رمز QR في رأس اللوحة.",
       "blind": "محجوب",
       "blocked_a_chat_from_another_workflow_open": "حُجبت محادثة من سير عمل آخر. افتح «{workflow}» قبل استئنافها.",
       "bridge_url": "عنوان الجسر",
@@ -1010,7 +1010,7 @@
       "the_canvas_was_not_reverted_no_graph": "لم تُستعَد لوحة الرسم — لا توجد لقطة للمخطط لذلك الدور (تُحفظ لآخر 25 دورًا ثم تُزال). عادت رسالتك إلى مربع الكتابة، لكن لوحة الرسم ما تزال تحمل تعديلات ذلك الدور.",
       "the_connection_that_asked_this_dropped_so": "انقطع الاتصال الذي أرسل {what}، لذا لم يعد بإمكان أي إجابة هنا أن تصل إلى الوكيل.",
       "the_old_session_could_not_be_invalidated": "تعذّر إبطال الجلسة القديمة بشكل دائم؛ لذا أُوقفت إعادة الاتصال مؤقتًا تفاديًا لاستعادتها.",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ لم يؤكّد المنسّق تغيير وضع الحجب — قد يكون أقدم من الإصدار v0.42.0، حيث كان الحجب يقيّد تغذية الصور الخاصة باللوحة فقط (أما أدوات الصور لدى الوكيل فغير مقيّدة). حدّث comfyui-mcp للتطبيق الكامل.",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ لم يؤكّد المنسّق تغيير وضع الحجب — قد يكون أقدم من الإصدار v0.42.0، حيث كان الحجب يقيّد تغذية الصور الخاصة باللوحة فقط (أما أدوات الصور لدى الوكيل فغير مقيّدة). حدّث comfyui-mcp للتطبيق الكامل.",
       "the_panel_agent_dropped_restarting_it": "انقطع وكيل اللوحة — جارٍ إعادة تشغيله…",
       "the_panel_agent_isn_t_answering_yet": "وكيل اللوحة لا يجيب بعد — جارٍ إعادة الاتصال…",
       "the_panel_agent_keeps_failing_to_start": "⚠ يستمر وكيل اللوحة في الفشل عند البدء. تأكّد من تسجيل دخولك (شغّل `claude` مرة واحدة، أو `codex login` لـ Codex، أو `gemini` لـ Gemini، أو `ollama serve` للنماذج المحلية)، ثم انقر «اتصال».",

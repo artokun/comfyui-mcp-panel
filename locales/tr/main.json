@@ -296,10 +296,10 @@
       "action_rewind_the_canvas": "tuvali geri sarma",
       "action_roll_back_the_canvas": "tuvali eski hâline döndürme",
       "canvas_not_restored_no_snapshot": "Tuval geri YÜKLENMEDİ — bunun için bir grafik anlık görüntüsü yok, dolayısıyla geri almaya çalıştığınız değişiklikler hâlâ duruyor.",
-      "could_not_action_nothing_was_loaded": "⚠️ {action} yapılamadı — hiçbir şey yüklenmedi, yani grafiğe hiçbir değişiklik uygulanmadı ve yeniden denemek güvenli. {reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ {action} işleminin gerçekleşip gerçekleşmediği anlaşılamadı — panel tanımadığı bir sonuç aldı, bu yüzden başka bir şey yapmadan önce tuvali kontrol edin.",
+      "could_not_action_nothing_was_loaded": "⚠ {action} yapılamadı — hiçbir şey yüklenmedi, yani grafiğe hiçbir değişiklik uygulanmadı ve yeniden denemek güvenli. {reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ {action} işleminin gerçekleşip gerçekleşmediği anlaşılamadı — panel tanımadığı bir sonuç aldı, bu yüzden başka bir şey yapmadan önce tuvali kontrol edin.",
       "no_reason_was_reported": "Herhangi bir neden bildirilmedi.",
-      "the_action_ran_but_unconfirmed": "⚠️ {action} ÇALIŞTI ama panel sonucu doğrulayamadı, yani tuval değişmiş olabilir — başka bir şey yapmadan önce kontrol edin. {reason}"
+      "the_action_ran_but_unconfirmed": "⚠ {action} ÇALIŞTI ama panel sonucu doğrulayamadı, yani tuval değişmiş olabilir — başka bir şey yapmadan önce kontrol edin. {reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "ComfyUI-Manager'a ulaşılamıyor (yerleşik Manager etkin mi?)"
@@ -349,7 +349,7 @@
       "auto_arranged_nodes_other": "{count} düğüm otomatik düzenlendi",
       "auto_let_the_agent_pick": "Otomatik (seçimi ajan yapsın)",
       "auto_restart_failed": "Otomatik yeniden başlatma başarısız oldu: {error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ Beta — uygulama hızla değişiyor ve sürümler arasında bozulabilir. Yukarıdaki anahtarı açın, platformunuza uygun olanı kurun, sonra panel başlığındaki QR düğmesiyle eşleştirin.",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ Beta — uygulama hızla değişiyor ve sürümler arasında bozulabilir. Yukarıdaki anahtarı açın, platformunuza uygun olanı kurun, sonra panel başlığındaki QR düğmesiyle eşleştirin.",
       "blind": "Kör",
       "blocked_a_chat_from_another_workflow_open": "Başka bir iş akışından gelen sohbet engellendi. Sürdürmeden önce \"{workflow}\" iş akışını açın.",
       "bridge_url": "Köprü adresi",
@@ -850,7 +850,7 @@
       "the_canvas_was_not_reverted_no_graph": "Tuval geri ALINMADI — o tur için grafik anlık görüntüsü yok (yalnızca son 25 tanesi tutulur, gerisi atılır). Mesajınız yazma alanına döndü ama tuval hâlâ o turun değişikliklerini taşıyor.",
       "the_connection_that_asked_this_dropped_so": "Bu {what} hangi bağlantıdan geldiyse o bağlantı koptu, bu yüzden buradan verilecek bir yanıt artık ajana ulaşamaz.",
       "the_old_session_could_not_be_invalidated": "Eski oturum kalıcı olarak geçersizleştirilemedi; geri yüklenmesini önlemek için yeniden bağlanma duraklatıldı.",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ Orkestratör Kör değişikliğini onaylamadı — v0.42.0 öncesinden olabilir; o sürümde Kör yalnızca panelin kendi görsel akışını kısıtlar (ajanın görsel araçları kısıtlanmaz). Tam uygulanması için comfyui-mcp sürümünü güncelleyin.",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ Orkestratör Kör değişikliğini onaylamadı — v0.42.0 öncesinden olabilir; o sürümde Kör yalnızca panelin kendi görsel akışını kısıtlar (ajanın görsel araçları kısıtlanmaz). Tam uygulanması için comfyui-mcp sürümünü güncelleyin.",
       "the_panel_agent_dropped_restarting_it": "Panel ajanı düştü — yeniden başlatılıyor…",
       "the_panel_agent_isn_t_answering_yet": "Panel ajanı henüz yanıt vermiyor — yeniden bağlanılıyor…",
       "the_panel_agent_keeps_failing_to_start": "⚠ Panel ajanı bir türlü başlayamıyor. Giriş yaptığınızdan emin olun (bir kez `claude`, Codex için `codex login`, Gemini için `gemini` ya da yerel modeller için `ollama serve` çalıştırın), sonra Bağlan'a tıklayın.",

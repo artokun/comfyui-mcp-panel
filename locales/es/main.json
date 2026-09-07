@@ -305,10 +305,10 @@
       "action_rewind_the_canvas": "retroceder el lienzo",
       "action_roll_back_the_canvas": "revertir el lienzo",
       "canvas_not_restored_no_snapshot": "El lienzo NO se restauró: no hay ninguna instantánea del grafo disponible para esto, así que sigue conservando las ediciones que intentabas deshacer.",
-      "could_not_action_nothing_was_loaded": "⚠️ No se pudo {action}: no se cargó nada, así que no se aplicó ninguna edición al grafo y reintentar es seguro. {reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ No se pudo confirmar si se llegó a {action}: el panel recibió un resultado que no reconoce, así que revisa el lienzo antes de hacer nada más.",
+      "could_not_action_nothing_was_loaded": "⚠ No se pudo {action}: no se cargó nada, así que no se aplicó ninguna edición al grafo y reintentar es seguro. {reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ No se pudo confirmar si se llegó a {action}: el panel recibió un resultado que no reconoce, así que revisa el lienzo antes de hacer nada más.",
       "no_reason_was_reported": "No se informó de ningún motivo.",
-      "the_action_ran_but_unconfirmed": "⚠️ La acción de {action} SÍ se ejecutó, pero el panel no pudo confirmar el resultado, así que el lienzo puede haber cambiado: revísalo antes de hacer nada más. {reason}"
+      "the_action_ran_but_unconfirmed": "⚠ La acción de {action} SÍ se ejecutó, pero el panel no pudo confirmar el resultado, así que el lienzo puede haber cambiado: revísalo antes de hacer nada más. {reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "No se puede acceder a ComfyUI-Manager (¿está activado el Manager integrado?)"
@@ -360,7 +360,7 @@
       "auto_arranged_nodes_other": "Se organizaron automáticamente {count} nodos",
       "auto_let_the_agent_pick": "Auto (que elija el agente)",
       "auto_restart_failed": "Falló el reinicio automático: {error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ Beta — la app cambia muy rápido y las compilaciones pueden romperse entre actualizaciones. Activa el interruptor de arriba, instálala para tu plataforma y empareja con el botón QR de la cabecera del panel.",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ Beta — la app cambia muy rápido y las compilaciones pueden romperse entre actualizaciones. Activa el interruptor de arriba, instálala para tu plataforma y empareja con el botón QR de la cabecera del panel.",
       "blind": "A ciegas",
       "blocked_a_chat_from_another_workflow_open": "Se bloqueó un chat de otro flujo de trabajo. Abre “{workflow}” antes de reanudarlo.",
       "bridge_url": "URL del puente",
@@ -890,7 +890,7 @@
       "the_canvas_was_not_reverted_no_graph": "El lienzo NO se revirtió — no hay instantánea del grafo de ese turno (se conservan las 25 últimas y luego se descartan). Tu mensaje está de vuelta en el redactor, pero el lienzo todavía conserva las ediciones de ese turno.",
       "the_connection_that_asked_this_dropped_so": "La conexión que hizo esta {what} se cayó, así que una respuesta aquí ya no puede llegar al agente.",
       "the_old_session_could_not_be_invalidated": "La sesión antigua no se pudo invalidar de forma duradera; la reconexión queda en pausa para evitar restaurarla.",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ El orquestador no confirmó el cambio del modo A ciegas — puede que sea anterior a la v0.42.0, donde A ciegas solo controla el feed de imágenes del propio panel (las herramientas de imagen del agente NO quedan restringidas). Actualiza comfyui-mcp para que se aplique por completo.",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ El orquestador no confirmó el cambio del modo A ciegas — puede que sea anterior a la v0.42.0, donde A ciegas solo controla el feed de imágenes del propio panel (las herramientas de imagen del agente NO quedan restringidas). Actualiza comfyui-mcp para que se aplique por completo.",
       "the_panel_agent_dropped_restarting_it": "El agente del panel se cayó — reiniciándolo…",
       "the_panel_agent_isn_t_answering_yet": "El agente del panel aún no responde — reconectando…",
       "the_panel_agent_keeps_failing_to_start": "⚠ El agente del panel sigue sin poder iniciarse. Comprueba que tienes la sesión iniciada (ejecuta `claude` una vez, `codex login` para Codex, `gemini` para Gemini u `ollama serve` para modelos locales) y pulsa Conectar.",
