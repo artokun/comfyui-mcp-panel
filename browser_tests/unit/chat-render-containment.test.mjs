@@ -82,5 +82,7 @@ test("#1801 contains every direct chat message without changing the feed surface
   assert.ok(renderTodoAt >= 0, "replay still renders the thread tray");
   assert.ok(finalScrollAt > renderTodoAt, "replay seeds a final post-A2UI scroll correction");
   assert.match(functionBody(source, "mountLiveA2UICard"), /log\.appendChild\(handle\.el\)/);
-  assert.match(functionBody(source, "paintA2UIRecord"), /log\.appendChild\(renderA2UIInert\(/);
+  const a2uiReplay = functionBody(source, "paintA2UIRecord");
+  assert.match(a2uiReplay, /const inert = renderA2UIInert\(/);
+  assert.match(a2uiReplay, /log\.appendChild\(inert\)/);
 });
