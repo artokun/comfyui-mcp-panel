@@ -11,6 +11,7 @@ All notable changes to this project are documented here. This project adheres to
 - snapshot and live-state queue restores now re-resolve widgets by node/name from shallow to deep after DynamicCombo parents replace dotted children; missing replacements and unrelated setter failures remain fail-closed (#2033)
 - panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is resolved to its live replacement (#2033)
 - panel_connect accepts an Autogrow display-label alias (`ref_image_0` → `ref_images.ref_image_0`) instead of refusing with a false "no input accepts type IMAGE"; the resolved live slot name still feeds #2008 dotted-name reconcile, and an unmatched name reports internal slot names rather than blaming the origin type (#2266)
+- panel_get_errors no longer reports previous-workflow node ids after a switch: a live combo scan whose ids are gone from the bound graph is refused as an instance mismatch rather than listing leftover ids (5599/5603), and load-time missing node types that do not appear on the live graph are dropped (#2263)
 
 ## [0.15.179] - 2026-09-05
 
@@ -21,7 +22,6 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 - fetch_image no longer sends `/view` through ComfyUI `api.fetchApi`, which prefixes `/api` so local media became `/api/view` and failed with `Failed to fetch` after headless ECONNREFUSED. `/view` uses origin-validated `fileURL` + same-origin fetch (and `Comfy-User` when the API object has a user). History / system_stats keep `fetchApi` so cloud auth headers and 401 remint stay intact (comfyui-mcp#2884, #2261)
-
 
 ## [0.15.177] - 2026-09-05
 

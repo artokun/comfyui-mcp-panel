@@ -26,6 +26,9 @@ import {
   isWidgetInputSpec,
   reconcileUnknownWidgetNames,
   collectAllGraphs,
+  liveGraphNodeIdSet,
+  graphGetErrorsLiveScanStale,
+  recordedMissingTypesOnLiveGraph,
   reapplyDefsToLiveNodes,
   comboRebuildCovered,
   authoritativeComboValues,
@@ -713,6 +716,89 @@ test("collectAllGraphs walks nested subgraphs", () => {
   const graphs = collectAllGraphs(root);
   assert.ok(graphs.includes(root));
   assert.ok(graphs.includes(innerGraph));
+});
+
+test("#2263 liveGraphNodeIdSet includes nested subgraph ids", () => {
+  const inner = { id: 5603, widgets: [] };
+  const innerGraph = graphOf([inner]);
+  const host = { id: 12, subgraph: innerGraph };
+  const ids = liveGraphNodeIdSet(graphOf([host]));
+  assert.equal(ids.has("12"), true);
+  assert.equal(ids.has("5603"), true);
+});
+
+test("#2263 graphGetErrorsLiveScanStale: FALSE when scanned ids are still on the live graph", () => {
+  const n = { id: 12, type: "LoadImage", widgets: [] };
+  const graph = graphOf([n]);
+  assert.equal(
+    graphGetErrorsLiveScanStale({
+      scannedNodes: [n],
+      liveRootGraph: graph,
+      liveScan: { unknown: [{ id: 12, type: "LoadImage", reason: "node type not found in /object_info" }] },
+    }),
+    false,
+  );
+});
+
+test("#2263 graphGetErrorsLiveScanStale: TRUE after an in-place load replaces the node set", () => {
+  const previous = [
+    { id: 5599, type: "H3AdaLNLoRAFix", widgets: [] },
+    { id: 5603, type: "H3SLAAttention", widgets: [] },
+  ];
+  const live = graphOf([{ id: 1, type: "LoadImage", widgets: [] }]);
+  assert.equal(
+    graphGetErrorsLiveScanStale({
+      scannedNodes: previous,
+      liveRootGraph: live,
+      liveScan: {
+        unknown: [
+          { id: 5599, type: "H3AdaLNLoRAFix", reason: "node type not found in /object_info" },
+          { id: 5603, type: "H3SLAAttention", reason: "node type not found in /object_info" },
+        ],
+      },
+    }),
+    true,
+  );
+});
+
+test("#2263 graphGetErrorsLiveScanStale: TRUE when the live root is unreadable", () => {
+  assert.equal(
+    graphGetErrorsLiveScanStale({
+      scannedNodes: [{ id: 1 }],
+      liveRootGraph: null,
+      liveScan: { unknown: [{ id: 1 }] },
+    }),
+    true,
+  );
+});
+
+test("#2263 graphGetErrorsLiveScanStale: FALSE for nested inner ids of the CURRENT root", () => {
+  const inner = { id: 5599, type: "H3AdaLNLoRAFix", widgets: [] };
+  const host = { id: 12, type: "MiniMaxH3", subgraph: graphOf([inner]), widgets: [] };
+  const root = graphOf([host]);
+  assert.equal(
+    graphGetErrorsLiveScanStale({
+      scannedNodes: [host, inner],
+      liveRootGraph: root,
+      liveScan: { unknown: [{ id: 5599, type: "H3AdaLNLoRAFix", reason: "node type not found in /object_info" }] },
+    }),
+    false,
+  );
+});
+
+test("#2263 recordedMissingTypesOnLiveGraph drops previous-tab types absent from the live graph", () => {
+  const nodes = [{ id: 1, type: "LoadImage" }, { id: 2, type: "KSampler" }];
+  assert.deepEqual(
+    recordedMissingTypesOnLiveGraph(["H3AdaLNLoRAFix", "H3SLAAttention", "LoadImage"], nodes),
+    ["LoadImage"],
+  );
+});
+
+test("#2263 recordedMissingTypesOnLiveGraph fails open on an empty live type set", () => {
+  assert.deepEqual(
+    recordedMissingTypesOnLiveGraph(["H3AdaLNLoRAFix"], []),
+    ["H3AdaLNLoRAFix"],
+  );
 });
 
 test("reapplyDefsToLiveNodes repairs an ALREADY-LOADED node using fresh defs (finding #3)", () => {
