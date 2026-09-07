@@ -257,6 +257,34 @@ test("#365: output before the panel prompt receipt stays held during dispatch", 
   );
 });
 
+test("#365: production dispatch end keeps late output held until its receipt", async () => {
+  const h = makeHarness();
+  const P = "panel-production-late-receipt";
+  const dispatchToken = h.tracker.beginPanelRun();
+
+  // Production ends the token as soon as its bounded queue dispatch returns.
+  // Lifecycle output can still arrive before the delayed /prompt response.
+  h.tracker.endPanelRun(dispatchToken);
+  const dispatch = h.tracker._panelRunDispatches.get(dispatchToken);
+  assert.equal(dispatch.acceptsCandidates, false, "queue admission closes at production dispatch end");
+  assert.equal(dispatch.acceptsLateCandidates, true, "bounded late lifecycle grace remains active");
+  h.tracker.onExecuted(P, imgs([img("production-early-preview.png", "temp")]));
+  h.tick(1500);
+  assert.equal(h.flushes.length, 0, "ended dispatch still fences its late candidate");
+
+  h.tracker.onQueued(P, { routeId: "route", sessionId: "session", dispatchToken });
+  await Promise.resolve();
+  h.tracker.onExecuted(P, imgs([img("production-final-save.png", "output")]));
+  h.tracker.onExecutionSuccess(P);
+
+  assert.equal(h.flushes.length, 1, "the receipt and terminal success emit one completion");
+  assert.deepEqual(
+    h.flushes[0].images.map((m) => m.filename),
+    ["production-early-preview.png", "production-final-save.png"],
+    "late production output remains in the keyed completion batch",
+  );
+});
+
 test("#365: a keyed panel run survives the next prompt start until its own terminal", () => {
   const h = makeHarness();
   const A = "panel-prompt-A";
@@ -349,9 +377,12 @@ test("#365: overlapping dispatch receipts do not release another dispatch's live
   const A = "panel-overlap-A";
   const B = "panel-overlap-B";
   const C = "canvas-overlap";
+  h.tracker.endPanelRun(dispatchA);
+  h.tracker.endPanelRun(dispatchB);
 
-  // These lifecycle frames are visible while BOTH production dispatch holds are
-  // live. The candidate reverse index must therefore name both tokens.
+  // These lifecycle frames arrive after BOTH production dispatches have returned,
+  // while their bounded late-candidate grace is live. The candidate reverse index
+  // must therefore name both tokens.
   h.tracker.onExecuted(A, imgs([img("panel-a-early.png", "temp")]));
   h.tracker.onExecuted(B, imgs([img("panel-b-early.png", "temp")]));
   h.tracker.onExecuted(C, imgs([img("canvas-overlap.png", "output")]));

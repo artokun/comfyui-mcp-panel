@@ -729,6 +729,7 @@ export function createRunCompletionTracker({
     const dispatch = panelRunDispatches.get(token);
     if (!dispatch || !dispatch.receiptSeen) return;
     dispatch.acceptsCandidates = false;
+    dispatch.acceptsLateCandidates = false;
     for (const candidate of [...dispatch.candidates]) {
       detachPanelRunCandidate(candidate, token);
     }
@@ -775,7 +776,8 @@ export function createRunCompletionTracker({
     // A response can arrive after the 30-second hold. Keep accepting late
     // lifecycle ids only in this token's receipt-grace window so its exact
     // receipt can still distinguish panel output from canvas output.
-    dispatch.acceptsCandidates = !dispatch.receiptSeen;
+    dispatch.acceptsCandidates = false;
+    dispatch.acceptsLateCandidates = !dispatch.receiptSeen;
     dispatch.holdTimer = null;
     if (dispatch.receiptSeen) {
       finalizePanelRunDispatchReceipt(token);
@@ -812,7 +814,9 @@ export function createRunCompletionTracker({
     // fenced by its own keyed state. It must not be reclassified as a candidate
     // for a later overlapping dispatch.
     if (panelRunAwaitsAuthoritativeCompletion(k) || panelRunCompletionKeys.has(k)) return;
-    const openDispatches = [...panelRunDispatches.entries()].filter(([, dispatch]) => dispatch.acceptsCandidates);
+    const openDispatches = [...panelRunDispatches.entries()].filter(([, dispatch]) =>
+      dispatch.acceptsCandidates || dispatch.acceptsLateCandidates,
+    );
     if (!openDispatches.length) return;
     let candidate = panelRunDispatchCandidates.get(k);
     if (!candidate) {
@@ -1816,6 +1820,10 @@ export function createRunCompletionTracker({
       }
       const dispatch = {
         acceptsCandidates: true,
+        // `endPanelRun` closes normal queue admission, but a late websocket
+        // lifecycle frame can still precede the delayed /prompt receipt. Keep
+        // only this bounded provisional-candidate phase for that race.
+        acceptsLateCandidates: false,
         holdsUnkeyedCompletions: true,
         receiptSeen: false,
         holdExpired: false,
@@ -1842,6 +1850,7 @@ export function createRunCompletionTracker({
       dispatch.acceptsCandidates = false;
       dispatch.holdsUnkeyedCompletions = false;
       if (dispatch.receiptSeen) finalizePanelRunDispatchReceipt(token);
+      else dispatch.acceptsLateCandidates = true;
       releaseHeldUnkeyedCompletions();
     },
 
