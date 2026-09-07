@@ -7,10 +7,13 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
-- the same-value short-circuit no longer swallows the relocation replay (#2033/#2140). reconcileFreshDynamicWidgets renames an orphan to `<root>.__cmcp_stale_N`, pushes a store cleanup alias, and replays the root so LiteGraph's own setter deletes both — but that replay is a SAME-VALUE write, which is exactly what the #2033 guard returns on, and it returned precisely when the root was HEALTHY (live dotted children), i.e. the common case. The stale row and its store alias stayed attached. The guard now stands down while a root still carries those rows, and applies again once the replay has removed them. Found by the Copilot review on the PR
-- snapshot and live-state queue restores now re-resolve widgets by node/name from shallow to deep after DynamicCombo parents replace dotted children; missing replacements and unrelated setter failures remain fail-closed (#2033)
-- panel_run no longer hits a bare SaveVideo `Dynamic widget doesn't exist on node` on the first dispatch after restart/reconnect: DynamicCombo setters installed by that first serialize are sealed before queue-time snapshot restore, a same-value parent write keeps live children instead of replacing them, and a detached captured child is resolved to its live replacement (#2033)
 - panel_connect accepts an Autogrow display-label alias (`ref_image_0` → `ref_images.ref_image_0`) instead of refusing with a false "no input accepts type IMAGE"; the resolved live slot name still feeds #2008 dotted-name reconcile, and an unmatched name reports internal slot names rather than blaming the origin type (#2266)
+
+## [0.15.180] - 2026-09-07
+
+### Fixed
+- Dynamic widget recovery now preserves same-value relocation cleanup and re-resolves shallow-to-deep live widgets during queue restore; panel_run seals DynamicCombo setters before restore and resolves detached children to their live replacements (#2033/#2140)
+- panel_connect accepts an Autogrow display-label alias (`ref_image_0` → `ref_images.ref_image_0`) instead of refusing with a false "no input accepts type IMAGE"; the resolved live slot name still feeds dotted-name reconcile, and an unmatched name reports internal slot names rather than blaming the origin type (#2273)
 
 ## [0.15.179] - 2026-09-05
 
