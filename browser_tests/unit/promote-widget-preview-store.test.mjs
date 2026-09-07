@@ -11,6 +11,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { findSubgraphOwner } from "../../web/js/lib/subgraph-scope.js";
+// #2108 — the sliced method now raises the subgraph's link-id counter before
+// promoting. A module-scope import is not in scope inside `new Function`, so it
+// is injected the same way findSubgraphOwner already is: the REAL one, so the
+// test still drives shipped code rather than a stub.
+import { ensureLinkIdHeadroom } from "../../web/js/lib/link-id-headroom.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -35,10 +40,11 @@ function realPromoteWidget(document, getGraphCtx, resolveNode, pressableWidgetHi
     "resolveNode",
     "pressableWidgetHint",
     "findSubgraphOwner",
+    "ensureLinkIdHeadroom",
     `${helpersSrc}
      const executors = { ${methodMatch[0]} };
      return executors.graph_promote_widget;`,
-  )(document, getGraphCtx, resolveNode, pressableWidgetHint, findSubgraphOwnerFn);
+  )(document, getGraphCtx, resolveNode, pressableWidgetHint, findSubgraphOwnerFn, ensureLinkIdHeadroom);
 }
 
 /** Pinia as getPiniaStore finds it: #vue-app → __vue_app__ → $pinia._s.get(id). */

@@ -13,6 +13,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { ensureLinkIdHeadroom } from "../../web/js/lib/link-id-headroom.js";
 
 const SRC = readFileSync(
   new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),

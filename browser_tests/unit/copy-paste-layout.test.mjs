@@ -15,6 +15,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { ensureLinkIdHeadroom } from "../../web/js/lib/link-id-headroom.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -379,6 +380,7 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
       "diffCopiedVsPasted",
       "formatDroppedWarning",
       "sanitizeNodesAuxId",
+      "ensureLinkIdHeadroom",
       "window",
       `"use strict"; const e = { ${pasteSrc} }; return e.graph_paste_nodes;`,
     )(
@@ -400,6 +402,7 @@ function shippedCopyPaste(srcGraph, srcCanvas, srcLG) {
       diffCopiedVsPasted,
       formatDroppedWarning,
       sanitizeNodesAuxId,
+      ensureLinkIdHeadroom,
       window,
     );
   }
@@ -556,6 +559,36 @@ test("snapshotNodeLayout records collapsed flags", () => {
 });
 
 // ---- shipped handlers ------------------------------------------------------
+
+// #2108 — paste ALLOCATES link ids (internal wires among the copied nodes, and
+// with connect_inputs the reconnection to existing nodes), minted by LGraphNode
+// as toLinkId(lastLinkId + 1) into a _links.set that REPLACES. A counter sitting
+// below an id the graph already holds therefore overwrites a bystander, exactly
+// as it did for connect. Drives the SHIPPED handler, not the helper.
+test("#2108 paste raises a stale link-id counter and discloses the repair", () => {
+  clearInMemoryClipboard();
+  clearCopiedLayout();
+  const src = makeBranchedGraph();
+  const { copy, makePaster } = shippedCopyPaste(src.graph, src.canvas, src.LG);
+  copy({ node_ids: src.graph._nodes.map((n) => n.id) });
+
+  const dst = makeBranchedGraph();
+  // The shape the report names: a graph loaded from something carrying no
+  // last_link_id, so the counter sits BELOW a live id.
+  dst.graph._links = new Map([[7, { id: 7 }]]);
+  dst.graph.last_link_id = 2;
+
+  const paste = makePaster(dst.graph, dst.canvas, dst.LG);
+  const result = paste({});
+
+  assert.equal(dst.graph.last_link_id, 7, "counter raised above every id held");
+  assert.deepEqual(
+    result.link_counter_repaired,
+    { from: 2, to: 7 },
+    "the repair is disclosed on the paste result, not applied silently",
+  );
+  assert.ok(result.warning, "a repaired counter carries the warning sentence");
+});
 
 test("#1294 shipped copy+paste keeps groups and distinct branch y-positions", () => {
   clearInMemoryClipboard();
