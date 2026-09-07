@@ -541,6 +541,59 @@ function makeFrameDeps(overrides = {}) {
   return { deps, frames, painted, uploadCalls };
 }
 
+/** Extract the shipped lifecycle callers so delivery tests do not bypass production wiring. */
+function makeProductionCompletionHandlers(runCompletion) {
+  const panelSrc = readFileSync(
+    new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const sourceBetween = (startMarker, endMarker) => {
+    const start = panelSrc.indexOf(startMarker);
+    const end = panelSrc.indexOf(endMarker, start);
+    assert.ok(start >= 0 && end > start, `could not locate ${startMarker}`);
+    return panelSrc.slice(start, end).trim();
+  };
+  return new Function(
+    "imageViewUrl",
+    "isVideoOutput",
+    "isAudioOutput",
+    "paintVideo",
+    "paintAudio",
+    "paintImage",
+    "stripMisattachedExecutionPreviews",
+    "app",
+    "createStoryboardIdentity",
+    "appendStoryboardCacheBust",
+    "appendImageCacheBust",
+    "NO_PROMPT_KEY",
+    "collectNodeOutputMedia",
+    "chatMediaEnabled",
+    "getSetting",
+    "SETTING_CHAT_MEDIA",
+    `return (runCompletion) => [
+      (${sourceBetween("  function onExecuted(ev) {", "  function onExecError(ev)")}),
+      (${sourceBetween("  function onExecutionSuccess(ev) {", "  // Primary render-duration start signal")}),
+    ];`,
+  )(
+    (media) => `view://${media.filename}`,
+    () => false,
+    () => false,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    { graph: {}, nodeOutputs: {}, nodePreviewImages: {} },
+    () => "storyboard",
+    (url) => url,
+    (url) => url,
+    NO_PROMPT_KEY,
+    collectNodeOutputMedia,
+    (v) => v !== false,
+    () => undefined,
+    "comfyui-mcp.chatMedia",
+  )(runCompletion);
+}
+
 test("#1837 a repeat registration REUSES the run's identity — one finished run, one agent turn", () => {
   const h = makeHarness();
   const P = "repeat-registration";
@@ -952,6 +1005,55 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
   assert.equal(pruneCount, 1);
   assert.equal(runCompletion.isSettled(promptId), true);
   assert.equal(runCompletion._delivered.has(promptId), true);
+});
+
+test("#365 production delivery: terminal before receipt emits exactly one keyed frame", async () => {
+  const { deps, frames } = makeFrameDeps();
+  let runCompletion;
+  const productionOnFlush = createRunCompletionFlushHandler({
+    ...deps,
+    markDelivered: (promptId, completionKey) => runCompletion.markDelivered(promptId, completionKey),
+    markUndelivered: (promptId, completionKey) => runCompletion.markUndelivered(promptId, completionKey),
+    pruneRebootMarker: () => {},
+    isAgentMuted: () => false,
+  });
+  runCompletion = createRunCompletionTracker({
+    onFlush: productionOnFlush,
+    setTimer: () => 0,
+    clearTimer: () => {},
+  });
+  const [onExecuted, onExecutionSuccess] = makeProductionCompletionHandlers(runCompletion);
+  const dispatchToken = runCompletion.beginPanelRun();
+  runCompletion.endPanelRun(dispatchToken);
+  const promptId = "panel-terminal-before-receipt";
+
+  // This is the production order: queuePrompt's bounded dispatch has returned,
+  // then the lifecycle reaches terminal before the delayed /prompt response.
+  onExecuted({
+    detail: {
+      prompt_id: promptId,
+      node: "save",
+      output: { images: [{ filename: "terminal-before-receipt.png", type: "output" }] },
+    },
+  });
+  onExecutionSuccess({ detail: { prompt_id: promptId } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(frames.length, 0, "terminal-before-receipt must not send an unkeyed fallback");
+
+  const completionKey = runCompletion.onQueued(promptId, {
+    routeId: "route",
+    sessionId: "session",
+    dispatchToken,
+  });
+  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(frames.length, 1, "the delayed receipt emits one completion frame");
+  assert.equal(frames[0].completion_key, completionKey, "the only frame is keyed");
+  assert.deepEqual(
+    frames[0].images.map((m) => m.filename),
+    ["terminal-before-receipt.png"],
+  );
 });
 
 test("presentation: a still-storyboard fallback (no blob) still yields ONE frame with the note", async () => {

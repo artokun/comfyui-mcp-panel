@@ -562,8 +562,7 @@ test("#1824: a timeout-released terminal batch survives teardown and late prompt
   });
   first.onExecutionSuccess("P-timeout");
   first._fireTimers(30000);
-  assert.equal(firstFlushes.length, 1, "the expired production hold emits its fallback frame");
-  assert.equal(firstFlushes[0].awaitingCompletionKey, true);
+  assert.equal(firstFlushes.length, 0, "the expired production hold keeps receipt grace for late adoption");
   assert.equal(first.hasPending(), true);
   const terminalState = first.terminalCompletionMetadata();
   assert.deepEqual(terminalState[0], {
@@ -575,7 +574,7 @@ test("#1824: a timeout-released terminal batch survives teardown and late prompt
       durationMs: 0,
       finishedAt: 1_000_000,
     },
-    unkeyedFlushed: true,
+    unkeyedFlushed: false,
   });
   first.dispose();
 

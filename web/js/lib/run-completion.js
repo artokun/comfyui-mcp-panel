@@ -660,7 +660,16 @@ export function createRunCompletionTracker({
 
   function hasOpenPanelRunDispatches() {
     for (const dispatch of panelRunDispatches.values()) {
-      if (dispatch.holdsUnkeyedCompletions) return true;
+      // A terminal candidate must remain unkeyed until every dispatch that could
+      // own it has either supplied its receipt or let its bounded grace expire.
+      // `endPanelRun` closes normal queue admission, but its late-candidate phase
+      // is still an unresolved receipt window; releasing here would send the same
+      // payload once unkeyed and again when onQueued supplies its completion key.
+      if (
+        dispatch.holdsUnkeyedCompletions ||
+        dispatch.acceptsCandidates ||
+        dispatch.acceptsLateCandidates
+      ) return true;
     }
     return false;
   }

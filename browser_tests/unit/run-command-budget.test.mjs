@@ -1541,14 +1541,10 @@ test("#1824 CALL SITE: a long panel_run completion stays replayable until the or
     const timeout = [...timers].find((candidate) => candidate.ms === 30000);
     assert.ok(timeout, "the production panel_run hold has a 30-second timeout");
     timers.delete(timeout);
-    const unkeyedP = waitForSend();
     await timeout.fn();
     assert.equal(frames.length, 0, "the hold timeout does not flush an active render");
     tracker.onExecutionSuccess("long-prompt-1824");
-    await unkeyedP;
-    assert.equal(frames.length, 1, "the expired hold emits its best-effort unkeyed frame");
-    assert.equal(frames[0].completion_key, undefined, "the timeout frame has no prompt key yet");
-    assert.equal(flushes[0].awaitingCompletionKey, true);
+    assert.equal(frames.length, 0, "terminal output remains held during receipt grace");
     assert.equal(tracker.hasPending(), true, "the timeout frame remains in the recovery ledger");
     assert.equal(tracker.isSettled("long-prompt-1824"), false);
 
@@ -1556,9 +1552,9 @@ test("#1824 CALL SITE: a long panel_run completion stays replayable until the or
     latePromptId();
     assert.equal(sweep._hasTimer(), true, "the real panel_run capture arms reconciliation");
     await sentP;
-    assert.equal(flushes.length, 2, "the delayed prompt binds and replays the held terminal media");
-    assert.equal(frames.length, 2);
-    const completionKey = frames[1].completion_key;
+    assert.equal(flushes.length, 1, "the delayed prompt binds and delivers the held terminal media");
+    assert.equal(frames.length, 1);
+    const completionKey = frames[0].completion_key;
     const completionParts = JSON.parse(completionKey);
     assert.equal(completionParts[0], "panel-route-1824");
     assert.equal(completionParts[1], "1824");
@@ -1579,8 +1575,8 @@ test("#1824 CALL SITE: a long panel_run completion stays replayable until the or
       isVideo: () => false,
     });
     await replayP;
-    assert.equal(frames.length, 3, "pending history reconciliation replays the completion");
-    assert.equal(frames[2].completion_key, completionKey, "replay uses the same idempotency key");
+    assert.equal(frames.length, 2, "pending history reconciliation replays the completion");
+    assert.equal(frames[1].completion_key, completionKey, "replay uses the same idempotency key");
     assert.equal(tracker.hasPending(), true, "replay remains pending until the receipt");
 
     assert.equal(
