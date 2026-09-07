@@ -97,18 +97,18 @@ export function describeUndeliveredReply(entry) {
  * whatever the user typed. The panel already treats both as unspeakable elsewhere (they
  * are never echoed as activity cards and never recorded to history).
  *
- * They must therefore NEVER be journaled as raw frames for cross-socket replay (codex).
- * A replay lands on whatever socket is current later — which can be a DIFFERENT
+ * They must therefore NEVER be sent as raw frames to an unproven replacement socket
+ * (codex). A replay lands on whatever socket is current later — which can be a DIFFERENT
  * orchestrator entirely after a backend switch or a Bridge-URL change — so replaying the
- * raw frame would hand one session's secret to another process. Redacted instead: the
- * outcome is still reported truthfully, and for a secret "you never received it" is
- * exactly right, because the orchestrator only stores what actually reaches it.
+ * raw frame would hand one session's secret to another process. The journal keeps only a
+ * redacted public frame; a private bounded side table can select the raw frame after the
+ * same URL + session epoch has been proven.
  */
 export const SENSITIVE_RESULT_CMDS = new Set(["request_secret", "ask_user"]);
 
-/** The frame that is safe to journal for `cmd`. Non-sensitive commands pass through
- *  unchanged; sensitive ones are replaced by a rid-correlated, payload-free failure that
- *  tells the caller to re-request on the current connection. */
+/** The frame that is safe to expose from the journal for `cmd`. Non-sensitive commands
+ * pass through unchanged; sensitive ones are replaced by a rid-correlated, payload-free
+ * failure that is safe for an unproven replacement session. */
 export function redactSensitiveReply(reply, cmd) {
   if (!reply || !SENSITIVE_RESULT_CMDS.has(cmd)) return reply;
   // #952 — redact what CARRIES the user's input, not every reply for these commands.
@@ -127,21 +127,53 @@ export function redactSensitiveReply(reply, cmd) {
     ok: false,
     error:
       `the panel collected the "${cmd}" response, but the connection dropped before it could be ` +
-      `returned. Its content is deliberately NOT replayed across a reconnect (it is the user's ` +
-      `own input, and the connection it was meant for is gone). Nothing was applied and nothing ` +
-      `was stored — ask again on the current connection.`,
+      `returned. Its content is deliberately NOT replayed to an unproven replacement session ` +
+      `(it is the user's own input, and session continuity was not established). Nothing was ` +
+      `applied and nothing was stored — ask again on the current connection.`,
   };
+}
+
+/**
+ * Does the source and target identify one proven bridge session?
+ *
+ * URL is the endpoint identity; the server-issued epoch is the process/session
+ * identity. Both are required. An absent epoch cannot prove that a replacement
+ * socket reached the same orchestrator, so callers that carry user input must
+ * fail closed rather than treating two unknowns as equal.
+ */
+export function sameBridgeSession({ sourceUrl, sourceEpoch, targetUrl, targetEpoch } = {}) {
+  const epoch = (value) =>
+    (typeof value === "string" && value.length > 0) ||
+    (typeof value === "number" && Number.isFinite(value));
+  return (
+    typeof sourceUrl === "string" && sourceUrl.length > 0 &&
+    typeof targetUrl === "string" && targetUrl.length > 0 &&
+    sourceUrl === targetUrl &&
+    epoch(sourceEpoch) && epoch(targetEpoch) &&
+    sourceEpoch === targetEpoch
+  );
 }
 
 /** Bounded journal of command outcomes whose reply could not be delivered. */
 export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
   const limit = Number.isFinite(cap) && cap > 0 ? cap : LOST_REPLY_CAP;
   let entries = [];
+  // Sensitive results are kept only in this private side table until the bounded
+  // entry is either replayed into the SAME proven session or discarded. The public
+  // entry remains redacted, so list(), summaries(), and accidental diagnostics can
+  // never expose the user's answer.
+  const rawSensitiveReplies = new WeakMap();
+  const replayReply = (entry, { now, targetUrl, targetEpoch } = {}) => {
+    if (!entry || !rawSensitiveReplies.has(entry)) return entry?.reply;
+    if (isReplayable(entry, { now, targetUrl, targetEpoch })) {
+      return rawSensitiveReplies.get(entry) ?? entry.reply;
+    }
+    return entry.reply;
+  };
   return {
-    /** Record one undelivered outcome. `reply` is the exact frame we failed to send, so
-     *  it can be re-sent verbatim on the next socket: rids are random UUIDs, so an
-     *  orchestrator that no longer knows the rid simply drops it, and one that still has
-     *  the command pending resolves it with its TRUE outcome. */
+    /** Record one undelivered outcome. Non-sensitive replies are retained verbatim.
+     * Sensitive replies have a redacted public frame plus a private raw value that may
+     * only be selected after the replay caller proves the same URL + session epoch. */
     record({ reply, cmd, reason, at = 0, url, epoch } = {}) {
       if (!reply || typeof reply !== "object" || typeof reply.rid !== "string") return null;
       const safe = redactSensitiveReply(reply, cmd);
@@ -167,6 +199,7 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
         redacted: safe !== reply,
         reply: safe,
       };
+      if (safe !== reply) rawSensitiveReplies.set(entry, reply);
       entries.push(entry);
       while (entries.length > limit) entries.shift();
       return entry;
@@ -186,8 +219,22 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
       const visible = targetUrl
         ? entries.filter((e) => isReplayable(e, { now, targetUrl, targetEpoch }))
         : entries;
-      return visible.map(({ rid, cmd, ok, reason, at }) => ({ rid, cmd, ok, reason, at }));
+      return visible.map((entry) => ({
+        rid: entry.rid,
+        cmd: entry.cmd,
+        // A same-session sensitive answer is replayable as a success, while the
+        // public entry remains redacted and never includes its value.
+        ok: Boolean(replayReply(entry, { now, targetUrl, targetEpoch })?.ok),
+        reason: entry.reason,
+        at: entry.at,
+      }));
     },
+    /**
+     * Select the frame for a replay. A sensitive answer is returned only when the
+     * caller proves the same recent bridge/session; every mismatch gets the public
+     * payload-free failure instead. Non-sensitive replies pass through unchanged.
+     */
+    replayReply,
     /** Take everything and empty the journal (used when replaying onto a new socket, so
      *  a replay can never loop). */
     drain() {
@@ -218,8 +265,9 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
  * session at the same address. The age bound here remains the backstop for a LEGACY
  * orchestrator that sends no epoch (absent on both sides compares equal — URL-only
  * matching, exactly the pre-epoch behaviour), bounding that residual four ways:
- * sensitive results never enter the journal at all; replay goes ONLY to the exact
- * socket instance that completed a handshake; entries age out here; and the window is
+ * sensitive results remain redacted in the public journal and raw values are selected only
+ * for a proven same-session replay; replay goes ONLY to the exact socket instance that
+ * completed a handshake; entries age out here; and the window is
  * deliberately tight — a drop, reconnect and handshake take a couple of seconds, so 20s
  * is generous for the case this serves while leaving little room for an orchestrator to
  * restart and re-bind inside it.

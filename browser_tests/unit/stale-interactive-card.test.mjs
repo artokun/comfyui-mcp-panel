@@ -1,20 +1,12 @@
 /**
- * #952 — a `panel_ask` whose tab disconnects mid-command returns an unknown outcome, and
- * the orchestrator's own message (comfyui-mcp 0.50.88) has to warn:
+ * #2218 — an interactive `panel_ask` card must survive a replacement WebSocket when the
+ * replacement proves the same bridge URL + server-issued session epoch. The old socket id
+ * fence disabled the card and dropped the user's pick even though the orchestrator process
+ * was still the same.
  *
- *   "Expect the stale card to remain on screen: retry suppression is keyed to the socket
- *    that dropped, so this counts as a new command and the user may see two. Tell them
- *    which one to answer."
- *
- * The panel is the side that can just say it. A card painted on a connection that has since
- * been replaced cannot deliver an answer to anyone — the panel deliberately does not replay
- * a reply of this kind across a reconnect — yet it looks exactly as clickable as the newer
- * card beside it.
- *
- * DELIBERATELY NOT TOUCHED, because they are design questions this issue records and leaves
- * to its owner: whether interactive cards should dedupe on a scope that survives a
- * reconnect, and what a retry should return while the original is unanswered. Retiring a
- * dead card needs neither — no new scope, no retry semantics, no ledger change.
+ * The negative side remains load-bearing: an unknown, different URL, or different session
+ * epoch must retire the card and abandon its command. A retry must never paint a second card
+ * merely because the original socket disappeared.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -27,6 +19,7 @@ import { dirname, join } from "node:path";
 // with `{holes}` filled. So the wording assertions below still read the English the panel
 // renders, and they still fail if that English changes.
 import { tr } from "../../web/js/lib/i18n.js";
+import { sameBridgeSession } from "../../web/js/lib/command-liveness.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PANEL_JS = join(HERE, "../../web/js/comfyui-mcp-panel.js");
@@ -111,39 +104,37 @@ test("#952 retirement is presentation only — a hostile card cannot break a rec
   assert.doesNotThrow(() => retire(fakeCard(), { alreadyAnswered: () => { throw new Error("boom"); } }));
 });
 
-test("#952 (codex) source guard: a DIFFERENT SOCKET retires cards, and nothing resolves their promise", () => {
+test("#2218 source guard: cards use a proven bridge session, not a socket", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  // `"connected"` re-fires on every re-handshake — each `models` frame calls markConnected,
-  // and a workflow change re-hellos the LIVE socket — so keying on the status string would
-  // retire cards that are still perfectly answerable. The socket's identity can tell them
-  // apart; the string cannot.
-  assert.match(src, /socketId != null && socketId !== liveSocketId/, "a DIFFERENT socket");
-  assert.match(src, /retireInteractiveCardsFromPreviousSockets\(\);/);
-  assert.ok(!/bridgeConnectSeq/.test(src), "the status-counting trigger must not come back");
-  assert.match(src, /thisSock\.__cmcpSocketId = \+\+socketSeq;/, "minted once per WebSocket");
-  assert.match(src, /onStatus\(s, sock\?\.__cmcpSocketId \?\? null\)/, "and handed to the UI");
-  const sweep = namedFunctionSource(src, "retireInteractiveCardsFromPreviousSockets");
-  assert.match(sweep, /if \(record\.paintedOnSocket === liveSocketId\) continue;/, "only cards from another socket");
-  // Resolving would send an answer to a socket that is gone, and the panel's own rule is
-  // that a reply of this kind does not cross a reconnect.
+  assert.match(src, /sameBridgeSession\(/, "the session identity helper is the retirement gate");
+  assert.match(src, /function bindInteractiveCardsToHandshake\(/, "pre-handshake cards are bound at handshake");
+  assert.match(src, /function retireInteractiveCardsFromPreviousSessions\(/);
+  assert.match(src, /onStatus\(state, socketId, bridgeScope\)/);
+  assert.match(src, /url: sock\?\.__cmcpBridgeUrl \?\? null/);
+  assert.match(src, /epoch: sock\?\.__cmcpBridgeEpoch/);
+  assert.ok(!/let liveSocketId/.test(src), "a socket-only live identity must not return");
+  const sweep = namedFunctionSource(src, "retireInteractiveCardsFromPreviousSessions");
+  assert.match(sweep, /sameBridgeSession\(/, "retirement compares URL + epoch");
   assert.ok(!/resolveFn|resolve\(/.test(sweep), "the sweep must not answer anything");
   const retireSrc = namedFunctionSource(src, "retireInteractiveCard");
   assert.ok(!/resolveFn|resolve\(/.test(retireSrc), "nor may the retirement itself");
 });
 
-test("#952 source guard: a question card registers itself and unregisters when answered", () => {
+test("#2218: a question card registers its bridge scope and unregisters when answered", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   const paint = namedFunctionSource(src, "paintQuestion");
   assert.match(
     paint,
-    /const unregister = paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/,
-    "registered at paint, and ONLY when a command painted it",
+    /const cardScope = normalizeInteractiveCardScope\(paintedOnScope\);/,
+    "the command's scope is normalized at paint",
   );
+  assert.match(paint, /paintedOnSocketId: cardScope\.socketId/);
+  assert.match(paint, /paintedOnScope: cardScope/);
   assert.match(paint, /alreadyAnswered: \(\) => done,/, "so an answered card is skipped");
   assert.match(paint, /handedToCaller\.then\(unregister, unregister\)/, "and dropped once the caller-facing wait settles, either way");
 });
 
-test("#952 (codex) a SECRET card is retired too, with secret-safe wording", () => {
+test("#2218: a SECRET card carries the same session scope and remains secret-safe", () => {
   // It matters more here than for a question: a live password field whose reply has
   // nowhere to go can still display "Token saved", telling a user their token was stored
   // when nothing received it.
@@ -151,9 +142,11 @@ test("#952 (codex) a SECRET card is retired too, with secret-safe wording", () =
   const paint = namedFunctionSource(src, "paintSecret");
   assert.match(
     paint,
-    /const unregisterSecret = paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/,
-    "registered at paint, and ONLY when a command painted it",
+    /const cardScope = normalizeInteractiveCardScope\(paintedOnScope\);/,
+    "the command's scope is normalized at paint",
   );
+  assert.match(paint, /paintedOnSocketId: cardScope\.socketId/);
+  assert.match(paint, /paintedOnScope: cardScope/);
   // Either the bare literal or the translated form — but if it is translated, the KEY is
   // pinned too, not just the English. A wildcard key would let `tr("panel.question",
   // "secret request")` pass while every non-English locale renders the secret card with the
@@ -183,133 +176,120 @@ test("#952 (codex) the retirement note takes the caller's detail, and defaults f
   assert.match(q._children[0].textContent, /If it asked again, answer the newer card\./, "the default stands");
 });
 
-test("#952 (codex r2) a card painted BEFORE its socket handshakes is not retired by that handshake", () => {
-  // A command frame is accepted before the handshake, so an interactive card can be painted
-  // on socket B while the UI still believes A is live. Retiring on B's `connected` would
-  // then kill a card that is perfectly answerable — worse than the duplicate this fixes.
-  // The sandbox runs the SHIPPED registry functions with the shipped handler's two lines,
-  // which the source guard below pins.
-  const src = readFileSync(PANEL_JS, "utf8");
-  const register = namedFunctionSource(src, "registerInteractiveCard");
-  const sweep = namedFunctionSource(src, "retireInteractiveCardsFromPreviousSockets");
-  const make = new Function(
-    `let liveSocketId = null;
-     const liveInteractiveCards = new Set();
-     ${register}
-     ${sweep}
-     function onStatus(state, socketId) {
-       if (socketId != null && socketId !== liveSocketId) liveSocketId = socketId;
-       if (state === "connected") retireInteractiveCardsFromPreviousSockets();
+function cardRegistryHarness(src) {
+  return new Function(
+    "sameBridgeSession",
+    `const liveInteractiveCards = new Set();
+     ${namedFunctionSource(src, "registerInteractiveCard")}
+     ${namedFunctionSource(src, "bindInteractiveCardsToHandshake")}
+     ${namedFunctionSource(src, "retireInteractiveCardsFromPreviousSessions")}
+     function onStatus(state, socketId, bridgeScope) {
+       if (state === "connected") {
+         bindInteractiveCardsToHandshake(socketId, bridgeScope);
+         retireInteractiveCardsFromPreviousSessions(bridgeScope);
+       }
      }
-     return { registerInteractiveCard, onStatus, liveCount: () => liveInteractiveCards.size };`,
-  );
-  const s = make();
+     return { registerInteractiveCard, onStatus, size: () => liveInteractiveCards.size };`,
+  )(sameBridgeSession);
+}
 
-  // Socket A connects; a card is painted and answered normally.
-  s.onStatus("connected", 1);
-  const retiredA = [];
-  s.registerInteractiveCard({ paintedOnSocket: 1, retire: () => retiredA.push("A") });
-
-  // A drops, B opens ("connecting" carries B's id) and receives ask_user BEFORE its models
-  // frame — the window this test exists for.
-  s.onStatus("connecting", 2);
-  const retiredB = [];
-  s.registerInteractiveCard({ paintedOnSocket: 2, retire: () => retiredB.push("B") });
-
-  // B handshakes.
-  s.onStatus("connected", 2);
-  assert.deepEqual(retiredA, ["A"], "the card from the previous socket IS retired");
-  assert.deepEqual(retiredB, [], "the card painted on B, before B handshaked, is NOT");
-  assert.equal(s.liveCount(), 1, "and B's card is still tracked");
+test("#2218: same-session reconnect keeps the live approval exactly once", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const make = cardRegistryHarness(src);
+  make.onStatus("connected", 1, { url: "ws://agent", epoch: "session-1" });
+  const retired = [];
+  make.registerInteractiveCard({
+    paintedOnSocketId: 1,
+    paintedOnScope: { url: "ws://agent", epoch: "session-1" },
+    retire: () => retired.push("retire"),
+    abandon: () => retired.push("abandon"),
+  });
+  make.onStatus("connected", 2, { url: "ws://agent", epoch: "session-1" });
+  assert.deepEqual(retired, [], "a new socket in the same session does not withdraw the pick");
+  assert.equal(make.size(), 1, "the reconnect does not create a duplicate card");
 });
 
-test("#952 (codex r2) a RE-HANDSHAKE on the same socket retires nothing", () => {
+test("#2218: epoch/URL mismatch withdraws, while a pre-handshake card binds to its own session", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  const make = new Function(
-    `let liveSocketId = null;
-     const liveInteractiveCards = new Set();
-     ${namedFunctionSource(src, "registerInteractiveCard")}
-     ${namedFunctionSource(src, "retireInteractiveCardsFromPreviousSockets")}
-     function onStatus(state, socketId) {
-       if (socketId != null && socketId !== liveSocketId) liveSocketId = socketId;
-       if (state === "connected") retireInteractiveCardsFromPreviousSockets();
-     }
-     return { registerInteractiveCard, onStatus };`,
-  )();
-  make.onStatus("connected", 7);
+  const make = cardRegistryHarness(src);
+  make.onStatus("connected", 1, { url: "ws://agent", epoch: "session-1" });
   const retired = [];
-  make.registerInteractiveCard({ paintedOnSocket: 7, retire: () => retired.push("x") });
-  // Every models frame re-emits "connected" on the SAME socket; a workflow change re-hellos it.
-  make.onStatus("connected", 7);
-  make.onStatus("connected", 7);
+  make.registerInteractiveCard({
+    paintedOnSocketId: 1,
+    paintedOnScope: { url: "ws://agent", epoch: "session-1" },
+    retire: () => retired.push("old-retire"),
+    abandon: () => retired.push("old-abandon"),
+  });
+  make.registerInteractiveCard({
+    paintedOnSocketId: 2,
+    paintedOnScope: { url: "ws://agent", epoch: undefined },
+    retire: () => retired.push("new-retire"),
+    abandon: () => retired.push("new-abandon"),
+  });
+  make.onStatus("connected", 2, { url: "ws://agent", epoch: "session-2" });
+  assert.deepEqual(retired, ["old-retire", "old-abandon"], "the epoch mismatch withdraws the old card");
+  assert.equal(make.size(), 1, "the card painted before the new handshake remains once");
+
+  const urlRetired = [];
+  make.registerInteractiveCard({
+    paintedOnSocketId: 2,
+    paintedOnScope: { url: "ws://agent", epoch: "session-2" },
+    retire: () => urlRetired.push("retire"),
+    abandon: () => urlRetired.push("abandon"),
+  });
+  make.onStatus("connected", 3, { url: "ws://other-agent", epoch: "session-2" });
+  assert.deepEqual(urlRetired, ["retire", "abandon"], "the URL mismatch also withdraws");
+});
+
+test("#2218: repeated handshakes in one bridge session retire nothing", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const make = cardRegistryHarness(src);
+  make.onStatus("connected", 7, { url: "ws://agent", epoch: "session-1" });
+  const retired = [];
+  make.registerInteractiveCard({
+    paintedOnSocketId: 7,
+    paintedOnScope: { url: "ws://agent", epoch: "session-1" },
+    retire: () => retired.push("x"),
+  });
+  // Every models frame re-emits "connected"; a workflow change can re-hello the live socket.
+  make.onStatus("connected", 7, { url: "ws://agent", epoch: "session-1" });
+  make.onStatus("connected", 7, { url: "ws://agent", epoch: "session-1" });
   assert.deepEqual(retired, [], "a live card survives any number of re-handshakes");
 });
 
-test("#952 (codex r2) source guard: adoption is unconditional, retirement waits for the handshake", () => {
+test("#2218 source guard: session scope is stamped before replay and handed to the panel", () => {
   const src = readFileSync(PANEL_JS, "utf8");
   assert.match(
     src,
-    /if \(socketId != null && socketId !== liveSocketId\) liveSocketId = socketId;\r?\n\s*if \(state === "connected"\) retireInteractiveCardsFromPreviousSockets\(\);/,
-    "adopt on any status carrying a new id; sweep only on connected",
+    /if \(state === "connected"\) \{\r?\n\s*bindInteractiveCardsToHandshake\(socketId, connectedScope\);\r?\n\s*retireInteractiveCardsFromPreviousSessions\(connectedScope\);/,
+    "bind and sweep only after a connected handshake",
   );
-  // The open path must actually emit a status carrying the new socket's id, or a card
-  // painted pre-handshake would still record the previous one.
   assert.match(src, /thisSock\.__cmcpSocketId = \+\+socketSeq;/);
-  assert.match(src, /onStatus\(s, sock\?\.__cmcpSocketId \?\? null\)/);
+  assert.match(src, /onStatus\(s, sock\?\.__cmcpSocketId \?\? null, \{[\s\S]*?url: sock\?\.__cmcpBridgeUrl/);
+  assert.match(src, /epoch: sock\?\.__cmcpBridgeEpoch/);
 });
 
-test("#952 (codex r2) the card records the socket that ASKED, not the UI's belief", () => {
-  // The open status that would tell the UI about a new socket is suppressed once the
-  // patience window has been given up on (`if (!gaveUp) emitStatus("connecting")`), so a
-  // UI-side belief can be stale exactly when a pre-handshake command arrives. Taking the
-  // id from the command's own socket removes the dependency entirely.
+test("#2218: the card records the command's URL+epoch scope, not the UI's belief", () => {
   const src = readFileSync(PANEL_JS, "utf8");
-  assert.match(src, /result = await onAsk\(msg, thisSock\.__cmcpSocketId \?\? null\);/, "ask carries its socket");
-  assert.match(src, /result = await onSecret\(msg, thisSock\.__cmcpSocketId \?\? null\);/, "so does the secret request");
-  assert.match(src, /onAsk\(msg, socketId\) \{/, "the UI takes it");
-  assert.match(src, /onSecret\(msg, socketId\) \{/);
-  assert.match(src, /const p = paintQuestion\(msg, socketId\);/, "and threads it to the painter");
-  assert.match(src, /const p = paintSecret\(msg, socketId\);/);
-  assert.match(src, /function paintQuestion\(msg, paintedOnSocket = null\) \{/);
-  assert.match(src, /function paintSecret\(msg, paintedOnSocket = null\) \{/);
-  // The registry entry prefers the painter's own id and falls back to the UI's belief.
-  // BOTH painters, COUNTED. Matching once passed while one of the two had lost it — a
-  // guard that cannot tell "both do this" from "at least one does" is not guarding much.
+  for (const cmd of ["onAsk", "onSecret"]) {
+    const at = src.indexOf(`result = await ${cmd === "onAsk" ? "onAsk" : "onSecret"}(msg, {`);
+    assert.ok(at > 0, `${cmd} carries a bridge scope`);
+    const frame = src.slice(at, at + 260);
+    assert.match(frame, /socketId: thisSock\.__cmcpSocketId/);
+    assert.match(frame, /url: thisSock\.__cmcpBridgeUrl \?\? socketUrl/);
+    assert.match(frame, /epoch: thisSock\.__cmcpBridgeEpoch/);
+  }
+  assert.match(src, /onAsk\(msg, cardScope\) \{/);
+  assert.match(src, /onSecret\(msg, cardScope\) \{/);
+  assert.match(src, /const p = paintQuestion\(msg, cardScope\);/);
+  assert.match(src, /const p = paintSecret\(msg, cardScope\);/);
+  assert.match(src, /function paintQuestion\(msg, paintedOnScope = null\) \{/);
+  assert.match(src, /function paintSecret\(msg, paintedOnScope = null\) \{/);
   assert.equal(
-    (src.match(/paintedOnSocket == null \? \(\) => \{\} : registerInteractiveCard\(\{/g) ?? []).length,
+    (src.match(/cardScope == null \? \(\) => \{\} : registerInteractiveCard\(\{/g) ?? []).length,
     2,
-    "the question card AND the secret card each register only when a command painted them",
+    "both interactive card types register only when a command painted them",
   );
-});
-
-test("#952 (codex r2) a card painted on a socket the UI never adopted is still tied to it", () => {
-  // The behavioural half: with the id coming from the COMMAND, a card painted while
-  // `liveSocketId` is stale still records the socket that asked, so that socket
-  // handshaking does not retire it — and the older one still does. This matters because
-  // the open status carrying a new socket's id is suppressed once the patience window has
-  // been given up on, so the UI's belief can be stale exactly when it counts.
-  const src = readFileSync(PANEL_JS, "utf8");
-  const make = new Function(
-    `let liveSocketId = null;
-     const liveInteractiveCards = new Set();
-     ${namedFunctionSource(src, "registerInteractiveCard")}
-     ${namedFunctionSource(src, "retireInteractiveCardsFromPreviousSockets")}
-     function onStatus(state, socketId) {
-       if (socketId != null && socketId !== liveSocketId) liveSocketId = socketId;
-       if (state === "connected") retireInteractiveCardsFromPreviousSockets();
-     }
-     return { registerInteractiveCard, onStatus };`,
-  )();
-  make.onStatus("connected", 1); // socket A is live
-  const retiredA = [];
-  make.registerInteractiveCard({ paintedOnSocket: 1, retire: () => retiredA.push("A") });
-  // Socket B opens with NO status reaching the UI, and an ask_user arrives on it: the
-  // painter names B explicitly.
-  const retiredB = [];
-  make.registerInteractiveCard({ paintedOnSocket: 2, retire: () => retiredB.push("B") });
-  make.onStatus("connected", 2); // B finally handshakes
-  assert.deepEqual(retiredA, ["A"], "the card from A is retired");
-  assert.deepEqual(retiredB, [], "the card that named B survives B handshaking");
 });
 
 test("#952 (codex r3) a SETTINGS token card is never registered — it is agent-free", () => {
@@ -323,8 +303,7 @@ test("#952 (codex r3) a SETTINGS token card is never registered — it is agent-
   assert.ok(!/socketId/.test(settingsCall), "it passes no socket id");
   // …and with none passed, the painter does not register it at all.
   const make = new Function(
-    `let liveSocketId = 9;
-     const liveInteractiveCards = new Set();
+    `const liveInteractiveCards = new Set();
      ${namedFunctionSource(src, "registerInteractiveCard")}
      return { registerInteractiveCard, size: () => liveInteractiveCards.size };`,
   )();
@@ -335,7 +314,7 @@ test("#952 (codex r3) a SETTINGS token card is never registered — it is agent-
   off();
   assert.match(
     namedFunctionSource(src, "registerInteractiveCard"),
-    /const record = \{ paintedOnSocket: null, \.\.\.entry \};/,
-    "no liveSocketId fallback — an entry names its own socket or none",
+    /const record = \{ paintedOnSocketId: null, paintedOnScope: null, \.\.\.entry \};/,
+    "no live socket fallback — an entry names its own bridge scope or none",
   );
 });

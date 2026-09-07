@@ -167,7 +167,8 @@ function makeQuestionPainter({
     "tr",
     "INTERACTIVE_ABANDONED",
     "waitForAdultConsentAnswer",
-    `${namedFunctionSource(source, "paintQuestion")}; return paintQuestion;`,
+    `${namedFunctionSource(source, "normalizeInteractiveCardScope")};
+     ${namedFunctionSource(source, "paintQuestion")}; return paintQuestion;`,
   )(
     document,
     log,
@@ -272,7 +273,7 @@ test("#390 the painter imports and returns the shipped consent wait", () => {
   assert.match(paint, /return handedToCaller;/);
   assert.match(
     namedFunctionSource(source, "createBridgeClient"),
-    /result = await onAsk\(msg, thisSock\.__cmcpSocketId \?\? null\)/,
+    /result = await onAsk\(msg, \{[\s\S]*?socketId: thisSock\.__cmcpSocketId \?\? null,[\s\S]*?url: thisSock\.__cmcpBridgeUrl \?\? socketUrl,[\s\S]*?epoch: thisSock\.__cmcpBridgeEpoch,/,
     "the executor still awaits the painter's promise — that is the command duration",
   );
 });

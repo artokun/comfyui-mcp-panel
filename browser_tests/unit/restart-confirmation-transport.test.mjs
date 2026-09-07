@@ -109,7 +109,8 @@ function makeQuestionPainter({ record = () => {}, onReveal = () => {} } = {}) {
     "tr",
     "INTERACTIVE_ABANDONED",
     "waitForAdultConsentAnswer",
-    `${namedFunctionSource(source, "paintQuestion")}; return paintQuestion;`,
+    `${namedFunctionSource(source, "normalizeInteractiveCardScope")};
+     ${namedFunctionSource(source, "paintQuestion")}; return paintQuestion;`,
   )(
     document,
     log,
@@ -159,7 +160,11 @@ test("#1764 the real question painter settles the command before history persist
 
 test("#1764 production caller path keeps the original ask rid on the answer", () => {
   const bridge = namedFunctionSource(source, "createBridgeClient");
-  assert.match(bridge, /result = await onAsk\(msg, thisSock\.__cmcpSocketId \?\? null\)/);
+  assert.match(
+    bridge,
+    /result = await onAsk\(msg, \{[\s\S]*?socketId: thisSock\.__cmcpSocketId \?\? null,[\s\S]*?url: thisSock\.__cmcpBridgeUrl \?\? socketUrl,[\s\S]*?epoch: thisSock\.__cmcpBridgeEpoch,/,
+    "the answer remains tied to the command's bridge scope",
+  );
   assert.match(bridge, /reply = \{ rid: msg\.rid, ok: true, result: withViewingWitness\(result\) \}/);
   assert.match(bridge, /thisSock\["send"\]\(JSON\.stringify\(reply\)\)/);
   assert.match(bridge, /settleRid\(reply\)/);
