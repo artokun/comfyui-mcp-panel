@@ -1417,3 +1417,104 @@ test("#716 P1: existing mapped UUIDs still omit when noncanonical", () => {
     assert.equal(replyUuid(workflow, workflow), null, `mapped ${workflow.path} must not publish a noncanonical UUID`);
   }
 });
+
+// #2139 — the `stale: "unknown"` arm recommended `panel_load_workflow` UNCONDITIONALLY.
+// That call loads the on-disk copy OVER the canvas, so on a tab with unsaved edits it
+// discards them. Every other arm of this chain consults the dirty flags first (the
+// CONFLICT arm says so outright; the arm after it is the proven-clean `else`) — this one
+// alone did not, and it is the arm that fires when the disk read was "unavailable or
+// slower than its deadline", which is transient and common. The one path that admits it
+// verified nothing was the one giving an unconditional instruction to overwrite.
+//
+// Scoped to the branch region and comment-stripped on purpose: the fix ships with a long
+// explanatory comment naming these very identifiers, and an unscoped `assert.match` over
+// the handler body would pass on the comment alone.
+test("#2139 the unknown arm does not CLAIM a conflict it could not verify", () => {
+  // A conflict is "the file changed on disk AND this tab has unsaved edits". On this
+  // arm the disk read failed, so only the second half is known — asserting `conflict`
+  // would claim exactly what the hint admits it could not check. The agent reads that
+  // key as established fact, so an unverified `true` is worse than an absent field.
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = stripComments(handlerBody(src, "async workflow_open({"));
+  const at = body.indexOf('staleInfo.stale === "unknown"');
+  assert.notEqual(at, -1, "the unknown arm must still exist");
+  const region = body.slice(at, at + 2200);
+  assert.match(region, /dirtyNow \|\| wasDirty/, "the arm must still branch on dirtiness");
+  assert.doesNotMatch(
+    region,
+    /conflict:\s*true/,
+    "unknown staleness must not assert a conflict; the CONFLICT arm above owns that claim",
+  );
+});
+test("#2139 the unknown-staleness arm does not tell a DIRTY tab to load over its edits", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const body = stripComments(handlerBody(src, "async workflow_open({"));
+  const at = body.indexOf('staleInfo.stale === "unknown"');
+  assert.notEqual(at, -1, "the unknown arm must still exist");
+  // Bound the region at the end of the ternary chain so this cannot pass on the
+  // CONFLICT arm above it, which has always been dirty-aware.
+  const region = body.slice(at, at + 2200);
+
+  assert.match(
+    region,
+    /dirtyNow \|\| wasDirty/,
+    "the unknown arm must consult the dirty flags before recommending a disk load",
+  );
+
+  // The condition must not be NEGATED. `!(dirtyNow || wasDirty)` still contains the
+  // substring the regex above looks for, and the slice below still reads the FIRST
+  // message object — so the arms could be swapped and every assertion here would
+  // still pass while dirty tabs received the clean-tab advice.
+  assert.doesNotMatch(
+    region,
+    /!\s*\(\s*dirtyNow \|\| wasDirty/,
+    "the dirty arm must be the TRUE branch, not the negation",
+  );
+  // ...and pin the MAPPING, not just the presence of both strings: the true branch
+  // carries the has-unsaved-edits text and the false branch the reports-none text.
+  const ternary = region.slice(region.indexOf("dirtyNow || wasDirty"));
+  const qAt = ternary.indexOf("?");
+  const colonAt = ternary.indexOf(": {", qAt);
+  assert.ok(qAt > -1 && colonAt > qAt, "the unknown arm is still a ternary");
+  const trueBranch = ternary.slice(qAt, colonAt);
+  const falseBranch = ternary.slice(colonAt, colonAt + 1200);
+  assert.match(trueBranch, /AND this tab has unsaved edits/, "TRUE branch = the dirty tab");
+  assert.match(falseBranch, /reports no unsaved edits/, "FALSE branch = the quiet tab");
+
+  const dirtyArm = region.slice(region.indexOf("dirtyNow || wasDirty"));
+  const cut = dirtyArm.indexOf("Could not verify", dirtyArm.indexOf("Could not verify") + 1);
+  const warned = cut === -1 ? dirtyArm : dirtyArm.slice(0, cut);
+  assert.match(
+    warned,
+    /unsaved edits/,
+    "the dirty arm must SAY the tab has unsaved edits",
+  );
+  assert.match(
+    warned,
+    /discarded|do NOT reach for panel_load_workflow/,
+    "the dirty arm must name the loss, not just mention staleness",
+  );
+  // The REMEDY must not be able to cause the loss this hint warns about.
+  // classifyInPlaceOverwrite returns "skip" for a tab already isPersisted === true,
+  // so an ordinary save of a persisted tab overwrites in place WITHOUT reading disk
+  // -- and this whole branch exists because the disk contents could not be
+  // established. An unqualified "save first" here can therefore clobber the very
+  // change the sentence says might exist.
+  assert.match(
+    region,
+    /NEW path/,
+    "both arms must send the caller to a new path, not an in-place overwrite",
+  );
+  assert.doesNotMatch(
+    region,
+    /Save first, then re-read/,
+    "the in-place instruction must not come back",
+  );
+
+  // ...and the clean arm must still give the original, useful advice.
+  assert.match(
+    region,
+    /call panel_load_workflow to be sure you have the on-disk version/,
+    "a tab with no unsaved edits still gets the plain re-read recommendation",
+  );
+});
