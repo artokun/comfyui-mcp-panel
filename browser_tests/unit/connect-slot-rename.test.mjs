@@ -40,6 +40,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { ensureLinkIdHeadroom } from "../../web/js/lib/link-id-headroom.js";
 
 import {
   isLinkPersisted,
@@ -144,6 +145,7 @@ function autoMatchSlots(origin, target, from_output, to_input) {
  */
 function buildConnect(graph, overrides = {}) {
   const deps = {
+    ensureLinkIdHeadroom,
     getGraphCtx: () => ({ graph, canvas: {}, app: {}, rootGraph: graph, LG: {} }),
     resolveNode,
     resolveSlot,
@@ -225,6 +227,17 @@ function mkGraph() {
   const store = mkLinkStore();
   const graph = {
     lastLinkId: 0,
+    // Mirrors the real LGraph, where `last_link_id` is a DEPRECATED accessor pair
+    // over the state counter (`get/set last_link_id` -> `state.lastLinkId`, read out
+    // of the shipped frontend). Without it the fixture models a graph carrying NO
+    // counter at all -- the API-workflow shape #2108 is about -- so every connect
+    // through this harness looked like one that needed a link-id repair.
+    get last_link_id() {
+      return this.lastLinkId;
+    },
+    set last_link_id(v) {
+      this.lastLinkId = v;
+    },
     _links: store.map,
     links: store.proxy,
     nodes: [],
@@ -706,6 +719,26 @@ test("#2380 an ordinary connect stays byte-identical — no collateral key, no w
   assert.equal(res.connected.to.node_id, 1283);
   assert.ok(!("collateral_changes" in res), "a clean connect must not grow a rider");
   assert.ok(!("warning" in res), "nor a warning key");
+});
+
+test("#2196 a counter that is BEHIND is disclosed by graph_connect, not repaired silently", () => {
+  // The end-to-end path the source-shape pins cannot reach: a REAL graph_connect,
+  // on a graph in exactly #2108's state, has to come back saying so. Same fixture as
+  // the byte-identical test above, with the counter knocked below a live id -- the
+  // shape an API/prompt workflow loads in, which panel#2011 made loadable.
+  const { graph, src, preLinkId } = collateralFixture();
+  attachConnect(src);
+  graph.lastLinkId = 0;
+
+  const graph_connect = buildConnect(graph);
+  const res = graph_connect({ from_node_id: 1280, from_output: 0, to_node_id: 1283, to_input: 0 });
+
+  assert.equal(res.connected.to.node_id, 1283);
+  assert.deepEqual(res.link_counter_repaired, { from: 0, to: preLinkId });
+  assert.match(res.warning, /#2108/);
+  // It must not read as "your graph is fixed": the repair protects the NEXT connect
+  // and cannot undo the collisions already made.
+  assert.match(res.warning, /cannot undo an earlier one/);
 });
 
 test("#2380 a pack RENAMING its own slots is not collateral (false-positive guard)", () => {
