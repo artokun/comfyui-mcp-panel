@@ -163,9 +163,25 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
   // entry remains redacted, so list(), summaries(), and accidental diagnostics can
   // never expose the user's answer.
   const rawSensitiveReplies = new WeakMap();
+  const canReplay = (entry, { now, targetUrl, targetEpoch } = {}) => {
+    if (!isReplayable(entry, { now, targetUrl, targetEpoch })) return false;
+    // A private answer has no safe legacy mode. URL equality alone cannot prove that an
+    // epoch-less replacement is the same orchestrator session, so every sensitive entry
+    // requires the stronger URL + proven epoch fence even though ordinary replies retain
+    // the pre-epoch compatibility rule.
+    return (
+      !rawSensitiveReplies.has(entry) ||
+      sameBridgeSession({
+        sourceUrl: entry.url,
+        sourceEpoch: entry.epoch,
+        targetUrl,
+        targetEpoch,
+      })
+    );
+  };
   const replayReply = (entry, { now, targetUrl, targetEpoch } = {}) => {
     if (!entry || !rawSensitiveReplies.has(entry)) return entry?.reply;
-    if (isReplayable(entry, { now, targetUrl, targetEpoch })) {
+    if (canReplay(entry, { now, targetUrl, targetEpoch })) {
       return rawSensitiveReplies.get(entry) ?? entry.reply;
     }
     return entry.reply;
@@ -193,8 +209,8 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
         // the models handshake). URL equality is only ENDPOINT identity: a restarted
         // orchestrator at the same address mints a fresh epoch, and its predecessor's
         // journal must never replay into the new session. A legacy orchestrator sends
-        // no epoch — absent here and absent on the target socket compare EQUAL, which
-        // preserves the pre-epoch (URL-only) behaviour exactly.
+        // no epoch. That is retained for safe, non-sensitive replay only; the private
+        // side table below requires both proven epochs.
         epoch: typeof epoch === "string" || typeof epoch === "number" ? epoch : undefined,
         redacted: safe !== reply,
         reply: safe,
@@ -216,9 +232,11 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
      *  a bridge that never owned these commands would still learn their ids, names and
      *  outcomes even though the replies themselves are correctly withheld. */
     summaries({ now, targetUrl, targetEpoch } = {}) {
-      const visible = targetUrl
-        ? entries.filter((e) => isReplayable(e, { now, targetUrl, targetEpoch }))
-        : entries;
+      const visible = entries.filter((entry) => {
+        // A public summary must use the same delivery fence as replay. With no target it
+        // remains an internal, payload-free bookkeeping view and excludes private answers.
+        return targetUrl ? canReplay(entry, { now, targetUrl, targetEpoch }) : !rawSensitiveReplies.has(entry);
+      });
       return visible.map((entry) => ({
         rid: entry.rid,
         cmd: entry.cmd,
@@ -229,6 +247,8 @@ export function createLostReplyJournal({ cap = LOST_REPLY_CAP } = {}) {
         at: entry.at,
       }));
     },
+    /** Whether this entry may be delivered to the specified proven target. */
+    canReplay,
     /**
      * Select the frame for a replay. A sensitive answer is returned only when the
      * caller proves the same recent bridge/session; every mismatch gets the public

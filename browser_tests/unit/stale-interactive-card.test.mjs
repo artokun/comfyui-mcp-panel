@@ -181,6 +181,7 @@ function cardRegistryHarness(src) {
     "sameBridgeSession",
     `const liveInteractiveCards = new Set();
      ${namedFunctionSource(src, "registerInteractiveCard")}
+     ${namedFunctionSource(src, "interactiveCardWouldDuplicate")}
      ${namedFunctionSource(src, "bindInteractiveCardsToHandshake")}
      ${namedFunctionSource(src, "retireInteractiveCardsFromPreviousSessions")}
      function onStatus(state, socketId, bridgeScope) {
@@ -189,7 +190,7 @@ function cardRegistryHarness(src) {
          retireInteractiveCardsFromPreviousSessions(bridgeScope);
        }
      }
-     return { registerInteractiveCard, onStatus, size: () => liveInteractiveCards.size };`,
+     return { registerInteractiveCard, interactiveCardWouldDuplicate, onStatus, size: () => liveInteractiveCards.size };`,
   )(sameBridgeSession);
 }
 
@@ -239,6 +240,38 @@ test("#2218: epoch/URL mismatch withdraws, while a pre-handshake card binds to i
   });
   make.onStatus("connected", 3, { url: "ws://other-agent", epoch: "session-2" });
   assert.deepEqual(urlRetired, ["retire", "abandon"], "the URL mismatch also withdraws");
+});
+
+test("#2218: an unproven same-URL retry cannot create a second interactive card", () => {
+  const src = readFileSync(PANEL_JS, "utf8");
+  const make = cardRegistryHarness(src);
+  make.onStatus("connected", 1, { url: "ws://agent", epoch: "session-1" });
+  make.registerInteractiveCard({
+    paintedOnSocketId: 1,
+    paintedOnScope: { url: "ws://agent", epoch: "session-1" },
+    retire: () => {},
+    abandon: () => {},
+  });
+
+  assert.equal(
+    make.interactiveCardWouldDuplicate({ url: "ws://agent" }),
+    true,
+    "an unknown epoch cannot prove that a same-URL replacement is a new interaction",
+  );
+  assert.equal(
+    make.interactiveCardWouldDuplicate({ url: "ws://other-agent" }),
+    false,
+    "a different endpoint is left for its own handshake fence",
+  );
+  assert.equal(
+    make.interactiveCardWouldDuplicate({ url: "ws://agent", epoch: "session-1" }),
+    false,
+    "a proven session may continue through its normal card path",
+  );
+
+  const panel = readFileSync(PANEL_JS, "utf8");
+  assert.match(panel, /fenceInteractiveCard\("ask_user"\);\r?\n\s*if \(interactiveCardWouldDuplicate\(cardScope\)\)/);
+  assert.match(panel, /fenceInteractiveCard\("request_secret"\);\r?\n\s*if \(interactiveCardWouldDuplicate\(cardScope\)/);
 });
 
 test("#2218: repeated handshakes in one bridge session retire nothing", () => {

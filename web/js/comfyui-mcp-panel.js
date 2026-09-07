@@ -29186,7 +29186,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // the residual bounds below are exactly the pre-epoch ones: sensitive
       // results are never exposed by the public journal, this runs only AFTER a real
       // handshake, and stale entries age out here.
-      if (!isReplayable(entry, { now, targetUrl, targetEpoch })) {
+      if (!lostReplies.canReplay(entry, { now, targetUrl, targetEpoch })) {
         dropped++;
         continue;
       }
@@ -38375,6 +38375,25 @@ function buildPanel() {
     return () => liveInteractiveCards.delete(record);
   }
 
+  /**
+   * A command can arrive on a replacement socket before that socket's handshake. Its
+   * epoch is therefore unknown, so painting another command-backed card while a card
+   * from this URL is still live would create two controls for one pending interaction.
+   * Refuse that unproven duplicate; the original card remains available until the new
+   * socket proves whether it is the same session or a different one.
+   */
+  function interactiveCardWouldDuplicate(scope) {
+    const url = scope && typeof scope.url === "string" && scope.url ? scope.url : null;
+    const epochKnown =
+      (typeof scope?.epoch === "string" && scope.epoch.length > 0) ||
+      (typeof scope?.epoch === "number" && Number.isFinite(scope.epoch));
+    if (epochKnown) return false;
+    return [...liveInteractiveCards].some((record) => {
+      const existingUrl = record.paintedOnScope?.url;
+      return existingUrl && (!url || existingUrl === url);
+    });
+  }
+
   function bindInteractiveCardsToHandshake(socketId, bridgeScope) {
     if (socketId == null || !bridgeScope || bridgeScope.epoch == null) return;
     for (const record of liveInteractiveCards) {
@@ -40963,6 +40982,7 @@ function buildPanel() {
       // whose `turn:working` is discarded by the stale-working guard no longer
       // reaches the classifier with a null owner.
       fenceInteractiveCard("ask_user");
+      if (interactiveCardWouldDuplicate(cardScope)) return Promise.resolve(INTERACTIVE_ABANDONED);
       const p = paintQuestion(msg, cardScope);
       bumpThinking();
       noteActivity(); // a panel_ask frame is real turn activity → reset the clock
@@ -41212,6 +41232,7 @@ function buildPanel() {
       // no longer owns must not get a masked input painted into the conversation
       // that happens to be on screen — see lib/interactive-card-fence.js.
       fenceInteractiveCard("request_secret");
+      if (interactiveCardWouldDuplicate(cardScope)) return Promise.resolve(INTERACTIVE_ABANDONED);
       const p = paintSecret(msg, cardScope);
       bumpThinking();
       if (req) {

@@ -177,7 +177,7 @@ test("codex R8: replay never crosses a bridge change — entries for another bri
   const body = src.slice(start, src.indexOf("\n  }", start));
   assert.match(
     body,
-    /if \(!isReplayable\(entry, \{ now, targetUrl, targetEpoch \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
+    /if \(!lostReplies\.canReplay\(entry, \{ now, targetUrl, targetEpoch \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
     "an outcome belonging to a previous bridge, session, or too old must never be volunteered",
   );
   assert.match(body, /lostReplies\.replayReply\(entry, \{ now, targetUrl, targetEpoch \}\)/, "same-session sensitive frames use the guarded selector");
@@ -272,6 +272,22 @@ test("#2218: sensitive replies correlate once and replay raw only to the proven 
     assert.deepEqual(j.summaries({ now, targetUrl: URL_A, targetEpoch: "e2" }), [], `${cmd}: mismatch is withdrawn, not advertised`);
     assert.equal(j.replayReply(entry, { now, targetUrl: URL_A }), entry.reply, `${cmd}: an unknown epoch fails closed`);
   }
+});
+
+test("#2218: an epoch-less sensitive reply is never replayable across a same-URL replacement", () => {
+  const URL_A = "ws://127.0.0.1:9199";
+  const now = 1_000_000;
+  const j = createLostReplyJournal();
+  const reply = { rid: "legacy-secret", ok: true, result: "user-private-value" };
+  const entry = j.record({ reply, cmd: "ask_user", at: now - 1000, url: URL_A });
+
+  assert.equal(j.canReplay(entry, { now, targetUrl: URL_A }), false);
+  assert.equal(j.replayReply(entry, { now, targetUrl: URL_A }).result, undefined);
+  assert.deepEqual(
+    j.summaries({ now, targetUrl: URL_A }),
+    [],
+    "an unproven replacement must not even advertise the sensitive outcome",
+  );
 });
 
 test("#694: the journal records the session epoch and summaries filter by it identically", () => {
