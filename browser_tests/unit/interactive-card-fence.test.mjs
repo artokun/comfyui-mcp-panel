@@ -425,6 +425,9 @@ function buildHandlers() {
     let lastMintedThreadId = null;
     let thread = null;
     let pendingSecretRequest = null;
+    // This harness extracts the fence and host callbacks without the full card registry;
+    // the registry's duplicate guard is covered by stale-interactive-card.test.mjs.
+    const interactiveCardWouldDuplicate = () => false;
     ${fenceMatch[0]}
     const host = {
       ${onAskSrc}
@@ -574,6 +577,9 @@ function buildLifecycle() {
     let thread = null;
     let localEndAt = 0;
     let pendingSecretRequest = null;
+    // This harness extracts the fence and host callbacks without the full card registry;
+    // the registry's duplicate guard is covered by stale-interactive-card.test.mjs.
+    const interactiveCardWouldDuplicate = () => false;
     let lastAgentGraph = null, lastAgentGraphKey = null, lastAgentGraphEpoch = null, sessionEpoch = 0;
     const completeDedicatedWorkflowSessionSwap = () => {};
     const settlePendingDedicatedWorkflowSwapAfterCancellation = () => {};
