@@ -19,6 +19,12 @@ import {
   conversionSnapshot,
   conversionThrowReport,
 } from "../../web/js/lib/subgraph-conversion-integrity.js";
+import {
+  normalizeCreateSubgraphNodeIds,
+  recoverConvertedSubgraph,
+  recoveredCreateSubgraphResult,
+  unresolvedCreateSubgraphNodesRefusal,
+} from "../../web/js/lib/subgraph-conversion-recovery.js";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
@@ -101,6 +107,10 @@ function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
     "assertSubgraphNodeLanded",
     "assertSubgraphConversionSerializable",
     "subgraphConversionAdvisories",
+    "normalizeCreateSubgraphNodeIds",
+    "recoverConvertedSubgraph",
+    "recoveredCreateSubgraphResult",
+    "unresolvedCreateSubgraphNodesRefusal",
     `const executors = { ${createSource} }; return executors.graph_create_subgraph;`,
   )(
     getGraphCtx,
@@ -109,6 +119,10 @@ function realCreate(getGraphCtx, clearStaleRedFlagsAfterSubgraphConversion) {
     assertSubgraphNodeLanded,
     assertSubgraphConversionSerializable,
     subgraphConversionAdvisories,
+    normalizeCreateSubgraphNodeIds,
+    recoverConvertedSubgraph,
+    recoveredCreateSubgraphResult,
+    unresolvedCreateSubgraphNodesRefusal,
   );
 }
 
