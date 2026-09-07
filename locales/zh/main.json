@@ -287,10 +287,10 @@
       "action_rewind_the_canvas": "回退画布",
       "action_roll_back_the_canvas": "回滚画布",
       "canvas_not_restored_no_snapshot": "画布并未恢复 —— 找不到对应的工作流快照，因此画布上仍是你想要撤销的那些改动。",
-      "could_not_action_nothing_was_loaded": "⚠️ 无法{action} —— 什么都没有加载，因此没有对工作流做任何改动，可以放心重试。{reason}",
-      "could_not_tell_whether_the_action_happened": "⚠️ 无法确认{action}是否执行过 —— 面板收到了无法识别的结果，请先检查画布再进行其他操作。",
+      "could_not_action_nothing_was_loaded": "⚠ 无法{action} —— 什么都没有加载，因此没有对工作流做任何改动，可以放心重试。{reason}",
+      "could_not_tell_whether_the_action_happened": "⚠ 无法确认{action}是否执行过 —— 面板收到了无法识别的结果，请先检查画布再进行其他操作。",
       "no_reason_was_reported": "未提供原因。",
-      "the_action_ran_but_unconfirmed": "⚠️ {action}已经执行，但面板无法确认结果，画布可能已被改动 —— 请先检查画布再进行其他操作。{reason}"
+      "the_action_ran_but_unconfirmed": "⚠ {action}已经执行，但面板无法确认结果，画布可能已被改动 —— 请先检查画布再进行其他操作。{reason}"
     },
     "manager_404": {
       "comfyui_manager_not_reachable_is_the_built": "无法连接 ComfyUI-Manager（内置管理器是否已启用？）"
@@ -338,7 +338,7 @@
       "auto_arranged_nodes_other": "已自动排布 {count} 个节点",
       "auto_let_the_agent_pick": "自动（由智能体选择）",
       "auto_restart_failed": "自动重启失败：{error}",
-      "beta_the_app_changes_rapidly_and_builds": "⚠️ 测试版 —— 应用变化很快，版本之间可能会出问题。请先打开上面的开关，安装对应平台的版本，然后用面板顶部的二维码按钮配对。",
+      "beta_the_app_changes_rapidly_and_builds": "⚠ 测试版 —— 应用变化很快，版本之间可能会出问题。请先打开上面的开关，安装对应平台的版本，然后用面板顶部的二维码按钮配对。",
       "blind": "屏蔽图像",
       "blocked_a_chat_from_another_workflow_open": "已拦截一个来自其他工作流的对话。请先打开“{workflow}”，再继续它。",
       "bridge_url": "桥接 URL",
@@ -810,7 +810,7 @@
       "the_canvas_was_not_reverted_no_graph": "画布并未回退 —— 那一轮没有工作流快照（只保留最近 25 个，之后会被淘汰）。你的消息已回到输入框，但画布上仍保留着那一轮的改动。",
       "the_connection_that_asked_this_dropped_so": "提出这个{what}的连接已经断开，所以在这里回答已经无法送达智能体。",
       "the_old_session_could_not_be_invalidated": "旧会话无法被可靠地作废；为免把它恢复回来，重新连接已暂停。",
-      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠️ 编排器没有确认“屏蔽图像”的变更 —— 它的版本可能早于 v0.42.0：在那之前，屏蔽只限制面板自身的图像信息流（智能体的图像工具并不受限）。请升级 comfyui-mcp 以获得完整效果。",
+      "the_orchestrator_didnt_acknowledge_the_blind_change": "⚠ 编排器没有确认“屏蔽图像”的变更 —— 它的版本可能早于 v0.42.0：在那之前，屏蔽只限制面板自身的图像信息流（智能体的图像工具并不受限）。请升级 comfyui-mcp 以获得完整效果。",
       "the_panel_agent_dropped_restarting_it": "面板智能体掉线了 —— 正在重启…",
       "the_panel_agent_isn_t_answering_yet": "面板智能体还没有响应 —— 正在重新连接…",
       "the_panel_agent_keeps_failing_to_start": "⚠ 面板智能体一直启动失败。请确认你已经登录（运行一次 `claude`；Codex 用 `codex login`，Gemini 用 `gemini`，本地模型用 `ollama serve`），然后点击“连接”。",

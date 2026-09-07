@@ -132,14 +132,19 @@ export function buttonReplyText(component, fields = []) {
  * all come off. Anchored at ^ so a user who types the same words is left
  * alone.
  */
+// The selector is OPTIONAL on the warning prefixes. #2023 dropped it from what the
+// panel EMITS (it is what pulls in the crashing emoji font), which silently killed
+// these three patterns -- they required it, so the agent-only blocks stopped being
+// stripped and users started seeing the shouty text this list exists to hide.
+// Matching both spellings also keeps already-persisted chat working.
 const AGENT_DIRECTED_PREFIXES = [
   /^(?:⚙\s*)?LIVE-CANVAS TOOLS[\s\S]*?(?:\n\n|$)/i,
   /^⟳\s*MANUAL CANVAS CHANGES[\s\S]*?(?:\n\n|$)/,
   /^⟳\s*ACTIVE WORKFLOW CHANGED[\s\S]*?(?:\n\n|$)/,
   /^\[The user cannot see this message[\s\S]*?(?:\n\n|$)/,
-  /^⚠️\s*GRAPH VALIDATION ERRORS[\s\S]*?(?:\n\n|$)/,
-  /^⚠️\s*MISSING ASSETS[\s\S]*?(?:\n\n|$)/,
-  /^⚠️\s*LAST RUN FAILED[\s\S]*?(?:\n\n|$)/,
+  /^⚠\uFE0F?\s*GRAPH VALIDATION ERRORS[\s\S]*?(?:\n\n|$)/,
+  /^⚠\uFE0F?\s*MISSING ASSETS[\s\S]*?(?:\n\n|$)/,
+  /^⚠\uFE0F?\s*LAST RUN FAILED[\s\S]*?(?:\n\n|$)/,
 ];
 
 /** Remove agent-only prefixes from text that is about to be shown to the user. */

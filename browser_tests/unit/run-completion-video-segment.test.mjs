@@ -128,7 +128,7 @@ test("#1485: the note describes the frames actually PAINTED, not the grid's capa
   );
   assert.match(frame.note, /Only 3 of its 20 cells hold a sampled frame/, "the count that was drawn is the count that is stated");
   assert.match(frame.note, /the other 17 are BLANK/, "and the blanks are disclosed, not implied");
-  assert.match(frame.note, /📽️ 20-cell storyboard \(contact sheet\) of the FINAL saved video/,
+  assert.match(frame.note, /📽 20-cell storyboard \(contact sheet\) of the FINAL saved video/,
     "the head names the sheet and flows into the file — the caveat is its own sentence");
 });
 
@@ -138,7 +138,7 @@ test("#1485: a FULL sheet still reads as a plain N-frame storyboard", async () =
   const { deps, calls } = makeDeps();
   const frame = await composeRunCompletionFrame(videoPayload(), deps);
 
-  assert.match(frame.note, /📽️ 20-frame storyboard \(contact sheet\)/);
+  assert.match(frame.note, /📽 20-frame storyboard \(contact sheet\)/);
   assert.ok(!/BLANK/.test(frame.note), "nothing was blank, so nothing is disclosed as blank");
   assert.deepEqual(
     calls.painted.map((p) => p.caption),
@@ -181,7 +181,7 @@ test("#1485: a count over capacity is CLAMPED, never announced as more than the 
 
   assert.ok(!/25/.test(frame.note), `a count above the capacity must never be printed
 ${frame.note}`);
-  assert.match(frame.note, /📽️ 20-frame storyboard \(contact sheet\)/);
+  assert.match(frame.note, /📽 20-frame storyboard \(contact sheet\)/);
   assert.ok(!/BLANK/.test(frame.note), "a clamped-full sheet has no blanks to disclose");
 });
 
@@ -200,7 +200,7 @@ test("#1485: an UNKNOWN sampled count claims no count at all — never the capac
   const frame = await composeRunCompletionFrame(videoPayload(), deps);
 
   assert.equal(frame.images.length, 1, "the sheet still ships — an unknown count is not a reason to withhold it");
-  assert.match(frame.note, /📽️ storyboard \(contact sheet\)/, "described, but not counted");
+  assert.match(frame.note, /📽 storyboard \(contact sheet\)/, "described, but not counted");
   assert.ok(!/20-frame|20-cell/.test(frame.note), `the capacity must not stand in for the count\n${frame.note}`);
   assert.ok(
     !/null|undefined|NaN/.test(frame.note),
@@ -243,7 +243,7 @@ test("#1485: the completion frame does not wait for the card's poster", async ()
 
   assert.ok(frame, "the completion frame is sent");
   assert.equal(frame.images.length, 1, "and it carries the storyboard the agent needs");
-  assert.match(frame.note, /📽️ 20-frame storyboard/, "not the timed-out fallback");
+  assert.match(frame.note, /📽 20-frame storyboard/, "not the timed-out fallback");
   assert.ok(posterUploadStarted, "the poster is still uploaded — it is detached, not dropped");
   assert.equal(calls.posters.length, 0, "it simply has not landed yet, and the card back-fills when it does");
 });
@@ -335,6 +335,6 @@ test("#1485: a HEAD that throws degrades the metadata line, never the completion
     },
   });
   const frame = await composeRunCompletionFrame(videoPayload(), deps);
-  assert.match(frame.note, /📽️ 20-frame storyboard/, "the sheet survives a failed size lookup");
+  assert.match(frame.note, /📽 20-frame storyboard/, "the sheet survives a failed size lookup");
   assert.equal(frame.images.length, 1);
 });

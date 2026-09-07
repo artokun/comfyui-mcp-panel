@@ -180,7 +180,7 @@ export function describeRevertOutcome(outcome, { restoredText, noneText, action 
     // that nothing was loaded; the specifics ride in `reason`.
     return tr(
       "graph_revert.could_not_action_nothing_was_loaded",
-      "⚠️ Could not {action} — nothing was loaded, so no graph edits were applied and retrying " +
+      "⚠ Could not {action} — nothing was loaded, so no graph edits were applied and retrying " +
         "is safe. {reason}",
       { action: verb, reason: statedReason },
     );
@@ -196,14 +196,14 @@ export function describeRevertOutcome(outcome, { restoredText, noneText, action 
     // have changed.
     return tr(
       "graph_revert.the_action_ran_but_unconfirmed",
-      "⚠️ The {action} RAN but the panel could not confirm the result, so the canvas may have " +
+      "⚠ The {action} RAN but the panel could not confirm the result, so the canvas may have " +
         "changed — check it before doing anything else. {reason}",
       { action: verb, reason: statedReason },
     );
   }
   return tr(
     "graph_revert.could_not_tell_whether_the_action_happened",
-    "⚠️ Could not tell whether the {action} happened — the panel got back an outcome it does " +
+    "⚠ Could not tell whether the {action} happened — the panel got back an outcome it does " +
       "not recognize, so check the canvas before doing anything else.",
     { action: verb },
   );
