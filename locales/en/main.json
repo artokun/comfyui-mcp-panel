@@ -252,6 +252,7 @@
       "share_with_agent": "Share with agent",
       "shared_with_the_agent": "Shared with the agent.",
       "sign_in_failed": "Sign-in failed: {error}",
+      "sign_in_timed_out": "CivitAI sign-in did not complete. If the popup showed a 403, ComfyUI's cross-site protection blocked the redirect back — it rejects that request without logging anything. Start ComfyUI with --enable-cors-header to allow it (see panel#2044). The panel's “{setting}” setting will NOT help here: that token is used by the agent's download tools, and browser sign-in uses a separate OAuth token.",
       "sign_in_to_civitai_to_like": "Sign in to CivitAI to like",
       "sign_in_to_civitai_to_like_opening": "Sign in to CivitAI to like — opening sign-in…",
       "sign_in_to_see_your_favorites": "Sign in to see your favorites.",
