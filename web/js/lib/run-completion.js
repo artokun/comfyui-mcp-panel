@@ -196,13 +196,29 @@ export function createRunCompletionTracker({
   // The timeout fallback may already have emitted an unkeyed frame, but it must
   // remain recoverable until the delayed /prompt identity binds it.
   const terminalNoKeyFlushed = new Set(); // keys whose unkeyed fallback was sent
-  const panelRunDispatches = new Map(); // token -> timer
-  // Lifecycle prompt ids observed while a panel_run hold is active remain
-  // associated with that dispatch after the 30-second timer expires. Without
-  // this handoff fence, a long render finishing after the timer bypasses
-  // terminalNoKeyCompletion entirely and is marked delivered unkeyed.
+  // A dispatch owns its own bounded hold and delayed-receipt grace window. The
+  // production path can overlap two queuePrompt calls, so a receipt for one
+  // token must never release candidates observed while another token was live.
+  const PANEL_RUN_DISPATCH_HOLD_MS = 30_000;
+  const PANEL_RUN_DISPATCH_RECEIPT_GRACE_MS = 30_000;
+  const PANEL_RUN_DISPATCH_CANDIDATE_TTL_MS =
+    PANEL_RUN_DISPATCH_HOLD_MS + PANEL_RUN_DISPATCH_RECEIPT_GRACE_MS;
+  const MAX_PANEL_RUN_DISPATCHES = 16;
+  const MAX_PANEL_RUN_DISPATCH_CANDIDATES = 64;
+  const panelRunDispatches = new Map(); // token -> dispatch state
+  // Prompt ids with a retained terminal replay remain associated with that
+  // dispatch after the 30-second timer expires. A live keyed panel handoff is
+  // represented by its exact completion record below.
+  // Provisional ids seen before the /prompt receipt live in the separate
+  // candidate set below so unrelated canvas work can be released.
   const panelRunCompletionKeys = new Set();
-  let panelRunLateCapture = false;
+  // Before a delayed /prompt response identifies the panel-owned prompt, a
+  // lifecycle id is provisional. The reverse index keeps every candidate tied
+  // to every dispatch that could have observed it. A receipt releases only the
+  // candidates no other unresolved token could own. `at` plus the size cap make
+  // this ambiguity window explicitly bounded.
+  const panelRunDispatchCandidates = new Map(); // prompt key -> { tokens, claimed, at }
+  const panelRunCandidateReleaseScheduled = new Set(); // tokens awaiting microtask finalization
   // A panel_run completion is not retired when the browser socket accepts the
   // frame. Keep every exact route+agent-session+prompt+nonce identity with the
   // run so restored same-prompt rows cannot overwrite one another.
@@ -228,6 +244,19 @@ export function createRunCompletionTracker({
 
   function hasCompletionRecords(k) {
     return completionRecords(k).length > 0;
+  }
+
+  // A route-scoped panel_run has its completion receipt key already, or its
+  // terminal replay is retained in panelRunCompletionKeys while the receipt is
+  // delayed. Bare legacy registrations (without route/session identity) retain
+  // the old orphan salvage behavior; the current production path is keyed and
+  // must wait for the authoritative end signal (#365).
+  function panelRunAwaitsAuthoritativeCompletion(k) {
+    return panelQueued.has(k) && (hasCompletionRecords(k) || panelRunCompletionKeys.has(k));
+  }
+
+  function panelRunHandoffPending(k) {
+    return panelRunCompletionKeys.has(k) || panelRunDispatchCandidates.has(k);
   }
 
   function addCompletionRecord(k, { routeId, sessionId, completionKey }) {
@@ -629,19 +658,172 @@ export function createRunCompletionTracker({
     notifyTerminalCompletionStateChange();
   }
 
+  function hasOpenPanelRunDispatches() {
+    for (const dispatch of panelRunDispatches.values()) {
+      if (dispatch.holdsUnkeyedCompletions) return true;
+    }
+    return false;
+  }
+
+  function forgetPanelRunCandidate(k) {
+    const candidate = panelRunDispatchCandidates.get(k);
+    if (!candidate) return null;
+    panelRunDispatchCandidates.delete(k);
+    for (const token of candidate.tokens) {
+      panelRunDispatches.get(token)?.candidates.delete(k);
+    }
+    candidate.tokens.clear();
+    return candidate;
+  }
+
+  function releaseUnclaimedPanelRunCandidate(k) {
+    const candidate = forgetPanelRunCandidate(k);
+    if (!candidate || candidate.claimed) return;
+    // A candidate may already have crossed the bounded hold and been sent
+    // without a key. Once every dispatch that could have owned it is resolved,
+    // that candidate is ordinary canvas work: retire its provisional replay
+    // record instead of leaving it waiting for a panel receipt it can never have.
+    const held = terminalNoKeyCompletion.get(k);
+    if (held) {
+      const alreadyFlushed = terminalNoKeyFlushed.has(k);
+      terminalNoKeyCompletion.delete(k);
+      terminalNoKeyFlushed.delete(k);
+      panelRunCompletionKeys.delete(k);
+      if (alreadyFlushed) {
+        markDelivered(k);
+      } else {
+        releaseUnkeyedCompletion(k, held, { retire: true });
+      }
+      notifyTerminalCompletionStateChange();
+    }
+    const buf = buffers.get(k);
+    if (!buf) return;
+    // Once the panel receipt identifies its own prompt, an unclaimed canvas
+    // candidate returns to the ordinary orphan/active lifecycle immediately.
+    if (active.has(k)) {
+      if (!buf.timer) arm(k);
+    } else if (hasBufferedMedia(k)) {
+      flush(k);
+    }
+  }
+
+  function detachPanelRunCandidate(k, token) {
+    const dispatch = panelRunDispatches.get(token);
+    dispatch?.candidates.delete(k);
+    const candidate = panelRunDispatchCandidates.get(k);
+    if (!candidate) return;
+    candidate.tokens.delete(token);
+    if (candidate.tokens.size) return;
+    if (candidate.claimed) forgetPanelRunCandidate(k);
+    else releaseUnclaimedPanelRunCandidate(k);
+  }
+
+  function claimPanelRunCandidate(k, token) {
+    const candidate = panelRunDispatchCandidates.get(k);
+    if (!candidate) return;
+    candidate.claimed = true;
+    detachPanelRunCandidate(k, token);
+  }
+
+  function finalizePanelRunDispatchReceipt(token) {
+    const dispatch = panelRunDispatches.get(token);
+    if (!dispatch || !dispatch.receiptSeen) return;
+    dispatch.acceptsCandidates = false;
+    for (const candidate of [...dispatch.candidates]) {
+      detachPanelRunCandidate(candidate, token);
+    }
+  }
+
+  function releaseUnclaimedPanelRunCandidatesFor(token) {
+    finalizePanelRunDispatchReceipt(token);
+    const dispatch = panelRunDispatches.get(token);
+    // Once queuePrompt has settled, an authoritative receipt closes this
+    // token's ambiguity window. Keep the microtask boundary above so a batch
+    // response can claim all of its prompt ids, then retire the token and its
+    // timers; late lifecycle for a known prompt is fenced by its completion key.
+    if (dispatch && !dispatch.holdsUnkeyedCompletions) expirePanelRunDispatch(token);
+  }
+
+  function scheduleUnclaimedPanelRunCandidateRelease(token) {
+    if (!token || panelRunCandidateReleaseScheduled.has(token)) return;
+    panelRunCandidateReleaseScheduled.add(token);
+    const release = () => {
+      panelRunCandidateReleaseScheduled.delete(token);
+      releaseUnclaimedPanelRunCandidatesFor(token);
+    };
+    if (typeof queueMicrotask === "function") queueMicrotask(release);
+    else Promise.resolve().then(release);
+  }
+
+  function expirePanelRunDispatch(token) {
+    const dispatch = panelRunDispatches.get(token);
+    if (!dispatch) return;
+    if (dispatch.holdTimer != null) clearTimer(dispatch.holdTimer);
+    if (dispatch.graceTimer != null) clearTimer(dispatch.graceTimer);
+    panelRunDispatches.delete(token);
+    for (const candidate of [...dispatch.candidates]) {
+      detachPanelRunCandidate(candidate, token);
+    }
+    releaseHeldUnkeyedCompletions();
+  }
+
+  function expirePanelRunDispatchHold(token) {
+    const dispatch = panelRunDispatches.get(token);
+    if (!dispatch || dispatch.holdExpired) return;
+    dispatch.holdExpired = true;
+    dispatch.holdsUnkeyedCompletions = false;
+    // A response can arrive after the 30-second hold. Keep accepting late
+    // lifecycle ids only in this token's receipt-grace window so its exact
+    // receipt can still distinguish panel output from canvas output.
+    dispatch.acceptsCandidates = !dispatch.receiptSeen;
+    dispatch.holdTimer = null;
+    if (dispatch.receiptSeen) {
+      finalizePanelRunDispatchReceipt(token);
+      expirePanelRunDispatch(token);
+      return;
+    }
+    const graceMs = Math.max(0, dispatch.holdExpiresAt + PANEL_RUN_DISPATCH_RECEIPT_GRACE_MS - now());
+    dispatch.graceTimer = setTimer(() => expirePanelRunDispatch(token), graceMs);
+    releaseHeldUnkeyedCompletions();
+  }
+
   function releaseHeldUnkeyedCompletions() {
-    if (panelRunDispatches.size) return;
+    if (hasOpenPanelRunDispatches()) return;
     for (const [k, payload] of [...terminalNoKeyCompletion]) {
       releaseUnkeyedCompletion(k, payload);
     }
   }
 
+  function trimPanelRunDispatchCandidates() {
+    const cutoff = now() - PANEL_RUN_DISPATCH_CANDIDATE_TTL_MS;
+    for (const [k, candidate] of panelRunDispatchCandidates) {
+      if (candidate.at >= cutoff) continue;
+      releaseUnclaimedPanelRunCandidate(k);
+    }
+    while (panelRunDispatchCandidates.size > MAX_PANEL_RUN_DISPATCH_CANDIDATES) {
+      const oldest = panelRunDispatchCandidates.keys().next().value;
+      releaseUnclaimedPanelRunCandidate(oldest);
+    }
+  }
+
   function notePanelRunLifecycle(k) {
     if (k === NO_PROMPT_KEY) return;
-    if (panelRunDispatches.size || panelRunLateCapture) {
-      panelRunCompletionKeys.add(k);
-      if (!panelRunDispatches.size) panelRunLateCapture = false;
+    // Once the exact receipt or terminal replay is known, this prompt is already
+    // fenced by its own keyed state. It must not be reclassified as a candidate
+    // for a later overlapping dispatch.
+    if (panelRunAwaitsAuthoritativeCompletion(k) || panelRunCompletionKeys.has(k)) return;
+    const openDispatches = [...panelRunDispatches.entries()].filter(([, dispatch]) => dispatch.acceptsCandidates);
+    if (!openDispatches.length) return;
+    let candidate = panelRunDispatchCandidates.get(k);
+    if (!candidate) {
+      candidate = { tokens: new Set(), claimed: false, at: now() };
+      panelRunDispatchCandidates.set(k, candidate);
     }
+    for (const [token, dispatch] of openDispatches) {
+      candidate.tokens.add(token);
+      dispatch.candidates.add(k);
+    }
+    trimPanelRunDispatchCandidates();
   }
 
   function completionMetadataSnapshot() {
@@ -738,12 +920,23 @@ export function createRunCompletionTracker({
       const b = buffers.get(k);
       if (!b) return;
       b.timer = null;
-      if (active.has(k)) {
+      // A panel_run can receive its first `executed` websocket frame before the
+      // `/prompt` response registers the prompt id. While that dispatch hold is
+      // open, this key is only a provisional candidate; do not let that
+      // response-order race turn the first output into a completion (#365).
+      const panelRunDispatchPending = panelRunDispatchCandidates.has(k);
+      if (active.has(k) || panelRunAwaitsAuthoritativeCompletion(k) || panelRunDispatchPending) {
         // The prompt is (still) running per ComfyUI — NEVER flush a partial batch
-        // (#293/#200). Re-arm a bounded number of times purely to cap timer churn,
-        // then stop and wait for the authoritative end signal (success / queue
-        // idle / next run). A legitimately long run is completed there, in full.
-        if (b.rearms < maxRearms) {
+        // (#293/#200). A panel_run prompt is also fenced here even when both
+        // lifecycle-start frames were lost: its prompt_id was accepted by
+        // ComfyUI, and the run must wait for execution_success or /history rather
+        // than letting the first executed payload become a premature completion
+        // (#365). Re-arm only an actively observed run, purely to cap timer churn;
+        // a known panel_run with no active signal retains its buffer for the
+        // authoritative end/reconcile path. Re-arm only while an observed run or
+        // the bounded pre-receipt dispatch hold is still live; once that hold ends,
+        // the existing orphan fallback may make its best-effort delivery.
+        if ((active.has(k) || panelRunDispatchPending) && b.rearms < maxRearms) {
           b.rearms += 1;
           arm(k);
         }
@@ -816,7 +1009,7 @@ export function createRunCompletionTracker({
     };
     if (
       !hasCompletionKey &&
-      (panelRunDispatches.size || panelRunCompletionKeys.has(k)) &&
+      panelRunHandoffPending(k) &&
       k !== NO_PROMPT_KEY
     ) {
       // Do not retire this as an ordinary canvas completion while a panel_run
@@ -828,7 +1021,7 @@ export function createRunCompletionTracker({
       notifyTerminalCompletionStateChange();
       // Once the bounded hold has expired, release the unkeyed best-effort
       // frame immediately but retain the terminal record for keyed replay.
-      if (!panelRunDispatches.size) releaseUnkeyedCompletion(k, payload);
+      if (!hasOpenPanelRunDispatches()) releaseUnkeyedCompletion(k, payload);
       return;
     }
     markTerminal(k);
@@ -1090,6 +1283,7 @@ export function createRunCompletionTracker({
     liveReplays.delete(k);
     clearCompletionRecords(k);
     panelRunCompletionKeys.delete(k);
+    forgetPanelRunCandidate(k);
     terminalNoKeyCompletion.delete(k);
     terminalNoKeyFlushed.delete(k);
     notifyTerminalCompletionStateChange();
@@ -1178,7 +1372,14 @@ export function createRunCompletionTracker({
       // delivered, so a LATER reconcile for that prompt is correctly a no-op; the
       // drop-with-reconnect case (where the next run does NOT start before the
       // reconnect) is still recovered in full by reconcile.
-      for (const other of [...buffers.keys()]) flush(other);
+      for (const other of [...buffers.keys()]) {
+        // A keyed panel_run is still owed its full batch even when another
+        // prompt starts first. The sequential sweep remains the legacy salvage
+        // path for canvas/orphan buffers, but it must not turn panel prompt A's
+        // first preview into completion merely because prompt B started (#365).
+        if (panelRunAwaitsAuthoritativeCompletion(other) || panelRunDispatchCandidates.has(other)) continue;
+        flush(other);
+      }
       active.clear();
       markStart(id);
       active.add(k);
@@ -1345,6 +1546,7 @@ export function createRunCompletionTracker({
       // this to suppress a duplicate run_error frame (codex P1).
       if (!terminal.has(k)) {
         panelRunCompletionKeys.delete(k);
+        forgetPanelRunCandidate(k);
         terminalNoKeyCompletion.delete(k);
         terminalNoKeyFlushed.delete(k);
         notifyTerminalCompletionStateChange();
@@ -1383,7 +1585,8 @@ export function createRunCompletionTracker({
         // comes, the next run's sequential flush in onExecutionStart clears it (and
         // there the refs ARE recoverable — that run reconciles from /history), and
         // execution_success itself deletes it via flush()'s empty-batch path.
-        if (!active.has(k) && hasBufferedMedia(k)) flush(k);
+        const panelRunDispatchPending = panelRunDispatchCandidates.has(k);
+        if (!active.has(k) && !panelRunAwaitsAuthoritativeCompletion(k) && !panelRunDispatchPending && hasBufferedMedia(k)) flush(k);
       }
     },
 
@@ -1423,6 +1626,20 @@ export function createRunCompletionTracker({
       const k = key(id);
       trackPending(id);
       let nextKey = null;
+      const dispatch = dispatchToken ? panelRunDispatches.get(dispatchToken) : null;
+      const isDispatchReceipt = !!dispatch && !dispatch.expired;
+      if (isDispatchReceipt) {
+        // The response names a prompt owned by THIS dispatch. Mark only this
+        // token's receipt and claim only this id; candidates shared with an
+        // overlapping dispatch remain fenced until that other token resolves.
+        dispatch.receiptSeen = true;
+        claimPanelRunCandidate(k, dispatchToken);
+        // RegisterPromptId can call onQueued once per prompt in a batch. Defer
+        // this token's candidate cleanup one microtask so all ids in that
+        // response can claim their own candidates before the remaining ids are
+        // released.
+        scheduleUnclaimedPanelRunCandidateRelease(dispatchToken);
+      }
       // #356 Bug 2 — records that THIS run carried panel_run's wait-for-it promise.
       if (id != null) {
         panelQueued.add(k);
@@ -1443,10 +1660,6 @@ export function createRunCompletionTracker({
             notifyCompletionStateChange();
           }
         }
-      }
-      if (dispatchToken && panelRunDispatches.has(dispatchToken)) {
-        // Keep the dispatch hold until its bounded timer expires. A batch may
-        // produce more than one prompt id, and a later id can still be waiting.
       }
       const lateMedia = id != null ? terminalNoKeyCompletion.get(k) : null;
       if (lateMedia) {
@@ -1527,6 +1740,7 @@ export function createRunCompletionTracker({
       terminalNoKeyCompletion.delete(key(id));
       terminalNoKeyFlushed.delete(key(id));
       panelRunCompletionKeys.delete(key(id));
+      forgetPanelRunCandidate(key(id));
       notifyCompletionStateChange();
       notifyTerminalCompletionStateChange();
       markDelivered(id);
@@ -1550,6 +1764,7 @@ export function createRunCompletionTracker({
       terminalNoKeyCompletion.delete(k);
       terminalNoKeyFlushed.delete(k);
       panelRunCompletionKeys.delete(k);
+      forgetPanelRunCandidate(k);
       notifyCompletionStateChange();
       notifyTerminalCompletionStateChange();
       markDelivered(k);
@@ -1594,21 +1809,39 @@ export function createRunCompletionTracker({
     /** Mark a panel_run dispatch as active before queuePrompt starts. */
     beginPanelRun() {
       const token = `panel-run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-      const timer = setTimer(() => {
-        panelRunDispatches.delete(token);
-        if (!panelRunDispatches.size) panelRunLateCapture = true;
-        releaseHeldUnkeyedCompletions();
-      }, 30_000);
-      panelRunDispatches.set(token, timer);
+      while (panelRunDispatches.size >= MAX_PANEL_RUN_DISPATCHES) {
+        const oldest = panelRunDispatches.keys().next().value;
+        if (oldest == null) break;
+        expirePanelRunDispatch(oldest);
+      }
+      const dispatch = {
+        acceptsCandidates: true,
+        holdsUnkeyedCompletions: true,
+        receiptSeen: false,
+        holdExpired: false,
+        holdExpiresAt: now() + PANEL_RUN_DISPATCH_HOLD_MS,
+        holdTimer: null,
+        graceTimer: null,
+        candidates: new Set(),
+      };
+      dispatch.holdTimer = setTimer(
+        () => expirePanelRunDispatchHold(token),
+        PANEL_RUN_DISPATCH_HOLD_MS,
+      );
+      panelRunDispatches.set(token, dispatch);
       return token;
     },
 
     /** End a known dispatch without disturbing prompt ids already registered. */
     endPanelRun(token) {
-      if (!token || !panelRunDispatches.has(token)) return;
-      const timer = panelRunDispatches.get(token);
-      if (timer != null) clearTimer(timer);
-      panelRunDispatches.delete(token);
+      const dispatch = token ? panelRunDispatches.get(token) : null;
+      if (!dispatch) return;
+      // Stop admitting new lifecycle ids once queuePrompt has settled, but keep
+      // this token's candidates and receipt window until its original bounded
+      // hold expires. A delayed response may still bind the exact prompt.
+      dispatch.acceptsCandidates = false;
+      dispatch.holdsUnkeyedCompletions = false;
+      if (dispatch.receiptSeen) finalizePanelRunDispatchReceipt(token);
       releaseHeldUnkeyedCompletions();
     },
 
@@ -1671,11 +1904,13 @@ export function createRunCompletionTracker({
     },
 
     dispose() {
-      for (const timer of panelRunDispatches.values()) {
-        try { clearTimer(timer); } catch {}
+      for (const dispatch of panelRunDispatches.values()) {
+        try { if (dispatch.holdTimer != null) clearTimer(dispatch.holdTimer); } catch {}
+        try { if (dispatch.graceTimer != null) clearTimer(dispatch.graceTimer); } catch {}
       }
       panelRunDispatches.clear();
-      panelRunLateCapture = false;
+      panelRunDispatchCandidates.clear();
+      panelRunCandidateReleaseScheduled.clear();
     },
 
     /**
@@ -1837,5 +2072,7 @@ export function createRunCompletionTracker({
     _terminalNoKeyCompletion: terminalNoKeyCompletion,
     _terminalNoKeyFlushed: terminalNoKeyFlushed,
     _panelRunCompletionKeys: panelRunCompletionKeys,
+    _panelRunDispatches: panelRunDispatches,
+    _panelRunDispatchCandidates: panelRunDispatchCandidates,
   };
 }
