@@ -739,7 +739,7 @@ test("every connection status token has a translated label", () => {
   // Scoped to the onStatus handler, not the whole file, for two reasons: a whole-file
   // doesNotMatch dumps 1.6MB into the failure output, and a COMMENT explaining the rejected
   // shape would trip it — which is exactly what happened on the first run.
-  const onStatusAt = src.indexOf("onStatus(state, socketId)");
+  const onStatusAt = src.indexOf("onStatus(state, socketId, bridgeScope)");
   assert.notEqual(onStatusAt, -1, "onStatus handler must exist");
   const handler = src.slice(onStatusAt, onStatusAt + 1400).replace(/^\s*\/\/.*$/gm, "");
   assert.doesNotMatch(handler, /tr\(\s*`/, "status keys must be literal, not assembled at runtime");

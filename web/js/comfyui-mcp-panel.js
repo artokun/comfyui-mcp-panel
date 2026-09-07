@@ -831,6 +831,7 @@ import {
   describeUndeliveredReply,
   createLostReplyJournal,
   isReplayable,
+  sameBridgeSession,
   pruneAttempts,
   shouldReRegister,
   reRegisterExhaustedHint,
@@ -28907,11 +28908,14 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // `onboard` actually lives. This used to reach for it from here — a sibling scope — so it
     // threw ReferenceError on every connect, and the try/catch that was meant to guard "the
     // card isn't built yet" swallowed that instead. The card simply never auto-hid.
-    // #952 — the SOCKET this status is about. `"connected"` re-fires on every
-    // re-handshake, so the string alone cannot distinguish a replacement connection
-    // from the live one saying hello again; the id can, and a consumer that ignores
-    // the argument behaves exactly as before.
-    onStatus(s, sock?.__cmcpSocketId ?? null);
+    // #2218 — carry the bridge identity this status is about. `"connected"` re-fires
+    // on every re-handshake, and a replacement WebSocket within one orchestrator
+    // session must not withdraw a still-answerable card. The URL + server epoch pair
+    // distinguishes that from a different endpoint or orchestrator process.
+    onStatus(s, sock?.__cmcpSocketId ?? null, {
+      url: sock?.__cmcpBridgeUrl ?? null,
+      epoch: sock?.__cmcpBridgeEpoch,
+    });
   }
   // FIX 1/2 — STEADY status + cold-start patience. While we're actively (auto)
   // reconnecting we hold the pill on a steady "connecting"; a terminal
@@ -29139,7 +29143,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
     // #640 — advisory frame; an unestablished route omits the field rather than
     // naming a route this tab has not established. Read ONCE: two reads could
     // straddle the hello that establishes the identity. The replay below is the
-    // load-bearing delivery and is socket-scoped either way.
+    // load-bearing delivery is delivered on the target socket only after the
+    // target URL+epoch has been proven to be the same bridge session.
     const lostRepliesRouteId = bridgeRouteId();
     try {
       // Registry workaround (#1854/#1886): the python_network_operations rule family
@@ -29167,8 +29172,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // it was produced for; after a backend switch or a Bridge-URL edit the current socket
       // is a DIFFERENT process, and volunteering another session's result to it is a leak,
       // not a recovery. Such an entry is also meaningless there — its rid is unknown — so
-      // it is dropped rather than carried forever. (Sensitive results are additionally
-      // redacted at journal time and never travel at all.)
+      // it is dropped rather than carried forever. Sensitive results keep only a redacted
+      // public entry; the private raw frame is selected by replayReply only after the same
+      // URL + epoch check above passes.
       // Replayable = SAME bridge AND SAME session AND recent enough (codex, #694).
       // A bridge is identified by its URL, and URL equality is ENDPOINT identity,
       // not SESSION identity — a newly started orchestrator on the same address
@@ -29178,9 +29184,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // predecessor session's entry fails the check and is dropped. A legacy
       // orchestrator sends no epoch — absent on both sides compares equal, and
       // the residual bounds below are exactly the pre-epoch ones: sensitive
-      // results never enter the journal at all, this runs only AFTER a real
+      // results are never exposed by the public journal, this runs only AFTER a real
       // handshake, and stale entries age out here.
-      if (!isReplayable(entry, { now, targetUrl, targetEpoch })) {
+      if (!lostReplies.canReplay(entry, { now, targetUrl, targetEpoch })) {
         dropped++;
         continue;
       }
@@ -29196,7 +29202,7 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // receiver (Illegal invocation), and this codebase passes duck-typed sockets --
         // 10 wiring tests do exactly that. REVERT to the plain dotted form once the rule
         // stops scanning JS.
-        target["send"](JSON.stringify(entry.reply));
+        target["send"](JSON.stringify(lostReplies.replayReply(entry, { now, targetUrl, targetEpoch })));
         sent++;
       } catch {
         keep.push(entry);
@@ -29648,12 +29654,16 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // chat (UI scope) and block on the user's pick. The chosen string
             // becomes the tool result the agent receives.
             if (!onAsk) throw new Error("This panel build can't display questions.");
-            // #952 — the card is tied to the socket that ASKED, taken from the frame's own
-            // socket rather than from whatever the UI currently believes is live. A command
+            // #952/#2218 — the card is tied to the bridge session that ASKED, taken from
+            // the frame's own URL+epoch scope rather than from whatever the UI currently believes is live. A command
             // is accepted before the handshake, and the open status that would have told the
             // UI about this socket is suppressed once the patience window has been given up
             // on — so a UI-side belief can be stale exactly when it matters (codex r2).
-            result = await onAsk(msg, thisSock.__cmcpSocketId ?? null);
+            result = await onAsk(msg, {
+              socketId: thisSock.__cmcpSocketId ?? null,
+              url: thisSock.__cmcpBridgeUrl ?? socketUrl,
+              epoch: thisSock.__cmcpBridgeEpoch,
+            });
             // #952 — a card withdrawn by a reconnect resolves with a SENTINEL rather
             // than staying pending forever. Thrown, so the ordinary error path builds
             // the reply AND `settleRid` runs: without this the ledger keeps an
@@ -29666,7 +29676,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
             // orchestrator (which writes it to config) and is the tool's reply;
             // it is never surfaced to the agent's context or recorded to history.
             if (!onSecret) throw new Error("This panel build can't collect secrets.");
-            result = await onSecret(msg, thisSock.__cmcpSocketId ?? null);
+            result = await onSecret(msg, {
+              socketId: thisSock.__cmcpSocketId ?? null,
+              url: thisSock.__cmcpBridgeUrl ?? socketUrl,
+              epoch: thisSock.__cmcpBridgeEpoch,
+            });
             // #952 — same withdrawal, and the failure carries NO payload, so the
             // undeliverable-reply path has nothing of the user's to redact.
             if (isAbandonedInteractive(result)) throw new Error(abandonedInteractiveError(msg.cmd));
@@ -38107,7 +38121,18 @@ function buildPanel() {
    * An always-present "Other…" field lets the user answer freely. Returns the
    * chosen string (comma-joined for multi-select) — the agent's tool result.
    */
-  function paintQuestion(msg, paintedOnSocket = null) {
+  function normalizeInteractiveCardScope(scope) {
+    if (!scope || typeof scope !== "object") return null;
+    return {
+      socketId: scope.socketId ?? null,
+      url: typeof scope.url === "string" && scope.url ? scope.url : null,
+      epoch:
+        (typeof scope.epoch === "string" && scope.epoch) ||
+        (typeof scope.epoch === "number" && Number.isFinite(scope.epoch) ? scope.epoch : undefined),
+    };
+  }
+
+  function paintQuestion(msg, paintedOnScope = null) {
     clearEmpty();
     const opts = Array.isArray(msg.options) ? msg.options : [];
     const multi = !!msg.multi_select;
@@ -38275,17 +38300,15 @@ function buildPanel() {
       },
       schedule: (fn, ms) => setTimeout(fn, ms),
     });
-    // #952 — REGISTER THE CARD AGAINST THE CONNECTION THAT PAINTED IT. A reply of this
-    // kind is deliberately not replayed across a reconnect, so once this connection is
-    // replaced the card cannot deliver an answer to anyone — while still looking exactly
-    // as clickable as a newer card asking the same thing. The orchestrator's own message
-    // has to warn "the user may see two … tell them which one to answer"; the panel is
-    // the side that can just say it.
-    // #952 — tracked ONLY when a command painted it. A card with no command behind it
+    // #2218 — register the card against the command's bridge URL + epoch. A same-session
+    // reconnect preserves the live card and its pending answer; an unproven or mismatched
+    // session retires it fail-closed. A card with no command behind it
     // has no socket to be orphaned by, and retiring it would disable something that
     // still works (codex r3).
-    const unregister = paintedOnSocket == null ? () => {} : registerInteractiveCard({
-      paintedOnSocket,
+    const cardScope = normalizeInteractiveCardScope(paintedOnScope);
+    const unregister = cardScope == null ? () => {} : registerInteractiveCard({
+      paintedOnSocketId: cardScope.socketId,
+      paintedOnScope: cardScope,
       retire: () =>
         retireInteractiveCard(card, {
           alreadyAnswered: () => done,
@@ -38328,35 +38351,66 @@ function buildPanel() {
   }
 
   /**
-   * #952 — cards painted on a connection that has since been replaced.
+   * #2218 — cards painted in a bridge session that has since been replaced.
    *
-   * KEYED ON THE SOCKET, not on the status string (codex). `"connected"` is emitted on
+   * KEYED ON THE BRIDGE SESSION, not on the socket or status string (codex). `"connected"` is emitted on
    * every RE-HANDSHAKE — each `models` frame calls `markConnected`, and a workflow change
    * re-hellos the LIVE socket — so counting those would retire question cards that are
    * still perfectly answerable, which is worse than the duplicate this fixes. The client
-   * mints an id per WebSocket and hands it to `onStatus`; a card records the id that was
-   * live when it was painted, and only a DIFFERENT id retires it.
+   * stamps each socket with the bridge URL and server-issued session epoch; a card records
+   * that pair when it was painted, and only a DIFFERENT or unproven pair retires it.
    *
-   * Deliberately NOT resolving the card's promise. The command that painted it already
-   * failed with an unknown outcome on the socket that dropped; resolving here would send
-   * an answer nowhere, and the panel's own rule is that a reply of this kind does not
-   * cross a reconnect. The card stops LOOKING answerable, and says why.
+   * Deliberately NOT resolving the card's promise on withdrawal. A same-session reconnect
+   * leaves it pending so the original answer can be delivered through the journal; a
+   * different or unproven session must stop LOOKING answerable and abandon the command.
    */
-  /** The socket id the UI currently believes it is talking to (#952). */
-  let liveSocketId = null;
   const liveInteractiveCards = new Set();
 
   function registerInteractiveCard(entry) {
-    // Every entry names the socket its COMMAND arrived on; a card with no command
-    // behind it is never registered, so there is no belief-based fallback here.
-    const record = { paintedOnSocket: null, ...entry };
+    // Every command-backed entry names the bridge session and the socket that supplied
+    // it. The socket id is only a pre-handshake binding aid; retirement compares the
+    // proven URL + epoch pair, never the WebSocket instance.
+    const record = { paintedOnSocketId: null, paintedOnScope: null, ...entry };
     liveInteractiveCards.add(record);
     return () => liveInteractiveCards.delete(record);
   }
 
-  function retireInteractiveCardsFromPreviousSockets() {
+  /**
+   * A command can arrive on a replacement socket before that socket's handshake. Its
+   * epoch is therefore unknown, so painting another command-backed card while a card
+   * from this URL is still live would create two controls for one pending interaction.
+   * Refuse that unproven duplicate; the original card remains available until the new
+   * socket proves whether it is the same session or a different one.
+   */
+  function interactiveCardWouldDuplicate(scope) {
+    const url = scope && typeof scope.url === "string" && scope.url ? scope.url : null;
+    const epochKnown =
+      (typeof scope?.epoch === "string" && scope.epoch.length > 0) ||
+      (typeof scope?.epoch === "number" && Number.isFinite(scope.epoch));
+    if (epochKnown) return false;
+    return [...liveInteractiveCards].some((record) => {
+      const existingUrl = record.paintedOnScope?.url;
+      return existingUrl && (!url || existingUrl === url);
+    });
+  }
+
+  function bindInteractiveCardsToHandshake(socketId, bridgeScope) {
+    if (socketId == null || !bridgeScope || bridgeScope.epoch == null) return;
+    for (const record of liveInteractiveCards) {
+      if (record.paintedOnSocketId !== socketId) continue;
+      if (record.paintedOnScope?.epoch != null) continue;
+      record.paintedOnScope = { ...bridgeScope, socketId };
+    }
+  }
+
+  function retireInteractiveCardsFromPreviousSessions(bridgeScope) {
     for (const record of [...liveInteractiveCards]) {
-      if (record.paintedOnSocket === liveSocketId) continue;
+      if (sameBridgeSession({
+        sourceUrl: record.paintedOnScope?.url,
+        sourceEpoch: record.paintedOnScope?.epoch,
+        targetUrl: bridgeScope?.url,
+        targetEpoch: bridgeScope?.epoch,
+      })) continue;
       liveInteractiveCards.delete(record);
       // RETIRE FIRST, then abandon — and in SEPARATE try blocks, so neither step can
       // be skipped by the other throwing. Order matters: retirement asks the card
@@ -38425,7 +38479,7 @@ function buildPanel() {
    * over the bridge to the orchestrator (which writes it to config); it never
    * enters the agent's context.
    */
-  function paintSecret(msg, paintedOnSocket = null) {
+  function paintSecret(msg, paintedOnScope = null) {
     clearEmpty();
     const card = document.createElement("div");
     card.className = "cmcp-card cmcp-secret";
@@ -38601,8 +38655,10 @@ function buildPanel() {
     // reconnect it can still send its set_secret on the current socket, so retiring it
     // would disable a working control and tell the user to wait for a request that is
     // never coming (codex r3).
-    const unregisterSecret = paintedOnSocket == null ? () => {} : registerInteractiveCard({
-      paintedOnSocket,
+    const cardScope = normalizeInteractiveCardScope(paintedOnScope);
+    const unregisterSecret = cardScope == null ? () => {} : registerInteractiveCard({
+      paintedOnSocketId: cardScope.socketId,
+      paintedOnScope: cardScope,
       retire: () =>
         retireInteractiveCard(card, {
           alreadyAnswered: () => done,
@@ -40734,7 +40790,7 @@ function buildPanel() {
   // here; the `pair_url`/`pair_error` reply consumes it (mirrors pendingSetSecret).
   let pendingPair = null;
   const client = createBridgeClient({
-    onStatus(state, socketId) {
+    onStatus(state, socketId, bridgeScope) {
       // Translate at the RENDER boundary, never at the source. `state` is a state TOKEN —
       // emitStatus compares it (`s !== "connected"`) and the comment below keys behaviour on
       // it — so translating `emitStatus("connected")` would make those comparisons
@@ -40757,20 +40813,18 @@ function buildPanel() {
       // emitStatus, which cannot see `onboard`. try/catch still guards the genuine case the
       // original comment described: a status arriving before the card is built.
       if (state === "connected") { try { onboard.hidden = true; } catch {} }
-      // #952 — a card painted on a connection that has since been REPLACED can no longer
-      // deliver an answer. The trigger is the socket's identity, not the status string:
-      // `"connected"` re-fires on every re-handshake (each `models` frame, and a workflow
-      // change re-hellos the live socket), so keying on it would retire cards that are
-      // still perfectly answerable (codex).
-      // ADOPT AS SOON AS THE SOCKET EXISTS, RETIRE ONLY ONCE IT HAS HANDSHAKEN (codex r2).
-      // A command frame is accepted before the handshake, so an interactive card CAN be
-      // painted on a socket whose id the UI has not adopted yet — and it would then look
-      // like it belonged to the PREVIOUS connection and be retired the moment this one
-      // finished handshaking, killing a card that is perfectly live. Adoption happens on
-      // the open status that carries the new id; the sweep waits for `connected`, which is
-      // the point at which the previous connection is definitively replaced.
-      if (socketId != null && socketId !== liveSocketId) liveSocketId = socketId;
-      if (state === "connected") retireInteractiveCardsFromPreviousSockets();
+      // #2218 — a card painted on a replacement WebSocket remains answerable when the
+      // replacement proves the SAME bridge URL + server-issued session epoch. A status
+      // string or socket id cannot make that distinction: `"connected"` re-fires on
+      // every models handshake, and a same-session reconnect mints a new socket id.
+      // ADOPT THE SESSION ONLY AT HANDSHAKE. A command frame is accepted before the
+      // handshake, so bind that card's missing epoch to its own socket when connected;
+      // an unknown or mismatched pair still retires and abandons it fail-closed.
+      const connectedScope = normalizeInteractiveCardScope(bridgeScope);
+      if (state === "connected") {
+        bindInteractiveCardsToHandshake(socketId, connectedScope);
+        retireInteractiveCardsFromPreviousSessions(connectedScope);
+      }
       dot.className = "cmcp-dot" + (state === "connected" ? " connected" : state === "connecting" ? " connecting" : "");
       // Connection status does NOT drive this box's visibility. It's a
       // dropdown: the user opens it and the user closes it (trigger, click
@@ -40907,7 +40961,7 @@ function buildPanel() {
     },
     // The agent called panel_ask — render a question card and resolve with the
     // user's pick. Keep the working indicator pinned below it while we wait.
-    onAsk(msg, socketId) {
+    onAsk(msg, cardScope) {
       // Fence FIRST: a card from a turn this tab no longer owns must not paint,
       // and must not revive the working indicator on its way past either.
       //
@@ -40928,7 +40982,8 @@ function buildPanel() {
       // whose `turn:working` is discarded by the stale-working guard no longer
       // reaches the classifier with a null owner.
       fenceInteractiveCard("ask_user");
-      const p = paintQuestion(msg, socketId);
+      if (interactiveCardWouldDuplicate(cardScope)) return Promise.resolve(INTERACTIVE_ABANDONED);
+      const p = paintQuestion(msg, cardScope);
       bumpThinking();
       noteActivity(); // a panel_ask frame is real turn activity → reset the clock
       return p;
@@ -41163,7 +41218,7 @@ function buildPanel() {
       setThinkingTokens(tokens);
     },
     // The agent called panel_request_secret — collect a token securely.
-    onSecret(msg, socketId) {
+    onSecret(msg, cardScope) {
       // If this secure request was kicked off from a Settings "Set … token" button,
       // record a (non-secret) "set at" marker once a non-empty value is submitted so
       // the Settings indicator can show set/not-set. Only the timestamp is stored.
@@ -41177,7 +41232,8 @@ function buildPanel() {
       // no longer owns must not get a masked input painted into the conversation
       // that happens to be on screen — see lib/interactive-card-fence.js.
       fenceInteractiveCard("request_secret");
-      const p = paintSecret(msg, socketId);
+      if (interactiveCardWouldDuplicate(cardScope)) return Promise.resolve(INTERACTIVE_ABANDONED);
+      const p = paintSecret(msg, cardScope);
       bumpThinking();
       if (req) {
         p.then((value) => {

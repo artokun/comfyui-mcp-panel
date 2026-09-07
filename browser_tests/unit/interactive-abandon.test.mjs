@@ -11,11 +11,10 @@
  *
  * What is real is underneath it. `ask_user` / `request_secret` are the only commands whose
  * executor blocks on a human, and retirement (0.13.0) deliberately does not resolve the
- * card's promise. So the executor stays suspended forever, `settleRid` never runs, and the
- * ledger keeps an IN-FLIGHT entry — which is never evicted, by design, because dropping an
- * unsettled command would let its replay double-apply. Two consequences, both tested here:
- * the entry is unreclaimable, and a redelivery of that rid awaits a promise that can never
- * resolve, so the panel answers NOTHING at all.
+ * card's promise. On a different or unproven bridge session the panel therefore abandons
+ * the card, settles the command with a payload-free sentinel failure, and never forwards
+ * the user's input. A same URL + epoch reconnect is the narrow exception: its private
+ * journal entry may replay once to the proven same session, without painting a second card.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -191,19 +190,17 @@ test("#952 (codex ×2) the claim is the LEDGER — not a caller-visible recovery
   }
 });
 
-test("#952 (codex r4) the trigger is a REPLACEMENT connection, not a bare disconnect", () => {
-  // The header used to say the card is retired "when the connection that asked drops".
-  // The sweep runs from a `connected` status carrying a different socket id — so a socket
-  // that simply drops retires nothing, and the card stays live until something replaces
-  // it. Documenting the wrong trigger would have a reader expect an abandonment reply at
-  // a moment when none is produced.
+test("#2218: the trigger is a replacement session, not a bare disconnect", () => {
+  // A socket drop alone does not prove that the orchestrator session changed. The sweep
+  // runs only from a connected handshake and compares the URL + epoch pair, so a same-
+  // session reconnect keeps its card while a different or unproven session withdraws it.
   const src = readFileSync(new URL("../../web/js/lib/interactive-abandon.js", import.meta.url), "utf8");
   assert.match(src, /a bare disconnect retires nothing/, "the trigger is stated correctly");
   const panel = readFileSync(PANEL, "utf8");
   assert.match(
     panel,
-    /if \(state === "connected"\) retireInteractiveCardsFromPreviousSockets\(\);/,
-    "and that is what the wiring does",
+    /if \(state === "connected"\) \{[\s\S]*?retireInteractiveCardsFromPreviousSessions\(connectedScope\);/,
+    "the wiring sweeps only after a connected session handshake",
   );
 });
 
@@ -220,7 +217,7 @@ test("#952 (codex r3) the note does not claim a card that may not be on screen",
 
 test("#952 source: retirement disables the card AND ends its command, in that order", () => {
   const src = readFileSync(PANEL, "utf8");
-  const start = src.indexOf("function retireInteractiveCardsFromPreviousSockets()");
+  const start = src.indexOf("function retireInteractiveCardsFromPreviousSessions(");
   assert.ok(start > 0, "the sweep exists");
   const body = src.slice(start, src.indexOf("\n  }", start));
   const retireAt = body.indexOf("record.retire?.()");
@@ -254,7 +251,7 @@ test("#952 source: the abandon flag is NOT the answered flag", () => {
 
 test("#952 source: both interactive executors recognize the sentinel and throw", () => {
   const src = readFileSync(PANEL, "utf8");
-  for (const call of ["onAsk(msg, thisSock.__cmcpSocketId", "onSecret(msg, thisSock.__cmcpSocketId"]) {
+  for (const call of ["onAsk(msg, {", "onSecret(msg, {"]) {
     const at = src.indexOf(call);
     assert.ok(at > 0, call);
     const after = src.slice(at, at + 900);

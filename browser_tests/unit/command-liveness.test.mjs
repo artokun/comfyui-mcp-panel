@@ -32,6 +32,7 @@ import {
   describeUndeliveredReply,
   createLostReplyJournal,
   isReplayable,
+  sameBridgeSession,
   REPLAY_MAX_AGE_MS,
   SENSITIVE_RESULT_CMDS,
   redactSensitiveReply,
@@ -133,10 +134,10 @@ test("the journal keeps the EXACT reply frame (replayable verbatim) but omits it
   assert.deepEqual(j.summaries(), [{ rid: "abc", cmd: "workflow_open", ok: true, reason: "socket_closed", at: 7 }]);
 });
 
-test("codex R8: a SENSITIVE result is never journaled in the clear (it must not survive to a replay)", () => {
+test("codex R8: a SENSITIVE result is never exposed in the public journal", () => {
   // request_secret's result IS the pasted secret; ask_user's is whatever the user typed.
-  // A journaled raw frame is replayed on whatever socket is current later — which can be a
-  // DIFFERENT orchestrator after a backend switch — so the payload must not be kept at all.
+  // The public entry is replayed on whatever socket is current later — which can be a
+  // DIFFERENT orchestrator after a backend switch — so it must never contain the payload.
   for (const cmd of ["request_secret", "ask_user"]) {
     assert.ok(SENSITIVE_RESULT_CMDS.has(cmd), `${cmd} must be classified sensitive`);
     const j = createLostReplyJournal();
@@ -176,9 +177,10 @@ test("codex R8: replay never crosses a bridge change — entries for another bri
   const body = src.slice(start, src.indexOf("\n  }", start));
   assert.match(
     body,
-    /if \(!isReplayable\(entry, \{ now, targetUrl, targetEpoch \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
+    /if \(!lostReplies\.canReplay\(entry, \{ now, targetUrl, targetEpoch \}\)\) \{\s*\n\s*dropped\+\+;\s*\n\s*continue;/,
     "an outcome belonging to a previous bridge, session, or too old must never be volunteered",
   );
+  assert.match(body, /lostReplies\.replayReply\(entry, \{ now, targetUrl, targetEpoch \}\)/, "same-session sensitive frames use the guarded selector");
   assert.match(body, /lostReplies\.replace\(keep\)/, "only undeliverable-but-still-ours entries are retried");
   assert.match(body, /Discarded \$\{dropped\}/, "the user must be told what was discarded");
   // codex R9 — the comparison must use the SOCKET's own bridge, not the mutable current
@@ -242,6 +244,64 @@ test("#694: isReplayable demands the SAME session epoch — match replays, misma
     false,
     "an epoch-less entry must not replay to an epoch'd target",
   );
+});
+
+test("#2218: sensitive replies correlate once and replay raw only to the proven same session", () => {
+  const URL_A = "ws://127.0.0.1:9199";
+  const now = 1_000_000;
+  assert.equal(sameBridgeSession({ sourceUrl: URL_A, sourceEpoch: "e1", targetUrl: URL_A, targetEpoch: "e1" }), true);
+  assert.equal(sameBridgeSession({ sourceUrl: URL_A, sourceEpoch: 0, targetUrl: URL_A, targetEpoch: 0 }), true);
+  assert.equal(sameBridgeSession({ sourceUrl: URL_A, sourceEpoch: "e1", targetUrl: URL_A, targetEpoch: "e2" }), false);
+  assert.equal(sameBridgeSession({ sourceUrl: URL_A, sourceEpoch: "e1", targetUrl: "ws://other", targetEpoch: "e1" }), false);
+  assert.equal(sameBridgeSession({ sourceUrl: URL_A, sourceEpoch: "e1", targetUrl: URL_A }), false);
+  assert.equal(sameBridgeSession({ sourceUrl: URL_A, targetUrl: URL_A }), false);
+  assert.equal(sameBridgeSession({ sourceUrl: URL_A, sourceEpoch: NaN, targetUrl: URL_A, targetEpoch: NaN }), false);
+
+  for (const cmd of ["ask_user", "request_secret"]) {
+    const j = createLostReplyJournal();
+    const reply = { rid: `${cmd}-rid`, ok: true, result: "user-private-value" };
+    const entry = j.record({ reply, cmd, at: now - 1000, url: URL_A, epoch: "e1" });
+    const sameSession = j.replayReply(entry, { now, targetUrl: URL_A, targetEpoch: "e1" });
+    assert.deepEqual(sameSession, reply, `${cmd}: same-session replay preserves correlation and result`);
+    assert.equal(j.summaries({ now, targetUrl: URL_A, targetEpoch: "e1" })[0].ok, true, `${cmd}: status is not falsely pending`);
+
+    const mismatch = j.replayReply(entry, { now, targetUrl: URL_A, targetEpoch: "e2" });
+    assert.equal(mismatch.ok, false, `${cmd}: a restarted orchestrator gets a failure`);
+    assert.equal(mismatch.result, undefined, `${cmd}: the mismatch gets no private result`);
+    assert.equal(JSON.stringify(mismatch).includes("user-private-value"), false, `${cmd}: no value crosses the session fence`);
+    assert.deepEqual(j.summaries({ now, targetUrl: URL_A, targetEpoch: "e2" }), [], `${cmd}: mismatch is withdrawn, not advertised`);
+    assert.equal(j.replayReply(entry, { now, targetUrl: URL_A }), entry.reply, `${cmd}: an unknown epoch fails closed`);
+  }
+});
+
+test("#2218: an epoch-less sensitive reply is never replayable across a same-URL replacement", () => {
+  const URL_A = "ws://127.0.0.1:9199";
+  const now = 1_000_000;
+  const j = createLostReplyJournal();
+  const reply = { rid: "legacy-secret", ok: true, result: "user-private-value" };
+  const entry = j.record({ reply, cmd: "ask_user", at: now - 1000, url: URL_A });
+
+  assert.equal(j.canReplay(entry, { now, targetUrl: URL_A }), false);
+  assert.equal(j.replayReply(entry, { now, targetUrl: URL_A }).result, undefined);
+  assert.deepEqual(
+    j.summaries({ now, targetUrl: URL_A }),
+    [],
+    "an unproven replacement must not even advertise the sensitive outcome",
+  );
+
+  const failureJournal = createLostReplyJournal();
+  const failure = failureJournal.record({
+    reply: { rid: "safe-failure", ok: false, error: "question withdrawn" },
+    cmd: "request_secret",
+    at: now - 1000,
+    url: URL_A,
+  });
+  assert.equal(
+    failureJournal.canReplay(failure, { now, targetUrl: URL_A }),
+    false,
+    "even a payload-free sensitive failure needs a proven session",
+  );
+  assert.deepEqual(failureJournal.summaries({ now, targetUrl: URL_A }), []);
 });
 
 test("#694: the journal records the session epoch and summaries filter by it identically", () => {
