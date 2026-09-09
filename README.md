@@ -1,5 +1,11 @@
 # ComfyUI Agent Panel
 
+> [!IMPORTANT]
+> This project is no longer maintained.
+> ComfyUI now ships official agent and MCP tooling — Comfy Agent and Comfy MCP — built and supported by the Comfy-Org team with deeper integration than a community project can match. If you’re looking for an MCP server or AI agent for ComfyUI, use the official tooling.
+> This repo will remain public as a reference, but no new features, bug fixes, or dependency updates will be made. Issues and pull requests are closed.
+> Thanks to everyone who used, starred, forked, and contributed to this project. It was a good run. :rocket:
+
 > ### 📦 On ComfyUI-Manager & the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-agent-panel) as `comfyui-agent-panel`
 > The polished public release — native ComfyUI design system, live activity cards for every
 > agent edit, and multi-tab support. Search **`comfyui-agent-panel`** in ComfyUI-Manager to install,
