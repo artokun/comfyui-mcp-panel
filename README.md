@@ -15,6 +15,11 @@
 >
 > Thanks to everyone who used, starred, forked, and contributed to this project.
 > It was a good run. :rocket:
+>
+> The full story is in the [goodbye post](https://comfyui-mcp.artokun.io/docs/blog/goodbye).
+>
+> Looking for a ComfyUI or generative-AI integration expert? I take on custom solutions — reach me by
+> email at **art.longbottom.jr@gmail.com** or on [LinkedIn](https://www.linkedin.com/in/alongbottom/).
 
 > ### 📦 On ComfyUI-Manager & the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-agent-panel) as `comfyui-agent-panel`
 > The polished public release — native ComfyUI design system, live activity cards for every
