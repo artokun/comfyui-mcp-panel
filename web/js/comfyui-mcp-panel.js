@@ -1,3 +1,4 @@
+import { finishThoughtStream, createProcessPresentation } from "./lib/dsh-transcript.js";
 // =============================================================================
 // ComfyUI Agent Panel — sidebar driven by an autonomous background agent.
 // =============================================================================
@@ -6233,7 +6234,7 @@ const BACKEND_SECTION = {
 // row exists for either, its description reads "the undefined background agent". No row does
 // today (they are instantiated one by one, not from this map), which is exactly why the gap
 // was invisible: the entries are added here so the next row added cannot ship that string.
-const BACKEND_TEXT = /* null-prototype: see BACKEND_LABELS (#1084 codex) */ Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", qwen: "Qwen Code", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
+const BACKEND_TEXT = /* null-prototype: see BACKEND_LABELS (#1084 codex) */ Object.assign(Object.create(null), { dsh: "DSH", claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", qwen: "Qwen Code", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
 // The allowlisted secure-store keys (mirrors the orchestrator's #59 allowlist).
 const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 
@@ -6302,7 +6303,7 @@ const settingsBackendState = {
 // render-fns when the dialog opens, so a freshly-arrived catalog can repaint the
 // matching backend's dropdown in place (a render-fn setting has no static options
 // to re-key). Keyed by backend; null when that group isn't mounted.
-const settingsModelSelectEls = { claude: null, codex: null, gemini: null, antigravity: null, pi: null, grok: null, qwen: null, kimi: null, moonshot: null, glm: null, minimax: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
+const settingsModelSelectEls = { dsh: null, claude: null, codex: null, gemini: null, antigravity: null, pi: null, grok: null, qwen: null, kimi: null, moonshot: null, glm: null, minimax: null, ollama: null, openrouter: null, lmstudio: null, llamacpp: null, custom: null };
 // Disabled placeholder <option> value — mapped to "" (Auto) if ever selected so
 // it can never persist as a bogus model id.
 const SETTINGS_PLACEHOLDER = "__cmcp_placeholder__";
@@ -6314,7 +6315,7 @@ function currentSettingsBackend() {
   const b = getSetting(SETTING_BACKEND);
   // Every selectable backend counts — this list lagging a provider addition
   // silently stops that provider's Settings edits from driving the live panel.
-  return ["codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
+  return ["dsh", "codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"].includes(b) ? b : "claude";
 }
 /** Fetched model rows for `backend` (the same presentable catalog the composer
  *  picker uses), or null when none is cached (backend never connected this session). */
@@ -7026,6 +7027,7 @@ function panelSettingsList() {
           // reproduces the picker's "ChatGPT vs chatgpt" confusion one dialog over. `codex`
           // reuses `panel.chatgpt_codex`, which the panel ALREADY ships translated for the
           // sign-in card, rather than minting a near-duplicate key for the same words.
+          { value: "dsh", text: tr("panel.dsh", "DSH") },
           { value: "codex", text: tr("panel.chatgpt_codex", "ChatGPT (Codex)") },
           { value: "chatgpt", text: tr("panel.chatgpt_direct_oauth", "ChatGPT (direct OAuth)") },
           { value: "gemini", text: tr("panel.gemini", "Gemini") },
@@ -33604,7 +33606,7 @@ function buildPanel() {
   // and `["__proto__"]` returns an object, so the `|| id` fallback never fires and a
   // function would be interpolated into a sentence. Harmless while the gate below only let
   // known ids through; reachable the moment it accepts an id this map has never seen.
-  const BACKEND_LABELS = Object.assign(Object.create(null), { claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", qwen: "Qwen Code", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
+  const BACKEND_LABELS = Object.assign(Object.create(null), { dsh: "DSH", claude: "Claude", codex: "ChatGPT (Codex)", chatgpt: "ChatGPT (direct OAuth)", gemini: "Gemini", antigravity: "Antigravity", pi: "Pi", grok: "Grok", qwen: "Qwen Code", kimi: "Kimi", moonshot: "Kimi K3", glm: "GLM (z.ai)", minimax: "MiniMax", ollama: "Ollama", openrouter: "OpenRouter", lmstudio: "LM Studio", llamacpp: "llama.cpp", custom: "Custom endpoint", copilot: "GitHub Copilot" });
   // Appends a visible "(experimental)" marker to a backend's display label when
   // the readiness data flags it (b.experimental, e.g. Copilot — device-code,
   // GitHub ToS risk). Keeps picking it a deliberate, informed act everywhere a
@@ -33696,7 +33698,7 @@ function buildPanel() {
   // Pi must stay conservative until that snapshot has landed for this connection.
   let piBackendsReadinessReceived = false;
   // Short per-provider hint shown under each provider row in the popup.
-  const BACKEND_HINTS = { claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", antigravity: "Gemini 3 · Google subscription", pi: "pi.dev · multi-provider CLI · no ComfyUI tools", grok: "Grok Composer · Build", qwen: "Qwen3 Coder · Coding Plan", kimi: "Kimi (Moonshot)", moonshot: "Kimi K3 · Moonshot", glm: "GLM · z.ai coding plan", minimax: "MiniMax M3 · 1M context", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "DeepSeek · vLLM · any OpenAI-compatible API" };
+  const BACKEND_HINTS = { dsh: "DSH CLI · ACP", claude: "Fable · Opus · Sonnet · Haiku", codex: "GPT-5 (Codex)", gemini: "Gemini 2.5 Pro · Flash", antigravity: "Gemini 3 · Google subscription", pi: "pi.dev · multi-provider CLI · no ComfyUI tools", grok: "Grok Composer · Build", qwen: "Qwen3 Coder · Coding Plan", kimi: "Kimi (Moonshot)", moonshot: "Kimi K3 · Moonshot", glm: "GLM · z.ai coding plan", minimax: "MiniMax M3 · 1M context", ollama: "Local LLMs", openrouter: "MiMo · MiniMax (1M · SOTA)", lmstudio: "Local LLMs · no account", llamacpp: "Local LLMs · no account", custom: "DeepSeek · vLLM · any OpenAI-compatible API" };
 
   // Hint for a provider that exists but isn't usable yet — distinguishes
   // "install the CLI" from "sign in". Empty when ready or readiness is unknown.
@@ -34116,6 +34118,7 @@ function buildPanel() {
   // support reads the prose in any language.
   const PROVIDER_SETUP = {
     claude: { label: tr("panel.claude", "Claude"), install: "npm i -g @anthropic-ai/claude-code", login: "claude auth login" },
+    dsh: { label: "DSH", install: "npm i -g @deepseek-ai/dsh", login: "dsh" },
     codex: { label: tr("panel.chatgpt", "ChatGPT"), install: "npm i -g @openai/codex", login: "codex login" },
     gemini: { label: tr("panel.gemini", "Gemini"), install: "npm i -g @google/gemini-cli", login: "gemini" },
     // Google's Antigravity CLI (agy) — the individual-tier Google-subscription
@@ -34210,7 +34213,7 @@ function buildPanel() {
     // ships the `cmd /c` wrapper, so no separate execution-policy caveat is needed.
     runCol.append(makeShellCommandBlock(connectCommand()));
     onboard.appendChild(runCol);
-    for (const id of ["claude", "codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
+    for (const id of ["dsh", "claude", "codex", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot", "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]) {
       const meta = PROVIDER_SETUP[id];
       const st = list.find((b) => b.backend === id) || {};
       const col = document.createElement("div");
@@ -34821,6 +34824,17 @@ function buildPanel() {
   ctxLabel.title = tr("panel.context_window_used", "Context window used");
   const CTX_KEY = "comfyui-mcp.panel.ctxPct";
   ctxLabel.textContent = "—"; // until the first usage report
+  let contextUsage = null;
+
+  function renderContextReadout() {
+    if (!contextUsage) return;
+    const used = contextUsage.used;
+    const maximum = contextUsage.context_window;
+    const compact = value => new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+    ctxLabel.textContent = `${compact(used)}/${Number.isFinite(maximum) && maximum > 0 ? compact(maximum) : "?"}`;
+    ctxLabel.title = `${Math.round(used).toLocaleString()} / ${Number.isFinite(maximum) && maximum > 0 ? Math.round(maximum).toLocaleString() : "?"} tokens`;
+    ringTitle.textContent = ctxLabel.title;
+  }
 
   function setContextPct(p) {
     const clamped = Math.max(0, Math.min(1, p > 1 ? p / 100 : p));
@@ -34875,12 +34889,18 @@ function buildPanel() {
   // the conversation currently on screen (#381).
   function refreshContextRingForScope() {
     const key = ctxScopeKey();
+    contextUsage = null;
+    try {
+      const saved = key ? JSON.parse(ssGet(`${key}:usage`) || "null") : null;
+      if (Number.isFinite(saved?.used) && saved.used >= 0) contextUsage = saved;
+    } catch { /* Keep malformed historical usage unknown. */ }
     const v = key ? Number(ssGet(key)) : 0;
     if (v > 0) setContextPct(v);
     else {
       setContextPct(0);
       ctxLabel.textContent = "—";
     }
+    renderContextReadout();
   }
   // Drop every scope's persisted fill — used when clearing ALL history, which
   // removes the conversations those values described (also sweeps the pre-#381
@@ -37029,6 +37049,7 @@ function buildPanel() {
     renderRichText(b, safeText);
     log.appendChild(b);
     scrollLog();
+    return b;
   }
 
   function paintCard({ icon, text, detail, error }) {
@@ -38914,9 +38935,28 @@ function buildPanel() {
     }
   }
 
-  function appendAgent(text) {
-    paintAgent(text);
-    record({ role: "agent", text });
+  function wrapExecutionProcess(element) {
+    if (!element || element.querySelector(":scope > .cmcp-execution-process")) return;
+    const details = document.createElement("details");
+    details.className = "cmcp-think cmcp-execution-process";
+    const summary = document.createElement("summary");
+    summary.textContent = tr("panel.execution_process", "Execution details");
+    const body = document.createElement("div");
+    body.className = "cmcp-think-body";
+    while (element.firstChild) body.appendChild(element.firstChild);
+    details.append(summary, body);
+    element.appendChild(details);
+  }
+  const processPresentation = createProcessPresentation(wrapExecutionProcess, entry => {
+    const now = Date.now();
+    historyStore.touchMessage(entry, now);
+    if (thread) { thread.updatedAt = Math.max(Number(thread.updatedAt) || 0, now); thread.ts = thread.updatedAt; }
+    persistThreads();
+  });
+  function appendAgent(text, transportId) {
+    const element = paintAgent(text);
+    const entry = record({ role: "agent", text });
+    processPresentation.register(transportId, element, entry);
   }
 
   // ```a2ui fence fallback — for backends without panel tools (Ollama family).
@@ -39056,6 +39096,12 @@ function buildPanel() {
   }
 
   function onStreamDelta(msg) {
+    if (msg.phase === "process") { processPresentation.mark(msg.id); return; }
+    if (msg.phase === "think_end") {
+      finishThoughtStream(msg.id, streamBubbles, animating, collapseThinking, tr("panel.see_thinking", "See thinking"));
+      scrollLog();
+      return;
+    }
     const { phase, id } = msg;
     const delta = typeof msg.delta === "string" ? msg.delta : "";
     if (phase === "think") {
@@ -39081,7 +39127,8 @@ function buildPanel() {
     collapseThinking(s, tr("panel.see_thinking", "See thinking"));
     renderRichText(s.replyEl, s.commitText); // streamed plain text → final markdown
     s.el.classList.remove("streaming");
-    record({ role: "agent", text: s.commitText }); // thinking is ephemeral
+    const entry = record({ role: "agent", text: s.commitText }); // thinking is ephemeral
+    processPresentation.register(s.id, s.el, entry);
     scrollLog();
   }
 
@@ -39461,6 +39508,8 @@ function buildPanel() {
   const releaseChatAudio = () => stopChatAudio({ release: true });
 
   function resetFeed() {
+    processPresentation.clear();
+    contextUsage = null;
     releaseChatAudio();
     for (const el of [...log.children]) el.remove();
     streamBubbles.clear(); // drop any in-flight streaming previews (DOM is gone)
@@ -39539,7 +39588,10 @@ function buildPanel() {
     mediaRecorder.replay(() => {
       for (const m of t.msgs) {
         if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
-        else if (m.role === "agent") paintAgent(m.text);
+        else if (m.role === "agent") {
+          const element = paintAgent(m.text);
+          if (m.executionProcess === true) wrapExecutionProcess(element);
+        }
         else if (m.role === "media") {
           // The kind decision has to be repeated here, or a reload replays an
           // audio card through paintImage and the broken <img> is back (#710).
@@ -40943,7 +40995,7 @@ function buildPanel() {
       const { text: stripped, specs } = extractA2UIFences(text);
       const committed = stripped || (specs.length ? "" : text);
       if (committed) {
-        if (!(meta && meta.id && commitStream(meta.id, committed))) appendAgent(committed);
+        if (!(meta && meta.id && commitStream(meta.id, committed))) appendAgent(committed, meta?.id);
       } else if (meta && meta.id) {
         commitStream(meta.id, committed); // clears the streaming bubble even when the whole say was one fence
       }
@@ -41463,8 +41515,9 @@ function buildPanel() {
       }
     },
     onAgentStatus(s) {
-      // Percentage of the context window used (label + ring), persisted so a
-      // reload isn't blank. % is what the user wants — not raw token counts.
+      if (s.session_id && s.session_id !== thread?.sessionId) return;
+      if (client?.sessionTransitionPending?.()) return;
+      // Persist the ratio for the ring and actual token counts for the readout.
       if (typeof s.context_pct === "number") {
         // Persist under the turn's OWNER always; repaint the ring only when the
         // frame belongs to the conversation on screen (#381 codex-P2) — a
@@ -41479,6 +41532,12 @@ function buildPanel() {
         }
       }
       // Keep the chip in sync if the agent reports a concrete model id we know.
+      if (Number.isFinite(s.used) && s.used >= 0) {
+        const usage = { used: s.used, context_window: s.context_window, model: s.model };
+        const persistKey = ctxPersistKey();
+        if (persistKey) ssSet(`${persistKey}:usage`, JSON.stringify(usage));
+        if (ctxFrameForActiveView()) { contextUsage = usage; renderContextReadout(); }
+      }
       if (typeof s.model === "string" && modelCatalog.some((m) => m.id === s.model)) {
         prefs.model = s.model;
         refreshModelChip();

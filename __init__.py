@@ -79,6 +79,7 @@ _LAUNCHER_INSTALL_COMMAND = "npx -y comfyui-mcp@latest launcher install"
 # handshake, not a port. Informational for the panel's picker; this pack
 # never binds or spawns.
 _BACKEND_PORTS = {
+    "dsh": _BRIDGE_PORT,
     "claude": _BRIDGE_PORT,
     "codex": _BRIDGE_PORT,
     "gemini": _BRIDGE_PORT,
@@ -425,6 +426,7 @@ def _backend_port(backend):
 # pi is the exception because the MCP starts it with shell-less spawn.
 _PROVIDER_CLIS = {
     "claude": ("claude", "claude.cmd", "claude.exe"),
+    "dsh": ("dsh", "dsh.cmd", "dsh.exe"),
     "codex": ("codex", "codex.cmd", "codex.exe"),
     "gemini": ("gemini", "gemini.cmd", "gemini.exe"),
     "antigravity": ("agy", "agy.exe"),
@@ -569,6 +571,10 @@ def _provider_auth(provider):
         if sys.platform == "darwin":
             return None
         return False
+    if provider == "dsh":
+        # The orchestrator probes the official ACP runtime on its own host.
+        # A ComfyUI container cannot inspect the host's DSH credentials.
+        return None
     if provider == "codex":
         return os.path.isfile(os.path.join(home, ".codex", "auth.json"))
     if provider == "gemini":

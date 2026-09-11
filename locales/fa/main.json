@@ -893,7 +893,9 @@
       "workflow_snapshot": "اسنپ‌شات گردش‌کار",
       "working": "در حال کار…",
       "your_agent_inline": "عامل شما",
-      "your_agent_is_at_your_canvas": "عامل شما کنار بوم شماست"
+      "your_agent_is_at_your_canvas": "عامل شما کنار بوم شماست",
+      "execution_process": "جزئیات اجرا",
+      "dsh": "DSH"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "محدودهٔ «اجرا تا این گره» اعمال نشد؛ چیزی به صف نرفت"

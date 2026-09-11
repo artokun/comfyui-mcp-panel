@@ -23,6 +23,8 @@ import { fileURLToPath } from "node:url";
 
 const panelPath = fileURLToPath(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url));
 const panelSrc = readFileSync(panelPath, "utf8");
+const readoutMatch = panelSrc.match(/function renderContextReadout\(\) \{[\s\S]*?\n {2}\}/);
+assert.ok(readoutMatch, "context readout renderer is present");
 
 const CTX_KEY = "comfyui-mcp.panel.ctxPct";
 
@@ -90,7 +92,7 @@ function buildHelpers({ thread = null, liveTurnThreadId = null, scopeRef = { val
     "setContextPct",
     "ctxLabel",
     "window",
-    `${sliceMatch[0]}\nreturn { ctxScopeKey, ctxPersistKey, ctxFrameForActiveView, refreshContextRingForScope, clearAllCtxScopes };`,
+    `let contextUsage = null; const ringTitle = {textContent: ''};\n${readoutMatch[0]}\n${sliceMatch[0]}\nreturn { ctxScopeKey, ctxPersistKey, ctxFrameForActiveView, refreshContextRingForScope, clearAllCtxScopes };`,
   );
   const helpers = factory(
     CTX_KEY,
@@ -244,4 +246,20 @@ test("#381 clearAllCtxScopes drops every conversation's fill and the legacy glob
   helpers.clearAllCtxScopes();
 
   assert.deepEqual([...ss._dump().keys()], ["unrelated.key"], "only non-ctx keys should survive");
+});
+
+test("DSH raw usage restores per conversation and never leaks to a new thread", () => {
+  const thread = { id: "dsh-A" };
+  const ss = makeSessionStorage();
+  const { helpers, ctxLabel } = buildHelpers({ thread, sessionStorage: ss });
+  ss.setItem(`${CTX_KEY}:dsh-A`, "0.0776");
+  ss.setItem(`${CTX_KEY}:dsh-A:usage`, JSON.stringify({ used: 77600, context_window: 1000000 }));
+  helpers.refreshContextRingForScope();
+  assert.equal(ctxLabel.textContent, "77.6K/1M");
+  thread.id = "dsh-B";
+  helpers.refreshContextRingForScope();
+  assert.equal(ctxLabel.textContent, "—");
+  thread.id = "dsh-A";
+  helpers.refreshContextRingForScope();
+  assert.equal(ctxLabel.textContent, "77.6K/1M");
 });

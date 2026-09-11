@@ -1053,7 +1053,9 @@
       "workflow_snapshot": "لقطة سير العمل",
       "working": "جارٍ العمل…",
       "your_agent_inline": "وكيلك",
-      "your_agent_is_at_your_canvas": "وكيلك في خدمة لوحة رسمك"
+      "your_agent_is_at_your_canvas": "وكيلك في خدمة لوحة رسمك",
+      "execution_process": "تفاصيل التنفيذ",
+      "dsh": "DSH"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "لم يُطبَّق نطاق التشغيل حتى العقدة؛ ولم يُدرَج أي شيء في قائمة الانتظار"
