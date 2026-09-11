@@ -944,7 +944,9 @@
       "workflow_snapshot": "Workflow snapshot",
       "working": "Working…",
       "your_agent_inline": "your agent",
-      "your_agent_is_at_your_canvas": "Your agent is at your canvas"
+      "your_agent_is_at_your_canvas": "Your agent is at your canvas",
+      "execution_process": "Execution details",
+      "dsh": "DSH"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "run-to-node scope was not applied; nothing was queued"

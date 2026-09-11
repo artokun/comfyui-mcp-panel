@@ -933,7 +933,9 @@
       "workflow_snapshot": "Snapshot do workflow",
       "working": "Trabalhando…",
       "your_agent_inline": "o seu agente",
-      "your_agent_is_at_your_canvas": "O seu agente está no seu canvas"
+      "your_agent_is_at_your_canvas": "O seu agente está no seu canvas",
+      "execution_process": "Detalhes da execução",
+      "dsh": "DSH"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "o escopo de executar até o nó não foi aplicado; nada foi enfileirado"

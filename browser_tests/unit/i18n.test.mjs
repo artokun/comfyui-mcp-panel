@@ -400,7 +400,7 @@ test("translating a combo changes only its TEXT, never the value that gets store
   // "chatgpt". Both are ids on the wire and neither may ever be translated, which is what
   // this list is here to hold.
   assert.deepEqual(values, [
-    "claude", "codex", "chatgpt", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot",
+    "claude", "dsh", "codex", "chatgpt", "gemini", "antigravity", "pi", "grok", "qwen", "kimi", "moonshot",
     "glm", "minimax", "ollama", "openrouter", "lmstudio", "llamacpp", "custom",
   ]);
   // Every one of those labels must go through tr() — a bare string here is a row that

@@ -103,5 +103,10 @@ class ProviderAuthClaude(unittest.TestCase):
             self.assertIs(result, False)
 
 
+class ProviderAuthDsh(unittest.TestCase):
+    def test_dsh_credentials_are_not_inferred_from_comfyui_host(self):
+        self.assertIsNone(mod._provider_auth("dsh"))
+
+
 if __name__ == "__main__":
     unittest.main()

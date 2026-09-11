@@ -853,7 +853,9 @@
       "workflow_snapshot": "ワークフローのスナップショット",
       "working": "処理中…",
       "your_agent_inline": "エージェント",
-      "your_agent_is_at_your_canvas": "エージェントがキャンバスで待機しています"
+      "your_agent_is_at_your_canvas": "エージェントがキャンバスで待機しています",
+      "execution_process": "実行の詳細",
+      "dsh": "DSH"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "「ノードまで実行」の範囲が適用されず、キューには何も追加されませんでした"

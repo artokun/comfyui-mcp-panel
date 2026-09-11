@@ -853,7 +853,9 @@
       "workflow_snapshot": "工作流快照",
       "working": "处理中…",
       "your_agent_inline": "你的智能体",
-      "your_agent_is_at_your_canvas": "智能体已就位，随时可操作画布"
+      "your_agent_is_at_your_canvas": "智能体已就位，随时可操作画布",
+      "execution_process": "执行过程",
+      "dsh": "DSH"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "未应用“运行到节点”的范围限制，因此没有任何任务入队"

@@ -893,7 +893,9 @@
       "workflow_snapshot": "İş akışı anlık görüntüsü",
       "working": "Çalışıyor…",
       "your_agent_inline": "ajanınız",
-      "your_agent_is_at_your_canvas": "Ajanınız tuvalinizin başında"
+      "your_agent_is_at_your_canvas": "Ajanınız tuvalinizin başında",
+      "execution_process": "İşlem ayrıntıları",
+      "dsh": "DSH"
     },
     "run_scope_guard": {
       "run_to_node_scope_was_not_applied": "düğüme kadar çalıştırma kapsamı uygulanmadı; kuyruğa hiçbir şey eklenmedi"
