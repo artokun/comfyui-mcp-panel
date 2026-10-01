@@ -13,7 +13,7 @@ All notable changes to this project are documented here. This project adheres to
 
 - archive notice — this project is no longer maintained (#2300)
 ### Fixed
-- Unpacking follows reminted interior-node identities and named slots, repairs displaced wires inside one undo step, and rolls back when identity cannot be proven. Temporary provenance never enters saved workflows or undo history.
+- Unpacking follows reminted interior-node identities and named slots, repairs displaced wires inside one undo step, and rolls back when identity cannot be proven. Temporary provenance never enters saved workflows or undo history (#2311).
 - Lost subgraph-conversion replies recover only from an exact live-graph receipt and recheck serialization; graph reloads and partial selections fail closed rather than duplicating conversions.
 - Workflow mismatch guidance warns about unsaved edits and no longer recommends reopening the active tab. The underlying frontend provenance defect remains unresolved.
 - Error scans reject detached node objects even when another workflow reuses their IDs, and a readable empty canvas clears stale missing-type records.
