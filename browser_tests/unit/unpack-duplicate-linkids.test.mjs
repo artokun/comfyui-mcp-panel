@@ -25,7 +25,9 @@ import { fileURLToPath } from "node:url";
 
 import {
   snapshotExternalLinks,
+  unpackWithIdentity,
   verifyExternalLinks,
+  reseatExternalLinksByIdentity,
 } from "../../web/js/lib/unpack-link-verify.js";
 import {
   materializePromotedValues,
@@ -155,7 +157,7 @@ function duplicateInboundRailGraph() {
   graph.unpackSubgraph = function (n) {
     this.unpackCalls += 1;
     visitBoundaryLinks(n);
-    const inner = { id: 10, inputs: [{ name: "IMAGE", link: 60 }], outputs: [] };
+    const inner = { id: 10, properties: { ...n.subgraph._nodes[0].properties }, inputs: [{ name: "IMAGE", link: 60 }], outputs: [] };
     this._nodes = this._nodes.filter((x) => x !== n).concat(inner);
     this._links.delete(50);
     addLink(this._links, 60, 131, 0, 10, 0);
@@ -174,7 +176,9 @@ function buildUnpack(graph, { app, canvas, rootGraph, methodSrc = unpackSrc } = 
     "materializePromotedValues",
     "resolveLoadGraphArgs",
     "snapshotExternalLinks",
+    "unpackWithIdentity",
     "verifyExternalLinks",
+    "reseatExternalLinksByIdentity",
     "materializedValuesNote",
     `return ({
 ${methodSrc}
@@ -198,7 +202,9 @@ ${methodSrc}
     materializePromotedValues,
     resolveLoadGraphArgs,
     snapshotExternalLinks,
+  unpackWithIdentity,
     verifyExternalLinks,
+    reseatExternalLinksByIdentity,
     materializedValuesNote,
   );
 }
@@ -301,9 +307,13 @@ test("#1938 the shipped method still owns the dedupe, before snapshot and unpack
   assert.match(unpackSrc, /new Set\(slot\.linkIds\)/);
   const dedupeAt = unpackSrc.indexOf("new Set(slot.linkIds)");
   const snapshotAt = unpackSrc.indexOf("snapshotExternalLinks(graph, node)");
-  const unpackAt = unpackSrc.indexOf("graph.unpackSubgraph(node");
+  const unpackAt = unpackSrc.indexOf("unpackWithIdentity(graph, node");
   assert.ok(dedupeAt > 0 && snapshotAt > 0 && unpackAt > 0);
   assert.ok(dedupeAt < snapshotAt, "dedupe must precede the snapshot");
   assert.ok(dedupeAt < unpackAt, "dedupe must precede the unpack");
-  assert.match(unpackSrc, /graph\.unpackSubgraph\(node[\s\S]{0,400}?\} catch \(err\)/);
+  assert.match(unpackSrc, /unpackWithIdentity\(graph, node[\s\S]{0,400}?\} catch \(err\)/);
+  const reseatAt = unpackSrc.indexOf("const reseated = reseatedDuringUnpack");
+  const verifyAt = unpackSrc.indexOf("verifyExternalLinks(graph, externalLinks)");
+  assert.ok(reseatAt > unpackAt, "identity reseat must follow unpack");
+  assert.ok(verifyAt > reseatAt, "identity verify must follow reseat");
 });

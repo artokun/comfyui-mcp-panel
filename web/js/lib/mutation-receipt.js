@@ -1,22 +1,28 @@
-// #2116 — persist graph_set_widget acknowledgements by request id.
+// #2116 / #2267 — persist applied mutation acknowledgements by request id.
 //
 // A timed-out mutation can still apply after the caller has given up. The
 // command rid is the transaction identity: retry_of must replay that receipt
 // instead of executing a second write, and panel_list_workflows advertises
 // the same rid-correlated list the save path uses for late_save_receipts.
+// graph_set_widget writes and subgraph conversions that landed are both
+// receipts — a lost panel_create_subgraph reply is how #2267 retried blind.
 
 export const LATE_MUTATION_RECEIPT_TTL_MS = 10 * 60 * 1000;
 export const MAX_LATE_MUTATION_RECEIPTS = 32;
 
-function appliedWidgetResult(result) {
+function appliedMutationResult(result) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return false;
   if (result.applied === true) return true;
   const set = result.set;
-  return !!(set && typeof set === "object" && Object.prototype.hasOwnProperty.call(set, "value"));
+  if (set && typeof set === "object" && Object.prototype.hasOwnProperty.call(set, "value")) {
+    return true;
+  }
+  const subgraph = result.subgraph;
+  return !!(subgraph && typeof subgraph === "object" && subgraph.node_id != null);
 }
 
 /**
- * Bounded rid-keyed store for applied widget-write receipts.
+ * Bounded rid-keyed store for applied mutation receipts.
  *
  * @param {{
  *   ttlMs?: number,
@@ -47,7 +53,7 @@ export function createMutationReceiptStore({
   return {
     remember(rid, result, { cmd = "graph_set_widget", fingerprint } = {}) {
       if (typeof rid !== "string" || !rid) return;
-      if (!appliedWidgetResult(result)) return;
+      if (!appliedMutationResult(result)) return;
       prune();
       receipts.set(rid, {
         rid,

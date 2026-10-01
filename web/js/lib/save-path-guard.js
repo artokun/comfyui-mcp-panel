@@ -188,11 +188,18 @@ export function workflowSaveRefusalError(verdict) {
         `tracker is not the active workflow's, and one of those swallowed it. NOTHING was ` +
         `written; the canvas is intact. RECOVERY, in order — each one re-runs the capture ` +
         `WITHOUT touching the canvas, so none of them can lose the changes: wait a moment and ` +
-        `save again (a still-open load/undo/transaction clears by itself); then nudge the ` +
-        `canvas so ComfyUI captures it — any panel graph mutation, or a click/drag on the ` +
-        `canvas, refreshes the snapshot — and save again. Do NOT close the tab, and do NOT ` +
-        `re-open the workflow from disk: both replace the canvas that holds the only copy of ` +
-        `those changes (panel#1563, panel#2133).`,
+        `save again; then nudge the canvas so ComfyUI captures it — any panel graph mutation, ` +
+        `or a click/drag on the canvas, refreshes the snapshot — and save again. ` +
+        `IF NEITHER WORKS, the cause is an open change transaction that was never closed, and ` +
+        `NEITHER STEP CAN CLEAR IT (measured): a nudge opens and closes its own pair, so the ` +
+        `depth returns to 1 rather than 0, and each nudge widens the gap. Do NOT fall back to ` +
+        `ComfyUI's own Save either — upstream writes the SNAPSHOT too ` +
+        `(\`content = JSON.stringify(activeState)\`) and, unlike this guard, does it silently, ` +
+        `so it would persist exactly the stale state refused here. Your changes live in the ` +
+        `GRAPH: anything reading the graph (copy/paste, this panel's graph reads) still sees ` +
+        `them; only snapshot readers do not. Keep the tab open and copy the work out. Do NOT ` +
+        `close the tab, and do NOT re-open the workflow from disk: both replace the canvas ` +
+        `that holds the only copy of those changes (panel#1563, panel#2133, panel#2139).`,
     );
   }
   const stamped = typeof verdict?.stampedPath === "string" && verdict.stampedPath
