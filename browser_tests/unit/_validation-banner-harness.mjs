@@ -7,7 +7,10 @@
 // function body, run with injected dependencies, so a test observes what SHIPS rather
 // than a re-implementation of it.
 import { PANEL_SRC } from "./_panel-constants.mjs";
-import { pruneContradictedNodeErrorMaps } from "../../web/js/lib/asset-staleness.js";
+import {
+  pruneContradictedNodeErrorMaps,
+  recordedMissingTypesOnLiveGraph,
+} from "../../web/js/lib/asset-staleness.js";
 
 function extractFunctionBody(source, signature) {
   const start = source.indexOf(signature);
@@ -61,6 +64,7 @@ const VALIDATION_BANNER_DEPS = [
   "filterServerConfirmedInputSubfolderMedia",
   "collectAllGraphs",
   "adjudicateRecordedMissingNodeTypes",
+  "recordedMissingTypesOnLiveGraph",
   "isRegisteredNodeType",
   "LiteGraph",
   "coerceMessageText",
@@ -103,6 +107,7 @@ export async function runProductionValidationBanner({
     filterServerConfirmedInputSubfolderMedia: async (media) => media,
     collectAllGraphs: (value) => [value],
     adjudicateRecordedMissingNodeTypes: (types) => ({ stillMissing: types, stalePlaceholders: [] }),
+    recordedMissingTypesOnLiveGraph,
     isRegisteredNodeType: () => false,
     LiteGraph: {},
     coerceMessageText: (value) => String(value ?? ""),

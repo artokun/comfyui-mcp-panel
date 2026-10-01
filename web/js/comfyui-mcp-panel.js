@@ -230,6 +230,8 @@ import {
   emptyComboNote,
   refreshComboOptionsFromDefs,
   collectAllGraphs,
+  graphGetErrorsLiveScanStale,
+  recordedMissingTypesOnLiveGraph,
   collectMissingNodeTypeReasons,
   collectUnexplainedRedOutlines,
   combineNodeErrorMaps,
@@ -313,7 +315,9 @@ import {
 } from "./lib/subgraph-instance-widgets.js";
 import {
   snapshotExternalLinks,
+  unpackWithIdentity,
   verifyExternalLinks,
+  reseatExternalLinksByIdentity,
 } from "./lib/unpack-link-verify.js";
 import { readSaveFailureCause } from "./lib/userdata-failure-cause.js";
 import { isGenericManagerUpdateError, readUpdateTraceback } from "./lib/manager-update-traceback.js";
@@ -548,6 +552,13 @@ import {
   conversionSnapshot,
   conversionThrowReport,
 } from "./lib/subgraph-conversion-integrity.js";
+import {
+  normalizeCreateSubgraphNodeIds,
+  recoverConvertedSubgraph,
+  rememberConvertedSubgraph,
+  recoveredCreateSubgraphResult,
+  unresolvedCreateSubgraphNodesRefusal,
+} from "./lib/subgraph-conversion-recovery.js";
 import {
   classifyWorkflowRefresh,
   knownSelectorSample,
@@ -3101,7 +3112,7 @@ const DOCS_URL = "https://comfyui-mcp.artokun.io/docs";
 // could never catch the real failure, that set-version.mjs was not run at all,
 // since one script writes them together. That is how 0.15.86..0.15.96 shipped
 // still announcing 0.15.85.
-const PANEL_VERSION = "0.15.182";
+const PANEL_VERSION = "0.15.183";
 
 // #1269 — ONE panel bundle per page, arbitrated AT MODULE SCOPE, before either
 // copy's registration polling can run. Two installs of this pack (a git clone at
@@ -5173,7 +5184,31 @@ function noteWorkflowIdentityDrift() {
 // and #750/#1019 rebuild it in isolation with `new Function`, where a module global does not
 // exist. One line on purpose (see above). Appended, never substituted — the refusal's own
 // reasoning survives; the note only says WHY the active workflow is not what was expected.
-function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, movedNote = null } = {}) {
+/**
+ * #2139 — the active tab's save/modify state, as EVIDENCE rather than a guarantee.
+ *
+ * `isModified` is set by ComfyUI's ChangeTracker, which does not observe every
+ * programmatic edit, so `true` is evidence of drift and `false` is evidence of
+ * nothing. Both callers of `workflowInstanceMismatchMessage` need the same
+ * reading, and the primary dispatch fence was passing neither — its refusal is
+ * the one a caller actually sees for an ordinary instance mismatch, so the
+ * discard warning never fired on the path it was written for. One probe, both
+ * sites, so they cannot drift apart.
+ */
+function activeWorkflowSaveState() {
+  try {
+    const active = activeWorkflowRef();
+    if (!active) return { activeIsUnsaved: null, activeIsModified: null };
+    return {
+      activeIsUnsaved: !savedWorkflowPath(active),
+      activeIsModified: active.isModified === true ? true : null,
+    };
+  } catch {
+    return { activeIsUnsaved: null, activeIsModified: null };
+  }
+}
+
+function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved = null, activeIsModified = null, movedNote = null } = {}) {
   const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
   const expected = str(commandUuid);
   const live = str(activeUuid);
@@ -5207,6 +5242,52 @@ function workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsa
         `still works normally. panel_list_workflows is exempt from this fence and ` +
         `republishes the active identity if you need it first (#1019).`
       : "") +
+    // #2139 — the OTHER cost of following this advice, which #1019 does not cover.
+    // That guard asks whether the active tab CAN be re-opened (an unsaved tab has no
+    // path). This asks what re-opening it COSTS: a SAVED tab with unsaved drift
+    // re-opens fine and discards the drift on the way. The reporter had exactly that
+    // — unsaved rewiring on a saved workflow, save already refused by the
+    // tracker-behind guard — and called panel_open_workflow a forbidden recovery,
+    // because it is the one move that loses the work.
+    //
+    // POSITIVE evidence only. `isModified === true` is the same reading used
+    // elsewhere in this file, and its own #882 note records why the negative is
+    // worthless: ComfyUI derives the flag from USER INPUT captures, so a value a
+    // NODE wrote leaves the tab reading clean while the canvas already differs. So
+    // true warns; false and undefined stay silent rather than implying it is safe.
+    //
+    // A SECOND blind spot, and it lands on this issue's own deadlock. Read out of
+    // the shipped frontend (`changeTracker.ts`): `workflow.isModified` is written
+    // only by `updateModified()`, which is reached only from `captureCanvasState()`
+    // — and that returns EARLY while a change transaction is open:
+    //
+    //     captureCanvasState:
+    //       const isInsideChangeTransaction = this.changeCount > 0
+    //       if (!app.graph || isInsideChangeTransaction || …) return
+    //       …
+    //       this.updateModified(previousState)
+    //
+    // (Braces omitted on purpose: the unit test extracts this function by counting
+    // braces over the raw source and does not skip comments, so an unbalanced one
+    // inside a comment makes the whole function unextractable.)
+    //
+    // So inside a STRANDED transaction the flag is frozen at whatever the last
+    // successful capture left. That is precisely the state in which save is refused
+    // as behind the canvas: if the drift happened entirely inside the stranded
+    // transaction, `isModified` is still the pre-drift value and this warning stays
+    // silent on the very case the sentence below names. Sessions that made balanced
+    // edits earlier read true and do warn, which is the common shape — but silence
+    // here is not evidence the tab is clean, and never was.
+    //
+    // Deliberately does NOT capture first. #882's helper exists for callers about to
+    // DISCARD a canvas and must read a fresh flag; this is an error message, and a
+    // mutation inside one is a new failure surface on a path that is already failing.
+    (activeIsModified === true
+      ? ` And note the ACTIVE tab has UNSAVED changes: panel_open_workflow re-reads it ` +
+        `from disk, so those changes are discarded. Save first, or re-target instead — ` +
+        `if the save is itself refused as behind the canvas, that is panel#2139 and ` +
+        `re-opening is the one recovery that loses the work.`
+      : "") +
     ` If NO panel tab is connected, neither will help and the connection is the thing ` +
     `to fix — panel_graph_outline reports connectivity directly.`
   );
@@ -5233,14 +5314,17 @@ function assertActiveWorkflowCommandTarget(msg, targetsNonActive = false) {
     // "Since the new workflow is unsaved, panel_open_workflow cannot recover it."
     // Read defensively: an unreadable path is not evidence either way, and the message
     // then keeps its existing wording rather than claiming something about the tab.
-    let activeIsUnsaved = null;
-    try {
-      const active = activeWorkflowRef();
-      if (active) activeIsUnsaved = !savedWorkflowPath(active);
-    } catch {
-      activeIsUnsaved = null;
-    }
-    throw new Error(workflowInstanceMismatchMessage({ commandUuid, activeUuid, activeIsUnsaved }));
+    // #2139 — read-only, and only the POSITIVE reading counts. `isModified` is
+    // ComfyUI's own flag; #882 records that it is derived from USER INPUT captures,
+    // so a value a NODE wrote leaves it false while the canvas already differs.
+    // `true` is therefore evidence of drift and `false` is evidence of nothing —
+    // which is the right shape for a warning, and the reason this does not capture
+    // first the way a caller about to DISCARD the canvas must. Both readings come
+    // from `activeWorkflowSaveState()` so this fence and the dispatch fence cannot
+    // disagree about the same tab.
+    throw new Error(
+      workflowInstanceMismatchMessage({ commandUuid, activeUuid, ...activeWorkflowSaveState() }),
+    );
   }
 }
 
@@ -5533,8 +5617,8 @@ function workflowListReadinessRefusalError(reason) {
     "workflow_list could not verify a live workflow identity after the ComfyUI reconnect (" +
       detail +
       ") within the bounded readiness window. This read-only probe changed no workflow target and " +
-      "is safe to retry in a moment; panel_open_workflow(path) can explicitly re-establish the tab " +
-      "if the reconnect does not settle.",
+      "is safe to retry in a moment. Keep the active tab open: reopening a workflow from disk " +
+      "can discard unsaved canvas edits. Retry the identity probe after the reconnect settles.",
   );
   workflowListReadinessRefusals.add(error);
   return error;
@@ -12661,10 +12745,11 @@ async function validationBanner() {
       allNodes,
       (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
     );
-    missing.nodeTypes = adjudicated.stillMissing;
+    missing.nodeTypes = recordedMissingTypesOnLiveGraph(adjudicated.stillMissing, allNodes);
     bannerStalePlaceholders = adjudicated.stalePlaceholders;
     // Same gate as graph_get_errors (panel#1370): an empty recorded list was never
     // narrowed by the adjudication, so its count is an unnamed miss, not a cleared one.
+    // #2263 — drop previous-tab type names the live graph does not carry.
     if (recordedTypes.length && !missing.nodeTypes.length) missing.nodeCount = 0;
   } catch {
     bannerStalePlaceholders = [];
@@ -21580,6 +21665,14 @@ const GRAPH_TOOL_EXECUTORS = {
         afterWorkflow: activeWorkflowRef(),
         beforeRootGraph: preProbeRootGraph,
         afterRootGraph: postProbeRootGraph,
+      }) ||
+      // #2263 — same-object in-place load: instance identity is unchanged but
+      // the scanned node ids are no longer on the bound graph. Refuse rather
+      // than emit the previous workflow's ids as if they were this canvas.
+      graphGetErrorsLiveScanStale({
+        scannedNodes: scanNodes,
+        liveRootGraph: postProbeRootGraph,
+        liveScan,
       })
     ) {
       throw new Error(
@@ -21604,7 +21697,7 @@ const GRAPH_TOOL_EXECUTORS = {
         allNodes,
         (type) => isRegisteredNodeType(LiteGraph?.registered_node_types, type),
       );
-      assets.nodeTypes = adjudicated.stillMissing;
+      assets.nodeTypes = recordedMissingTypesOnLiveGraph(adjudicated.stillMissing, allNodes);
       stalePlaceholders = adjudicated.stalePlaceholders;
       // #1332 drops the count when the adjudication removes every type the client can
       // now construct, so it cannot keep alarming for names that are no longer reported.
@@ -21612,6 +21705,7 @@ const GRAPH_TOOL_EXECUTORS = {
       // empty recorded list means the store named nothing to begin with, and the count is
       // then the only evidence that anything is missing; zeroing it there turns "N
       // missing, names unknown" into "no errors recorded since the last execution start".
+      // #2263 — the same drop when the store still names a PREVIOUS tab's types.
       if (recordedTypes.length && !assets.nodeTypes.length) assets.nodeCount = 0;
     } catch {
       /* unreadable registry → keep the load-time list (fail closed) */
@@ -25084,10 +25178,30 @@ const GRAPH_TOOL_EXECUTORS = {
     if (typeof graph.convertToSubgraph !== "function") {
       throw new Error("convertToSubgraph unavailable on this frontend");
     }
-    const ns = (Array.isArray(node_ids) ? node_ids : [])
-      .map((id) => graph.getNodeById(Number(id)))
-      .filter(Boolean);
-    if (!ns.length) throw new Error("provide node_ids to group into a subgraph");
+    const requested = normalizeCreateSubgraphNodeIds(node_ids);
+    if (!requested.length) throw new Error("provide node_ids to group into a subgraph");
+    const ns = requested.map((id) => graph.getNodeById(id)).filter(Boolean);
+    // #2267 — a lost reply after convertToSubgraph leaves the named nodes inside
+    // the wrapper. Retrying the same ids must return that wrapper, not wrap a
+    // leftover set or report the outcome as unknown.
+    if (ns.length !== requested.length) {
+      const recovered = recoverConvertedSubgraph({ graph, nodeIds: requested });
+      if (recovered) {
+        const advisories = assertSubgraphConversionSerializable(
+          { subgraph: recovered.subgraph }, recovered, "panel_create_subgraph",
+        );
+        const result = recoveredCreateSubgraphResult(recovered, requested);
+        Object.assign(result.subgraph, subgraphConversionAdvisories(advisories));
+        return result;
+      }
+      throw new Error(
+        unresolvedCreateSubgraphNodesRefusal({
+          what: "panel_create_subgraph",
+          requested,
+          foundIds: ns.map((n) => n.id),
+        }),
+      );
+    }
     // #1463 — selects, refuses a detached selection, and reports a THROW with a
     // mutation verdict instead of the frontend's bare exception.
     const res = convertSelectionToSubgraph({
@@ -25101,6 +25215,7 @@ const GRAPH_TOOL_EXECUTORS = {
     // `node_id: null` inside a `subgraph:` payload reads as a success with a missing
     // field, not as a failure. Refuse instead — see assertSubgraphNodeLanded.
     const created = assertSubgraphNodeLanded(res, graph, "panel_create_subgraph");
+    rememberConvertedSubgraph(graph, requested, created);
     // #1571: a node that LANDED can still be unserializable. Refuse rather than report a
     // success the next run will contradict — see assertSubgraphConversionSerializable.
     const advisories = assertSubgraphConversionSerializable(res, created, "panel_create_subgraph");
@@ -25704,8 +25819,9 @@ const GRAPH_TOOL_EXECUTORS = {
       }
     }
     const externalLinks = snapshotExternalLinks(graph, node);
+    let reseatedDuringUnpack = 0;
     try {
-      graph.unpackSubgraph(node, { skipMissingNodes: true });
+      reseatedDuringUnpack = unpackWithIdentity(graph, node, externalLinks, { skipMissingNodes: true });
     } catch (err) {
       // Half-unpacked graph — restore the pre-unpack workflow so the failure is
       // atomic (no partial mutation left behind), then report a real error.
@@ -25732,6 +25848,13 @@ const GRAPH_TOOL_EXECUTORS = {
     // expected link by NAME against the live link table; if any cannot be proven
     // present, roll back and refuse with exactly what would have been lost rather
     // than report a success over a graph that would render wrong.
+    //
+    // comfyui-mcp#2887 — #1665 only counted surviving wires. After a MiniMax-style
+    // autogrow rebuild, litegraph can still attach those wires to the WRONG named
+    // child (`IMAGE` on `ref_videos.ref_video_0`). Reseat by the snapshotted
+    // boundary identity (namespace + child + type) before verifying; a slot that
+    // is not unique is left for the refusal below rather than guessed.
+    const reseated = reseatedDuringUnpack;
     const linkCheck = verifyExternalLinks(graph, externalLinks);
     if (linkCheck.dropped.length) {
       let rolledBack = false;
@@ -25748,8 +25871,9 @@ const GRAPH_TOOL_EXECUTORS = {
       throw new Error(
         `unpack_subgraph refused: the unpack did not restore ${linkCheck.dropped.length} ` +
           `external link(s):\n${lost}\n` +
-          `These are links litegraph's unpackSubgraph rewires by slot index and silently loses ` +
-          `when the target is a widget-converted or dynamic input (comfyui-mcp#1665). ` +
+          `These are links litegraph's unpackSubgraph rewires by slot index: it can DROP them ` +
+          `on widget-converted/dynamic targets (#1665) or RESTORE them onto the wrong named ` +
+          `child after a dynamic-input rebuild (#2887). ` +
           (rolledBack
             ? `The workflow was reloaded from its pre-unpack snapshot, so the subgraph and all ` +
               `its links are intact — nothing was lost. Unpack in the ComfyUI canvas and re-add ` +
@@ -25773,8 +25897,9 @@ const GRAPH_TOOL_EXECUTORS = {
         // pre-unpack state could not even be read (pre-existing corruption the unpack
         // did not cause, disclosed rather than silently inherited).
         ...(externalLinks.links.length
-          ? { external_links_verified: linkCheck.restored }
+          ? { external_links_verified: linkCheck.restored, external_links_identity_ok: true }
           : {}),
+        ...(reseated ? { external_links_reseated: reseated } : {}),
         ...(linkCheck.unverifiable.length ? { external_links_unverifiable: linkCheck.unverifiable } : {}),
         // #979 — disclose what was carried inward. An unpack cannot be undone from
         // this result, so a caller checking values afterwards needs to know which
@@ -28793,8 +28918,9 @@ function awaitDuplicateReply(prior, rid, callerTimeoutMs) {
   ]);
 }
 const commandRidLedger = createCommandDedupeLedger(200, (m) => console.warn(m));
-// #2116 — rid-correlated receipts for graph_set_widget mutations that applied
-// after the caller timeout. retry_of reads these instead of executing again.
+// #2116 / #2267 — rid-correlated receipts for mutations that applied after the
+// caller timeout (widget writes and subgraph conversions). retry_of reads these
+// instead of executing again.
 const lateMutationReceipts = createMutationReceiptStore();
 
 // #968 — WHAT last moved the active workflow. A stale binding and a fresh one are the same
@@ -29902,6 +30028,11 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
                   workflowInstanceMismatchMessage({
                     commandUuid: dispatchCommandUuid,
                     activeUuid: dispatchActiveUuid,
+                    // #2139 — this fence is the refusal an ordinary instance mismatch
+                    // produces, so it must carry the same discard warning as the
+                    // write-boundary assertion below. It passed neither flag, which
+                    // left the warning unreachable on the primary path.
+                    ...activeWorkflowSaveState(),
                     // #968 — what last moved the active workflow, if anything did. This is the
                     // refusal a caller actually sees when a binding has gone stale.
                     movedNote: activeWorkflowMoves.describeLast(),
@@ -30144,7 +30275,12 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
         // the same rid on a fresh socket learns the true outcome instead of
         // re-executing the command.
         settleRid(reply);
-        if (msg.cmd === "graph_set_widget" && reply?.ok) {
+        if (
+          (msg.cmd === "graph_set_widget" ||
+            msg.cmd === "graph_create_subgraph" ||
+            msg.cmd === "graph_subgraph_group") &&
+          reply?.ok
+        ) {
           lateMutationReceipts.remember(msg.rid, reply.result, {
             cmd: msg.cmd,
             fingerprint,

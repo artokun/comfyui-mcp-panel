@@ -498,14 +498,14 @@ test("#1370 CONSUMER WIRING: both count-readers zero only on an ACTUAL removal",
   for (const holder of ["assets", "missing"]) {
     const at = PANEL.indexOf(`const recordedTypes = ${holder}.nodeTypes;`);
     assert.ok(at > 0, `${holder}: the pre-adjudication capture must exist`);
-    const after = PANEL.slice(at, at + 400);
+    const after = PANEL.slice(at, at + 700);
     assert.match(
       after,
       /adjudicateRecordedMissingNodeTypes\(\r?\n\s+recordedTypes,/,
       `${holder}: the captured list must be the one adjudicated`,
     );
     assert.ok(
-      after.indexOf(`${holder}.nodeTypes = adjudicated.stillMissing;`) >
+      after.indexOf(`${holder}.nodeTypes = recordedMissingTypesOnLiveGraph(adjudicated.stillMissing, allNodes);`) >
         after.indexOf("adjudicateRecordedMissingNodeTypes("),
       `${holder}: the capture must precede the narrowing assignment`,
     );

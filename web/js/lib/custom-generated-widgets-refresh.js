@@ -33,8 +33,12 @@
  * hidden `active_loras` count, recompute size, and dirty the canvas. The
  * rebuild is the pack's own:
  *
- *   1. `onConfigure()` is the public re-entry the workaround already used
- *      (Deno queues `setupNode` from it). Invoked when present.
+ *   1. `onConfigure(info)` is the public re-entry (Deno queues `setupNode`
+ *      from it). `info` is the node's serialized state so a pack that reads
+ *      `info.widgets_values` — including after a widget-layout migrate that
+ *      dropped that field off the live node — does not throw. Invoked only
+ *      when `widgets_values` is present on that state (filled from the live
+ *      widget list when serialize() omitted it).
  *   2. Generated row widgets are then reconciled synchronously from an
  *      existing row's constructor (`new RowCtor(index)`), because Deno's
  *      `onConfigure` is a `queueMicrotask` and a caller that reads the node
@@ -379,6 +383,80 @@ function dirtyCanvas(node, setDirty) {
   }
 }
 
+function hasWidgetsValues(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  return value != null && typeof value === "object";
+}
+
+function skipSerializedWidget(widget) {
+  try {
+    return widget?.options?.serialize === false;
+  } catch {
+    return false;
+  }
+}
+
+function widgetSerializedValue(widget, node, index) {
+  try {
+    if (typeof widget?.serializeValue === "function") {
+      return reflectApply(widget.serializeValue, widget, [node, index]);
+    }
+  } catch {
+    /* fall through to .value */
+  }
+  try {
+    return widget?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Positional widgets_values matching LiteGraph: skip serialize:false rows. */
+function liveSerializedWidgetsValues(node) {
+  const widgets = readWidgets(node);
+  if (!widgets) return null;
+  const values = [];
+  for (let i = 0; i < widgets.length; i++) {
+    const widget = widgets[i];
+    if (skipSerializedWidget(widget)) continue;
+    values.push(widgetSerializedValue(widget, node, i));
+  }
+  return values;
+}
+
+/**
+ * Serialized node state for onConfigure. After a widget-layout migrate the
+ * live node often has no `widgets_values` of its own; serialize() may omit
+ * it too. Fill from the live widget list so packs that read
+ * `info.widgets_values` without optional chaining do not throw.
+ *
+ * @returns {object | null}
+ */
+function serializedConfigureInfo(node) {
+  let info = null;
+  try {
+    if (typeof node?.serialize === "function") {
+      const serialized = reflectApply(node.serialize, node, []);
+      if (serialized && typeof serialized === "object") info = serialized;
+    }
+  } catch {
+    // unknown-ok: a throwing serialize is treated as missing state
+    info = null;
+  }
+  if (info && hasWidgetsValues(info.widgets_values)) return info;
+  const live = liveSerializedWidgetsValues(node);
+  if (!hasWidgetsValues(live)) return null;
+  if (info) return { ...info, widgets_values: live };
+  return { widgets_values: live };
+}
+
+function invokeOnConfigure(node) {
+  if (typeof node.onConfigure !== "function") return;
+  const info = serializedConfigureInfo(node);
+  if (!info) return;
+  reflectApply(node.onConfigure, node, [info]);
+}
+
 /**
  * Rebuild generated custom-widget rows after a successful write.
  *
@@ -402,11 +480,11 @@ export function refreshCustomGeneratedWidgetsAfterWrite(node, { beforeChange, af
     try {
       // Pack-owned re-entry. Deno rebuilds generated rows from onConfigure →
       // setupNode → rebuildUi (the same path leaving and re-entering a subgraph
-      // takes). Arguments are not supplied: this is a refresh of widgets already
-      // on the node, not a deserialize.
-      if (typeof node.onConfigure === "function") {
-        reflectApply(node.onConfigure, node, []);
-      }
+      // takes). Pass serialized state: packs that read info.widgets_values
+      // (UnifiedResizeImageMask after a migrated layout) throw when the
+      // argument is missing. Skip the hook when widgets_values cannot be
+      // produced — never call onConfigure(undefined).
+      invokeOnConfigure(node);
     } catch (err) {
       threw = err;
     }

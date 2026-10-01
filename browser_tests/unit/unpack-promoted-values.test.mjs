@@ -390,7 +390,7 @@ test("#979 (codex r2): a recoverable failure stays unresolved and does NOT stop 
 test("#979 (codex r2) source guard: the unpack REFUSES when a carry could not be rolled back", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const guard = src.indexOf("materialized?.unrecoverable?.length");
-  const unpack = src.indexOf("graph.unpackSubgraph(node, { skipMissingNodes: true })");
+  const unpack = src.indexOf("unpackWithIdentity(graph, node, externalLinks, { skipMissingNodes: true })");
   assert.ok(guard > 0, "the refusal must exist");
   assert.ok(guard < unpack, "and it must come BEFORE the destructive call");
   assert.match(src, /unpack_subgraph refused/, "and it refuses rather than annotating");
@@ -458,7 +458,7 @@ test("#979 (codex final) source guard: an aborted or thrown carry refuses instea
   assert.match(src, /carryFailed = !!materialized\?\.aborted/, "an aborted iteration is a failure");
   assert.match(src, /carryFailed = true/, "and so is a throw escaping the carry");
   const guard = src.indexOf("if (carryFailed || materialized?.unrecoverable?.length)");
-  const unpack = src.indexOf("graph.unpackSubgraph(node, { skipMissingNodes: true })");
+  const unpack = src.indexOf("unpackWithIdentity(graph, node, externalLinks, { skipMissingNodes: true })");
   assert.ok(guard > 0, "the refusal must key on carryFailed, not only on findings");
   assert.ok(guard < unpack, "and precede the destructive call");
 });
@@ -466,7 +466,7 @@ test("#979 (codex final) source guard: an aborted or thrown carry refuses instea
 test("#979 (codex r4) source guard: no snapshot ⇒ preflight refuses rather than losing values", () => {
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const preflight = src.indexOf("findDivergentPromotedValues(node,");
-  const unpack = src.indexOf("graph.unpackSubgraph(node, { skipMissingNodes: true })");
+  const unpack = src.indexOf("unpackWithIdentity(graph, node, externalLinks, { skipMissingNodes: true })");
   assert.ok(preflight > 0 && preflight < unpack, "the preflight must run before the destructive call");
   assert.match(src, /could not be snapshotted/, "and it says why it refused");
   assert.match(src, /Nothing was ` \+\s*`changed/, "and that nothing was changed");
@@ -519,7 +519,7 @@ test("#979 source guard: the unpack path materializes BEFORE it unpacks, and dis
   // asserted against the shipped source.
   const src = readFileSync(new URL("../../web/js/comfyui-mcp-panel.js", import.meta.url), "utf8");
   const materialize = src.indexOf("materialized = materializePromotedValues(node,");
-  const unpack = src.indexOf("graph.unpackSubgraph(node, { skipMissingNodes: true })");
+  const unpack = src.indexOf("unpackWithIdentity(graph, node, externalLinks, { skipMissingNodes: true })");
   assert.ok(materialize > 0, "the unpack path must carry promoted values");
   assert.ok(unpack > 0, "the unpack call must still be there");
   assert.ok(materialize < unpack, "and the carry must happen BEFORE the unpack");

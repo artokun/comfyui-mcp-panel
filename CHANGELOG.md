@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.183] - 2026-10-01
+
+### Changed
+- Resume limited maintenance of the local panel and provider choice; remove the October 9 shutdown commitment and keep automatic issue reporting disabled. Reassess support when Comfy's official local panel becomes publicly available.
+
+- Supersede the September archive notice with the narrower support policy (#2300).
+### Fixed
+- Unpacking follows reminted interior-node identities and named slots, repairs displaced wires inside one undo step, and rolls back when identity cannot be proven. Temporary provenance never enters saved workflows or undo history (#2311).
+- Lost subgraph-conversion replies recover only from an exact live-graph receipt and recheck serialization; graph reloads and partial selections fail closed rather than duplicating conversions.
+- Workflow mismatch and reconnect guidance protect unsaved edits and no longer recommend reopening the active tab. The underlying frontend provenance defect remains unresolved.
+- Error scans reject detached node objects even when another workflow reuses their IDs, and a readable empty canvas clears stale missing-type records.
+- Generated custom-widget refresh passes serialized widget values to configuration hooks; existing retention verification rejects values overwritten by those hooks.
+
+
+
 ## [0.15.182] - 2026-09-07
 
 ### Fixed

@@ -180,6 +180,11 @@ function runDispatchFence(msg, { activeUuid, onMismatch = () => {}, onMove = () 
     "workflowInstanceMismatchMessage",
     "targetsNonActive",
     "activeWorkflowMoves",
+    // #2139 — the fence now reads the active tab's save state so the discard warning
+    // reaches the refusal an ordinary instance mismatch produces. A `new Function`
+    // harness resolves every dependency BY NAME, so an un-injected one is a
+    // ReferenceError at call time rather than a missing warning.
+    "activeWorkflowSaveState",
     slice,
   );
   factory(
@@ -195,6 +200,7 @@ function runDispatchFence(msg, { activeUuid, onMismatch = () => {}, onMove = () 
       `but the tab routed to has reported active workflow ${live}`,
     false,
     { describeLast: () => null },
+    () => ({ activeIsUnsaved: null, activeIsModified: null }),
   );
 }
 
