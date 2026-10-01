@@ -94,3 +94,55 @@ test('unprovable unpack rolls back the complete workflow without duplicating con
   // Rollback loads a new graph inventory; old provenance must never claim success.
   await expect(command(mockBridge, 'graph_create_subgraph', { node_ids: [child] })).rejects.toThrow(/NOT run|NOT retried/)
 })
+
+test('generated widget configuration gets serialized state and cannot acknowledge an overwritten value', async ({ panel, mockBridge, page }) => {
+  await panel.goto(); await page.keyboard.press('Escape'); await panel.setBridgeUrl(mockBridge.url); await panel.openSidebar(); await panel.connect()
+  await command(mockBridge, 'graph_clear')
+  const id = Number((await command(mockBridge, 'graph_add_node', { class_type: 'EmptyLatentImage' })).added.id)
+  await page.evaluate(async (id) => {
+    const { app } = await import('/scripts/app.js' as string)
+    const n = app.graph.getNodeById(id)
+    n.widgets.find((w: any) => w.name === 'width').hidden = true
+    n.addCustomWidget({ name: 'maintenance_generated_row', type: 'custom', options: { serialize: false },
+      value: 'not a backend value', computeSize: () => [100, 20], draw: () => {} })
+    n.onConfigure = function (info: any) {
+      // Reproduce the reported pack hook's unconditional widgets_values read.
+      this.properties.maintenanceSeen = info.widgets_values[0]
+      if (this.properties.maintenanceOverwrite) this.widgets.find((w: any) => w.name === 'width').value = 512
+    }
+  }, id)
+  const set = await command(mockBridge, 'graph_set_widget', { node_id: id, widget: 'width', value: 1024 })
+  expect(set.set ?? set).not.toHaveProperty('generated_widgets_refresh_failed')
+  expect(await page.evaluate(async id => {
+    const { app } = await import('/scripts/app.js' as string)
+    return app.graph.getNodeById(id).properties.maintenanceSeen
+  }, id)).toBe(1024)
+  await page.evaluate(async id => {
+    const { app } = await import('/scripts/app.js' as string)
+    app.graph.getNodeById(id).properties.maintenanceOverwrite = true
+  }, id)
+  await expect(command(mockBridge, 'graph_set_widget', { node_id: id, widget: 'width', value: 1536 })).rejects.toThrow(/retain|persist|overwrit|requested value/i)
+})
+
+test('error scan refuses detached nodes even when the live graph reuses their IDs', async ({ panel, mockBridge, page }) => {
+  await panel.goto(); await page.keyboard.press('Escape'); await panel.setBridgeUrl(mockBridge.url); await panel.openSidebar(); await panel.connect()
+  await command(mockBridge, 'graph_clear')
+  const id = Number((await command(mockBridge, 'graph_add_node', { class_type: 'EmptyLatentImage' })).added.id)
+  let release!: () => void, reached!: () => void
+  const gate = new Promise<void>(r => { release = r }), held = new Promise<void>(r => { reached = r })
+  await page.route(/\/(api\/)?system_stats(?:\?.*)?$/, async route => {
+    reached(); await gate; await route.continue()
+  })
+  const scan = command(mockBridge, 'graph_get_errors')
+  await held
+  await page.evaluate(async id => {
+    const { app } = await import('/scripts/app.js' as string)
+    const old = app.graph.getNodeById(id), saved = old.serialize()
+    app.graph.remove(old)
+    const replacement = (window as any).LiteGraph.createNode(saved.type)
+    replacement.configure(saved); replacement.id = id; app.graph.add(replacement)
+    if (replacement === old) throw new Error('fixture must replace the node object')
+  }, id)
+  release()
+  await expect(scan).rejects.toThrow(/DIFFERENT workflows|active workflow changed/i)
+})
