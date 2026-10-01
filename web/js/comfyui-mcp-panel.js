@@ -5617,8 +5617,8 @@ function workflowListReadinessRefusalError(reason) {
     "workflow_list could not verify a live workflow identity after the ComfyUI reconnect (" +
       detail +
       ") within the bounded readiness window. This read-only probe changed no workflow target and " +
-      "is safe to retry in a moment; panel_open_workflow(path) can explicitly re-establish the tab " +
-      "if the reconnect does not settle.",
+      "is safe to retry in a moment. Keep the active tab open: reopening a workflow from disk " +
+      "can discard unsaved canvas edits. Retry the identity probe after the reconnect settles.",
   );
   workflowListReadinessRefusals.add(error);
   return error;

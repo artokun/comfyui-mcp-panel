@@ -29,6 +29,17 @@ function handlerBody(src, sig) {
 
 const LIST_BODY = handlerBody(SRC, "async workflow_list()");
 
+test("reconnect refusal preserves the active canvas instead of recommending a disk reload", () => {
+  const fn = SRC.match(/function workflowListReadinessRefusalError\(reason\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(fn);
+  const refuse = new Function("workflowListReadinessRefusals", `${fn}; return workflowListReadinessRefusalError;`)(new WeakSet());
+  const message = refuse("identity not established").message;
+  assert.match(message, /Keep the active tab open/);
+  assert.match(message, /discard unsaved canvas edits/);
+  assert.match(message, /Retry the identity probe/);
+  assert.doesNotMatch(message, /panel_open_workflow|panel_load_workflow/);
+});
+
 function recordSleep() {
   const slept = [];
   return {
