@@ -7,6 +7,9 @@ All notable changes to this project are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- Reconnect reconciliation: the "outcome could not be confirmed" and "cancelled while disconnected" notices now send the run's `prompt_id` as a field, so comfyui-mcp correlates them to the run they are about instead of reporting "the panel reported NO prompt id for this run" and leaving the run's ticket open (comfyui-mcp#2989).
+
+### Fixed
 - panel_set_widget no longer refuses a number written to a backend INT/FLOAT input whose live canvas widget an extension has rebuilt as a label combo. Core `ImageFromBatch.length` is `["INT", {...}]` in `/object_info`, but on the reporter's canvas it rendered as a duration dropdown (`custom`, `30 seconds`, `1 minute`, …), and the integer 16 was refused with `Value 16 is not a valid option for combo widget "length"` listing presets no backend input accepts. The write now consults the freshly fetched server schema for the exact class and concrete input on every write attempt: a declared INT or FLOAT means a combo-shaped live widget is validated and written as a number (the reply discloses `backend_declared_type`), and a non-numeric value — including one of the artifact's own labels, which the live list used to accept and serialize as a string into an INT input — is refused terminally naming the backend type. A server-declared combo (V1 or V2), a STRING input, or a snapshot-only schema leave the write unchanged and still refuse an off-list number (comfyui-mcp#2988)
 
 ## [0.15.184] - 2026-10-14
