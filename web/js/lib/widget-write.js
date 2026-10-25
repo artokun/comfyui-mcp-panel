@@ -1446,14 +1446,18 @@ export function coerceWidgetValue(
     return mergeCompositeFields(name, base, { [subFieldPath]: value });
   }
 
-  // mcp#2988 — `serverNumericType` ("INT" | "FLOAT") is set by runSetWidget ONLY after the
-  // freshly fetched /object_info declared this exact class + input a scalar number and the
-  // live widget was refused as a combo. The combo shape is then a frontend artifact (an
-  // extension turned a core INT widget into a label dropdown), and the value the queued
-  // prompt is validated against is a number — so the write is coerced and validated as
-  // numeric below, never against the artifact's label list. Default null ⇒ unchanged: the
-  // live widget's own shape decides, exactly as before.
-  const numericByServer = serverNumericType === "INT" || serverNumericType === "FLOAT";
+  // mcp#2988 — `serverNumericType` ("INT" | "FLOAT") is what the freshly fetched
+  // /object_info declares for this exact class + concrete input; runSetWidget passes it on
+  // every write attempt. It changes the verdict ONLY for a COMBO-SHAPED widget: that shape
+  // is then a frontend artifact (an extension turned a core INT widget into a label
+  // dropdown), and the value the queued prompt is validated against is a number — so the
+  // write is coerced and validated as numeric below, never against the artifact's label
+  // list, and one of the artifact's own labels is refused as NOT A NUMBER rather than
+  // written as a string into an INT input (codex gate, P1). A widget of any other shape
+  // (number, text, boolean, composite) is untouched by the option, and the default null
+  // leaves every widget's own shape deciding exactly as before.
+  const numericByServer =
+    (serverNumericType === "INT" || serverNumericType === "FLOAT") && isComboWidget(widget);
   if (isComboWidget(widget) && !numericByServer) {
     // ONE read, kept as a snapshot. Never re-read to re-derive a verdict below (#1126).
     const read = readComboOptions(widget);
@@ -1621,9 +1625,9 @@ export function coerceWidgetValue(
       );
     }
     // mcp#2988 — record that the BACKEND's declared type, not the live widget's shape,
-    // admitted this value, so the reply can disclose it. Only when the two disagreed:
-    // an ordinary numeric widget leaves the marker unset.
-    if (numericByServer && out && !isNumericWidget(widget)) {
+    // admitted this value, so the reply can disclose it. `numericByServer` is true only
+    // when the two disagreed; an ordinary numeric widget leaves the marker unset.
+    if (numericByServer && out) {
       out.serverNumericTypeUsed = serverNumericType;
     }
     return num;
@@ -3049,8 +3053,8 @@ export function applyWidgetWrite(
     // combo rejection, so a transient callback failure is re-read before any decision.
     acceptUnreadableComboOptions = false,
     // mcp#2988: "INT" | "FLOAT" when the fresh /object_info declares the concrete input a
-    // scalar number while the live widget presents as a combo. Set by runSetWidget only on
-    // that observation; default null ⇒ the live widget's shape decides, as before.
+    // scalar number. Passed by runSetWidget on every attempt; it only changes the verdict
+    // for a combo-shaped live widget. Default null ⇒ the widget's own shape decides.
     serverNumericType = null,
     // #2143 — WHICH of several widgets sharing this name the caller addressed:
     // `{index, of, label, widget}`, resolved once at the command boundary (graph_set_widget)
@@ -4623,6 +4627,20 @@ export function applyWidgetWrite(
     // caller reaching that acceptance from EITHER ladder branch sees one field with one
     // name, rather than the #507 branch alone naming it at the runSetWidget level.
     ...(coerceOutcome.emptyAcceptanceUsed ? { empty_option_list: true } : {}),
+    // mcp#2988 — the BACKEND's declared scalar type admitted this value while the live
+    // widget presented as a combo. Emitted only on that disagreement; every write where the
+    // widget's own shape decided replies byte-identically to before.
+    ...(coerceOutcome.serverNumericTypeUsed
+      ? {
+          backend_declared_type: coerceOutcome.serverNumericTypeUsed,
+          frontend_widget_shape: "combo",
+          backend_type_note:
+            `The live widget presents as a combo but the ComfyUI backend declares this input ` +
+            `${coerceOutcome.serverNumericTypeUsed}; the value was validated and written as a ` +
+            `number — the queued prompt is checked against the backend schema, not the canvas ` +
+            `widget's option list.`,
+        }
+      : {}),
     // #1519 — what the node's own onWidgetChanged hook did, as DATA. Both fields are
     // emitted ONLY on an OBSERVATION, so every node without the hook — which is every
     // stock ComfyUI node — replies byte-identically to before:

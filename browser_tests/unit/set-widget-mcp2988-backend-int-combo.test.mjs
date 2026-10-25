@@ -11,10 +11,12 @@
 //   "30 seconds", "1 minute", "1-2 minutes", "2-3 minutes", "3-4 minutes", "4-5 minutes".
 //
 // /object_info declares that input `["INT", {...}]`, and the queued prompt is validated
-// against THAT, not against the canvas widget's shape. So runSetWidget now consults the
-// freshly fetched server schema for the exact class + concrete input before running the
-// stale-combo ladder: a declared INT/FLOAT means the value is coerced and validated as a
-// number; anything else leaves the ladder exactly as it was.
+// against THAT, not against the canvas widget's shape. So runSetWidget now reads the freshly
+// fetched server schema for the exact class + concrete input and hands it to every write
+// attempt: a declared INT/FLOAT means a combo-shaped live widget is coerced and validated
+// as a number — on the FIRST attempt, so one of the artifact's own labels is refused rather
+// than written as a string into an INT input; anything else leaves the write exactly as it
+// was.
 //
 // These tests drive the SHIPPED runSetWidget (the same async unit graph_set_widget delegates
 // to) with the fresh-oracle capability wired the way the handler wires it, plus the two
@@ -103,9 +105,9 @@ test("mcp#2988 the reporter's write lands: integer 16 into a backend-declared IN
   );
   assert.equal(node.widgets[1].value, 16, "the number is what serializes into the queued prompt");
   assert.equal(result.applied, true);
-  assert.equal(result.backend_declared_type, "INT", "the reply discloses WHICH schema admitted the value");
-  assert.equal(result.frontend_widget_shape, "combo");
-  assert.match(result.note, /backend declares this input INT/);
+  assert.equal(result.set.backend_declared_type, "INT", "the reply discloses WHICH schema admitted the value");
+  assert.equal(result.set.frontend_widget_shape, "combo");
+  assert.match(result.set.backend_type_note, /backend declares this input INT/);
   assert.equal(refreshCalls, 0, "the stale-combo ladder is not consulted — no refresh can turn labels into an integer");
 });
 
@@ -114,7 +116,7 @@ test("mcp#2988 a numeric STRING is coerced to the number, as on any numeric widg
   const result = await runSetWidget(node, "length", "16", setWidgetOpts(IMAGE_FROM_BATCH_DEFS));
   assert.equal(node.widgets[1].value, 16);
   assert.equal(typeof node.widgets[1].value, "number");
-  assert.equal(result.backend_declared_type, "INT");
+  assert.equal(result.set.backend_declared_type, "INT");
 });
 
 test("mcp#2988 a FLOAT-declared input accepts a fraction", async () => {
@@ -131,13 +133,10 @@ test("mcp#2988 a FLOAT-declared input accepts a fraction", async () => {
     ...HOOKS,
   });
   assert.equal(node.widgets[1].value, 0.5);
-  assert.equal(result.backend_declared_type, "FLOAT");
+  assert.equal(result.set.backend_declared_type, "FLOAT");
 });
 
 test("mcp#2988 a NON-numeric value against a declared INT is refused TERMINALLY, naming the backend type", async () => {
-  // Off the live label list AND not a number. (A label that IS on the live list is accepted
-  // by the first write attempt, before any recovery runs — that pre-existing behaviour is
-  // the extension's own value and is not what this fix is about.)
   const node = reporterNode();
   let refreshCalls = 0;
   await assert.rejects(
@@ -153,7 +152,6 @@ test("mcp#2988 a NON-numeric value against a declared INT is refused TERMINALLY,
     ),
     (err) => {
       assert.match(err.message, /panel_set_widget refused "length" on node 38 \(ImageFromBatch\)/);
-      assert.match(err.message, /against the backend-declared INT type/);
       assert.match(err.message, /declared INT by the ComfyUI backend/);
       assert.match(err.message, /"sixteen" is not a number/);
       assert.doesNotMatch(err.message, /not a valid option for combo widget/, "no verdict against the artifact's label list");
@@ -162,6 +160,38 @@ test("mcp#2988 a NON-numeric value against a declared INT is refused TERMINALLY,
   );
   assert.equal(node.widgets[1].value, "custom", "nothing was written");
   assert.equal(refreshCalls, 0, "a refresh cannot make a label an integer, so none is attempted");
+});
+
+test("mcp#2988 (gate P1) one of the artifact's OWN labels is refused too — it would serialize a string into an INT input", async () => {
+  // Before the rework the backend type was consulted only AFTER a combo refusal, and a label
+  // that IS on the live list never produces one: `"custom"` was accepted by ordinary combo
+  // membership and written as a string into a backend INT. The decision now runs on the
+  // first attempt, so the live label list is never the authority for a server-declared number.
+  for (const label of ["custom", "30 seconds"]) {
+    const node = reporterNode();
+    node.widgets[1].value = "1 minute";
+    let refreshCalls = 0;
+    await assert.rejects(
+      runSetWidget(
+        node,
+        "length",
+        label,
+        setWidgetOpts(IMAGE_FROM_BATCH_DEFS, {
+          refreshCombos: async () => {
+            refreshCalls++;
+          },
+        }),
+      ),
+      (err) => {
+        assert.match(err.message, /declared INT by the ComfyUI backend/);
+        assert.match(err.message, new RegExp(`${JSON.stringify(label)} is not a number`));
+        return true;
+      },
+      `label ${label}`,
+    );
+    assert.equal(node.widgets[1].value, "1 minute", `nothing was written for ${label}`);
+    assert.equal(refreshCalls, 0);
+  }
 });
 
 // ---- CONTROLS: the #240 direction must not move --------------------------------------
@@ -270,6 +300,18 @@ test("mcp#2988 coerceWidgetValue: WITHOUT the option the live combo shape still 
     () => coerceWidgetValue(widget, 16, widget, null, { serverNumericType: "STRING" }),
     (err) => err instanceof WidgetWriteError && err.combo === true,
   );
+});
+
+test("mcp#2988 coerceWidgetValue: the option touches ONLY a combo-shaped widget", () => {
+  // A text widget on a server-declared INT (no such core case, but an extension could make
+  // one) is deliberately left to its own shape: this fix is about the combo misclassification
+  // and nothing wider.
+  const textWidget = { name: "length", type: "text", value: "abc" };
+  const out = {};
+  assert.equal(coerceWidgetValue(textWidget, "abc", textWidget, null, { serverNumericType: "INT", out }), "abc");
+  assert.equal(out.serverNumericTypeUsed, undefined);
+  const boolWidget = { name: "length", type: "toggle", value: false };
+  assert.equal(coerceWidgetValue(boolWidget, "true", boolWidget, null, { serverNumericType: "INT" }), true);
 });
 
 test("mcp#2988 coerceWidgetValue: an ORDINARY numeric widget does not carry the backend marker", () => {

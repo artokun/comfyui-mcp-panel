@@ -1140,6 +1140,39 @@ async function runSetWidgetBody(
   // to the orchestrator and a widget reaches the whole graph through `node.graph`.
   const writtenWidgets = new WeakMap();
 
+  // mcp#2988 — what the BACKEND declares this input to be, read ONCE from the /object_info
+  // payload fetched for type authorization above and handed to EVERY write attempt.
+  //
+  // Core ImageFromBatch.length is `["INT", {...}]` in /object_info; on the reporter's
+  // canvas an extension keyed on the widget name had rebuilt it as a label dropdown
+  // (`custom`, `30 seconds`, `1 minute`, …), so `isComboWidget` saw a combo, the integer 16
+  // was refused as an off-list combo value, and the refusal named duration presets no
+  // backend input accepts. The queued prompt is validated against the SERVER's schema, not
+  // the canvas widget's shape — so when the server declares this exact class + concrete
+  // input "INT" or "FLOAT", coerceWidgetValue treats a combo-shaped live widget as the
+  // numeric input it is: a number is validated and written, and a string — including one
+  // of the artifact's own labels, which the live list would otherwise ACCEPT and serialize
+  // as `"custom"` into an INT input (codex gate, P1) — is a terminal, NON-combo refusal
+  // that names the backend type. Decided on the FIRST attempt, not in the combo-refusal
+  // ladder, precisely so an on-list label cannot slip past it there.
+  //
+  // Why it is safe where #240 is strict: #240 refuses a NUMBER against a combo so it cannot
+  // be silently read as an INDEX into a real option list. Here the server says there IS no
+  // option list for this input — the number is the value itself. The read is the server's
+  // (never `nodeData` off the LiteGraph registry, which a beforeRegisterNodeDef hook can
+  // rewrite into the very shape being doubted); a snapshot-only map carries no `input` and
+  // yields null, as do a V1/V2 combo, a STRING, or a missing input — every one of those
+  // leaves the write exactly as it was. Keyed on the ULTIMATE CONCRETE type + input name
+  // like the ladder's own branches, so a promoted rail resolves to the backend input it
+  // serializes into. Post-write retention is verified by the shared write path unchanged,
+  // so an extension callback that snaps the number back to a label is reported as drift,
+  // never as success.
+  const serverNumericType = serverDeclaredNumericType(
+    freshDefs ?? undefined,
+    authTarget?.type,
+    concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
+  );
+
   const writeAttempt = (extra, writeOut) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
@@ -1216,6 +1249,7 @@ async function runSetWidgetBody(
         promotedResolution,
         occurrence,
         out: writeOut,
+        serverNumericType,
         ...extra,
       });
       preserveDynamicComboChildren();
@@ -1727,55 +1761,6 @@ async function runSetWidgetBody(
     if (!(err instanceof WidgetWriteError)) throw err;
     if (!err.combo) {
       throw refusalFrame(err);
-    }
-
-    // mcp#2988 — the live widget is a combo the BACKEND never declared. Core
-    // ImageFromBatch.length is `["INT", {...}]` in /object_info; on the reporter's canvas
-    // an extension keyed on the widget name had rebuilt it as a label dropdown
-    // (`custom`, `30 seconds`, `1 minute`, …), so the integer 16 was refused as an
-    // off-list combo value and the refusal named duration presets no backend input
-    // accepts. The queued prompt is validated against the SERVER's schema, not the
-    // canvas widget's shape, so the server's schema is what decides here: when the
-    // freshly fetched /object_info declares this exact class + concrete input "INT" or
-    // "FLOAT", the value is coerced and validated as a number and the combo ladder
-    // below (refresh / inventory / upload probe / empty / unreadable) is not consulted
-    // — none of it can turn a label list into an integer.
-    //
-    // Why it is safe where #240 is strict: #240 refuses a NUMBER against a combo so it
-    // cannot be silently read as an INDEX into a real option list. Here the server says
-    // there IS no option list for this input — the number is the value itself. And the
-    // read is the server's: `freshDefs` is the /object_info payload fetched for type
-    // authorization moments ago (a snapshot-only map carries no `input` and yields null,
-    // so it fails closed to the old ladder), keyed on the ULTIMATE CONCRETE type + input
-    // name exactly like the sibling branches below, so a promoted rail resolves to the
-    // backend input it actually serializes into. A non-numeric value against a declared
-    // INT is a terminal, NON-combo refusal that names the backend type — a retry cannot
-    // make "custom" an integer. Post-write retention is verified by the shared write path
-    // unchanged, so an extension callback that snaps the number back to a label is
-    // reported as the drift it is, never as success.
-    const serverNumericType = serverDeclaredNumericType(
-      freshDefs ?? undefined,
-      authTarget?.type,
-      concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
-    );
-    if (serverNumericType) {
-      try {
-        return await succeedWrite(
-          { serverNumericType },
-          {
-            backend_declared_type: serverNumericType,
-            frontend_widget_shape: "combo",
-            note:
-              `The live widget presents as a combo but the ComfyUI backend declares this ` +
-              `input ${serverNumericType}; the value was validated and written as a number ` +
-              `(the queued prompt is checked against the backend schema, not the canvas ` +
-              `widget's option list).`,
-          },
-        );
-      } catch (numErr) {
-        if (!(numErr instanceof WidgetWriteError)) throw numErr;
-        throw refusalFrame(numErr, ` against the backend-declared ${serverNumericType} type`);
-      }
     }
 
     // STALE-COMBO RECOVERY (#338/#317/#299/#288/#284/#304): a just-downloaded model /
