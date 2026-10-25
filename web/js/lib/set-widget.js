@@ -60,6 +60,7 @@ import {
   applyComboInventory,
   addComboOption,
   serverDeclaresEmptyComboOptions,
+  serverDeclaredNumericType,
   serverDeclaresRemoteComboOptions,
 } from "./input-asset.js";
 import { withTimeout } from "./bounded-step.js";
@@ -1139,6 +1140,39 @@ async function runSetWidgetBody(
   // to the orchestrator and a widget reaches the whole graph through `node.graph`.
   const writtenWidgets = new WeakMap();
 
+  // mcp#2988 — what the BACKEND declares this input to be, read ONCE from the /object_info
+  // payload fetched for type authorization above and handed to EVERY write attempt.
+  //
+  // Core ImageFromBatch.length is `["INT", {...}]` in /object_info; on the reporter's
+  // canvas an extension keyed on the widget name had rebuilt it as a label dropdown
+  // (`custom`, `30 seconds`, `1 minute`, …), so `isComboWidget` saw a combo, the integer 16
+  // was refused as an off-list combo value, and the refusal named duration presets no
+  // backend input accepts. The queued prompt is validated against the SERVER's schema, not
+  // the canvas widget's shape — so when the server declares this exact class + concrete
+  // input "INT" or "FLOAT", coerceWidgetValue treats a combo-shaped live widget as the
+  // numeric input it is: a number is validated and written, and a string — including one
+  // of the artifact's own labels, which the live list would otherwise ACCEPT and serialize
+  // as `"custom"` into an INT input (codex gate, P1) — is a terminal, NON-combo refusal
+  // that names the backend type. Decided on the FIRST attempt, not in the combo-refusal
+  // ladder, precisely so an on-list label cannot slip past it there.
+  //
+  // Why it is safe where #240 is strict: #240 refuses a NUMBER against a combo so it cannot
+  // be silently read as an INDEX into a real option list. Here the server says there IS no
+  // option list for this input — the number is the value itself. The read is the server's
+  // (never `nodeData` off the LiteGraph registry, which a beforeRegisterNodeDef hook can
+  // rewrite into the very shape being doubted); a snapshot-only map carries no `input` and
+  // yields null, as do a V1/V2 combo, a STRING, or a missing input — every one of those
+  // leaves the write exactly as it was. Keyed on the ULTIMATE CONCRETE type + input name
+  // like the ladder's own branches, so a promoted rail resolves to the backend input it
+  // serializes into. Post-write retention is verified by the shared write path unchanged,
+  // so an extension callback that snaps the number back to a label is reported as drift,
+  // never as success.
+  const serverNumericType = serverDeclaredNumericType(
+    freshDefs ?? undefined,
+    authTarget?.type,
+    concreteWidgetName ?? writeTargetWidgetName ?? widgetName,
+  );
+
   const writeAttempt = (extra, writeOut) => {
     // No await follows this check before applyWidgetWrite, whose mutation is
     // synchronous. A workflow switch while the fresh-object-info fetch was in
@@ -1215,6 +1249,7 @@ async function runSetWidgetBody(
         promotedResolution,
         occurrence,
         out: writeOut,
+        serverNumericType,
         ...extra,
       });
       preserveDynamicComboChildren();
