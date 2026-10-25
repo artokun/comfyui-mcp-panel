@@ -42443,9 +42443,16 @@ function buildPanel() {
     // non-urgent event protocol, and does not claim an output was produced.
     onReconcileInterrupted: ({ promptId }) => {
       const note =
-        `The workflow run you queued was cancelled while the connection was down (prompt ${promptId}). ` +
+        `The queued workflow run (prompt ${promptId}) was cancelled while the connection was down. ` +
         `It did not crash; no action is required unless the cancellation was unintended.`;
-      const sent = client.sendFrame({ type: "agent_event", kind: "executed", note });
+      // comfyui-mcp#2989 — carry the id as a FIELD, not only in the prose. The
+      // orchestrator correlates a completion by `prompt_id` alone; a frame that
+      // names the run only in its note is filed as ID-LESS and the agent is told
+      // "the panel reported NO prompt id … CANNOT be correlated" about a run this
+      // panel knows exactly. With the field, the notice lands on the run's own
+      // ticket (settling it, so nothing keeps waiting on a cancelled render) and
+      // the orchestrator — not this sentence — states whose run it was.
+      const sent = client.sendFrame({ type: "agent_event", kind: "executed", prompt_id: promptId, note });
       if (sent)
         appendSystem(
           tr("panel.queued_render_was_cancelled_while_disconnected_prompt", "Queued render was cancelled while disconnected (prompt {promptId}).", {
@@ -42481,11 +42488,16 @@ function buildPanel() {
       //
       // Everything else this path does is unchanged: the delivery-unconfirmed flag
       // (#585), the reboot-marker prune, and the one-time surfacing below.
+      // comfyui-mcp#2989 — same as the interrupted path: the id rides as a field
+      // so this correlates to the run it is about instead of being reported as
+      // id-less, and so it is delivered ONCE against that ticket rather than as an
+      // unattributable notice the agent is told to go and verify.
       const sent = client.sendFrame({
         type: "agent_event",
         kind: "executed",
+        prompt_id: promptId,
         note:
-          `The outcome of your queued run (prompt ${promptId}) could NOT be confirmed after ` +
+          `The outcome of the queued run (prompt ${promptId}) could NOT be confirmed after ` +
           `reconnecting — the server has no history for it, which is what a cancelled or ` +
           `interrupted run looks like. This is NOT a reported failure: nothing was observed ` +
           `going wrong. It is also not proof nothing was produced — if the connection dropped ` +

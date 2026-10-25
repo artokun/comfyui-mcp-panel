@@ -135,3 +135,30 @@ test("#1489 run_error is STILL used where a failure is actually known", () => {
     "at least one path must still report a KNOWN failure as urgent, or errors go unnoticed",
   );
 });
+
+// comfyui-mcp#2989 — the orchestrator correlates a completion by its `prompt_id`
+// FIELD alone (run-completion-journal: `correlate()` reads `payload.prompt_id`,
+// never the note). A frame that names the run only in prose is filed as
+// ID-LESS: the agent is told "the panel reported NO prompt id for this run, so
+// it CANNOT be correlated" about a run this panel knows exactly, and the run's
+// ticket is never settled, so a later sweep can raise it again. Measured on
+// comfyui-mcp main: a `{kind:"executed", note}` frame → `unidentified`, ticket
+// still awaiting after ack; the same frame with `prompt_id` → `matched`, ticket
+// settled, and a resend flagged `alreadyDelivered` (suppressed by the ingress).
+test("mcp#2989 the give-up notice carries the prompt id as a FIELD, not only in its prose", () => {
+  const body = giveUpBody();
+  assert.match(body, /prompt_id: promptId/, "the orchestrator correlates on this field alone");
+});
+
+test("mcp#2989 the interrupted notice carries the prompt id as a FIELD too", () => {
+  const body = interruptedBody();
+  assert.match(body, /prompt_id: promptId/, "same correlation rule, same fix");
+});
+
+test("mcp#2989 neither note asserts WHOSE run it was — the orchestrator's correlation preamble does", () => {
+  // Once the frame correlates, the orchestrator prefixes "This is the run YOU
+  // queued" or "does NOT match any run you queued". A note that also says "your
+  // queued run" would contradict the second of those for a canvas-queued run.
+  assert.doesNotMatch(giveUpBody(), /your queued run/i);
+  assert.doesNotMatch(interruptedBody(), /run you queued/i);
+});
