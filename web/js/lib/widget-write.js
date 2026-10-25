@@ -1377,7 +1377,7 @@ export function coerceWidgetValue(
   value,
   mergeBaseWidget = widget,
   subFieldPath = null,
-  { acceptEmptyComboOptions = false, acceptUnreadableComboOptions = false, out } = {},
+  { acceptEmptyComboOptions = false, acceptUnreadableComboOptions = false, serverNumericType = null, out } = {},
 ) {
   const name = widget?.name ?? "(widget)";
 
@@ -1446,7 +1446,15 @@ export function coerceWidgetValue(
     return mergeCompositeFields(name, base, { [subFieldPath]: value });
   }
 
-  if (isComboWidget(widget)) {
+  // mcp#2988 — `serverNumericType` ("INT" | "FLOAT") is set by runSetWidget ONLY after the
+  // freshly fetched /object_info declared this exact class + input a scalar number and the
+  // live widget was refused as a combo. The combo shape is then a frontend artifact (an
+  // extension turned a core INT widget into a label dropdown), and the value the queued
+  // prompt is validated against is a number — so the write is coerced and validated as
+  // numeric below, never against the artifact's label list. Default null ⇒ unchanged: the
+  // live widget's own shape decides, exactly as before.
+  const numericByServer = serverNumericType === "INT" || serverNumericType === "FLOAT";
+  if (isComboWidget(widget) && !numericByServer) {
     // ONE read, kept as a snapshot. Never re-read to re-derive a verdict below (#1126).
     const read = readComboOptions(widget);
     const options = read.options;
@@ -1593,7 +1601,7 @@ export function coerceWidgetValue(
     throw new WidgetWriteError(describeOffListCombo(name, value, options), { combo: true });
   }
 
-  if (isNumericWidget(widget)) {
+  if (isNumericWidget(widget) || numericByServer) {
     // Accept ONLY a finite number, or a non-blank numeric string. Reject
     // arrays/objects/booleans/null/whitespace — Number([])===0 and
     // Number([5])===5 would otherwise silently mutate an INT/FLOAT slot.
@@ -1604,9 +1612,19 @@ export function coerceWidgetValue(
       num = Number(value);
     } else {
       throw new WidgetWriteError(
-        `Widget "${name}" is numeric (type ${widget?.type}) but value ` +
-          `${JSON.stringify(value)} is not a number.`,
+        numericByServer
+          ? `Widget "${name}" is declared ${serverNumericType} by the ComfyUI backend (the live ` +
+              `widget's combo shape is a frontend artifact) but value ${JSON.stringify(value)} is ` +
+              `not a number.`
+          : `Widget "${name}" is numeric (type ${widget?.type}) but value ` +
+              `${JSON.stringify(value)} is not a number.`,
       );
+    }
+    // mcp#2988 — record that the BACKEND's declared type, not the live widget's shape,
+    // admitted this value, so the reply can disclose it. Only when the two disagreed:
+    // an ordinary numeric widget leaves the marker unset.
+    if (numericByServer && out && !isNumericWidget(widget)) {
+      out.serverNumericTypeUsed = serverNumericType;
     }
     return num;
   }
@@ -3030,6 +3048,10 @@ export function applyWidgetWrite(
     // a non-empty string as written. Default false ⇒ the unreadable case is a RETRYABLE
     // combo rejection, so a transient callback failure is re-read before any decision.
     acceptUnreadableComboOptions = false,
+    // mcp#2988: "INT" | "FLOAT" when the fresh /object_info declares the concrete input a
+    // scalar number while the live widget presents as a combo. Set by runSetWidget only on
+    // that observation; default null ⇒ the live widget's shape decides, as before.
+    serverNumericType = null,
     // #2143 — WHICH of several widgets sharing this name the caller addressed:
     // `{index, of, label, widget}`, resolved once at the command boundary (graph_set_widget)
     // from the "NAME[i]" / display-label form. Re-applied HERE against the LIVE widget list;
@@ -3062,6 +3084,7 @@ export function applyWidgetWrite(
     resolveWidgetWrite(node, widgetName, value, resolveSource, assertTargetWritable, promotedResolution, {
       acceptEmptyComboOptions,
       acceptUnreadableComboOptions,
+      serverNumericType,
       // Filled in by coerceWidgetValue with WHICH acceptance admitted the value — the
       // EMPTY-LIST one (#507) or the UNREADABLE-LIST one (#1126) — rather than ordinary
       // membership. Read below; NEVER re-derived by reading the option list again, since

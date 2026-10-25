@@ -293,6 +293,44 @@ export function serverDeclaresRemoteComboOptions(defsByType, type, widgetName) {
 }
 
 /**
+ * mcp#2988 — the backend's DECLARED scalar numeric type for `widgetName` on `type`:
+ * the literal string "INT" or "FLOAT", or null when the server declares anything else.
+ *
+ * The question this answers is narrower than "is this widget numeric?". The LIVE widget
+ * can be anything a frontend extension made it — the reported case is core
+ * ImageFromBatch.length, declared `["INT", {...}]` by /object_info, rendered on the canvas
+ * as a label combo (`custom`, `30 seconds`, `1 minute`, …) by an extension that keys on
+ * the widget NAME. `isComboWidget` sees an `options.values` array and classifies it as a
+ * combo, so panel_set_widget refused the integer 16 as an off-list combo value and named
+ * duration presets the backend has never heard of. Only the server's own schema can say
+ * which of the two the queued prompt is validated against, so only the server's word is
+ * read here — never `nodeData` off the LiteGraph registry, which a beforeRegisterNodeDef
+ * hook can have rewritten into exactly the shape being doubted.
+ *
+ * Fails CLOSED on every uncertainty: no defs, no def for the type, a snapshot-only def
+ * (type names only, no `input`), no such input, a non-array spec, or any declared type
+ * other than the two literal strings all return null — and the caller then takes the
+ * ordinary combo ladder exactly as before. A V1 combo (`[[...], cfg]`) has an array at
+ * `spec[0]`, a V2 combo has the string "COMBO": neither is "INT"/"FLOAT", so a real combo
+ * can never be reclassified by this read.
+ */
+export function serverDeclaredNumericType(defsByType, type, widgetName) {
+  try {
+    if (!defsByType || !type || !widgetName) return null;
+    const input = defsByType[type]?.input;
+    if (!input) return null;
+    const spec =
+      (input.required && input.required[widgetName]) ??
+      (input.optional && input.optional[widgetName]);
+    if (!Array.isArray(spec)) return null;
+    const declared = spec[0];
+    return declared === "INT" || declared === "FLOAT" ? declared : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * True when `value`'s file extension is a plausibly-LOADABLE asset for the upload
  * `config`'s kind (image/video/audio/model). This is the strictness gate on top of a
  * mere server-existence probe (#240): `/view?type=input` confirms the file is on disk
