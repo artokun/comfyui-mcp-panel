@@ -51,6 +51,10 @@
     "name": "Generated media in chat",
     "tooltip": "Show generated images, videos, and audio as cards in the chat transcript. Turn off to keep the transcript text-only; the agent still receives the outputs (including storyboards and completion frames). Applies to media generated after the change. Cards already in the chat stay; suppressed cards are not saved and will not reappear after a reload."
   },
+  "comfyui-mcp_ownRunMedia": {
+    "name": "Post my own runs' outputs in chat",
+    "tooltip": "Also show outputs of runs you queue yourself from ComfyUI. Off: only runs the agent queued are posted. The agent gets your runs' filenames either way, never their pixels."
+  },
   "comfyui-mcp_videoPreviews": {
     "name": "Inline video playback in chat",
     "tooltip": "Play generated videos inline in the chat. Turn off to save RAM: a video then appears as a placeholder with its first frame and filename, and clicking it opens the full video in the lightbox. This does not hide videos from the chat — use Generated media in chat for that. Applies to videos generated after the change; cards already in the chat keep their player."

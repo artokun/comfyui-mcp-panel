@@ -150,7 +150,7 @@ function productionOnExecuted({ chatMediaSetting = undefined, isAudioOutput = ()
     (url, name) => painted.video.push({ url, name }),
     (url, name) => painted.audio.push({ url, name }),
     (url, name) => painted.image.push({ url, name }),
-    { onExecuted: (promptId, output) => buffered.push({ promptId, output }) },
+    { onExecuted: (promptId, output) => buffered.push({ promptId, output }), isPanelRun: () => true },
     () => {},
     {},
     createStoryboardIdentity,

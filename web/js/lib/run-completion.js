@@ -1987,6 +1987,15 @@ export function createRunCompletionTracker({
     },
 
     /**
+     * True when panel_run queued `id`, or an open panel_run dispatch may still
+     * own it. False for runs the user queued from ComfyUI itself.
+     */
+    isPanelRun(id) {
+      const k = key(id);
+      return panelQueued.has(k) || panelRunDispatchCandidates.has(k);
+    },
+
+    /**
      * Every real prompt_id that is still owed a completion frame. Snapshotted when
      * a reboot is armed so the post-restart resume can be correlated to THOSE runs
      * specifically, never to a global "is anything pending" count — which an

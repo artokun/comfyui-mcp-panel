@@ -570,6 +570,7 @@ function makeProductionCompletionHandlers(runCompletion) {
     "chatMediaEnabled",
     "getSetting",
     "SETTING_CHAT_MEDIA",
+    "SETTING_OWN_RUN_MEDIA",
     `return (runCompletion) => [
       (${sourceBetween("  function onExecuted(ev) {", "  function onExecError(ev)")}),
       (${sourceBetween("  function onExecutionSuccess(ev) {", "  // Primary render-duration start signal")}),
@@ -591,6 +592,7 @@ function makeProductionCompletionHandlers(runCompletion) {
     (v) => v !== false,
     () => undefined,
     "comfyui-mcp.chatMedia",
+    "comfyui-mcp.ownRunMedia",
   )(runCompletion);
 }
 
@@ -862,6 +864,7 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
     "chatMediaEnabled",
     "getSetting",
     "SETTING_CHAT_MEDIA",
+    "SETTING_OWN_RUN_MEDIA",
     `return (runCompletion) => [
       (${panelSrc.slice(onExecutedStart, onExecutedEnd).trim()}),
       (${panelSrc.slice(
@@ -890,6 +893,7 @@ test("#1805 production event wiring: a cached completion reaches the agent frame
     (v) => v !== false,
     () => undefined,
     "comfyui-mcp.chatMedia",
+    "comfyui-mcp.ownRunMedia",
   );
 
   const registrationStart = panelSrc.indexOf(

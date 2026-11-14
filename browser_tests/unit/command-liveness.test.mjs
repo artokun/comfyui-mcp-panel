@@ -1013,11 +1013,6 @@ test("#1095 codex P1: BOTH outbound send paths consult the advertised route firs
   assert.ok(umMergeAt !== -1 && umClearAt !== -1, "the one-shot merge and clear must still be here");
   assert.ok(umRefuseAt < umMergeAt, "the refusal must precede the one-shot merge");
   assert.ok(umRefuseAt < umClearAt, "…and the clear that consumes it");
-  // `AGENT_BLIND` may still run before the refusal — it only nulls a local, consuming nothing.
-  assert.ok(
-    umBody.indexOf("if (AGENT_BLIND) images = undefined;") > umRefuseAt,
-    "nothing that mutates caller state may run before the refusal",
-  );
   // The CALL, not the word — the comment above it names holdForRoute to explain why this
   // path deliberately does not use it.
   assert.equal(

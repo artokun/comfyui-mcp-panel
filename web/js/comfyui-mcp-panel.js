@@ -6247,6 +6247,11 @@ const SETTING_VIDEO_PREVIEWS = "comfyui-mcp.videoPreviews";
 // videos / storyboard / completion frames are untouched. Read per executed
 // completion so a toggle applies to the next output without a reload.
 const SETTING_CHAT_MEDIA = "comfyui-mcp.chatMedia";
+// Chat attachments upload into input/<this>/ so they stay out of the input root.
+const ATTACHMENT_SUBFOLDER = "comfyui-mcp";
+// Also paint outputs of runs the user queued from ComfyUI (not panel_run). Off
+// by default: ComfyUI's own assets panel already shows them.
+const SETTING_OWN_RUN_MEDIA = "comfyui-mcp.ownRunMedia";
 // RETIRED setting ids (mcp#884): "comfyui-mcp.sessionFollowsPanel" (legacy
 // boolean) and "comfyui-mcp.chatScope" (panel/workflow/ask combo). The
 // conversation is always panel-owned now; stored values under these ids are
@@ -7276,6 +7281,17 @@ function panelSettingsList() {
         "saved and will not reappear after a reload.",
       type: "boolean",
       defaultValue: true,
+    },
+    {
+      id: SETTING_OWN_RUN_MEDIA,
+      name: "Post my own runs' outputs in chat",
+      get category() { return cat(tr("panel.general", "General"), "Post my own runs' outputs in chat"); },
+      sortOrder: 150,
+      tooltip:
+        "Also show outputs of runs you queue yourself from ComfyUI. Off: only runs the agent queued are posted. " +
+        "The agent gets your runs' filenames either way, never their pixels.",
+      type: "boolean",
+      defaultValue: false,
     },
     {
       id: SETTING_VIDEO_PREVIEWS,
@@ -30370,6 +30386,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
           "open_training", "training_get_state", "training_set_field",
           "training_goto_step", "training_set_target", "training_highlight",
           "training_close", "training_set_dock",
+          // Pulled by the orchestrator on every hello, never by the agent.
+          "graph_get_virtual_types",
         ]);
         if (!SILENT_CMDS.has(msg.cmd)) {
           onCommand?.(msg.cmd, msg, reply);
@@ -31185,11 +31203,8 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       // before the merge means a refusal consumes nothing at all, structurally, rather than
       // by remembering to put back everything a later edit might take.
       if (advertisedRouteIsStale()) return false;
-      // Blind mode withholds pixels from EVERY agent-facing path — including
-      // images explicitly attached to a typed user message. The sendFrame() gate
-      // below only covers agent_event, so without this a blind session still
-      // leaks user attachments into the user_message frame (#174, privacy).
-      if (AGENT_BLIND) images = undefined;
+      // Images here were attached or mentioned by the user, so Blind does not
+      // strip them; Blind gates the agent's own image tools and run feed.
       // Merge any armed one-shot context (transcript replay) ahead of this
       // message's own context, then clear it so it's sent exactly once.
       // The composer passes context as a `{ workflow, subgraph }` OBJECT; the
@@ -32198,6 +32213,11 @@ const PANEL_CSS = `
      overflow-wrap:anywhere rather than break-word so it also breaks MID-token
      when the token alone is wider than the panel, which is the case here. */
   max-width: 100%; overflow-wrap: anywhere; text-align: center;
+}
+.cmcp-sys.cmcp-local { opacity: 0.75; }
+.cmcp-local-tag {
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7692); font-style: italic;
+  color: var(--p-text-muted-color, #a1a1aa); margin-top: 0.15rem;
 }
 .cmcp-card {
   align-self: flex-start; max-width: 92%; width: 100%; box-sizing: border-box;
@@ -36116,7 +36136,8 @@ function buildPanel() {
       ? tr(
           "panel.image_feed_blind",
           "Image feed: BLIND — the agent still gets text notifications about renders and results, but " +
-            "NEVER receives the image pixels. Click to allow images again.",
+            "its own tools never receive image pixels. Images you attach to a message are still sent. " +
+            "Click to allow images again.",
         )
       : tr(
           "panel.image_feed_on",
@@ -36137,10 +36158,25 @@ function buildPanel() {
   window.addEventListener("cmcp:set-content-mode-ack", () => {
     if (_blindAckPending) { clearTimeout(_blindAckPending); _blindAckPending = null; }
   });
+  // Each Blind change the orchestrator applies restarts the agent session, so
+  // rapid clicks are settled first and only a net change is sent.
+  let _blindSendTimer = null;
+  let _blindSent = AGENT_BLIND;
+  // Session id when the last Blind change was sent; bindSession compares the
+  // next bound id against it to catch a restart that did not resume.
+  let blindRestartFrom = null;
   blindBtn.onclick = () => {
     AGENT_BLIND = !AGENT_BLIND;
     try { localStorage.setItem("cmcp.blindAgents", AGENT_BLIND ? "1" : "0"); } catch {}
     reflectFeedGates();
+    clearTimeout(_blindSendTimer);
+    _blindSendTimer = setTimeout(sendBlindMode, 1500);
+  };
+  function sendBlindMode() {
+    _blindSendTimer = null;
+    if (AGENT_BLIND === _blindSent) return;
+    _blindSent = AGENT_BLIND;
+    blindRestartFrom = thread?.sessionId || null;
     // Issue #90: Blind must also gate the comfyui MCP's image tools
     // (get_image action:"get"/"view" return pixels straight from /view). Tell the
     // orchestrator so it respawns this tab's tool server with the blind env —
@@ -36166,7 +36202,7 @@ function buildPanel() {
         );
       }, 6000);
     }
-  };
+  }
   ring.style.cursor = "pointer"; ring.onclick = deafenBtn.onclick; // clicking the ring toggles deafen
   reflectFeedGates();
 
@@ -37053,6 +37089,17 @@ function buildPanel() {
       const replay = buildReplayTranscript();
       if (replay) client?.armContext?.(replay);
     }
+    if (sessionId && blindRestartFrom && sessionId !== blindRestartFrom) {
+      appendSystem(
+        tr(
+          "panel.session_restarted_context_dropped",
+          "⚠ The agent session restarted as a new session after the Blind change — earlier context did not carry over. Your next message includes the visible transcript.",
+        ),
+      );
+      const replay = buildReplayTranscript();
+      if (replay) client?.armContext?.(replay);
+    }
+    if (sessionId) blindRestartFrom = null;
     ssSet(SESSION_KEY, sessionId);
     if (thread) {
       const values = { sessionId: sessionId || null };
@@ -39271,14 +39318,34 @@ function buildPanel() {
     return true;
   }
 
-  function appendSystem(text) {
+  function appendSystem(text, { replaceKey = null } = {}) {
     // System notices are transient — painted, never recorded. Coerce so a
     // structured value can never render as "[object Object]" (#276).
+    // `replaceKey` folds a run of the same notice into one row.
+    const last = thinkingEl && log.lastElementChild === thinkingEl ? thinkingEl.previousElementSibling : log.lastElementChild;
+    if (replaceKey && last?.dataset.replaceKey === replaceKey) {
+      last.textContent = coerceMessageText(text);
+      return;
+    }
     const b = document.createElement("div");
     b.className = "cmcp-sys";
+    markLocalOnly(b);
+    if (replaceKey) b.dataset.replaceKey = replaceKey;
     b.textContent = coerceMessageText(text);
     log.appendChild(b);
     scrollLog();
+  }
+
+  // Rows painted for the user only. `label` adds a visible tag for cards that
+  // would otherwise read as agent context.
+  function markLocalOnly(el, label = null) {
+    el.classList.add("cmcp-local");
+    el.title = label || tr("panel.local_only", "Panel note · not sent to the agent");
+    if (!label) return;
+    const tag = document.createElement("div");
+    tag.className = "cmcp-local-tag";
+    tag.textContent = label;
+    el.appendChild(tag);
   }
 
   /**
@@ -40158,7 +40225,7 @@ function buildPanel() {
         );
         // The armContext line just above is AGENT-facing and stays English; this one is
         // the transcript note the human reads, so only this one is translated.
-        appendSystem(tr("panel.canvas_same_conversation", "Canvas → {name} (same conversation).", { name }));
+        appendSystem(tr("panel.canvas_same_conversation", "Canvas → {name} (same conversation).", { name }), { replaceKey: "canvas" });
       }
       return;
     }
@@ -42411,6 +42478,9 @@ function buildPanel() {
       storyboardFrameCount,
       paintImage,
       applyVideoPoster,
+      showsRunMedia: (promptId) =>
+        chatMediaEnabled(getSetting(SETTING_CHAT_MEDIA)) &&
+        (runCompletion.isPanelRun(promptId) || getSetting(SETTING_OWN_RUN_MEDIA) === true),
       videoStoryboardEnabled: () => prefs.videoStoryboard !== false,
       agentReceivesImages: () => !AGENT_BLIND,
       isAgentMuted: () => AGENT_MUTED,
@@ -43388,7 +43458,13 @@ function buildPanel() {
     // #2034 — read per completion, not at mount. An unreadable store must not
     // hide cards (`!== false`); skipping paint skips recordMedia so a suppressed
     // card is not replayed. Agent-visible buffers below still fill.
-    const chatMediaOn = chatMediaEnabled(getSetting(SETTING_CHAT_MEDIA));
+    // Runs the user queued from ComfyUI only paint when SETTING_OWN_RUN_MEDIA is
+    // on; the agent gets their filenames on the completion frame, never pixels.
+    const ownRun = !runCompletion.isPanelRun(d.prompt_id);
+    const chatMediaOn = chatMediaEnabled(getSetting(SETTING_CHAT_MEDIA)) && (!ownRun || getSetting(SETTING_OWN_RUN_MEDIA) === true);
+    const markOwnRun = () => {
+      if (ownRun) markLocalOnly(log.lastElementChild, tr("panel.own_run_media", "Your run · the agent gets the filename only"));
+    };
     for (const m of media) {
       if (!m || !m.filename) continue;
       const url = imageViewUrl(m);
@@ -43398,7 +43474,10 @@ function buildPanel() {
         // source decode, and late poster callback all address this render only.
         const storyboardIdentity = createStoryboardIdentity();
         const videoUrl = appendStoryboardCacheBust(url, storyboardIdentity);
-        if (chatMediaOn) paintVideo(videoUrl, m.filename);
+        if (chatMediaOn) {
+          paintVideo(videoUrl, m.filename);
+          markOwnRun();
+        }
         // Carry the node id so the deferred storyboard event can name its node,
         // plus the exact URL/identity used by the already-painted card.
         videos.push({ m, nodeId, videoUrl, storyboardIdentity });
@@ -43408,7 +43487,10 @@ function buildPanel() {
         // blocks, so audio there would be both a broken picture and a claim of
         // something the agent cannot perceive (#710). It IS reported by NAME on
         // the completion frame (#2126), which is the honest half.
-        if (chatMediaOn) paintAudio(url, m.filename);
+        if (chatMediaOn) {
+          paintAudio(url, m.filename);
+          markOwnRun();
+        }
         audios.push(m);
       } else {
         // #1834 — THE CARD's URL is the one that has to be unique, not just the
@@ -43429,7 +43511,10 @@ function buildPanel() {
         // probe could agree with — a key minted here would just make the note
         // describe a different file from the one on screen. Closing it needs a
         // per-run identity threaded through the tracker's buffer and flush.
-        if (chatMediaOn) paintImage(appendImageCacheBust(url, runCacheKey), m.filename);
+        if (chatMediaOn) {
+          paintImage(appendImageCacheBust(url, runCacheKey), m.filename);
+          markOwnRun();
+        }
         inlineImages.push(m);
       }
     }
@@ -43442,7 +43527,10 @@ function buildPanel() {
     // surface. No cache-bust: audio has no poster/probe pair to keep on one URL.
     for (const m of audioBag) {
       if (!m || !m.filename) continue;
-      if (chatMediaOn) paintAudio(imageViewUrl(m), m.filename);
+      if (chatMediaOn) {
+        paintAudio(imageViewUrl(m), m.filename);
+        markOwnRun();
+      }
       audios.push(m);
     }
     // Buffer this run's outputs (images AND videos) instead of delivering per
@@ -45402,6 +45490,7 @@ function buildPanel() {
       chip.className = "cmcp-attach-chip";
       if (att.id === openPreviewId) chip.classList.add("open");
       chip.title = tr("panel.click_to_preview", "Click to preview");
+      if (att.inputRef) chip.title = `input/${att.inputRef}\n${chip.title}`;
       if (att.kind === "image" && att.dataUrl) {
         const img = document.createElement("img");
         img.className = "cmcp-attach-thumb";
@@ -45510,6 +45599,7 @@ function buildPanel() {
       try {
         const fd = new FormData();
         fd.append("image", file, name);
+        fd.append("subfolder", ATTACHMENT_SUBFOLDER);
         // #1188 — read the measurements ONCE, before anything can fail on them. A `size` or
         // `type` that throws would otherwise throw AGAIN inside the catch that reports it,
         // escape the handler, and REJECT `att.ready` — which the send path awaits and is
@@ -45591,6 +45681,7 @@ function buildPanel() {
         const fd = new FormData();
         // ComfyUI's /upload/image writes ANY uploaded file verbatim into input/.
         fd.append("image", file, name);
+        fd.append("subfolder", ATTACHMENT_SUBFOLDER);
         // #1188 — read the measurements ONCE. Same reason as the image path above: a
         // throwing `size`/`type` getter would throw again inside the reporting catch and
         // reject `att.ready`.
@@ -46448,6 +46539,8 @@ function buildPanel() {
     const paintMedia = () => {
       for (const a of refImgs) if (a.dataUrl) paintImage(a.dataUrl, a.name);
       for (const a of refVideos) if (a.ref) paintVideo(imageViewUrl(a.ref), a.name);
+      const saved = [...refImgs, ...refVideos, ...refUploads].filter((a) => a.inputRef).map((a) => `input/${a.inputRef}`);
+      if (saved.length) appendSystem(tr("panel.attachments_saved_to", "Saved to ComfyUI: {paths}", { paths: saved.join(", ") }));
     };
     if (!isQueued) paintMedia();
 
