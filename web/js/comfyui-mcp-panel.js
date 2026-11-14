@@ -6252,6 +6252,10 @@ const ATTACHMENT_SUBFOLDER = "comfyui-mcp";
 // Also paint outputs of runs the user queued from ComfyUI (not panel_run). Off
 // by default: ComfyUI's own assets panel already shows them.
 const SETTING_OWN_RUN_MEDIA = "comfyui-mcp.ownRunMedia";
+// The panel body hosts an OpenCode web UI instead of the built-in chat.
+const SETTING_OPENCODE_URL = "comfyui-mcp.opencodeUrl";
+const DEFAULT_OPENCODE_URL = "http://127.0.0.1:28894/";
+const SETTING_OPENCODE_SCALE = "comfyui-mcp.opencodeScale";
 // RETIRED setting ids (mcp#884): "comfyui-mcp.sessionFollowsPanel" (legacy
 // boolean) and "comfyui-mcp.chatScope" (panel/workflow/ask combo). The
 // conversation is always panel-owned now; stored values under these ids are
@@ -6831,97 +6835,6 @@ function panelSettingsList() {
   // then API tokens LAST — NOT the alphabetical default.
   // (Verified against the installed comfyui_frontend_package SettingDialog.vue.)
   // Section MAX sortOrder: About 200 > General 150 > Claude 130 > Codex 110 > Gemini 90 > tokens 20.
-  //
-  // A per-backend "Default model" — a render-fn DROPDOWN of the FETCHED models for
-  // THAT backend (the same catalog the composer picker shows). Static `combo`s
-  // can't be repopulated, hence the custom render-fn. Each group is INDEPENDENT and
-  // STATIC: the Claude group only reads/writes the Claude setting + Claude catalog,
-  // the Codex group only the Codex ones — neither resets the other on a switch.
-  // "Auto" clears the forced model. We gate the LIVE applier on settingsArmed AND
-  // on this being the ACTIVE backend's group (a non-active group's edit only
-  // persists; it must not drive the running agent).
-  const modelSetting = (backend, sortOrder) => ({
-    id: SETTING_MODEL[backend],
-    name: "Default model",
-    get category() { return cat(BACKEND_SECTION[backend], "Default model"); },
-    sortOrder,
-    tooltip:
-      `Default model for the ${BACKEND_TEXT[backend]} background agent, chosen from the models fetched for ` +
-      `${BACKEND_TEXT[backend]} (the same list the panel's model picker shows). 'Auto' lets the agent pick. ` +
-      `Changing the model in the panel updates this too. Until you connect to ${BACKEND_TEXT[backend]} this may ` +
-      `show only 'Auto' + your saved choice.`,
-    type: () => {
-      const sel = makeSettingSelect();
-      populateModelSelect(sel, backend);
-      sel.addEventListener("change", () => {
-        let v = sel.value === SETTINGS_PLACEHOLDER ? "" : sel.value;
-        // Never persist/send a model that isn't in this backend's known fetched
-        // catalog (a stale cross-backend id) — snap to Auto instead.
-        if (v) {
-          const rows = settingsModelsFor(backend);
-          if (rows && !rows.some((m) => m.id === v)) {
-            v = "";
-            sel.value = "";
-          }
-        }
-        setSetting(SETTING_MODEL[backend], v);
-        // Drive the live panel ONLY for the ACTIVE backend's group.
-        if (settingsArmed && backend === currentSettingsBackend()) {
-          panelHooks.applyModel?.(v);
-        }
-      });
-      settingsModelSelectEls[backend] = sel;
-      return sel;
-    },
-  });
-  // A per-backend "Default reasoning effort" — a STATIC combo of THAT backend's
-  // fixed scale (Claude: low–max; Codex: none–ultra; Gemini: no effort control).
-  // No dynamic remap needed since the groups are separate. Drives the live panel
-  // only for the active group.
-  const effortSetting = (backend, sortOrder) => ({
-    id: SETTING_EFFORT[backend],
-    name: "Default reasoning effort",
-    get category() { return cat(BACKEND_SECTION[backend], "Default reasoning effort"); },
-    sortOrder,
-    tooltip:
-      ((BACKEND_EFFORTS[backend] || ALL_EFFORTS).length
-        ? `Default reasoning effort for the ${BACKEND_TEXT[backend]} agent, from its scale ` +
-          `(${backend === "codex" ? "none–ultra" : "low–max"}). 'Model default' leaves it unset.`
-        : `${BACKEND_TEXT[backend]} exposes no reasoning-effort control; leave this at 'Model default'.`),
-    type: "combo",
-    // Lazy for the same reason as everything else here — and this one is load-bearing
-    // twice over: effortMeta()'s labels are ALREADY getter-backed (EFFORT_META), so
-    // calling effortComboOptions() eagerly at construction time would read every one of
-    // those getters before the catalog existed and silently undo them.
-    get options() { return effortComboOptions(backend); },
-    defaultValue: "",
-    onChange: (v) => {
-      if (suppressSettingOnChange || !settingsArmed) return;
-      if (backend === currentSettingsBackend()) panelHooks.applyEffort?.(v);
-    },
-  });
-  // A per-backend "Bridge URL" settings row — retained from the pre-single-port
-  // layout (ONE bridge on 9199 now serves every backend; configuredBridgeUrlFor
-  // ignores stale per-backend values). The value seeds the URL field shown for
-  // that backend; /connect's returned bridge_url still applies. Drives the live panel
-  // (a reconnect) only for the ACTIVE backend's group — a non-active group's edit
-  // just persists, it never retargets the running bridge.
-  const bridgeUrlSetting = (backend, sortOrder) => ({
-    id: SETTING_BRIDGE_URL[backend],
-    name: "Bridge URL",
-    get category() { return cat(BACKEND_SECTION[backend], "Bridge URL"); },
-    sortOrder,
-    tooltip:
-      `WebSocket URL of the ${BACKEND_TEXT[backend]} panel orchestrator bridge. Default ` +
-      `${defaultBridgeUrlFor(backend)}. Only change this if you run the ${BACKEND_TEXT[backend]} ` +
-      `orchestrator on a non-default port.`,
-    type: "text",
-    defaultValue: defaultBridgeUrlFor(backend),
-    onChange: (v) => {
-      if (suppressSettingOnChange || !settingsArmed) return;
-      if (backend === currentSettingsBackend()) panelHooks.applyBridgeUrl?.(v);
-    },
-  });
 
   return [
     // ---- About (renders FIRST — highest sortOrder of ALL) ----
@@ -7096,69 +7009,7 @@ function panelSettingsList() {
         return btn;
       },
     },
-    // ---- General (backend selector is the first row) ----
-    {
-      id: SETTING_BACKEND,
-      name: "Default agent backend",
-      get category() { return cat(tr("panel.general", "General"), "Default agent backend"); },
-      sortOrder: 150,
-      tooltip:
-        "Which background agent the panel connects to by default. Claude runs on your Claude subscription; " +
-        "ChatGPT runs on your Codex (ChatGPT) account; Gemini runs on your Google (Gemini) login. Seeds the " +
-        "panel's backend (and which group below seeds the runtime); you can still switch live in the model " +
-        "picker (a live switch is session-only and does NOT change this default).",
-      type: "combo",
-      // A GETTER for the same reason `category` is one: ComfyUI reads `setting.options`
-      // when the dialog renders (SettingItem.vue's `formItem` computed), so deferring the
-      // lookup is what lets these arrive translated. `value` is the WIRE value and is never
-      // touched — only `text` is displayed, so translating it cannot change what is stored.
-      get options() {
-        return [
-          { value: "claude", text: tr("panel.claude", "Claude") },
-          // #1084 — the two ChatGPT routes are named apart here too, or this dropdown
-          // reproduces the picker's "ChatGPT vs chatgpt" confusion one dialog over. `codex`
-          // reuses `panel.chatgpt_codex`, which the panel ALREADY ships translated for the
-          // sign-in card, rather than minting a near-duplicate key for the same words.
-          { value: "codex", text: tr("panel.chatgpt_codex", "ChatGPT (Codex)") },
-          { value: "chatgpt", text: tr("panel.chatgpt_direct_oauth", "ChatGPT (direct OAuth)") },
-          { value: "gemini", text: tr("panel.gemini", "Gemini") },
-          { value: "antigravity", text: tr("panel.antigravity_google_subscription", "Antigravity (Google subscription)") },
-          // Comma, not the middot this row used to carry: the panel already ships this exact
-          // label — translated in every locale — for the same product elsewhere. Matching it
-          // reuses that translation instead of minting a near-duplicate key whose only
-          // difference is punctuation, which is a string translators would have to be told
-          // apart by eye.
-          { value: "pi", text: tr("panel.pi_pi_dev_multi_provider_cli", "Pi (pi.dev, multi-provider CLI)") },
-          { value: "grok", text: tr("panel.grok", "Grok") },
-          { value: "qwen", text: tr("panel.qwen_code", "Qwen Code") },
-          { value: "kimi", text: tr("panel.kimi", "Kimi") },
-          { value: "moonshot", text: tr("panel.kimi_k3", "Kimi K3") },
-          { value: "glm", text: tr("panel.glm_z_ai", "GLM (z.ai)") },
-          { value: "minimax", text: tr("panel.minimax", "MiniMax") },
-          { value: "ollama", text: tr("panel.ollama_local", "Ollama (local)") },
-          { value: "openrouter", text: tr("panel.openrouter_1m_sota", "OpenRouter (1M · SOTA)") },
-          { value: "lmstudio", text: tr("panel.lm_studio_local", "LM Studio (local)") },
-          { value: "llamacpp", text: tr("panel.llama_cpp_local", "llama.cpp (local)") },
-          { value: "custom", text: tr("panel.custom_endpoint_openai_compatible", "Custom endpoint (OpenAI-compatible)") },
-        ];
-      },
-      defaultValue: "claude",
-      // #1198 — `previous` is ComfyUI's `oldValue`, the second argument it has always passed
-      // and this handler always dropped. It is the ONLY record of what the saved default held
-      // before this change: the store is overwritten the moment this returns, so by the time
-      // the switch has finished awaiting there is nothing left to read. Without it an aborted
-      // switch has no value to roll back to.
-      onChange: (v, previous) => {
-        // ASKED FIRST, BEFORE the suppress flag, and that order is load-bearing. ComfyUI
-        // dispatches onChange synchronously from inside setSetting, so the panel's own
-        // rollback echoes back while `suppressSettingOnChange` is still true — letting the
-        // flag win here would swallow the notification and leave the rollback's marker
-        // outstanding, armed to eat the user's next real pick of that backend.
-        if (settingsBackendDefault.isSelfWrite(v)) return;
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyBackend?.(v, previous);
-      },
-    },
+    // ---- General ----
     // mcp#884 — the user-selectable "Chat conversation scope" combo is retired:
     // provider state owns the behavior. A stored "workflow"/"ask" value from an
     // older build is simply ignored; Grok's dedicated workflow sessions are not
@@ -7206,22 +7057,6 @@ function panelSettingsList() {
         // in place would mean rebuilding a tree that may hold an in-flight run, an open
         // modal, or half-typed composer text. The tooltip says so rather than pretending.
         void applyPanelLocale(v);
-      },
-    },
-    {
-      id: SETTING_MOBILE_BETA,
-      name: "Control via Mobile app (beta)",
-      get category() { return cat(tr("panel.mobile_app_beta", "Mobile app (beta)"), "Control via Mobile app (beta)"); },
-      sortOrder: 144,
-      tooltip:
-        "Show the Remote-control pairing button (QR) in the panel header and the beta app download links below. " +
-        "The mobile app is in BETA and rapidly changing — expect rough edges, breaking changes between builds, and " +
-        "occasional re-pairing. Pairing stays on your own machine/network unless you explicitly choose Internet mode.",
-      type: "boolean",
-      defaultValue: false,
-      onChange: (v) => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyMobileBeta?.(!!v);
       },
     },
     {
@@ -7294,6 +7129,30 @@ function panelSettingsList() {
       defaultValue: false,
     },
     {
+      id: SETTING_OPENCODE_URL,
+      name: "OpenCode URL",
+      get category() { return cat(tr("panel.general", "General"), "OpenCode URL"); },
+      sortOrder: 151,
+      tooltip: "Address of the OpenCode web UI shown in the panel. Run `opencode service status` to see it.",
+      type: "text",
+      defaultValue: DEFAULT_OPENCODE_URL,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyOpencodeUrl?.(v);
+      },
+    },
+    {
+      id: SETTING_OPENCODE_SCALE,
+      name: "OpenCode scale (%)",
+      get category() { return cat(tr("panel.general", "General"), "OpenCode scale (%)"); },
+      sortOrder: 152,
+      tooltip: "Shrinks or enlarges the OpenCode web UI inside the panel. 100% is its normal size.",
+      type: "slider",
+      attrs: { min: 50, max: 150, step: 5 },
+      defaultValue: 85,
+      onChange: (v) => panelHooks.applyOpencodeScale?.(v),
+    },
+    {
       id: SETTING_VIDEO_PREVIEWS,
       name: "Inline video playback in chat",
       get category() { return cat(tr("panel.general", "General"), "Inline video playback in chat"); },
@@ -7305,59 +7164,6 @@ function panelSettingsList() {
         "cards already in the chat keep their player.",
       type: "boolean",
       defaultValue: true,
-    },
-    {
-      // Link rows — same custom-HTMLElement trick as "Star on GitHub"; no
-      // persisted value. Buttons render disabled ("coming soon") while a
-      // channel's invite URL constant is still empty.
-      id: "comfyui-mcp.mobileAppLinks",
-      name: "Get the beta app",
-      get category() { return cat(tr("panel.mobile_app_beta", "Mobile app (beta)"), "Get the beta app"); },
-      sortOrder: 143,
-      tooltip:
-        "Tester downloads for the ComfyUI MCP mobile app. iOS installs via Apple TestFlight; Android via Firebase " +
-        "App Distribution. Both channels are beta: builds update frequently and may require re-pairing with this panel.",
-      type: () => {
-        const wrap = document.createElement("div");
-        wrap.style.cssText = "display:flex;flex-direction:column;gap:0.4rem;max-width:26rem;";
-        const note = document.createElement("div");
-        note.textContent = tr(
-          "panel.beta_the_app_changes_rapidly_and_builds",
-          "⚠ Beta — the app changes rapidly and builds may break between updates. " +
-            "Enable the toggle above, install for your platform, then pair with the QR button in the panel header.",
-        );
-        note.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9231);opacity:0.75;line-height:1.35;";
-        const row = document.createElement("div");
-        row.style.cssText = "display:flex;gap:0.5rem;flex-wrap:wrap;";
-        const linkBtn = (label, url) => {
-          const a = document.createElement("a");
-          a.textContent = label;
-          a.style.cssText =
-            "display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:6px;" +
-            "border:1px solid var(--p-surface-500,#555);background:var(--p-surface-800,#27272a);" +
-            "color:var(--p-text-color,#e4e4e7);text-decoration:none;font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.9846);white-space:nowrap;";
-          if (url) {
-            a.href = url;
-            a.target = "_blank";
-            a.rel = "noopener noreferrer";
-          } else {
-            // Appended, not interpolated, so the label above stays one translatable unit
-            // per platform; a language that needs the marker elsewhere in the phrase can
-            // fold it into its own label text.
-            a.textContent += tr("panel.coming_soon", " — coming soon");
-            a.style.opacity = "0.45";
-            a.style.pointerEvents = "none";
-            a.setAttribute("aria-disabled", "true");
-          }
-          return a;
-        };
-        row.append(
-          linkBtn(tr("panel.ios_testflight", "🍎 iOS — TestFlight"), MOBILE_IOS_TESTFLIGHT_URL),
-          linkBtn(tr("panel.android_firebase_beta", "🤖 Android — Firebase beta"), MOBILE_ANDROID_FIREBASE_URL),
-        );
-        wrap.append(note, row);
-        return wrap;
-      },
     },
     {
       id: SETTING_UI_SCALE,
@@ -7381,45 +7187,6 @@ function panelSettingsList() {
         // and a user dragging the slider expects the panel to move while they
         // drag — including before the panel has finished arming.
         applyPanelUiScale(value);
-      },
-    },
-    {
-      id: SETTING_STALL_S,
-      name: "Render stall warning (seconds)",
-      get category() { return cat(tr("panel.general", "General"), "Render stall warning (seconds)"); },
-      sortOrder: 142,
-      tooltip:
-        "How long a ComfyUI render may make NO progress before the agent is warned its render looks stalled/wedged " +
-        "(e.g. an OOM-stuck sampler step) and is told to cancel/restart rather than queue another run. Video steps " +
-        "are legitimately slow, so keep this generous. Default 600s; range 15–3600. Applies when the orchestrator " +
-        "next starts — Disconnect then Connect (or /restart) to change it for a running agent.",
-      type: "number",
-      attrs: { min: RENDER_STALL_SECONDS_MIN, max: RENDER_STALL_SECONDS_MAX, step: 5 },
-      defaultValue: DEFAULT_RENDER_STALL_SECONDS,
-      onChange: () => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        // Push the new threshold to a live orchestrator (set_config) so it applies
-        // without a reconnect; also sent on connect and forwarded on spawn via env.
-        panelHooks.applyStallConfig?.();
-      },
-    },
-    {
-      id: SETTING_REMOTE_URL,
-      name: "Remote ComfyUI URL (advanced)",
-      get category() { return cat(tr("panel.general", "General"), "Remote ComfyUI URL (advanced)"); },
-      sortOrder: 143,
-      tooltip:
-        "Point the AGENT at a remote ComfyUI instead of this machine — e.g. a RunPod pod at " +
-        "https://xxxxxxxx-8188.proxy.runpod.net. Leave BLANK to drive the local ComfyUI (default). " +
-        "When set, the agent's tools (queue, models, history, uploads) target the remote server, and " +
-        "local-only tools (download_model / installer packs / model scans) are disabled. Applies when " +
-        "the orchestrator next starts — Disconnect then Connect to change it. Your live canvas still " +
-        "follows whichever ComfyUI you opened in the browser.",
-      type: "text",
-      defaultValue: "",
-      onChange: () => {
-        // No live apply: the URL is baked into the orchestrator's MCP at spawn, so
-        // it takes effect on the next Connect (Disconnect → Connect).
       },
     },
     {
@@ -7461,146 +7228,6 @@ function panelSettingsList() {
         }
       },
     },
-    // ---- Claude (Default model, Default reasoning effort) ----
-    modelSetting("claude", 130),
-    effortSetting("claude", 125),
-    // ---- ChatGPT (Codex) (Default model, Default reasoning effort) ----
-    modelSetting("codex", 110),
-    effortSetting("codex", 105),
-    // ---- Gemini (Default model, Default reasoning effort) ----
-    modelSetting("gemini", 90),
-    effortSetting("gemini", 85),
-    // ---- Antigravity (Google) (Default model; no effort scale, like Gemini) ----
-    modelSetting("antigravity", 84),
-    effortSetting("antigravity", 82),
-    // ---- Pi (pi.dev) (Default model; no effort scale, like Antigravity) ----
-    modelSetting("pi", 83),
-    effortSetting("pi", 81),
-    // ---- Grok (Default model, Default reasoning effort) ----
-    modelSetting("grok", 80),
-    effortSetting("grok", 75),
-    // ---- Qwen Code (Default model; no effort scale, like Grok) ----
-    modelSetting("qwen", 79),
-    effortSetting("qwen", 79),
-    modelSetting("kimi", 76),
-    effortSetting("kimi", 72),
-    // ---- Kimi K3 (Moonshot platform, hosted API key) (Default model; no effort scale) ----
-    modelSetting("moonshot", 71),
-    effortSetting("moonshot", 71),
-    // ---- GLM (z.ai coding plan, hosted API key) (Default model; no effort scale) ----
-    modelSetting("glm", 71),
-    effortSetting("glm", 71),
-    // ---- MiniMax (MiniMax platform, hosted API key) (Default model; no effort scale) ----
-    modelSetting("minimax", 71),
-    effortSetting("minimax", 71),
-    // ---- Ollama (local) (Default model; no effort scale) ----
-    modelSetting("ollama", 70),
-    {
-      id: SETTING_PREFERRED_MODELS,
-      name: "Preferred models",
-      get category() { return cat(BACKEND_SECTION.ollama, "Preferred models"); },
-      sortOrder: 68,
-      tooltip:
-        "Your own favorite models, comma-separated — Ollama tags (artokun/gemma4-comfyui-mcp:e4b — our ComfyUI fine-tune, gemma4:12b, qwen3:4b) and/or OpenRouter ids " +
-        "(xiaomi/mimo-v2.5, moonshotai/kimi-k2.5). They pin to the TOP of the model picker (marked ★ when not in " +
-        "the discovered catalog). Persisted by the orchestrator, so they survive restarts and apply immediately.",
-      type: "text",
-      defaultValue: "",
-      onChange: () => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyAgentModelConfig?.();
-      },
-    },
-    {
-      id: SETTING_OLLAMA_API,
-      name: "Endpoint type",
-      get category() { return cat(BACKEND_SECTION.ollama, "Endpoint type"); },
-      sortOrder: 66,
-      tooltip:
-        "How the Ollama backend talks to its endpoint. 'Ollama (local)' uses the native /api/chat on your local " +
-        "Ollama. 'OpenAI-compatible' speaks /chat/completions — use it for OpenRouter, vLLM, LM Studio, DeepSeek " +
-        "etc. (set the base URL below; the API key comes from the orchestrator's env, e.g. OPENROUTER_API_KEY). " +
-        "Applies to NEW sessions — Disconnect then Connect after changing.",
-      type: "combo",
-      get options() {
-        return [
-          { value: "ollama", text: tr("panel.ollama_local", "Ollama (local)") },
-          { value: "openai", text: tr("panel.openai_compatible_openrouter_vllm", "OpenAI-compatible (OpenRouter, vLLM, …)") },
-        ];
-      },
-      defaultValue: "ollama",
-      onChange: () => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyAgentModelConfig?.();
-      },
-    },
-    {
-      id: SETTING_OLLAMA_NUM_CTX,
-      name: "Context window",
-      get category() { return cat(BACKEND_SECTION.ollama, "Context window"); },
-      sortOrder: 65,
-      tooltip:
-        "How much conversation the model can hold at once (Ollama's num_ctx). 'Auto' uses the model's own " +
-        "maximum, capped at 64K so a small GPU isn't overloaded. 'Max' uses the model's full window (256K on " +
-        "some models): best for long tool-heavy sessions, but the KV cache needs extra VRAM. A fixed size is " +
-        "never set above what the model supports. Applies from your next message.",
-      type: "combo",
-      get options() {
-        return [
-          { value: "auto", text: tr("panel.ctx_auto_native_up_to_64k", "Auto (model's window, up to 64K)") },
-          { value: "max", text: tr("panel.ctx_max_full_native_window", "Max (model's full window)") },
-          ...[16, 32, 64, 128, 256].map((k) => ({
-            value: String(k * 1024),
-            text: tr("panel.ctx_fixed_k_tokens", "{k}K tokens", { k }),
-          })),
-        ];
-      },
-      defaultValue: "auto",
-      onChange: () => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyAgentModelConfig?.();
-      },
-    },
-    {
-      id: SETTING_OLLAMA_BASE_URL,
-      name: "Endpoint base URL",
-      get category() { return cat(BACKEND_SECTION.ollama, "Endpoint base URL"); },
-      sortOrder: 64,
-      tooltip:
-        "Base URL for the endpoint above. Leave BLANK for local Ollama (http://127.0.0.1:11434). For " +
-        "OpenAI-compatible endpoints include the /v1 (e.g. https://openrouter.ai/api/v1). Applies to NEW " +
-        "sessions — Disconnect then Connect after changing.",
-      type: "text",
-      defaultValue: "",
-      onChange: () => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyAgentModelConfig?.();
-      },
-    },
-    // ---- OpenRouter (hosted: curated 1M · SOTA models; key stored 0600) ----
-    modelSetting("openrouter", 62),
-    modelSetting("lmstudio", 63),
-    modelSetting("llamacpp", 64),
-    tokenSetting(SETTING_TOKEN_OPENROUTER, "OPENROUTER_API_KEY", "OpenRouter", 61, "openrouter", "API key"),
-    // ---- Custom endpoint (issue #162: any OpenAI-compatible server) ----
-    {
-      id: SETTING_CUSTOM_BASE_URL,
-      name: "Endpoint base URL",
-      get category() { return cat(BACKEND_SECTION.custom, "Endpoint base URL"); },
-      sortOrder: 60,
-      tooltip:
-        "Any OpenAI-compatible endpoint — vLLM, DeepSeek, Together, Azure OpenAI, a llama-server on another " +
-        "box… Include the /v1 (e.g. http://192.168.1.20:8000/v1). Persisted by the orchestrator and applies " +
-        "immediately; if the server needs a key, use “Set API key…” below. Leave blank to disable this provider.",
-      type: "text",
-      defaultValue: "",
-      onChange: () => {
-        if (suppressSettingOnChange || !settingsArmed) return;
-        panelHooks.applyAgentModelConfig?.();
-      },
-    },
-    modelSetting("custom", 59),
-    tokenSetting(SETTING_TOKEN_CUSTOM, "COMFYUI_MCP_CUSTOM_API_KEY", "Custom endpoint", 58, "custom", "API key"),
     // ---- API tokens (LAST) ----
     tokenSetting(SETTING_TOKEN_CIVITAI, "CIVITAI_API_TOKEN", "CivitAI", 20),
     tokenSetting(SETTING_TOKEN_HF, "HUGGINGFACE_TOKEN", "HuggingFace", 15),
@@ -28864,7 +28491,9 @@ const RECONNECT_MAX_MS = 15000;
 // Agent feed gates (persisted across reloads). MUTE = NO agent_event reaches any
 // agent (total silence). BLIND = agents still get the text/observation but never the
 // image pixels (ToS-safe: reason about the work without receiving the images).
-let AGENT_MUTED = (() => { try { return localStorage.getItem("cmcp.muteAgents") === "1"; } catch { return false; } })();
+// No sidebar chat in this build: OpenCode drives the canvas, so nothing feeds the
+// orchestrator's own agent.
+let AGENT_MUTED = true;
 let AGENT_BLIND = (() => { try { return localStorage.getItem("cmcp.blindAgents") === "1"; } catch { return false; } })();
 
 /**
@@ -31186,6 +30815,9 @@ function createBridgeClient({ onStatus, onSay, onStream, onLog, onCommand, onCom
       pendingContext = typeof ctx === "string" && ctx.trim() ? ctx : null;
     },
     sendUserMessage(text, context, images, mid) {
+      // No sidebar chat in this build. Auto-resume nudges (after a restart or
+      // reconnect) would otherwise start the orchestrator's hidden agent.
+      if (AGENT_MUTED) return false;
       if (!sock || sock.readyState !== WebSocket.OPEN) return false;
       // #1095 — REFUSED HERE, BEFORE ANYTHING ONE-SHOT IS CONSUMED.
       //
@@ -31646,7 +31278,7 @@ const PANEL_CSS = `
 }
 .cmcp-header {
   display: flex; align-items: center; gap: 0.5rem;
-  padding: 0.75rem 1rem;
+  padding: 0.375rem 0.75rem;
   border-bottom: 1px solid var(--p-content-border-color, #3f3f46);
 }
 /* The wordmark is ~4.9:1, so pin the HEIGHT and let width follow — the old
@@ -31780,6 +31412,37 @@ const PANEL_CSS = `
   flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0.75rem;
   display: flex; flex-direction: column; gap: 0.5rem;
 }
+.cmcp-opencode-wrap {
+  flex: 1 1 auto; min-height: 0; position: relative; overflow: hidden;
+}
+.cmcp-opencode {
+  position: absolute; top: 0; left: 0; border: 0; display: block;
+  transform-origin: 0 0;
+}
+.cmcp-opencode[hidden] { display: none; }
+.cmcp-opencode-down {
+  padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem;
+  color: var(--p-text-muted-color, #a1a1aa);
+}
+.cmcp-opencode-down[hidden] { display: none; }
+.cmcp-opencode-down ul { margin: 0; padding-left: 1.125rem; display: flex; flex-direction: column; gap: 0.375rem; }
+.cmcp-opencode-down code { color: var(--p-text-color, #fff); user-select: all; }
+.cmcp-opencode-down form { display: flex; gap: 0.375rem; }
+.cmcp-opencode-down .cmcp-input { flex: 1 1 auto; min-width: 0; }
+.cmcp-feedbar {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+  padding: 0 0.5rem 0 0.75rem; cursor: row-resize; user-select: none; touch-action: none;
+  border-top: 1px solid var(--p-content-border-color, #3f3f46);
+  color: var(--p-text-muted-color, #a1a1aa);
+  font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8615);
+}
+.cmcp-feed {
+  flex: 0 0 auto; min-height: 0; position: relative;
+  display: flex; flex-direction: column;
+}
+.cmcp-feed[hidden] { display: none; }
+/* Chat leftovers from older builds' threads; the feed shows command cards only. */
+.cmcp-feed .cmcp-bubble, .cmcp-feed .cmcp-empty { display: none; }
 /* #1801 — keep the long-lived transcript out of canvas-adjacent reflow/paint.
    The feed's direct children are one message each (bubbles, tool/question cards,
    A2UI cards, status notices, and the live thinking row). Contain the message,
@@ -33713,6 +33376,7 @@ function buildPanel() {
   // conversion sweep could not see it (codex). 0.625/0.8125, same as every other value.
   caret.style.fontSize = "calc(var(--cmcp-fs, 0.8125rem) * 0.7692)";
   status.append(dot, statusText, caret);
+  status.style.marginLeft = "0"; // `actions` takes the auto margin and sits beside it
 
   function iconBtn(icon, titleText) {
     const b = document.createElement("button");
@@ -33741,9 +33405,8 @@ function buildPanel() {
   };
   applyMobileBetaVisibility(getSetting(SETTING_MOBILE_BETA) === true);
   panelHooks.applyMobileBeta = applyMobileBetaVisibility;
-  // Reload / restart live as slash commands (/reload, /reload-ui, /restart) — no
-  // header buttons for them.
-  actions.append(newChatBtn, historyBtn, remoteBtn);
+  // New chat / History / Remote are chat features this build drops; the former
+  // toolbar row's buttons (CivitAI, …) are appended to `actions` further down.
 
   header.style.position = "relative";
   const histPop = document.createElement("div");
@@ -33756,9 +33419,6 @@ function buildPanel() {
   // crowding the composer; future integrations (Civitai explorer, …) join it.
   // Buttons are appended by the sections that own their logic (feed gates are
   // wired next to the composer's context ring, which they also tint).
-  const toolbar = document.createElement("div");
-  toolbar.className = "cmcp-toolbar";
-  root.appendChild(toolbar);
 
   // Panel preferences (model/effort/storyboard toggle/…), localStorage-backed.
   // Declared up here so the settings UI below can read/write it (e.g. the
@@ -34099,7 +33759,7 @@ function buildPanel() {
 
   const btnRow = document.createElement("div");
   btnRow.style.cssText = "display:flex;gap:0.375rem;align-items:center;flex-wrap:wrap;";
-  btnRow.append(connectBtn, disconnectBtn, saveBtn, apiKeysBtn, promptsBtn);
+  btnRow.append(connectBtn, disconnectBtn, saveBtn);
 
   const helpDiv = document.createElement("div");
   helpDiv.className = "cmcp-help";
@@ -34649,11 +34309,148 @@ function buildPanel() {
     }
   }
 
+  // Body: the OpenCode web UI on top, the activity feed (canvas command cards)
+  // below. The bar between them resizes the feed; its chevron collapses it.
   const body = document.createElement("div");
   body.className = "cmcp-body";
-  body.style.position = "relative"; // anchor the "new messages" pill
-  body.appendChild(onboard);
-  body.appendChild(log);
+  // The frame is cross-origin, so its text can't be restyled; scale the whole
+  // frame instead and oversize it so it still fills the wrapper.
+  const opencodeWrap = document.createElement("div");
+  opencodeWrap.className = "cmcp-opencode-wrap";
+  const opencodeFrame = document.createElement("iframe");
+  opencodeFrame.className = "cmcp-opencode";
+  opencodeFrame.title = "OpenCode";
+  opencodeFrame.allow = "clipboard-read; clipboard-write";
+  // Shown instead of the frame when nothing answers at the URL, so the user gets
+  // start-up steps rather than the browser's connection-refused page.
+  const opencodeDown = document.createElement("div");
+  opencodeDown.className = "cmcp-opencode-down";
+  opencodeDown.hidden = true;
+  const downTitle = document.createElement("div");
+  downTitle.className = "cmcp-onboard-title";
+  const downSteps = document.createElement("ul");
+  for (const [text, cmd] of [
+    ["Start the OpenCode server:", "opencode service start"],
+    ["See the address it's on:", "opencode service status"],
+    ["First time in this browser? Sign in with a link from:", "opencode pair"],
+  ]) {
+    const li = document.createElement("li");
+    const code = document.createElement("code");
+    code.textContent = cmd;
+    li.append(text, " ", code);
+    downSteps.appendChild(li);
+  }
+  const downForm = document.createElement("form");
+  const downInput = document.createElement("input");
+  downInput.type = "text";
+  downInput.className = "cmcp-input";
+  downInput.spellcheck = false;
+  const downSave = document.createElement("button");
+  downSave.type = "submit";
+  downSave.className = "cmcp-btn";
+  downSave.textContent = "Save & retry";
+  downForm.append(downInput, downSave);
+  downForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const v = downInput.value.trim() || DEFAULT_OPENCODE_URL;
+    setSetting(SETTING_OPENCODE_URL, v);
+    applyOpencodeUrl(v);
+  });
+  opencodeDown.append(downTitle, downSteps, downForm);
+  opencodeWrap.append(opencodeFrame, opencodeDown);
+
+  let opencodeUrl = DEFAULT_OPENCODE_URL;
+  let opencodeProbe = 0;
+  const applyOpencodeUrl = async (v) => {
+    opencodeUrl = String(v || "").trim() || DEFAULT_OPENCODE_URL;
+    const probe = ++opencodeProbe;
+    let up = false;
+    try {
+      // no-cors: the response is opaque, but it only resolves if something answered.
+      await fetch(opencodeUrl, { mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(4000) });
+      up = true;
+    } catch {}
+    if (probe !== opencodeProbe) return;
+    opencodeDown.hidden = up;
+    opencodeFrame.hidden = !up;
+    if (up) {
+      opencodeFrame.src = opencodeUrl;
+    } else {
+      downTitle.textContent = `OpenCode isn't answering at ${opencodeUrl}`;
+      downInput.value = opencodeUrl;
+    }
+  };
+  applyOpencodeUrl(getSetting(SETTING_OPENCODE_URL));
+  panelHooks.applyOpencodeUrl = applyOpencodeUrl;
+  const applyOpencodeScale = (v) => {
+    const s = (Number(v) || 100) / 100;
+    opencodeFrame.style.width = `${100 / s}%`;
+    opencodeFrame.style.height = `${100 / s}%`;
+    opencodeFrame.style.transform = `scale(${s})`;
+  };
+  applyOpencodeScale(getSetting(SETTING_OPENCODE_SCALE) ?? 85);
+  panelHooks.applyOpencodeScale = applyOpencodeScale;
+
+  const feedBar = document.createElement("div");
+  feedBar.className = "cmcp-feedbar";
+  feedBar.title = "Drag to resize the activity feed";
+  const feedToggle = document.createElement("button");
+  feedToggle.type = "button";
+  feedToggle.className = "cmcp-iconbtn";
+  feedToggle.title = "Show or hide the activity feed";
+  const feedToggleIcon = document.createElement("i");
+  feedToggle.appendChild(feedToggleIcon);
+  // Starts a fresh local thread; the orchestrator's session is left alone.
+  const feedClear = document.createElement("button");
+  feedClear.type = "button";
+  feedClear.className = "cmcp-iconbtn";
+  feedClear.title = "Clear the activity feed";
+  feedClear.innerHTML = '<i class="pi pi-trash"></i>';
+  feedClear.addEventListener("click", () => newChat({ notifyBackend: false }));
+  feedClear.addEventListener("pointerdown", (e) => e.stopPropagation());
+  const feedLabel = document.createElement("span");
+  feedLabel.textContent = "Activity";
+  feedLabel.style.marginRight = "auto";
+  feedBar.append(feedLabel, feedClear, feedToggle);
+
+  const feed = document.createElement("div");
+  feed.className = "cmcp-feed";
+  feed.appendChild(log);
+  const FEED_HEIGHT_KEY = "cmcp.feedHeight";
+  const FEED_HIDDEN_KEY = "cmcp.feedHidden";
+  feed.style.height = `${Number(localStorage.getItem(FEED_HEIGHT_KEY)) || 200}px`;
+  const setFeedHidden = (hidden) => {
+    feed.hidden = hidden;
+    feedToggleIcon.className = `pi ${hidden ? "pi-chevron-up" : "pi-chevron-down"}`;
+    try { localStorage.setItem(FEED_HIDDEN_KEY, hidden ? "1" : "0"); } catch {}
+  };
+  setFeedHidden(localStorage.getItem(FEED_HIDDEN_KEY) === "1");
+  feedToggle.addEventListener("click", () => setFeedHidden(!feed.hidden));
+  feedToggle.addEventListener("pointerdown", (e) => e.stopPropagation());
+  feedBar.addEventListener("pointerdown", (e) => {
+    if (feed.hidden) return;
+    e.preventDefault();
+    feedBar.setPointerCapture(e.pointerId);
+    // The iframe would swallow pointer events mid-drag.
+    opencodeFrame.style.pointerEvents = "none";
+    const startY = e.clientY;
+    const startH = feed.getBoundingClientRect().height;
+    const maxH = body.getBoundingClientRect().height - feedBar.getBoundingClientRect().height - 80;
+    const onMove = (ev) => {
+      feed.style.height = `${Math.max(60, Math.min(maxH, startH + startY - ev.clientY))}px`;
+    };
+    const onUp = () => {
+      feedBar.removeEventListener("pointermove", onMove);
+      feedBar.removeEventListener("pointerup", onUp);
+      feedBar.removeEventListener("pointercancel", onUp);
+      opencodeFrame.style.pointerEvents = "";
+      try { localStorage.setItem(FEED_HEIGHT_KEY, String(Math.round(feed.getBoundingClientRect().height))); } catch {}
+    };
+    feedBar.addEventListener("pointermove", onMove);
+    feedBar.addEventListener("pointerup", onUp);
+    feedBar.addEventListener("pointercancel", onUp);
+  });
+  body.append(opencodeWrap, feedBar, feed);
 
   // Discord-style sticky autoscroll: follow new content only while the user is
   // already at the bottom. If they've scrolled up to read, leave them there and
@@ -34732,7 +34529,7 @@ function buildPanel() {
     shouldStick: () => stickToBottom && !scrollIntent.hasPending(),
     beforeScroll: () => scrollIntent.noteProgrammaticScroll(),
   });
-  body.appendChild(newMsgBtn);
+  feed.appendChild(newMsgBtn);
   root.appendChild(body);
 
   // Footer status tray — docked above the composer. Hosts the agent's live TODO
@@ -36491,9 +36288,15 @@ function buildPanel() {
   };
   reflectRunpodHost();
 
-  const toolbarSpacer = document.createElement("span");
-  toolbarSpacer.className = "cmcp-spacer";
-  toolbar.append(deafenBtn, blindBtn, toolbarSpacer, civitaiBtn, appsBtn, trainingBtn, runpodBtn);
+  // Opens the same OpenCode UI in a browser tab; the panel's frame stays put.
+  const opencodeTabBtn = toolbarBtn("pi-external-link", "Open OpenCode in a new tab");
+  opencodeTabBtn.addEventListener("click", () => window.open(opencodeUrl, "_blank", "noopener"));
+  // Icon-only in the header row; the label moves to the tooltip.
+  for (const b of [civitaiBtn, appsBtn, trainingBtn, runpodBtn, opencodeTabBtn]) {
+    b.classList.add("cmcp-toolbtn-iconic");
+    if (!b.title) b.title = b.textContent.trim();
+  }
+  actions.append(civitaiBtn, appsBtn, trainingBtn, runpodBtn, opencodeTabBtn);
 
   // Feature-flag the newer toolbar surfaces (Apps / Training / RunPod). Hidden by
   // default; opt in via Settings › Features. Inline display (not the `hidden`
@@ -36511,7 +36314,6 @@ function buildPanel() {
 
   row.append(ring, ctxLabel, modelChip, spacer, attachBtn, micBtn, sendBtn);
   form.append(menuPop, modelPop, attachBar, input, row, fileInput);
-  root.appendChild(form);
 
   // ---- feed renderers + thread persistence ----
   // paint* draws DOM only; append* paints AND records into the current

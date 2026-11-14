@@ -138,7 +138,7 @@ test("onChange applies immediately and is NOT gated on settingsArmed", () => {
   // The armed gate exists for settings that SEED the panel's runtime, so a
   // hydration pass cannot re-seed them. This one writes nothing but CSS, and a
   // user dragging the slider expects the panel to move while they drag.
-  const entry = PANEL.slice(PANEL.indexOf("id: SETTING_UI_SCALE"), PANEL.indexOf("id: SETTING_STALL_S"));
+  const entry = PANEL.slice(PANEL.indexOf("id: SETTING_UI_SCALE"), PANEL.indexOf("id: SETTING_BRIDGE,"));
   assert.match(entry, /onChange: \(value\) => \{[\s\S]*applyPanelUiScale\(value\)/);
   // The GUARD, not the word: the comment above the handler explains why the
   // guard is absent, so matching the identifier would fail on the explanation.
@@ -157,7 +157,7 @@ test("the tooltip names the knob that now DOES work, and what it does not cover"
   // calc(var(--cmcp-fs) * k), so there is a working knob to name instead of a dead end
   // to warn about. The warning must not survive the thing it warned about — a tooltip
   // that still says overrides do not work is now the misleading one.
-  const entry = PANEL.slice(PANEL.indexOf("id: SETTING_UI_SCALE"), PANEL.indexOf("id: SETTING_STALL_S"));
+  const entry = PANEL.slice(PANEL.indexOf("id: SETTING_UI_SCALE"), PANEL.indexOf("id: SETTING_BRIDGE,"));
   assert.match(entry, /--cmcp-fs/, "names the variable");
   assert.match(entry, /0\.8125rem/, "and its default, so a user can compute a target");
   assert.ok(

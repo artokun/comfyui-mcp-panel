@@ -81,7 +81,7 @@ test("every registered setting id has an English name and tooltip in the catalog
   const ids = [...registeredIds()].sort();
   // A silent zero, or a collapse to the handful of inline rows, would make every assertion
   // below vacuous — the failure mode this file exists to prevent.
-  assert.ok(ids.length >= 50, `expected the full settings list, extracted ${ids.length}`);
+  assert.ok(ids.length >= 20, `expected the full settings list, extracted ${ids.length}`);
 
   const missing = ids.filter((id) => !EN[normalizeI18nKey(id)]);
   assert.deepEqual(missing, [], `setting ids with no locales/en/settings.json entry:\n  ${missing.join("\n  ")}`);
