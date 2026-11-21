@@ -31,6 +31,7 @@ export function createRunCompletionFlushHandler({
   storyboardFrameCount,
   paintImage,
   applyVideoPoster,
+  showsRunMedia = () => true,
   videoStoryboardEnabled = true,
   agentReceivesImages = () => true,
   isAgentMuted = () => false,
@@ -67,9 +68,19 @@ export function createRunCompletionFlushHandler({
     // A timeout fallback may be sent before delayed /prompt identity arrives.
     // It remains recoverable until the tracker can replay it with a key.
     const awaitsCompletionKey = awaitingCompletionKey === true;
+    // A muted agent never receives the frame, so don't compose it: composing
+    // reads every output (size/dimension probes, video decode) and uploads a
+    // storyboard and poster to temp/. Settle it exactly as a dropped muted send.
+    if (isAgentMuted()) {
+      markDelivered(promptId, completionKey);
+      pruneRebootMarker();
+      return;
+    }
     let framePushed = false;
     let sendAttempted = false;
     const compositionStartedAt = now();
+    // Decided now: the tracker forgets panel ownership once delivery settles.
+    const paintsMedia = showsRunMedia(promptId);
     // A completed prompt delivers its FULL batch here, exactly once. Compose
     // ONE consolidated agent_event for the whole run — stills AND every video's
     // storyboard folded into a single images+note+metadata turn — so a mixed /
@@ -116,7 +127,7 @@ export function createRunCompletionFlushHandler({
         buildVideoStoryboard,
         uploadBlobToInput,
         storyboardFrameCount,
-        paintImage,
+        paintImage: paintsMedia ? paintImage : () => {},
         // The card is already in the log by the time the storyboard resolves,
         // so the poster it produced is handed back by video URL rather than
         // passed down at paint time.

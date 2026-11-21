@@ -48,10 +48,13 @@ function productionOnExecuted({
   chatMediaSetting = undefined,
   isVideoOutput = () => false,
   isAudioOutput = () => false,
+  panelRun = true,
+  ownRunMediaSetting = undefined,
 } = {}) {
   const painted = { image: [], video: [], audio: [] };
   const buffered = [];
   let settingReads = 0;
+  let localMarks = 0;
   const onExecuted = new Function(
     "imageViewUrl",
     "isVideoOutput",
@@ -70,6 +73,10 @@ function productionOnExecuted({
     "chatMediaEnabled",
     "getSetting",
     "SETTING_CHAT_MEDIA",
+    "SETTING_OWN_RUN_MEDIA",
+    "markLocalOnly",
+    "log",
+    "tr",
     `return (${onExecutedSource().trim()});`,
   )(
     (m) =>
@@ -79,7 +86,7 @@ function productionOnExecuted({
     (url, name) => painted.video.push({ url, name }),
     (url, name) => painted.audio.push({ url, name }),
     (url, name) => painted.image.push({ url, name }),
-    { onExecuted: (promptId, output) => buffered.push({ promptId, output }) },
+    { onExecuted: (promptId, output) => buffered.push({ promptId, output }), isPanelRun: () => panelRun },
     () => {},
     {},
     createStoryboardIdentity,
@@ -93,11 +100,16 @@ function productionOnExecuted({
         settingReads += 1;
         return typeof chatMediaSetting === "function" ? chatMediaSetting() : chatMediaSetting;
       }
+      if (id === "comfyui-mcp.ownRunMedia") return ownRunMediaSetting;
       return undefined;
     },
     "comfyui-mcp.chatMedia",
+    "comfyui-mcp.ownRunMedia",
+    () => { localMarks += 1; },
+    { lastElementChild: {} },
+    (_key, fallback) => fallback,
   );
-  return { onExecuted, painted, buffered, reads: () => settingReads };
+  return { onExecuted, painted, buffered, reads: () => settingReads, localMarks: () => localMarks };
 }
 
 test("#2034: generated media in chat is ON unless the stored value is explicitly false", () => {
@@ -237,6 +249,24 @@ test("#2034: default ON still paints every kind", () => {
     [],
     "audio still does not join the agent's inline-image delivery",
   );
+});
+
+test("own runs: no card by default, the agent is still told; opt-in paints a marked card", () => {
+  const output = { images: [{ filename: "mine.png", type: "output" }] };
+  const off = productionOnExecuted({ panelRun: false });
+  off.onExecuted({ detail: { prompt_id: "user", output } });
+  assert.equal(off.painted.image.length, 0, "a run the user queued posts no card by default");
+  assert.equal(off.buffered.length, 1, "its completion is still buffered for the agent");
+
+  const on = productionOnExecuted({ panelRun: false, ownRunMediaSetting: true });
+  on.onExecuted({ detail: { prompt_id: "user", output } });
+  assert.equal(on.painted.image.length, 1);
+  assert.equal(on.localMarks(), 1, "the opted-in card is marked as the user's own run");
+
+  const agent = productionOnExecuted({ panelRun: true });
+  agent.onExecuted({ detail: { prompt_id: "agent", output } });
+  assert.equal(agent.painted.image.length, 1, "agent-queued runs still post");
+  assert.equal(agent.localMarks(), 0);
 });
 
 test("#2034: replay of already-recorded cards is not gated — only new executed paints are", () => {

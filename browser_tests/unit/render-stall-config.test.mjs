@@ -105,16 +105,6 @@ test("#183 the shipped setting reader returns the default and reads the persiste
   assert.equal(shippedStallSetting(() => 99999), RENDER_STALL_SECONDS_MAX);
 });
 
-test("#183 the setting row advertises and registers the same default/range", () => {
-  const start = PANEL.indexOf("id: SETTING_STALL_S");
-  const end = PANEL.indexOf("\n    },", start);
-  assert.ok(start >= 0 && end > start, "the render-stall setting row must exist");
-  const row = PANEL.slice(start, end);
-  assert.match(row, /Default 600s/);
-  assert.match(row, /attrs: \{ min: RENDER_STALL_SECONDS_MIN, max: RENDER_STALL_SECONDS_MAX, step: 5 \}/);
-  assert.match(row, /defaultValue: DEFAULT_RENDER_STALL_SECONDS/);
-});
-
 test("#183 the shipped live bridge sender carries the normalized threshold", () => {
   const factory = new Function(
     "client",

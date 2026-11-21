@@ -158,7 +158,7 @@ test("#1718 production boundary: late poster results stay with their render atte
     (url) => painted.push(url),
     () => {},
     () => {},
-    { onExecuted: (_promptId, output) => buffered.push(output) },
+    { onExecuted: (_promptId, output) => buffered.push(output), isPanelRun: () => true },
     () => {},
     {},
     createStoryboardIdentity,

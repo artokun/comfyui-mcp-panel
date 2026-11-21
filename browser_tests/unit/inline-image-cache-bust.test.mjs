@@ -70,7 +70,7 @@ function productionOnExecuted() {
     () => {},
     () => {},
     (url, name) => painted.push({ url, name }),
-    { onExecuted: (promptId, output) => buffered.push({ promptId, output }) },
+    { onExecuted: (promptId, output) => buffered.push({ promptId, output }), isPanelRun: () => true },
     () => {},
     {},
     () => "identity",
