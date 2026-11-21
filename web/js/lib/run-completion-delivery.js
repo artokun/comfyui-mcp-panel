@@ -68,6 +68,14 @@ export function createRunCompletionFlushHandler({
     // A timeout fallback may be sent before delayed /prompt identity arrives.
     // It remains recoverable until the tracker can replay it with a key.
     const awaitsCompletionKey = awaitingCompletionKey === true;
+    // A muted agent never receives the frame, so don't compose it: composing
+    // reads every output (size/dimension probes, video decode) and uploads a
+    // storyboard and poster to temp/. Settle it exactly as a dropped muted send.
+    if (isAgentMuted()) {
+      markDelivered(promptId, completionKey);
+      pruneRebootMarker();
+      return;
+    }
     let framePushed = false;
     let sendAttempted = false;
     const compositionStartedAt = now();

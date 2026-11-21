@@ -37378,6 +37378,8 @@ function buildPanel() {
   }
 
   function paintImage(url, name) {
+    // The chat is detached while the agent is muted: never load media into it.
+    if (AGENT_MUTED) return;
     // Coerce the caption at the painter boundary — a structured/persisted caption
     // must never render (or re-persist) as "[object Object]", live OR on replay (#276).
     name = name == null ? name : coerceMessageText(name);
@@ -37830,6 +37832,7 @@ function buildPanel() {
   }
 
   function paintVideo(url, name) {
+    if (AGENT_MUTED) return; // see paintImage
     // Coerce the caption at the painter boundary — see paintImage (#276).
     name = name == null ? name : coerceMessageText(name);
     clearEmpty();
@@ -37921,6 +37924,7 @@ function buildPanel() {
   //  - it does not autoplay. A picture appearing is silent; sound starting on
   //    its own is not, and the user asked to be shown a file, not played at.
   function paintAudio(url, name) {
+    if (AGENT_MUTED) return; // see paintImage
     // Coerce the caption at the painter boundary — see paintImage (#276).
     name = name == null ? name : coerceMessageText(name);
     clearEmpty();
