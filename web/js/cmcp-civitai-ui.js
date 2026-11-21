@@ -77,6 +77,22 @@ function setLikesCollection(c) {
   } catch { /* non-persistent is fine */ }
 }
 
+// The last tab, search and filters, restored when the browser is reopened.
+const VIEW_KEY = "comfyui-mcp.civitai.view";
+function savedView() {
+  try { return JSON.parse(localStorage.getItem(VIEW_KEY)) || null; }
+  catch { return null; }
+}
+function saveView(state) {
+  const { period, imageSort, modelSort, baseModels, favorited, username, browsingLevels } = state.filters;
+  try {
+    localStorage.setItem(VIEW_KEY, JSON.stringify({
+      tab: state.tab, query: state.query, favType: state.favType,
+      filters: { period, imageSort, modelSort, baseModels, favorited, username, browsingLevels },
+    }));
+  } catch { /* non-persistent is fine */ }
+}
+
 /** The collection the likes feed reads from: the picked "likes collection"
  *  when set, else a one-time auto-detect persisted for next time (the web's ❤
  *  saves into a COLLECTION — reactions only hold in-app hearts, so reading
@@ -137,6 +153,7 @@ function injectCss() {
   .cmcp-cv-owned { position: absolute; top: .3rem; right: .3rem; background: rgba(34,197,94,.92);
     color: #04120a; font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.7385); font-weight: 700; padding: .12rem .35rem; border-radius: 4px; }
   .cmcp-cv-loading { text-align: center; padding: 1rem; color: var(--p-text-muted-color,#a1a1aa); }
+  .cmcp-cv-notice { padding: 0.375rem 0.75rem; font-size: 0.75rem; color: var(--p-text-muted-color,#a1a1aa); }
   .cmcp-cv-progress { position: absolute; top: 0; left: 0; right: 0; height: 2px;
     background: var(--p-primary-color, #3a7bd5); opacity: .0; transition: opacity .2s; }
   .cmcp-cv-progress.on { opacity: 1; animation: cmcp-cv-pulse 1s ease-in-out infinite; }
@@ -231,6 +248,10 @@ function injectCss() {
   .cmcp-cv-lb-prompt { font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.96); white-space: pre-wrap; word-break: break-word;
     background: var(--p-surface-950,#111); border-radius: 8px; padding: .5rem;
     max-height: 14rem; overflow-y: auto; }
+  .cmcp-cv-copyrow { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+  .cmcp-cv-copyrow .cmcp-cv-flabel { width: auto; }
+  .cmcp-cv-copybtn { background: transparent; border: none; cursor: pointer; padding: 0;
+    font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.8862); color: var(--p-primary-color,#3a7bd5); flex-shrink: 0; }
   .cmcp-cv-lb-params { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .6rem;
     font-size: calc(var(--cmcp-fs, 0.8125rem) * 0.9108); }
   .cmcp-cv-lb-params .k { color: var(--p-text-muted-color,#a1a1aa); }
@@ -255,6 +276,45 @@ const el = (tag, cls, txt) => {
   if (txt != null) n.textContent = txt;
   return n;
 };
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  // Plain-http LAN access has no Clipboard API.
+  const ta = el("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { if (!document.execCommand("copy")) throw new Error("copy command refused"); }
+  finally { ta.remove(); }
+}
+
+function copyButton(text) {
+  const btn = el("button", "cmcp-cv-copybtn", tr("civitai_ui.copy", "Copy"));
+  btn.type = "button";
+  btn.title = tr("civitai_ui.copy_to_clipboard", "Copy to clipboard");
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    try {
+      await copyText(coerceMessageText(text));
+      btn.textContent = tr("civitai_ui.copied", "Copied ✓");
+      setTimeout(() => { btn.textContent = tr("civitai_ui.copy", "Copy"); }, 1500);
+    } catch (err) {
+      toast(tr("civitai_ui.copy_failed", "Copy failed: {error}", { error: err?.message || err }));
+    }
+  });
+  return btn;
+}
+
+/** Section label with a Copy button on the right, for prompt blocks. */
+function copyLabel(label, text) {
+  const row = el("div", "cmcp-cv-copyrow");
+  row.append(el("div", "cmcp-cv-flabel", label), copyButton(text));
+  return row;
+}
 
 /** Fail-CLOSED dirty check for the load-onto-canvas overwrite confirm: any
  *  uncertainty (missing getter, non-boolean answer, a throw) counts as DIRTY
@@ -370,17 +430,27 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   const search = shell.searchEl; // the shell's single search input
 
   // ── state ────────────────────────────────────────────────────────────────
+  // Explicit opts (an agent's open_civitai) win over the restored view.
+  const saved = savedView() || {};
+  const savedFilters = saved.filters && typeof saved.filters === "object" ? saved.filters : {};
+  const knownLevels = new Set(LEVELS.map((l) => l.level));
+  const savedLevels = Array.isArray(savedFilters.browsingLevels)
+    ? savedFilters.browsingLevels.filter((n) => knownLevels.has(n))
+    : [];
   const state = {
-    tab: resolveCivitaiTab(opts.tab) || "images",
-    query: opts.query || "",
+    tab: resolveCivitaiTab(opts.tab) || resolveCivitaiTab(saved.tab) || "images",
+    query: opts.query ?? (typeof saved.query === "string" ? saved.query : ""),
     // Deep-copy the array fields: DEFAULT_FILTERS is frozen but freeze is
     // shallow — spreading shares its arrays, and the level/base-model toggles
     // mutate in place (push/splice), which would corrupt the module default.
     filters: {
       ...DEFAULT_FILTERS,
+      ...savedFilters,
       ...(opts.filters || {}),
-      baseModels: [...(opts.filters?.baseModels ?? DEFAULT_FILTERS.baseModels)],
-      browsingLevels: [...(opts.filters?.browsingLevels ?? DEFAULT_FILTERS.browsingLevels)],
+      baseModels: [...(opts.filters?.baseModels
+        ?? (Array.isArray(savedFilters.baseModels) ? savedFilters.baseModels : DEFAULT_FILTERS.baseModels))],
+      browsingLevels: [...(opts.filters?.browsingLevels
+        ?? (savedLevels.length ? savedLevels : DEFAULT_FILTERS.browsingLevels))],
     },
     items: [], models: [], cursor: null, loading: false, done: false, reqId: 0,
     // Distinguishing an empty grid from a FAILURE (agent-facing, issues #190/#375):
@@ -393,7 +463,7 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     favOut: [], // favorites outside the enabled levels, held for the catchall
     searchSeq: 0, // searching-overlay ownership (see reload)
     signedIn: false, localNames: new Set(), localLoaded: false,
-    favType: "all", // favorites sub-filter: all | image | video
+    favType: ["all", "image", "video"].includes(saved.favType) ? saved.favType : "all", // favorites sub-filter
     // Agent-drive: a render generation bumped on every reload/tab/filter so a
     // highlight that survives the await knows whether it's stale, and the
     // highlight target set (ids, in input order) that appendItems/appendModels
@@ -496,6 +566,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       state.filters.username = seeded.creator;
       creatorFromSearch = true;
       state.query = seeded.query;
+    } else if (state.filters.username) {
+      creatorFromSearch = true; // a restored creator is shown as its @token
     }
   }
   /** "See more from @creator" — set the creator filter and reflect it in the
@@ -566,6 +638,10 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
   const progress = el("div", "cmcp-cv-progress");
   const grid = el("div", "cmcp-cv-grid");
   const sentinel = el("div", "cmcp-cv-loading");
+  const notice = el("div", "cmcp-cv-notice",
+    tr("civitai_ui.media_keyword_filter",
+      "CivitAI no longer offers keyword search for images and videos, so this filters the feed (current period and sort) by prompt, creator and model name."));
+  notice.style.display = "none";
   const searchOverlay = el("div", "cmcp-cv-searching");
   searchOverlay.appendChild(el("div", "cmcp-cv-spinner"));
   searchOverlay.style.display = "none";
@@ -607,6 +683,8 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     state.error = null; state.favoritesStatus = null; // cleared per generation
     state.favOut = []; // favorites outside the enabled levels, held for the catchall
     grid.innerHTML = ""; syncTabs();
+    saveView(state);
+    notice.style.display = state.query && !tabDef().model && !tabDef().fav ? "" : "none";
     // Overlay ownership: only the NEWEST reload may hide the searching
     // spinner — a superseded reload's finally must not kill the overlay of
     // the search that replaced it (same generation pattern as the grid).
@@ -754,22 +832,25 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         state.hiddenByLevel = (state.hiddenByLevel || 0) + (page.hiddenByLevel || 0);
         appendModels(page.models);
         stalled = !page.models.length && !state.done;
-      } else if (state.query) {
-        const items = await client.searchMedia(state.query, {
-          type: t.media, levels, offset: state.items.length,
-          ...(f.username ? { username: f.username } : {}),
-        });
-        if (req !== state.reqId) return;
-        state.done = items.length === 0;
-        appendItems(items);
       } else {
+        // CivitAI retired keyword search for images and videos (its images_v6
+        // index is empty and the replacement semantic search is not public), so
+        // a query filters the feed by prompt, creator and model name instead.
         const page = await client.fetchFeed({
           type: t.media, period: f.period, sort: f.imageSort, levels, cursor: state.cursor,
           ...(f.username ? { username: f.username } : {}),
         });
         if (req !== state.reqId) return;
         state.cursor = page.nextCursor; state.done = !page.nextCursor;
-        appendItems(page.items);
+        const terms = state.query.toLowerCase().split(/\s+/).filter(Boolean);
+        const items = terms.length
+          ? page.items.filter((it) => {
+            const text = `${it.prompt || ""} ${it.author || ""} ${it.modelName || ""}`.toLowerCase();
+            return terms.every((w) => text.includes(w));
+          })
+          : page.items;
+        appendItems(items);
+        stalled = terms.length > 0 && !items.length && !state.done;
       }
       if (stalled) {
         // Explicit affordance instead of a silent dead end.
@@ -1126,11 +1207,11 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
         genBox.appendChild(el("div", "cmcp-cv-lb-muted", embeddedWorkflowNote(wf)));
         if (gen.meta?.prompt) {
           // Distinct from `civitai_ui.prompt` ("Prompt: "), which is a sentence prefix.
-          genBox.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.prompt_label", "Prompt")));
+          genBox.appendChild(copyLabel(tr("civitai_ui.prompt_label", "Prompt"), gen.meta.prompt));
           genBox.appendChild(el("div", "cmcp-cv-lb-prompt", gen.meta.prompt));
         }
         if (gen.meta?.negativePrompt) {
-          genBox.appendChild(el("div", "cmcp-cv-flabel", tr("civitai_ui.negative", "Negative")));
+          genBox.appendChild(copyLabel(tr("civitai_ui.negative", "Negative"), gen.meta.negativePrompt));
           genBox.appendChild(el("div", "cmcp-cv-lb-prompt", gen.meta.negativePrompt));
         }
         const params = CivitaiClient.params(gen.meta);
@@ -1216,8 +1297,11 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
       sheet.body.appendChild(row);
     }
     if (gen.meta?.prompt) {
-      const p = el("div"); p.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.96);margin-top:.5rem;white-space:pre-wrap";
-      p.textContent = tr("civitai_ui.prompt", "Prompt: ") + coerceMessageText(gen.meta.prompt); sheet.body.appendChild(p);
+      const row = el("div", "cmcp-cv-copyrow"); row.style.cssText = "align-items:flex-start;margin-top:.5rem";
+      const p = el("div"); p.style.cssText = "font-size:calc(var(--cmcp-fs, 0.8125rem) * 0.96);white-space:pre-wrap";
+      p.textContent = tr("civitai_ui.prompt", "Prompt: ") + coerceMessageText(gen.meta.prompt);
+      row.append(p, copyButton(gen.meta.prompt));
+      sheet.body.appendChild(row);
     }
   }
 
@@ -2503,8 +2587,9 @@ export function createCivitaiContent(ctx, shell, opts = {}) {
     hasSearch: true, searchPlaceholder: tr("civitai_ui.search_civitai", "Search CivitAI…"),
     subnavExtras: () => [subTabsWrap, favChips, filterBtn, acctBtn],
     mount(bodyEl) {
-      search.value = state.query;
-      bodyEl.append(progress, grid, sentinel, searchOverlay);
+      search.value = [creatorFromSearch && state.filters.username ? `@${state.filters.username}` : "", state.query]
+        .filter(Boolean).join(" ");
+      bodyEl.append(progress, notice, grid, sentinel, searchOverlay);
     },
     // The shell dispatches every keystroke here; keep the 500ms debounce + the
     // creator-token parse (applySearch reads the shared box). Enter flushes.
